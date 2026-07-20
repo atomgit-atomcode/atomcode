@@ -127,8 +127,14 @@ mod tests {
         // The reported leak: a GitHub PAT inside a bash curl command.
         let s = r#"bash(command=curl -s -H "Authorization: token ghp_Qq1234567890abcdefghijKLMNOP0987654321")"#;
         let out = redact_secrets(s);
-        assert!(!out.contains("ghp_Qq1234567890"), "token must be gone: {out}");
-        assert!(out.contains("<REDACTED>"), "expected redaction marker: {out}");
+        assert!(
+            !out.contains("ghp_Qq1234567890"),
+            "token must be gone: {out}"
+        );
+        assert!(
+            out.contains("<REDACTED>"),
+            "expected redaction marker: {out}"
+        );
     }
 
     #[test]
@@ -136,9 +142,13 @@ mod tests {
         // Second reported form: powershell `$token = 'ghp_…'`. The token is
         // caught by the standalone-shape pass even though the KV pass can't
         // reach past the single quote.
-        let s = "bash(command=powershell -Command \"$token = 'ghp_Qq1234567890abcdefghijKLMNOP0987'\")";
+        let s =
+            "bash(command=powershell -Command \"$token = 'ghp_Qq1234567890abcdefghijKLMNOP0987'\")";
         let out = redact_secrets(s);
-        assert!(!out.contains("ghp_Qq1234567890"), "token must be gone: {out}");
+        assert!(
+            !out.contains("ghp_Qq1234567890"),
+            "token must be gone: {out}"
+        );
     }
 
     #[test]

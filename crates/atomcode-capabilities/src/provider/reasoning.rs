@@ -97,14 +97,26 @@ mod tests {
 
     #[test]
     fn deepseek_v4_includes() {
-        assert_eq!(ReasoningPolicy::derive("deepseek-v4-flash", ""), ReasoningPolicy::Include);
-        assert_eq!(ReasoningPolicy::derive("DeepSeek-V4", ""), ReasoningPolicy::Include);
+        assert_eq!(
+            ReasoningPolicy::derive("deepseek-v4-flash", ""),
+            ReasoningPolicy::Include
+        );
+        assert_eq!(
+            ReasoningPolicy::derive("DeepSeek-V4", ""),
+            ReasoningPolicy::Include
+        );
     }
 
     #[test]
     fn deepseek_r1_excludes() {
-        assert_eq!(ReasoningPolicy::derive("deepseek-r1", ""), ReasoningPolicy::Exclude);
-        assert_eq!(ReasoningPolicy::derive("deepseek-reasoner", ""), ReasoningPolicy::Exclude);
+        assert_eq!(
+            ReasoningPolicy::derive("deepseek-r1", ""),
+            ReasoningPolicy::Exclude
+        );
+        assert_eq!(
+            ReasoningPolicy::derive("deepseek-reasoner", ""),
+            ReasoningPolicy::Exclude
+        );
         // r1 wins even if the URL looks like a moonshot host.
         assert_eq!(
             ReasoningPolicy::derive("deepseek-r1", "https://api.moonshot.cn/v1"),
@@ -114,8 +126,14 @@ mod tests {
 
     #[test]
     fn moonshot_kimi_mimo_include() {
-        assert_eq!(ReasoningPolicy::derive("kimi-k2", ""), ReasoningPolicy::Include);
-        assert_eq!(ReasoningPolicy::derive("moonshot-v1-8k", ""), ReasoningPolicy::Include);
+        assert_eq!(
+            ReasoningPolicy::derive("kimi-k2", ""),
+            ReasoningPolicy::Include
+        );
+        assert_eq!(
+            ReasoningPolicy::derive("moonshot-v1-8k", ""),
+            ReasoningPolicy::Include
+        );
         // MiMo by MODEL NAME (reuses DeepSeek-V4 thinking protocol) — even on a generic
         // gateway URL that doesn't contain "mimo".
         assert_eq!(
@@ -138,15 +156,27 @@ mod tests {
         assert_eq!(ReasoningPolicy::from_config(None), Ok(None));
         assert_eq!(ReasoningPolicy::from_config(Some("")), Ok(None));
         assert_eq!(ReasoningPolicy::from_config(Some("  ")), Ok(None));
-        assert_eq!(ReasoningPolicy::from_config(Some("include")), Ok(Some(ReasoningPolicy::Include)));
-        assert_eq!(ReasoningPolicy::from_config(Some(" Exclude ")), Ok(Some(ReasoningPolicy::Exclude)));
+        assert_eq!(
+            ReasoningPolicy::from_config(Some("include")),
+            Ok(Some(ReasoningPolicy::Include))
+        );
+        assert_eq!(
+            ReasoningPolicy::from_config(Some(" Exclude ")),
+            Ok(Some(ReasoningPolicy::Exclude))
+        );
         assert!(ReasoningPolicy::from_config(Some("sometimes")).is_err());
     }
 
     #[test]
     fn glm_and_default_exclude() {
-        assert_eq!(ReasoningPolicy::derive("glm-5.1", "https://open.bigmodel.cn/api/paas/v4"), ReasoningPolicy::Exclude);
-        assert_eq!(ReasoningPolicy::derive("gpt-4o", "https://api.openai.com/v1"), ReasoningPolicy::Exclude);
+        assert_eq!(
+            ReasoningPolicy::derive("glm-5.1", "https://open.bigmodel.cn/api/paas/v4"),
+            ReasoningPolicy::Exclude
+        );
+        assert_eq!(
+            ReasoningPolicy::derive("gpt-4o", "https://api.openai.com/v1"),
+            ReasoningPolicy::Exclude
+        );
         assert_eq!(ReasoningPolicy::derive("", ""), ReasoningPolicy::Exclude);
     }
 }

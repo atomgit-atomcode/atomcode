@@ -2,7 +2,26 @@
 //! crate stays a leaf (no core dependency). Behavior-identical copies:
 //!   - [`real_home_dir`] mirrors `atomcode_core::tool::real_home_dir` (sudo-aware).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Stable bucket key shared by session storage and project-scoped trust data.
+/// The `PathBuf` hash is part of the existing on-disk format and must not be
+/// replaced with a plain string hash.
+pub fn stable_project_hash(path: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut normalized = path.to_string_lossy().replace('\\', "/");
+    if normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+
+    let mut hasher = DefaultHasher::new();
+    PathBuf::from(normalized).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
 
 /// Resolve the invoking user's real home dir, sudo-aware: under `sudo`, `$HOME`
 /// points at root, so consult `SUDO_USER` via `getpwnam` first (avoids creating a
@@ -78,4 +97,18 @@ pub fn model_name_suggests_vision(name: &str) -> bool {
         || n.starts_with("pixtral")
         || n.contains("llava")
         || n.contains("qvq")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_project_hash_keeps_existing_disk_key() {
+        assert_eq!(
+            stable_project_hash(Path::new("/tmp/atomcode-trust-golden")),
+            "8b6a67e0b2c06dae"
+        );
+    }
 }

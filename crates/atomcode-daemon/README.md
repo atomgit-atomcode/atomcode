@@ -503,6 +503,7 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 ```json
 {
   "logged_in": true,
+  "expired": false,
   "auth_path": "/home/user/.atomcode/auth.toml",
   "user": {
     "username": "example_user",
@@ -525,11 +526,13 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 
 ```json
 {
-  "open_browser": true
+  "open_browser": true,
+  "protocol_version": 2
 }
 ```
 
 - `open_browser`：是否自动打开浏览器（默认 `true`）
+- `protocol_version`：传 `2` 启用带类型终态和结构化错误的登录协议；省略时保持旧客户端兼容语义
 
 **响应示例：**
 
@@ -537,7 +540,9 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 {
   "login_id": "uuid-of-login-session",
   "url": "https://auth.example.com/login?code=xxx",
-  "expires_in_seconds": 600
+  "expires_in_seconds": 600,
+  "daemon_instance_id": "uuid-of-daemon-process",
+  "protocol_version": 2
 }
 ```
 
@@ -550,9 +555,14 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 ```json
 {
   "status": "pending",
-  "user": null
+  "user": null,
+  "retry_after_ms": 2000
 }
 ```
+
+协议 v2 还会以 HTTP 200 返回 `expired`、`cancelled`、`failed` 终态，并附带稳定的
+`code`/`message`；可重试的临时错误使用 HTTP 503 和 `retryable: true`。登录会话只属于
+创建它的 daemon 实例，实例重启后客户端必须重新发起登录，不能重放旧 `login_id`。
 
 **响应示例（已授权）：**
 
@@ -567,7 +577,7 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 
 #### `DELETE /auth/login/:login_id`
 
-取消并移除进行中的登录会话。
+幂等取消登录会话。终态会短暂保留，保证并发请求和响应重试能读取一致结果。
 
 #### `POST /auth/logout`
 

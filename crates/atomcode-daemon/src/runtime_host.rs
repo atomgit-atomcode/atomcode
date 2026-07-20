@@ -10,18 +10,20 @@ pub struct InstalledPluginHookSource;
 impl PluginHookSource for InstalledPluginHookSource {
     fn load(&self) -> Result<Vec<HookConfig>, String> {
         atomcode_capabilities::plugin::hook_trust::ensure_migrated();
-        Ok(atomcode_capabilities::plugin::loader::installed_plugin_cc_hooks()
-            .into_iter()
-            .filter_map(|hook| {
-                HookConfig::from_plugin_spec(
-                    &hook.event,
-                    hook.matcher,
-                    hook.command,
-                    hook.timeout_secs,
-                    hook.plugin_root,
-                )
-            })
-            .collect())
+        Ok(
+            atomcode_capabilities::plugin::loader::installed_plugin_cc_hooks()
+                .into_iter()
+                .filter_map(|hook| {
+                    HookConfig::from_plugin_spec(
+                        &hook.event,
+                        hook.matcher,
+                        hook.command,
+                        hook.timeout_secs,
+                        hook.plugin_root,
+                    )
+                })
+                .collect(),
+        )
     }
 }
 
@@ -40,7 +42,6 @@ pub fn gather_plugin_skill_dirs() -> Vec<(std::path::PathBuf, String)> {
     }
     out
 }
-
 
 #[derive(Debug, Default)]
 pub struct CodingPlanRateLimitSource;

@@ -29,14 +29,21 @@ impl AtomgitClient {
             .build()
             .map_err(|e| format!("failed to build AtomGit HTTP client: {e}"))?;
         let base_url = cfg.base_url.trim_end_matches('/').to_string();
-        Ok(Self { http, base_url, token: cfg.token })
+        Ok(Self {
+            http,
+            base_url,
+            token: cfg.token,
+        })
     }
 
     fn url(&self, path: &str) -> String {
         // All callers pass an absolute path (e.g. "/repos/{owner}/{repo}"); catch a
         // future caller that forgets the leading slash before it silently malforms
         // the URL. No-op in release.
-        debug_assert!(path.starts_with('/'), "atomgit path must start with '/': {path}");
+        debug_assert!(
+            path.starts_with('/'),
+            "atomgit path must start with '/': {path}"
+        );
         format!("{}{}", self.base_url, path)
     }
 
@@ -64,7 +71,9 @@ impl AtomgitClient {
     }
 
     async fn parse<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T, String> {
-        resp.json::<T>().await.map_err(|e| format!("failed to parse AtomGit response: {e}"))
+        resp.json::<T>()
+            .await
+            .map_err(|e| format!("failed to parse AtomGit response: {e}"))
     }
 
     pub(crate) async fn get_json<T: DeserializeOwned>(
@@ -72,7 +81,9 @@ impl AtomgitClient {
         path: &str,
         query: &[(&str, String)],
     ) -> Result<T, String> {
-        let resp = self.send(self.http.get(self.url(path)).query(query)).await?;
+        let resp = self
+            .send(self.http.get(self.url(path)).query(query))
+            .await?;
         Self::parse(resp).await
     }
 
@@ -99,7 +110,9 @@ impl AtomgitClient {
         path: &str,
         body: &B,
     ) -> Result<T, String> {
-        let resp = self.send(self.http.patch(self.url(path)).json(body)).await?;
+        let resp = self
+            .send(self.http.patch(self.url(path)).json(body))
+            .await?;
         Self::parse(resp).await
     }
 
@@ -113,7 +126,8 @@ impl AtomgitClient {
         path: &str,
         body: &B,
     ) -> Result<(), String> {
-        self.send(self.http.delete(self.url(path)).json(body)).await?;
+        self.send(self.http.delete(self.url(path)).json(body))
+            .await?;
         Ok(())
     }
 }
@@ -186,7 +200,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client(&server).get_json::<Thing>("/boom", &[]).await.unwrap_err();
+        let err = client(&server)
+            .get_json::<Thing>("/boom", &[])
+            .await
+            .unwrap_err();
         assert!(err.contains("422"), "{err}");
         assert!(err.contains("bad input"), "{err}");
     }

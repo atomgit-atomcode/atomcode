@@ -2,12 +2,12 @@
 pub mod cell;
 pub(crate) mod diff;
 pub mod mascot;
-pub mod welcome_tips;
 pub mod plain;
 pub mod qr;
 pub mod retained;
 pub mod screen;
 pub mod theme;
+pub mod welcome_tips;
 pub mod worker;
 
 use std::time::Duration;
@@ -404,7 +404,9 @@ impl MenuKind {
     pub fn max_visible_rows(&self, screen_height: usize, item_count: usize) -> usize {
         match self {
             MenuKind::SlashCommand | MenuKind::AtMention => item_count.min(4),
-            MenuKind::Skill | MenuKind::TwoColumn { .. } => item_count.min((screen_height / 2).max(4)),
+            MenuKind::Skill | MenuKind::TwoColumn { .. } => {
+                item_count.min((screen_height / 2).max(4))
+            }
             MenuKind::Plugin => {
                 let plugin_count = item_count.saturating_sub(3);
                 let max_plugins = (screen_height / 4).max(2);
@@ -726,7 +728,10 @@ mod tests {
         // unlike `bash_input_hint` which needs a runnable command.
         assert!(input_shell_mode("!"), "bare ! already arms shell mode");
         assert!(input_shell_mode("!ls -la"));
-        assert!(input_shell_mode("  !git status"), "leading whitespace tolerated");
+        assert!(
+            input_shell_mode("  !git status"),
+            "leading whitespace tolerated"
+        );
         // Reverts the instant the `!` is gone — pure fn of the live buffer, so a
         // submit/clear/delete flips it back with no persistent state.
         assert!(!input_shell_mode(""), "empty buffer is not shell mode");
@@ -737,7 +742,10 @@ mod tests {
 
     #[test]
     fn compaction_rule_wraps_label_unicode() {
-        assert_eq!(compaction_rule("已压缩 · 摘要 2 条", true), "─── 已压缩 · 摘要 2 条 ───");
+        assert_eq!(
+            compaction_rule("已压缩 · 摘要 2 条", true),
+            "─── 已压缩 · 摘要 2 条 ───"
+        );
     }
 
     #[test]

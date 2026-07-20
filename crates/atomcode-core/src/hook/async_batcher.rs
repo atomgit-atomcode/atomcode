@@ -59,7 +59,7 @@ fn default_batch_size() -> usize {
 }
 
 fn default_flush_interval() -> u64 {
-    1000  // 1 秒
+    1000 // 1 秒
 }
 
 fn default_timeout() -> u64 {
@@ -128,11 +128,7 @@ impl AsyncWebhookBatcher {
         // 启动后台任务
         let client_clone = client.clone();
         let config_clone = config.clone();
-        let handle = tokio::spawn(Self::background_task(
-            client_clone,
-            config_clone,
-            receiver,
-        ));
+        let handle = tokio::spawn(Self::background_task(client_clone, config_clone, receiver));
 
         Self {
             config,
@@ -235,7 +231,10 @@ impl AsyncWebhookBatcher {
         let mut last_error = None;
         for attempt in 0..=config.retries {
             let request = client.request(
-                config.method.parse().map_err(|e| format!("Invalid HTTP method: {}", e))?,
+                config
+                    .method
+                    .parse()
+                    .map_err(|e| format!("Invalid HTTP method: {}", e))?,
                 &config.url,
             );
 
@@ -266,7 +265,9 @@ impl AsyncWebhookBatcher {
                     } else {
                         last_error = Some(format!(
                             "HTTP {} at attempt {}: {}",
-                            status, attempt + 1, body
+                            status,
+                            attempt + 1,
+                            body
                         ));
                     }
                 }
@@ -326,7 +327,10 @@ impl AsyncWebhookRegistry {
         let batcher = Arc::new(AsyncWebhookBatcher::new(config.clone()));
         tracing::info!(
             "[AsyncWebhook] Registered: {} -> {} (batch={}, interval={}ms)",
-            config.name, config.url, config.batch_size, config.flush_interval_ms
+            config.name,
+            config.url,
+            config.batch_size,
+            config.flush_interval_ms
         );
         self.batchers.insert(config.name.clone(), batcher);
     }

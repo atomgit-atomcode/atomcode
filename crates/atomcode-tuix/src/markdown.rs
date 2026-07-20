@@ -228,8 +228,18 @@ pub fn render_line_with_width(
             format!("{} {}", "#".repeat(level as usize), inner)
         } else {
             match level {
-                1 | 2 | 3 => format!("{}{}{}", theme::md_heading_open(), inner, theme::MD_HEADING_CLOSE),
-                _ => format!("{}{}{}", theme::MD_ITALIC_OPEN, inner, theme::MD_ITALIC_CLOSE),
+                1 | 2 | 3 => format!(
+                    "{}{}{}",
+                    theme::md_heading_open(),
+                    inner,
+                    theme::MD_HEADING_CLOSE
+                ),
+                _ => format!(
+                    "{}{}{}",
+                    theme::MD_ITALIC_OPEN,
+                    inner,
+                    theme::MD_ITALIC_CLOSE
+                ),
             }
         };
         return Some(prepend(body));
@@ -245,7 +255,11 @@ pub fn render_line_with_width(
         let body = if caps.colors {
             format!(
                 "{}{}{}{}{}",
-                indent, theme::MD_MUTED_OPEN, item.marker, theme::MD_MUTED_CLOSE, inner
+                indent,
+                theme::MD_MUTED_OPEN,
+                item.marker,
+                theme::MD_MUTED_CLOSE,
+                inner
             )
         } else {
             format!("{}{} {}", indent, item.marker, inner)
@@ -337,7 +351,9 @@ fn box_drawing_table_row(trimmed: &str) -> Option<String> {
                 let converted: String = trimmed
                     .chars()
                     .map(|c| match c {
-                        '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘' => '|',
+                        '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘' => {
+                            '|'
+                        }
                         '─' => '-',
                         other => other,
                     })
@@ -624,8 +640,16 @@ fn render_wrapped_box_table(
     col_widths: &[usize],
     caps: TerminalCaps,
 ) -> String {
-    let border_on = if caps.colors { theme::md_border_open() } else { "" };
-    let border_off = if caps.colors { theme::MD_MUTED_CLOSE } else { "" };
+    let border_on = if caps.colors {
+        theme::md_border_open()
+    } else {
+        ""
+    };
+    let border_off = if caps.colors {
+        theme::MD_MUTED_CLOSE
+    } else {
+        ""
+    };
     let ncols = col_widths.len();
     let rule = |left: char, mid: char, right: char| -> String {
         let mut s = String::new();
@@ -773,8 +797,7 @@ pub fn flush_aligned_table_with_width(
     //
     // If this exceeds the terminal budget, switch to flat mode.
     let bar_w = crate::width::cell_char_width('│').unwrap_or(1).max(1);
-    let natural_row_width: usize =
-        bar_w + col_widths.iter().map(|w| w + 2 + bar_w).sum::<usize>();
+    let natural_row_width: usize = bar_w + col_widths.iter().map(|w| w + 2 + bar_w).sum::<usize>();
     if max_width > 0 && natural_row_width > max_width {
         // Middle tier (codex-style graceful degradation): before collapsing to a
         // flat vertical list, try to keep the GRID by shrinking wide columns and
@@ -783,8 +806,7 @@ pub fn flush_aligned_table_with_width(
         // hairier, so those go straight to the safe flat path.
         let cjk_border = dash_w > 1 || bar_w > 1;
         if !cjk_border {
-            if let Some(shrunk) =
-                fit_columns_to_grid(&parsed, &col_widths, ncols, max_width, bar_w)
+            if let Some(shrunk) = fit_columns_to_grid(&parsed, &col_widths, ncols, max_width, bar_w)
             {
                 // Starvation guard (codex-style): if keeping the grid squeezes a
                 // column so hard that a cell wraps into a tall stack, a flat
@@ -804,8 +826,16 @@ pub fn flush_aligned_table_with_width(
     // invisible until a selection highlight revealed it. `md_border_open`
     // keeps SGR 90 on light and switches to SGR 37 (soft light-gray) on
     // dark — quiet structure that stays visible on both.
-    let border_on = if caps.colors { theme::md_border_open() } else { "" };
-    let border_off = if caps.colors { theme::MD_MUTED_CLOSE } else { "" };
+    let border_on = if caps.colors {
+        theme::md_border_open()
+    } else {
+        ""
+    };
+    let border_off = if caps.colors {
+        theme::MD_MUTED_CLOSE
+    } else {
+        ""
+    };
 
     // Draw a horizontal rule row with given connector characters.
     //
@@ -1325,10 +1355,7 @@ mod tests {
         let row = "| 模式匹配 | `Foo | Bar` 多模式 |";
         assert_eq!(
             split_table_row(row),
-            vec![
-                "模式匹配".to_string(),
-                "`Foo | Bar` 多模式".to_string(),
-            ],
+            vec!["模式匹配".to_string(), "`Foo | Bar` 多模式".to_string(),],
         );
     }
 
@@ -1488,7 +1515,10 @@ mod tests {
 
     #[test]
     fn inline_italic() {
-        assert_eq!(render_inline_line("*em*", caps()), format!("{}em{}", theme::MD_ITALIC_OPEN, theme::MD_ITALIC_CLOSE));
+        assert_eq!(
+            render_inline_line("*em*", caps()),
+            format!("{}em{}", theme::MD_ITALIC_OPEN, theme::MD_ITALIC_CLOSE)
+        );
     }
 
     #[test]
@@ -1556,7 +1586,11 @@ mod tests {
         let _ = render_line("```rust", &mut state, caps());
         assert!(render_line("fn main() {}", &mut state, caps()).is_none());
         let out = render_line("```", &mut state, caps()).unwrap();
-        assert!(out.contains("  fn main() {}"), "indent + body preserved: {:?}", out);
+        assert!(
+            out.contains("  fn main() {}"),
+            "indent + body preserved: {:?}",
+            out
+        );
         assert!(
             !out.contains('\x1b'),
             "expected zero ANSI bytes under plan-0, got: {:?}",
@@ -1599,7 +1633,11 @@ mod tests {
         assert!(out.contains("Hello"));
         // H1-H3 use the heading colour so they sit on a separate
         // colour layer from default-colour body text.
-        assert!(out.contains(theme::md_heading_open()), "H2 should use MD_HEADING_OPEN, got: {:?}", out);
+        assert!(
+            out.contains(theme::md_heading_open()),
+            "H2 should use MD_HEADING_OPEN, got: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -1609,8 +1647,15 @@ mod tests {
         assert!(out.contains("Sub-deep"));
         // H4+ keeps italic-only — distinct from coloured H1-H3 without
         // adding a third colour tier.
-        assert!(out.contains(theme::MD_ITALIC_OPEN), "H4 should use MD_ITALIC_OPEN, got: {:?}", out);
-        assert!(!out.contains(theme::md_heading_open()), "H4 must not pick up the H1-H3 heading colour");
+        assert!(
+            out.contains(theme::MD_ITALIC_OPEN),
+            "H4 should use MD_ITALIC_OPEN, got: {:?}",
+            out
+        );
+        assert!(
+            !out.contains(theme::md_heading_open()),
+            "H4 must not pick up the H1-H3 heading colour"
+        );
     }
 
     #[test]
@@ -1711,7 +1756,11 @@ mod tests {
         let out = render_line("- item", &mut st, caps()).unwrap();
         // Bullet marker rendered in muted colour.
         assert!(
-            out.contains(&format!("{}•{}", theme::MD_MUTED_OPEN, theme::MD_MUTED_CLOSE)),
+            out.contains(&format!(
+                "{}•{}",
+                theme::MD_MUTED_OPEN,
+                theme::MD_MUTED_CLOSE
+            )),
             "bullet must use MD_MUTED colour: {:?}",
             out
         );
@@ -1730,7 +1779,15 @@ mod tests {
     fn list_nested_indent() {
         let mut st = MdState::new();
         let out = render_line("  - nested", &mut st, caps()).unwrap();
-        assert!(out.starts_with(&format!("  {}•{}", theme::MD_MUTED_OPEN, theme::MD_MUTED_CLOSE)), "nested bullet with indent: {:?}", out);
+        assert!(
+            out.starts_with(&format!(
+                "  {}•{}",
+                theme::MD_MUTED_OPEN,
+                theme::MD_MUTED_CLOSE
+            )),
+            "nested bullet with indent: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -1738,7 +1795,11 @@ mod tests {
         let mut st = MdState::new();
         let out = render_line("1. first item", &mut st, caps()).unwrap();
         assert!(
-            out.contains(&format!("{}1.{}", theme::MD_MUTED_OPEN, theme::MD_MUTED_CLOSE)),
+            out.contains(&format!(
+                "{}1.{}",
+                theme::MD_MUTED_OPEN,
+                theme::MD_MUTED_CLOSE
+            )),
             "ordered marker must use MD_MUTED colour: {:?}",
             out
         );
@@ -1750,7 +1811,11 @@ mod tests {
         let mut st = MdState::new();
         let out = render_line("12. twelfth item", &mut st, caps()).unwrap();
         assert!(
-            out.contains(&format!("{}12.{}", theme::MD_MUTED_OPEN, theme::MD_MUTED_CLOSE)),
+            out.contains(&format!(
+                "{}12.{}",
+                theme::MD_MUTED_OPEN,
+                theme::MD_MUTED_CLOSE
+            )),
             "double-digit marker must use MD_MUTED colour: {:?}",
             out
         );
@@ -1770,7 +1835,11 @@ mod tests {
         let mut st = MdState::new();
         let out = render_line("  5. nested ordered", &mut st, caps()).unwrap();
         assert!(
-            out.starts_with(&format!("  {}5.{}", theme::MD_MUTED_OPEN, theme::MD_MUTED_CLOSE)),
+            out.starts_with(&format!(
+                "  {}5.{}",
+                theme::MD_MUTED_OPEN,
+                theme::MD_MUTED_CLOSE
+            )),
             "nested ordered with indent: {:?}",
             out
         );
@@ -1782,7 +1851,11 @@ mod tests {
         // "3.text" (no space after dot) should NOT be parsed as a list item.
         let mut st = MdState::new();
         let out = render_line("3.text", &mut st, caps()).unwrap();
-        assert!(!out.contains(theme::MD_MUTED_OPEN), "no muted marker: {:?}", out);
+        assert!(
+            !out.contains(theme::MD_MUTED_OPEN),
+            "no muted marker: {:?}",
+            out
+        );
         assert!(out.contains("3.text"));
     }
 
@@ -1822,13 +1895,32 @@ mod tests {
         // render as a table, not show raw markdown source. Regression for the
         // "long comparison tables rendered un-rendered in the TUI" report.
         let mut st = MdState::new();
-        assert!(render_line("对比 | HEAD | main", &mut st, plain_caps()).is_none(), "header buffered");
-        assert!(render_line("---|---|---", &mut st, plain_caps()).is_none(), "delimiter buffered");
-        assert!(render_line("代码 | 手动 | 调用", &mut st, plain_caps()).is_none(), "data buffered");
-        let out = render_line("下一段", &mut st, plain_caps()).expect("trailing line flushes table");
-        assert!(out.contains('┌') || out.contains('│'), "must render as a table box: {out}");
-        assert!(!out.contains("---|---"), "raw delimiter must not leak: {out}");
-        assert!(out.contains("HEAD") && out.contains("代码"), "cells preserved: {out}");
+        assert!(
+            render_line("对比 | HEAD | main", &mut st, plain_caps()).is_none(),
+            "header buffered"
+        );
+        assert!(
+            render_line("---|---|---", &mut st, plain_caps()).is_none(),
+            "delimiter buffered"
+        );
+        assert!(
+            render_line("代码 | 手动 | 调用", &mut st, plain_caps()).is_none(),
+            "data buffered"
+        );
+        let out =
+            render_line("下一段", &mut st, plain_caps()).expect("trailing line flushes table");
+        assert!(
+            out.contains('┌') || out.contains('│'),
+            "must render as a table box: {out}"
+        );
+        assert!(
+            !out.contains("---|---"),
+            "raw delimiter must not leak: {out}"
+        );
+        assert!(
+            out.contains("HEAD") && out.contains("代码"),
+            "cells preserved: {out}"
+        );
     }
 
     #[test]
@@ -1837,16 +1929,29 @@ mod tests {
         // (`- option A | option B`) is a LIST item, not a table row — it must keep
         // its bullet, not get buffered as a table and lose its marker.
         let mut st = MdState::new();
-        let a = render_line("- option A | option B", &mut st, plain_caps()).expect("list item renders inline");
-        assert!(a.contains('•') || a.contains('-'), "list marker preserved: {a}");
-        assert!(a.contains("option A") && a.contains("option B"), "content preserved: {a}");
+        let a = render_line("- option A | option B", &mut st, plain_caps())
+            .expect("list item renders inline");
+        assert!(
+            a.contains('•') || a.contains('-'),
+            "list marker preserved: {a}"
+        );
+        assert!(
+            a.contains("option A") && a.contains("option B"),
+            "content preserved: {a}"
+        );
         assert!(!a.contains('┌'), "must not be boxed: {a}");
         // The `---|---` delimiter is NOT a list item, so real pipe-less tables still work.
         let mut st2 = MdState::new();
         assert!(render_line("H1 | H2", &mut st2, plain_caps()).is_none());
-        assert!(render_line("---|---", &mut st2, plain_caps()).is_none(), "delimiter buffered, not a list item");
+        assert!(
+            render_line("---|---", &mut st2, plain_caps()).is_none(),
+            "delimiter buffered, not a list item"
+        );
         let out = render_line("done", &mut st2, plain_caps()).expect("flush");
-        assert!(out.contains('┌') || out.contains('│'), "pipe-less table still renders: {out}");
+        assert!(
+            out.contains('┌') || out.contains('│'),
+            "pipe-less table still renders: {out}"
+        );
     }
 
     #[test]
@@ -1857,23 +1962,42 @@ mod tests {
         let mut st = MdState::new();
         assert!(render_line("run foo | bar here", &mut st, plain_caps()).is_none());
         let out = render_line("next paragraph", &mut st, plain_caps()).expect("flush");
-        assert!(!out.contains('┌'), "prose-with-pipe must not be boxed: {out}");
-        assert!(out.contains("foo") && out.contains("bar"), "prose preserved: {out}");
+        assert!(
+            !out.contains('┌'),
+            "prose-with-pipe must not be boxed: {out}"
+        );
+        assert!(
+            out.contains("foo") && out.contains("bar"),
+            "prose preserved: {out}"
+        );
     }
 
     #[test]
     fn flush_pipeless_rows_render_as_table_and_no_sep_renders_inline() {
         // Flush directly: pipe-less rows WITH a delimiter → box.
         let table = flush_aligned_table_with_width(
-            &["A | B".to_string(), "---|---".to_string(), "c | d".to_string()],
+            &[
+                "A | B".to_string(),
+                "---|---".to_string(),
+                "c | d".to_string(),
+            ],
             plain_caps(),
             80,
         );
-        assert!(table.contains('┌') && table.contains('│'), "pipe-less table renders as box: {table}");
-        assert!(table.contains('A') && table.contains('d'), "cells preserved: {table}");
+        assert!(
+            table.contains('┌') && table.contains('│'),
+            "pipe-less table renders as box: {table}"
+        );
+        assert!(
+            table.contains('A') && table.contains('d'),
+            "cells preserved: {table}"
+        );
         // No delimiter → NOT a table → inline, no box.
         let prose = flush_aligned_table_with_width(&["a | b".to_string()], plain_caps(), 80);
-        assert!(!prose.contains('┌'), "no box without a delimiter row: {prose}");
+        assert!(
+            !prose.contains('┌'),
+            "no box without a delimiter row: {prose}"
+        );
         assert!(prose.contains("a | b"), "raw inline preserved: {prose}");
     }
 
@@ -1892,8 +2016,14 @@ mod tests {
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 40);
 
         // Flat mode: no box-drawing characters anywhere.
-        assert!(!out.contains('│'), "narrow output must not contain border │");
-        assert!(!out.contains('┌'), "narrow output must not contain top corner");
+        assert!(
+            !out.contains('│'),
+            "narrow output must not contain border │"
+        );
+        assert!(
+            !out.contains('┌'),
+            "narrow output must not contain top corner"
+        );
 
         // Every cell value survives in full — no truncation.
         assert!(out.contains("AtomCode Air"));
@@ -1901,9 +2031,15 @@ mod tests {
 
         // Each header label appears once per data row.
         let count_neng_li = out.matches("能力").count();
-        assert_eq!(count_neng_li, 2, "header `能力` should label both data rows");
+        assert_eq!(
+            count_neng_li, 2,
+            "header `能力` should label both data rows"
+        );
         let count_cursor = out.matches("Cursor").count();
-        assert_eq!(count_cursor, 2, "header `Cursor` should label both data rows");
+        assert_eq!(
+            count_cursor, 2,
+            "header `Cursor` should label both data rows"
+        );
 
         // Records are separated by a blank line.
         assert!(
@@ -1958,7 +2094,9 @@ mod tests {
             "no line over width: {lines:?}"
         );
         assert!(
-            lines.iter().all(|l| !l.starts_with(' ') && !l.ends_with(' ')),
+            lines
+                .iter()
+                .all(|l| !l.starts_with(' ') && !l.ends_with(' ')),
             "clean word breaks, no dangling spaces: {lines:?}"
         );
         assert_eq!(lines.join(" "), "Handles login and session tokens");
@@ -1989,10 +2127,19 @@ mod tests {
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 40);
 
         // Grid survives — box corners present, NOT the flat fallback.
-        assert!(out.contains('┌'), "grid must be kept, not flattened:\n{out}");
+        assert!(
+            out.contains('┌'),
+            "grid must be kept, not flattened:\n{out}"
+        );
         // No content lost to the wrap.
-        assert!(out.contains("Handles"), "start of wrapped cell present:\n{out}");
-        assert!(out.contains("tokens"), "end of wrapped cell present:\n{out}");
+        assert!(
+            out.contains("Handles"),
+            "start of wrapped cell present:\n{out}"
+        );
+        assert!(
+            out.contains("tokens"),
+            "end of wrapped cell present:\n{out}"
+        );
         // Every rendered line fits the budget.
         for line in out.lines() {
             assert!(
@@ -2041,8 +2188,14 @@ mod tests {
             "| Authentication | Handles login and session tokens | Complete |".to_string(),
         ];
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 16);
-        assert!(!out.contains('│'), "far-too-narrow must collapse to flat:\n{out}");
-        assert!(out.contains("Handles"), "content preserved in flat mode:\n{out}");
+        assert!(
+            !out.contains('│'),
+            "far-too-narrow must collapse to flat:\n{out}"
+        );
+        assert!(
+            out.contains("Handles"),
+            "content preserved in flat mode:\n{out}"
+        );
     }
 
     #[test]
@@ -2153,7 +2306,10 @@ mod tests {
                 out.push('\n');
             }
         }
-        assert!(out.contains('┌'), "wide terminal should keep box rendering:\n{out}");
+        assert!(
+            out.contains('┌'),
+            "wide terminal should keep box rendering:\n{out}"
+        );
         assert!(out.contains('└'));
         assert!(out.contains("a") && out.contains("2"));
     }
@@ -2239,7 +2395,11 @@ mod tests {
             "code-block output must contain zero ANSI under plan-0, got: {:?}",
             out
         );
-        assert!(out.contains("  fn main() {}"), "indent + body preserved: {:?}", out);
+        assert!(
+            out.contains("  fn main() {}"),
+            "indent + body preserved: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -2249,7 +2409,11 @@ mod tests {
         render_line("let x = 1;", &mut st, plain_caps());
         let out = render_line("```", &mut st, plain_caps()).unwrap();
         assert!(out.contains("  let x = 1;"));
-        assert!(!out.contains('\x1b'), "plain_caps must emit zero ANSI, got: {:?}", out);
+        assert!(
+            !out.contains('\x1b'),
+            "plain_caps must emit zero ANSI, got: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -2300,10 +2464,7 @@ mod tests {
     /// literal, never stripped.
     #[test]
     fn strip_md_for_width_keeps_double_star_inside_inline_code() {
-        assert_eq!(
-            strip_md_for_width("`src/**/*.ts`"),
-            "src/**/*.ts"
-        );
+        assert_eq!(strip_md_for_width("`src/**/*.ts`"), "src/**/*.ts");
     }
 
     /// Companion to the bug above: `*italic*` is rendered as the inner text

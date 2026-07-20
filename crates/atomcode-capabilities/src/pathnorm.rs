@@ -98,7 +98,10 @@ mod tests {
     #[test]
     fn strip_verbatim_disk_and_unc_and_noop() {
         assert_eq!(strip_verbatim(r"\\?\C:\Users\x"), r"C:\Users\x");
-        assert_eq!(strip_verbatim(r"\\?\UNC\server\share\x"), r"\\server\share\x");
+        assert_eq!(
+            strip_verbatim(r"\\?\UNC\server\share\x"),
+            r"\\server\share\x"
+        );
         assert_eq!(strip_verbatim("/home/u/x"), "/home/u/x"); // POSIX untouched
         assert_eq!(strip_verbatim(r"C:\already\plain"), r"C:\already\plain");
     }
@@ -122,6 +125,9 @@ mod tests {
     fn to_display_strips_verbatim_prefix() {
         // On any platform, the `\\?\` string form must be gone from the output.
         let out = to_display(Path::new(r"\\?\C:\repo\src\main.rs"));
-        assert!(!out.starts_with(r"\\?\"), "verbatim prefix must be stripped: {out}");
+        assert!(
+            !out.starts_with(r"\\?\"),
+            "verbatim prefix must be stripped: {out}"
+        );
     }
 }

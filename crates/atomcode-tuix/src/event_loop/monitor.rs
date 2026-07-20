@@ -141,8 +141,7 @@ pub fn spawn_check(
         // Blocking HTTP client lives in a spawn_blocking thread so we
         // don't stall the tokio runtime's worker pool.
         let fetch: Result<Vec<String>, ()> = tokio::task::spawn_blocking(move || {
-            let client =
-                atomcode_codingplan::client::Client::from_stored_auth().map_err(|_| ())?;
+            let client = atomcode_codingplan::client::Client::from_stored_auth().map_err(|_| ())?;
             // Query with the user's ACTUAL tier, not `Max`. `plan_available` is
             // computed relative to the requested `plan_type` (see `ModelEntry`
             // docs): a Lite user querying `Max` gets higher-tier models (e.g.

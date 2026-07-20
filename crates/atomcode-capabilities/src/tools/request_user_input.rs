@@ -45,7 +45,10 @@ pub struct UserInputResponse {
 
 impl UserInputResponse {
     pub fn declined() -> Self {
-        Self { declined: true, ..Default::default() }
+        Self {
+            declined: true,
+            ..Default::default()
+        }
     }
 }
 
@@ -54,7 +57,8 @@ impl UserInputResponse {
 pub fn parse_args(args: &str) -> Result<UserInputRequest, String> {
     let req: UserInputRequest = serde_json::from_str(args)
         .map_err(|e| format!("invalid request_user_input arguments: {e}"))?;
-    if matches!(req.mode, UserInputMode::Single | UserInputMode::Multiple) && req.options.is_empty() {
+    if matches!(req.mode, UserInputMode::Single | UserInputMode::Multiple) && req.options.is_empty()
+    {
         return Err(
             "request_user_input: single/multiple mode requires a non-empty `options` array".into(),
         );
@@ -63,11 +67,21 @@ pub fn parse_args(args: &str) -> Result<UserInputRequest, String> {
 }
 
 fn err_result(msg: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: msg.into(), is_error: true, images: vec![] }
+    ToolResult {
+        call_id: String::new(),
+        content: msg.into(),
+        is_error: true,
+        images: vec![],
+    }
 }
 
 fn ok_result(msg: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: msg.into(), is_error: false, images: vec![] }
+    ToolResult {
+        call_id: String::new(),
+        content: msg.into(),
+        is_error: false,
+        images: vec![],
+    }
 }
 
 /// Map the user's answer to a tool result string.
@@ -84,7 +98,12 @@ pub fn format_result(resp: &UserInputResponse) -> ToolResult {
     if resp.selected.is_empty() {
         return ok_result("User selected nothing.");
     }
-    let joined = resp.selected.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join(", ");
+    let joined = resp
+        .selected
+        .iter()
+        .map(|s| format!("{s:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     ok_result(format!("User selected: {joined}"))
 }
 
@@ -225,7 +244,10 @@ mod tests {
             r#"User answered: "hi""#
         );
         let d = format_result(&UserInputResponse::declined());
-        assert!(!d.is_error, "declined must not be an error — model should proceed, not retry/abort");
+        assert!(
+            !d.is_error,
+            "declined must not be an error — model should proceed, not retry/abort"
+        );
         assert_eq!(
             d.content,
             "No answer was provided. Proceed with your own best judgment; only ask again if you \
@@ -239,7 +261,10 @@ mod tests {
             header: "H".into(),
             question: "Q?".into(),
             mode: UserInputMode::Single,
-            options: vec![UserInputOption { label: "A".into(), description: None }],
+            options: vec![UserInputOption {
+                label: "A".into(),
+                description: None,
+            }],
         };
         assert_eq!(
             serde_json::from_str::<UserInputRequest>(&serde_json::to_string(&req).unwrap())

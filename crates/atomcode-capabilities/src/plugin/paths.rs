@@ -29,7 +29,10 @@ pub fn installed_plugins_file() -> Option<PathBuf> {
 /// - `Local` scope: `<working_dir>/.atomcode/plugins/local/`
 ///
 /// Returns `None` for `User` scope (user scope uses the global `plugins_root()`).
-pub fn project_plugins_root(working_dir: &std::path::Path, scope: &InstallScope) -> Option<PathBuf> {
+pub fn project_plugins_root(
+    working_dir: &std::path::Path,
+    scope: &InstallScope,
+) -> Option<PathBuf> {
     match scope {
         InstallScope::Project => Some(working_dir.join(".atomcode/plugins")),
         InstallScope::Local => Some(working_dir.join(".atomcode/plugins/local")),
@@ -38,13 +41,19 @@ pub fn project_plugins_root(working_dir: &std::path::Path, scope: &InstallScope)
 }
 
 /// Project-level `installed_plugins.json` path for a given scope.
-pub fn project_installed_plugins_file(working_dir: &std::path::Path, scope: &InstallScope) -> Option<PathBuf> {
+pub fn project_installed_plugins_file(
+    working_dir: &std::path::Path,
+    scope: &InstallScope,
+) -> Option<PathBuf> {
     project_plugins_root(working_dir, scope).map(|root| root.join("installed_plugins.json"))
 }
 
 /// Project-level marketplaces directory for a given scope.
 #[allow(dead_code)]
-pub fn project_marketplaces_root(working_dir: &std::path::Path, scope: &InstallScope) -> Option<PathBuf> {
+pub fn project_marketplaces_root(
+    working_dir: &std::path::Path,
+    scope: &InstallScope,
+) -> Option<PathBuf> {
     project_plugins_root(working_dir, scope).map(|root| root.join("marketplaces"))
 }
 
@@ -66,14 +75,20 @@ mod tests {
     fn project_plugins_root_project_scope() {
         let dir = std::path::Path::new("/tmp/myproject");
         let root = project_plugins_root(dir, &InstallScope::Project).unwrap();
-        assert_eq!(root, std::path::PathBuf::from("/tmp/myproject/.atomcode/plugins"));
+        assert_eq!(
+            root,
+            std::path::PathBuf::from("/tmp/myproject/.atomcode/plugins")
+        );
     }
 
     #[test]
     fn project_plugins_root_local_scope() {
         let dir = std::path::Path::new("/tmp/myproject");
         let root = project_plugins_root(dir, &InstallScope::Local).unwrap();
-        assert_eq!(root, std::path::PathBuf::from("/tmp/myproject/.atomcode/plugins/local"));
+        assert_eq!(
+            root,
+            std::path::PathBuf::from("/tmp/myproject/.atomcode/plugins/local")
+        );
     }
 
     #[test]

@@ -18,13 +18,12 @@ use tokio::io::AsyncWriteExt;
 use super::config::matches_tool;
 use super::json_config::load_hooks_config;
 use super::{
-    ErrorContext, Hook, HookConfig, HookContext, HookCtx, HookEvent, HookResult,
-    PreHookResult, PreToolExecutionHook, PostToolExecutionHook, PostTurnHook,
-    SystemPromptHook, OnSessionStartHook, OnSessionEndHook, OnErrorHook,
-    OnUserPromptSubmitHook, OnToolCallStartHook, OnModelResponseHook,
-    ToolCallStartContext, ToolResultContext, TurnCompleteContext, TurnStartContext,
-    UserPromptHookResult, UserPromptSubmitPayload, UserPromptSubmitOutput,
-    UserPromptSubmitResult,
+    ErrorContext, Hook, HookConfig, HookContext, HookCtx, HookEvent, HookResult, OnErrorHook,
+    OnModelResponseHook, OnSessionEndHook, OnSessionStartHook, OnToolCallStartHook,
+    OnUserPromptSubmitHook, PostToolExecutionHook, PostTurnHook, PreHookResult,
+    PreToolExecutionHook, SystemPromptHook, ToolCallStartContext, ToolResultContext,
+    TurnCompleteContext, TurnStartContext, UserPromptHookResult, UserPromptSubmitOutput,
+    UserPromptSubmitPayload, UserPromptSubmitResult,
 };
 
 // ============================================================================
@@ -153,7 +152,10 @@ impl HookEngine {
     /// - Ok((None, true))      — Hook 明确允许，可跳过审批
     /// - Ok((None, false))     — 继续原样
     /// - Err(reason)           — 被阻止
-    pub async fn trigger_pre_tool_use(&self, ctx: &HookCtx) -> Result<(Option<String>, bool), String> {
+    pub async fn trigger_pre_tool_use(
+        &self,
+        ctx: &HookCtx,
+    ) -> Result<(Option<String>, bool), String> {
         let mut modified_args: Option<String> = None;
         let mut explicitly_allowed = false;
         for hook in &self.pre_tool_hooks {
@@ -241,7 +243,10 @@ impl HookEngine {
 
     /// 用户提交 prompt 时触发所有 OnUserPromptSubmitHook。
     pub async fn trigger_user_prompt_submit(
-        &self, content: &str, session_id: &str, cwd: &str,
+        &self,
+        content: &str,
+        session_id: &str,
+        cwd: &str,
     ) -> UserPromptHookResult {
         let payload = UserPromptSubmitPayload {
             session_id: session_id.to_string(),
@@ -340,9 +345,7 @@ impl HookEngine {
     }
 
     /// 模型响应后触发所有 OnModelResponseHook (fire-and-forget)。
-    pub async fn trigger_on_model_response(
-        &self, response: &str, turn_ctx: &TurnStartContext,
-    ) {
+    pub async fn trigger_on_model_response(&self, response: &str, turn_ctx: &TurnStartContext) {
         for hook in &self.on_model_response_hooks {
             match hook.on_model_response(response, turn_ctx).await {
                 HookResult::Warning(msg) => {
@@ -571,7 +574,10 @@ impl ShellCommandHook {
     /// 执行 shell 命令，返回 stdout（环境变量协议）。
     async fn execute_hook(&self, ctx: &HookContext) -> anyhow::Result<String> {
         let ctx_json = serde_json::to_string(ctx).unwrap_or_else(|e| {
-            tracing::warn!("[Hook Warning] Failed to serialize HookContext to JSON: {}", e);
+            tracing::warn!(
+                "[Hook Warning] Failed to serialize HookContext to JSON: {}",
+                e
+            );
             "{}".to_string()
         });
 
@@ -601,7 +607,9 @@ impl ShellCommandHook {
             );
         }
 
-        Ok(crate::process_utils::decode_subprocess_output(&output.stdout))
+        Ok(crate::process_utils::decode_subprocess_output(
+            &output.stdout,
+        ))
     }
 
     /// 执行 shell 命令并 pipe stdin，返回 (exit_ok, stdout, stderr)。
@@ -641,7 +649,6 @@ impl ShellCommandHook {
 
         Ok(tokio::time::timeout(timeout, fut).await??)
     }
-
 }
 
 impl Hook for ShellCommandHook {
@@ -677,9 +684,9 @@ impl PreToolExecutionHook for ShellCommandHook {
             Ok(stdout) => {
                 match serde_json::from_str::<PreHookResult>(&stdout) {
                     Ok(PreHookResult::Block { reason }) => HookResult::Denied(reason),
-                    Ok(PreHookResult::Modify { args }) => HookResult::Modified(
-                        serde_json::to_string(&args).unwrap_or_default(),
-                    ),
+                    Ok(PreHookResult::Modify { args }) => {
+                        HookResult::Modified(serde_json::to_string(&args).unwrap_or_default())
+                    }
                     Ok(PreHookResult::Allow) => HookResult::ExplicitAllow,
                     Err(_) => HookResult::Ok, // non-JSON → Allow
                 }
@@ -762,8 +769,7 @@ impl OnUserPromptSubmitHook for ShellCommandHook {
         &self,
         payload: &UserPromptSubmitPayload,
     ) -> UserPromptSubmitResult {
-        let payload_json =
-            serde_json::to_string(payload).unwrap_or_else(|_| "{}".into());
+        let payload_json = serde_json::to_string(payload).unwrap_or_else(|_| "{}".into());
 
         match self.execute_hook_with_stdin(&payload_json).await {
             Ok((exit_ok, stdout, stderr)) => {
@@ -800,9 +806,8 @@ impl OnUserPromptSubmitHook for ShellCommandHook {
 
                 // last-line-first JSON 解析 (CC parity)
                 let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty());
-                let json_action = last_line.and_then(|l| {
-                    serde_json::from_str::<UserPromptSubmitOutput>(l.trim()).ok()
-                });
+                let json_action = last_line
+                    .and_then(|l| serde_json::from_str::<UserPromptSubmitOutput>(l.trim()).ok());
 
                 if let Some(parsed) = json_action {
                     if matches!(parsed.decision.as_deref(), Some("block")) {
@@ -841,10 +846,7 @@ impl OnUserPromptSubmitHook for ShellCommandHook {
 
 #[async_trait]
 impl OnToolCallStartHook for ShellCommandHook {
-    async fn on_tool_call_start(
-        &self,
-        _ctx: &super::ToolCallStartContext,
-    ) -> HookResult {
+    async fn on_tool_call_start(&self, _ctx: &super::ToolCallStartContext) -> HookResult {
         // ShellCommandHook 在此事件不做事（后续可扩展）
         HookResult::Ok
     }
@@ -858,9 +860,8 @@ impl OnToolCallStartHook for ShellCommandHook {
 mod tests {
     use super::*;
     use crate::hook::{
-        HookConfig, HookContext, HookEvent, OnErrorHook, OnModelResponseHook,
-        OnToolCallStartHook, OnTurnCompleteHook, OnTurnStartHook, PostTurnHook,
-        SystemPromptHook,
+        HookConfig, HookContext, HookEvent, OnErrorHook, OnModelResponseHook, OnToolCallStartHook,
+        OnTurnCompleteHook, OnTurnStartHook, PostTurnHook, SystemPromptHook,
     };
 
     // ── Helpers ────────────────────────────────────────────────
@@ -968,7 +969,7 @@ mod tests {
             event: HookEvent::PreToolUse,
             matcher: None,
             command: "sleep 10".to_string(),
-            timeout_ms: 1,  // 极短超时
+            timeout_ms: 1, // 极短超时
             plugin_root: None,
         };
         let hook = Arc::new(ShellCommandHook::from_hook_config(config));
@@ -1074,7 +1075,9 @@ mod tests {
         let config = HookConfig {
             event: HookEvent::UserPromptSubmit,
             matcher: None,
-            command: "echo '{\"hookSpecificOutput\": {\"additionalContext\": \"helpful context\"}}'".to_string(),
+            command:
+                "echo '{\"hookSpecificOutput\": {\"additionalContext\": \"helpful context\"}}'"
+                    .to_string(),
             timeout_ms: 10_000,
             plugin_root: None,
         };
@@ -1337,8 +1340,7 @@ mod tests {
     #[async_trait]
     impl PostTurnHook for PostTurnSpy {
         async fn on_post_turn(&self, _ctx: &HookCtx, _turn_result: &str) -> HookResult {
-            self.fired
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
             HookResult::Ok
         }
     }
@@ -1422,8 +1424,7 @@ mod tests {
     #[async_trait]
     impl OnTurnStartHook for SpyHook {
         async fn on_turn_start(&self, _ctx: &TurnStartContext) -> HookResult {
-            self.fired
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
             HookResult::Ok
         }
     }
@@ -1431,17 +1432,19 @@ mod tests {
     #[async_trait]
     impl OnTurnCompleteHook for SpyHook {
         async fn on_turn_complete(&self, _ctx: &TurnCompleteContext) -> HookResult {
-            self.fired
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
             HookResult::Ok
         }
     }
 
     #[async_trait]
     impl OnModelResponseHook for SpyHook {
-        async fn on_model_response(&self, _response: &str, _turn_ctx: &TurnStartContext) -> HookResult {
-            self.fired
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        async fn on_model_response(
+            &self,
+            _response: &str,
+            _turn_ctx: &TurnStartContext,
+        ) -> HookResult {
+            self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
             HookResult::Ok
         }
     }
@@ -1449,8 +1452,7 @@ mod tests {
     #[async_trait]
     impl OnErrorHook for SpyHook {
         async fn on_error(&self, _ctx: &ErrorContext) -> HookResult {
-            self.fired
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
             HookResult::Ok
         }
     }
@@ -1458,8 +1460,7 @@ mod tests {
     #[async_trait]
     impl OnToolCallStartHook for SpyHook {
         async fn on_tool_call_start(&self, _ctx: &ToolCallStartContext) -> HookResult {
-            self.fired
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
             HookResult::Ok
         }
     }
@@ -1562,7 +1563,9 @@ mod tests {
             fired: fired.clone(),
             name: "tool-call-start-spy",
         }));
-        engine.trigger_on_tool_call_start(&tool_call_start_ctx()).await;
+        engine
+            .trigger_on_tool_call_start(&tool_call_start_ctx())
+            .await;
         assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
     }
 
@@ -1575,7 +1578,9 @@ mod tests {
             .trigger_on_model_response("x", &turn_start_ctx())
             .await;
         engine.trigger_on_error(&error_ctx()).await;
-        engine.trigger_on_tool_call_start(&tool_call_start_ctx()).await;
+        engine
+            .trigger_on_tool_call_start(&tool_call_start_ctx())
+            .await;
     }
 
     // ── stats() ──
@@ -1584,21 +1589,17 @@ mod tests {
     async fn stats_counts_registered_hooks() {
         let mut engine = HookEngine::new();
 
-        engine.register_pre_tool_hook(Arc::new(ShellCommandHook::from_hook_config(
-            HookConfig {
-                event: HookEvent::PreToolUse,
-                matcher: None,
-                command: "echo ok".to_string(),
-                timeout_ms: 10_000,
-                plugin_root: None,
-            },
-        )));
+        engine.register_pre_tool_hook(Arc::new(ShellCommandHook::from_hook_config(HookConfig {
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            command: "echo ok".to_string(),
+            timeout_ms: 10_000,
+            plugin_root: None,
+        })));
         engine.register_post_turn_hook(Arc::new(PostTurnSpy {
             fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }));
-        engine.register_system_prompt_hook(Arc::new(PromptExtender {
-            text: "x".into(),
-        }));
+        engine.register_system_prompt_hook(Arc::new(PromptExtender { text: "x".into() }));
 
         let s = engine.stats();
         assert_eq!(s.pre_tool_hooks, 1);

@@ -149,8 +149,7 @@ fn path_in_workspace_lexical(raw: &str, workspace: &Path) -> bool {
 /// build-affecting config (`Cargo.toml`, `package.json`, `tsconfig.json`, …), whose edits a
 /// real check legitimately catches.
 const NONCODE_DOC_EXTS: &[&str] = &[
-    "md", "markdown", "mdx", "txt", "text", "rst", "adoc", "asciidoc", "org", "csv", "tsv",
-    "log",
+    "md", "markdown", "mdx", "txt", "text", "rst", "adoc", "asciidoc", "org", "csv", "tsv", "log",
 ];
 
 /// Whether an edit target is a doc/data file whose edit should not arm the verify cadence
@@ -605,12 +604,12 @@ mod tests {
         assert!(path_in_workspace_lexical("src/main.rs", ws)); // relative → joined to ws
         assert!(path_in_workspace_lexical("./a/b.rs", ws));
         assert!(path_in_workspace_lexical("/home/proj/./sub/../x.rs", ws)); // normalizes inside
-        // Outside.
+                                                                            // Outside.
         assert!(!path_in_workspace_lexical("/tmp/test.txt", ws));
         assert!(!path_in_workspace_lexical("/home/other/x.rs", ws));
         assert!(!path_in_workspace_lexical("../sibling/x.rs", ws)); // escapes via ..
         assert!(!path_in_workspace_lexical("/home/proj/../evil.rs", ws)); // climbs out
-        // Sibling-prefix must not false-match (/home/proj2 is NOT under /home/proj).
+                                                                          // Sibling-prefix must not false-match (/home/proj2 is NOT under /home/proj).
         assert!(!path_in_workspace_lexical("/home/proj2/x.rs", ws));
         // Empty / unparseable → conservative in-workspace.
         assert!(path_in_workspace_lexical("", ws));
@@ -701,11 +700,29 @@ mod tests {
 
     #[test]
     fn path_is_noncode_doc_classifies_extensions() {
-        for doc in ["report.md", "a.markdown", "notes.txt", "data.csv", "run.log", "/x/y.MD"] {
+        for doc in [
+            "report.md",
+            "a.markdown",
+            "notes.txt",
+            "data.csv",
+            "run.log",
+            "/x/y.MD",
+        ] {
             assert!(path_is_noncode_doc(doc), "{doc} should be a non-code doc");
         }
-        for code in ["main.rs", "app.ts", "x.py", "index.html", "Cargo.toml", "package.json", "noext"] {
-            assert!(!path_is_noncode_doc(code), "{code} must stay verifiable (arms cadence)");
+        for code in [
+            "main.rs",
+            "app.ts",
+            "x.py",
+            "index.html",
+            "Cargo.toml",
+            "package.json",
+            "noext",
+        ] {
+            assert!(
+                !path_is_noncode_doc(code),
+                "{code} must stay verifiable (arms cadence)"
+            );
         }
     }
 

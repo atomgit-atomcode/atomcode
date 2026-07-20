@@ -33,12 +33,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
-    ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args.into(),
+    }
 }
 
 /// Collect every AgentEvent up to (and including) the first TurnComplete.
-async fn drive_collect(handle: &mut atomcode_kernel::agent::AgentHandle, text: &str) -> Vec<AgentEvent> {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
+async fn drive_collect(
+    handle: &mut atomcode_kernel::agent::AgentHandle,
+    text: &str,
+) -> Vec<AgentEvent> {
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: text.into(),
+            images: vec![],
+        })
+        .unwrap();
     let mut events = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         let stop = matches!(ev, AgentEvent::TurnComplete { .. });
@@ -52,7 +65,13 @@ async fn drive_collect(handle: &mut atomcode_kernel::agent::AgentHandle, text: &
 
 /// Just drive a turn to completion, dropping the events.
 async fn drive_one_turn(handle: &mut atomcode_kernel::agent::AgentHandle, text: &str) {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: text.into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -61,7 +80,10 @@ async fn drive_one_turn(handle: &mut atomcode_kernel::agent::AgentHandle, text: 
 }
 
 /// Count distinct ToolResult events whose result.call_id == `id`.
-fn tool_results_for<'a>(events: &'a [AgentEvent], id: &str) -> Vec<&'a atomcode_kernel::tool::ToolResult> {
+fn tool_results_for<'a>(
+    events: &'a [AgentEvent],
+    id: &str,
+) -> Vec<&'a atomcode_kernel::tool::ToolResult> {
     events
         .iter()
         .filter_map(|e| match e {
@@ -114,8 +136,14 @@ async fn duplicate_call_id_yields_exactly_one_result() {
             StreamEvent::ToolCall(tool_call("c1", "echo", "{\"text\":\"hi\"}")),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done t1".into()), StreamEvent::Done { truncated: false }],
-        vec![StreamEvent::TextDelta("done t2".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("done t1".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("done t2".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
 
@@ -150,7 +178,11 @@ async fn duplicate_call_id_yields_exactly_one_result() {
     let _ = handle.task.await;
 
     let calls = calls.lock().unwrap();
-    assert!(calls.len() >= 2, "expected >=2 recorded requests; got {}", calls.len());
+    assert!(
+        calls.len() >= 2,
+        "expected >=2 recorded requests; got {}",
+        calls.len()
+    );
     let history = &calls[1].0;
     let c1_result_msgs = history
         .iter()
@@ -180,8 +212,14 @@ async fn same_name_args_different_id_is_not_re_executed_but_still_paired() {
             StreamEvent::ToolCall(tool_call("c2", "count", "{}")),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done t1".into()), StreamEvent::Done { truncated: false }],
-        vec![StreamEvent::TextDelta("done t2".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("done t1".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("done t2".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
 
@@ -204,16 +242,27 @@ async fn same_name_args_different_id_is_not_re_executed_but_still_paired() {
     let c1 = tool_results_for(&events, "c1");
     let c2 = tool_results_for(&events, "c2");
     assert_eq!(c1.len(), 1, "c1 must have exactly one ToolResult");
-    assert_eq!(c2.len(), 1, "c2 (the duplicate) must STILL get exactly one ToolResult (parity)");
+    assert_eq!(
+        c2.len(),
+        1,
+        "c2 (the duplicate) must STILL get exactly one ToolResult (parity)"
+    );
 
     // c1 is the real result; c2 is the duplicate stub (not re-executed).
-    assert!(c1[0].content.starts_with("count#1"), "c1 is the real first execution, got {:?}", c1[0].content);
+    assert!(
+        c1[0].content.starts_with("count#1"),
+        "c1 is the real first execution, got {:?}",
+        c1[0].content
+    );
     assert!(
         c2[0].content.contains("duplicate call"),
         "c2 must be the duplicate stub, got {:?}",
         c2[0].content
     );
-    assert!(!c2[0].is_error, "the duplicate stub is success=true (not an error)");
+    assert!(
+        !c2[0].is_error,
+        "the duplicate stub is success=true (not an error)"
+    );
 
     // Stored history: each assistant tool_call id paired with exactly one result.
     drive_one_turn(&mut handle, "again").await;
@@ -221,13 +270,23 @@ async fn same_name_args_different_id_is_not_re_executed_but_still_paired() {
     let _ = handle.task.await;
 
     let calls = calls.lock().unwrap();
-    assert!(calls.len() >= 2, "expected >=2 recorded requests; got {}", calls.len());
+    assert!(
+        calls.len() >= 2,
+        "expected >=2 recorded requests; got {}",
+        calls.len()
+    );
     let history = &calls[1].0;
     assert_each_call_has_exactly_one_result(history);
     // Concretely both ids present in history exactly once.
     for id in ["c1", "c2"] {
-        let n = history.iter().filter(|m| m.tool_call_id.as_deref() == Some(id)).count();
-        assert_eq!(n, 1, "history must carry exactly one result for {id}; got {n}");
+        let n = history
+            .iter()
+            .filter(|m| m.tool_call_id.as_deref() == Some(id))
+            .count();
+        assert_eq!(
+            n, 1,
+            "history must carry exactly one result for {id}; got {n}"
+        );
     }
 }
 
@@ -299,8 +358,14 @@ async fn distinct_calls_all_execute() {
             StreamEvent::ToolCall(tool_call("c3", "count", "{\"k\":\"v\"}")),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done t1".into()), StreamEvent::Done { truncated: false }],
-        vec![StreamEvent::TextDelta("done t2".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("done t1".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("done t2".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
 
@@ -331,7 +396,11 @@ async fn distinct_calls_all_execute() {
     }
     // The echo call ran for real.
     let c2 = tool_results_for(&events, "c2");
-    assert!(c2[0].content.starts_with("echo: "), "c2 echo must be a real result, got {:?}", c2[0].content);
+    assert!(
+        c2[0].content.starts_with("echo: "),
+        "c2 echo must be a real result, got {:?}",
+        c2[0].content
+    );
 
     drive_one_turn(&mut handle, "again").await;
     handle.commands.send(AgentCommand::Shutdown).unwrap();
@@ -360,8 +429,14 @@ async fn duplicate_id_with_following_call_leaves_no_dangling_or_duplicate() {
             StreamEvent::ToolCall(tool_call("c2", "echo", "{\"text\":\"b\"}")), // distinct
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done t1".into()), StreamEvent::Done { truncated: false }],
-        vec![StreamEvent::TextDelta("done t2".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("done t1".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("done t2".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
 
@@ -374,8 +449,16 @@ async fn duplicate_id_with_following_call_leaves_no_dangling_or_duplicate() {
     let events = drive_collect(&mut handle, "dup id then a distinct call").await;
 
     // c1 gets exactly one result (the skipped dup added none); c2 gets one.
-    assert_eq!(tool_results_for(&events, "c1").len(), 1, "c1 must have exactly one result");
-    assert_eq!(tool_results_for(&events, "c2").len(), 1, "the following distinct c2 must still run");
+    assert_eq!(
+        tool_results_for(&events, "c1").len(),
+        1,
+        "c1 must have exactly one result"
+    );
+    assert_eq!(
+        tool_results_for(&events, "c2").len(),
+        1,
+        "the following distinct c2 must still run"
+    );
 
     drive_one_turn(&mut handle, "again").await;
     handle.commands.send(AgentCommand::Shutdown).unwrap();
@@ -386,7 +469,13 @@ async fn duplicate_id_with_following_call_leaves_no_dangling_or_duplicate() {
     // No dangling AND no duplicate: each tool_call id maps to exactly one result.
     assert_each_call_has_exactly_one_result(history);
     for id in ["c1", "c2"] {
-        let n = history.iter().filter(|m| m.tool_call_id.as_deref() == Some(id)).count();
-        assert_eq!(n, 1, "history must carry exactly one result for {id}; got {n}");
+        let n = history
+            .iter()
+            .filter(|m| m.tool_call_id.as_deref() == Some(id))
+            .count();
+        assert_eq!(
+            n, 1,
+            "history must carry exactly one result for {id}; got {n}"
+        );
     }
 }

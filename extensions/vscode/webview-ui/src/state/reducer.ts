@@ -797,7 +797,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
         providers: action.providers,
         currentProvider: current?.name ?? state.currentProvider,
         currentModel: current?.model ?? state.currentModel,
-        setupRequired: state.auth?.logged_in === false || action.providers.length === 0,
+        setupRequired: state.auth?.logged_in === false || state.auth?.expired === true || action.providers.length === 0,
       };
     }
 
@@ -805,7 +805,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         auth: action.auth,
-        setupRequired: !action.auth.logged_in || state.providers.length === 0,
+        setupRequired: !action.auth.logged_in || action.auth.expired === true || state.providers.length === 0,
       };
 
     case 'SET_SETUP_STATE': {

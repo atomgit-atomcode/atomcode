@@ -64,7 +64,11 @@ impl Tool for AstGrepTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => return err(format!("ast_grep: invalid arguments: {e}. Expected {{\"pattern\":\"<pat>\"}}.")),
+            Err(e) => {
+                return err(format!(
+                    "ast_grep: invalid arguments: {e}. Expected {{\"pattern\":\"<pat>\"}}."
+                ))
+            }
         };
         if a.pattern.trim().is_empty() {
             return err("ast_grep: `pattern` must be non-empty.");
@@ -75,14 +79,22 @@ impl Tool for AstGrepTool {
             a.paths
                 .iter()
                 .filter(|p| !p.trim().is_empty())
-                .map(|p| resolve_path(p, &ctx.working_dir).to_string_lossy().to_string())
+                .map(|p| {
+                    resolve_path(p, &ctx.working_dir)
+                        .to_string_lossy()
+                        .to_string()
+                })
                 .collect()
         } else {
             vec![ctx.working_dir.to_string_lossy().to_string()]
         };
 
-        let mut argv: Vec<String> =
-            vec!["run".into(), "--pattern".into(), a.pattern.clone(), "--json=compact".into()];
+        let mut argv: Vec<String> = vec![
+            "run".into(),
+            "--pattern".into(),
+            a.pattern.clone(),
+            "--json=compact".into(),
+        ];
         if let Some(lang) = a.lang.as_deref().filter(|s| !s.trim().is_empty()) {
             argv.push("--lang".into());
             argv.push(lang.to_string());
@@ -99,7 +111,11 @@ impl Tool for AstGrepTool {
             // A pattern that fails to parse is the common case — surface ast-grep's reason.
             return err(format!(
                 "ast_grep: search failed{}",
-                if detail.is_empty() { String::new() } else { format!(": {detail}") }
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
             ));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -130,7 +146,11 @@ fn parse_ast_grep_json(stdout: &str) -> Vec<AstMatch> {
     };
     let mut out = Vec::with_capacity(arr.len());
     for m in arr {
-        let file = m.get("file").and_then(|f| f.as_str()).unwrap_or("").to_string();
+        let file = m
+            .get("file")
+            .and_then(|f| f.as_str())
+            .unwrap_or("")
+            .to_string();
         if file.is_empty() {
             continue;
         }
@@ -143,7 +163,11 @@ fn parse_ast_grep_json(stdout: &str) -> Vec<AstMatch> {
             .unwrap_or(0);
         let text = m.get("text").and_then(|t| t.as_str()).unwrap_or("");
         let first = text.lines().next().unwrap_or("").trim_end().to_string();
-        out.push(AstMatch { file, line: line0 as u32 + 1, text: first });
+        out.push(AstMatch {
+            file,
+            line: line0 as u32 + 1,
+            text: first,
+        });
     }
     out
 }
@@ -165,7 +189,10 @@ fn render_matches(matches: &[AstMatch], max: usize) -> String {
         out.push_str(&format!("  {}: {}\n", m.line, m.text));
     }
     if matches.len() > max {
-        out.push_str(&format!("\n[showing {max} of {} matches; narrow the pattern or paths]", matches.len()));
+        out.push_str(&format!(
+            "\n[showing {max} of {} matches; narrow the pattern or paths]",
+            matches.len()
+        ));
     } else {
         out.push_str(&format!("\n[{} match(es)]", matches.len()));
     }
@@ -216,7 +243,10 @@ mod tests {
         assert_eq!(m[0].file, "src/a.rs");
         assert_eq!(m[0].line, 10, "0-based 9 → 1-based 10");
         assert_eq!(m[0].text, "x.unwrap()");
-        assert_eq!(m[1].text, "y.unwrap()", "multi-line match shows first line only");
+        assert_eq!(
+            m[1].text, "y.unwrap()",
+            "multi-line match shows first line only"
+        );
         assert_eq!(m[2].line, 1);
     }
 
@@ -233,12 +263,27 @@ mod tests {
     #[test]
     fn renders_grouped_by_file() {
         let m = vec![
-            AstMatch { file: "a.rs".into(), line: 10, text: "x.unwrap()".into() },
-            AstMatch { file: "a.rs".into(), line: 20, text: "y.unwrap()".into() },
-            AstMatch { file: "b.rs".into(), line: 1, text: "z.unwrap()".into() },
+            AstMatch {
+                file: "a.rs".into(),
+                line: 10,
+                text: "x.unwrap()".into(),
+            },
+            AstMatch {
+                file: "a.rs".into(),
+                line: 20,
+                text: "y.unwrap()".into(),
+            },
+            AstMatch {
+                file: "b.rs".into(),
+                line: 1,
+                text: "z.unwrap()".into(),
+            },
         ];
         let out = render_matches(&m, 100);
-        assert!(out.contains("a.rs\n  10: x.unwrap()\n  20: y.unwrap()"), "{out}");
+        assert!(
+            out.contains("a.rs\n  10: x.unwrap()\n  20: y.unwrap()"),
+            "{out}"
+        );
         assert!(out.contains("b.rs\n  1: z.unwrap()"), "{out}");
         assert!(out.contains("[3 match(es)]"), "{out}");
     }
@@ -246,11 +291,19 @@ mod tests {
     #[test]
     fn render_caps_and_notes_truncation() {
         let m: Vec<AstMatch> = (0..150)
-            .map(|i| AstMatch { file: "a.rs".into(), line: i + 1, text: "t".into() })
+            .map(|i| AstMatch {
+                file: "a.rs".into(),
+                line: i + 1,
+                text: "t".into(),
+            })
             .collect();
         let out = render_matches(&m, 100);
         assert!(out.contains("showing 100 of 150 matches"), "{out}");
         assert!(out.contains("  100: t"), "{out}");
-        assert!(!out.contains("  101: t"), "capped: {}", &out[out.len().saturating_sub(60)..]);
+        assert!(
+            !out.contains("  101: t"),
+            "capped: {}",
+            &out[out.len().saturating_sub(60)..]
+        );
     }
 }

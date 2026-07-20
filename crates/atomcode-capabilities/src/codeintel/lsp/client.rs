@@ -44,7 +44,11 @@ pub struct LspClient {
 
 impl LspClient {
     /// Build a client over an injected transport and perform the initialize handshake.
-    pub async fn connect(reader: BoxRead, writer: BoxWrite, root_uri: String) -> Result<Self, String> {
+    pub async fn connect(
+        reader: BoxRead,
+        writer: BoxWrite,
+        root_uri: String,
+    ) -> Result<Self, String> {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let diagnostics: DiagMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -74,7 +78,9 @@ impl LspClient {
                     }
                     // server→client request (e.g. client/registerCapability): ignored.
                 }
-                if msg.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics") {
+                if msg.get("method").and_then(Value::as_str)
+                    == Some("textDocument/publishDiagnostics")
+                {
                     if let Some(params) = msg.get("params") {
                         handle_publish(params, &rd);
                     }
@@ -125,7 +131,9 @@ impl LspClient {
         // No console-window flash for the language server (mirrors core's lsp client);
         // no-op off Windows.
         crate::process_utils::suppress_console_window(&mut cmd);
-        let mut child = cmd.spawn().map_err(|e| format!("failed to spawn {}: {e}", config.command))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("failed to spawn {}: {e}", config.command))?;
         let stdout = child.stdout.take().ok_or("no stdout from LSP server")?;
         let stdin = child.stdin.take().ok_or("no stdin to LSP server")?;
         let client = Self::connect(Box::new(stdout), Box::new(stdin), root_uri).await?;
@@ -145,7 +153,8 @@ impl LspClient {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        self.write_msg(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })).await?;
+        self.write_msg(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .await?;
         match tokio::time::timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => Err(format!("LSP {method} error: {e}")),
@@ -158,11 +167,17 @@ impl LspClient {
     }
 
     async fn send_notification(&self, method: &str, params: Value) -> Result<(), String> {
-        self.write_msg(json!({ "jsonrpc": "2.0", "method": method, "params": params })).await
+        self.write_msg(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+            .await
     }
 
     /// didOpen the first time a path is synced, didChange after (full-text sync).
-    pub async fn sync_document(&self, path: &Path, content: &str, language_id: &str) -> Result<(), String> {
+    pub async fn sync_document(
+        &self,
+        path: &Path,
+        content: &str,
+        language_id: &str,
+    ) -> Result<(), String> {
         let uri = path_to_uri(path)?;
         let version = {
             let mut opened = self.opened.lock().unwrap();
@@ -193,16 +208,31 @@ impl LspClient {
     }
 
     pub fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
-        self.diagnostics.lock().unwrap().get(path).cloned().unwrap_or_default()
+        self.diagnostics
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn all_diagnostics(&self) -> Vec<Diagnostic> {
-        self.diagnostics.lock().unwrap().values().flatten().cloned().collect()
+        self.diagnostics
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
     }
 
     /// Graceful shutdown: shutdown request + exit notification, then kill the child.
     pub async fn shutdown(&self) {
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.send_request("shutdown", Value::Null)).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.send_request("shutdown", Value::Null),
+        )
+        .await;
         let _ = self.send_notification("exit", Value::Null).await;
         if let Some(mut child) = self.child.lock().unwrap().take() {
             let _ = child.start_kill();
@@ -227,7 +257,9 @@ impl Drop for LspClient {
 }
 
 fn path_to_uri(path: &Path) -> Result<String, String> {
-    url::Url::from_file_path(path).map(|u| u.to_string()).map_err(|_| format!("not an absolute path: {}", path.display()))
+    url::Url::from_file_path(path)
+        .map(|u| u.to_string())
+        .map_err(|_| format!("not an absolute path: {}", path.display()))
 }
 
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
@@ -243,7 +275,11 @@ fn handle_publish(params: &Value, diagnostics: &DiagMap) {
     let Some(path) = uri_to_path(uri) else {
         return;
     };
-    let items = params.get("diagnostics").and_then(Value::as_array).cloned().unwrap_or_default();
+    let items = params
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     if items.is_empty() {
         diagnostics.lock().unwrap().remove(&path);
         return;
@@ -259,17 +295,39 @@ fn handle_publish(params: &Value, diagnostics: &DiagMap) {
             let line = start.get("line").and_then(Value::as_u64)? as u32 + 1;
             let column = start.get("character").and_then(Value::as_u64)? as u32 + 1;
             let end = range.get("end");
-            let end_line = end.and_then(|e| e.get("line")).and_then(Value::as_u64).map(|l| l as u32 + 1);
-            let end_column = end.and_then(|e| e.get("character")).and_then(Value::as_u64).map(|c| c as u32 + 1);
-            let severity = DiagnosticSeverity::from_lsp(d.get("severity").and_then(Value::as_u64).unwrap_or(1));
-            let message = d.get("message").and_then(Value::as_str).unwrap_or_default().to_string();
+            let end_line = end
+                .and_then(|e| e.get("line"))
+                .and_then(Value::as_u64)
+                .map(|l| l as u32 + 1);
+            let end_column = end
+                .and_then(|e| e.get("character"))
+                .and_then(Value::as_u64)
+                .map(|c| c as u32 + 1);
+            let severity = DiagnosticSeverity::from_lsp(
+                d.get("severity").and_then(Value::as_u64).unwrap_or(1),
+            );
+            let message = d
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             let source = d.get("source").and_then(Value::as_str).map(String::from);
             let code = d.get("code").and_then(|c| match c {
                 Value::String(s) => Some(s.clone()),
                 Value::Number(n) => Some(n.to_string()),
                 _ => None,
             });
-            Some(Diagnostic { file: file.clone(), line, column, end_line, end_column, severity, message, source, code })
+            Some(Diagnostic {
+                file: file.clone(),
+                line,
+                column,
+                end_line,
+                end_column,
+                severity,
+                message,
+                source,
+                code,
+            })
         })
         .collect();
     if parsed.is_empty() {
@@ -300,12 +358,20 @@ mod tests {
             match method {
                 "initialize" => {
                     let id = msg.get("id").and_then(Value::as_u64).unwrap();
-                    let resp = json!({ "jsonrpc": "2.0", "id": id, "result": { "capabilities": {} } });
-                    let _ = writer.write_all(&jsonrpc::encode(&serde_json::to_vec(&resp).unwrap())).await;
+                    let resp =
+                        json!({ "jsonrpc": "2.0", "id": id, "result": { "capabilities": {} } });
+                    let _ = writer
+                        .write_all(&jsonrpc::encode(&serde_json::to_vec(&resp).unwrap()))
+                        .await;
                     let _ = writer.flush().await;
                 }
                 "textDocument/didOpen" => {
-                    let uri = msg.get("params").and_then(|p| p.get("textDocument")).and_then(|t| t.get("uri")).cloned().unwrap();
+                    let uri = msg
+                        .get("params")
+                        .and_then(|p| p.get("textDocument"))
+                        .and_then(|t| t.get("uri"))
+                        .cloned()
+                        .unwrap();
                     let note = json!({
                         "jsonrpc": "2.0",
                         "method": "textDocument/publishDiagnostics",
@@ -317,7 +383,9 @@ mod tests {
                             }]
                         }
                     });
-                    let _ = writer.write_all(&jsonrpc::encode(&serde_json::to_vec(&note).unwrap())).await;
+                    let _ = writer
+                        .write_all(&jsonrpc::encode(&serde_json::to_vec(&note).unwrap()))
+                        .await;
                     let _ = writer.flush().await;
                 }
                 _ => {}
@@ -348,8 +416,15 @@ mod tests {
         let client = LspClient::connect(Box::new(cr), Box::new(cw), "file:///proj".into())
             .await
             .expect("handshake");
-        let path = if cfg!(windows) { PathBuf::from("C:\\proj\\a.rs") } else { PathBuf::from("/proj/a.rs") };
-        client.sync_document(&path, "fn main() {\n  let x=1;\n}\n", "rust").await.expect("didOpen");
+        let path = if cfg!(windows) {
+            PathBuf::from("C:\\proj\\a.rs")
+        } else {
+            PathBuf::from("/proj/a.rs")
+        };
+        client
+            .sync_document(&path, "fn main() {\n  let x=1;\n}\n", "rust")
+            .await
+            .expect("didOpen");
 
         let diags = wait_for_diags(&client, &path).await;
         assert_eq!(diags.len(), 1, "expected one diagnostic");
@@ -364,17 +439,32 @@ mod tests {
     #[tokio::test]
     async fn empty_publish_clears_diagnostics() {
         let dm: DiagMap = Arc::new(Mutex::new(HashMap::new()));
-        let p = if cfg!(windows) { "file:///C:/x.rs" } else { "file:///x.rs" };
-        handle_publish(&json!({ "uri": p, "diagnostics": [{ "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":1}}, "severity": 2, "message": "w" }] }), &dm);
+        let p = if cfg!(windows) {
+            "file:///C:/x.rs"
+        } else {
+            "file:///x.rs"
+        };
+        handle_publish(
+            &json!({ "uri": p, "diagnostics": [{ "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":1}}, "severity": 2, "message": "w" }] }),
+            &dm,
+        );
         assert_eq!(dm.lock().unwrap().values().flatten().count(), 1);
         handle_publish(&json!({ "uri": p, "diagnostics": [] }), &dm);
-        assert_eq!(dm.lock().unwrap().values().flatten().count(), 0, "empty publish clears");
+        assert_eq!(
+            dm.lock().unwrap().values().flatten().count(),
+            0,
+            "empty publish clears"
+        );
     }
 
     #[test]
     fn malformed_diagnostics_are_dropped_not_defaulted() {
         let dm: DiagMap = Arc::new(Mutex::new(HashMap::new()));
-        let p = if cfg!(windows) { "file:///C:/y.rs" } else { "file:///y.rs" };
+        let p = if cfg!(windows) {
+            "file:///C:/y.rs"
+        } else {
+            "file:///y.rs"
+        };
         // one valid + one missing `range` → only the valid one is kept (no (1,1) ghost).
         handle_publish(
             &json!({ "uri": p, "diagnostics": [

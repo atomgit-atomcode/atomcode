@@ -189,9 +189,9 @@ impl TerminalCaps {
         // `TERMINAL_EMULATOR` string IntelliJ-platform terminals export.
         // INTENTIONALLY computed AFTER (and independent of) unicode_symbols /
         // legacy_conhost above — it must not perturb any existing decision.
-        let jediterm = env.force_jediterm.unwrap_or_else(|| {
-            env.terminal_emulator.as_deref() == Some("JetBrains-JediTerm")
-        });
+        let jediterm = env
+            .force_jediterm
+            .unwrap_or_else(|| env.terminal_emulator.as_deref() == Some("JetBrains-JediTerm"));
 
         Self {
             tty,
@@ -296,7 +296,13 @@ mod tests {
         assert!(!wt.legacy_conhost);
 
         // Non-Windows is never legacy conhost.
-        assert!(!TerminalCaps::from_env(EnvView { is_windows: false, ..env() }).legacy_conhost);
+        assert!(
+            !TerminalCaps::from_env(EnvView {
+                is_windows: false,
+                ..env()
+            })
+            .legacy_conhost
+        );
     }
 
     #[test]
@@ -445,7 +451,10 @@ mod tests {
             term_program: Some("vscode".to_string()),
             ..env()
         });
-        assert!(caps.unicode_symbols, "VS Code's integrated terminal is fine");
+        assert!(
+            caps.unicode_symbols,
+            "VS Code's integrated terminal is fine"
+        );
     }
 
     #[test]
@@ -514,7 +523,10 @@ mod tests {
         assert_eq!(base.prompt_chevron(), jt.prompt_chevron());
         // And on bare Windows the JediTerm marker still leaves the
         // legacy-console ASCII fallback exactly as it was.
-        let win = TerminalCaps::from_env(EnvView { is_windows: true, ..env() });
+        let win = TerminalCaps::from_env(EnvView {
+            is_windows: true,
+            ..env()
+        });
         let win_jt = TerminalCaps::from_env(EnvView {
             is_windows: true,
             terminal_emulator: Some("JetBrains-JediTerm".to_string()),
@@ -555,7 +567,10 @@ mod tests {
             "non-JediTerm TTY: push iff non-Windows"
         );
         // Never pushed when stdout isn't a TTY, JediTerm or not.
-        let not_tty = TerminalCaps::from_env(EnvView { is_stdout_tty: false, ..env() });
+        let not_tty = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: false,
+            ..env()
+        });
         assert!(!crate::should_enable_kitty_keyboard(&not_tty));
     }
 

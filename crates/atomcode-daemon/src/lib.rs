@@ -31,16 +31,19 @@ mod api_config;
 mod api_provider;
 pub mod approval_mode;
 mod commands;
-pub mod legacy_convert;
-mod runtime_host;
 pub(crate) mod kernel_runtime;
+pub mod legacy_convert;
+mod login_state;
+#[cfg(test)]
+mod login_state_tests;
+mod runtime_host;
 pub use kernel_runtime::{
     spawn_native_runtime_for_session_deferred, start_native_runtime,
     start_native_runtime_with_session,
 };
 pub use runtime_host::{
-    coding_plan_rate_limit_source, coding_provider_factory, installed_plugin_hook_source,
-    gather_plugin_skill_dirs,
+    coding_plan_rate_limit_source, coding_provider_factory, gather_plugin_skill_dirs,
+    installed_plugin_hook_source,
 };
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
@@ -69,17 +72,17 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use atomcode_config::config::Config;
 use atomcode_auth as auth;
+use atomcode_capabilities::session::SessionManager as NativeSessionManager;
+use atomcode_config::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::mcp::McpRegistry;
 use atomcode_core::provider;
-use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::turn::event::TurnEvent;
 use atomcode_telemetry::detect_repo_origin;
 use atomcode_telemetry::{
@@ -98,6 +101,10 @@ const CHAT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) struct ApiError {
     pub success: bool,
     pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
 }
 
 /// Sanitized config response (never exposes api_key).
@@ -131,14 +138,10 @@ pub(crate) struct ProviderInfo {
     pub ephemeral: bool,
 }
 
-/// In-flight OAuth login session stored in daemon memory.
-pub struct LoginSessionEntry {
-    pub session: atomcode_auth::LoginSession,
-    pub created_at: std::time::Instant,
-}
-
-/// Login sessions store: login_id -> LoginSessionEntry
-pub(crate) type LoginSessionsStore = Arc<RwLock<HashMap<String, LoginSessionEntry>>>;
+/// Login attempts stay addressable while a blocking poll is in flight. Per-record
+/// synchronization prevents a concurrent poll/cancel from observing false absence.
+pub(crate) type LoginSessionsStore =
+    Arc<RwLock<HashMap<String, Arc<Mutex<login_state::LoginRecord>>>>>;
 
 /// Create a structured JSON error response.
 pub(crate) fn json_error(
@@ -150,6 +153,25 @@ pub(crate) fn json_error(
         Json(ApiError {
             success: false,
             error: message.into(),
+            code: None,
+            retryable: None,
+        }),
+    )
+}
+
+pub(crate) fn coded_json_error(
+    status: StatusCode,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    retryable: bool,
+) -> (StatusCode, Json<ApiError>) {
+    (
+        status,
+        Json(ApiError {
+            success: false,
+            error: message.into(),
+            code: Some(code.into()),
+            retryable: Some(retryable),
         }),
     )
 }
@@ -337,7 +359,11 @@ pub struct AppState {
     /// Per-project MCP registry cache (keyed by working_dir)
     pub mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     /// In-flight OAuth login sessions (login_id -> entry)
-    pub login_sessions: LoginSessionsStore,
+    pub(crate) login_sessions: LoginSessionsStore,
+    /// Serializes external OAuth attempt creation with capacity accounting.
+    pub(crate) login_start_lock: Arc<Mutex<()>>,
+    /// Process-unique generation for invalidating daemon-owned operation IDs.
+    pub(crate) daemon_instance_id: Arc<str>,
     /// Shared telemetry handle (R1.4)
     pub telemetry: Arc<Telemetry>,
     /// Repo origin detected at daemon launch (R4.2)
@@ -693,16 +719,100 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
     }
 }
 
+impl MessageInfo {
+    fn from_kernel(msg: &atomcode_kernel::message::Message) -> Self {
+        use atomcode_kernel::message::Role;
+
+        let role = match msg.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+        let tool_calls = (!msg.tool_calls.is_empty()).then(|| {
+            msg.tool_calls
+                .iter()
+                .map(|call| ToolCallInfo {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    display: format_tool_args(&call.name, &call.arguments),
+                })
+                .collect()
+        });
+        let tool_result = (msg.role == Role::Tool).then(|| {
+            let first_line = msg.text.lines().next().unwrap_or("");
+            let summary = if first_line.len() > 100 {
+                format!("{}...", first_line.chars().take(97).collect::<String>())
+            } else {
+                first_line.to_string()
+            };
+            ToolResultInfo {
+                call_id: msg.tool_call_id.clone().unwrap_or_default(),
+                success: !msg.is_error,
+                summary,
+                line_count: msg.text.lines().count(),
+            }
+        });
+        let artifacts = extract_artifacts_from_call_fields(
+            msg.tool_calls
+                .iter()
+                .map(|call| (call.name.as_str(), call.arguments.as_str())),
+        );
+        let mut content = msg.text.clone();
+        let mut images = (!msg.images.is_empty()).then(|| {
+            msg.images
+                .iter()
+                .map(|image| ImageData {
+                    media_type: image.media_type.clone(),
+                    data: image.data.clone(),
+                    missing: false,
+                })
+                .collect()
+        });
+        if msg.role == Role::User {
+            let (display, had_vision_marker) = strip_vision_marker(&content);
+            if had_vision_marker {
+                content = display;
+                if images.is_none() {
+                    images = Some(vec![ImageData::missing_placeholder()]);
+                }
+            }
+        }
+        Self {
+            role: role.into(),
+            content,
+            synthetic: msg.synthetic,
+            internal_origin: msg.internal_origin.clone(),
+            tool_calls,
+            tool_result,
+            artifacts,
+            images,
+            created_at: None,
+        }
+    }
+}
+
 /// Extract artifacts from tool calls (e.g., write_file creating HTML files)
 fn extract_artifacts_from_tool_calls(
     tool_calls: &[atomcode_core::tool::ToolCall],
 ) -> Option<Vec<ArtifactInfo>> {
+    extract_artifacts_from_call_fields(
+        tool_calls
+            .iter()
+            .map(|call| (call.name.as_str(), call.arguments.as_str())),
+    )
+}
+
+fn extract_artifacts_from_call_fields<'a>(
+    tool_calls: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<Vec<ArtifactInfo>> {
     let mut artifacts = Vec::new();
 
-    for tc in tool_calls {
-        if tc.name == "create_file" || tc.name == "edit_file" {
+    for (name, arguments) in tool_calls {
+        if name == "create_file" || name == "edit_file" {
             // Parse arguments
-            let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
+            let args: serde_json::Value = match serde_json::from_str(arguments) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -749,9 +859,9 @@ fn extract_artifacts_from_tool_calls(
                 language: Some(language.to_string()),
                 content,
             });
-        } else if tc.name == "bash" {
+        } else if name == "bash" {
             // Extract artifacts from bash commands that create files
-            let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
+            let args: serde_json::Value = match serde_json::from_str(arguments) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -1087,15 +1197,10 @@ fn effective_chat_approval_mode(
 }
 /// Map a working directory to its physical session-bucket name.
 ///
-/// MUST match `atomcode_core::session::hash_path` exactly — the core session
-/// store names its `<sessions_root>/<hash>/` directories with that function,
-/// so the daemon has to delegate to it. A previous local copy hashed the
-/// normalized string via `str::hash` instead of `Path::hash`, producing a
-/// DIFFERENT hash for the same path; `/project` then reported a bucket that
-/// did not exist on disk and the webui fell back to matching sessions by the
-/// mutable `working_dir` field, which cross-contaminates projects.
+/// Delegates to the native store so API project ids and physical buckets stay
+/// byte-for-byte identical.
 pub(crate) fn hash_path(path: &std::path::Path) -> String {
-    atomcode_core::session::hash_path(path)
+    NativeSessionManager::project_hash(path)
 }
 
 fn response_project_hash(path: &std::path::Path) -> String {
@@ -1130,77 +1235,35 @@ fn is_system_temp_dir(path: &std::path::Path) -> bool {
 
 /// List all projects (scans sessions directory)
 fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
-    let sessions_root = SessionManager::sessions_root_dir();
-    let mut projects = Vec::new();
-
-    if !sessions_root.exists() {
-        return Ok(projects);
-    }
-
-    // Scan sessions directory for actual session data
-    for entry in std::fs::read_dir(sessions_root)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            let hash = path.file_name().unwrap().to_string_lossy().to_string();
-
-            // Scan sessions in this project to get working_dir and stats
-            let mut session_count = 0;
-            let mut last_updated = 0u64;
-            let mut created_at = u64::MAX;
-            let mut working_dir = PathBuf::new();
-
-            for session_file in std::fs::read_dir(&path)? {
-                let session_file = session_file?;
-                let file_path = session_file.path();
-
-                if file_path.extension().map_or(false, |ext| ext == "json") {
-                    if let Ok(json) = std::fs::read_to_string(&file_path) {
-                        if let Ok(session) = serde_json::from_str::<Session>(&json) {
-                            session_count += 1;
-                            last_updated = last_updated.max(session.updated_at);
-                            created_at = created_at.min(session.created_at);
-                            if working_dir.to_string_lossy().is_empty() {
-                                working_dir = session.working_dir;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Only include projects with at least one session and not in system temp dirs
-            if session_count > 0 {
-                // Filter out system temp directories (e.g. /tmp/.tmpXXX, C:\Windows\Temp\...)
-                if !working_dir.to_string_lossy().is_empty() && is_system_temp_dir(&working_dir) {
-                    continue;
-                }
-
-                let name = working_dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                projects.push(ProjectInfo {
-                    hash,
-                    name,
-                    working_dir,
-                    description: None,
-                    session_count,
-                    created_at: if created_at == u64::MAX {
-                        0
-                    } else {
-                        created_at
-                    },
-                    last_updated,
-                });
-            }
+    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root())?;
+    let mut by_project = std::collections::BTreeMap::<String, ProjectInfo>::new();
+    for entry in scan.entries {
+        if is_system_temp_dir(&entry.working_dir) {
+            continue;
         }
+        let created_at = u64::try_from(entry.created_at_ms.max(0)).unwrap_or(0) / 1_000;
+        let updated_at = u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000;
+        let project = by_project
+            .entry(entry.project_bucket.clone())
+            .or_insert_with(|| ProjectInfo {
+                hash: entry.project_bucket.clone(),
+                name: entry
+                    .working_dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".into()),
+                working_dir: entry.working_dir.clone(),
+                description: None,
+                session_count: 0,
+                created_at,
+                last_updated: updated_at,
+            });
+        project.session_count += 1;
+        project.created_at = project.created_at.min(created_at);
+        project.last_updated = project.last_updated.max(updated_at);
     }
-
-    // Sort by last updated (most recent first)
+    let mut projects: Vec<_> = by_project.into_values().collect();
     projects.sort_by(|a, b| b.last_updated.cmp(&a.last_updated));
-
     Ok(projects)
 }
 
@@ -1209,87 +1272,77 @@ fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
 pub struct SessionMetaWithProject {
     pub project_hash: String,
     #[serde(flatten)]
-    pub meta: SessionMeta,
+    pub meta: SessionSummary,
+}
+
+/// Daemon/API listing DTO. Its wire shape intentionally matches the retired
+/// core `SessionMeta`, but it is sourced directly from the native catalog.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub name: String,
+    pub working_dir: PathBuf,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub message_count: usize,
+    #[serde(default)]
+    pub file_size: u64,
+}
+
+fn catalog_scan_in_root(
+    root: &std::path::Path,
+) -> std::io::Result<atomcode_capabilities::session::CatalogScan> {
+    let scan = atomcode_capabilities::session::SessionManager::scan_catalog(root);
+    if let Some(diagnostic) = scan.diagnostics.first() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: {}", diagnostic.path.display(), diagnostic.message),
+        ));
+    }
+    Ok(scan)
+}
+
+fn catalog_entry_to_session_summary(
+    entry: &atomcode_capabilities::session::CatalogEntry,
+) -> SessionSummary {
+    SessionSummary {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        working_dir: entry.working_dir.clone(),
+        created_at: u64::try_from(entry.created_at_ms.max(0)).unwrap_or(0) / 1_000,
+        updated_at: u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000,
+        message_count: entry.message_count,
+        file_size: 0,
+    }
+}
+
+fn catalog_entry_with_project(
+    entry: &atomcode_capabilities::session::CatalogEntry,
+) -> SessionMetaWithProject {
+    SessionMetaWithProject {
+        project_hash: entry.project_bucket.clone(),
+        meta: catalog_entry_to_session_summary(entry),
+    }
 }
 
 /// List sessions for a project
-fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionMeta>> {
-    let project_dir = SessionManager::sessions_root_dir().join(project_hash);
-    if !project_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut sessions = Vec::new();
-
-    for entry in std::fs::read_dir(project_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.extension().map_or(false, |ext| ext == "json") {
-            let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            if let Ok(json) = std::fs::read_to_string(&path) {
-                if let Ok(session) = serde_json::from_str::<Session>(&json) {
-                    // Skip empty sessions (no messages)
-                    if session.messages.is_empty() {
-                        continue;
-                    }
-                    let mut meta = SessionMeta::from(&session);
-                    meta.file_size = file_size;
-                    sessions.push(meta);
-                }
-            }
-        }
-    }
-
-    // Sort by updated_at descending
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    Ok(sessions)
+fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionSummary>> {
+    Ok(catalog_scan_in_root(&NativeSessionManager::sessions_root())?
+        .entries
+        .iter()
+        .filter(|entry| entry.project_bucket == project_hash && entry.message_count > 0)
+        .map(catalog_entry_to_session_summary)
+        .collect())
 }
 
 /// List all sessions across all projects
 fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
-    let sessions_root = SessionManager::sessions_root_dir();
-    if !sessions_root.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut all_sessions = Vec::new();
-
-    for entry in std::fs::read_dir(sessions_root)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            let project_hash = path.file_name().unwrap().to_string_lossy().to_string();
-
-            for session_file in std::fs::read_dir(&path)? {
-                let session_file = session_file?;
-                let file_path = session_file.path();
-
-                if file_path.extension().map_or(false, |ext| ext == "json") {
-                    let file_size = session_file.metadata().map(|m| m.len()).unwrap_or(0);
-                    if let Ok(json) = std::fs::read_to_string(&file_path) {
-                        if let Ok(session) = serde_json::from_str::<Session>(&json) {
-                            // Skip empty sessions (no messages)
-                            if session.messages.is_empty() {
-                                continue;
-                            }
-                            let mut meta = SessionMeta::from(&session);
-                            meta.file_size = file_size;
-                            all_sessions.push(SessionMetaWithProject {
-                                project_hash: project_hash.clone(),
-                                meta,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Sort by updated_at descending
-    all_sessions.sort_by(|a, b| b.meta.updated_at.cmp(&a.meta.updated_at));
-    // Limit to first 50 sessions
+    let mut all_sessions: Vec<_> = catalog_scan_in_root(&NativeSessionManager::sessions_root())?
+        .entries
+        .iter()
+        .filter(|entry| entry.message_count > 0)
+        .map(catalog_entry_with_project)
+        .collect();
     all_sessions.truncate(50);
     Ok(all_sessions)
 }
@@ -1307,83 +1360,17 @@ fn resolve_session_in_root(
     sessions_root: &std::path::Path,
     id_prefix: &str,
 ) -> std::io::Result<Option<SessionMetaWithProject>> {
-    if id_prefix.is_empty() || !sessions_root.exists() {
+    if id_prefix.is_empty() {
         return Ok(None);
     }
-
-    let read_meta = |bucket: &str, path: &std::path::Path| -> Option<SessionMetaWithProject> {
-        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let json = std::fs::read_to_string(path).ok()?;
-        let session = serde_json::from_str::<Session>(&json).ok()?;
-        let mut meta = SessionMeta::from(&session);
-        meta.file_size = file_size;
-        Some(SessionMetaWithProject {
-            project_hash: bucket.to_string(),
-            meta,
-        })
-    };
-
-    let mut best: Option<SessionMetaWithProject> = None;
-    for entry in std::fs::read_dir(sessions_root)? {
-        let entry = entry?;
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let bucket = dir.file_name().unwrap().to_string_lossy().to_string();
-        for f in std::fs::read_dir(&dir)? {
-            let f = f?;
-            let path = f.path();
-            if path.extension().map_or(false, |e| e == "json") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if stem == id_prefix {
-                        // Exact id wins immediately.
-                        if let Some(m) = read_meta(&bucket, &path) {
-                            return Ok(Some(m));
-                        }
-                    } else if stem.starts_with(id_prefix) {
-                        if let Some(m) = read_meta(&bucket, &path) {
-                            let newer = best
-                                .as_ref()
-                                .map_or(true, |b| m.meta.updated_at > b.meta.updated_at);
-                            if newer {
-                                best = Some(m);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(best)
+    catalog_scan_in_root(sessions_root)?
+        .find(id_prefix)
+        .map(|entry| entry.as_ref().map(catalog_entry_with_project))
+        .map_err(std::io::Error::from)
 }
 
 fn resolve_session_by_id(id_prefix: &str) -> std::io::Result<Option<SessionMetaWithProject>> {
-    resolve_session_in_root(&SessionManager::sessions_root_dir(), id_prefix)
-}
-
-/// Load a specific session
-pub(crate) fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session> {
-    let path = SessionManager::sessions_root_dir()
-        .join(project_hash)
-        .join(format!("{}.json", session_id));
-
-    let json = std::fs::read_to_string(path)?;
-    serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-}
-
-/// Save a session to a specific project-hash bucket (symmetric with `load_session`).
-/// Ensures undo/compact write back to the exact file they loaded from.
-pub(crate) fn save_session_to_hash(
-    project_hash: &str,
-    session: &atomcode_core::session::Session,
-) -> std::io::Result<()> {
-    let dir = SessionManager::sessions_root_dir().join(project_hash);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", session.id.as_str()));
-    let json = serde_json::to_string_pretty(session)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&path, json)
+    resolve_session_in_root(&NativeSessionManager::sessions_root(), id_prefix)
 }
 
 // ============== HTTP Handlers ==============
@@ -1395,6 +1382,8 @@ pub struct HealthResponse {
     pub version: &'static str,
     pub service: &'static str,
     pub binary_hash: &'static str,
+    pub instance_id: String,
+    pub capabilities: &'static [&'static str],
 }
 
 fn executable_sha256() -> &'static str {
@@ -1410,12 +1399,14 @@ fn executable_sha256() -> &'static str {
 }
 
 /// GET /health - Health check endpoint
-async fn health() -> impl IntoResponse {
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         service: "atomcode-daemon",
         binary_hash: executable_sha256(),
+        instance_id: state.daemon_instance_id.to_string(),
+        capabilities: &["auth.login.v2"],
     })
 }
 
@@ -1649,9 +1640,7 @@ async fn change_dir(
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            crate::live_api::live_switch_session(atomcode_core::session::SessionId::from_string(
-                sid.to_string(),
-            ));
+            crate::live_api::live_switch_session(sid.to_string());
         }
 
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
@@ -1728,31 +1717,27 @@ async fn get_sessions_by_working_dir(
 
 /// GET /projects/:hash/sessions/:id - Get session detail
 async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
-    match load_session(&hash, &id) {
-        Ok(session) => {
-            let messages = merge_session_messages_for_display(&session);
-            // bot review P2: 统一时间单位为毫秒。kernel Session.created_at/updated_at 为 epoch seconds,
-            // 此处 API 响应边界乘 1000 转毫秒,与 MessageInfo.created_at 单位一致,前端无需启发式兼容。
-            // bot review P3: checked_mul 在 epoch 秒值上永不溢出 (u64 上限约 5.8e8 年),
-            // unwrap_or 的 fallback 与主路径同溢出行为,仅作为防御性兜底保留;真溢出时 fallback 也是错的,
-            // 但该场景物理不可能,故不 panic。
+    match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
+        Ok(Some(session)) => {
+            let messages = match merge_catalog_session_messages_for_display(&session) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    let msg = format!("Failed to load session: {error}");
+                    return (StatusCode::NOT_FOUND, Json(msg)).into_response();
+                }
+            };
             let detail = SessionDetail {
-                id: session.id.to_string(),
-                name: session.name,
-                working_dir: session.working_dir,
-                created_at: session
-                    .created_at
-                    .checked_mul(1000)
-                    .unwrap_or(session.created_at * 1000),
-                updated_at: session
-                    .updated_at
-                    .checked_mul(1000)
-                    .unwrap_or(session.updated_at * 1000),
+                id: session.meta.id,
+                name: session.meta.name,
+                working_dir: PathBuf::from(session.meta.working_dir),
+                created_at: u64::try_from(session.meta.created_at.max(0)).unwrap_or(0),
+                updated_at: u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0),
                 message_count: messages.len(),
                 messages,
             };
             Json(detail).into_response()
         }
+        Ok(None) => (StatusCode::NOT_FOUND, Json("Session not found")).into_response(),
         Err(e) => {
             let msg = format!("Failed to load session: {}", e);
             (StatusCode::NOT_FOUND, Json(msg)).into_response()
@@ -1760,58 +1745,84 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
     }
 }
 
-fn merge_session_messages_for_display(
-    session: &atomcode_core::session::Session,
-) -> Vec<MessageInfo> {
-    let mut messages = Vec::with_capacity(session.messages.len() + session.display_messages.len());
+fn merge_catalog_session_messages_for_display(
+    session: &crate::legacy_convert::CatalogSessionView,
+) -> anyhow::Result<Vec<MessageInfo>> {
+    use atomcode_capabilities::session::{DisplayAnchor, PresentationRole};
 
-    // PR #562: stamp every replayed message with the session's last-update time so
-    // the webui can show a send-time label even for history the kernel stored without
-    // a per-message clock. Kernel stores `updated_at` in epoch SECONDS; the webui
-    // works in ms, so multiply here once. Live/snapshot turns inject `Date.now()`
-    // client-side and never read this field.
-    // bot review P3: session.updated_at 在 kernel 中恒有值 (Session::new 时 Instant::now()),
-    // checked_mul(1000) 在 epoch 秒上永不溢出,故 session_ts_ms 恒为 Some;
-    // 下文 info.created_at = session_ts_ms 对所有历史消息统一赋值,不会静默丢失。
-    let session_ts_ms = session.updated_at.checked_mul(1000);
-
-    for display in session
-        .display_messages
+    let runtime_messages: Vec<_> = session
+        .snapshot
+        .messages
         .iter()
-        .filter(|d| d.after_message == 0)
-    {
-        let mut info = MessageInfo::from(&display.message);
-        info.created_at = session_ts_ms;
-        messages.push(info);
+        .filter(|message| {
+            message.internal_origin.as_deref()
+                != Some(atomcode_core::conversation::LEGACY_COLD_SUMMARY_ORIGIN)
+        })
+        .collect();
+    let mut presentation = std::collections::BTreeMap::<usize, Vec<_>>::new();
+    for entry in &session.presentation.entries {
+        let after_message = match entry.anchor {
+            DisplayAnchor::AtStart => 0,
+            DisplayAnchor::AfterTurn { turn_id } => session
+                .meta
+                .turn_stats
+                .iter()
+                .find(|stat| stat.turn_id == turn_id)
+                .map(|stat| stat.after_message)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("presentation references missing turn id {turn_id}")
+                })?,
+        };
+        presentation.entry(after_message).or_default().push(entry);
     }
-
-    for (idx, msg) in session.messages.iter().enumerate() {
-        let after_message = idx + 1;
-        let mut info = MessageInfo::from(msg);
-        info.created_at = session_ts_ms;
+    let timestamp = Some(u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0));
+    let mut messages = Vec::with_capacity(runtime_messages.len() + session.presentation.entries.len());
+    let mut append_presentation = |position: usize, messages: &mut Vec<MessageInfo>| {
+        for entry in presentation.remove(&position).unwrap_or_default() {
+            messages.push(MessageInfo {
+                role: match entry.role {
+                    PresentationRole::User => "user",
+                    PresentationRole::Assistant => "assistant",
+                }
+                .into(),
+                content: entry.text.clone(),
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: timestamp,
+            });
+        }
+    };
+    append_presentation(0, &mut messages);
+    for (index, message) in runtime_messages.into_iter().enumerate() {
+        let mut info = MessageInfo::from_kernel(message);
+        info.created_at = timestamp;
         messages.push(info);
-        for display in session
-            .display_messages
-            .iter()
-            .filter(|d| d.after_message == after_message)
-        {
-            let mut info = MessageInfo::from(&display.message);
-            info.created_at = session_ts_ms;
-            messages.push(info);
+        append_presentation(index + 1, &mut messages);
+    }
+    for (_, entries) in presentation {
+        for entry in entries {
+            messages.push(MessageInfo {
+                role: match entry.role {
+                    PresentationRole::User => "user",
+                    PresentationRole::Assistant => "assistant",
+                }
+                .into(),
+                content: entry.text.clone(),
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: timestamp,
+            });
         }
     }
-
-    for display in session
-        .display_messages
-        .iter()
-        .filter(|d| d.after_message > session.messages.len())
-    {
-        let mut info = MessageInfo::from(&display.message);
-        info.created_at = session_ts_ms;
-        messages.push(info);
-    }
-
-    messages
+    Ok(messages)
 }
 
 /// GET /sessions - List all sessions across all projects
@@ -1853,38 +1864,48 @@ async fn create_session(
         }
     }
 
-    // Create session manager
-    let manager = SessionManager::new(&working_dir);
-
-    // Create new session
-    let mut session = Session::new(working_dir.clone());
-
-    // Set title if provided
+    let id = uuid::Uuid::new_v4().to_string();
+    let manager = atomcode_capabilities::session::SessionManager::for_project(&working_dir);
+    let lease = match manager.acquire_lease(&id) {
+        Ok(lease) => lease,
+        Err(error) => {
+            let msg = format!("Failed to create session: {error}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
+        }
+    };
+    let now = atomcode_capabilities::session::now_ms();
+    let mut meta =
+        atomcode_capabilities::session::SessionMeta::new(&id, working_dir.to_string_lossy(), now);
+    meta.owner = atomcode_capabilities::session::StorageOwner::Native;
     if let Some(title) = req.title {
-        session.rename(title);
+        meta.name = title;
+        meta.user_renamed = true;
     }
-
-    // Save session
-    if let Err(e) = manager.save(&session) {
+    let snapshot = atomcode_kernel::message::SessionSnapshot::new(Vec::new());
+    let presentation = atomcode_capabilities::session::PresentationFile::default();
+    if let Err(e) =
+        manager.commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+    {
         let msg = format!("Failed to save session: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
     }
+    drop(lease);
 
     let project_hash = response_project_hash(&working_dir);
 
     let response = CreateSessionResponse {
-        id: session.id.to_string(),
-        name: session.name.clone(),
-        working_dir: session.working_dir.clone(),
+        id: id.clone(),
+        name: meta.name.clone(),
+        working_dir: working_dir.clone(),
         project_hash,
-        created_at: session.created_at,
+        created_at: u64::try_from(meta.created_at.max(0)).unwrap_or(0) / 1_000,
     };
 
     // Broadcast new session creation to other views (sync-mode TUI / other webui tabs)
     // so they follow: create new session with the same ID. Only when the caller has
     // sync enabled — sync-off webui新建对话不应牵连 TUI 新建（issue #850）。
     if req.sync {
-        crate::live_api::live_switch_session(session.id.clone());
+        crate::live_api::live_switch_session(id);
     }
 
     (StatusCode::CREATED, Json(response)).into_response()
@@ -1904,46 +1925,36 @@ async fn append_session_messages(
         }
     };
 
-    let manager = SessionManager::new(&working_dir);
-    let session_id_obj = SessionId::from_string(session_id.clone());
-    let mut session = match manager.load(&session_id_obj) {
-        Ok(session) => session,
-        Err(e) => {
-            let msg = format!("Session not found: {} ({})", session_id, e);
-            return (StatusCode::NOT_FOUND, Json(msg)).into_response();
-        }
-    };
-
-    let after_message = session.messages.len();
+    let mut messages = Vec::with_capacity(req.messages.len());
     for msg in req.messages {
         let role = match msg.role.to_ascii_lowercase().as_str() {
-            "user" => atomcode_core::conversation::message::Role::User,
-            "assistant" => atomcode_core::conversation::message::Role::Assistant,
+            "user" => atomcode_capabilities::session::PresentationRole::User,
+            "assistant" => atomcode_capabilities::session::PresentationRole::Assistant,
             _ => {
                 let err = format!("Unsupported message role: {}", msg.role);
                 return (StatusCode::BAD_REQUEST, Json(err)).into_response();
             }
         };
-        session
-            .display_messages
-            .push(atomcode_core::session::DisplayMessage {
-                after_message,
-                message: atomcode_core::conversation::message::Message::new(role, msg.content),
-            });
-    }
-
-    session.touch();
-    if let Err(e) = manager.save(&session) {
-        let msg = format!("Failed to save session: {}", e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
+        messages.push((role, msg.content));
     }
 
     let project_hash = response_project_hash(&working_dir);
+    let message_count = match crate::legacy_convert::append_catalog_presentation_in_project(
+        &project_hash,
+        &session_id,
+        &messages,
+    ) {
+        Ok(count) => count,
+        Err(error) => {
+            let msg = format!("Failed to save session: {error}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
+        }
+    };
 
     let response = AppendSessionMessagesResponse {
         success: true,
-        session_id: session.id.to_string(),
-        message_count: session.messages.len() + session.display_messages.len(),
+        session_id,
+        message_count,
         project_hash,
     };
 
@@ -1952,66 +1963,22 @@ async fn append_session_messages(
 
 /// Search sessions by name across all projects
 fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWithProject>> {
-    let sessions_root = SessionManager::sessions_root_dir();
-    if !sessions_root.exists() {
-        return Ok(Vec::new());
-    }
-
     let keyword_lower = keyword.to_lowercase();
-    let mut results = Vec::new();
-
-    for entry in std::fs::read_dir(sessions_root)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            let project_hash = path.file_name().unwrap().to_string_lossy().to_string();
-
-            for session_file in std::fs::read_dir(&path)? {
-                let session_file = session_file?;
-                let file_path = session_file.path();
-
-                if file_path.extension().map_or(false, |ext| ext == "json") {
-                    let file_size = session_file.metadata().map(|m| m.len()).unwrap_or(0);
-                    if let Ok(json) = std::fs::read_to_string(&file_path) {
-                        if let Ok(session) = serde_json::from_str::<Session>(&json) {
-                            // Skip empty sessions
-                            if session.messages.is_empty() {
-                                continue;
-                            }
-                            // Match on name / working dir (substring) or id (prefix),
-                            // mirroring the webui's previous client-side filter so
-                            // moving search server-side does not drop the ability to
-                            // find a session by its directory or (short) id.
-                            let matches = session.name.to_lowercase().contains(&keyword_lower)
-                                || session
-                                    .working_dir
-                                    .to_string_lossy()
-                                    .to_lowercase()
-                                    .contains(&keyword_lower)
-                                || session
-                                    .id
-                                    .as_str()
-                                    .to_lowercase()
-                                    .starts_with(&keyword_lower);
-                            if matches {
-                                let mut meta = SessionMeta::from(&session);
-                                meta.file_size = file_size;
-                                results.push(SessionMetaWithProject {
-                                    project_hash: project_hash.clone(),
-                                    meta,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Sort by updated_at descending
-    results.sort_by(|a, b| b.meta.updated_at.cmp(&a.meta.updated_at));
-    Ok(results)
+    Ok(catalog_scan_in_root(&NativeSessionManager::sessions_root())?
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.message_count > 0
+                && (entry.name.to_lowercase().contains(&keyword_lower)
+                    || entry
+                        .working_dir
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&keyword_lower)
+                    || entry.id.to_lowercase().starts_with(&keyword_lower))
+        })
+        .map(catalog_entry_with_project)
+        .collect())
 }
 
 /// GET /sessions/search?q=keyword - Search sessions by name
@@ -2035,18 +2002,8 @@ async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse 
 
 /// Delete a session file
 fn delete_session_file(project_hash: &str, session_id: &str) -> std::io::Result<()> {
-    let path = SessionManager::sessions_root_dir()
-        .join(project_hash)
-        .join(format!("{}.json", session_id));
-
-    if !path.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Session not found: {}/{}", project_hash, session_id),
-        ));
-    }
-
-    std::fs::remove_file(path)
+    crate::legacy_convert::delete_catalog_session_in_project(project_hash, session_id)
+        .map_err(std::io::Error::other)
 }
 
 /// DELETE /projects/:hash/sessions/:id - Delete a session
@@ -2090,26 +2047,9 @@ fn rename_session_file(
     session_id: &str,
     new_name: &str,
 ) -> std::io::Result<()> {
-    let path = SessionManager::sessions_root_dir()
-        .join(project_hash)
-        .join(format!("{}.json", session_id));
-
-    if !path.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Session not found: {}/{}", project_hash, session_id),
-        ));
-    }
-
-    // Load, rename, and save
-    let json = std::fs::read_to_string(&path)?;
-    let mut session: Session = serde_json::from_str(&json)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-    session.rename(new_name.to_string());
-
-    let manager = SessionManager::new(&PathBuf::from(&session.working_dir));
-    manager.save(&session)
+    crate::legacy_convert::rename_catalog_session_in_project(project_hash, session_id, new_name)
+        .map(|_| ())
+        .map_err(std::io::Error::other)
 }
 
 /// PATCH /projects/:hash/sessions/:id/rename - Rename a session
@@ -2802,39 +2742,33 @@ async fn process_chat_request(
         .working_dir
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    // Create session manager for this working directory
-    let session_manager = SessionManager::new(&working_dir);
-
-    // Load or create session
-    // Load or create session
-    let mut session = if let Some(ref session_id_str) = req.session_id {
-        // Try to load existing session
-        let session_id = SessionId::from_string(session_id_str.clone());
-        match session_manager.load(&session_id) {
-            Ok(session) => session,
-            Err(_) => {
-                // Session not found, create new one
-                Session::new(working_dir.clone())
-            }
-        }
+    let (session_id, initial_snapshot) = if let Some(ref session_id_str) = req.session_id {
+        let session = crate::legacy_convert::find_catalog_session_view(session_id_str)?
+            .ok_or_else(|| anyhow::anyhow!("session {session_id_str:?} not found"))?;
+        (
+            session.meta.id,
+            crate::legacy_convert::snapshot_to_core(&session.snapshot),
+        )
     } else {
-        // Create new session
-        Session::new(working_dir.clone())
+        (uuid::Uuid::new_v4().to_string(), Default::default())
     };
 
     // Bind the persisted conversation id to the one-off active provider used by the
     // VL preprocessor, preserving the same gateway affinity as the main chat turn.
-    active_provider.set_session_id(session.id.as_str());
+    active_provider.set_session_id(&session_id);
 
     // Key used to route interactive permission decisions back to this turn's
     // decider. We use the *actual* session id (not req.session_id, which may be
     // empty for brand-new chats and would collide across concurrent new
     // sessions). Both the responder registration AND the emitted
     // `permission_request` SSE event use this same key.
-    let perm_session_key = session.id.to_string();
+    let perm_session_key = session_id.clone();
 
-    // Create conversation from session messages
-    let conversation = Arc::new(tokio::sync::Mutex::new(session.to_conversation()));
+    // The core conversation is retained only as the current live transport adapter;
+    // persisted history was loaded from the native/kernel session view above.
+    let conversation = Arc::new(tokio::sync::Mutex::new(Conversation::from_snapshot(
+        initial_snapshot,
+    )));
     // Keep the original images in the persisted/display conversation, but preprocess the
     // runtime caption first when the active model is text-only. `run_chat_turn_v2` detects
     // the marker and omits the already-described image bytes from the kernel input.
@@ -2897,18 +2831,19 @@ async fn process_chat_request(
         // conversation should still be resumable via /resume.
         {
             let conv = conversation.lock().await;
-            session.update_from_conversation(&conv);
-            session.auto_name_from_messages();
-            session.touch();
-            if let Err(e) = session_manager.save(&session) {
-                eprintln!("Warning: Failed to save session after early stop: {}", e);
+            if let Err(e) = crate::legacy_convert::persist_pre_runtime_terminal(
+                &working_dir,
+                &session_id,
+                &conv.snapshot(),
+            ) {
+                eprintln!("Warning: Failed to save native session after early stop: {e}");
             }
         }
         let _ = event_tx.send(ChatEvent::Stopped);
         let _ = event_tx.send(ChatEvent::Done {
             tokens: 0,
             tool_calls: 0,
-            session_id: session.id.to_string(),
+            session_id: session_id.clone(),
         });
         // Turn never ran — the turn task (which registers the responder) never
         // spawned, so this is a defensive no-op cleanup for interactive Build mode.
@@ -2941,9 +2876,11 @@ async fn process_chat_request(
         };
         let conv = conversation.clone();
         let cancel = cancel_token.clone();
+        let runtime_session_id = perm_session_key.clone();
         tokio::spawn(async move {
             CurrentContext::scope(tel_ctx, || async move {
                 live_api::run_chat_turn_v2(
+                    runtime_session_id,
                     conv,
                     turn_tx,
                     cancel,
@@ -3165,13 +3102,9 @@ async fn process_chat_request(
             &req.message,
             &submitted_images,
         );
-        session.update_from_conversation(&conv);
     }
-    session.auto_name_from_messages();
-    session.touch();
-    if let Err(e) = session_manager.save(&session) {
-        eprintln!("Warning: Failed to save session: {}", e);
-    }
+    // The native SnapshotHook owns terminal persistence. The core projection above
+    // exists only to shape the HTTP response and must never be written back.
 
     // Clean up stopped sessions marker if present
     if was_stopped {
@@ -3183,7 +3116,7 @@ async fn process_chat_request(
     let _ = event_tx.send(ChatEvent::Done {
         tokens: total_tokens,
         tool_calls: tool_call_count,
-        session_id: session.id.to_string(),
+        session_id,
     });
     // Turn finished (the forwarding loop above exits when turn_rx closes, i.e.
     // when the turn task and its turn_tx are dropped). Drop the permission
@@ -3550,7 +3483,11 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
             error,
         });
     }
-    Json(McpStatusResponse { servers, trusted, blocked })
+    Json(McpStatusResponse {
+        servers,
+        trusted,
+        blocked,
+    })
 }
 
 async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -4476,6 +4413,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
         mcp_cache: Arc::new(RwLock::new(HashMap::new())),
         login_sessions: Arc::new(RwLock::new(HashMap::new())),
+        login_start_lock: Arc::new(Mutex::new(())),
+        daemon_instance_id: Arc::from(uuid::Uuid::new_v4().to_string()),
         telemetry: telemetry.clone(),
         repo_origin: repo_origin.clone(),
         shutdown_tx: shutdown_tx.clone(),
@@ -4979,12 +4918,12 @@ mod tests {
         assert!(matches!(merged[0].1, ServerStatus::Connected));
     }
 
-    // 回归：daemon 解析工作目录→物理会话桶名的 hash 必须与 core 会话存储命名目录
+    // 回归：daemon 解析工作目录→物理会话桶名的 hash 必须与 native 会话存储命名目录
     // 用的 hash 完全一致。曾经 daemon 自持一份用 `str::hash`（而非 `Path::hash`）的
     // 拷贝，对同一路径算出不同 hash → `/project` 指向磁盘上不存在的桶 → webui 退化成
     // 按可变的 `working_dir` 字段匹配会话，导致跨项目串台。
     #[test]
-    fn daemon_hash_path_matches_core_session_bucket_naming() {
+    fn daemon_hash_path_matches_shared_project_bucket_naming() {
         for p in [
             "/Users/theo/Documents/workspace/atomcode",
             "/Users/theo/Desktop",
@@ -4994,8 +4933,8 @@ mod tests {
             let path = std::path::Path::new(p);
             assert_eq!(
                 hash_path(path),
-                atomcode_core::session::hash_path(path),
-                "daemon hash for {p:?} diverged from core session bucket naming"
+                atomcode_config::util::stable_project_hash(path),
+                "daemon hash for {p:?} diverged from the shared bucket naming"
             );
         }
     }
@@ -5017,33 +4956,53 @@ mod tests {
     fn resolve_session_by_short_and_full_id_across_buckets() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let mk = |bucket: &str, wd: &str| -> atomcode_core::session::Session {
-            std::fs::create_dir_all(root.join(bucket)).unwrap();
-            let s = atomcode_core::session::Session::new(std::path::PathBuf::from(wd));
-            std::fs::write(
-                root.join(bucket).join(format!("{}.json", s.id.as_str())),
-                serde_json::to_string(&s).unwrap(),
-            )
-            .unwrap();
-            s
+        let mk = |bucket: &str, wd: &str, id: &str| {
+            use atomcode_capabilities::session::{
+                PresentationFile, SessionManager, SessionMeta, StorageOwner,
+            };
+            let manager = SessionManager::with_root(root.join(bucket));
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+                atomcode_kernel::message::Message::user("fixture"),
+            ]);
+            let mut meta = SessionMeta::new(id, wd, 1);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+            id.to_string()
         };
         // A decoy in a different bucket + the real target.
-        let _decoy = mk("bucket_decoy_0000", "/proj/decoy");
-        let target = mk("bucket_target_111", "/proj/target");
+        let _decoy = mk(
+            "0000000000000000",
+            "/proj/decoy",
+            "00000000-0000-4000-8000-000000000000",
+        );
+        let target = mk(
+            "1111111111111111",
+            "/proj/target",
+            "11111111-1111-4111-8111-111111111111",
+        );
 
         // Short prefix resolves to the target and reports its physical bucket.
-        let short = &target.id.as_str()[..8];
+        let short = &target[..8];
         let found = resolve_session_in_root(root, short)
             .unwrap()
             .expect("short id should resolve");
-        assert_eq!(found.project_hash, "bucket_target_111");
-        assert_eq!(found.meta.id.as_str(), target.id.as_str());
+        assert_eq!(found.project_hash, "1111111111111111");
+        assert_eq!(found.meta.id, target);
 
         // Full id resolves exactly.
-        let found_full = resolve_session_in_root(root, target.id.as_str())
+        let found_full = resolve_session_in_root(root, &target)
             .unwrap()
             .expect("full id should resolve");
-        assert_eq!(found_full.meta.id.as_str(), target.id.as_str());
+        assert_eq!(found_full.meta.id, target);
 
         // Unknown id → None.
         assert!(resolve_session_in_root(root, "zzzzzzzz").unwrap().is_none());

@@ -11,7 +11,6 @@
 // daemon will attempt to re-attach to the parent console for stderr output.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use atomcode_core::session::SessionManager;
 use atomcode_daemon::{run_server, ServerOpts};
 use atomcode_telemetry::{CliOverride, SessionMode};
 
@@ -150,7 +149,9 @@ async fn main() {
 
     // Ensure legacy sessions (macOS pre-v4.16 ~/Library/Application Support/atomcode/sessions)
     // are migrated to the canonical location ($ATOMCODE_HOME/sessions) before any handler reads it.
-    SessionManager::migrate_from_legacy();
+    if let Err(error) = atomcode_capabilities::session::SessionManager::migrate_from_legacy() {
+        tracing::warn!("[session] Failed to migrate legacy sessions: {error}");
+    }
 
     let (host, port, cli_override, idle_timeout_secs, startup_mode) = parse_daemon_args();
 

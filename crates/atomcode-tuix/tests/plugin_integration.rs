@@ -74,7 +74,12 @@ fn add_install_reload_flow() {
 
     let url = format!("file://{}", repo.display());
     atomcode_core::plugin::marketplace::add_marketplace(&url).unwrap();
-    atomcode_core::plugin::installer::install("e2e", "e2e", atomcode_core::plugin::InstallScope::User).unwrap();
+    atomcode_core::plugin::installer::install(
+        "e2e",
+        "e2e",
+        atomcode_core::plugin::InstallScope::User,
+    )
+    .unwrap();
 
     // Verify SkillRegistry sees `e2e:sk`.
     let working = tempfile::tempdir().unwrap();

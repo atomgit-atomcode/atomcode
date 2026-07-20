@@ -100,13 +100,6 @@ pub(crate) fn save_config(config: &Config) -> Result<(), String> {
         .map_err(|e| format!("Failed to save config: {:#}", e))
 }
 
-/// Clean up expired login sessions (TTL: 10 minutes).
-pub(crate) async fn cleanup_expired_sessions(login_sessions: &crate::LoginSessionsStore) {
-    let mut sessions = login_sessions.write().await;
-    let now = std::time::Instant::now();
-    sessions.retain(|_, entry| now.duration_since(entry.created_at).as_secs() < 600);
-}
-
 // ============================================================================
 // Handlers
 // ============================================================================

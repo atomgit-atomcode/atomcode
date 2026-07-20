@@ -43,7 +43,10 @@ mod tests {
 
     #[test]
     fn multi_line_each_line_indented() {
-        assert_eq!(highlight_block("let x = 1;\nlet y = 2;"), "  let x = 1;\n  let y = 2;");
+        assert_eq!(
+            highlight_block("let x = 1;\nlet y = 2;"),
+            "  let x = 1;\n  let y = 2;"
+        );
     }
 
     #[test]
@@ -66,9 +69,15 @@ mod tests {
         // emits zero ANSI under the new contract.
         let src = "fn main() { let x = 1; }\n// a comment\nlet s = \"hi\";";
         let out = highlight_block(src);
-        assert!(!out.contains('\x1b'), "expected zero ANSI bytes, got: {out:?}");
+        assert!(
+            !out.contains('\x1b'),
+            "expected zero ANSI bytes, got: {out:?}"
+        );
         for (i, line) in out.split('\n').enumerate() {
-            assert!(line.starts_with("  "), "line {i} missing 2-space indent: {line:?}");
+            assert!(
+                line.starts_with("  "),
+                "line {i} missing 2-space indent: {line:?}"
+            );
         }
     }
 }

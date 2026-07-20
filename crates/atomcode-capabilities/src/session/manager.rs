@@ -4,7 +4,7 @@
 //! The hooks (snapshot / transcript) and the recall tool call into this; the manager
 //! itself does only file IO, so it is fully unit-testable with a temp root.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::{Barrier, Mutex};
 
 use atomcode_kernel::message::{SessionSnapshot, SNAPSHOT_VERSION};
-use serde::{Deserialize, Serialize};
+use serde::{de::IgnoredAny, Deserialize, Serialize};
 
 use super::presentation::{PresentationEntry, PresentationFile, MAX_PRESENTATION_BYTES};
 
@@ -29,6 +29,7 @@ pub const META_VERSION: u32 = 1;
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_LEGACY_SESSION_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_JSONL_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_JSONL_LINES: usize = 1_000_000;
@@ -51,6 +52,20 @@ pub enum SessionStoreError {
     SessionInUse {
         id: String,
         path: PathBuf,
+    },
+    AmbiguousId {
+        query: String,
+        matches: Vec<CatalogLocation>,
+    },
+    LeaseMismatch {
+        id: String,
+        expected: PathBuf,
+        actual: PathBuf,
+    },
+    OwnershipConflict {
+        id: String,
+        owner: StorageOwner,
+        operation: &'static str,
     },
     TooLarge {
         kind: &'static str,
@@ -82,6 +97,8 @@ impl SessionStoreError {
             Self::InvalidId { .. } => io::ErrorKind::InvalidInput,
             Self::NotFound { .. } => io::ErrorKind::NotFound,
             Self::SessionInUse { .. } => io::ErrorKind::WouldBlock,
+            Self::AmbiguousId { .. } | Self::LeaseMismatch { .. } => io::ErrorKind::InvalidInput,
+            Self::OwnershipConflict { .. } => io::ErrorKind::PermissionDenied,
             Self::TooLarge { .. }
             | Self::FutureSchema { .. }
             | Self::Corrupt { .. }
@@ -99,6 +116,29 @@ impl fmt::Display for SessionStoreError {
             Self::SessionInUse { id, .. } => {
                 write!(f, "session {id:?} is already in use by another runtime")
             }
+            Self::AmbiguousId { query, matches } => write!(
+                f,
+                "session query {query:?} is ambiguous across {} locations",
+                matches.len()
+            ),
+            Self::LeaseMismatch {
+                id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "session lease for {id:?} belongs to {}, expected {}",
+                actual.display(),
+                expected.display()
+            ),
+            Self::OwnershipConflict {
+                id,
+                owner,
+                operation,
+            } => write!(
+                f,
+                "session {id:?} is owned by {owner:?}; {operation} is not allowed"
+            ),
             Self::TooLarge {
                 kind,
                 limit,
@@ -137,6 +177,120 @@ impl From<SessionStoreError> for io::Error {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogLocation {
+    pub id: String,
+    pub project_bucket: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogPresence {
+    LegacyOnly,
+    NativeOnly,
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogEntry {
+    pub id: String,
+    pub name: String,
+    pub project_bucket: String,
+    pub working_dir: PathBuf,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub message_count: usize,
+    pub turn_count: usize,
+    pub presence: CatalogPresence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogDiagnosticKind {
+    Io,
+    InvalidId,
+    UnsafeFile,
+    TooLarge,
+    FutureSchema,
+    Corrupt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogDiagnostic {
+    pub project_bucket: Option<String>,
+    pub path: PathBuf,
+    pub kind: CatalogDiagnosticKind,
+    pub message: String,
+}
+
+#[derive(Debug, Default)]
+pub struct CatalogScan {
+    pub entries: Vec<CatalogEntry>,
+    pub diagnostics: Vec<CatalogDiagnostic>,
+}
+
+impl CatalogScan {
+    pub fn latest(&self) -> Option<&CatalogEntry> {
+        self.entries.first()
+    }
+
+    pub fn search_name(&self, query: &str) -> Vec<&CatalogEntry> {
+        let query = query.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|entry| entry.name.to_lowercase().contains(&query))
+            .collect()
+    }
+
+    /// Resolve an exact id first, then a safe prefix. Directory order and timestamps
+    /// never break ties: every multi-location match is explicitly ambiguous.
+    pub fn find(&self, query: &str) -> SessionResult<Option<CatalogEntry>> {
+        validate_session_query(query)?;
+        let exact: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.id == query)
+            .collect();
+        if !exact.is_empty() {
+            return unique_catalog_match(query, exact);
+        }
+        unique_catalog_match(
+            query,
+            self.entries
+                .iter()
+                .filter(|entry| entry.id.starts_with(query))
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageOwner {
+    Unconfirmed,
+    Legacy,
+    Native,
+}
+
+impl Default for StorageOwner {
+    fn default() -> Self {
+        Self::Unconfirmed
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportKind {
+    Full,
+    MetadataOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportInfo {
+    pub legacy_schema: String,
+    pub source_sha256: String,
+    pub importer_version: u32,
+    pub kind: ImportKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     /// `.meta` SCHEMA VERSION — the forward-compat seam (`.snapshot` has
@@ -155,6 +309,14 @@ pub struct SessionMeta {
     /// `user_renamed` so a resumed session does not run the one-shot namer again.
     #[serde(default)]
     pub ai_named: bool,
+    /// Durable storage authority. Missing on pre-S2 metadata, which must be
+    /// resolved under the session lease instead of guessed by readers.
+    #[serde(default)]
+    pub owner: StorageOwner,
+    /// Provenance of a committed legacy cutover. Fresh native sessions leave it
+    /// empty; it is deliberately independent from `owner`.
+    #[serde(default)]
+    pub import_info: Option<ImportInfo>,
     pub working_dir: String,
     /// epoch MILLISECONDS, UTC.
     pub created_at: i64,
@@ -181,6 +343,8 @@ impl SessionMeta {
             id,
             user_renamed: false,
             ai_named: false,
+            owner: StorageOwner::Unconfirmed,
+            import_info: None,
             working_dir: working_dir.into(),
             created_at: now_ms,
             updated_at: now_ms,
@@ -189,6 +353,36 @@ impl SessionMeta {
             turn_stats: Vec::new(),
         }
     }
+}
+
+/// Complete native session state for driver/API readers. Keeping the three
+/// persisted artifacts together prevents consumers from inventing different
+/// missing-file or ownership fallback rules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedSession {
+    pub meta: SessionMeta,
+    pub snapshot: SessionSnapshot,
+    pub presentation: PresentationFile,
+}
+
+/// Minimal, core-free view of a historical `<id>.json`. Unknown fields, including
+/// the full conversation, are streamed past by serde instead of entering catalog memory.
+#[derive(Deserialize)]
+struct LegacyCatalogMeta {
+    id: String,
+    name: String,
+    working_dir: PathBuf,
+    created_at: u64,
+    updated_at: u64,
+    messages: Vec<IgnoredAny>,
+    #[serde(default)]
+    turn_stats: Vec<IgnoredAny>,
+}
+
+#[derive(Default)]
+struct CatalogAggregate {
+    native: Option<SessionMeta>,
+    legacy: Option<LegacyCatalogMeta>,
 }
 
 /// One completed turn's stats — drives a resume-time `✓ … tokens` divider.
@@ -280,13 +474,33 @@ impl MetaReadPause {
 }
 
 impl SessionManager {
+    pub fn sessions_root() -> PathBuf {
+        super::config_dir().join("sessions")
+    }
+
+    /// Copy the pre-v4.16 macOS session tree into the canonical sessions root.
+    /// An initialized canonical root is never modified.
+    pub fn migrate_from_legacy() -> SessionResult<usize> {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(legacy_root) = dirs::data_local_dir()
+                .map(|path| path.join("atomcode").join("sessions"))
+            else {
+                return Ok(0);
+            };
+            migrate_sessions_from(&legacy_root, &Self::sessions_root())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(0)
+        }
+    }
+
     /// The store for `working_dir`'s project — `$ATOMCODE_HOME/sessions/<project_hash>`,
     /// the SAME bucket production uses (so old `<id>.json` and new `<id>.snapshot`
     /// sessions of the same project land together).
     pub fn for_project(working_dir: &Path) -> Self {
-        let root = super::config_dir()
-            .join("sessions")
-            .join(Self::project_hash(working_dir));
+        let root = Self::sessions_root().join(Self::project_hash(working_dir));
         Self {
             root,
             #[cfg(test)]
@@ -308,29 +522,9 @@ impl SessionManager {
         &self.root
     }
 
-    /// Stable per-project bucket id, BYTE-FOR-BYTE the production scheme
-    /// (`atomcode_core::session::hash_path`): normalize the path (backslashes→slashes,
-    /// strip one trailing slash, lowercase on Windows), then hash the resulting
-    /// `PathBuf` — NOT the `&str` — with the std `DefaultHasher`, formatted `{:016x}`.
-    /// Hashing the `PathBuf` (length-prefixed components) rather than the string is
-    /// what keeps us on production's bucket so a future unified `/resume` still finds
-    /// legacy sessions.
+    /// Stable per-project bucket id shared with project-scoped trust storage.
     pub fn project_hash(working_dir: &Path) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let normalized = working_dir.to_string_lossy();
-        let mut normalized = normalized.replace('\\', "/");
-        if normalized.len() > 1 && normalized.ends_with('/') {
-            normalized.pop();
-        }
-        #[cfg(windows)]
-        let normalized = normalized.to_lowercase();
-
-        let mut hasher = DefaultHasher::new();
-        let p: PathBuf = PathBuf::from(normalized);
-        p.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        atomcode_config::util::stable_project_hash(working_dir)
     }
 
     pub fn snapshot_path(&self, id: &str) -> SessionResult<PathBuf> {
@@ -355,6 +549,20 @@ impl SessionManager {
     /// snapshot so display-only entries can never enter provider context.
     pub fn presentation_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "ui.json")
+    }
+
+    pub fn legacy_path(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "json")
+    }
+
+    /// Read a historical core session under the same no-follow and size bounds as
+    /// catalog discovery. Parsing stays in the daemon compatibility layer.
+    pub fn read_legacy_bytes(&self, id: &str) -> SessionResult<Vec<u8>> {
+        read_regular_file_bounded(
+            &self.legacy_path(id)?,
+            "legacy session",
+            MAX_LEGACY_SESSION_BYTES,
+        )
     }
 
     fn path_for(&self, id: &str, extension: &str) -> SessionResult<PathBuf> {
@@ -390,6 +598,7 @@ impl SessionManager {
 
     /// Persist the working-set snapshot (atomic). Overwrites every turn.
     pub fn save_snapshot(&self, id: &str, snap: &SessionSnapshot) -> SessionResult<()> {
+        self.ensure_native_writable(id, "save snapshot")?;
         validate_snapshot(snap)?;
         let bytes = serialize_bounded(snap, "snapshot", MAX_SNAPSHOT_BYTES)?;
         atomic_write(&self.snapshot_path(id)?, &bytes)
@@ -404,7 +613,28 @@ impl SessionManager {
     }
 
     pub fn write_meta(&self, meta: &SessionMeta) -> SessionResult<()> {
-        self.with_meta_lock(&meta.id, || self.write_meta_unlocked(meta))
+        self.with_meta_lock(&meta.id, || {
+            match self.read_meta(&meta.id) {
+                Ok(existing) if existing.owner != meta.owner => {
+                    return Err(SessionStoreError::OwnershipConflict {
+                        id: meta.id.clone(),
+                        owner: existing.owner,
+                        operation: "change storage owner outside importer commit",
+                    });
+                }
+                Ok(existing) if existing.owner == StorageOwner::Legacy => {
+                    return Err(SessionStoreError::OwnershipConflict {
+                        id: meta.id.clone(),
+                        owner: existing.owner,
+                        operation: "write native metadata",
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            self.write_meta_unlocked(meta)
+        })
     }
 
     fn write_meta_unlocked(&self, meta: &SessionMeta) -> SessionResult<()> {
@@ -423,6 +653,13 @@ impl SessionManager {
     ) -> SessionResult<()> {
         self.with_meta_lock(id, || {
             let mut meta = self.read_meta(id)?;
+            if meta.owner == StorageOwner::Legacy {
+                return Err(SessionStoreError::OwnershipConflict {
+                    id: id.to_string(),
+                    owner: StorageOwner::Legacy,
+                    operation: "update native metadata",
+                });
+            }
             update(&mut meta);
             ensure_meta_id(id, &meta)?;
             self.write_meta_unlocked(&meta)
@@ -441,6 +678,13 @@ impl SessionManager {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => new_meta,
                 Err(error) => return Err(error),
             };
+            if meta.owner == StorageOwner::Legacy {
+                return Err(SessionStoreError::OwnershipConflict {
+                    id: id.to_string(),
+                    owner: StorageOwner::Legacy,
+                    operation: "update native metadata",
+                });
+            }
             update(&mut meta);
             ensure_meta_id(id, &meta)?;
             self.write_meta_unlocked(&meta)
@@ -495,7 +739,10 @@ impl SessionManager {
         id: &str,
         presentation: &PresentationFile,
     ) -> SessionResult<()> {
-        self.with_meta_lock(id, || self.write_presentation_unlocked(id, presentation))
+        self.with_meta_lock(id, || {
+            self.ensure_native_writable(id, "write presentation")?;
+            self.write_presentation_unlocked(id, presentation)
+        })
     }
 
     fn write_presentation_unlocked(
@@ -519,8 +766,189 @@ impl SessionManager {
         Ok(presentation)
     }
 
+    /// Load the complete authoritative native state. A legacy/unconfirmed owner or
+    /// any missing artifact is an explicit error; callers must cut over through the
+    /// importer instead of manufacturing defaults.
+    pub fn load_native_session(&self, id: &str) -> SessionResult<LoadedSession> {
+        let meta = self.read_meta(id)?;
+        if meta.owner != StorageOwner::Native {
+            return Err(SessionStoreError::OwnershipConflict {
+                id: id.to_string(),
+                owner: meta.owner,
+                operation: "load native session",
+            });
+        }
+        let snapshot = self.load_snapshot(id)?;
+        let presentation = self.read_presentation(id)?;
+        Ok(LoadedSession {
+            meta,
+            snapshot,
+            presentation,
+        })
+    }
+
+    /// Publish a prepared legacy import under the caller's active session lease.
+    /// Every payload is validated/serialized before the first target changes and
+    /// `meta(owner=native)` is always the final reader-visible commit point.
+    /// `None` preserves an already-valid native artifact selected by the importer.
+    pub fn commit_native_import(
+        &self,
+        lease: &SessionLease,
+        snapshot: Option<&SessionSnapshot>,
+        presentation: Option<&PresentationFile>,
+        meta: &SessionMeta,
+    ) -> SessionResult<()> {
+        self.validate_lease(lease)?;
+        if meta.id != lease.id() {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session import",
+                message: format!(
+                    "lease id {:?} does not match imported meta id {:?}",
+                    lease.id(),
+                    meta.id
+                ),
+            });
+        }
+        if meta.owner != StorageOwner::Native {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session import",
+                message: "commit point requires owner=native".into(),
+            });
+        }
+
+        let snapshot_bytes = snapshot
+            .map(|snapshot| {
+                validate_snapshot(snapshot)?;
+                serialize_bounded(snapshot, "snapshot", MAX_SNAPSHOT_BYTES)
+            })
+            .transpose()?;
+        let presentation_bytes = presentation
+            .map(|presentation| {
+                presentation.validate()?;
+                serialize_pretty_bounded(presentation, "presentation", MAX_PRESENTATION_BYTES)
+            })
+            .transpose()?;
+        validate_meta(meta)?;
+        let meta_bytes = serialize_pretty_bounded(meta, "session meta", MAX_META_BYTES)?;
+
+        self.with_meta_lock(lease.id(), || {
+            self.cleanup_import_staging(lease.id())?;
+            if let Some(bytes) = &snapshot_bytes {
+                atomic_write(&self.snapshot_path(lease.id())?, bytes)?;
+            }
+            if let Some(bytes) = &presentation_bytes {
+                atomic_write(&self.presentation_path(lease.id())?, bytes)?;
+            }
+            atomic_write(&self.meta_path(lease.id())?, &meta_bytes)
+        })
+    }
+
+    /// Commit an owner-native runtime mutation under the active session lease.
+    /// All payloads are validated and serialized before the first replacement;
+    /// metadata is written last and is the catalog-visible commit point.
+    pub fn commit_native_runtime_mutation(
+        &self,
+        lease: &SessionLease,
+        snapshot: &SessionSnapshot,
+        presentation: &PresentationFile,
+        meta: &SessionMeta,
+    ) -> SessionResult<()> {
+        self.validate_lease(lease)?;
+        if meta.id != lease.id() {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session mutation",
+                message: format!(
+                    "lease id {:?} does not match metadata id {:?}",
+                    lease.id(),
+                    meta.id
+                ),
+            });
+        }
+        if meta.owner != StorageOwner::Native {
+            return Err(SessionStoreError::OwnershipConflict {
+                id: meta.id.clone(),
+                owner: meta.owner.clone(),
+                operation: "commit native runtime mutation",
+            });
+        }
+        validate_snapshot(snapshot)?;
+        presentation.validate()?;
+        validate_meta(meta)?;
+        let snapshot_bytes = serialize_bounded(snapshot, "snapshot", MAX_SNAPSHOT_BYTES)?;
+        let presentation_bytes =
+            serialize_pretty_bounded(presentation, "presentation", MAX_PRESENTATION_BYTES)?;
+        let meta_bytes = serialize_pretty_bounded(meta, "session meta", MAX_META_BYTES)?;
+
+        self.with_meta_lock(lease.id(), || {
+            let current = self.read_meta(lease.id())?;
+            if current.owner != StorageOwner::Native {
+                return Err(SessionStoreError::OwnershipConflict {
+                    id: lease.id().to_string(),
+                    owner: current.owner,
+                    operation: "commit native runtime mutation",
+                });
+            }
+            atomic_write(&self.snapshot_path(lease.id())?, &snapshot_bytes)?;
+            atomic_write(&self.presentation_path(lease.id())?, &presentation_bytes)?;
+            atomic_write(&self.meta_path(lease.id())?, &meta_bytes)
+        })
+    }
+
+    fn validate_lease(&self, lease: &SessionLease) -> SessionResult<()> {
+        let expected = self.lease_path(lease.id())?;
+        if lease.inner.path == expected {
+            Ok(())
+        } else {
+            Err(SessionStoreError::LeaseMismatch {
+                id: lease.id().to_string(),
+                expected,
+                actual: lease.inner.path.clone(),
+            })
+        }
+    }
+
+    /// Verify that a lease was acquired for this exact project bucket/session.
+    /// Drivers use this before transferring an importer-held guard into a runtime.
+    pub fn validate_active_lease(&self, lease: &SessionLease) -> SessionResult<()> {
+        self.validate_lease(lease)
+    }
+
+    fn cleanup_import_staging(&self, id: &str) -> SessionResult<()> {
+        let prefixes = [
+            format!(".{id}.snapshot."),
+            format!(".{id}.meta."),
+            format!(".{id}.ui.json."),
+        ];
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io_at(&self.root, error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| io_at(&self.root, error))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.ends_with(".tmp") || !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| io_at(&path, error))?;
+            if !metadata.file_type().is_file() {
+                return Err(SessionStoreError::UnsafeFile {
+                    path,
+                    reason: "import staging residue is not a regular file",
+                });
+            }
+            fs::remove_file(&path).map_err(|error| io_at(&path, error))?;
+        }
+        Ok(())
+    }
+
     pub fn append_presentation(&self, id: &str, entry: PresentationEntry) -> SessionResult<()> {
         self.with_meta_lock(id, || {
+            self.ensure_native_writable(id, "append presentation")?;
             let mut presentation = match self.read_presentation(id) {
                 Ok(presentation) => presentation,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -539,6 +967,7 @@ impl SessionManager {
         surviving_turn_ids: &BTreeSet<u64>,
     ) -> SessionResult<usize> {
         self.with_meta_lock(id, || {
+            self.ensure_native_writable(id, "prune presentation")?;
             let mut presentation = self.read_presentation(id)?;
             let removed = presentation.retain_turns(surviving_turn_ids);
             if removed != 0 {
@@ -557,6 +986,13 @@ impl SessionManager {
     ) -> SessionResult<usize> {
         self.with_meta_lock(id, || {
             let mut meta = self.read_meta(id)?;
+            if meta.owner == StorageOwner::Legacy {
+                return Err(SessionStoreError::OwnershipConflict {
+                    id: id.to_string(),
+                    owner: StorageOwner::Legacy,
+                    operation: "prune native turn stats",
+                });
+            }
             let before = meta.turn_stats.len();
             meta.turn_stats
                 .retain(|stat| stat.turn_id == 0 || surviving_turn_ids.contains(&stat.turn_id));
@@ -576,6 +1012,16 @@ impl SessionManager {
         });
         *self.meta_read_pause.lock().unwrap() = Some(pause.clone());
         pause
+    }
+
+    /// Scan every project bucket below an explicit sessions root. Missing roots are
+    /// an empty catalog; malformed individual entries become diagnostics.
+    pub fn scan_catalog(sessions_root: &Path) -> CatalogScan {
+        scan_catalog_root(sessions_root)
+    }
+
+    pub fn scan_all() -> CatalogScan {
+        Self::scan_catalog(&Self::sessions_root())
     }
 
     /// List all sessions in this project bucket, NEWEST FIRST. Reads ONLY `*.meta`
@@ -622,15 +1068,23 @@ impl SessionManager {
         })
     }
 
-    /// Remove a session's persisted files. A missing file is not an error (idempotent).
-    pub fn delete(&self, id: &str) -> SessionResult<()> {
-        let _lease = self.acquire_lease(id)?;
-        for p in [
+    /// Remove native data plus the corresponding historical core JSON. The caller
+    /// must already hold this exact bucket's active-session lease. Lock files remain
+    /// persistent so no second inode can be locked while an old descriptor exists.
+    pub fn delete(&self, lease: &SessionLease) -> SessionResult<()> {
+        let id = lease.id();
+        self.validate_lease(lease)?;
+        let targets = [
             self.snapshot_path(id)?,
             self.meta_path(id)?,
             self.jsonl_path(id)?,
             self.presentation_path(id)?,
-        ] {
+            self.legacy_path(id)?,
+        ];
+        for path in &targets {
+            validate_delete_target(path)?;
+        }
+        for p in targets {
             match fs::remove_file(&p) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -641,6 +1095,7 @@ impl SessionManager {
     }
 
     pub(crate) fn append_jsonl_line(&self, id: &str, line: &[u8]) -> SessionResult<()> {
+        self.ensure_native_writable(id, "append transcript")?;
         if line.len() > MAX_JSONL_LINE_BYTES {
             return Err(SessionStoreError::TooLarge {
                 kind: "transcript line",
@@ -670,6 +1125,502 @@ impl SessionManager {
         }
         file.write_all(line).map_err(|e| io_at(&path, e))
     }
+
+    fn ensure_native_writable(&self, id: &str, operation: &'static str) -> SessionResult<()> {
+        match self.read_meta(id) {
+            Ok(meta) if meta.owner == StorageOwner::Legacy => {
+                Err(SessionStoreError::OwnershipConflict {
+                    id: id.to_string(),
+                    owner: StorageOwner::Legacy,
+                    operation,
+                })
+            }
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            // A corrupt historical meta cannot prove `owner=legacy`. Snapshot/
+            // sidecar writes remain non-authoritative staging while the bad meta
+            // stays in place; metadata mutation itself still fails closed.
+            Err(SessionStoreError::Corrupt { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
+    let mut scan = CatalogScan::default();
+    let mut sessions: BTreeMap<(String, String), CatalogAggregate> = BTreeMap::new();
+    let mut native_meta_ids = BTreeSet::new();
+    let mut native_sidecars = BTreeMap::new();
+    let buckets = match fs::read_dir(sessions_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return scan,
+        Err(error) => {
+            scan.diagnostics.push(io_catalog_diagnostic(
+                None,
+                sessions_root.to_path_buf(),
+                error,
+            ));
+            return scan;
+        }
+    };
+
+    for bucket_result in buckets {
+        let bucket_entry = match bucket_result {
+            Ok(entry) => entry,
+            Err(error) => {
+                scan.diagnostics.push(io_catalog_diagnostic(
+                    None,
+                    sessions_root.to_path_buf(),
+                    error,
+                ));
+                continue;
+            }
+        };
+        let bucket_path = bucket_entry.path();
+        let bucket = match bucket_entry.file_name().into_string() {
+            Ok(bucket) if valid_project_bucket(&bucket) => bucket,
+            Ok(bucket) => {
+                scan.diagnostics.push(CatalogDiagnostic {
+                    project_bucket: Some(bucket),
+                    path: bucket_path,
+                    kind: CatalogDiagnosticKind::InvalidId,
+                    message: "project bucket must be exactly 16 ASCII hex characters".into(),
+                });
+                continue;
+            }
+            Err(_) => {
+                scan.diagnostics.push(CatalogDiagnostic {
+                    project_bucket: None,
+                    path: bucket_path,
+                    kind: CatalogDiagnosticKind::InvalidId,
+                    message: "project bucket name is not valid UTF-8".into(),
+                });
+                continue;
+            }
+        };
+        match bucket_entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => {}
+            Ok(_) => {
+                scan.diagnostics.push(CatalogDiagnostic {
+                    project_bucket: Some(bucket),
+                    path: bucket_path,
+                    kind: CatalogDiagnosticKind::UnsafeFile,
+                    message: "project bucket is not a directory".into(),
+                });
+                continue;
+            }
+            Err(error) => {
+                scan.diagnostics
+                    .push(io_catalog_diagnostic(Some(bucket), bucket_path, error));
+                continue;
+            }
+        }
+
+        let files = match fs::read_dir(&bucket_path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                scan.diagnostics
+                    .push(io_catalog_diagnostic(Some(bucket), bucket_path, error));
+                continue;
+            }
+        };
+        let manager = SessionManager::with_root(&bucket_path);
+        for file_result in files {
+            let file_entry = match file_result {
+                Ok(entry) => entry,
+                Err(error) => {
+                    scan.diagnostics.push(io_catalog_diagnostic(
+                        Some(bucket.clone()),
+                        bucket_path.clone(),
+                        error,
+                    ));
+                    continue;
+                }
+            };
+            let path = file_entry.path();
+            let name = match file_entry.file_name().into_string() {
+                Ok(name) => name,
+                Err(_) => {
+                    scan.diagnostics.push(CatalogDiagnostic {
+                        project_bucket: Some(bucket.clone()),
+                        path,
+                        kind: CatalogDiagnosticKind::InvalidId,
+                        message: "session filename is not valid UTF-8".into(),
+                    });
+                    continue;
+                }
+            };
+            let direct_sidecar_id = name
+                .strip_suffix(".snapshot")
+                .or_else(|| name.strip_suffix(".jsonl"));
+            if let Some(id) = direct_sidecar_id {
+                match file_entry.file_type() {
+                    Ok(file_type) if file_type.is_file() => {}
+                    Ok(_) => {
+                        scan.diagnostics.push(CatalogDiagnostic {
+                            project_bucket: Some(bucket.clone()),
+                            path,
+                            kind: CatalogDiagnosticKind::UnsafeFile,
+                            message: "native session sidecar is not a regular file".into(),
+                        });
+                        continue;
+                    }
+                    Err(error) => {
+                        scan.diagnostics.push(io_catalog_diagnostic(
+                            Some(bucket.clone()),
+                            path,
+                            error,
+                        ));
+                        continue;
+                    }
+                }
+                if let Err(error) = validate_session_id(id) {
+                    scan.diagnostics.push(catalog_diagnostic_from_error(
+                        Some(bucket.clone()),
+                        path,
+                        error,
+                    ));
+                    continue;
+                }
+                native_sidecars
+                    .entry((bucket.clone(), id.to_string()))
+                    .or_insert(path);
+                continue;
+            }
+            let source = if let Some(id) = name.strip_suffix(".meta") {
+                Some((id, false))
+            } else if let Some(id) = name.strip_suffix(".json") {
+                if let Some(presentation_id) = name.strip_suffix(".ui.json") {
+                    let has_native_companion =
+                        ["meta", "snapshot", "jsonl"].iter().any(|extension| {
+                            bucket_path
+                                .join(format!("{presentation_id}.{extension}"))
+                                .symlink_metadata()
+                                .is_ok()
+                        });
+                    if has_native_companion {
+                        None
+                    } else {
+                        Some((id, true))
+                    }
+                } else {
+                    Some((id, true))
+                }
+            } else {
+                None
+            };
+            let Some((id, legacy)) = source else {
+                continue;
+            };
+            match file_entry.file_type() {
+                Ok(file_type) if file_type.is_file() => {}
+                Ok(_) => {
+                    scan.diagnostics.push(CatalogDiagnostic {
+                        project_bucket: Some(bucket.clone()),
+                        path,
+                        kind: CatalogDiagnosticKind::UnsafeFile,
+                        message: "catalog source is not a regular file".into(),
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    scan.diagnostics
+                        .push(io_catalog_diagnostic(Some(bucket.clone()), path, error));
+                    continue;
+                }
+            }
+            if let Err(error) = validate_session_id(id) {
+                scan.diagnostics.push(catalog_diagnostic_from_error(
+                    Some(bucket.clone()),
+                    path,
+                    error,
+                ));
+                continue;
+            }
+
+            let key = (bucket.clone(), id.to_string());
+            if legacy {
+                match read_legacy_catalog_meta(&path, id) {
+                    Ok(meta) => sessions.entry(key).or_default().legacy = Some(meta),
+                    Err(error) => scan.diagnostics.push(catalog_diagnostic_from_error(
+                        Some(bucket.clone()),
+                        path,
+                        error,
+                    )),
+                }
+            } else {
+                native_meta_ids.insert(key.clone());
+                match manager.read_meta(id) {
+                    Ok(meta) => sessions.entry(key).or_default().native = Some(meta),
+                    Err(error) => scan.diagnostics.push(catalog_diagnostic_from_error(
+                        Some(bucket.clone()),
+                        path,
+                        error,
+                    )),
+                }
+            }
+        }
+    }
+
+    for (key, path) in native_sidecars {
+        if !native_meta_ids.contains(&key) {
+            scan.diagnostics.push(CatalogDiagnostic {
+                project_bucket: Some(key.0),
+                path,
+                kind: CatalogDiagnosticKind::Corrupt,
+                message: format!("native session {:?} has sidecars but no metadata", key.1),
+            });
+        }
+    }
+
+    scan.entries = sessions
+        .into_iter()
+        .filter_map(|((project_bucket, id), sources)| catalog_entry(project_bucket, id, sources))
+        .collect();
+    scan.entries.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| a.id.cmp(&b.id))
+            .then_with(|| a.project_bucket.cmp(&b.project_bucket))
+    });
+    scan.diagnostics.sort_by(|a, b| a.path.cmp(&b.path));
+    scan
+}
+
+fn valid_project_bucket(bucket: &str) -> bool {
+    bucket.len() == 16 && bucket.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn migrate_sessions_from(legacy_root: &Path, target_root: &Path) -> SessionResult<usize> {
+    if !legacy_root.exists() {
+        return Ok(0);
+    }
+    if target_root.exists() {
+        let mut entries = fs::read_dir(target_root).map_err(|error| io_at(target_root, error))?;
+        if entries.next().is_some() {
+            return Ok(0);
+        }
+    }
+
+    let mut copies = Vec::new();
+    for bucket_entry in
+        fs::read_dir(legacy_root).map_err(|error| io_at(legacy_root, error))?
+    {
+        let bucket_entry = bucket_entry.map_err(|error| io_at(legacy_root, error))?;
+        let bucket_path = bucket_entry.path();
+        let file_type = bucket_entry
+            .file_type()
+            .map_err(|error| io_at(&bucket_path, error))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let bucket = bucket_entry.file_name().to_string_lossy().into_owned();
+        if !valid_project_bucket(&bucket) {
+            return Err(SessionStoreError::UnsafeFile {
+                path: bucket_path,
+                reason: "legacy session bucket is not a 16-character hex id",
+            });
+        }
+        for file_entry in
+            fs::read_dir(&bucket_path).map_err(|error| io_at(&bucket_path, error))?
+        {
+            let file_entry = file_entry.map_err(|error| io_at(&bucket_path, error))?;
+            let source = file_entry.path();
+            if !file_entry
+                .file_type()
+                .map_err(|error| io_at(&source, error))?
+                .is_file()
+            {
+                return Err(SessionStoreError::UnsafeFile {
+                    path: source,
+                    reason: "legacy session artifact is not a regular file",
+                });
+            }
+            copies.push((
+                source,
+                target_root.join(&bucket).join(file_entry.file_name()),
+            ));
+        }
+    }
+
+    for (source, target) in &copies {
+        let parent = target.parent().expect("session target always has a bucket");
+        fs::create_dir_all(parent).map_err(|error| io_at(parent, error))?;
+        let mut input = File::open(source).map_err(|error| io_at(source, error))?;
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(target)
+            .map_err(|error| io_at(target, error))?;
+        io::copy(&mut input, &mut output).map_err(|error| io_at(target, error))?;
+        output.sync_all().map_err(|error| io_at(target, error))?;
+    }
+    Ok(copies.len())
+}
+
+fn read_legacy_catalog_meta(path: &Path, expected_id: &str) -> SessionResult<LegacyCatalogMeta> {
+    let bytes = read_regular_file_bounded(path, "legacy session", MAX_LEGACY_SESSION_BYTES)?;
+    let meta: LegacyCatalogMeta = deserialize(&bytes, "legacy session")?;
+    validate_session_id(&meta.id)?;
+    validate_string("legacy session name", &meta.name, MAX_STORED_STRING_BYTES)?;
+    validate_string(
+        "legacy working directory",
+        &meta.working_dir.to_string_lossy(),
+        MAX_STORED_STRING_BYTES,
+    )?;
+    if meta.id != expected_id {
+        return Err(SessionStoreError::Corrupt {
+            kind: "legacy session",
+            message: format!(
+                "file id {expected_id:?} does not match stored id {:?}",
+                meta.id
+            ),
+        });
+    }
+    checked_legacy_millis(meta.created_at)?;
+    checked_legacy_millis(meta.updated_at)?;
+    Ok(meta)
+}
+
+fn checked_legacy_millis(seconds: u64) -> SessionResult<i64> {
+    seconds
+        .checked_mul(1_000)
+        .and_then(|millis| i64::try_from(millis).ok())
+        .ok_or_else(|| SessionStoreError::Corrupt {
+            kind: "legacy session",
+            message: format!("timestamp {seconds} seconds does not fit epoch milliseconds"),
+        })
+}
+
+fn catalog_entry(
+    project_bucket: String,
+    id: String,
+    sources: CatalogAggregate,
+) -> Option<CatalogEntry> {
+    match (sources.native, sources.legacy) {
+        (Some(native), legacy) => Some(CatalogEntry {
+            id,
+            name: native.name,
+            project_bucket,
+            working_dir: PathBuf::from(native.working_dir),
+            created_at_ms: native.created_at,
+            updated_at_ms: native.updated_at,
+            message_count: native.message_count as usize,
+            turn_count: native.turn_count as usize,
+            presence: if legacy.is_some() {
+                CatalogPresence::Both
+            } else {
+                CatalogPresence::NativeOnly
+            },
+        }),
+        (None, Some(legacy)) => Some(CatalogEntry {
+            id,
+            name: legacy.name,
+            project_bucket,
+            working_dir: legacy.working_dir,
+            created_at_ms: checked_legacy_millis(legacy.created_at).ok()?,
+            updated_at_ms: checked_legacy_millis(legacy.updated_at).ok()?,
+            message_count: legacy.messages.len(),
+            turn_count: legacy.turn_stats.len(),
+            presence: CatalogPresence::LegacyOnly,
+        }),
+        (None, None) => None,
+    }
+}
+
+fn unique_catalog_match(
+    query: &str,
+    matches: Vec<&CatalogEntry>,
+) -> SessionResult<Option<CatalogEntry>> {
+    match matches.as_slice() {
+        [] => Ok(None),
+        [entry] => Ok(Some((*entry).clone())),
+        _ => Err(SessionStoreError::AmbiguousId {
+            query: query.to_string(),
+            matches: matches
+                .into_iter()
+                .map(|entry| CatalogLocation {
+                    id: entry.id.clone(),
+                    project_bucket: entry.project_bucket.clone(),
+                })
+                .collect(),
+        }),
+    }
+}
+
+fn catalog_diagnostic_from_error(
+    project_bucket: Option<String>,
+    path: PathBuf,
+    error: SessionStoreError,
+) -> CatalogDiagnostic {
+    let kind = match &error {
+        SessionStoreError::InvalidId { .. } => CatalogDiagnosticKind::InvalidId,
+        SessionStoreError::TooLarge { .. } => CatalogDiagnosticKind::TooLarge,
+        SessionStoreError::FutureSchema { .. } => CatalogDiagnosticKind::FutureSchema,
+        SessionStoreError::Corrupt { .. } => CatalogDiagnosticKind::Corrupt,
+        SessionStoreError::UnsafeFile { .. } => CatalogDiagnosticKind::UnsafeFile,
+        SessionStoreError::NotFound { .. }
+        | SessionStoreError::SessionInUse { .. }
+        | SessionStoreError::AmbiguousId { .. }
+        | SessionStoreError::LeaseMismatch { .. }
+        | SessionStoreError::OwnershipConflict { .. }
+        | SessionStoreError::Io { .. } => CatalogDiagnosticKind::Io,
+    };
+    CatalogDiagnostic {
+        project_bucket,
+        path,
+        kind,
+        message: error.to_string(),
+    }
+}
+
+fn io_catalog_diagnostic(
+    project_bucket: Option<String>,
+    path: PathBuf,
+    error: io::Error,
+) -> CatalogDiagnostic {
+    CatalogDiagnostic {
+        project_bucket,
+        path,
+        kind: CatalogDiagnosticKind::Io,
+        message: error.to_string(),
+    }
+}
+
+fn validate_delete_target(path: &Path) -> SessionResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(SessionStoreError::UnsafeFile {
+            path: path.to_path_buf(),
+            reason: "delete target is not a regular file",
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_at(path, error)),
+    }
+}
+
+fn validate_session_query(query: &str) -> SessionResult<()> {
+    if query.is_empty() {
+        return Err(invalid_id(query, "query must not be empty"));
+    }
+    if query.len() > MAX_SESSION_ID_BYTES {
+        return Err(invalid_id(query, "query exceeds the maximum byte length"));
+    }
+    if matches!(query, "." | "..")
+        || query.starts_with('/')
+        || query.starts_with('\\')
+        || query.contains('/')
+        || query.contains('\\')
+        || query
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return Err(invalid_id(
+            query,
+            "query contains a path separator or filesystem-reserved character",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_session_id(id: &str) -> SessionResult<()> {
@@ -734,6 +1685,36 @@ fn validate_meta(meta: &SessionMeta) -> SessionResult<()> {
         &meta.working_dir,
         MAX_STORED_STRING_BYTES,
     )?;
+    if let Some(import) = &meta.import_info {
+        if meta.owner != StorageOwner::Native {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session meta",
+                message: "import_info requires owner=native".into(),
+            });
+        }
+        validate_string(
+            "legacy schema",
+            &import.legacy_schema,
+            MAX_STORED_STRING_BYTES,
+        )?;
+        if import.importer_version == 0 {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session meta",
+                message: "importer_version must be non-zero".into(),
+            });
+        }
+        if import.source_sha256.len() != 64
+            || !import
+                .source_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session meta",
+                message: "source_sha256 must be 64 hexadecimal characters".into(),
+            });
+        }
+    }
     if meta.turn_stats.len() > MAX_META_TURN_STATS {
         return Err(SessionStoreError::TooLarge {
             kind: "meta turn stats",
@@ -1103,6 +2084,45 @@ mod tests {
     }
 
     #[test]
+    fn legacy_root_migration_copies_regular_bucket_files_without_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy");
+        let target = dir.path().join("target");
+        let bucket = "0123456789abcdef";
+        std::fs::create_dir_all(legacy.join(bucket)).unwrap();
+        std::fs::write(legacy.join(bucket).join("session.json"), b"legacy").unwrap();
+
+        assert_eq!(migrate_sessions_from(&legacy, &target).unwrap(), 1);
+        assert_eq!(
+            std::fs::read(target.join(bucket).join("session.json")).unwrap(),
+            b"legacy"
+        );
+
+        std::fs::write(legacy.join(bucket).join("session.json"), b"changed").unwrap();
+        assert_eq!(migrate_sessions_from(&legacy, &target).unwrap(), 0);
+        assert_eq!(
+            std::fs::read(target.join(bucket).join("session.json")).unwrap(),
+            b"legacy",
+            "an initialized canonical root must never be overwritten"
+        );
+    }
+
+    #[test]
+    fn legacy_root_migration_rejects_untrusted_bucket_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy");
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(legacy.join("not-a-bucket")).unwrap();
+        std::fs::write(legacy.join("not-a-bucket").join("session.json"), b"legacy").unwrap();
+
+        assert!(matches!(
+            migrate_sessions_from(&legacy, &target),
+            Err(SessionStoreError::UnsafeFile { .. })
+        ));
+        assert!(!target.join("not-a-bucket").exists());
+    }
+
+    #[test]
     fn snapshot_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = SessionManager::with_root(dir.path());
@@ -1419,6 +2439,147 @@ mod tests {
         assert_eq!(rewritten["turn_stats"][0]["ctx_window"], 0);
         assert_eq!(meta.turn_stats[0].turn_id, 0);
         assert_eq!(rewritten["turn_stats"][0]["turn_id"], 0);
+        assert_eq!(meta.owner, StorageOwner::Unconfirmed);
+        assert!(meta.import_info.is_none());
+        assert_eq!(rewritten["owner"], "unconfirmed");
+        assert!(rewritten["import_info"].is_null());
+    }
+
+    #[test]
+    fn import_metadata_round_trips_separately_from_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut meta = SessionMeta::new("legacy", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        meta.import_info = Some(ImportInfo {
+            legacy_schema: "core-session-json".into(),
+            source_sha256: "ab".repeat(32),
+            importer_version: 1,
+            kind: ImportKind::Full,
+        });
+
+        mgr.write_meta(&meta).unwrap();
+        assert_eq!(mgr.read_meta("legacy").unwrap(), meta);
+    }
+
+    #[test]
+    fn native_import_commit_validates_all_payloads_and_commits_meta_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let snapshot = snap(&["kept"]);
+        let presentation = PresentationFile::default();
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        meta.import_info = Some(ImportInfo {
+            legacy_schema: "core-session-json".into(),
+            source_sha256: "ab".repeat(32),
+            importer_version: 1,
+            kind: ImportKind::Full,
+        });
+        let stale = dir.path().join(".s1.snapshot.999.1.tmp");
+        std::fs::write(&stale, b"stale").unwrap();
+
+        mgr.commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+            .unwrap();
+
+        assert_eq!(mgr.load_snapshot("s1").unwrap(), snapshot);
+        assert_eq!(mgr.read_presentation("s1").unwrap(), presentation);
+        assert_eq!(mgr.read_meta("s1").unwrap(), meta);
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn loaded_native_session_requires_native_owner_and_complete_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let snapshot = snap(&["kept"]);
+        let presentation = PresentationFile::default();
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+
+        mgr.commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+            .unwrap();
+        let loaded = mgr.load_native_session("s1").unwrap();
+        assert_eq!(loaded.meta, meta);
+        assert_eq!(loaded.snapshot, snapshot);
+        assert_eq!(loaded.presentation, presentation);
+
+        std::fs::remove_file(mgr.presentation_path("s1").unwrap()).unwrap();
+        assert!(matches!(
+            mgr.load_native_session("s1"),
+            Err(SessionStoreError::NotFound { .. })
+        ));
+
+        let mut unconfirmed = SessionMeta::new("pending", "/p", 1);
+        unconfirmed.owner = StorageOwner::Unconfirmed;
+        mgr.write_meta(&unconfirmed).unwrap();
+        assert!(matches!(
+            mgr.load_native_session("pending"),
+            Err(SessionStoreError::OwnershipConflict {
+                owner: StorageOwner::Unconfirmed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn native_import_invalid_sidecar_does_not_publish_snapshot_or_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let invalid = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![presentation_entry(
+                DisplayAnchor::AfterTurn { turn_id: 0 },
+                "invalid",
+            )],
+        };
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+
+        assert!(mgr
+            .commit_native_import(&lease, Some(&snap(&["new"])), Some(&invalid), &meta)
+            .is_err());
+        assert!(!mgr.snapshot_path("s1").unwrap().exists());
+        assert!(!mgr.meta_path("s1").unwrap().exists());
+    }
+
+    #[test]
+    fn owner_legacy_rejects_normal_native_writers_but_import_commit_can_cut_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut legacy = SessionMeta::new("s1", "/p", 1);
+        legacy.owner = StorageOwner::Legacy;
+        mgr.write_meta(&legacy).unwrap();
+
+        assert!(matches!(
+            mgr.save_snapshot("s1", &snap(&["blocked"])),
+            Err(SessionStoreError::OwnershipConflict { .. })
+        ));
+        assert!(matches!(
+            mgr.write_presentation("s1", &PresentationFile::default()),
+            Err(SessionStoreError::OwnershipConflict { .. })
+        ));
+        assert!(matches!(
+            mgr.rename("s1", "blocked"),
+            Err(SessionStoreError::OwnershipConflict { .. })
+        ));
+        assert!(!mgr.snapshot_path("s1").unwrap().exists());
+        assert_eq!(mgr.read_meta("s1").unwrap().name, legacy.name);
+
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut native = legacy;
+        native.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snap(&["committed"])),
+            Some(&PresentationFile::default()),
+            &native,
+        )
+        .unwrap();
+        assert_eq!(mgr.read_meta("s1").unwrap().owner, StorageOwner::Native);
     }
 
     #[test]
@@ -1479,6 +2640,205 @@ mod tests {
         assert!(m.user_renamed);
     }
 
+    fn write_legacy_catalog_session(
+        bucket: &Path,
+        id: &str,
+        working_dir: &str,
+        updated_at_secs: u64,
+    ) {
+        std::fs::create_dir_all(bucket).unwrap();
+        let session = serde_json::json!({
+            "id": id,
+            "name": format!("legacy-{id}"),
+            "working_dir": working_dir,
+            "created_at": 1,
+            "updated_at": updated_at_secs,
+            "messages": []
+        });
+        std::fs::write(
+            bucket.join(format!("{id}.json")),
+            serde_json::to_vec(&session).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn catalog_scan_merges_physical_sources_and_keeps_diagnostics() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        let mgr = SessionManager::with_root(&bucket);
+        let mut both = SessionMeta::new("both", "/native", 2_000);
+        both.name = "native-both".into();
+        both.updated_at = 4_000;
+        mgr.write_meta(&both).unwrap();
+        write_legacy_catalog_session(&bucket, "both", "/legacy", 3);
+        write_legacy_catalog_session(&bucket, "legacy", "/legacy-only", 2);
+        mgr.write_meta(&SessionMeta::new("native", "/native-only", 1_000))
+            .unwrap();
+        std::fs::write(bucket.join("broken.meta"), b"{").unwrap();
+        std::fs::write(
+            bucket.join("broken-legacy.json"),
+            br#"{"id":"broken-legacy","name":"broken","working_dir":"/p","created_at":1,"updated_at":1,"messages":"not-an-array"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bucket.join("future.meta"),
+            br#"{"v":999,"id":"future","name":"future","working_dir":"/p","created_at":1,"updated_at":1}"#,
+        )
+        .unwrap();
+
+        let scan = SessionManager::scan_catalog(root.path());
+
+        assert_eq!(scan.entries.len(), 3);
+        let both = scan
+            .entries
+            .iter()
+            .find(|entry| entry.id == "both")
+            .unwrap();
+        assert_eq!(both.presence, CatalogPresence::Both);
+        assert_eq!(both.project_bucket, "0123456789abcdef");
+        assert_eq!(both.working_dir, PathBuf::from("/native"));
+        assert_eq!(both.updated_at_ms, 4_000);
+        assert_eq!(
+            scan.entries
+                .iter()
+                .find(|entry| entry.id == "legacy")
+                .unwrap()
+                .presence,
+            CatalogPresence::LegacyOnly
+        );
+        assert_eq!(
+            scan.entries
+                .iter()
+                .find(|entry| entry.id == "native")
+                .unwrap()
+                .presence,
+            CatalogPresence::NativeOnly
+        );
+        assert_eq!(scan.diagnostics.len(), 3);
+        assert!(scan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path.ends_with("broken.meta")));
+        assert!(scan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == CatalogDiagnosticKind::FutureSchema));
+        assert!(scan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path.ends_with("broken-legacy.json")));
+        assert_eq!(scan.latest().unwrap().id, "both");
+        assert_eq!(scan.search_name("LEGACY").len(), 1);
+        assert_eq!(scan.search_name("LEGACY")[0].id, "legacy");
+    }
+
+    #[test]
+    fn catalog_lookup_rejects_exact_and_prefix_ambiguity_across_buckets() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("1111111111111111");
+        let second = root.path().join("2222222222222222");
+        write_legacy_catalog_session(&first, "abc-one", "/one", 1);
+        write_legacy_catalog_session(&second, "abc-two", "/two", 2);
+        write_legacy_catalog_session(&first, "same", "/one", 1);
+        write_legacy_catalog_session(&second, "same", "/two", 2);
+        let scan = SessionManager::scan_catalog(root.path());
+
+        assert!(matches!(
+            scan.find("abc"),
+            Err(SessionStoreError::AmbiguousId { ref matches, .. }) if matches.len() == 2
+        ));
+        assert!(matches!(
+            scan.find("same"),
+            Err(SessionStoreError::AmbiguousId { ref matches, .. }) if matches.len() == 2
+        ));
+        assert_eq!(
+            scan.find("abc-one").unwrap().unwrap().working_dir,
+            PathBuf::from("/one")
+        );
+        assert!(scan.find("missing").unwrap().is_none());
+        assert!(matches!(
+            scan.find("../escape"),
+            Err(SessionStoreError::InvalidId { .. })
+        ));
+    }
+
+    #[test]
+    fn catalog_reports_orphan_native_sidecars_but_ignores_persistent_locks() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        let mgr = SessionManager::with_root(&bucket);
+        mgr.save_snapshot("orphan", &snap(&["x"])).unwrap();
+        let lock_only = mgr.acquire_lease("deleted").unwrap();
+        drop(lock_only);
+
+        let scan = SessionManager::scan_catalog(root.path());
+
+        assert!(scan.entries.is_empty());
+        assert_eq!(scan.diagnostics.len(), 1);
+        assert!(scan.diagnostics[0].path.ends_with("orphan.snapshot"));
+        assert_eq!(scan.diagnostics[0].kind, CatalogDiagnosticKind::Corrupt);
+    }
+
+    #[test]
+    fn logical_delete_requires_the_same_bucket_lease_and_keeps_lock_files() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket_a = root.path().join("aaaaaaaaaaaaaaaa");
+        let bucket_b = root.path().join("bbbbbbbbbbbbbbbb");
+        let mgr_a = SessionManager::with_root(&bucket_a);
+        let mgr_b = SessionManager::with_root(&bucket_b);
+        mgr_b.write_meta(&SessionMeta::new("s1", "/p", 1)).unwrap();
+        mgr_b.save_snapshot("s1", &snap(&["x"])).unwrap();
+        std::fs::write(mgr_b.jsonl_path("s1").unwrap(), b"{}\n").unwrap();
+        mgr_b
+            .write_presentation("s1", &PresentationFile::default())
+            .unwrap();
+        write_legacy_catalog_session(&bucket_b, "s1", "/p", 1);
+        let wrong_bucket_lease = mgr_a.acquire_lease("s1").unwrap();
+
+        assert!(matches!(
+            mgr_b.delete(&wrong_bucket_lease),
+            Err(SessionStoreError::LeaseMismatch { ref id, .. }) if id == "s1"
+        ));
+        assert!(mgr_b.snapshot_path("s1").unwrap().exists());
+
+        let lease = mgr_b.acquire_lease("s1").unwrap();
+        mgr_b.delete(&lease).unwrap();
+        assert!(!mgr_b.meta_path("s1").unwrap().exists());
+        assert!(!mgr_b.snapshot_path("s1").unwrap().exists());
+        assert!(!mgr_b.jsonl_path("s1").unwrap().exists());
+        assert!(!mgr_b.presentation_path("s1").unwrap().exists());
+        assert!(!bucket_b.join("s1.json").exists());
+        assert!(bucket_b.join("s1.lease").exists());
+        assert!(bucket_b.join("s1.meta.lock").exists());
+
+        mgr_b.delete(&lease).unwrap();
+        let scan = SessionManager::scan_catalog(root.path());
+        assert!(scan.entries.is_empty());
+        assert!(scan.diagnostics.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logical_delete_validates_every_target_before_removing_anything() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        mgr.save_snapshot("s1", &snap(&["keep"])).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, dir.path().join("s1.json")).unwrap();
+        let lease = mgr.acquire_lease("s1").unwrap();
+
+        assert!(matches!(
+            mgr.delete(&lease),
+            Err(SessionStoreError::UnsafeFile { .. })
+        ));
+        assert!(mgr.snapshot_path("s1").unwrap().exists());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    }
+
     #[test]
     fn delete_removes_all_session_files_idempotently() {
         let dir = tempfile::tempdir().unwrap();
@@ -1489,13 +2849,46 @@ mod tests {
         mgr.write_presentation("s1", &PresentationFile::default())
             .unwrap();
 
-        mgr.delete("s1").unwrap();
+        let lease = mgr.acquire_lease("s1").unwrap();
+        mgr.delete(&lease).unwrap();
         assert!(!mgr.meta_path("s1").unwrap().exists());
         assert!(!mgr.snapshot_path("s1").unwrap().exists());
         assert!(!mgr.jsonl_path("s1").unwrap().exists());
         assert!(!mgr.presentation_path("s1").unwrap().exists());
         // Idempotent: deleting again is fine.
-        mgr.delete("s1").unwrap();
+        mgr.delete(&lease).unwrap();
+    }
+
+    #[test]
+    fn native_runtime_mutation_commits_snapshot_presentation_then_meta_under_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut original_meta = SessionMeta::new("s1", "/p", 1);
+        original_meta.owner = StorageOwner::Native;
+        original_meta.message_count = 2;
+        mgr.write_meta(&original_meta).unwrap();
+        mgr.save_snapshot("s1", &snap(&["before", "removed"]))
+            .unwrap();
+        mgr.write_presentation(
+            "s1",
+            &PresentationFile {
+                v: super::super::presentation::PRESENTATION_VERSION,
+                entries: vec![],
+            },
+        )
+        .unwrap();
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let next_snapshot = snap(&["after"]);
+        let mut next_meta = original_meta;
+        next_meta.message_count = 1;
+        let next_presentation = PresentationFile::default();
+
+        mgr.commit_native_runtime_mutation(&lease, &next_snapshot, &next_presentation, &next_meta)
+            .unwrap();
+
+        assert_eq!(mgr.load_snapshot("s1").unwrap(), next_snapshot);
+        assert_eq!(mgr.read_presentation("s1").unwrap(), next_presentation);
+        assert_eq!(mgr.read_meta("s1").unwrap(), next_meta);
     }
 
     #[test]
@@ -1520,20 +2913,19 @@ mod tests {
     }
 
     #[test]
-    fn delete_rejects_an_active_session_without_removing_data() {
+    fn delete_requires_the_active_session_lease() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = SessionManager::with_root(dir.path());
         mgr.save_snapshot("s1", &snap(&["keep"])).unwrap();
         let lease = mgr.acquire_lease("s1").unwrap();
 
         assert!(matches!(
-            mgr.delete("s1"),
+            mgr.acquire_lease("s1"),
             Err(SessionStoreError::SessionInUse { ref id, .. }) if id == "s1"
         ));
         assert!(mgr.snapshot_path("s1").unwrap().exists());
 
-        drop(lease);
-        mgr.delete("s1").unwrap();
+        mgr.delete(&lease).unwrap();
         assert!(!mgr.snapshot_path("s1").unwrap().exists());
     }
 

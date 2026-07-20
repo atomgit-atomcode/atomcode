@@ -10,7 +10,9 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use atomcode_capabilities::session::{SessionLease, SessionStoreError};
+use atomcode_capabilities::session::{
+    PresentationFile, SessionLease, SessionMeta, SessionStoreError, StorageOwner,
+};
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::checkpoint::CompactionCheckpointError;
 use atomcode_kernel::event::{AgentCommand, AgentEvent, RequestId, StopReason};
@@ -28,10 +30,9 @@ use crate::controllers::{
     MAX_EVAL_FAILURES, MAX_UNPRODUCTIVE,
 };
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
-use crate::{
-    assemble, prepare_with_plugin_hook_source, CodingAgentConfig, CodingProviderFactory,
-    PluginHookSource, PrepareOptions,
-};
+#[cfg(test)]
+use crate::prepare_with_plugin_hook_source;
+use crate::{assemble, CodingAgentConfig, CodingProviderFactory, PluginHookSource, PrepareOptions};
 
 /// Runtime facts emitted by the coding engine without depending on the legacy
 /// `atomcode-core` driver protocol.
@@ -126,16 +127,15 @@ pub struct UndoResult {
     pub prompts_before: usize,
 }
 
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotUndoResult {
+    pub snapshot: SessionSnapshot,
+    pub restored_prompt: String,
+    pub target_n: usize,
+    pub prompts_before: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeMode {
     #[default]
@@ -1076,18 +1076,16 @@ impl CodingRuntimeHandle {
     pub async fn undo_to_prompt(&self, nth: Option<usize>) -> Result<UndoResult, RuntimeError> {
         let generation = self.status().generation;
         let original = self.snapshot().await?;
-        let plan = compute_runtime_undo(&original.messages, nth)?;
-        let mut truncated = original.as_ref().clone();
-        truncated.messages = plan.truncated;
+        let undo = undo_snapshot_to_prompt(&original, nth)?;
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::ApplyUndo {
                 generation,
                 original,
-                truncated,
-                restored_prompt: plan.restored_prompt,
-                target_n: plan.target_n,
-                prompts_before: plan.prompts_before,
+                truncated: undo.snapshot,
+                restored_prompt: undo.restored_prompt,
+                target_n: undo.target_n,
+                prompts_before: undo.prompts_before,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -1224,6 +1222,24 @@ impl CodingRuntime {
         input: CodingRuntimeStart,
         bootstrap: ProviderBootstrap,
     ) -> Result<Self, RuntimeStartError> {
+        Self::start_with_bootstrap_and_session_lease(input, bootstrap, None).await
+    }
+
+    /// Start while reusing a lease held across legacy import/ownership commit.
+    /// The guard is validated against the prepared project bucket before reuse.
+    pub async fn start_with_session_lease(
+        input: CodingRuntimeStart,
+        bootstrap: ProviderBootstrap,
+        lease: SessionLease,
+    ) -> Result<Self, RuntimeStartError> {
+        Self::start_with_bootstrap_and_session_lease(input, bootstrap, Some(lease)).await
+    }
+
+    async fn start_with_bootstrap_and_session_lease(
+        input: CodingRuntimeStart,
+        bootstrap: ProviderBootstrap,
+        session_lease: Option<SessionLease>,
+    ) -> Result<Self, RuntimeStartError> {
         let CodingRuntimeStart {
             mut agent,
             prepare,
@@ -1239,10 +1255,14 @@ impl CodingRuntime {
         }
         let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
         let loop_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut parts =
-            prepare_with_plugin_hook_source(&agent, prepare.clone(), plugin_hooks.as_ref())
-                .await
-                .map_err(runtime_start_prepare_error)?;
+        let mut parts = prepare_with_plugin_hook_source_reusing_lease(
+            &agent,
+            prepare.clone(),
+            plugin_hooks.as_ref(),
+            session_lease,
+        )
+        .await
+        .map_err(runtime_start_prepare_error)?;
         parts.register_extra_tool(Arc::new(ScheduleWakeupTool::new(
             wakeup_tx.clone(),
             Arc::clone(&loop_active),
@@ -1268,7 +1288,10 @@ impl CodingRuntime {
                     Err(crate::ProviderBuildError::Authentication(_))
                         if bootstrap == ProviderBootstrap::RecoverAuthentication =>
                     {
-                        (None, Some(ProviderUnavailableReason::AuthenticationRequired))
+                        (
+                            None,
+                            Some(ProviderUnavailableReason::AuthenticationRequired),
+                        )
                     }
                     Err(error) => return Err(RuntimeStartError::Provider(error)),
                 }
@@ -1862,9 +1885,10 @@ fn spawn_runtime_owner_with_optional_agent(
         tagged: tagged_event_tx,
         generation: Arc::clone(&event_generation),
     };
-    controls
-        .state
-        .store(runtime_phase_state(generation, initial_phase), Ordering::Release);
+    controls.state.store(
+        runtime_phase_state(generation, initial_phase),
+        Ordering::Release,
+    );
 
     let owner_task = tokio::spawn(async move {
         // Keep the fallback receiver pending for transitional owner tests/adapters
@@ -2991,11 +3015,14 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
-                        if let Err(error) = persist_runtime_snapshot(&mut runtime, &truncated) {
-                            resources = Some(runtime);
-                            let _ = done.send(Err(RuntimeError::ReconfigureFailed(error)));
-                            continue;
-                        }
+                        let undo_sidecars = match persist_runtime_undo(&mut runtime, &truncated) {
+                            Ok(sidecars) => sidecars,
+                            Err(error) => {
+                                resources = Some(runtime);
+                                let _ = done.send(Err(RuntimeError::ReconfigureFailed(error)));
+                                continue;
+                            }
+                        };
                         controls.state.store(
                             runtime_phase_state(generation, RuntimePhase::Reconfiguring),
                             Ordering::Release,
@@ -3039,9 +3066,10 @@ fn spawn_runtime_owner_with_optional_agent(
                                 }));
                             }
                             Err(candidate_error) => {
-                                let restore_error = persist_runtime_snapshot(
+                                let restore_error = restore_runtime_undo(
                                     &mut runtime,
                                     original.as_ref(),
+                                    undo_sidecars,
                                 )
                                 .err();
                                 match assemble_runtime_resources(&mut runtime) {
@@ -3126,7 +3154,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let original = current_runtime_snapshot(&runtime)
                             .or_else(|| stop_report.snapshot.clone());
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
-                        let persisted = persist_runtime_snapshot(&mut runtime, &snapshot);
+                        let persisted = persist_runtime_undo(&mut runtime, &snapshot);
                         let candidate = persisted
                             .as_ref()
                             .map_err(|error| error.clone())
@@ -3156,11 +3184,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let _ = done.send(Ok(changed));
                             }
                             Err(candidate_error) => {
-                                let restore_error = original
-                                    .as_ref()
-                                    .and_then(|original| {
-                                        persist_runtime_snapshot(&mut runtime, original).err()
-                                    });
+                                let restore_error = original.as_ref().and_then(|original| {
+                                    restore_runtime_undo(
+                                        &mut runtime,
+                                        original,
+                                        persisted.ok().flatten(),
+                                    )
+                                    .err()
+                                });
                                 match assemble_runtime_resources(&mut runtime) {
                                     Ok(rollback) => {
                                         agent = Some(rollback);
@@ -4000,6 +4031,84 @@ fn session_changed(generation: u64, runtime: &RuntimeResources) -> SessionChange
     }
 }
 
+struct NativeUndoSidecars {
+    meta: SessionMeta,
+    presentation: PresentationFile,
+}
+
+fn persist_runtime_undo(
+    runtime: &mut RuntimeResources,
+    snapshot: &SessionSnapshot,
+) -> Result<Option<NativeUndoSidecars>, String> {
+    let Some(binding) = runtime.parts.session.as_ref() else {
+        runtime.parts.set_runtime_resume(snapshot.clone());
+        return Ok(None);
+    };
+    let original_meta = binding
+        .manager
+        .read_meta(&binding.id)
+        .map_err(|error| error.to_string())?;
+    if original_meta.owner != StorageOwner::Native {
+        binding
+            .manager
+            .save_snapshot(&binding.id, snapshot)
+            .map_err(|error| error.to_string())?;
+        return Ok(None);
+    }
+    let original_presentation = match binding.manager.read_presentation(&binding.id) {
+        Ok(presentation) => presentation,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => PresentationFile::default(),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut meta = original_meta.clone();
+    meta.turn_stats
+        .retain(|stat| stat.after_message <= snapshot.messages.len());
+    let surviving_turn_ids: BTreeSet<_> = meta
+        .turn_stats
+        .iter()
+        .filter_map(|stat| (stat.turn_id != 0).then_some(stat.turn_id))
+        .collect();
+    let mut presentation = original_presentation.clone();
+    presentation.retain_turns(&surviving_turn_ids);
+    meta.message_count = u32::try_from(snapshot.messages.len())
+        .map_err(|_| "snapshot message count exceeds native metadata".to_string())?;
+    meta.turn_count = u32::try_from(meta.turn_stats.len())
+        .map_err(|_| "turn count exceeds native metadata".to_string())?;
+    meta.updated_at = atomcode_capabilities::session::now_ms();
+    binding
+        .manager
+        .commit_native_runtime_mutation(&binding.lease, snapshot, &presentation, &meta)
+        .map_err(|error| error.to_string())?;
+    Ok(Some(NativeUndoSidecars {
+        meta: original_meta,
+        presentation: original_presentation,
+    }))
+}
+
+fn restore_runtime_undo(
+    runtime: &mut RuntimeResources,
+    snapshot: &SessionSnapshot,
+    sidecars: Option<NativeUndoSidecars>,
+) -> Result<(), String> {
+    let Some(sidecars) = sidecars else {
+        return persist_runtime_snapshot(runtime, snapshot);
+    };
+    let binding = runtime
+        .parts
+        .session
+        .as_ref()
+        .ok_or_else(|| "native undo rollback lost its session binding".to_string())?;
+    binding
+        .manager
+        .commit_native_runtime_mutation(
+            &binding.lease,
+            snapshot,
+            &sidecars.presentation,
+            &sidecars.meta,
+        )
+        .map_err(|error| error.to_string())
+}
+
 fn persist_runtime_snapshot(
     runtime: &mut RuntimeResources,
     snapshot: &SessionSnapshot,
@@ -4025,6 +4134,21 @@ struct RuntimeUndoPlan {
     restored_prompt: String,
     target_n: usize,
     prompts_before: usize,
+}
+
+pub fn undo_snapshot_to_prompt(
+    snapshot: &SessionSnapshot,
+    nth: Option<usize>,
+) -> Result<SnapshotUndoResult, RuntimeError> {
+    let plan = compute_runtime_undo(&snapshot.messages, nth)?;
+    let mut truncated = snapshot.clone();
+    truncated.messages = plan.truncated;
+    Ok(SnapshotUndoResult {
+        snapshot: truncated,
+        restored_prompt: plan.restored_prompt,
+        target_n: plan.target_n,
+        prompts_before: plan.prompts_before,
+    })
 }
 
 fn compute_runtime_undo(
@@ -4353,7 +4477,9 @@ mod tests {
                     "login required".into(),
                 ))
             } else {
-                Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![])))
+                Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(
+                    vec![],
+                )))
             }
         }
     }
@@ -5197,14 +5323,15 @@ mod tests {
         let mut start = native_start(false);
         start.provider_factory = factory.clone();
 
-        let runtime = CodingRuntime::start_with_bootstrap(
-            start,
-            ProviderBootstrap::RecoverAuthentication,
-        )
-        .await
-        .unwrap();
+        let runtime =
+            CodingRuntime::start_with_bootstrap(start, ProviderBootstrap::RecoverAuthentication)
+                .await
+                .unwrap();
 
-        assert_eq!(runtime.handle.status().phase, RuntimePhase::AwaitingProvider);
+        assert_eq!(
+            runtime.handle.status().phase,
+            RuntimePhase::AwaitingProvider
+        );
         assert!(matches!(
             runtime.handle.submit(UserInput::from("blocked")).await,
             Err(RuntimeError::ProviderUnavailable(
@@ -5234,15 +5361,16 @@ mod tests {
                 .unwrap(),
             RuntimeGeneration(1)
         );
-        assert_eq!(runtime.handle.status().phase, RuntimePhase::AwaitingProvider);
+        assert_eq!(
+            runtime.handle.status().phase,
+            RuntimePhase::AwaitingProvider
+        );
         let unavailable = loop {
-            let event = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                runtime.events.recv(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(1), runtime.events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
             if let CodingRuntimeEvent::ProviderUnavailable { reason, forced } = event.event {
                 break (reason, forced);
             }
@@ -5407,7 +5535,10 @@ mod tests {
         handle.start_goal("tests pass").await.unwrap();
         assert!(matches!(
             runtime_events.recv().await,
-            Some(CodingRuntimeEvent::GoalChanged(GoalProgress { active: true, .. }))
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                ..
+            }))
         ));
         handle
             .submit(UserInput::from("initial turn"))
@@ -5625,13 +5756,10 @@ mod tests {
             provider_factory,
             plugin_hooks,
         } = native_start(false);
-        let parts = prepare_with_plugin_hook_source(
-            &config,
-            prepare.clone(),
-            plugin_hooks.as_ref(),
-        )
-        .await
-        .unwrap();
+        let parts =
+            prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
+                .await
+                .unwrap();
         let resources = RuntimeResources {
             config,
             prepare,
@@ -5655,9 +5783,15 @@ mod tests {
         handle.start_loop("watch CI").await.unwrap();
         assert!(matches!(
             runtime_events.recv().await,
-            Some(CodingRuntimeEvent::LoopChanged(LoopProgress { active: true, .. }))
+            Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
+                active: true,
+                ..
+            }))
         ));
-        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -5671,14 +5805,20 @@ mod tests {
             .unwrap();
         assert!(matches!(
             runtime_events.recv().await,
-            Some(CodingRuntimeEvent::LoopChanged(LoopProgress { active: true, .. }))
+            Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
+                active: true,
+                ..
+            }))
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
                 reason: StopReason::Stopped,
             })
             .unwrap();
-        assert!(matches!(kernel_commands.recv().await, Some(AgentCommand::Snapshot)));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
         kernel_events
             .send(AgentEvent::Snapshot {
                 snapshot: SessionSnapshot::new(vec![Message::user("persisted")]),
@@ -5698,19 +5838,27 @@ mod tests {
         .expect("snapshot never entered the held-turn state");
         assert!(matches!(
             runtime_events.recv().await,
-            Some(CodingRuntimeEvent::LoopChanged(LoopProgress { active: false, .. }))
-        ));
-        assert!(matches!(
-            runtime_events.recv().await,
-            Some(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
-                turn_id: 1,
-                reason: StopReason::Cancelled,
+            Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
+                active: false,
                 ..
             }))
         ));
         assert!(matches!(
             runtime_events.recv().await,
-            Some(CodingRuntimeEvent::GoalChanged(GoalProgress { active: true, .. }))
+            Some(CodingRuntimeEvent::TurnFinished(
+                TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: StopReason::Cancelled,
+                    ..
+                }
+            ))
+        ));
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                ..
+            }))
         ));
         assert_eq!(handle.status().phase, RuntimePhase::Ready);
 
@@ -5729,13 +5877,10 @@ mod tests {
             plugin_hooks,
             ..
         } = native_start(false);
-        let parts = prepare_with_plugin_hook_source(
-            &config,
-            prepare.clone(),
-            plugin_hooks.as_ref(),
-        )
-        .await
-        .unwrap();
+        let parts =
+            prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
+                .await
+                .unwrap();
         let resources = RuntimeResources {
             config,
             prepare,
@@ -5759,9 +5904,15 @@ mod tests {
         handle.start_goal("tests pass").await.unwrap();
         assert!(matches!(
             runtime_events.recv().await,
-            Some(CodingRuntimeEvent::GoalChanged(GoalProgress { active: true, .. }))
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                ..
+            }))
         ));
-        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -5771,7 +5922,10 @@ mod tests {
                 reason: StopReason::Stopped,
             })
             .unwrap();
-        assert!(matches!(kernel_commands.recv().await, Some(AgentCommand::Snapshot)));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
         kernel_events
             .send(AgentEvent::Snapshot {
                 snapshot: SessionSnapshot::new(vec![Message::user("persisted")]),
@@ -5791,19 +5945,27 @@ mod tests {
         .expect("snapshot never entered the held-turn state");
         assert!(matches!(
             runtime_events.recv().await,
-            Some(CodingRuntimeEvent::GoalChanged(GoalProgress { active: false, .. }))
-        ));
-        assert!(matches!(
-            runtime_events.recv().await,
-            Some(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
-                turn_id: 1,
-                reason: StopReason::Cancelled,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: false,
                 ..
             }))
         ));
         assert!(matches!(
             runtime_events.recv().await,
-            Some(CodingRuntimeEvent::LoopChanged(LoopProgress { active: true, .. }))
+            Some(CodingRuntimeEvent::TurnFinished(
+                TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: StopReason::Cancelled,
+                    ..
+                }
+            ))
+        ));
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
+                active: true,
+                ..
+            }))
         ));
         assert_eq!(handle.status().phase, RuntimePhase::Ready);
 
@@ -5822,13 +5984,10 @@ mod tests {
             provider_factory,
             plugin_hooks,
         } = native_start(false);
-        let parts = prepare_with_plugin_hook_source(
-            &config,
-            prepare.clone(),
-            plugin_hooks.as_ref(),
-        )
-        .await
-        .unwrap();
+        let parts =
+            prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
+                .await
+                .unwrap();
         let resources = RuntimeResources {
             config,
             prepare,
@@ -5849,7 +6008,10 @@ mod tests {
             Some(wakeup_rx),
         );
 
-        handle.submit(UserInput::from("still running")).await.unwrap();
+        handle
+            .submit(UserInput::from("still running"))
+            .await
+            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -5883,13 +6045,10 @@ mod tests {
             provider_factory,
             plugin_hooks,
         } = native_start(false);
-        let parts = prepare_with_plugin_hook_source(
-            &config,
-            prepare.clone(),
-            plugin_hooks.as_ref(),
-        )
-        .await
-        .unwrap();
+        let parts =
+            prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
+                .await
+                .unwrap();
         let resources = RuntimeResources {
             config,
             prepare,
@@ -5912,7 +6071,10 @@ mod tests {
 
         handle.start_loop("watch CI").await.unwrap();
         let _ = runtime_events.recv().await;
-        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
         let _ = kernel_commands.recv().await;
         wakeup_tx
             .send(WakeupRequest {
@@ -5927,7 +6089,10 @@ mod tests {
                 reason: StopReason::Stopped,
             })
             .unwrap();
-        assert!(matches!(kernel_commands.recv().await, Some(AgentCommand::Snapshot)));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
         kernel_events
             .send(AgentEvent::Snapshot {
                 snapshot: SessionSnapshot::new(vec![Message::user("persisted")]),
@@ -5944,15 +6109,20 @@ mod tests {
         ));
         assert!(matches!(
             runtime_events.recv().await,
-            Some(CodingRuntimeEvent::LoopChanged(LoopProgress { active: false, .. }))
+            Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
+                active: false,
+                ..
+            }))
         ));
         assert!(matches!(
             runtime_events.recv().await,
-            Some(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
-                turn_id: 1,
-                reason: StopReason::Cancelled,
-                ..
-            }))
+            Some(CodingRuntimeEvent::TurnFinished(
+                TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: StopReason::Cancelled,
+                    ..
+                }
+            ))
         ));
         assert!(matches!(
             runtime_events.recv().await,
@@ -6147,6 +6317,38 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
+    async fn importer_lease_is_transferred_without_an_unlocked_resume_window() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let id = "imported-runtime";
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        manager
+            .save_snapshot(id, &SessionSnapshot::new(vec![Message::user("persisted")]))
+            .unwrap();
+        let mut meta = SessionMeta::new(id, project.path().to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        manager.write_meta(&meta).unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.into());
+
+        let runtime =
+            CodingRuntime::start_with_session_lease(start, ProviderBootstrap::Required, lease)
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            manager.acquire_lease(id),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        runtime.handle.shutdown().await.unwrap();
+        manager.acquire_lease(id).unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
     async fn session_switch_conflict_keeps_old_owner_then_transfers_both_leases() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -6280,6 +6482,27 @@ mod tests {
         let current = runtime.handle.snapshot().await.unwrap();
         assert_eq!(current.messages, result.snapshot.messages);
         runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn offline_undo_preserves_snapshot_counters_and_truncates_at_selected_prompt() {
+        let mut snapshot = SessionSnapshot::new(vec![
+            Message::system("system"),
+            Message::user("first"),
+            Message::assistant("answer", Vec::new()),
+            Message::user("second"),
+            Message::assistant("answer 2", Vec::new()),
+        ]);
+        snapshot.turn_counter = 9;
+        snapshot.request_counter = 12;
+
+        let undo = undo_snapshot_to_prompt(&snapshot, Some(2)).unwrap();
+
+        assert_eq!(undo.restored_prompt, "second");
+        assert_eq!(undo.prompts_before, 2);
+        assert_eq!(undo.snapshot.messages.len(), 3);
+        assert_eq!(undo.snapshot.turn_counter, 9);
+        assert_eq!(undo.snapshot.request_counter, 12);
     }
 
     #[tokio::test]

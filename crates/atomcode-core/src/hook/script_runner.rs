@@ -6,8 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
 use crate::hook::{
-    Hook, HookCtx, HookResult, PreToolExecutionHook, PostToolExecutionHook,
-    PostTurnHook, SystemPromptHook, ToolResultContext,
+    Hook, HookCtx, HookResult, PostToolExecutionHook, PostTurnHook, PreToolExecutionHook,
+    SystemPromptHook, ToolResultContext,
 };
 
 /// 脚本 Hook 配置
@@ -58,7 +58,7 @@ impl ScriptHook {
     /// 执行脚本并获取结果
     async fn run_script(&self, input_json: &str) -> Result<String, String> {
         let script_path = &self.config.script;
-        
+
         // 检查脚本是否存在
         if !script_path.exists() {
             return Err(format!("Script not found: {}", script_path.display()));
@@ -69,12 +69,20 @@ impl ScriptHook {
             "python" => ("python", vec![script_path.to_string_lossy().to_string()]),
             "shell" | "bash" => {
                 if cfg!(windows) {
-                    ("cmd", vec!["/C".to_string(), script_path.to_string_lossy().to_string()])
+                    (
+                        "cmd",
+                        vec!["/C".to_string(), script_path.to_string_lossy().to_string()],
+                    )
                 } else {
                     ("sh", vec![script_path.to_string_lossy().to_string()])
                 }
             }
-            _ => return Err(format!("Unsupported script type: {}", self.config.script_type)),
+            _ => {
+                return Err(format!(
+                    "Unsupported script type: {}",
+                    self.config.script_type
+                ))
+            }
         };
 
         // 启动子进程
@@ -180,13 +188,34 @@ impl ScriptHook {
 
         // 解析简单字符串格式
         if output.starts_with("warning:") || output.starts_with("WARN:") {
-            return HookResult::Warning(output.splitn(2, ':').nth(1).unwrap_or("").trim().to_string());
+            return HookResult::Warning(
+                output
+                    .splitn(2, ':')
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            );
         }
         if output.starts_with("deny:") || output.starts_with("DENY:") {
-            return HookResult::Denied(output.splitn(2, ':').nth(1).unwrap_or("").trim().to_string());
+            return HookResult::Denied(
+                output
+                    .splitn(2, ':')
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            );
         }
         if output.starts_with("modify:") || output.starts_with("MODIFY:") {
-            return HookResult::Modified(output.splitn(2, ':').nth(1).unwrap_or("").trim().to_string());
+            return HookResult::Modified(
+                output
+                    .splitn(2, ':')
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            );
         }
 
         // 默认：视为成功
@@ -223,9 +252,15 @@ impl PreToolExecutionHook for ScriptHook {
 impl PostToolExecutionHook for ScriptHook {
     async fn on_post_execute(&self, ctx: &HookCtx, result_ctx: &ToolResultContext) -> HookResult {
         let mut combined = serde_json::Map::new();
-        combined.insert("hook_context".to_string(), serde_json::to_value(ctx).unwrap_or_default());
-        combined.insert("result_context".to_string(), serde_json::to_value(result_ctx).unwrap_or_default());
-        
+        combined.insert(
+            "hook_context".to_string(),
+            serde_json::to_value(ctx).unwrap_or_default(),
+        );
+        combined.insert(
+            "result_context".to_string(),
+            serde_json::to_value(result_ctx).unwrap_or_default(),
+        );
+
         let input = serde_json::to_string(&combined).unwrap_or_default();
         match self.run_script(&input).await {
             Ok(output) => self.parse_output(&output),
@@ -238,9 +273,15 @@ impl PostToolExecutionHook for ScriptHook {
 impl PostTurnHook for ScriptHook {
     async fn on_post_turn(&self, ctx: &HookCtx, turn_result: &str) -> HookResult {
         let mut combined = serde_json::Map::new();
-        combined.insert("hook_context".to_string(), serde_json::to_value(ctx).unwrap_or_default());
-        combined.insert("turn_result".to_string(), serde_json::Value::String(turn_result.to_string()));
-        
+        combined.insert(
+            "hook_context".to_string(),
+            serde_json::to_value(ctx).unwrap_or_default(),
+        );
+        combined.insert(
+            "turn_result".to_string(),
+            serde_json::Value::String(turn_result.to_string()),
+        );
+
         let input = serde_json::to_string(&combined).unwrap_or_default();
         match self.run_script(&input).await {
             Ok(output) => self.parse_output(&output),
@@ -254,7 +295,7 @@ impl SystemPromptHook for ScriptHook {
     async fn extend_system_prompt(&self) -> Option<String> {
         let empty_ctx = HookCtx::new("".to_string(), "".to_string(), "".to_string());
         let input = serde_json::to_string(&empty_ctx).unwrap_or_default();
-        
+
         match self.run_script(&input).await {
             Ok(output) if !output.is_empty() => Some(output),
             _ => None,

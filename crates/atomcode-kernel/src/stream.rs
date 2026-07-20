@@ -156,19 +156,46 @@ mod tests {
     fn merge_max_keeps_split_and_cumulative_fields() {
         // Anthropic-style split: input early, cumulative output across later deltas.
         let mut u = TokenUsage::default();
-        u.merge_max(TokenUsage { prompt: 100, completion: 0, cached: 10 }); // message_start
-        u.merge_max(TokenUsage { prompt: 0, completion: 20, cached: 0 }); // message_delta
-        u.merge_max(TokenUsage { prompt: 0, completion: 50, cached: 0 }); // message_delta (cumulative)
+        u.merge_max(TokenUsage {
+            prompt: 100,
+            completion: 0,
+            cached: 10,
+        }); // message_start
+        u.merge_max(TokenUsage {
+            prompt: 0,
+            completion: 20,
+            cached: 0,
+        }); // message_delta
+        u.merge_max(TokenUsage {
+            prompt: 0,
+            completion: 50,
+            cached: 0,
+        }); // message_delta (cumulative)
         assert_eq!(
             u,
-            TokenUsage { prompt: 100, completion: 50, cached: 10 },
+            TokenUsage {
+                prompt: 100,
+                completion: 50,
+                cached: 10
+            },
             "split fields are kept and cumulative output is not double-counted"
         );
 
         // OpenAI-style single cumulative event: merge is a no-op equivalent.
         let mut o = TokenUsage::default();
-        o.merge_max(TokenUsage { prompt: 200, completion: 30, cached: 5 });
-        assert_eq!(o, TokenUsage { prompt: 200, completion: 30, cached: 5 });
+        o.merge_max(TokenUsage {
+            prompt: 200,
+            completion: 30,
+            cached: 5,
+        });
+        assert_eq!(
+            o,
+            TokenUsage {
+                prompt: 200,
+                completion: 30,
+                cached: 5
+            }
+        );
     }
 }
 
@@ -177,7 +204,13 @@ mod overflow_tests {
     use super::ProviderError;
 
     fn err(http: Option<u16>, code: Option<&str>, msg: &str) -> ProviderError {
-        ProviderError { retryable: false, message: msg.into(), http_status: http, code: code.map(Into::into), retry_after_secs: None }
+        ProviderError {
+            retryable: false,
+            message: msg.into(),
+            http_status: http,
+            code: code.map(Into::into),
+            retry_after_secs: None,
+        }
     }
 
     #[test]
@@ -186,11 +219,21 @@ mod overflow_tests {
     }
     #[test]
     fn anthropic_message_is_overflow() {
-        assert!(err(Some(400), None, "prompt is too long: 250000 tokens > 200000").is_context_overflow());
+        assert!(err(
+            Some(400),
+            None,
+            "prompt is too long: 250000 tokens > 200000"
+        )
+        .is_context_overflow());
     }
     #[test]
     fn generic_400_context_message_is_overflow() {
-        assert!(err(Some(400), None, "This model's maximum context length is 8192 tokens").is_context_overflow());
+        assert!(err(
+            Some(400),
+            None,
+            "This model's maximum context length is 8192 tokens"
+        )
+        .is_context_overflow());
     }
     #[test]
     fn auth_and_model_errors_are_not_overflow() {

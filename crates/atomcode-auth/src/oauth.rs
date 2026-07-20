@@ -87,7 +87,9 @@ fn apply_blocking_proxy_policy(
     builder: reqwest::blocking::ClientBuilder,
 ) -> reqwest::blocking::ClientBuilder {
     atomcode_config::proxy::ensure_runtime_initialized();
-    if std::env::var(atomcode_config::proxy::MODE_ENV).ok().as_deref()
+    if std::env::var(atomcode_config::proxy::MODE_ENV)
+        .ok()
+        .as_deref()
         == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
     {
         builder.no_proxy()
@@ -646,7 +648,11 @@ pub fn open_browser(url: &str) -> Result<()> {
     }
 
     // ShellExecute failed (rare). Fall back to the legacy launchers.
-    if std::process::Command::new("explorer").arg(url).spawn().is_ok() {
+    if std::process::Command::new("explorer")
+        .arg(url)
+        .spawn()
+        .is_ok()
+    {
         return Ok(());
     }
     std::process::Command::new("cmd")

@@ -23,30 +23,30 @@ fn ascii_for(ch: char) -> Option<&'static str> {
         // ── status marks (the i18n `✓`/`✗`/`⚠` family — the reported tofu) ──
         '\u{2713}' | '\u{2705}' | '\u{2714}' => "v", // ✓ ✅ ✔
         '\u{2717}' | '\u{2718}' | '\u{274C}' | '\u{2716}' => "x", // ✗ ✘ ❌ ✖
-        '\u{26A0}' => "!",  // ⚠
-        '\u{2139}' | '\u{24D8}' => "i", // ℹ ⓘ
-        '\u{1F4A1}' => "*", // 💡
+        '\u{26A0}' => "!",                           // ⚠
+        '\u{2139}' | '\u{24D8}' => "i",              // ℹ ⓘ
+        '\u{1F4A1}' => "*",                          // 💡
         // ── bullets / circles / diamonds (tool headers, list markers) ──
         '\u{25CF}' | '\u{25C6}' | '\u{25CE}' | '\u{23FA}' | '\u{2B24}' => "*", // ● ◆ ◎ ⏺ ⬤
-        '\u{25CB}' | '\u{25E6}' | '\u{25C7}' | '\u{25A2}' => "o", // ○ ◦ ◇ ▢
+        '\u{25CB}' | '\u{25E6}' | '\u{25C7}' | '\u{25A2}' => "o",              // ○ ◦ ◇ ▢
         '\u{2022}' | '\u{2219}' => "*", // • ∙  (·  U+00B7 is Latin-1, renders fine — left as-is)
         // ── triangles / play / pointers ──
         '\u{25B8}' | '\u{25B6}' | '\u{25BA}' | '\u{276F}' => ">", // ▸ ▶ ► ❯
-        '\u{25C2}' | '\u{25C0}' => "<", // ◂ ◀
+        '\u{25C2}' | '\u{25C0}' => "<",                           // ◂ ◀
         // ── arrows ──
         '\u{2192}' | '\u{21D2}' | '\u{21A6}' | '\u{21B3}' | '\u{2794}' | '\u{27A4}' => ">", // → ⇒ ↦ ↳ ➔ ➤
         '\u{2190}' | '\u{21D0}' | '\u{21A9}' | '\u{21B5}' | '\u{23CE}' => "<", // ← ⇐ ↩ ↵ ⏎
-        '\u{2191}' | '\u{21D1}' => "^", // ↑ ⇑
-        '\u{2193}' | '\u{21D3}' => "v", // ↓ ⇓
+        '\u{2191}' | '\u{21D1}' => "^",                                        // ↑ ⇑
+        '\u{2193}' | '\u{21D3}' => "v",                                        // ↓ ⇓
         '\u{2194}' | '\u{21D4}' | '\u{21BB}' | '\u{21BA}' | '\u{1F504}' => "~", // ↔ ⇔ ↻ ↺ 🔄
         // ── media/state controls ──
-        '\u{23F8}' => "=",  // ⏸
-        '\u{23F9}' => "#",  // ⏹
+        '\u{23F8}' => "=",              // ⏸
+        '\u{23F9}' => "#",              // ⏹
         '\u{23F3}' | '\u{231B}' => "~", // ⏳ ⌛
         // ── box drawing (rules, trees, tables) → classic ASCII box ──
         '\u{2500}' | '\u{2550}' | '\u{2501}' => "-", // ─ ═ ━
         '\u{2502}' | '\u{2551}' | '\u{2503}' | '\u{258E}' => "|", // │ ║ ┃ ▎
-        '\u{23BD}' | '\u{23BC}' => "_", // ⎽ ⎼ horizontal scan lines
+        '\u{23BD}' | '\u{23BC}' => "_",              // ⎽ ⎼ horizontal scan lines
         '\u{23BF}' | '\u{2514}' | '\u{2570}' => "`", // ⎿ └ ╰
         '\u{250C}' | '\u{2510}' | '\u{2518}' | '\u{251C}' | '\u{2524}' | '\u{252C}'
         | '\u{2534}' | '\u{253C}' | '\u{256D}' | '\u{256E}' | '\u{256F}' | '\u{2554}'
@@ -54,7 +54,7 @@ fn ascii_for(ch: char) -> Option<&'static str> {
         | '\u{2569}' | '\u{256C}' => "+", // ┌┐┘├┤┬┴┼╭╮╯ + double variants
         // ── blocks / shades (progress bars, banners) ──
         '\u{2588}' | '\u{2580}' | '\u{2584}' | '\u{2592}' | '\u{2593}' => "#", // █ ▀ ▄ ▒ ▓
-        '\u{2591}' => ".",  // ░
+        '\u{2591}' => ".",                                                     // ░
         // ── weather / status emoji that leak into output ──
         '\u{1F7E2}' | '\u{1F7E1}' | '\u{1F534}' | '\u{1F535}' | '\u{1F7E0}' => "*", // 🟢🟡🔴🔵🟠
         _ => return None,
@@ -97,18 +97,27 @@ mod tests {
 
     #[test]
     fn unicode_terminal_unchanged() {
-        assert!(matches!(downgrade_glyphs("✓ Baked · ─────", true), Cow::Borrowed(_)));
+        assert!(matches!(
+            downgrade_glyphs("✓ Baked · ─────", true),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
     fn ascii_input_is_zero_copy() {
-        assert!(matches!(downgrade_glyphs("v Stopped - 0 rounds", false), Cow::Borrowed(_)));
+        assert!(matches!(
+            downgrade_glyphs("v Stopped - 0 rounds", false),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
     fn no_mapped_glyph_is_zero_copy() {
         // CJK is content, never downgraded — and triggers no allocation.
-        assert!(matches!(downgrade_glyphs("写一个网页", false), Cow::Borrowed(_)));
+        assert!(matches!(
+            downgrade_glyphs("写一个网页", false),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
@@ -122,7 +131,10 @@ mod tests {
     fn tool_and_box_glyphs_downgrade() {
         assert_eq!(downgrade_glyphs("● Bash", false), "* Bash");
         assert_eq!(downgrade_glyphs("└ → done", false), "` > done");
-        assert_eq!(downgrade_glyphs("──── label ────", false), "---- label ----");
+        assert_eq!(
+            downgrade_glyphs("──── label ────", false),
+            "---- label ----"
+        );
     }
 
     #[test]

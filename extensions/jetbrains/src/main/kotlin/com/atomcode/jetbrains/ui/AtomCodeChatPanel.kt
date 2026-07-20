@@ -407,7 +407,7 @@ class AtomCodeChatPanel(
 
     private fun renderSetupSnapshot(snapshot: SetupSnapshot) {
         setupSnapshot = snapshot
-        loggedIn = snapshot.auth?.loggedIn == true
+        loggedIn = snapshot.auth?.let { it.loggedIn && !it.expired } == true
 
         loadingModels = true
         modelPicker.removeAllItems()
@@ -431,17 +431,20 @@ class AtomCodeChatPanel(
     private fun login() {
         service.loginWithBrowser { message ->
             SwingUtilities.invokeLater {
-                header.updateConnectionState(ConnectionState.CheckingDaemon)
+                header.updateLoginStatus(message)
             }
         }.whenComplete { snapshot, error ->
             SwingUtilities.invokeLater {
                 if (error != null) {
-                    addErrorMessage("Login failed: ${error.cause?.message ?: error.message ?: "failed"}")
+                    header.updateLoginStatus(
+                        "Login failed: ${error.cause?.message ?: error.message ?: "failed"}",
+                        failed = true,
+                    )
                     refreshSetupSnapshot()
                     return@invokeLater
                 }
                 renderSetupSnapshot(snapshot)
-                addSystemMessage("Login complete.")
+                header.updateConnectionState(service.connectionState)
             }
         }
     }
@@ -1774,7 +1777,7 @@ class AtomCodeChatPanel(
     private fun handleLocalInputCommand(prompt: String): Boolean {
         val command = prompt.split(Regex("\\s+"), limit = 2).firstOrNull()?.lowercase() ?: return false
         return when (command) {
-            "/login" -> { addSystemMessage("Opening AtomGit sign-in in your browser..."); login(); true }
+            "/login" -> { login(); true }
             else -> false
         }
     }

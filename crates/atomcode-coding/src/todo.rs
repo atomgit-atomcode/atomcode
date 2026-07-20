@@ -5,7 +5,9 @@
 
 use async_trait::async_trait;
 use atomcode_capabilities::reminder::system_reminder;
-use atomcode_capabilities::tools::todo::{derive_current_todos, render_todos_numbered, TodoItem, TodoStatus};
+use atomcode_capabilities::tools::todo::{
+    derive_current_todos, render_todos_numbered, TodoItem, TodoStatus,
+};
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, Role};
 
@@ -36,7 +38,9 @@ fn current_real_user_start(convo: &Conversation) -> usize {
 fn completion_nudge_already_present(convo: &Conversation) -> bool {
     let start = current_real_user_start(convo);
     convo.messages[start..].iter().any(|m| {
-        m.role == Role::User && m.synthetic && m.text.trim_start().starts_with(TODO_COMPLETION_NUDGE)
+        m.role == Role::User
+            && m.synthetic
+            && m.text.trim_start().starts_with(TODO_COMPLETION_NUDGE)
     })
 }
 
@@ -46,9 +50,11 @@ fn completion_nudge_already_present(convo: &Conversation) -> bool {
 /// continuation. Mirrors `VerifyCadenceHook`'s narrow "only right after an edit" scoping.
 fn managed_todos_this_turn(convo: &Conversation) -> bool {
     let start = current_real_user_start(convo);
-    convo.messages[start..]
-        .iter()
-        .any(|m| m.tool_calls.iter().any(|c| c.name == "todo" || c.name == "todowrite"))
+    convo.messages[start..].iter().any(|m| {
+        m.tool_calls
+            .iter()
+            .any(|c| c.name == "todo" || c.name == "todowrite")
+    })
 }
 
 /// The mid-work "reconcile your pointer" anchor prepended to the per-request reminder.
@@ -64,7 +70,10 @@ fn managed_todos_this_turn(convo: &Conversation) -> bool {
 /// - Otherwise (all completed) → `None` (nothing to reconcile; don't add noise).
 /// `id` is the 1-based position, matching `render_todos_numbered`.
 fn todo_anchor_line(todos: &[TodoItem]) -> Option<String> {
-    if let Some(i) = todos.iter().position(|t| t.status == TodoStatus::InProgress) {
+    if let Some(i) = todos
+        .iter()
+        .position(|t| t.status == TodoStatus::InProgress)
+    {
         return Some(format!(
             ">> You are currently ON task #{} \"{}\". Before your NEXT action, reconcile: if it \
 is actually DONE, mark it completed now (`{{\"action\":\"update\",\"id\":{},\"status\":\"completed\"}}`); \
@@ -133,13 +142,23 @@ mod tests {
     use atomcode_kernel::tool::ToolCall;
 
     fn todowrite_msg(args: &str) -> Message {
-        Message::assistant("", vec![ToolCall { id: "1".into(), name: "todowrite".into(), arguments: args.into() }])
+        Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "1".into(),
+                name: "todowrite".into(),
+                arguments: args.into(),
+            }],
+        )
     }
 
     // ---- mid-work drift backstop: the anchor line ------------------------------------------
 
     fn item(content: &str, status: TodoStatus) -> TodoItem {
-        TodoItem { content: content.into(), status }
+        TodoItem {
+            content: content.into(),
+            status,
+        }
     }
 
     #[test]
@@ -153,7 +172,10 @@ mod tests {
         let a = todo_anchor_line(&todos).expect("in_progress → anchor");
         assert!(a.contains("#2"), "must name the 1-based id: {a}");
         assert!(a.contains("do the thing"), "must name the title: {a}");
-        assert!(a.contains("reconcile") && a.contains("moved on"), "must force reconcile: {a}");
+        assert!(
+            a.contains("reconcile") && a.contains("moved on"),
+            "must force reconcile: {a}"
+        );
     }
 
     #[test]
@@ -186,12 +208,24 @@ mod tests {
         ];
         TodoHook.pre_request(&mut msgs, &TurnCtx::default()).await;
         let last = &msgs[msgs.len() - 1];
-        assert!(last.text.contains("currently ON task #1"), "anchor must lead: {}", last.text);
-        assert!(last.text.contains("step one"), "anchor must name the task: {}", last.text);
+        assert!(
+            last.text.contains("currently ON task #1"),
+            "anchor must lead: {}",
+            last.text
+        );
+        assert!(
+            last.text.contains("step one"),
+            "anchor must name the task: {}",
+            last.text
+        );
         // The anchor precedes the list body.
         let anchor_at = last.text.find("currently ON task").unwrap();
         let list_at = last.text.find("Current task list").unwrap();
-        assert!(anchor_at < list_at, "anchor must come before the list: {}", last.text);
+        assert!(
+            anchor_at < list_at,
+            "anchor must come before the list: {}",
+            last.text
+        );
     }
 
     #[tokio::test]
@@ -230,25 +264,38 @@ mod tests {
         // The reported gap: the model produced its final summary but left an item open.
         let convo = convo_of(vec![
             Message::user("do the audit"),
-            todowrite_msg(r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}"#),
+            todowrite_msg(
+                r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}"#,
+            ),
             Message::assistant("here is the summary…", vec![]),
         ]);
-        assert!(TodoHook.offer_continuation(&convo).await.is_some(), "open item on stop must nudge");
+        assert!(
+            TodoHook.offer_continuation(&convo).await.is_some(),
+            "open item on stop must nudge"
+        );
     }
 
     #[tokio::test]
     async fn no_nudge_when_all_completed() {
         let convo = convo_of(vec![
             Message::user("do it"),
-            todowrite_msg(r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"completed"}]}"#),
+            todowrite_msg(
+                r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"completed"}]}"#,
+            ),
             Message::assistant("all done", vec![]),
         ]);
-        assert!(TodoHook.offer_continuation(&convo).await.is_none(), "all completed → let it stop");
+        assert!(
+            TodoHook.offer_continuation(&convo).await.is_none(),
+            "all completed → let it stop"
+        );
     }
 
     #[tokio::test]
     async fn no_nudge_when_no_todos() {
-        let convo = convo_of(vec![Message::user("hi"), Message::assistant("hi there", vec![])]);
+        let convo = convo_of(vec![
+            Message::user("hi"),
+            Message::assistant("hi there", vec![]),
+        ]);
         assert!(TodoHook.offer_continuation(&convo).await.is_none());
     }
 
@@ -276,10 +323,17 @@ mod tests {
             todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
             Message::assistant("summary", vec![]),
         ]);
-        assert!(TodoHook.offer_continuation(&convo).await.is_some(), "first stop nudges");
+        assert!(
+            TodoHook.offer_continuation(&convo).await.is_some(),
+            "first stop nudges"
+        );
         // Kernel injected the nudge as a synthetic user message; model stops again without closing.
-        convo.messages.push(Message::synthetic_user(TODO_COMPLETION_NUDGE));
-        convo.messages.push(Message::assistant("still open", vec![]));
+        convo
+            .messages
+            .push(Message::synthetic_user(TODO_COMPLETION_NUDGE));
+        convo
+            .messages
+            .push(Message::assistant("still open", vec![]));
         assert!(
             TodoHook.offer_continuation(&convo).await.is_none(),
             "already nudged this turn → let it stop (no spin)"

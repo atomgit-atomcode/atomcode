@@ -322,10 +322,7 @@ mod tests {
         let raw: HooksFile = serde_json::from_str(json).unwrap();
         assert_eq!(raw.hooks.len(), 3);
         assert_eq!(raw.hooks["block-rm"].timeout_ms, 5000);
-        assert_eq!(
-            raw.hooks["block-rm"].matcher.as_deref(),
-            Some("bash")
-        );
+        assert_eq!(raw.hooks["block-rm"].matcher.as_deref(), Some("bash"));
         assert_eq!(raw.hooks["auto-format"].event, "post_tool_use");
     }
 

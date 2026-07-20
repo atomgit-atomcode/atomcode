@@ -60,7 +60,10 @@ pub struct WebSearchTool {
 
 impl Default for WebSearchTool {
     fn default() -> Self {
-        Self { provider: SearchProvider::Exa, exa_api_key: env_exa_key() }
+        Self {
+            provider: SearchProvider::Exa,
+            exa_api_key: env_exa_key(),
+        }
     }
 }
 
@@ -71,20 +74,31 @@ impl WebSearchTool {
     }
     /// Exa backend with an explicit key (`None` ⇒ keyless / `EXA_API_KEY` env fallback).
     pub fn exa(api_key: Option<String>) -> Self {
-        Self { provider: SearchProvider::Exa, exa_api_key: api_key.or_else(env_exa_key) }
+        Self {
+            provider: SearchProvider::Exa,
+            exa_api_key: api_key.or_else(env_exa_key),
+        }
     }
     /// Legacy DuckDuckGo backend (no key).
     pub fn duckduckgo() -> Self {
-        Self { provider: SearchProvider::DuckDuckGo, exa_api_key: None }
+        Self {
+            provider: SearchProvider::DuckDuckGo,
+            exa_api_key: None,
+        }
     }
     /// Build from a provider string (e.g. from config); Exa for unknown values.
     pub fn with_provider(provider: &str) -> Self {
-        Self { provider: SearchProvider::from_str(provider), exa_api_key: env_exa_key() }
+        Self {
+            provider: SearchProvider::from_str(provider),
+            exa_api_key: env_exa_key(),
+        }
     }
 }
 
 fn env_exa_key() -> Option<String> {
-    std::env::var("EXA_API_KEY").ok().filter(|s| !s.trim().is_empty())
+    std::env::var("EXA_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 #[derive(Deserialize)]
@@ -132,7 +146,11 @@ impl Tool for WebSearchTool {
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => return err(format!("web_search: invalid arguments: {e}. Expected {{\"query\":\"...\"}}.")),
+            Err(e) => {
+                return err(format!(
+                    "web_search: invalid arguments: {e}. Expected {{\"query\":\"...\"}}."
+                ))
+            }
         };
         let max = a.max_results.clamp(1, 20);
         match self.provider {
@@ -178,20 +196,26 @@ impl WebSearchTool {
             Ok(r) => r,
             Err(e) => {
                 note_network_unreachable();
-                return fail(format!("Exa web search could not reach mcp.exa.ai for '{query}': {e}"));
+                return fail(format!(
+                    "Exa web search could not reach mcp.exa.ai for '{query}': {e}"
+                ));
             }
         };
         if !resp.status().is_success() {
-            return fail(format!("Exa web search: HTTP {} for '{query}'", resp.status().as_u16()));
+            return fail(format!(
+                "Exa web search: HTTP {} for '{query}'",
+                resp.status().as_u16()
+            ));
         }
         let sse = match resp.text().await {
             Ok(t) => t,
             Err(e) => return fail(format!("Exa web search: failed to read response: {e}")),
         };
         match parse_exa_sse(&sse) {
-            Some(text) if !text.trim().is_empty() => {
-                ok(format!("Search results for \"{query}\":\n\n{}", text.trim()))
-            }
+            Some(text) if !text.trim().is_empty() => ok(format!(
+                "Search results for \"{query}\":\n\n{}",
+                text.trim()
+            )),
             _ => fail(format!(
                 "Exa web search returned no usable results for '{query}' ({} bytes received).",
                 sse.len()
@@ -218,7 +242,10 @@ impl WebSearchTool {
             }
         };
         if !resp.status().is_success() {
-            return fail(format!("web_search: HTTP {} from DuckDuckGo", resp.status().as_u16()));
+            return fail(format!(
+                "web_search: HTTP {} from DuckDuckGo",
+                resp.status().as_u16()
+            ));
         }
         let html = match resp.text().await {
             Ok(t) => t,
@@ -226,11 +253,20 @@ impl WebSearchTool {
         };
         let results = parse_ddg_results(&html, max);
         if results.is_empty() {
-            return fail(format!("web_search: no results for '{query}' ({} bytes received)", html.len()));
+            return fail(format!(
+                "web_search: no results for '{query}' ({} bytes received)",
+                html.len()
+            ));
         }
         let mut out = format!("Search results for \"{query}\":\n\n");
         for (i, r) in results.iter().enumerate() {
-            out.push_str(&format!("{}. {}\n   {}\n   {}\n\n", i + 1, r.title, r.url, r.snippet));
+            out.push_str(&format!(
+                "{}. {}\n   {}\n   {}\n\n",
+                i + 1,
+                r.title,
+                r.url,
+                r.snippet
+            ));
         }
         ok(out)
     }
@@ -308,7 +344,10 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
         let after_marker = ceil_char_boundary(html, marker_pos + link_marker.len());
 
         let tag_start = html[..marker_pos].rfind('<').unwrap_or(marker_pos);
-        let tag_end = html[after_marker..].find("</a>").map(|p| after_marker + p).unwrap_or(after_marker);
+        let tag_end = html[after_marker..]
+            .find("</a>")
+            .map(|p| after_marker + p)
+            .unwrap_or(after_marker);
 
         let safe_tag_end_plus4 = ceil_char_boundary(html, tag_end + 4);
         let tag_region = &html[tag_start..safe_tag_end_plus4];
@@ -322,7 +361,10 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
             continue;
         };
 
-        let content_start = html[after_marker..tag_end].find('>').map(|p| after_marker + p + 1).unwrap_or(after_marker);
+        let content_start = html[after_marker..tag_end]
+            .find('>')
+            .map(|p| after_marker + p + 1)
+            .unwrap_or(after_marker);
         let safe_content_start = ceil_char_boundary(html, content_start);
         let safe_tag_end = floor_char_boundary(html, tag_end);
         let title = if safe_content_start <= safe_tag_end {
@@ -336,8 +378,20 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
         let safe_tag_end2 = ceil_char_boundary(html, tag_end);
         let snippet = if let Some(sp) = html[safe_tag_end2..search_end].find(snippet_marker) {
             let snippet_pos = safe_tag_end2 + sp;
-            let s_start = ceil_char_boundary(html, html[snippet_pos..].find('>').map(|p| snippet_pos + p + 1).unwrap_or(snippet_pos));
-            let s_end = floor_char_boundary(html, html[s_start..].find("</a>").map(|p| s_start + p).unwrap_or(s_start));
+            let s_start = ceil_char_boundary(
+                html,
+                html[snippet_pos..]
+                    .find('>')
+                    .map(|p| snippet_pos + p + 1)
+                    .unwrap_or(snippet_pos),
+            );
+            let s_end = floor_char_boundary(
+                html,
+                html[s_start..]
+                    .find("</a>")
+                    .map(|p| s_start + p)
+                    .unwrap_or(s_start),
+            );
             if s_start <= s_end {
                 strip_html_tags(&html[s_start..s_end])
             } else {
@@ -348,7 +402,11 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
         };
 
         if !title.trim().is_empty() && url.starts_with("http") {
-            results.push(SearchResult { title: title.trim().to_string(), url, snippet: snippet.trim().to_string() });
+            results.push(SearchResult {
+                title: title.trim().to_string(),
+                url,
+                snippet: snippet.trim().to_string(),
+            });
         }
         pos = ceil_char_boundary(html, tag_end + 4);
     }
@@ -358,7 +416,10 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
 fn extract_ddg_url(raw: &str) -> String {
     if let Some(p) = raw.find("uddg=") {
         let start = p + 5;
-        let end = raw[start..].find('&').map(|e| start + e).unwrap_or(raw.len());
+        let end = raw[start..]
+            .find('&')
+            .map(|e| start + e)
+            .unwrap_or(raw.len());
         url_decode(&raw[start..end])
     } else if raw.starts_with("http") {
         raw.to_string()
@@ -418,11 +479,21 @@ mod tests {
     #[test]
     fn default_is_exa() {
         assert_eq!(WebSearchTool::new().provider, SearchProvider::Exa);
-        assert_eq!(WebSearchTool::duckduckgo().provider, SearchProvider::DuckDuckGo);
+        assert_eq!(
+            WebSearchTool::duckduckgo().provider,
+            SearchProvider::DuckDuckGo
+        );
         assert_eq!(SearchProvider::from_str("ddg"), SearchProvider::DuckDuckGo);
-        assert_eq!(SearchProvider::from_str("DuckDuckGo"), SearchProvider::DuckDuckGo);
+        assert_eq!(
+            SearchProvider::from_str("DuckDuckGo"),
+            SearchProvider::DuckDuckGo
+        );
         assert_eq!(SearchProvider::from_str("exa"), SearchProvider::Exa);
-        assert_eq!(SearchProvider::from_str("anything"), SearchProvider::Exa, "unknown → Exa default");
+        assert_eq!(
+            SearchProvider::from_str("anything"),
+            SearchProvider::Exa,
+            "unknown → Exa default"
+        );
     }
 
     #[test]
@@ -439,7 +510,10 @@ mod tests {
     fn parse_exa_sse_ignores_non_data_and_unparseable_lines() {
         let sse = "event: ping\n: comment\ndata: not-json\ndata: {\"result\":{\"content\":[{\"text\":\"ok\"}]}}\n";
         assert_eq!(parse_exa_sse(sse).as_deref(), Some("ok"));
-        assert!(parse_exa_sse("event: x\ndata: {}\n").is_none(), "no content → None");
+        assert!(
+            parse_exa_sse("event: x\ndata: {}\n").is_none(),
+            "no content → None"
+        );
         assert!(parse_exa_sse("").is_none());
     }
 
@@ -482,12 +556,17 @@ mod tests {
     #[test]
     #[serial_test::serial(offline_verdict)]
     fn auto_flips_offline_on_transport_failure() {
-        use atomcode_config::config::offline::{seed_offline_verdict, reset_offline_verdict_for_test, is_offline_active, OfflineMode};
+        use atomcode_config::config::offline::{
+            is_offline_active, reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
+        };
         reset_offline_verdict_for_test();
         seed_offline_verdict(OfflineMode::Auto, None);
         assert!(!is_offline_active());
         note_network_unreachable();
-        assert!(is_offline_active(), "auto flips offline after a web_search transport failure");
+        assert!(
+            is_offline_active(),
+            "auto flips offline after a web_search transport failure"
+        );
         reset_offline_verdict_for_test();
     }
 }

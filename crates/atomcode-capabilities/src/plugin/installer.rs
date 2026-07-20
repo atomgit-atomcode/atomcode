@@ -49,18 +49,18 @@ fn resolve_inline_dir(source: &str, mp_root_rel: &str) -> Result<String> {
     if normalized.is_empty() {
         Ok(mp_root_rel.to_string())
     } else {
-        Ok(format!("{}/{}", mp_root_rel, normalized.trim_end_matches('/')))
+        Ok(format!(
+            "{}/{}",
+            mp_root_rel,
+            normalized.trim_end_matches('/')
+        ))
     }
 }
 
 /// Realize an external plugin source by cloning (url/git/github) or copying
 /// (local) into `installed/<marketplace>/<plugin>/`. Returns the relative
 /// `plugin_dir` to record in state.
-fn install_external(
-    plugin_key: &str,
-    marketplace: &str,
-    ext: &ExternalSource,
-) -> Result<String> {
+fn install_external(plugin_key: &str, marketplace: &str, ext: &ExternalSource) -> Result<String> {
     let plugins_root = paths::plugins_root().ok_or_else(|| anyhow!("no plugin home"))?;
     let target_rel = format!("installed/{}/{}", marketplace, plugin_key);
     let target_abs = plugins_root.join(&target_rel);
@@ -84,7 +84,10 @@ fn install_external(
         }
         // Stale leftover — remove and continue.
         std::fs::remove_dir_all(&target_abs).with_context(|| {
-            format!("failed to remove stale install dir {}", target_abs.display())
+            format!(
+                "failed to remove stale install dir {}",
+                target_abs.display()
+            )
         })?;
     }
     if let Some(parent) = target_abs.parent() {
@@ -123,7 +126,9 @@ fn install_external(
 /// `./` and any trailing slash. (Traversal safety is enforced separately by
 /// `validate_plugin_source` before this is called.)
 fn normalize_rel_subdir(path: &str) -> String {
-    path.trim_start_matches("./").trim_end_matches('/').to_string()
+    path.trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 /// Realise a `git-subdir` source: sparse + partial clone of just `path` from
@@ -143,9 +148,19 @@ fn git_subdir_clone(git: &Path, url: &str, path: &str, pin: &GitPin, target: &Pa
     // fast, not deadlock the TUI. See `marketplace::git_command`.
     // git-subdir pins are branch names in practice (the schema's `ref`); a
     // commit `sha` would need full history, but the catalog carries none.
-    let branch = pin.git_ref.as_deref().or(pin.branch.as_deref()).map(String::from);
+    let branch = pin
+        .git_ref
+        .as_deref()
+        .or(pin.branch.as_deref())
+        .map(String::from);
     let build_partial = |cmd: &mut Command| {
-        cmd.args(["clone", "--filter=blob:none", "--no-checkout", "--depth", "1"]);
+        cmd.args([
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            "--depth",
+            "1",
+        ]);
         if let Some(b) = &branch {
             cmd.args(["--branch", b]);
         }
@@ -197,11 +212,7 @@ fn git_subdir_clone(git: &Path, url: &str, path: &str, pin: &GitPin, target: &Pa
     // The subdir must actually exist in the repo, or this plugin is empty.
     let materialised = target.join(&sub);
     if !materialised.is_dir() {
-        bail!(
-            "git-subdir path `{}` not found in repo {}",
-            sub,
-            clone_url
-        );
+        bail!("git-subdir path `{}` not found in repo {}", sub, clone_url);
     }
     Ok(())
 }
@@ -298,8 +309,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn git_clone_with_pin(git: &Path, url: &str, target: &Path, pin: &GitPin) -> Result<()> {
-    let needs_full_history =
-        pin.commit.is_some() || pin.tag.is_some() || pin.git_ref.is_some();
+    let needs_full_history = pin.commit.is_some() || pin.tag.is_some() || pin.git_ref.is_some();
     let branch = pin.branch.clone();
     super::marketplace::clone_with_optional_auth(git, url, target, |cmd| {
         cmd.arg("clone");
@@ -339,7 +349,10 @@ fn git_clone_with_pin(git: &Path, url: &str, target: &Path, pin: &GitPin) -> Res
 /// so two URLs that point at the same repo compare equal. Case is preserved
 /// because path components are case-sensitive on most git hosts.
 fn normalize_git_url(u: &str) -> String {
-    u.trim().trim_end_matches('/').trim_end_matches(".git").to_string()
+    u.trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string()
 }
 
 /// Decide whether an external source points at the same repo as the
@@ -348,9 +361,7 @@ fn normalize_git_url(u: &str) -> String {
 /// match the requested revision.
 fn external_matches_marketplace(ext: &ExternalSource, mp_url: &str) -> bool {
     let (url, pin) = match ext {
-        ExternalSource::Url { url, pin } | ExternalSource::Git { url, pin } => {
-            (url.clone(), pin)
-        }
+        ExternalSource::Url { url, pin } | ExternalSource::Git { url, pin } => (url.clone(), pin),
         ExternalSource::Github { repo, pin } => match expand_github_repo(repo) {
             Ok(u) => (u, pin),
             Err(_) => return false,
@@ -360,11 +371,7 @@ fn external_matches_marketplace(ext: &ExternalSource, mp_url: &str) -> bool {
         ExternalSource::GitSubdir { .. } => return false,
         ExternalSource::Local { .. } => return false,
     };
-    if pin.branch.is_some()
-        || pin.tag.is_some()
-        || pin.commit.is_some()
-        || pin.git_ref.is_some()
-    {
+    if pin.branch.is_some() || pin.tag.is_some() || pin.commit.is_some() || pin.git_ref.is_some() {
         return false;
     }
     normalize_git_url(&url) == normalize_git_url(mp_url)
@@ -383,14 +390,20 @@ fn validate_plugin_source(source: &str) -> Result<()> {
             Component::Normal(s) => {
                 let s = s.to_string_lossy();
                 if s.is_empty() || s == ".." || s.contains('\0') {
-                    bail!("plugin source path '{}' contains disallowed components", source);
+                    bail!(
+                        "plugin source path '{}' contains disallowed components",
+                        source
+                    );
                 }
             }
             Component::CurDir => {
                 // "./" is fine; skip.
             }
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                bail!("plugin source path '{}' contains disallowed components", source);
+                bail!(
+                    "plugin source path '{}' contains disallowed components",
+                    source
+                );
             }
         }
     }
@@ -435,14 +448,22 @@ pub fn resolve_plugin_marketplace(plugin_name: &str) -> Result<Vec<PluginMarketp
 /// and `Local` scopes, the plugin files are copied into the project's
 /// `.atomcode/plugins/` or `.atomcode/plugins/local/` directory so
 /// they are visible only within that project.
-pub fn install(plugin: &str, marketplace: &str, scope: InstallScope) -> Result<InstalledPluginInfo> {
+pub fn install(
+    plugin: &str,
+    marketplace: &str,
+    scope: InstallScope,
+) -> Result<InstalledPluginInfo> {
     let mp_state = load_marketplaces_file(&paths::marketplaces_file().unwrap())?;
     let entry = mp_state
         .marketplaces
         .get(marketplace)
         .ok_or_else(|| anyhow!("marketplace `{}` not registered", marketplace))?;
     if !entry.plugins.iter().any(|p| p == plugin) {
-        bail!("plugin `{}` not found in marketplace `{}`", plugin, marketplace);
+        bail!(
+            "plugin `{}` not found in marketplace `{}`",
+            plugin,
+            marketplace
+        );
     }
 
     // Resolve plugin source dir relative to marketplace root.
@@ -546,8 +567,8 @@ pub fn install(plugin: &str, marketplace: &str, scope: InstallScope) -> Result<I
             // Project-level install: copy the plugin files into the project's
             // .atomcode/plugins/ directory and record in the project-level
             // installed_plugins.json.
-            let working_dir = std::env::current_dir()
-                .context("cannot determine current working directory")?;
+            let working_dir =
+                std::env::current_dir().context("cannot determine current working directory")?;
             let project_root = paths::project_plugins_root(&working_dir, &scope)
                 .ok_or_else(|| anyhow!("no project plugins root for scope {:?}", scope))?;
 
@@ -555,7 +576,10 @@ pub fn install(plugin: &str, marketplace: &str, scope: InstallScope) -> Result<I
             // plugins root since marketplaces always live there).
             let source_abs = paths::plugins_root().unwrap().join(&plugin_dir_rel);
             if !source_abs.exists() {
-                bail!("plugin source directory does not exist: {}", source_abs.display());
+                bail!(
+                    "plugin source directory does not exist: {}",
+                    source_abs.display()
+                );
             }
 
             // Destination: project-level plugins dir.
@@ -603,7 +627,11 @@ pub fn install(plugin: &str, marketplace: &str, scope: InstallScope) -> Result<I
             if state.plugins.contains_key(&id) {
                 // Clean up the copy we just made.
                 std::fs::remove_dir_all(&dest_abs).ok();
-                bail!("plugin `{}` already installed in project scope {}", id, scope);
+                bail!(
+                    "plugin `{}` already installed in project scope {}",
+                    id,
+                    scope
+                );
             }
             state.plugins.insert(
                 id.clone(),
@@ -697,7 +725,8 @@ pub fn uninstall(plugin: &str, marketplace: &str, scope: InstallScope) -> Result
             // marketplace itself and must be left intact for any sibling plugins.
             if entry.plugin_dir.starts_with("installed/") {
                 if let Some(root) = paths::plugins_root() {
-                    let install_root_rel = format!("installed/{}/{}", entry.marketplace, entry.plugin);
+                    let install_root_rel =
+                        format!("installed/{}/{}", entry.marketplace, entry.plugin);
                     let abs = root.join(&install_root_rel);
                     if abs.exists() {
                         std::fs::remove_dir_all(&abs).ok();
@@ -706,15 +735,14 @@ pub fn uninstall(plugin: &str, marketplace: &str, scope: InstallScope) -> Result
             }
         }
         InstallScope::Project | InstallScope::Local => {
-            let working_dir = std::env::current_dir()
-                .context("cannot determine current working directory")?;
+            let working_dir =
+                std::env::current_dir().context("cannot determine current working directory")?;
             let state_path = paths::project_installed_plugins_file(&working_dir, &scope)
                 .ok_or_else(|| anyhow!("no project state file for scope {:?}", scope))?;
             let mut state = load_installed_plugins_file(&state_path)?;
-            let entry = state
-                .plugins
-                .remove(&id)
-                .ok_or_else(|| anyhow!("plugin `{}` not installed in project scope {}", id, scope))?;
+            let entry = state.plugins.remove(&id).ok_or_else(|| {
+                anyhow!("plugin `{}` not installed in project scope {}", id, scope)
+            })?;
             save_installed_plugins_file(&state_path, &state)?;
 
             // Remove the copied plugin files.
@@ -784,16 +812,36 @@ mod tests {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join(name);
         std::fs::create_dir_all(&repo).unwrap();
-        Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["config", "user.name", "t"]).current_dir(&repo).status().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
         if let Some(m) = manifest {
             std::fs::create_dir_all(repo.join(".atomcode-plugin")).unwrap();
             std::fs::write(repo.join(".atomcode-plugin/marketplace.json"), m).unwrap();
         }
         std::fs::write(repo.join("README"), "x").unwrap();
-        Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo).status().unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
         repo
     }
 
@@ -837,8 +885,16 @@ mod tests {
         // Pre-populate the subdirectory so the commit includes it.
         std::fs::create_dir_all(repo.join("plugins/sub")).unwrap();
         std::fs::write(repo.join("plugins/sub/plugin.json"), "{}").unwrap();
-        Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["commit", "-q", "-m", "add sub"]).current_dir(&repo).status().unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "add sub"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
         add_marketplace(&format!("file://{}", repo.display())).unwrap();
         let info = install("sub", "mp", InstallScope::User).unwrap();
         assert_eq!(info.plugin_dir, "marketplaces/mp/plugins/sub");
@@ -873,8 +929,16 @@ mod tests {
         let plugin_repo = make_repo("upstream", None);
         // Pre-create a marker file so we can verify the clone landed.
         std::fs::write(plugin_repo.join("PLUGIN_MARKER"), "yes").unwrap();
-        Command::new("git").args(["add", "-A"]).current_dir(&plugin_repo).status().unwrap();
-        Command::new("git").args(["commit", "-q", "-m", "marker"]).current_dir(&plugin_repo).status().unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&plugin_repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "marker"])
+            .current_dir(&plugin_repo)
+            .status()
+            .unwrap();
 
         // Marketplace repo whose manifest references the plugin repo by URL.
         let plugin_url = format!("file://{}", plugin_repo.display());
@@ -928,9 +992,21 @@ mod tests {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join("self_ref");
         std::fs::create_dir_all(&repo).unwrap();
-        Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["config", "user.name", "t"]).current_dir(&repo).status().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
         std::fs::create_dir_all(repo.join(".atomcode-plugin")).unwrap();
         let url = format!("file://{}", repo.display());
         let manifest = format!(
@@ -939,8 +1015,16 @@ mod tests {
         );
         std::fs::write(repo.join(".atomcode-plugin/marketplace.json"), manifest).unwrap();
         std::fs::write(repo.join("README"), "x").unwrap();
-        Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo).status().unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
 
         add_marketplace(&url).unwrap();
         let info = install("self_ref", "self_ref", InstallScope::User).unwrap();
@@ -949,7 +1033,8 @@ mod tests {
         assert_eq!(info.plugin_dir, "marketplaces/self_ref");
         let installed_root = paths::plugins_root().unwrap().join("installed");
         assert!(
-            !installed_root.exists() || std::fs::read_dir(&installed_root).unwrap().next().is_none(),
+            !installed_root.exists()
+                || std::fs::read_dir(&installed_root).unwrap().next().is_none(),
             "dedup should skip the installed/ tree entirely"
         );
     }
@@ -961,7 +1046,10 @@ mod tests {
         let url = "https://example.com/r.git";
         let mut pin = GitPin::default();
         pin.branch = Some("dev".into());
-        let ext = ExternalSource::Url { url: url.into(), pin };
+        let ext = ExternalSource::Url {
+            url: url.into(),
+            pin,
+        };
         assert!(!external_matches_marketplace(&ext, url));
     }
 
@@ -999,7 +1087,9 @@ mod tests {
     /// marketplace's.
     #[test]
     fn dedup_skipped_for_local_source() {
-        let ext = ExternalSource::Local { path: "/tmp/x".into() };
+        let ext = ExternalSource::Local {
+            path: "/tmp/x".into(),
+        };
         assert!(!external_matches_marketplace(&ext, "/tmp/x"));
     }
 
@@ -1049,9 +1139,21 @@ mod tests {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join("upstream");
         std::fs::create_dir_all(&repo).unwrap();
-        Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["config", "user.name", "t"]).current_dir(&repo).status().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
         let sub = repo.join(subdir);
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("plugin.json"), r#"{"name":"sk"}"#).unwrap();
@@ -1063,8 +1165,16 @@ mod tests {
         .unwrap();
         // A file OUTSIDE the subdir, to prove sparse-checkout scopes correctly.
         std::fs::write(repo.join("OUTSIDE_MARKER"), "x").unwrap();
-        Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo).status().unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
         let out = Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .current_dir(&repo)
@@ -1111,7 +1221,10 @@ mod tests {
 
         let abs = paths::plugins_root().unwrap().join(&info.plugin_dir);
         assert!(abs.join("plugin.json").exists(), "subdir content missing");
-        assert!(abs.join("skills/sk/SKILL.md").exists(), "subdir skill missing");
+        assert!(
+            abs.join("skills/sk/SKILL.md").exists(),
+            "subdir skill missing"
+        );
 
         // sparse-checkout must NOT have materialised files outside the subdir.
         let clone_root = paths::plugins_root().unwrap().join("installed/mp_gs/tool");
@@ -1148,6 +1261,9 @@ mod tests {
             path: "sub".into(),
             pin: GitPin::default(),
         };
-        assert!(!external_matches_marketplace(&ext, "https://github.com/o/r.git"));
+        assert!(!external_matches_marketplace(
+            &ext,
+            "https://github.com/o/r.git"
+        ));
     }
 }

@@ -233,7 +233,10 @@ impl SwappableClient {
         build: impl Fn() -> Result<reqwest::Client, ProviderError> + Send + Sync + 'static,
     ) -> Result<Self, ProviderError> {
         let initial = build()?;
-        Ok(Self { current: std::sync::RwLock::new(initial), build: Box::new(build) })
+        Ok(Self {
+            current: std::sync::RwLock::new(initial),
+            build: Box::new(build),
+        })
     }
 
     /// The current client (clone is an `Arc` bump — the pool is shared). Poison-tolerant:
@@ -241,7 +244,10 @@ impl SwappableClient {
     /// unrelated panic must not turn every subsequent request into a hard panic — that would
     /// re-create the exact "wedged until restart" failure this seam exists to prevent.
     pub(crate) fn get(&self) -> reqwest::Client {
-        self.current.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.current
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Rebuild with a fresh (empty) pool and swap it in, returning the new client.
@@ -295,10 +301,17 @@ impl LlmProvider for OpenAiCompatProvider {
         } else {
             options
         };
-        let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg, self.policy);
+        let body = build_request_body(
+            &self.cfg.model,
+            messages,
+            tools,
+            options,
+            &self.cfg,
+            self.policy,
+        );
         super::wire_dump_request(&self.cfg.model, &body); // byte-level dump (ATOMCODE_WIRE_DUMP=1)
-        // Serialize once and reuse the exact bytes across retries (hence `.body()`
-        // with an explicit content-type rather than re-serializing via `.json()`).
+                                                          // Serialize once and reuse the exact bytes across retries (hence `.body()`
+                                                          // with an explicit content-type rather than re-serializing via `.json()`).
         let body_bytes = match serde_json::to_vec(&body) {
             Ok(b) => b,
             Err(e) => {
@@ -322,7 +335,17 @@ impl LlmProvider for OpenAiCompatProvider {
         // the initial open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
-        let resp = match open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy).await {
+        let resp = match open_stream(
+            &client,
+            &url,
+            &body_bytes,
+            &signer,
+            &api_key,
+            &session_id,
+            &policy,
+        )
+        .await
+        {
             Ok(r) => r,
             // Gateway rejected `reasoning_effort`. Remember it for the session
             // (next send strips the field up front → succeeds) and surface one
@@ -484,14 +507,18 @@ async fn open_stream(
                     }
                     // Capture the real `Retry-After` BEFORE `text()` consumes `resp` — the
                     // authoritative rate-limit countdown for the self-heal (vs scraping text).
-                    let retry_after_secs = retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
+                    let retry_after_secs =
+                        retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
                     let text = resp.text().await.unwrap_or_default();
                     // Standard multi-shape extraction (detail / error / top-level message)
                     // so a clean human message surfaces for EVERY vendor — not just the
                     // OpenAI `error` object. GLM returns top-level `{"code","message"}`.
                     let detail = extract_error_detail(&text);
                     let envelope = serde_json::from_str::<serde_json::Value>(&text).ok();
-                    let provider_code = envelope.as_ref().and_then(|v| v.get("error")).and_then(error_code);
+                    let provider_code = envelope
+                        .as_ref()
+                        .and_then(|v| v.get("error"))
+                        .and_then(error_code);
                     return Err(ProviderError {
                         retryable: retry::is_retryable_status(code),
                         message: format!("HTTP {code}: {detail}"),
@@ -537,7 +564,11 @@ async fn open_stream(
 /// resumed conversation whose history contains an image from 400ing against a
 /// text-only model (`glm-5.2 is not a multimodal model`) on every turn — v1
 /// `OpenAiProvider::format_messages` had the same degrade; the v2 port lost it.
-fn format_messages(messages: &[Message], policy: ReasoningPolicy, supports_vision: bool) -> Vec<Value> {
+fn format_messages(
+    messages: &[Message],
+    policy: ReasoningPolicy,
+    supports_vision: bool,
+) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         match m.role {
@@ -697,7 +728,9 @@ fn build_request_body(
     }
     // Kimi-family `thinking` object — only when configured (omitted otherwise so non-Kimi
     // gateways don't 400 on an unknown top-level key). Port of v1's `thinking_body_value`.
-    if let Some(thinking) = thinking_body_value(cfg.thinking_type.as_deref(), cfg.thinking_keep.as_deref()) {
+    if let Some(thinking) =
+        thinking_body_value(cfg.thinking_type.as_deref(), cfg.thinking_keep.as_deref())
+    {
         body.insert("thinking".into(), thinking);
     }
     if !tools.is_empty() {
@@ -842,8 +875,15 @@ fn extract_error_detail(text: &str) -> String {
 /// Format an OpenAI-compatible error OBJECT (`{"message","type","code"}`) as a readable
 /// "[type/code] message" one-liner carrying BOTH the error CODE and the REASON.
 fn parse_error_obj(err: &serde_json::Value) -> String {
-    let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("").trim();
-    let typ = err.get("type").and_then(|t| t.as_str()).filter(|s| !s.is_empty());
+    let msg = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .trim();
+    let typ = err
+        .get("type")
+        .and_then(|t| t.as_str())
+        .filter(|s| !s.is_empty());
     // `code` may be a string OR a number (vendors differ) — normalize to a string.
     let code = err.get("code").and_then(|c| match c {
         serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
@@ -939,13 +979,19 @@ impl SseDecoder {
         }
         for (id, name, args) in std::mem::take(&mut self.tool_calls) {
             if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                out.push(StreamEvent::ToolCall(ToolCall { id, name, arguments: args }));
+                out.push(StreamEvent::ToolCall(ToolCall {
+                    id,
+                    name,
+                    arguments: args,
+                }));
             }
         }
         if let Some(u) = self.last_usage.take() {
             out.push(StreamEvent::Usage(u));
         }
-        out.push(StreamEvent::Done { truncated: self.truncated });
+        out.push(StreamEvent::Done {
+            truncated: self.truncated,
+        });
         self.done = true;
         out
     }
@@ -1077,7 +1123,11 @@ impl SseDecoder {
             self.seen_finish = true;
             for (id, name, args) in std::mem::take(&mut self.tool_calls) {
                 if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                    out.push(StreamEvent::ToolCall(ToolCall { id, name, arguments: args }));
+                    out.push(StreamEvent::ToolCall(ToolCall {
+                        id,
+                        name,
+                        arguments: args,
+                    }));
                 }
             }
             if fr == "length" {
@@ -1207,7 +1257,13 @@ mod tests {
         ] {
             assert!(model_suggests_vision(m), "should be vision: {m}");
         }
-        for m in ["glm-5.2", "deepseek-v4", "gpt-4-turbo", "claude-2.1", "o3-mini"] {
+        for m in [
+            "glm-5.2",
+            "deepseek-v4",
+            "gpt-4-turbo",
+            "claude-2.1",
+            "o3-mini",
+        ] {
             assert!(!model_suggests_vision(m), "should be text-only: {m}");
         }
     }
@@ -1232,7 +1288,11 @@ mod tests {
         let _ = sc.get();
         assert_eq!(calls.load(Ordering::SeqCst), 1, "get() must NOT rebuild");
         sc.rebuild();
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "rebuild() constructs a fresh client (empty pool)");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "rebuild() constructs a fresh client (empty pool)"
+        );
     }
 
     #[tokio::test]
@@ -1245,13 +1305,21 @@ mod tests {
             if c.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok(reqwest::Client::new())
             } else {
-                Err(ProviderError { retryable: false, message: "boom".into(), ..Default::default() })
+                Err(ProviderError {
+                    retryable: false,
+                    message: "boom".into(),
+                    ..Default::default()
+                })
             }
         })
         .expect("initial build");
         // A failing rebuild must not panic and must leave a usable client in place.
         let _client = sc.rebuild();
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "rebuild attempted the builder");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "rebuild attempted the builder"
+        );
         let _still_usable = sc.get(); // does not panic → old client retained
     }
 
@@ -1271,7 +1339,10 @@ mod tests {
         assert_eq!(out[2]["role"], "assistant");
         assert_eq!(out[2]["content"], "ans");
         assert!(out[2].get("reasoning_content").is_none());
-        assert_eq!(out[3], json!({"role":"tool","tool_call_id":"call_1","content":"result text"}));
+        assert_eq!(
+            out[3],
+            json!({"role":"tool","tool_call_id":"call_1","content":"result text"})
+        );
     }
 
     #[test]
@@ -1288,8 +1359,14 @@ mod tests {
         ];
         let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
         let systems = out.iter().filter(|v| v["role"] == "system").count();
-        assert_eq!(systems, 1, "consecutive system messages must coalesce to one: {out:?}");
-        assert_eq!(out[0], json!({"role":"system","content":"persona\n\nMEMORY\n- fact"}));
+        assert_eq!(
+            systems, 1,
+            "consecutive system messages must coalesce to one: {out:?}"
+        );
+        assert_eq!(
+            out[0],
+            json!({"role":"system","content":"persona\n\nMEMORY\n- fact"})
+        );
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
         assert_eq!(out.len(), 2, "exactly one system + one user");
     }
@@ -1307,7 +1384,10 @@ mod tests {
         use atomcode_kernel::message::ImageContent;
         let m = Message::user_with_images(
             "look",
-            vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
+            vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
         let c = &out[0]["content"];
@@ -1327,14 +1407,26 @@ mod tests {
         use atomcode_kernel::message::ImageContent;
         let m = Message::user_with_images(
             "[Image #1] 这是什么图啊",
-            vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
+            vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, false);
         let c = &out[0]["content"];
-        assert!(c.is_string(), "text-only target must get a string, got: {c}");
+        assert!(
+            c.is_string(),
+            "text-only target must get a string, got: {c}"
+        );
         let s = c.as_str().unwrap();
-        assert!(s.contains("这是什么图啊"), "caption must survive degradation: {s:?}");
-        assert!(!s.contains("data:image"), "no image_url bytes may leak: {s:?}");
+        assert!(
+            s.contains("这是什么图啊"),
+            "caption must survive degradation: {s:?}"
+        );
+        assert!(
+            !s.contains("data:image"),
+            "no image_url bytes may leak: {s:?}"
+        );
     }
 
     #[test]
@@ -1352,7 +1444,10 @@ mod tests {
         use atomcode_kernel::message::ImageContent;
         let m = Message::user_with_images(
             "",
-            vec![ImageContent { media_type: "image/jpeg".into(), data: "eHl6".into() }],
+            vec![ImageContent {
+                media_type: "image/jpeg".into(),
+                data: "eHl6".into(),
+            }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
         let c = out[0]["content"].as_array().unwrap();
@@ -1367,9 +1462,15 @@ mod tests {
         // degrades to a plain STRING content (never an empty content array a server rejects).
         let m = Message::user_with_images(
             "",
-            vec![ImageContent { media_type: "image/png".into(), data: "".into() }],
+            vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "".into(),
+            }],
         );
-        assert_eq!(format_messages(&[m], ReasoningPolicy::Exclude, true)[0], json!({"role":"user","content":""}));
+        assert_eq!(
+            format_messages(&[m], ReasoningPolicy::Exclude, true)[0],
+            json!({"role":"user","content":""})
+        );
     }
 
     #[test]
@@ -1377,10 +1478,16 @@ mod tests {
         use atomcode_kernel::message::ImageContent;
         let m = Message::user_with_images(
             "x",
-            vec![ImageContent { media_type: "".into(), data: "QUJD".into() }],
+            vec![ImageContent {
+                media_type: "".into(),
+                data: "QUJD".into(),
+            }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
-        assert_eq!(out[0]["content"][1]["image_url"]["url"], "data:application/octet-stream;base64,QUJD");
+        assert_eq!(
+            out[0]["content"][1]["image_url"]["url"],
+            "data:application/octet-stream;base64,QUJD"
+        );
     }
 
     #[test]
@@ -1400,7 +1507,10 @@ mod tests {
         assert_eq!(a["tool_calls"][0]["id"], "c1");
         assert_eq!(a["tool_calls"][0]["type"], "function");
         assert_eq!(a["tool_calls"][0]["function"]["name"], "read");
-        assert_eq!(a["tool_calls"][0]["function"]["arguments"], "{\"path\":\"a\"}");
+        assert_eq!(
+            a["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"a\"}"
+        );
     }
 
     #[test]
@@ -1415,16 +1525,22 @@ mod tests {
                 id: "c1".into(),
                 name: "write_file".into(),
                 // raw string: contains a single backslash before each segment.
-                arguments: r#"{"file_path":"C:\Users\fgv70\Downloads\deepseek.yaml","content":"app"}"#
-                    .into(),
+                arguments:
+                    r#"{"file_path":"C:\Users\fgv70\Downloads\deepseek.yaml","content":"app"}"#
+                        .into(),
             }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
-        let args = out[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        let args = out[0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
         let parsed: Value = serde_json::from_str(args)
             .unwrap_or_else(|e| panic!("outgoing arguments must be valid JSON ({e}): {args}"));
         // Repair preserves the path the model meant (backslashes survive a round-trip).
-        assert_eq!(parsed["file_path"], "C:\\Users\\fgv70\\Downloads\\deepseek.yaml");
+        assert_eq!(
+            parsed["file_path"],
+            "C:\\Users\\fgv70\\Downloads\\deepseek.yaml"
+        );
     }
 
     #[test]
@@ -1433,10 +1549,17 @@ mod tests {
         // (no re-encode), so the request prefix stays byte-stable across turns.
         let m = Message::assistant(
             "",
-            vec![ToolCall { id: "c1".into(), name: "read".into(), arguments: "{\"path\":\"a\"}".into() }],
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{\"path\":\"a\"}".into(),
+            }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
-        assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"], "{\"path\":\"a\"}");
+        assert_eq!(
+            out[0]["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"a\"}"
+        );
     }
 
     #[test]
@@ -1452,7 +1575,9 @@ mod tests {
             }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
-        let args = out[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        let args = out[0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
         assert!(
             serde_json::from_str::<Value>(args).is_ok(),
             "even unsalvageable args must serialize as valid JSON, got: {args}"
@@ -1481,12 +1606,22 @@ mod tests {
     fn body_basics_and_omissions() {
         let cfg = OpenAiCompatConfig::new("k", "https://x.test", "glm-5.1");
         let opts = ChatOptions::default();
-        let body = build_request_body("glm-5.1", &[Message::user("hi")], &[], &opts, &cfg, ReasoningPolicy::Exclude);
+        let body = build_request_body(
+            "glm-5.1",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert!(body.get("tools").is_none(), "empty tools omitted");
         assert!(body.get("tool_choice").is_none(), "Auto omits tool_choice");
-        assert!(body.get("temperature").is_none(), "None temperature omitted");
+        assert!(
+            body.get("temperature").is_none(),
+            "None temperature omitted"
+        );
         assert!(body.get("max_tokens").is_none(), "no max_tokens set");
     }
 
@@ -1505,7 +1640,14 @@ mod tests {
             description: "d".into(),
             parameters: json!({"type":"object"}),
         }];
-        let body = build_request_body("deepseek-v4-flash", &[Message::user("hi")], &tools, &opts, &cfg, ReasoningPolicy::Include);
+        let body = build_request_body(
+            "deepseek-v4-flash",
+            &[Message::user("hi")],
+            &tools,
+            &opts,
+            &cfg,
+            ReasoningPolicy::Include,
+        );
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["max_tokens"].as_u64(), Some(100)); // cfg fallback
@@ -1521,7 +1663,14 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::Max),
             ..Default::default()
         };
-        let body = build_request_body("deepseek-v4-flash", &[Message::user("hi")], &[], &opts, &cfg, ReasoningPolicy::Include);
+        let body = build_request_body(
+            "deepseek-v4-flash",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Include,
+        );
         assert_eq!(body["reasoning_effort"], "max");
     }
 
@@ -1532,8 +1681,18 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::High),
             ..Default::default()
         };
-        let body = build_request_body("glm-5.1", &[Message::user("hi")], &[], &opts, &cfg, ReasoningPolicy::Exclude);
-        assert!(body.get("reasoning_effort").is_none(), "non-v4 omits reasoning_effort");
+        let body = build_request_body(
+            "glm-5.1",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "non-v4 omits reasoning_effort"
+        );
     }
 
     #[test]
@@ -1541,15 +1700,32 @@ mod tests {
         let mut cfg = OpenAiCompatConfig::new("k", "https://x", "kimi-k2");
         cfg.thinking_type = Some("enabled".into());
         cfg.thinking_keep = Some("all".into());
-        let body = build_request_body("kimi-k2", &[Message::user("hi")], &[], &ChatOptions::default(), &cfg, ReasoningPolicy::Exclude);
+        let body = build_request_body(
+            "kimi-k2",
+            &[Message::user("hi")],
+            &[],
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
         assert_eq!(body["thinking"], json!({"type":"enabled","keep":"all"}));
     }
 
     #[test]
     fn no_thinking_object_when_unconfigured() {
         let cfg = OpenAiCompatConfig::new("k", "https://x", "kimi-k2");
-        let body = build_request_body("kimi-k2", &[Message::user("hi")], &[], &ChatOptions::default(), &cfg, ReasoningPolicy::Exclude);
-        assert!(body.get("thinking").is_none(), "omit thinking when unset (non-Kimi-safe)");
+        let body = build_request_body(
+            "kimi-k2",
+            &[Message::user("hi")],
+            &[],
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+        assert!(
+            body.get("thinking").is_none(),
+            "omit thinking when unset (non-Kimi-safe)"
+        );
     }
 
     #[test]
@@ -1559,7 +1735,14 @@ mod tests {
             tool_choice: ToolChoice::None,
             ..Default::default()
         };
-        let body = build_request_body("glm", &[Message::user("hi")], &[], &opts, &cfg, ReasoningPolicy::Exclude);
+        let body = build_request_body(
+            "glm",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
         assert_eq!(body["tool_choice"], "none");
     }
 
@@ -1600,10 +1783,29 @@ mod tests {
             },
         ];
         let msgs = vec![Message::system("s"), Message::user("u")];
-        let first = serde_json::to_string(&build_request_body("deepseek-v4-flash", &msgs, &tools, &opts, &cfg, ReasoningPolicy::Include)).unwrap();
+        let first = serde_json::to_string(&build_request_body(
+            "deepseek-v4-flash",
+            &msgs,
+            &tools,
+            &opts,
+            &cfg,
+            ReasoningPolicy::Include,
+        ))
+        .unwrap();
         for _ in 0..100 {
-            let again = serde_json::to_string(&build_request_body("deepseek-v4-flash", &msgs, &tools, &opts, &cfg, ReasoningPolicy::Include)).unwrap();
-            assert_eq!(first, again, "request body serialization must be deterministic");
+            let again = serde_json::to_string(&build_request_body(
+                "deepseek-v4-flash",
+                &msgs,
+                &tools,
+                &opts,
+                &cfg,
+                ReasoningPolicy::Include,
+            ))
+            .unwrap();
+            assert_eq!(
+                first, again,
+                "request body serialization must be deterministic"
+            );
         }
     }
 
@@ -1638,11 +1840,20 @@ mod tests {
         assert!(matches!(&ev[1], StreamEvent::TextDelta(s) if s == "lo"));
         let usage = ev
             .iter()
-            .find_map(|e| if let StreamEvent::Usage(u) = e { Some(*u) } else { None })
+            .find_map(|e| {
+                if let StreamEvent::Usage(u) = e {
+                    Some(*u)
+                } else {
+                    None
+                }
+            })
             .unwrap();
         assert_eq!(usage.prompt, 5);
         assert_eq!(usage.completion, 2);
-        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
+        assert!(matches!(
+            ev.last().unwrap(),
+            StreamEvent::Done { truncated: false }
+        ));
     }
 
     #[test]
@@ -1675,15 +1886,25 @@ mod tests {
         let mut ev = Vec::new();
         ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\"pa"}}]}}]})).as_bytes()));
         ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a\"}"}}]}}]})).as_bytes()));
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
         assert_eq!(
-            ev.iter().filter(|e| matches!(e, StreamEvent::ToolCall(_))).count(),
+            ev.iter()
+                .filter(|e| matches!(e, StreamEvent::ToolCall(_)))
+                .count(),
             1,
             "exactly one whole tool call, no partials"
         );
         let tc = ev
             .iter()
-            .find_map(|e| if let StreamEvent::ToolCall(t) = e { Some(t.clone()) } else { None })
+            .find_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
             .unwrap();
         assert_eq!(tc.id, "c1");
         assert_eq!(tc.name, "read");
@@ -1710,7 +1931,13 @@ mod tests {
         ev.extend(d.feed(line(json!({"choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}]})).as_bytes()));
         let calls: Vec<_> = ev
             .iter()
-            .filter_map(|e| if let StreamEvent::ToolCall(t) = e { Some(t.clone()) } else { None })
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(
             calls.len(),
@@ -1734,7 +1961,13 @@ mod tests {
         ev.extend(d.feed(b"data: [DONE]\n"));
         let calls: Vec<_> = ev
             .iter()
-            .filter_map(|e| if let StreamEvent::ToolCall(t) = e { Some(t.clone()) } else { None })
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(
             calls.len(),
@@ -1753,14 +1986,27 @@ mod tests {
     fn sse_multi_index_tool_calls() {
         let mut d = SseDecoder::new();
         let mut ev = Vec::new();
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[
-            {"index":0,"id":"c0","function":{"name":"a","arguments":"{}"}},
-            {"index":1,"id":"c1","function":{"name":"b","arguments":"{}"}}
-        ]}}]})).as_bytes()));
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()));
+        ev.extend(
+            d.feed(
+                line(json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"c0","function":{"name":"a","arguments":"{}"}},
+                    {"index":1,"id":"c1","function":{"name":"b","arguments":"{}"}}
+                ]}}]}))
+                .as_bytes(),
+            ),
+        );
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
         let calls: Vec<_> = ev
             .iter()
-            .filter_map(|e| if let StreamEvent::ToolCall(t) = e { Some(t.clone()) } else { None })
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
@@ -1789,9 +2035,17 @@ mod tests {
     fn sse_length_sets_truncated() {
         let mut d = SseDecoder::new();
         let mut ev = Vec::new();
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{"content":"x"},"finish_reason":"length"}]})).as_bytes()));
+        ev.extend(
+            d.feed(
+                line(json!({"choices":[{"delta":{"content":"x"},"finish_reason":"length"}]}))
+                    .as_bytes(),
+            ),
+        );
         ev.extend(d.feed(b"data: [DONE]\n"));
-        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: true }));
+        assert!(matches!(
+            ev.last().unwrap(),
+            StreamEvent::Done { truncated: true }
+        ));
     }
 
     #[test]
@@ -1815,10 +2069,27 @@ mod tests {
         let ev = d.feed(sse.as_bytes());
         // The tool_calls delta chunk now also emits a streaming `tooldelta` fragment
         // (live display) BEFORE the whole `tool` call is emitted at finish_reason.
-        assert_eq!(kinds(&ev), vec!["reason", "text", "text", "tooldelta", "tool", "usage", "done"]);
+        assert_eq!(
+            kinds(&ev),
+            vec![
+                "reason",
+                "text",
+                "text",
+                "tooldelta",
+                "tool",
+                "usage",
+                "done"
+            ]
+        );
         let usage = ev
             .iter()
-            .find_map(|e| if let StreamEvent::Usage(u) = e { Some(*u) } else { None })
+            .find_map(|e| {
+                if let StreamEvent::Usage(u) = e {
+                    Some(*u)
+                } else {
+                    None
+                }
+            })
             .unwrap();
         assert_eq!(usage.cached, 8);
     }
@@ -1830,26 +2101,45 @@ mod tests {
         // id+name arrive first, then arguments stream across two chunks.
         ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"search","arguments":"{\"q\":"}}]}}]})).as_bytes()));
         ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hi\"}"}}]}}]})).as_bytes()));
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
 
         // Streaming fragments (live display): id/name on the first, args chunks on both.
         let deltas: Vec<(u32, Option<String>, Option<String>, String)> = ev
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::ToolCallDelta { index, id, name, arguments } => {
-                    Some((*index, id.clone(), name.clone(), arguments.clone()))
-                }
+                StreamEvent::ToolCallDelta {
+                    index,
+                    id,
+                    name,
+                    arguments,
+                } => Some((*index, id.clone(), name.clone(), arguments.clone())),
                 _ => None,
             })
             .collect();
         assert_eq!(deltas.len(), 2);
-        assert_eq!(deltas[0], (0, Some("c1".into()), Some("search".into()), "{\"q\":".into()));
+        assert_eq!(
+            deltas[0],
+            (
+                0,
+                Some("c1".into()),
+                Some("search".into()),
+                "{\"q\":".into()
+            )
+        );
         assert_eq!(deltas[1], (0, None, None, "\"hi\"}".into()));
 
         // The WHOLE call (execution) is emitted once at finish, args reassembled.
         let whole: Vec<_> = ev
             .iter()
-            .filter_map(|e| if let StreamEvent::ToolCall(c) = e { Some(c.clone()) } else { None })
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(c) = e {
+                    Some(c.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(whole.len(), 1);
         assert_eq!(whole[0].id, "c1");
@@ -1870,7 +2160,13 @@ mod tests {
         );
         let u = ev
             .iter()
-            .find_map(|e| if let StreamEvent::Usage(u) = e { Some(*u) } else { None })
+            .find_map(|e| {
+                if let StreamEvent::Usage(u) = e {
+                    Some(*u)
+                } else {
+                    None
+                }
+            })
             .unwrap();
         assert_eq!(u.cached, 2);
     }
@@ -1879,14 +2175,28 @@ mod tests {
     fn sse_emits_provider_response_id_once() {
         let mut d = SseDecoder::new();
         let mut ev = Vec::new();
-        ev.extend(d.feed(line(json!({"id":"resp_xyz","choices":[{"delta":{"content":"a"}}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"id":"resp_xyz","choices":[{"delta":{"content":"a"}}]})).as_bytes()),
+        );
         // same id repeats on later chunks — must NOT re-emit.
-        ev.extend(d.feed(line(json!({"id":"resp_xyz","choices":[{"delta":{"content":"b"}}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"id":"resp_xyz","choices":[{"delta":{"content":"b"}}]})).as_bytes()),
+        );
         let ids: Vec<String> = ev
             .iter()
-            .filter_map(|e| if let StreamEvent::ResponseId(id) = e { Some(id.clone()) } else { None })
+            .filter_map(|e| {
+                if let StreamEvent::ResponseId(id) = e {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
-        assert_eq!(ids, vec!["resp_xyz".to_string()], "response id emitted exactly once, with value");
+        assert_eq!(
+            ids,
+            vec!["resp_xyz".to_string()],
+            "response id emitted exactly once, with value"
+        );
     }
 
     #[test]
@@ -1898,13 +2208,35 @@ mod tests {
         );
         let err = ev
             .iter()
-            .find_map(|e| if let StreamEvent::Error(e) = e { Some(e.clone()) } else { None })
+            .find_map(|e| {
+                if let StreamEvent::Error(e) = e {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            })
             .expect("a mid-stream error chunk must surface a StreamEvent::Error");
-        assert!(err.message.contains("server_error"), "must carry error type: {}", err.message);
-        assert!(err.message.contains("overloaded"), "must carry error code: {}", err.message);
-        assert!(err.message.contains("the model is overloaded"), "must carry reason: {}", err.message);
+        assert!(
+            err.message.contains("server_error"),
+            "must carry error type: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("overloaded"),
+            "must carry error code: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("the model is overloaded"),
+            "must carry reason: {}",
+            err.message
+        );
         assert!(!err.retryable, "mid-stream errors are non-retryable");
-        assert_eq!(err.code.as_deref(), Some("overloaded"), "structured code on mid-stream error");
+        assert_eq!(
+            err.code.as_deref(),
+            Some("overloaded"),
+            "structured code on mid-stream error"
+        );
     }
 
     #[test]
@@ -1919,7 +2251,8 @@ mod tests {
         assert!(formatted.contains("does not exist"), "{formatted}");
         assert_eq!(error_code(&v).as_deref(), Some("model_not_found"));
         // missing `code` falls back to `type`; numeric code normalizes to a string.
-        let v2: serde_json::Value = serde_json::from_str(r#"{"message":"x","type":"server_error"}"#).unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(r#"{"message":"x","type":"server_error"}"#).unwrap();
         assert_eq!(error_code(&v2).as_deref(), Some("server_error"));
         let v3: serde_json::Value = serde_json::from_str(r#"{"message":"x","code":429}"#).unwrap();
         assert_eq!(error_code(&v3).as_deref(), Some("429"));
@@ -1928,10 +2261,18 @@ mod tests {
     #[test]
     fn extract_error_detail_covers_all_envelope_shapes() {
         // OpenAI / Anthropic `{"error":{...}}` → tagged "[type/code] message".
-        let openai = extract_error_detail(r#"{"error":{"message":"boom","type":"rate_limit","code":"429"}}"#);
-        assert!(openai.contains("boom") && openai.contains("rate_limit"), "{openai}");
+        let openai = extract_error_detail(
+            r#"{"error":{"message":"boom","type":"rate_limit","code":"429"}}"#,
+        );
+        assert!(
+            openai.contains("boom") && openai.contains("rate_limit"),
+            "{openai}"
+        );
         // FastAPI / AtomGit `{"detail":{"message":...}}`.
-        assert_eq!(extract_error_detail(r#"{"detail":{"code":"X","message":"请升级"}}"#), "请升级");
+        assert_eq!(
+            extract_error_detail(r#"{"detail":{"code":"X","message":"请升级"}}"#),
+            "请升级"
+        );
         // FastAPI `{"detail":"..."}` string form.
         assert_eq!(extract_error_detail(r#"{"detail":"nope"}"#), "nope");
         // GLM-style TOP-LEVEL `{"code","message"}` — the case that previously dumped raw JSON.
@@ -1949,7 +2290,10 @@ mod tests {
         let mut ev = d.feed(line(json!({"choices":[{"delta":{"content":"x"}}]})).as_bytes());
         // no [DONE]; the network loop calls finish() on EOF
         ev.extend(d.finish());
-        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
+        assert!(matches!(
+            ev.last().unwrap(),
+            StreamEvent::Done { truncated: false }
+        ));
     }
 
     #[test]
@@ -1957,7 +2301,9 @@ mod tests {
         let mut d = SseDecoder::new();
         let mut ev = Vec::new();
         ev.extend(d.feed(line(json!({"choices":[{"delta":{"content":"ok"}}]})).as_bytes()));
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes()),
+        );
         assert!(!d.done);
 
         // This tool call delta chunk arrives after finish_reason.
@@ -1977,7 +2323,9 @@ mod tests {
         let mut ev = Vec::new();
         // Send a tool call delta 20000 times.
         // On the 20001-th time, it should terminate.
-        let delta_chunk = line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"w","arguments":"x"}}]}}]}));
+        let delta_chunk = line(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"w","arguments":"x"}}]}}]}),
+        );
         let delta_bytes = delta_chunk.as_bytes();
         for _ in 0..20000 {
             ev.extend(d.feed(delta_bytes));
@@ -2075,7 +2423,10 @@ mod tests {
         let events: Vec<StreamEvent> = stream.collect().await;
 
         let has_error = events.iter().any(|e| matches!(e, StreamEvent::Error(_)));
-        assert!(!has_error, "must not surface a mid-stream error after a clean re-open: {events:?}");
+        assert!(
+            !has_error,
+            "must not surface a mid-stream error after a clean re-open: {events:?}"
+        );
         let text: String = events
             .iter()
             .filter_map(|e| match e {
@@ -2083,7 +2434,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "ok", "should deliver the re-opened response: {events:?}");
+        assert_eq!(
+            text, "ok",
+            "should deliver the re-opened response: {events:?}"
+        );
 
         let _ = handle.join();
     }
@@ -2148,7 +2502,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "ok", "should deliver the third (successful) response: {events:?}");
+        assert_eq!(
+            text, "ok",
+            "should deliver the third (successful) response: {events:?}"
+        );
 
         let _ = handle.join();
     }
@@ -2175,7 +2532,8 @@ mod tests {
             .unwrap();
             // One complete chunk (delivers the delta), then abrupt close before the
             // `0\r\n\r\n` terminator → mid-stream EOF after an event was emitted.
-            s.write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes()).unwrap();
+            s.write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes())
+                .unwrap();
             s.flush().unwrap();
             drop(s);
         });
@@ -2196,7 +2554,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "x", "the one delivered delta must appear exactly once: {events:?}");
+        assert_eq!(
+            text, "x",
+            "the one delivered delta must appear exactly once: {events:?}"
+        );
         assert!(
             events.iter().any(|e| matches!(e, StreamEvent::Error(_))),
             "a post-emit mid-stream EOF must surface an error: {events:?}"
@@ -2225,7 +2586,10 @@ mod tests {
                 let clen = head
                     .to_lowercase()
                     .lines()
-                    .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().to_string()))
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .map(|v| v.trim().to_string())
+                    })
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(0);
                 let mut remaining = clen.saturating_sub(buf.len() - (pos + 4));
@@ -2336,11 +2700,20 @@ mod tests {
             "HTTP 400: field ReasoningEffort invalid, should be one of: low, medium, high, xhigh, none"
         )));
         // snake_case variant.
-        assert!(is_reasoning_effort_rejection(&mk(400, "HTTP 400: reasoning_effort not supported")));
+        assert!(is_reasoning_effort_rejection(&mk(
+            400,
+            "HTTP 400: reasoning_effort not supported"
+        )));
         // Unrelated 400 must NOT be misrouted into the effort-strip path.
-        assert!(!is_reasoning_effort_rejection(&mk(400, "HTTP 400: invalid api key")));
+        assert!(!is_reasoning_effort_rejection(&mk(
+            400,
+            "HTTP 400: invalid api key"
+        )));
         // Right text but not a 400 (e.g. a 500 that echoes the field) must not match.
-        assert!(!is_reasoning_effort_rejection(&mk(500, "reasoning_effort invalid")));
+        assert!(!is_reasoning_effort_rejection(&mk(
+            500,
+            "reasoning_effort invalid"
+        )));
     }
 
     /// Read a full HTTP request (headers + Content-Length body) and return it as
@@ -2415,7 +2788,8 @@ mod tests {
             drop(s2);
         });
 
-        let cfg = OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "deepseek-v4-flash");
+        let cfg =
+            OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "deepseek-v4-flash");
         let provider = OpenAiCompatProvider::new(cfg).unwrap();
         let opts = ChatOptions {
             reasoning_effort: Some(ReasoningEffort::Max),
@@ -2429,7 +2803,11 @@ mod tests {
             .err()
             .expect("first open should fail on the effort 400");
         assert!(
-            err.message.contains("强度") || err.message.to_ascii_lowercase().contains("reasoning_effort"),
+            err.message.contains("强度")
+                || err
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("reasoning_effort"),
             "must surface the actionable effort message, got: {}",
             err.message
         );
@@ -2446,7 +2824,9 @@ mod tests {
             .expect("second open should succeed after self-heal");
         let events: Vec<StreamEvent> = stream.collect().await;
         assert!(
-            events.iter().any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "ok")),
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "ok")),
             "self-healed turn must deliver the response: {events:?}"
         );
 

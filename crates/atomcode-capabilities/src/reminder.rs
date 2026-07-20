@@ -31,7 +31,10 @@ mod tests {
     #[test]
     fn wraps_body_in_the_canonical_tag() {
         let r = system_reminder("line one\nline two");
-        assert_eq!(r, "<system-reminder>\nline one\nline two\n</system-reminder>");
+        assert_eq!(
+            r,
+            "<system-reminder>\nline one\nline two\n</system-reminder>"
+        );
         assert!(r.starts_with(&format!("<{SYSTEM_REMINDER_TAG}>")));
         assert!(r.ends_with(&format!("</{SYSTEM_REMINDER_TAG}>")));
     }

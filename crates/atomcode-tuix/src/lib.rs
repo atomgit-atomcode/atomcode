@@ -23,8 +23,8 @@ pub mod modals;
 pub mod platform;
 pub mod pricing;
 pub mod render;
-pub(crate) mod runtime_convert;
 pub mod sanitize;
+pub mod session;
 #[cfg(unix)]
 mod signal_restore;
 pub mod state;
@@ -288,7 +288,7 @@ pub async fn run(
     spawned_runtime: SpawnedRuntime,
     runtime_spawn_override: RuntimeSpawnOverride,
     working_dir: std::path::PathBuf,
-    session_to_continue: Option<atomcode_core::session::Session>,
+    session_to_continue: Option<crate::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_capabilities::mcp::McpRegistry>>,
     mcp_connect_rx: Option<
         tokio::sync::mpsc::UnboundedReceiver<atomcode_capabilities::mcp::McpConnectEvent>,
@@ -514,11 +514,10 @@ pub async fn run(
         crate::input::history::History::load_with_cache(path, cache)
     };
 
-    let session_manager = atomcode_core::session::SessionManager::new(&working_dir);
     // Fresh session by default; `/resume` replaces this on load.
-    let mut current_session = atomcode_core::session::Session::default_session(working_dir.clone());
+    let mut current_session = crate::session::Session::default_session(working_dir.clone());
     if let Some(session_id) = runtime_session_id {
-        current_session.id = atomcode_core::session::SessionId::from_string(session_id);
+        current_session.id = session_id;
     }
 
     // Passive "new version available" check. Detached — never blocks
@@ -716,7 +715,9 @@ pub async fn run(
         model_name,
         runtime,
         pending_runtime_request_id: None,
-        allowed_always: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        allowed_always: std::sync::Arc::new(
+            std::sync::Mutex::new(std::collections::HashSet::new()),
+        ),
         native_tools: std::collections::HashMap::new(),
         shutdown_deadline: None,
         runtime_spawn_override,
@@ -730,7 +731,6 @@ pub async fn run(
         history,
         input_rx,
         commands: CommandRegistry::builtin(),
-        session_manager,
         current_session,
         update_hint,
         monitor_warning: std::sync::Arc::new(std::sync::Mutex::new(None)),

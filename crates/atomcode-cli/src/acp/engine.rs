@@ -83,8 +83,10 @@ mod tests {
             &self,
             _config: &CodingAgentConfig,
             session_id: Option<&str>,
-        ) -> Result<Arc<dyn atomcode_kernel::provider::LlmProvider>, atomcode_coding::ProviderBuildError>
-        {
+        ) -> Result<
+            Arc<dyn atomcode_kernel::provider::LlmProvider>,
+            atomcode_coding::ProviderBuildError,
+        > {
             self.session_ids
                 .lock()
                 .unwrap()
@@ -151,8 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_factory_builds_each_session_with_its_own_identity() {
-        let mut base =
-            CodingAgentConfig::new("k", "https://example.test/v1", "m", "/original");
+        let mut base = CodingAgentConfig::new("k", "https://example.test/v1", "m", "/original");
         base.context_window = 200_000;
         base.chat_options.max_tokens = Some(8192);
         let engine = EngineConfig::from_coding_config(base);

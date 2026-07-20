@@ -81,6 +81,11 @@ class HeaderPanel : JPanel(BorderLayout()) {
         }
     }
 
+    fun updateLoginStatus(message: String, failed: Boolean = false) {
+        statusDot.foreground = if (failed) ERROR_COLOR else CONNECTING_COLOR
+        statusDot.toolTipText = message
+    }
+
     fun setRightComponent(component: Component) {
         add(component, BorderLayout.EAST)
         revalidate()

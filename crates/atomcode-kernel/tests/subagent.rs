@@ -33,11 +33,18 @@ use std::time::Duration;
 const OUTER_GUARD: Duration = Duration::from_secs(5);
 
 fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
-    ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args.into(),
+    }
 }
 
 fn send(text: &str) -> AgentCommand {
-    AgentCommand::SendMessage { text: text.into(), images: vec![] }
+    AgentCommand::SendMessage {
+        text: text.into(),
+        images: vec![],
+    }
 }
 
 // ── CLAIM 31a: COMPOSITION ───────────────────────────────────────────────────
@@ -70,10 +77,17 @@ async fn subagent_composition_parent_runs_child_and_gets_result() {
     // The PARENT: round 1 calls the subagent; round 2 (after the tool result) stops.
     let parent_provider = Arc::new(RecordingProvider::new(vec![
         vec![
-            StreamEvent::ToolCall(tool_call("c_sub", "subagent", "{\"task\":\"do the thing\"}")),
+            StreamEvent::ToolCall(tool_call(
+                "c_sub",
+                "subagent",
+                "{\"task\":\"do the thing\"}",
+            )),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("parent wraps up".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("parent wraps up".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let mut handle = Agent::builder()
@@ -139,7 +153,9 @@ async fn subagent_cancel_propagates_into_detached_child() {
         },
         move || {
             let mut reg = ToolRegistry::new();
-            reg.register(Arc::new(BlockUntilCancelTool::new(observed_for_factory.clone())));
+            reg.register(Arc::new(BlockUntilCancelTool::new(
+                observed_for_factory.clone(),
+            )));
             reg.mount(&["block_until_cancel"])
         },
         "child persona",
@@ -162,7 +178,10 @@ async fn subagent_cancel_propagates_into_detached_child() {
         .spawn();
 
     let commands = handle.commands.clone();
-    handle.commands.send(send("delegate a long subtask")).unwrap();
+    handle
+        .commands
+        .send(send("delegate a long subtask"))
+        .unwrap();
 
     let (observed_cancel, cancelled, completed) = tokio::time::timeout(OUTER_GUARD, async {
         let mut sent_cancel = false;
@@ -207,9 +226,18 @@ async fn subagent_cancel_propagates_into_detached_child() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
-    assert!(observed_cancel, "the child's BlockUntilCancelTool must observe ctx.cancel");
-    assert!(cancelled, "the parent's cancelled turn must emit AgentEvent::Cancelled");
-    assert!(completed, "the parent's cancelled turn must end with TurnComplete");
+    assert!(
+        observed_cancel,
+        "the child's BlockUntilCancelTool must observe ctx.cancel"
+    );
+    assert!(
+        cancelled,
+        "the parent's cancelled turn must emit AgentEvent::Cancelled"
+    );
+    assert!(
+        completed,
+        "the parent's cancelled turn must end with TurnComplete"
+    );
 }
 
 // ── CLAIM 31c: WORKING_DIR ISOLATION ─────────────────────────────────────────
@@ -267,7 +295,10 @@ async fn subagent_working_dir_isolation() {
             StreamEvent::ToolCall(tool_call("c_sub", "subagent", "{\"task\":\"probe\"}")),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let mut handle = Agent::builder()
@@ -306,7 +337,10 @@ async fn subagent_working_dir_isolation() {
     // Sanity: the child dir is NOT the process cwd (so the assertion above is
     // meaningful — it would fail if working_dir were ignored and the process cwd
     // were used instead).
-    let process_cwd = std::env::current_dir().unwrap_or_default().display().to_string();
+    let process_cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .display()
+        .to_string();
     assert_ne!(
         child_dir_str, process_cwd,
         "the test's child dir must differ from the process cwd for the isolation claim to bite"

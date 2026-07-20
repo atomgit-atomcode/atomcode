@@ -539,7 +539,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                         models = models,
                         defaultProvider = defaultProvider,
                         currentModel = currentModel,
-                        setupRequired = auth?.loggedIn != true || providers?.providers.isNullOrEmpty(),
+                        setupRequired = auth?.loggedIn != true || auth.expired || providers?.providers.isNullOrEmpty(),
                     )
                 }
             }
@@ -551,10 +551,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                 CompletableFuture.failedFuture(IllegalStateException("AtomCode is not connected."))
             } else {
                 val client = getOrCreateClient()
-                client.startLogin(true).thenCompose { start ->
-                    onStatus("Opened browser for AtomGit sign-in.")
-                    pollLoginUntilAuthorized(client, start.loginId, start.expiresInSeconds, onStatus)
-                }.thenCompose {
+                AtomCodeLoginCoordinator.getInstance().login(client, onStatus).thenCompose {
                     loadSetupSnapshot()
                 }
             }
@@ -633,39 +630,6 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                     setConnectionState(ConnectionState.SetupRequired("AtomCode daemon is not running."))
                 }
             }
-    }
-
-    private fun pollLoginUntilAuthorized(
-        client: AtomCodeDaemonClient,
-        loginId: String,
-        expiresInSeconds: Int,
-        onStatus: (String) -> Unit,
-    ): CompletableFuture<Unit> {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(expiresInSeconds.coerceAtLeast(30).toLong())
-        fun poll(): CompletableFuture<Unit> {
-            return client.pollLogin(loginId).thenCompose { result ->
-                when (result.status) {
-                    "authorized" -> {
-                        onStatus("Signed in${result.userName?.let { " as $it" } ?: ""}.")
-                        CompletableFuture.completedFuture(Unit)
-                    }
-                    "pending" -> {
-                        if (System.nanoTime() >= deadline) {
-                            client.cancelLogin(loginId)
-                            CompletableFuture.failedFuture(IllegalStateException("Login timed out."))
-                        } else {
-                            onStatus("Waiting for browser authorization...")
-                            CompletableFuture.supplyAsync(
-                                { Unit },
-                                CompletableFuture.delayedExecutor(2, TimeUnit.SECONDS),
-                            ).thenCompose { poll() }
-                        }
-                    }
-                    else -> CompletableFuture.failedFuture(IllegalStateException("Unexpected login status: ${result.status}"))
-                }
-            }
-        }
-        return poll()
     }
 
     private fun syncProjectDirectory(client: AtomCodeDaemonClient, version: String): CompletableFuture<ConnectionState> {

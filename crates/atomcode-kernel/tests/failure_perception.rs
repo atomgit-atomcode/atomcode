@@ -14,25 +14,32 @@
 //!       continues is stopped with `StopReason::MaxContinuations` instead of
 //!       spinning forever with no model agency to stop it.
 
+use async_trait::async_trait;
 use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
-use atomcode_kernel::message::Conversation;
 use atomcode_kernel::hook::LifecycleHooks;
+use atomcode_kernel::message::Conversation;
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::testkit::{AlwaysStopProvider, EchoTool, MockProvider, ScriptedProvider};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
-use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
 
 const OUTER_GUARD: Duration = Duration::from_secs(5);
 
 fn send(text: &str) -> AgentCommand {
-    AgentCommand::SendMessage { text: text.into(), images: vec![] }
+    AgentCommand::SendMessage {
+        text: text.into(),
+        images: vec![],
+    }
 }
 
 fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
-    ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args.into(),
+    }
 }
 
 // ── A normal turn ends with StopReason::Stopped ──────────────────────────────
@@ -97,8 +104,14 @@ async fn failed_open_run_to_completion_reports_error_not_empty_success() {
         "the provider error message must be captured in Outcome.error, not dropped"
     );
     // And it must NOT look like a vacuous success.
-    assert!(outcome.text.is_empty(), "no bogus assistant text on a failed open");
-    assert!(outcome.tool_results.is_empty(), "no tool results on a failed open");
+    assert!(
+        outcome.text.is_empty(),
+        "no bogus assistant text on a failed open"
+    );
+    assert!(
+        outcome.tool_results.is_empty(),
+        "no tool results on a failed open"
+    );
 }
 
 // ── max_rounds fuse maps to StopReason::MaxRounds (event + Outcome) ───────────
@@ -160,12 +173,22 @@ async fn max_rounds_stop_reason() {
         .tools(reg2.mount(&["echo"]))
         .max_rounds(2)
         .build();
-    let outcome = tokio::time::timeout(OUTER_GUARD, agent.run_to_completion("loop", AutoRespond::AllowAll))
-        .await
-        .expect("max_rounds run_to_completion must not hang");
-    assert_eq!(outcome.stop, StopReason::MaxRounds, "Outcome.stop must be MaxRounds");
+    let outcome = tokio::time::timeout(
+        OUTER_GUARD,
+        agent.run_to_completion("loop", AutoRespond::AllowAll),
+    )
+    .await
+    .expect("max_rounds run_to_completion must not hang");
+    assert_eq!(
+        outcome.stop,
+        StopReason::MaxRounds,
+        "Outcome.stop must be MaxRounds"
+    );
     assert!(
-        outcome.error.as_deref().is_some_and(|m| m.contains("max rounds")),
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|m| m.contains("max rounds")),
         "the max-rounds error must be captured in Outcome.error; got {:?}",
         outcome.error
     );
@@ -230,7 +253,9 @@ async fn turn_end_continuation_fuse_stops_runaway() {
         "the runaway offer_continuation loop must end with StopReason::MaxContinuations"
     );
     assert!(
-        error_msg.as_deref().is_some_and(|m| m.contains("continuation")),
+        error_msg
+            .as_deref()
+            .is_some_and(|m| m.contains("continuation")),
         "an Error mentioning continuations must be emitted; got {error_msg:?}"
     );
 }
@@ -309,7 +334,10 @@ async fn cancel_reason() {
     .await
     .expect("a cancelled turn must terminate, not hang");
 
-    assert!(saw_marker, "the AgentEvent::Cancelled marker must still be emitted");
+    assert!(
+        saw_marker,
+        "the AgentEvent::Cancelled marker must still be emitted"
+    );
     assert_eq!(
         reason,
         Some(StopReason::Cancelled),
@@ -376,7 +404,10 @@ async fn prompt_rejected_reason() {
         "a rejected prompt must surface as Outcome.stop == PromptRejected"
     );
     assert!(
-        outcome.error.as_deref().is_some_and(|m| m.contains("rejected")),
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|m| m.contains("rejected")),
         "the rejection reason must be captured in Outcome.error; got {:?}",
         outcome.error
     );

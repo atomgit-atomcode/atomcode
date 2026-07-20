@@ -338,9 +338,10 @@ impl Tool for EditFileTool {
         };
 
         if super::is_sensitive_input_path(&parsed.file_path) {
-            return ApprovalRequirement::RequireApproval(
-                format!("Editing sensitive system path: {}", parsed.file_path),
-            );
+            return ApprovalRequirement::RequireApproval(format!(
+                "Editing sensitive system path: {}",
+                parsed.file_path
+            ));
         }
 
         ApprovalRequirement::AutoApprove
@@ -1097,9 +1098,15 @@ impl EditFileTool {
                 edit_count, file_path, summary_parts.join(", "), short_name),
             success: true,
         };
-        let (result, _final_content) =
-            validate_write_check(&new_content, file_path, &all_new_strings, content, result, ctx)
-                .await?;
+        let (result, _final_content) = validate_write_check(
+            &new_content,
+            file_path,
+            &all_new_strings,
+            content,
+            result,
+            ctx,
+        )
+        .await?;
         Ok(result)
     }
 }
@@ -1210,7 +1217,8 @@ fn try_fuzzy_replace(
     // Relative differences (lines indented more OR less than the anchor)
     // are preserved as signed offsets from the file's actual indent.
     let new_lines: Vec<&str> = new_string.lines().collect();
-    let new_base_indent = new_lines.iter()
+    let new_base_indent = new_lines
+        .iter()
         .find(|l| !l.trim().is_empty())
         .map(|l| l.len() - l.trim_start().len())
         .unwrap_or(0);
@@ -1232,27 +1240,34 @@ fn try_fuzzy_replace(
         // Build replacement preserving RELATIVE indentation from new_string,
         // supporting both deeper-than-anchor (add spaces) and outdented-from-
         // anchor (trim the file's indent prefix) cases.
-        let replacement: Vec<String> = new_lines.iter().map(|l| {
-            if l.trim().is_empty() {
-                String::new()
-            } else {
-                let line_indent = l.len() - l.trim_start().len();
-                let signed_relative = line_indent as isize - new_base_indent as isize;
-                let total_indent = if signed_relative >= 0 {
-                    // Same or deeper than anchor — keep file's indent prefix
-                    // (preserves tabs/spaces mix) and extend with plain spaces.
-                    format!("{}{}", file_indent_str, " ".repeat(signed_relative as usize))
+        let replacement: Vec<String> = new_lines
+            .iter()
+            .map(|l| {
+                if l.trim().is_empty() {
+                    String::new()
                 } else {
-                    // Outdented from anchor — drop `abs(signed_relative)`
-                    // chars from the tail of file_indent_str. Preserves the
-                    // leading whitespace semantics up to the needed depth.
-                    let drop = (-signed_relative) as usize;
-                    let keep = file_indent.saturating_sub(drop);
-                    file_indent_str.chars().take(keep).collect()
-                };
-                format!("{}{}", total_indent, l.trim())
-            }
-        }).collect();
+                    let line_indent = l.len() - l.trim_start().len();
+                    let signed_relative = line_indent as isize - new_base_indent as isize;
+                    let total_indent = if signed_relative >= 0 {
+                        // Same or deeper than anchor — keep file's indent prefix
+                        // (preserves tabs/spaces mix) and extend with plain spaces.
+                        format!(
+                            "{}{}",
+                            file_indent_str,
+                            " ".repeat(signed_relative as usize)
+                        )
+                    } else {
+                        // Outdented from anchor — drop `abs(signed_relative)`
+                        // chars from the tail of file_indent_str. Preserves the
+                        // leading whitespace semantics up to the needed depth.
+                        let drop = (-signed_relative) as usize;
+                        let keep = file_indent.saturating_sub(drop);
+                        file_indent_str.chars().take(keep).collect()
+                    };
+                    format!("{}{}", total_indent, l.trim())
+                }
+            })
+            .collect();
 
         result_lines.splice(start..end, replacement);
     }
@@ -1697,7 +1712,10 @@ mod security_tests {
         })
         .to_string();
 
-        assert!(matches!(tool.approval(&args), ApprovalRequirement::AutoApprove));
+        assert!(matches!(
+            tool.approval(&args),
+            ApprovalRequirement::AutoApprove
+        ));
     }
 
     #[test]
@@ -1766,7 +1784,10 @@ mod security_tests {
         // First edit of .env prompts; simulate the user pressing [A] by
         // recording the scoped grant the decider would store.
         let approval = EditFileTool.approval_with_context(&mk(&dotenv), &ctx);
-        assert!(matches!(store.check("edit_file", &approval), PermissionDecision::Ask(_)));
+        assert!(matches!(
+            store.check("edit_file", &approval),
+            PermissionDecision::Ask(_)
+        ));
         match &approval {
             ApprovalRequirement::RequireApprovalScoped { scope, .. } => {
                 store.grant_session_scope(scope)
@@ -1783,7 +1804,10 @@ mod security_tests {
         // A DIFFERENT sensitive file still prompts (scope is per-file).
         let different = EditFileTool.approval_with_context(&mk(&other), &ctx);
         assert!(
-            matches!(store.check("edit_file", &different), PermissionDecision::Ask(_)),
+            matches!(
+                store.check("edit_file", &different),
+                PermissionDecision::Ask(_)
+            ),
             "a [A] on one file must NOT unlock edits to a different sensitive file",
         );
     }
@@ -1821,8 +1845,11 @@ mod security_tests {
         let process_cwd = TempDir::new().unwrap();
         std::fs::create_dir_all(workspace.path().join("src")).unwrap();
         std::fs::create_dir_all(process_cwd.path().join("src")).unwrap();
-        std::fs::write(workspace.path().join("src/app.rs"), "fn main() {\n    old();\n}\n")
-            .unwrap();
+        std::fs::write(
+            workspace.path().join("src/app.rs"),
+            "fn main() {\n    old();\n}\n",
+        )
+        .unwrap();
 
         let original_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(process_cwd.path()).unwrap();

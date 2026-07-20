@@ -66,7 +66,9 @@ impl Lang {
         Some(match self {
             Lang::Rust => include_str!("queries/rust_calls.scm"),
             Lang::Python => include_str!("queries/python_calls.scm"),
-            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => include_str!("queries/javascript_calls.scm"),
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+                include_str!("queries/javascript_calls.scm")
+            }
             Lang::Java => include_str!("queries/java_calls.scm"),
             Lang::Go => include_str!("queries/go_calls.scm"),
             _ => return None,
@@ -78,7 +80,15 @@ impl Lang {
     pub fn is_indexed(&self) -> bool {
         matches!(
             self,
-            Lang::Rust | Lang::Python | Lang::JavaScript | Lang::TypeScript | Lang::Tsx | Lang::Go | Lang::Java | Lang::C | Lang::Cpp
+            Lang::Rust
+                | Lang::Python
+                | Lang::JavaScript
+                | Lang::TypeScript
+                | Lang::Tsx
+                | Lang::Go
+                | Lang::Java
+                | Lang::C
+                | Lang::Cpp
         )
     }
 
@@ -122,8 +132,18 @@ mod tests {
     fn every_lang_has_a_compilable_query() {
         let mut failures = Vec::new();
         for lang in [
-            Lang::Rust, Lang::Python, Lang::JavaScript, Lang::TypeScript, Lang::Tsx, Lang::Go,
-            Lang::Java, Lang::C, Lang::Cpp, Lang::CSharp, Lang::Html, Lang::Php,
+            Lang::Rust,
+            Lang::Python,
+            Lang::JavaScript,
+            Lang::TypeScript,
+            Lang::Tsx,
+            Lang::Go,
+            Lang::Java,
+            Lang::C,
+            Lang::Cpp,
+            Lang::CSharp,
+            Lang::Html,
+            Lang::Php,
         ] {
             match tree_sitter::Query::new(&lang.grammar(), lang.symbols_query()) {
                 Ok(q) => {
@@ -136,6 +156,10 @@ mod tests {
                 Err(e) => failures.push(format!("{lang:?}: {e:?}")),
             }
         }
-        assert!(failures.is_empty(), "query compile failures:\n{}", failures.join("\n"));
+        assert!(
+            failures.is_empty(),
+            "query compile failures:\n{}",
+            failures.join("\n")
+        );
     }
 }

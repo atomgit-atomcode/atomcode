@@ -248,18 +248,17 @@ impl Tool for OpenFileTool {
         // URLs don't need path-based approval — they're opened in the browser
         // and are as safe as any in-workspace file.
         let fp = parsed.file_path.trim();
-        if fp.to_ascii_lowercase().starts_with("http://") || fp.to_ascii_lowercase().starts_with("https://") {
+        if fp.to_ascii_lowercase().starts_with("http://")
+            || fp.to_ascii_lowercase().starts_with("https://")
+        {
             return ApprovalRequirement::AutoApprove;
         }
         let wd = match ctx.working_dir.try_read() {
             Ok(g) => g.clone(),
             Err(_) => return self.approval(args),
         };
-        match super::approval_for_path(
-            &parsed.file_path,
-            &wd,
-            super::ExternalPathAction::Enumerate,
-        ) {
+        match super::approval_for_path(&parsed.file_path, &wd, super::ExternalPathAction::Enumerate)
+        {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }
@@ -412,7 +411,11 @@ async fn open_url(url: &str) -> Result<ToolResult> {
     match cmd.spawn() {
         Ok(_child) => Ok(ToolResult {
             call_id: String::new(),
-            output: format!("Opened URL `{}` via `{}`.", url, strategy_command_name(&strategy)),
+            output: format!(
+                "Opened URL `{}` via `{}`.",
+                url,
+                strategy_command_name(&strategy)
+            ),
             success: true,
         }),
         Err(e) => Ok(ToolResult {

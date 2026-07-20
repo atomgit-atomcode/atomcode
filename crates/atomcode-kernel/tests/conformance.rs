@@ -9,6 +9,7 @@
 //! against its real OpenAI-compat adapter; an L2 specialization runs the tool/middleware/
 //! hook harnesses against its own extensions.)
 
+use async_trait::async_trait;
 use atomcode_kernel::conformance::{self, ConformanceReport};
 use atomcode_kernel::hook::{HookChain, LifecycleHooks, NoopHooks};
 use atomcode_kernel::message::{Message, MessageMeta};
@@ -20,10 +21,10 @@ use atomcode_kernel::testkit::{
     ApprovalMiddleware, ArgRewriteMiddleware, BlockToolMiddleware, BlockUntilCancelTool,
     BudgetReminderHook, ContinueOnceHook, CountingTool, DangerousBashTool, DropToolsHook, EchoTool,
     MockProvider, RecorderHook, RecordingProvider, RedactHook, RejectPromptHook, RiskyWriteTool,
-    RoundBudgetHook, ScriptedProvider, SilentStreamProvider, TruncateMiddleware, WorkingDirProbeTool,
+    RoundBudgetHook, ScriptedProvider, SilentStreamProvider, TruncateMiddleware,
+    WorkingDirProbeTool,
 };
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolCall, ToolContext, ToolDef, ToolResult};
-use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -31,7 +32,10 @@ use std::sync::Arc;
 
 /// Assert a report is non-conformant AND the failure is the EXPECTED named check.
 fn assert_check_failed(report: &ConformanceReport, name: &str) {
-    assert!(!report.passed(), "expected a violation but the report passed: {report:#?}");
+    assert!(
+        !report.passed(),
+        "expected a violation but the report passed: {report:#?}"
+    );
     assert!(
         report.failures().iter().any(|c| c.name == name),
         "expected check `{name}` to fail; actual failures = {:?}",
@@ -43,8 +47,12 @@ fn assert_check_failed(report: &ConformanceReport, name: &str) {
 
 #[tokio::test]
 async fn tool_doubles_are_conformant() {
-    conformance::tool::check(Arc::new(EchoTool), &["{\"text\":\"hi\"}"]).await.assert_conformant();
-    conformance::tool::check(Arc::new(RiskyWriteTool), &["{\"path\":\"/tmp/x\"}"]).await.assert_conformant();
+    conformance::tool::check(Arc::new(EchoTool), &["{\"text\":\"hi\"}"])
+        .await
+        .assert_conformant();
+    conformance::tool::check(Arc::new(RiskyWriteTool), &["{\"path\":\"/tmp/x\"}"])
+        .await
+        .assert_conformant();
     // arg-aware risk: drive both a safe AND a dangerous command.
     conformance::tool::check(
         Arc::new(DangerousBashTool),
@@ -52,8 +60,15 @@ async fn tool_doubles_are_conformant() {
     )
     .await
     .assert_conformant();
-    conformance::tool::check(Arc::new(CountingTool::new(Arc::new(AtomicUsize::new(0)))), &["{}"]).await.assert_conformant();
-    conformance::tool::check(Arc::new(WorkingDirProbeTool), &["{}"]).await.assert_conformant();
+    conformance::tool::check(
+        Arc::new(CountingTool::new(Arc::new(AtomicUsize::new(0)))),
+        &["{}"],
+    )
+    .await
+    .assert_conformant();
+    conformance::tool::check(Arc::new(WorkingDirProbeTool), &["{}"])
+        .await
+        .assert_conformant();
 }
 
 struct EmptyNameTool;
@@ -69,7 +84,12 @@ impl Tool for EmptyNameTool {
         json!({"type": "object"})
     }
     async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "x".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "x".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -86,7 +106,12 @@ impl Tool for EmptyDescriptionTool {
         json!({"type": "object"})
     }
     async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "x".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "x".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -106,7 +131,12 @@ impl Tool for UnstableSchemaTool {
         json!({"type": "object", "rev": rev})
     }
     async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "x".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "x".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -132,7 +162,12 @@ impl Tool for FlakyRiskTool {
         }
     }
     async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "x".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "x".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -155,14 +190,32 @@ impl Tool for PanicExecuteTool {
 
 #[tokio::test]
 async fn tool_harness_catches_violations() {
-    assert_check_failed(&conformance::tool::check(Arc::new(EmptyNameTool), &["{}"]).await, "name_non_empty");
-    assert_check_failed(&conformance::tool::check(Arc::new(EmptyDescriptionTool), &["{}"]).await, "description_non_empty");
     assert_check_failed(
-        &conformance::tool::check(Arc::new(UnstableSchemaTool { n: AtomicUsize::new(0) }), &["{}"]).await,
+        &conformance::tool::check(Arc::new(EmptyNameTool), &["{}"]).await,
+        "name_non_empty",
+    );
+    assert_check_failed(
+        &conformance::tool::check(Arc::new(EmptyDescriptionTool), &["{}"]).await,
+        "description_non_empty",
+    );
+    assert_check_failed(
+        &conformance::tool::check(
+            Arc::new(UnstableSchemaTool {
+                n: AtomicUsize::new(0),
+            }),
+            &["{}"],
+        )
+        .await,
         "schema_stable",
     );
     assert_check_failed(
-        &conformance::tool::check(Arc::new(FlakyRiskTool { n: AtomicUsize::new(0) }), &["{}"]).await,
+        &conformance::tool::check(
+            Arc::new(FlakyRiskTool {
+                n: AtomicUsize::new(0),
+            }),
+            &["{}"],
+        )
+        .await,
         "risk_deterministic",
     );
     assert_check_failed(
@@ -207,16 +260,29 @@ async fn tool_cancel_check_positive_and_negative() {
 
 #[tokio::test]
 async fn middleware_doubles_are_conformant() {
-    conformance::middleware::check(Arc::new(ApprovalMiddleware::new())).await.assert_conformant();
-    conformance::middleware::check(Arc::new(ArgRewriteMiddleware)).await.assert_conformant();
-    conformance::middleware::check(Arc::new(BlockToolMiddleware)).await.assert_conformant();
-    conformance::middleware::check(Arc::new(TruncateMiddleware)).await.assert_conformant();
+    conformance::middleware::check(Arc::new(ApprovalMiddleware::new()))
+        .await
+        .assert_conformant();
+    conformance::middleware::check(Arc::new(ArgRewriteMiddleware))
+        .await
+        .assert_conformant();
+    conformance::middleware::check(Arc::new(BlockToolMiddleware))
+        .await
+        .assert_conformant();
+    conformance::middleware::check(Arc::new(TruncateMiddleware))
+        .await
+        .assert_conformant();
 }
 
 struct ParkForeverMiddleware;
 #[async_trait]
 impl ToolMiddleware for ParkForeverMiddleware {
-    async fn before(&self, _call: &mut ToolCall, _tool: &Arc<dyn Tool>, _rt: &RequestCtx) -> BeforeOutcome {
+    async fn before(
+        &self,
+        _call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        _rt: &RequestCtx,
+    ) -> BeforeOutcome {
         // Ignores the RequestCtx timeout and parks — the kernel turn would hang here.
         futures::future::pending::<()>().await;
         BeforeOutcome::Proceed
@@ -226,7 +292,12 @@ impl ToolMiddleware for ParkForeverMiddleware {
 struct PanicBeforeMiddleware;
 #[async_trait]
 impl ToolMiddleware for PanicBeforeMiddleware {
-    async fn before(&self, _call: &mut ToolCall, _tool: &Arc<dyn Tool>, _rt: &RequestCtx) -> BeforeOutcome {
+    async fn before(
+        &self,
+        _call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        _rt: &RequestCtx,
+    ) -> BeforeOutcome {
         panic!("before blew up");
     }
 }
@@ -249,27 +320,57 @@ impl ToolMiddleware for ParkAfterMiddleware {
 
 #[tokio::test]
 async fn middleware_harness_catches_violations() {
-    assert_check_failed(&conformance::middleware::check(Arc::new(ParkForeverMiddleware)).await, "before_terminates");
-    assert_check_failed(&conformance::middleware::check(Arc::new(PanicBeforeMiddleware)).await, "before_no_panic");
-    assert_check_failed(&conformance::middleware::check(Arc::new(PanicAfterMiddleware)).await, "after_no_panic");
-    assert_check_failed(&conformance::middleware::check(Arc::new(ParkAfterMiddleware)).await, "after_terminates");
+    assert_check_failed(
+        &conformance::middleware::check(Arc::new(ParkForeverMiddleware)).await,
+        "before_terminates",
+    );
+    assert_check_failed(
+        &conformance::middleware::check(Arc::new(PanicBeforeMiddleware)).await,
+        "before_no_panic",
+    );
+    assert_check_failed(
+        &conformance::middleware::check(Arc::new(PanicAfterMiddleware)).await,
+        "after_no_panic",
+    );
+    assert_check_failed(
+        &conformance::middleware::check(Arc::new(ParkAfterMiddleware)).await,
+        "after_terminates",
+    );
 }
 
 // ────────────────────────────── Hooks seam ──────────────────────────────
 
 #[tokio::test]
 async fn hook_doubles_are_conformant() {
-    conformance::hooks::check(Arc::new(NoopHooks)).await.assert_conformant();
-    conformance::hooks::check(Arc::new(RecorderHook::new())).await.assert_conformant();
-    conformance::hooks::check(Arc::new(BudgetReminderHook)).await.assert_conformant();
-    conformance::hooks::check(Arc::new(RoundBudgetHook)).await.assert_conformant();
-    conformance::hooks::check(Arc::new(RedactHook)).await.assert_conformant();
-    conformance::hooks::check(Arc::new(DropToolsHook)).await.assert_conformant();
-    conformance::hooks::check(Arc::new(ContinueOnceHook::new())).await.assert_conformant();
-    conformance::hooks::check(Arc::new(RejectPromptHook)).await.assert_conformant();
+    conformance::hooks::check(Arc::new(NoopHooks))
+        .await
+        .assert_conformant();
+    conformance::hooks::check(Arc::new(RecorderHook::new()))
+        .await
+        .assert_conformant();
+    conformance::hooks::check(Arc::new(BudgetReminderHook))
+        .await
+        .assert_conformant();
+    conformance::hooks::check(Arc::new(RoundBudgetHook))
+        .await
+        .assert_conformant();
+    conformance::hooks::check(Arc::new(RedactHook))
+        .await
+        .assert_conformant();
+    conformance::hooks::check(Arc::new(DropToolsHook))
+        .await
+        .assert_conformant();
+    conformance::hooks::check(Arc::new(ContinueOnceHook::new()))
+        .await
+        .assert_conformant();
+    conformance::hooks::check(Arc::new(RejectPromptHook))
+        .await
+        .assert_conformant();
     // A composed chain is itself a conforming LifecycleHooks.
-    let chain: Arc<dyn LifecycleHooks> =
-        Arc::new(HookChain::new(vec![Arc::new(RecorderHook::new()), Arc::new(BudgetReminderHook)]));
+    let chain: Arc<dyn LifecycleHooks> = Arc::new(HookChain::new(vec![
+        Arc::new(RecorderHook::new()),
+        Arc::new(BudgetReminderHook),
+    ]));
     conformance::hooks::check(chain).await.assert_conformant();
 }
 
@@ -286,13 +387,19 @@ struct FabricateMetaHook;
 #[async_trait]
 impl LifecycleHooks for FabricateMetaHook {
     async fn on_model_response(&self, response: &mut Message) {
-        response.meta = Some(MessageMeta { round: 999, ..Default::default() });
+        response.meta = Some(MessageMeta {
+            round: 999,
+            ..Default::default()
+        });
     }
 }
 
 #[tokio::test]
 async fn hook_harness_catches_violations() {
-    assert_check_failed(&conformance::hooks::check(Arc::new(PanicDeltaHook)).await, "on_text_delta");
+    assert_check_failed(
+        &conformance::hooks::check(Arc::new(PanicDeltaHook)).await,
+        "on_text_delta",
+    );
     assert_check_failed(
         &conformance::hooks::check(Arc::new(FabricateMetaHook)).await,
         "on_model_response_preserves_meta",
@@ -332,7 +439,9 @@ async fn provider_doubles_are_conformant() {
         code: Some("auth".into()),
         retry_after_secs: None,
     };
-    conformance::provider::check(Arc::new(ScriptedProvider::open_error(err))).await.assert_conformant();
+    conformance::provider::check(Arc::new(ScriptedProvider::open_error(err)))
+        .await
+        .assert_conformant();
 }
 
 struct PanicOnOptionsProvider;
@@ -350,7 +459,9 @@ impl LlmProvider for PanicOnOptionsProvider {
         if *options != ChatOptions::default() {
             panic!("cannot handle non-default options");
         }
-        Ok(Box::pin(futures::stream::iter(vec![StreamEvent::Done { truncated: false }])))
+        Ok(Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+            truncated: false,
+        }])))
     }
 }
 
@@ -372,13 +483,25 @@ async fn provider_harness_catches_violations() {
 fn stream_wellformed_contract() {
     use conformance::provider::check_stream_wellformed;
     // Positive: content then a single trailing Done.
-    let good = vec![StreamEvent::TextDelta("hi".into()), StreamEvent::Done { truncated: false }];
+    let good = vec![
+        StreamEvent::TextDelta("hi".into()),
+        StreamEvent::Done { truncated: false },
+    ];
     check_stream_wellformed(&good).assert_conformant();
     // Negative: an event AFTER the Done terminal.
-    let after_done = vec![StreamEvent::Done { truncated: false }, StreamEvent::TextDelta("late".into())];
-    assert_check_failed(&check_stream_wellformed(&after_done), "no_events_after_terminal");
+    let after_done = vec![
+        StreamEvent::Done { truncated: false },
+        StreamEvent::TextDelta("late".into()),
+    ];
+    assert_check_failed(
+        &check_stream_wellformed(&after_done),
+        "no_events_after_terminal",
+    );
     // Negative: two Done events.
-    let two_done = vec![StreamEvent::Done { truncated: false }, StreamEvent::Done { truncated: false }];
+    let two_done = vec![
+        StreamEvent::Done { truncated: false },
+        StreamEvent::Done { truncated: false },
+    ];
     assert_check_failed(&check_stream_wellformed(&two_done), "at_most_one_done");
     // Negative: a mid-stream Error carrying an HTTP status (reserved for OPEN failures).
     let bad_err = vec![StreamEvent::Error(ProviderError {
@@ -388,26 +511,55 @@ fn stream_wellformed_contract() {
         code: None,
         retry_after_secs: None,
     })];
-    assert_check_failed(&check_stream_wellformed(&bad_err), "midstream_error_has_no_http_status");
+    assert_check_failed(
+        &check_stream_wellformed(&bad_err),
+        "midstream_error_has_no_http_status",
+    );
 }
 
 #[test]
 fn stream_reconstruction_contract() {
     // Positive: two fragments at index 0 reconstruct the complete call byte-for-byte.
     let good = vec![
-        StreamEvent::ToolCallDelta { index: 0, id: Some("c1".into()), name: Some("echo".into()), arguments: "{\"x\"".into() },
-        StreamEvent::ToolCallDelta { index: 0, id: None, name: None, arguments: ":1}".into() },
-        StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "echo".into(), arguments: "{\"x\":1}".into() }),
+        StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some("c1".into()),
+            name: Some("echo".into()),
+            arguments: "{\"x\"".into(),
+        },
+        StreamEvent::ToolCallDelta {
+            index: 0,
+            id: None,
+            name: None,
+            arguments: ":1}".into(),
+        },
+        StreamEvent::ToolCall(ToolCall {
+            id: "c1".into(),
+            name: "echo".into(),
+            arguments: "{\"x\":1}".into(),
+        }),
         StreamEvent::Done { truncated: false },
     ];
     conformance::provider::check_stream_reconstruction(&good).assert_conformant();
 
     // Negative: the concatenated args don't match the complete call.
     let bad_args = vec![
-        StreamEvent::ToolCallDelta { index: 0, id: None, name: Some("echo".into()), arguments: "{\"x\":1}".into() },
-        StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "echo".into(), arguments: "{\"WRONG\":9}".into() }),
+        StreamEvent::ToolCallDelta {
+            index: 0,
+            id: None,
+            name: Some("echo".into()),
+            arguments: "{\"x\":1}".into(),
+        },
+        StreamEvent::ToolCall(ToolCall {
+            id: "c1".into(),
+            name: "echo".into(),
+            arguments: "{\"WRONG\":9}".into(),
+        }),
     ];
-    assert_check_failed(&conformance::provider::check_stream_reconstruction(&bad_args), "reconstructed_args_match");
+    assert_check_failed(
+        &conformance::provider::check_stream_reconstruction(&bad_args),
+        "reconstructed_args_match",
+    );
 
     // Negative: a streamed index with NO matching complete call.
     let orphan = vec![StreamEvent::ToolCallDelta {
@@ -423,7 +575,11 @@ fn stream_reconstruction_contract() {
 
     // A stream with NO ToolCallDelta is trivially conformant.
     let no_deltas = vec![
-        StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "echo".into(), arguments: "{}".into() }),
+        StreamEvent::ToolCall(ToolCall {
+            id: "c1".into(),
+            name: "echo".into(),
+            arguments: "{}".into(),
+        }),
         StreamEvent::Done { truncated: false },
     ];
     conformance::provider::check_stream_reconstruction(&no_deltas).assert_conformant();
@@ -433,10 +589,18 @@ fn stream_reconstruction_contract() {
 
 #[tokio::test]
 async fn all_four_seams_conformant_smoke() {
-    conformance::tool::check(Arc::new(EchoTool), &["{}"]).await.assert_conformant();
-    conformance::middleware::check(Arc::new(ApprovalMiddleware::new())).await.assert_conformant();
-    conformance::hooks::check(Arc::new(RecorderHook::new())).await.assert_conformant();
-    conformance::provider::check(Arc::new(MockProvider::new(vec![vec![StreamEvent::Done { truncated: false }]])))
+    conformance::tool::check(Arc::new(EchoTool), &["{}"])
         .await
         .assert_conformant();
+    conformance::middleware::check(Arc::new(ApprovalMiddleware::new()))
+        .await
+        .assert_conformant();
+    conformance::hooks::check(Arc::new(RecorderHook::new()))
+        .await
+        .assert_conformant();
+    conformance::provider::check(Arc::new(MockProvider::new(vec![vec![StreamEvent::Done {
+        truncated: false,
+    }]])))
+    .await
+    .assert_conformant();
 }

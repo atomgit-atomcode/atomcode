@@ -9,10 +9,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::Stream;
 
-use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::Message;
 use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
+use atomcode_config::config::provider::ProviderConfig;
 
 /// Per-provider strategy for echoing back `reasoning_content` from historical
 /// assistant tool_call messages on subsequent requests.
@@ -113,7 +113,10 @@ pub trait LlmProvider: Send + Sync {
 /// workspace-wide `ATOMCODE_USER_AGENT` (`atomcode/<version>`) — see the
 /// constant's doc-comment for why lowercasing matters on the LLM gateway.
 /// `skip_tls_verify` disables TLS certificate verification when true.
-pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool) -> reqwest::Client {
+pub(super) fn build_http_client(
+    ua_override: Option<&str>,
+    skip_tls_verify: bool,
+) -> reqwest::Client {
     let ua = ua_override.unwrap_or(crate::ATOMCODE_USER_AGENT);
     let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
         .connect_timeout(std::time::Duration::from_secs(30))
@@ -169,11 +172,7 @@ pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool
 /// compact form keeps "429" inline AND the inner `<msg>` typically
 /// carries "rate" / "rate limit" — so the auto-retry backoff path
 /// fires identically against the new format.
-pub(super) fn format_http_error(
-    status: reqwest::StatusCode,
-    url: &str,
-    msg: &str,
-) -> String {
+pub(super) fn format_http_error(status: reqwest::StatusCode, url: &str, msg: &str) -> String {
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         format!("[429] {}", msg)
     } else {
@@ -240,7 +239,9 @@ mod non_retryable_rate_limit_tests {
             r#"{"error":{"message":"当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。","type":"auth_error","code":"429"}}"#
         ));
         // And on the agent-side formatted string.
-        assert!(is_non_retryable_rate_limit("[429] 当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。"));
+        assert!(is_non_retryable_rate_limit(
+            "[429] 当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。"
+        ));
     }
 
     #[test]
@@ -254,7 +255,9 @@ mod non_retryable_rate_limit_tests {
         // Rolling-window / load limits recover on their own — keep retrying.
         assert!(!is_non_retryable_rate_limit("滚动窗口限流，请稍后再试"));
         assert!(!is_non_retryable_rate_limit("请求过于频繁，请稍后再试"));
-        assert!(!is_non_retryable_rate_limit("模型「GLM-5.1」的请求负载过高，请稍后再试。"));
+        assert!(!is_non_retryable_rate_limit(
+            "模型「GLM-5.1」的请求负载过高，请稍后再试。"
+        ));
         assert!(!is_non_retryable_rate_limit("服务繁忙"));
         assert!(!is_non_retryable_rate_limit("当前已被限流"));
     }
@@ -745,8 +748,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-
-}
+        }
     }
 
     #[test]
@@ -917,7 +919,8 @@ mod tests {
     /// access_token when the provider points to an untrusted base_url.
     #[test]
     fn create_provider_rejects_no_api_key_on_untrusted_gateway() {
-        let result = super::create_provider(&cfg_no_key("openai", Some("https://evil.attacker.tld")));
+        let result =
+            super::create_provider(&cfg_no_key("openai", Some("https://evil.attacker.tld")));
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("expected Err for api_key=None + untrusted base_url"),
@@ -964,8 +967,10 @@ mod tests {
     /// must NOT be a gateway-guard error.
     #[test]
     fn create_provider_delegates_auth_on_trusted_gateway() {
-        let result =
-            super::create_provider(&cfg_no_key("openai", Some("https://pre-llm-api-cce.atomgit.com/v1")));
+        let result = super::create_provider(&cfg_no_key(
+            "openai",
+            Some("https://pre-llm-api-cce.atomgit.com/v1"),
+        ));
         let msg = match &result {
             Err(e) => e.to_string(),
             Ok(_) => "provider constructed (auth.toml exists)".to_string(),
@@ -996,7 +1001,10 @@ mod tests {
     /// Malicious subdomain of the trusted host must NOT pass the guard.
     #[test]
     fn create_provider_rejects_no_api_key_on_lookalike_gateway() {
-        let result = super::create_provider(&cfg_no_key("openai", Some("https://pre-llm-api-cce.atomgit.com.evil.com")));
+        let result = super::create_provider(&cfg_no_key(
+            "openai",
+            Some("https://pre-llm-api-cce.atomgit.com.evil.com"),
+        ));
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("expected Err for lookalike domain"),

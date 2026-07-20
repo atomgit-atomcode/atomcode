@@ -68,7 +68,10 @@ impl MemoryStore {
         let existing = fs::read_to_string(&self.path).unwrap_or_default();
         let needs_newline = !existing.is_empty() && !existing.ends_with('\n');
 
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
 
         if needs_newline {
             writeln!(file)?;
@@ -82,7 +85,10 @@ impl MemoryStore {
     /// genuinely new fact is never silently swallowed.
     pub fn append_deduped(&self, content: &str) -> io::Result<bool> {
         let trimmed = content.trim();
-        let dup = self.load().iter().any(|e| e.trim().eq_ignore_ascii_case(trimmed));
+        let dup = self
+            .load()
+            .iter()
+            .any(|e| e.trim().eq_ignore_ascii_case(trimmed));
         if dup {
             return Ok(false);
         }
@@ -124,7 +130,11 @@ impl MemoryStore {
             .collect()
     }
 
-    pub fn merged_for_prompt(global: &MemoryStore, project: &MemoryStore, project_name: &str) -> String {
+    pub fn merged_for_prompt(
+        global: &MemoryStore,
+        project: &MemoryStore,
+        project_name: &str,
+    ) -> String {
         let global_entries = global.load();
         let project_entries = project.load();
 

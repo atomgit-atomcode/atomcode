@@ -27,10 +27,10 @@
 //! 需要以上行为时,在上层扩展相应模块,不在 ctx 里做。
 
 use super::CtxBuilder;
-use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::Message;
 use crate::conversation::{ContextStats, Conversation};
 use crate::tool::ToolResult;
+use atomcode_config::config::provider::ProviderConfig;
 
 /// 本地 Ollama 模型的上下文策略。
 #[derive(Debug, Clone)]
@@ -157,8 +157,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-
-}
+        }
     }
 
     #[test]

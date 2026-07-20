@@ -64,11 +64,23 @@ export function classifyDaemonStreamError(
   return { type: 'error', message: `Stream error: ${message}` };
 }
 
+export class DaemonHttpError extends Error {
+  constructor(
+    public readonly statusCode: number | undefined,
+    public readonly code: string | undefined,
+    public readonly retryable: boolean,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'DaemonHttpError';
+  }
+}
+
 export class DaemonClient {
   private baseUrl: string;
   private host: string;
   private port: number;
-  /** Called when a request fails with ECONNREFUSED. If set, the client retries once after this resolves. */
+  /** Called when an idempotent GET fails with ECONNREFUSED; successful restart permits one GET retry. */
   public onConnectionLost?: () => Promise<boolean>;
 
   constructor(port: number) {
@@ -81,9 +93,10 @@ export class DaemonClient {
 
   private request<T>(method: string, path: string, body?: unknown): Promise<T> {
     return this.requestOnce<T>(method, path, body).catch(async (err) => {
-      // Auto-reconnect: if daemon is down and we have a reconnect handler, try to restart it.
-      // Skip reconnect for health/shutdown endpoints to avoid infinite recursion.
-      if (err instanceof Error && err.message === 'Daemon not running'
+      // Restart/retry only idempotent reads. Replaying POST/PATCH/DELETE after
+      // process replacement can duplicate work or reuse daemon-owned stale IDs.
+      if (method === 'GET'
+          && err instanceof Error && err.message === 'Daemon not running'
           && this.onConnectionLost
           && path !== '/health' && path !== '/shutdown') {
         const restarted = await this.onConnectionLost();
@@ -116,8 +129,20 @@ export class DaemonClient {
         res.on('data', (chunk: Buffer) => chunks.push(chunk));
         res.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf-8');
-          if (!res.statusCode || res.statusCode >= 400) {
-            reject(new Error(`HTTP ${res.statusCode}: ${this.errorMessage(res.statusCode, raw)}`));
+          const statusCode = res.statusCode;
+          if (!statusCode || statusCode >= 400) {
+            let parsed: { code?: string; retryable?: boolean } = {};
+            try {
+              parsed = JSON.parse(raw) as { code?: string; retryable?: boolean };
+            } catch {
+              // Preserve plain-text errors from older daemons.
+            }
+            reject(new DaemonHttpError(
+              statusCode,
+              parsed.code,
+              parsed.retryable ?? (statusCode === undefined || statusCode >= 500),
+              `HTTP ${statusCode}: ${this.errorMessage(statusCode, raw)}`,
+            ));
             return;
           }
           try {
@@ -279,7 +304,10 @@ export class DaemonClient {
   }
 
   startLogin(openBrowser = true): Promise<LoginStartResponse> {
-    return this.post<LoginStartResponse>('/auth/login/start', { open_browser: openBrowser });
+    return this.post<LoginStartResponse>('/auth/login/start', {
+      open_browser: openBrowser,
+      protocol_version: 2,
+    });
   }
 
   pollLogin(loginId: string): Promise<LoginPollResponse> {

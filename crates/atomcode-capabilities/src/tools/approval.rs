@@ -53,13 +53,22 @@ pub struct ApprovalResponse {
 
 impl ApprovalResponse {
     pub fn allow() -> Self {
-        Self { decision: "allow".into(), remember: false }
+        Self {
+            decision: "allow".into(),
+            remember: false,
+        }
     }
     pub fn allow_always() -> Self {
-        Self { decision: "allow_always".into(), remember: false }
+        Self {
+            decision: "allow_always".into(),
+            remember: false,
+        }
     }
     pub fn deny() -> Self {
-        Self { decision: "deny".into(), remember: false }
+        Self {
+            decision: "deny".into(),
+            remember: false,
+        }
     }
 }
 
@@ -118,10 +127,16 @@ impl PermissionStore for InMemoryPermissionStore {
         // Poison-recover instead of unwrap: an approval gate runs in the tool path and
         // MUST NOT panic (the kernel runs panic=abort). The critical section only touches
         // an infallible HashSet, so the guarded set is never left inconsistent.
-        self.granted.lock().unwrap_or_else(|e| e.into_inner()).contains(key)
+        self.granted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(key)
     }
     fn grant(&self, key: &str) {
-        self.granted.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string());
+        self.granted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string());
     }
 }
 
@@ -135,7 +150,10 @@ impl ApprovalMiddleware {
     /// Build over an injected store. `kind` defaults to `"approval"` (the driver
     /// matches `AgentEvent::Request.kind` on it).
     pub fn new(store: Arc<dyn PermissionStore>) -> Self {
-        Self { store, kind: APPROVAL_KIND.to_string() }
+        Self {
+            store,
+            kind: APPROVAL_KIND.to_string(),
+        }
     }
     /// Convenience: gate with a fresh in-memory store.
     pub fn in_memory() -> Self {
@@ -152,7 +170,11 @@ impl ApprovalMiddleware {
     /// edit this session (v1 parity), while `bash` keeps the default per-command
     /// scope so approving one destructive command never blanket-approves others.
     fn grant_key(call: &ToolCall, tool: &dyn Tool) -> String {
-        format!("{}::{}", call.name, tool.always_grant_scope(&call.arguments))
+        format!(
+            "{}::{}",
+            call.name,
+            tool.always_grant_scope(&call.arguments)
+        )
     }
 }
 
@@ -255,7 +277,11 @@ mod tests {
     fn safe_call() -> ToolCall {
         // read_file is Safe; use a risk-Safe tool's args. We reuse the write tool's
         // risk via a Safe arg? No — write is always Risky. Use ReadFileTool instead.
-        ToolCall { id: "2".into(), name: "read_file".into(), arguments: r#"{"file_path":"a.txt"}"#.into() }
+        ToolCall {
+            id: "2".into(),
+            name: "read_file".into(),
+            arguments: r#"{"file_path":"a.txt"}"#.into(),
+        }
     }
 
     /// REGRESSION: "总是 / Always" must be tool-wide for file-mutation tools (v1
@@ -308,15 +334,30 @@ mod tests {
     #[test]
     fn decision_parsing_fails_closed() {
         use serde_json::json;
-        assert_eq!(PermissionDecision::from_value(&json!({"decision":"allow"})), PermissionDecision::AllowOnce);
+        assert_eq!(
+            PermissionDecision::from_value(&json!({"decision":"allow"})),
+            PermissionDecision::AllowOnce
+        );
         assert_eq!(
             PermissionDecision::from_value(&json!({"decision":"allow","remember":true})),
             PermissionDecision::AllowAlways
         );
-        assert_eq!(PermissionDecision::from_value(&json!({"decision":"allow_always"})), PermissionDecision::AllowAlways);
-        assert_eq!(PermissionDecision::from_value(&json!({"decision":"deny"})), PermissionDecision::Deny);
-        assert_eq!(PermissionDecision::from_value(&serde_json::Value::Null), PermissionDecision::Deny);
-        assert_eq!(PermissionDecision::from_value(&json!({})), PermissionDecision::Deny);
+        assert_eq!(
+            PermissionDecision::from_value(&json!({"decision":"allow_always"})),
+            PermissionDecision::AllowAlways
+        );
+        assert_eq!(
+            PermissionDecision::from_value(&json!({"decision":"deny"})),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            PermissionDecision::from_value(&serde_json::Value::Null),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            PermissionDecision::from_value(&json!({})),
+            PermissionDecision::Deny
+        );
     }
 
     #[tokio::test]
@@ -381,17 +422,29 @@ mod tests {
         // Older approval payloads without call_id still parse; they simply cannot
         // correlate a pre-execution prompt with a later ToolStarted row.
         let legacy: ApprovalRequest =
-            serde_json::from_value(serde_json::json!({ "tool": "bash", "args": "{}" }))
-                .unwrap();
+            serde_json::from_value(serde_json::json!({ "tool": "bash", "args": "{}" })).unwrap();
         assert_eq!(legacy.call_id, "");
 
         // Response side: each constructor round-trips through from_value exactly.
         let v = serde_json::to_value(ApprovalResponse::allow()).unwrap();
-        assert_eq!(PermissionDecision::from_value(&v), PermissionDecision::AllowOnce);
+        assert_eq!(
+            PermissionDecision::from_value(&v),
+            PermissionDecision::AllowOnce
+        );
         let v = serde_json::to_value(ApprovalResponse::allow_always()).unwrap();
-        assert_eq!(PermissionDecision::from_value(&v), PermissionDecision::AllowAlways);
-        let v = serde_json::to_value(ApprovalResponse { decision: "allow".into(), remember: true }).unwrap();
-        assert_eq!(PermissionDecision::from_value(&v), PermissionDecision::AllowAlways);
+        assert_eq!(
+            PermissionDecision::from_value(&v),
+            PermissionDecision::AllowAlways
+        );
+        let v = serde_json::to_value(ApprovalResponse {
+            decision: "allow".into(),
+            remember: true,
+        })
+        .unwrap();
+        assert_eq!(
+            PermissionDecision::from_value(&v),
+            PermissionDecision::AllowAlways
+        );
         let v = serde_json::to_value(ApprovalResponse::deny()).unwrap();
         assert_eq!(PermissionDecision::from_value(&v), PermissionDecision::Deny);
         assert_eq!(APPROVAL_KIND, "approval");

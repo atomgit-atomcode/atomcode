@@ -43,7 +43,11 @@ pub struct UsageModal {
 
 impl UsageModal {
     pub fn new(data: UsageData) -> Self {
-        Self { data, tab: Tab::Current, copy_notice: None }
+        Self {
+            data,
+            tab: Tab::Current,
+            copy_notice: None,
+        }
     }
 
     pub(crate) fn next_tab(&mut self) {
@@ -121,7 +125,12 @@ impl UsageModal {
             // Window duration hint
             if w.window_hours > 0 {
                 rows.push((
-                    format!("  {m}({})\x1b[39m", t(Msg::UsageWindowHours { hours: w.window_hours })),
+                    format!(
+                        "  {m}({})\x1b[39m",
+                        t(Msg::UsageWindowHours {
+                            hours: w.window_hours
+                        })
+                    ),
                     String::new(),
                 ));
             }
@@ -197,8 +206,11 @@ impl UsageModal {
         let mut lines: Vec<String> = Vec::new();
 
         // ── Calendar heatmap ──
-        let cal_rows: Vec<(String, u64)> =
-            u.rows.iter().map(|r| (r.date.clone(), r.total_tokens)).collect();
+        let cal_rows: Vec<(String, u64)> = u
+            .rows
+            .iter()
+            .map(|r| (r.date.clone(), r.total_tokens))
+            .collect();
 
         if !cal_rows.is_empty() {
             let cells = calendar_layout(&cal_rows);
@@ -212,8 +224,7 @@ impl UsageModal {
             // can't fit before the next month, so a sliver month at the edge
             // doesn't show a cramped/clipped name.
             let month_names = [
-                "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
             ];
             const CELL_W: usize = 4; // display width per week-column cell (bigger grid)
             const WD_LABEL_W: usize = 4; // "Sun " weekday-label column width
@@ -323,7 +334,12 @@ impl UsageModal {
 
         // ── Stats block ──
         lines.push(String::new());
-        let overview = self.data.overview.as_ref().cloned().unwrap_or_else(|| compute_overview(u));
+        let overview = self
+            .data
+            .overview
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| compute_overview(u));
 
         // Collect the label/value pairs, then align the value column by DISPLAY
         // width. The old `{label:<20}` padded by CHAR COUNT, but CJK labels have
@@ -446,7 +462,7 @@ impl UsageModal {
         if caps_colors && caps_unicode {
             // ── Unified braille line chart ──
             let chart_w = 52usize; // cells (wider for clearer display)
-            let chart_h = 6usize;  // cells
+            let chart_h = 6usize; // cells
 
             // Global max across all series
             let global_max: u64 = model_stats
@@ -479,10 +495,7 @@ impl UsageModal {
                 .collect();
 
             // Chart title
-            rows.push((
-                format!("  \x1b[1mTokens per Day\x1b[22m"),
-                String::new(),
-            ));
+            rows.push((format!("  \x1b[1mTokens per Day\x1b[22m"), String::new()));
 
             // Render rows: merge grids, colour by first model with a dot
             for ri in 0..chart_h {
@@ -617,9 +630,7 @@ impl UsageModal {
                     String::new(),
                 ));
                 rows.push((
-                    format!(
-                        "    \x1b[38;5;{color}m{spark}\x1b[39m"
-                    ),
+                    format!("    \x1b[38;5;{color}m{spark}\x1b[39m"),
                     String::new(),
                 ));
                 rows.push((
@@ -1020,22 +1031,32 @@ mod tests {
         let bar = m.tab_bar();
         // Active tab "Overview" on the default (dark) test theme: bold + fixed
         // near-white 256-colour (231), the brightest/most prominent.
-        assert!(bar.contains("\x1b[1;38;5;231mOverview\x1b[22;39m"),
-            "active tab should be bold + fixed near-white 231 on dark; got: {bar}");
+        assert!(
+            bar.contains("\x1b[1;38;5;231mOverview\x1b[22;39m"),
+            "active tab should be bold + fixed near-white 231 on dark; got: {bar}"
+        );
         // Inactive tabs: fixed mid-grey (245), dimmer than active and
         // palette-independent. Must NOT use SGR 90/37/39 — all broke on
         // Solarized Dark (90≈bg, 37 brighter than default, 39=grey default fg).
-        assert!(bar.contains("\x1b[38;5;245m"),
-            "inactive tabs should use fixed 256-colour grey 245; got: {bar}");
-        assert!(!bar.contains("\x1b[90m") && !bar.contains("\x1b[37m") && !bar.contains("\x1b[1;39m"),
-            "tabs must not rely on palette-dependent SGR 90/37/39; got: {bar}");
+        assert!(
+            bar.contains("\x1b[38;5;245m"),
+            "inactive tabs should use fixed 256-colour grey 245; got: {bar}"
+        );
+        assert!(
+            !bar.contains("\x1b[90m") && !bar.contains("\x1b[37m") && !bar.contains("\x1b[1;39m"),
+            "tabs must not rely on palette-dependent SGR 90/37/39; got: {bar}"
+        );
     }
 
     #[test]
     fn current_tab_window_unavailable_when_no_window() {
         let m = sample_modal();
         let rows = m.current_rows();
-        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let all: String = rows
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             all.contains("unavailable") || all.contains("Unavailable") || all.contains("不可用"),
             "expected unavailable message on Current tab with no window; got:\n{all}"
@@ -1046,8 +1067,15 @@ mod tests {
     fn models_rows_contains_model_names() {
         let m = sample_modal();
         let rows = m.models_rows(true, true);
-        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(all.contains("deepseek-v4-flash"), "missing deepseek model; got:\n{all}");
+        let all: String = rows
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("deepseek-v4-flash"),
+            "missing deepseek model; got:\n{all}"
+        );
         assert!(all.contains("GLM-5.2"), "missing GLM model; got:\n{all}");
     }
 
@@ -1055,23 +1083,46 @@ mod tests {
     fn models_rows_unified_chart_contains_breakdown_percent() {
         let m = sample_modal();
         let rows = m.models_rows(true, true);
-        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let all: String = rows
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // GLM-5.2 has 717016/717116 ≈ 100% of tokens
         assert!(all.contains('%'), "expected percent breakdown; got:\n{all}");
         // The per-model TABLE has a "Requests" column header.
-        assert!(all.contains("Requests"), "expected 'Requests' table column; got:\n{all}");
+        assert!(
+            all.contains("Requests"),
+            "expected 'Requests' table column; got:\n{all}"
+        );
         // Title should appear
-        assert!(all.contains("Tokens per Day"), "expected chart title; got:\n{all}");
+        assert!(
+            all.contains("Tokens per Day"),
+            "expected chart title; got:\n{all}"
+        );
     }
 
     #[test]
     fn models_rows_fallback_contains_breakdown() {
         let m = sample_modal();
         let rows = m.models_rows(false, false);
-        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(all.contains("GLM-5.2"), "missing GLM model in fallback; got:\n{all}");
-        assert!(all.contains('%'), "expected percent in fallback breakdown; got:\n{all}");
-        assert!(all.contains("reqs"), "expected 'reqs' in fallback breakdown; got:\n{all}");
+        let all: String = rows
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("GLM-5.2"),
+            "missing GLM model in fallback; got:\n{all}"
+        );
+        assert!(
+            all.contains('%'),
+            "expected percent in fallback breakdown; got:\n{all}"
+        );
+        assert!(
+            all.contains("reqs"),
+            "expected 'reqs' in fallback breakdown; got:\n{all}"
+        );
     }
 
     #[test]
@@ -1096,7 +1147,11 @@ mod tests {
             error: None,
         });
         let rows = m.current_rows();
-        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let all: String = rows
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // plan_name should appear
         assert!(
             all.contains("CodingPlan Pro"),
@@ -1109,10 +1164,16 @@ mod tests {
         );
         // The standalone "Plan" title heading should NOT be its own line
         // (we omit the UsagePlanTitle push intentionally)
-        let stripped: String = rows.iter().map(|(l, _)| UsageModal::strip_ansi(l)).collect::<Vec<_>>().join("\n");
+        let stripped: String = rows
+            .iter()
+            .map(|(l, _)| UsageModal::strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         // The plan section starts directly at "CodingPlan Pro · Active", no bare "Plan" heading line
         assert!(
-            !stripped.lines().any(|line| line.trim() == t(Msg::UsagePlanTitle).as_ref()),
+            !stripped
+                .lines()
+                .any(|line| line.trim() == t(Msg::UsagePlanTitle).as_ref()),
             "standalone Plan title heading should be absent; got:\n{stripped}"
         );
     }
@@ -1124,9 +1185,15 @@ mod tests {
         // GLM-5.2 has 717016 tokens in rows, which should appear in breakdown.
         let m = sample_modal();
         let rows = m.models_rows(true, true);
-        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(all.contains("717.1k") || all.contains("717016") || all.contains("717"),
-            "expected GLM token count in breakdown; got:\n{all}");
+        let all: String = rows
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("717.1k") || all.contains("717016") || all.contains("717"),
+            "expected GLM token count in breakdown; got:\n{all}"
+        );
     }
 
     #[test]
@@ -1139,6 +1206,9 @@ mod tests {
     fn active_tab_text_is_plain() {
         let m = sample_modal();
         let text = m.active_tab_text(false, false);
-        assert!(!text.contains('\x1b'), "active_tab_text should not contain ANSI escapes");
+        assert!(
+            !text.contains('\x1b'),
+            "active_tab_text should not contain ANSI escapes"
+        );
     }
 }

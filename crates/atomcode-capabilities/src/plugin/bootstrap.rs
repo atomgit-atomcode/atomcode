@@ -78,9 +78,8 @@ pub const DEFAULT_SKILLS_URLS: &[&str] = &[
 /// listed here are auto-installed (both on fresh bootstrap and after
 /// post-upgrade `git pull`). `atomcode-plugins-official` is purposely
 /// excluded — it is registered for discoverability, not force-installed.
-const DEFAULT_AUTO_INSTALL_URLS: &[&str] = &[
-    "https://atomgit.com/atomgit_atomcode/atomcode-skills.git",
-];
+const DEFAULT_AUTO_INSTALL_URLS: &[&str] =
+    &["https://atomgit.com/atomgit_atomcode/atomcode-skills.git"];
 
 /// Versioned bootstrap marker. Bumped v1 → v2 when the default
 /// marketplace was repointed from the legacy `atomcode-skills` bag to the
@@ -187,7 +186,9 @@ fn maybe_install_default_skills() -> Vec<PluginJobEvent> {
 
     for url in DEFAULT_SKILLS_URLS {
         // Marketplace already installed? Use the existing entry.
-        let already = installed.iter().find(|m| m.source.eq_ignore_ascii_case(url));
+        let already = installed
+            .iter()
+            .find(|m| m.source.eq_ignore_ascii_case(url));
 
         if let Some(mp) = already {
             if should_auto_install(url) {
@@ -262,8 +263,7 @@ fn install_plugins_from_marketplace(
                 // AlreadyInstalledError is benign — the plugin was
                 // registered during an earlier bootstrap attempt (e.g.
                 // re-run after deleting the marker).
-                let msg =
-                    format!("auto-install of plugin `{plugin}@{mp_name}` failed: {e:#}");
+                let msg = format!("auto-install of plugin `{plugin}@{mp_name}` failed: {e:#}");
                 log_to_file(&format!("  ⚠ {msg}"));
                 events.push(PluginJobEvent::Failed {
                     op: "auto-install-plugin".into(),
@@ -326,9 +326,7 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
                             .cloned()
                             .collect();
                         if !new_plugins.is_empty() {
-                            install_plugins_from_marketplace(
-                                &mut events, &name, &new_plugins,
-                            );
+                            install_plugins_from_marketplace(&mut events, &name, &new_plugins);
                         }
                     }
                 }
@@ -378,7 +376,10 @@ mod tests {
         );
         assert!(first.contains("when ready"), "first line: {first:?}");
         // The error detail is still present (later in the message) — nothing lost.
-        assert!(msg.contains("stderr line 3"), "full error retained: {msg:?}");
+        assert!(
+            msg.contains("stderr line 3"),
+            "full error retained: {msg:?}"
+        );
     }
 
     #[test]

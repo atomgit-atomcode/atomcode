@@ -1,8 +1,8 @@
 //! CodingPlan 60-day usage: API types, parsing, and pure stat/format helpers
 //! for the `/usage` modal. No rendering here (that lives in the tuix layer).
 
-use std::collections::HashMap;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsageRow {

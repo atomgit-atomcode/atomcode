@@ -185,8 +185,14 @@ Edited a.rs (1 replacement)
         let e = parse_unified_diff(diff, 100);
         assert_eq!(e.len(), 3, "context + del + add, none dropped: {e:?}");
         assert_eq!(e[0].kind, DiffKind::Context);
-        assert_eq!((e[1].kind, e[1].text.as_str(), e[1].old_lineno), (DiffKind::Del, "--", Some(2)));
-        assert_eq!((e[2].kind, e[2].text.as_str(), e[2].new_lineno), (DiffKind::Add, "++new", Some(2)));
+        assert_eq!(
+            (e[1].kind, e[1].text.as_str(), e[1].old_lineno),
+            (DiffKind::Del, "--", Some(2))
+        );
+        assert_eq!(
+            (e[2].kind, e[2].text.as_str(), e[2].new_lineno),
+            (DiffKind::Add, "++new", Some(2))
+        );
     }
 
     #[test]
@@ -222,9 +228,24 @@ Edited a.rs (1 replacement)
     #[test]
     fn gutter_width_and_row_format() {
         let entries = vec![
-            DiffEntry { kind: DiffKind::Context, old_lineno: Some(9), new_lineno: Some(9), text: "ctx".into() },
-            DiffEntry { kind: DiffKind::Add, old_lineno: None, new_lineno: Some(10), text: "added".into() },
-            DiffEntry { kind: DiffKind::Del, old_lineno: Some(10), new_lineno: None, text: "removed".into() },
+            DiffEntry {
+                kind: DiffKind::Context,
+                old_lineno: Some(9),
+                new_lineno: Some(9),
+                text: "ctx".into(),
+            },
+            DiffEntry {
+                kind: DiffKind::Add,
+                old_lineno: None,
+                new_lineno: Some(10),
+                text: "added".into(),
+            },
+            DiffEntry {
+                kind: DiffKind::Del,
+                old_lineno: Some(10),
+                new_lineno: None,
+                text: "removed".into(),
+            },
         ];
         let w = diff_gutter_width(&entries);
         assert_eq!(w, 2); // largest line number is 10 → width 2

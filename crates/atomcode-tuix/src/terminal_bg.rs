@@ -82,7 +82,11 @@ fn detect_light_unix(timeout: Duration) -> Option<bool> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     let mut got_any = false;
     loop {
-        let deadline = if got_any { hard_deadline } else { first_byte_deadline };
+        let deadline = if got_any {
+            hard_deadline
+        } else {
+            first_byte_deadline
+        };
         let mut chunk = [0u8; 128];
         // SAFETY: chunk is stack-allocated and lives for the call; fd is
         // owned by stdin for the process lifetime.

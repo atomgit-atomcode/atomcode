@@ -79,9 +79,7 @@ fn second_run_skips_already_installed() {
     let old = std::env::var_os("ATOMCODE_HOME");
     std::env::set_var("ATOMCODE_HOME", user.path());
 
-    let make_opts = || {
-        RunOptions::new(proj.path().to_path_buf())
-    };
+    let make_opts = || RunOptions::new(proj.path().to_path_buf());
 
     let report1 = setup::run(make_opts()).unwrap();
     let report2 = setup::run(make_opts()).unwrap();

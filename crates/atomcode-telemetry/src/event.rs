@@ -845,7 +845,10 @@ mod tests {
 
     #[test]
     fn session_mode_atomcode_air_serializes_as_atomcode_desktop() {
-        assert_eq!(serde_json::to_string(&SessionMode::AtomcodeAir).unwrap(), "\"atomcode_desktop\"");
+        assert_eq!(
+            serde_json::to_string(&SessionMode::AtomcodeAir).unwrap(),
+            "\"atomcode_desktop\""
+        );
     }
 }
 

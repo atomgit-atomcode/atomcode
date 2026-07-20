@@ -58,7 +58,8 @@ impl AtomgitClient {
         if let Some(p) = private {
             body.insert("private".into(), json!(p));
         }
-        self.post_json(&format!("/repos/{owner}/{repo}/forks"), &json!(body)).await
+        self.post_json(&format!("/repos/{owner}/{repo}/forks"), &json!(body))
+            .await
     }
 
     /// `POST /repos/{owner}/{repo}/tags` — create a tag. `refs` is the start point
@@ -73,7 +74,8 @@ impl AtomgitClient {
         message: &str,
     ) -> Result<Tag, String> {
         let body = json!({ "refs": refs, "tag_name": tag_name, "tag_message": message });
-        self.post_json(&format!("/repos/{owner}/{repo}/tags"), &body).await
+        self.post_json(&format!("/repos/{owner}/{repo}/tags"), &body)
+            .await
     }
 }
 
@@ -115,11 +117,19 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v5/user/repos"))
-            .and(body_json(serde_json::json!({"name":"proj","description":"d","private":false})))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"name":"proj","full_name":"me/proj"})))
+            .and(body_json(
+                serde_json::json!({"name":"proj","description":"d","private":false}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"name":"proj","full_name":"me/proj"})),
+            )
             .mount(&server)
             .await;
-        let r = client(&server).repo_create(None, "proj", "d", false).await.unwrap();
+        let r = client(&server)
+            .repo_create(None, "proj", "d", false)
+            .await
+            .unwrap();
         assert_eq!(r.full_name, "me/proj");
     }
 
@@ -131,7 +141,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"name":"p"})))
             .mount(&server)
             .await;
-        let r = client(&server).repo_create(Some("acme"), "p", "", true).await.unwrap();
+        let r = client(&server)
+            .repo_create(Some("acme"), "p", "", true)
+            .await
+            .unwrap();
         assert_eq!(r.name, "p");
     }
 
@@ -151,11 +164,20 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v5/repos/o/r/tags"))
-            .and(body_json(serde_json::json!({"refs":"main","tag_name":"v1.0.0","tag_message":"release"})))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"tag_name":"v1.0.0","tag_message":"release"})))
+            .and(body_json(
+                serde_json::json!({"refs":"main","tag_name":"v1.0.0","tag_message":"release"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(
+                    serde_json::json!({"tag_name":"v1.0.0","tag_message":"release"}),
+                ),
+            )
             .mount(&server)
             .await;
-        let t = client(&server).repo_create_tag("o", "r", "v1.0.0", "main", "release").await.unwrap();
+        let t = client(&server)
+            .repo_create_tag("o", "r", "v1.0.0", "main", "release")
+            .await
+            .unwrap();
         assert_eq!(t.tag_name, "v1.0.0");
         assert_eq!(t.message, "release");
     }
@@ -169,7 +191,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"name":"r"})))
             .mount(&server)
             .await;
-        let r = client(&server).repo_fork("o", "r", None, None).await.unwrap();
+        let r = client(&server)
+            .repo_fork("o", "r", None, None)
+            .await
+            .unwrap();
         assert_eq!(r.name, "r");
     }
 }

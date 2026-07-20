@@ -29,7 +29,9 @@ fn rec() -> Record {
             mode: None,
             surface: None,
         },
-        event: Event::OpenAtomcode { dangerously_skip_permissions: false },
+        event: Event::OpenAtomcode {
+            dangerously_skip_permissions: false,
+        },
     }
 }
 
@@ -135,7 +137,9 @@ async fn track_writes_to_disk_queue() {
         atomcode_dir: d.path().to_path_buf(),
     };
     let tel = Telemetry::init(cfg, "test".into());
-    tel.track(Event::OpenAtomcode { dangerously_skip_permissions: false });
+    tel.track(Event::OpenAtomcode {
+        dangerously_skip_permissions: false,
+    });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     tel.shutdown(std::time::Duration::from_millis(500)).await;
 
@@ -150,7 +154,9 @@ async fn track_writes_to_disk_queue() {
     let mut found = false;
     for e in std::fs::read_dir(d.path().join("telemetry/queue")).unwrap() {
         let p = e.unwrap().path();
-        let Ok(c) = std::fs::read_to_string(&p) else { continue };
+        let Ok(c) = std::fs::read_to_string(&p) else {
+            continue;
+        };
         if c.lines()
             .any(|l| l.contains(r#""event_id":"open_atomcode""#))
         {
@@ -158,7 +164,10 @@ async fn track_writes_to_disk_queue() {
             break;
         }
     }
-    assert!(found, "expected an open_atomcode event persisted in the disk queue");
+    assert!(
+        found,
+        "expected an open_atomcode event persisted in the disk queue"
+    );
 }
 
 #[tokio::test]
@@ -186,8 +195,18 @@ async fn counters_increment_on_post() {
     let snap = counters.snapshot();
     assert_eq!(snap.segments_posted, 1);
     assert!(snap.bytes_sent > 0, "bytes_sent should be > 0");
-    assert!(snap.last_post_unix_ms > 0, "last_post_unix_ms should be > 0");
-    assert!(!snap.last_post_iso.is_empty(), "iso should be set when ms > 0");
-    assert!(snap.last_post_iso.contains('T'), "should be RFC 3339 format: {}", snap.last_post_iso);
+    assert!(
+        snap.last_post_unix_ms > 0,
+        "last_post_unix_ms should be > 0"
+    );
+    assert!(
+        !snap.last_post_iso.is_empty(),
+        "iso should be set when ms > 0"
+    );
+    assert!(
+        snap.last_post_iso.contains('T'),
+        "should be RFC 3339 format: {}",
+        snap.last_post_iso
+    );
     assert!(health_path.exists(), "health.json should be written");
 }

@@ -230,7 +230,12 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
             } else {
                 (self.make_explore_tools)()
             };
-            let persona = if is_worker { WORKER_PERSONA } else { EXPLORE_PERSONA }.to_string();
+            let persona = if is_worker {
+                WORKER_PERSONA
+            } else {
+                EXPLORE_PERSONA
+            }
+            .to_string();
             let child_cancel = ctx.cancel.child_token();
             // A second handle to fire the child's cancel on timeout (the token given to the
             // builder is moved in; this clone stays so we can stop a timed-out detached child).
@@ -286,8 +291,12 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
                 let mut handle = tokio::spawn(async move {
                     child.run_to_completion(prompt, AutoRespond::AllowAll).await
                 });
-                let timed_out_msg =
-                    || format!("subagent exceeded the {}s time limit", timeout_dur.as_secs());
+                let timed_out_msg = || {
+                    format!(
+                        "subagent exceeded the {}s time limit",
+                        timeout_dur.as_secs()
+                    )
+                };
                 let outcome = match tokio::time::timeout(timeout_dur, &mut handle).await {
                     Ok(Ok(o)) => o,
                     Ok(Err(join_err)) => Outcome {
@@ -428,7 +437,10 @@ fn summarize_tool_call(call: &ToolCall) -> String {
             KEYS.iter()
                 .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(str::to_string))
         });
-    let short = arg.as_deref().map(|a| first_line_capped(a, 30)).unwrap_or_default();
+    let short = arg
+        .as_deref()
+        .map(|a| first_line_capped(a, 30))
+        .unwrap_or_default();
     if short.is_empty() {
         call.name.clone()
     } else {
@@ -442,7 +454,10 @@ fn summarize_tool_call(call: &ToolCall) -> String {
 fn first_line_capped(s: &str, max: usize) -> String {
     let first = s.lines().next().unwrap_or("").trim();
     if first.chars().count() > max {
-        format!("{}\u{2026}", first.chars().take(max - 1).collect::<String>())
+        format!(
+            "{}\u{2026}",
+            first.chars().take(max - 1).collect::<String>()
+        )
     } else {
         first.to_string()
     }
@@ -470,8 +485,10 @@ impl LifecycleHooks for SubtaskProgressHook {
         }
         // No trailing ellipsis: the TUI spinner appends its own `…`, so emitting one
         // here would double it (`thinking……`).
-        self.progress
-            .emit(format!("{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} thinking", self.label));
+        self.progress.emit(format!(
+            "{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} thinking",
+            self.label
+        ));
     }
 
     async fn on_model_response(&self, response: &mut Message) {
@@ -618,7 +635,10 @@ mod tests {
         let out = finalize_grace_outcome(ok, "time limit".into());
         assert_eq!(out.stop, StopReason::Stopped);
         assert_eq!(out.text, "real result");
-        assert!(out.error.is_none(), "a genuine success must not gain a timeout error");
+        assert!(
+            out.error.is_none(),
+            "a genuine success must not gain a timeout error"
+        );
 
         // Child that observed the cancel → relabeled Timeout with our message, partial kept.
         let cancelled = Outcome {
@@ -661,7 +681,10 @@ mod tests {
         assert!(long.starts_with("bash "), "{long}");
         assert!(long.ends_with('\u{2026}'), "{long}");
         // No recognised key / bad JSON → just the tool name.
-        assert_eq!(summarize_tool_call(&mk("todowrite", r#"{"todos":[]}"#)), "todowrite");
+        assert_eq!(
+            summarize_tool_call(&mk("todowrite", r#"{"todos":[]}"#)),
+            "todowrite"
+        );
         assert_eq!(summarize_tool_call(&mk("weird", "not json")), "weird");
     }
 
@@ -703,9 +726,17 @@ mod tests {
         {
             let c = captured.lock().unwrap();
             assert_eq!(c.len(), 2, "expected thinking + tool lines: {c:?}");
-            assert!(c[0].starts_with(SUBAGENT_ACTIVITY_MARKER), "marker-prefixed: {:?}", c[0]);
+            assert!(
+                c[0].starts_with(SUBAGENT_ACTIVITY_MARKER),
+                "marker-prefixed: {:?}",
+                c[0]
+            );
             // The spinner appends its OWN ellipsis — the thinking line must carry none.
-            assert!(!c[0].contains('\u{2026}'), "no ellipsis on thinking line: {:?}", c[0]);
+            assert!(
+                !c[0].contains('\u{2026}'),
+                "no ellipsis on thinking line: {:?}",
+                c[0]
+            );
             assert!(c[0].ends_with("thinking"), "thinking line: {:?}", c[0]);
             assert!(c[1].contains("read_file a.rs"), "tool line: {:?}", c[1]);
         }
@@ -714,7 +745,11 @@ mod tests {
         cancel.cancel();
         hook.pre_request(&mut Vec::new(), &ctx).await;
         hook.on_model_response(&mut msg).await;
-        assert_eq!(captured.lock().unwrap().len(), 2, "cancelled hook must stay silent");
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            2,
+            "cancelled hook must stay silent"
+        );
     }
 
     #[test]
@@ -728,8 +763,14 @@ mod tests {
         let long = "audit every unwrap() call across the whole crate for panic safety and report\nsecond line";
         let line = subtask_progress_line("\u{2713} done \u{b7} worker#2", "GLM-5.2", long);
         assert!(line.starts_with("\u{2713} done \u{b7} worker#2 \u{b7} GLM-5.2 \u{b7} "));
-        assert!(line.ends_with('\u{2026}'), "long desc must be ellipsized: {line}");
-        assert!(!line.contains("second line"), "only first line should show: {line}");
+        assert!(
+            line.ends_with('\u{2026}'),
+            "long desc must be ellipsized: {line}"
+        );
+        assert!(
+            !line.contains("second line"),
+            "only first line should show: {line}"
+        );
         // Empty description → no trailing separator after the model.
         assert_eq!(
             subtask_progress_line("\u{21bb} explore#1", "deepseek", "  "),
@@ -752,17 +793,37 @@ mod tests {
         let r1 = reg.clone();
         let r2 = reg.clone();
         let tool = TaskTool::new(
-            || Arc::new(MockProvider { reply: Some("FOUND: the answer is 42".into()) }) as Arc<dyn LlmProvider>,
-            || Arc::new(MockProvider { reply: Some("FOUND: the answer is 42".into()) }) as Arc<dyn LlmProvider>,
+            || {
+                Arc::new(MockProvider {
+                    reply: Some("FOUND: the answer is 42".into()),
+                }) as Arc<dyn LlmProvider>
+            },
+            || {
+                Arc::new(MockProvider {
+                    reply: Some("FOUND: the answer is 42".into()),
+                }) as Arc<dyn LlmProvider>
+            },
             move || r1.mount(&[]),
             move || r2.mount(&[]),
         );
         let args = r#"{"tasks":[{"description":"find","prompt":"where is X","subagent_type":"explore","difficulty":"simple"}]}"#;
         let out = tool.execute(args, &ctx()).await;
         assert!(!out.is_error, "unexpected error: {}", out.content);
-        assert!(out.content.contains("<task_result>"), "missing tag: {}", out.content);
-        assert!(out.content.contains("FOUND: the answer is 42"), "missing reply: {}", out.content);
-        assert!(out.content.contains("state=\"completed\""), "missing state: {}", out.content);
+        assert!(
+            out.content.contains("<task_result>"),
+            "missing tag: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("FOUND: the answer is 42"),
+            "missing reply: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("state=\"completed\""),
+            "missing state: {}",
+            out.content
+        );
     }
 
     #[tokio::test]
@@ -779,7 +840,11 @@ mod tests {
         let args = r#"{"tasks":[{"description":"x","prompt":"p","subagent_type":"explore"}]}"#;
         let out = tool.execute(args, &ctx()).await;
         assert!(out.is_error, "expected error result, got: {}", out.content);
-        assert!(out.content.contains("<task_error>"), "missing tag: {}", out.content);
+        assert!(
+            out.content.contains("<task_error>"),
+            "missing tag: {}",
+            out.content
+        );
     }
 
     /// A child whose stream never yields must be capped by the per-subtask
@@ -814,9 +879,12 @@ mod tests {
         .with_subtask_timeout(std::time::Duration::from_millis(150));
         let args = r#"{"tasks":[{"description":"x","prompt":"p","subagent_type":"explore"}]}"#;
         // Outer guard: if the per-subtask timeout is broken, this rejects instead of hanging CI.
-        let out = tokio::time::timeout(std::time::Duration::from_secs(5), tool.execute(args, &ctx()))
-            .await
-            .expect("execute must return via the per-subtask timeout, not hang");
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tool.execute(args, &ctx()),
+        )
+        .await
+        .expect("execute must return via the per-subtask timeout, not hang");
         assert!(out.is_error, "expected timeout error, got: {}", out.content);
         assert!(
             out.content.contains("time limit"),
@@ -843,8 +911,9 @@ mod tests {
             ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
                 // Emit some text, then hang (no Done) → the child accumulates the text,
                 // then waits forever until its cancel fires on timeout.
-                let evs = stream::once(async { StreamEvent::TextDelta("PARTIAL-EDIT-DONE".into()) })
-                    .chain(stream::pending());
+                let evs =
+                    stream::once(async { StreamEvent::TextDelta("PARTIAL-EDIT-DONE".into()) })
+                        .chain(stream::pending());
                 Ok(evs.boxed())
             }
         }
@@ -859,11 +928,18 @@ mod tests {
         )
         .with_subtask_timeout(std::time::Duration::from_millis(150));
         let args = r#"{"tasks":[{"description":"x","prompt":"p","subagent_type":"explore"}]}"#;
-        let out = tokio::time::timeout(std::time::Duration::from_secs(10), tool.execute(args, &ctx()))
-            .await
-            .expect("execute must return via the per-subtask timeout, not hang");
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tool.execute(args, &ctx()),
+        )
+        .await
+        .expect("execute must return via the per-subtask timeout, not hang");
         assert!(out.is_error, "expected timeout error, got: {}", out.content);
-        assert!(out.content.contains("time limit"), "missing time limit: {}", out.content);
+        assert!(
+            out.content.contains("time limit"),
+            "missing time limit: {}",
+            out.content
+        );
         assert!(
             out.content.contains("PARTIAL-EDIT-DONE"),
             "partial output must survive the timeout: {}",
@@ -881,7 +957,11 @@ mod tests {
             let calls = calls.clone();
             move || {
                 let n = calls.fetch_add(1, Ordering::SeqCst);
-                let reply = if n == 0 { Some("did it".to_string()) } else { None };
+                let reply = if n == 0 {
+                    Some("did it".to_string())
+                } else {
+                    None
+                };
                 Arc::new(MockProvider { reply }) as Arc<dyn LlmProvider>
             }
         };
@@ -891,9 +971,21 @@ mod tests {
         let tool = TaskTool::new(mk.clone(), mk, move || r1.mount(&[]), move || r2.mount(&[]));
         let args = r#"{"tasks":[{"description":"a","prompt":"p","subagent_type":"explore"},{"description":"b","prompt":"q","subagent_type":"explore"}]}"#;
         let out = tool.execute(args, &ctx()).await;
-        assert!(!out.is_error, "partial failure must not be overall error: {}", out.content);
-        assert!(out.content.contains("<task_result>"), "missing success block: {}", out.content);
-        assert!(out.content.contains("<task_error>"), "missing failure block: {}", out.content);
+        assert!(
+            !out.is_error,
+            "partial failure must not be overall error: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("<task_result>"),
+            "missing success block: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("<task_error>"),
+            "missing failure block: {}",
+            out.content
+        );
     }
 
     #[tokio::test]
@@ -902,15 +994,27 @@ mod tests {
         let r1 = reg.clone();
         let r2 = reg.clone();
         let tool = TaskTool::new(
-            || Arc::new(MockProvider { reply: Some("done".into()) }) as Arc<dyn LlmProvider>,
-            || Arc::new(MockProvider { reply: Some("done".into()) }) as Arc<dyn LlmProvider>,
+            || {
+                Arc::new(MockProvider {
+                    reply: Some("done".into()),
+                }) as Arc<dyn LlmProvider>
+            },
+            || {
+                Arc::new(MockProvider {
+                    reply: Some("done".into()),
+                }) as Arc<dyn LlmProvider>
+            },
             move || r1.mount(&[]),
             move || r2.mount(&[]),
         );
         let args = r#"{"tasks":[{"description":"d","prompt":"p","subagent_type":"explore"}]}"#;
         let out = tool.execute(args, &ctx()).await;
         // The block surfaces the actual model the subagent ran on (MockProvider::model_name).
-        assert!(out.content.contains("model=\"mock\""), "missing model attr: {}", out.content);
+        assert!(
+            out.content.contains("model=\"mock\""),
+            "missing model attr: {}",
+            out.content
+        );
     }
 
     #[tokio::test]
@@ -919,8 +1023,16 @@ mod tests {
         let r1 = reg.clone();
         let r2 = reg.clone();
         let tool = TaskTool::new(
-            || Arc::new(MockProvider { reply: Some("ok".into()) }) as Arc<dyn LlmProvider>,
-            || Arc::new(MockProvider { reply: Some("ok".into()) }) as Arc<dyn LlmProvider>,
+            || {
+                Arc::new(MockProvider {
+                    reply: Some("ok".into()),
+                }) as Arc<dyn LlmProvider>
+            },
+            || {
+                Arc::new(MockProvider {
+                    reply: Some("ok".into()),
+                }) as Arc<dyn LlmProvider>
+            },
             move || r1.mount(&[]),
             move || r2.mount(&[]),
         );
@@ -937,7 +1049,11 @@ mod tests {
             "repair should have recovered the args, got: {}",
             out.content
         );
-        assert!(out.content.contains("<task_result>"), "expected a result: {}", out.content);
+        assert!(
+            out.content.contains("<task_result>"),
+            "expected a result: {}",
+            out.content
+        );
     }
 
     #[test]

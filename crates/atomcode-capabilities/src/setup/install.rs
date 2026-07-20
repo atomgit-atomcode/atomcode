@@ -7,7 +7,8 @@ use crate::setup::fs_atomic::atomic_write;
 use crate::setup::types::*;
 use std::path::PathBuf;
 
-const GITIGNORE_BLOCK: &str = "\n# AtomCode local-scope configs (machine-specific)\n.atomcode/local/\n";
+const GITIGNORE_BLOCK: &str =
+    "\n# AtomCode local-scope configs (machine-specific)\n.atomcode/local/\n";
 
 #[derive(Debug)]
 pub enum FileWrite {
@@ -29,7 +30,9 @@ impl InstalledTxn {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let backup_dir = project_root.join(".atomcode").join(format!(".setup-backup-{ts}"));
+        let backup_dir = project_root
+            .join(".atomcode")
+            .join(format!(".setup-backup-{ts}"));
         std::fs::create_dir_all(&backup_dir)?;
         Ok(Self {
             writes: vec![],
@@ -191,7 +194,11 @@ mod tests {
     #[test]
     fn append_gitignore_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".gitignore"), "node_modules/\n.atomcode/local/\n").unwrap();
+        std::fs::write(
+            dir.path().join(".gitignore"),
+            "node_modules/\n.atomcode/local/\n",
+        )
+        .unwrap();
         let mut txn = InstalledTxn::new(dir.path().to_path_buf()).unwrap();
         txn.append_gitignore(dir.path()).unwrap();
         assert!(txn.writes.is_empty()); // already present, nothing written
@@ -205,7 +212,9 @@ mod tests {
         std::fs::write(&gi, "node_modules/\n").unwrap();
         let mut txn = InstalledTxn::new(dir.path().to_path_buf()).unwrap();
         txn.append_gitignore(dir.path()).unwrap();
-        assert!(std::fs::read_to_string(&gi).unwrap().contains(".atomcode/local/"));
+        assert!(std::fs::read_to_string(&gi)
+            .unwrap()
+            .contains(".atomcode/local/"));
 
         let outcome = txn.rollback();
         assert!(matches!(outcome, RollbackOutcome::Clean));
@@ -223,7 +232,9 @@ mod tests {
             txn.append_gitignore(dir.path()).unwrap();
             let _summary = txn.commit();
         } // Drop runs here; should NOT restore .gitignore.
-        assert!(std::fs::read_to_string(&gi).unwrap().contains(".atomcode/local/"));
+        assert!(std::fs::read_to_string(&gi)
+            .unwrap()
+            .contains(".atomcode/local/"));
     }
 
     #[test]

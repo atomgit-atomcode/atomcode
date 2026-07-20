@@ -156,7 +156,13 @@ mod tests {
             enabled: Some(true),
             endpoint: None,
         };
-        let r = resolve(&cfg, &CliOverride { disabled: true }, dir(), &env(&[]), false);
+        let r = resolve(
+            &cfg,
+            &CliOverride { disabled: true },
+            dir(),
+            &env(&[]),
+            false,
+        );
         assert_eq!(r.state.reason(), Some("cli:--no-telemetry"));
     }
 
@@ -185,7 +191,10 @@ mod tests {
     #[test]
     fn offline_disables_telemetry() {
         let r = resolve(
-            &TelemetryConfig { enabled: Some(true), endpoint: None },
+            &TelemetryConfig {
+                enabled: Some(true),
+                endpoint: None,
+            },
             &CliOverride::default(),
             dir(),
             &env(&[]),

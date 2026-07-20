@@ -75,7 +75,6 @@ impl CommandRegistry {
     }
 }
 
-
 const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "login",   desc: "Sign in with AtomGit OAuth and claim CodingPlan models", needs_args: false, hidden: false },
     // needs_args=true so selecting it only completes to `/webui ` (does NOT
@@ -374,7 +373,10 @@ mod tests {
         // print status). The needs_args flag drives that menu behaviour.
         let reg = CommandRegistry::builtin();
         let goal = reg.find("goal").expect("/goal must be a built-in command");
-        assert!(goal.needs_args, "/goal selection must wait for the goal text");
+        assert!(
+            goal.needs_args,
+            "/goal selection must wait for the goal text"
+        );
     }
 
     #[test]
@@ -539,7 +541,11 @@ mod tests {
         for c in reg.all() {
             if c.hidden {
                 // Hidden commands are intentionally excluded from /help output.
-                assert!(!help.contains(&format!("/{} ", c.name)), "hidden command /{} must not appear in help", c.name);
+                assert!(
+                    !help.contains(&format!("/{} ", c.name)),
+                    "hidden command /{} must not appear in help",
+                    c.name
+                );
             } else {
                 assert!(help.contains(c.name), "help missing {}", c.name);
             }
@@ -575,7 +581,9 @@ mod tests {
     fn review_is_a_builtin_command() {
         let candidates = complete_commands("rev", &[]);
         assert!(
-            candidates.iter().any(|c| c.name == "review" && !c.is_custom),
+            candidates
+                .iter()
+                .any(|c| c.name == "review" && !c.is_custom),
             "/review must be a built-in command"
         );
     }

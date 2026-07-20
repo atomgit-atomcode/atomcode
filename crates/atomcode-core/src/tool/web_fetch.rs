@@ -441,7 +441,9 @@ impl Tool for WebFetchTool {
 /// yields nothing, so we still surface whatever readable content exists.
 fn html_to_markdown(html: &str) -> String {
     let md = match htmd::HtmlToMarkdown::builder()
-        .skip_tags(vec!["script", "style", "meta", "link", "noscript", "iframe", "head"])
+        .skip_tags(vec![
+            "script", "style", "meta", "link", "noscript", "iframe", "head",
+        ])
         .build()
         .convert(html)
     {
@@ -838,7 +840,10 @@ mod tests {
         // execute() still hard-rejects via validate_scheme, so this is safe.
         let tool = WebFetchTool;
         let args = r#"{"url":"file:///etc/passwd"}"#;
-        assert!(matches!(tool.approval(args), ApprovalRequirement::AutoApprove));
+        assert!(matches!(
+            tool.approval(args),
+            ApprovalRequirement::AutoApprove
+        ));
     }
 
     #[test]
@@ -855,7 +860,10 @@ mod tests {
     fn approval_auto_approves_unknown_public_domain() {
         let tool = WebFetchTool;
         let args = r#"{"url":"https://some-random-blog.example/"}"#;
-        assert!(matches!(tool.approval(args), ApprovalRequirement::AutoApprove));
+        assert!(matches!(
+            tool.approval(args),
+            ApprovalRequirement::AutoApprove
+        ));
     }
 
     #[test]
@@ -957,16 +965,27 @@ mod tests {
     async fn validate_host_literal_public_ip_returns_no_pins() {
         // Literal IP → no DNS, nothing to rebind, so nothing to pin.
         let url = Url::parse("http://8.8.8.8/").unwrap();
-        let pins = validate_host(&url).await.expect("public literal IP is allowed");
-        assert!(pins.is_empty(), "literal IP needs no resolve override: {pins:?}");
+        let pins = validate_host(&url)
+            .await
+            .expect("public literal IP is allowed");
+        assert!(
+            pins.is_empty(),
+            "literal IP needs no resolve override: {pins:?}"
+        );
     }
 
     #[tokio::test]
     async fn validate_host_literal_private_ip_is_blocked() {
         let url = Url::parse("http://127.0.0.1:1/").unwrap();
-        assert!(validate_host(&url).await.is_err(), "loopback literal must be blocked");
+        assert!(
+            validate_host(&url).await.is_err(),
+            "loopback literal must be blocked"
+        );
         let url = Url::parse("http://169.254.169.254/").unwrap();
-        assert!(validate_host(&url).await.is_err(), "metadata literal must be blocked");
+        assert!(
+            validate_host(&url).await.is_err(),
+            "metadata literal must be blocked"
+        );
     }
 
     // ── html_to_text / tag matching ────────────────────────────────────────
@@ -1054,7 +1073,10 @@ mod tests {
     #[test]
     fn html_to_markdown_renders_forge_code_as_fenced_block() {
         let md = html_to_markdown(FORGE_BLOB_HTML);
-        assert!(md.contains("```"), "expected a fenced code block, got:\n{md}");
+        assert!(
+            md.contains("```"),
+            "expected a fenced code block, got:\n{md}"
+        );
         assert!(md.contains("#!/bin/sh"), "shebang missing:\n{md}");
         assert!(
             md.contains("# OAT Pre-commit Check") && md.contains("exit 0"),
@@ -1070,11 +1092,17 @@ mod tests {
 
         // markdown format on HTML → fenced code, no raw <pre> tag.
         let md = render_body(FetchFormat::Markdown, true, FORGE_BLOB_HTML.to_string());
-        assert!(md.contains("```") && !md.contains("<pre"), "markdown not produced:\n{md}");
+        assert!(
+            md.contains("```") && !md.contains("<pre"),
+            "markdown not produced:\n{md}"
+        );
 
         // text format on HTML → plain text, no fence, no tags.
         let txt = render_body(FetchFormat::Text, true, FORGE_BLOB_HTML.to_string());
-        assert!(txt.contains("#!/bin/sh") && !txt.contains("<pre"), "text not produced:\n{txt}");
+        assert!(
+            txt.contains("#!/bin/sh") && !txt.contains("<pre"),
+            "text not produced:\n{txt}"
+        );
 
         // non-HTML body (e.g. a real raw text endpoint) → returned as-is for every format.
         let plain = "plain text body".to_string();
@@ -1116,7 +1144,10 @@ mod tests {
         let s = "é".repeat(10);
         let out = apply_char_cap(s, Some(5));
         let head = &out[..out.find("\n\n").unwrap()];
-        assert!(head.chars().all(|c| c == 'é'), "broke a char boundary: {head:?}");
+        assert!(
+            head.chars().all(|c| c == 'é'),
+            "broke a char boundary: {head:?}"
+        );
     }
 
     // ── strip_to_dominant_code_block: operates purely on Markdown shape, so
@@ -1137,7 +1168,10 @@ mod tests {
             big_code_block("python", 40)
         );
         let out = strip_to_dominant_code_block(&md).expect("dominant block should be detected");
-        assert!(out.starts_with("```python"), "should begin at the fence:\n{out}");
+        assert!(
+            out.starts_with("```python"),
+            "should begin at the fence:\n{out}"
+        );
         assert!(out.contains("var_40 = 40"), "code body truncated:\n{out}");
         assert!(
             !out.contains("Issues") && !out.contains("activation") && !out.contains("Wiki"),
@@ -1151,7 +1185,9 @@ mod tests {
         let prose: String = (1..=30)
             .map(|i| format!("Paragraph {i}: real explanatory prose that the reader needs.\n\n"))
             .collect();
-        let md = format!("# Guide\n\n{prose}Example:\n\n```sh\nls -la\necho hi\n```\n\nClosing prose.\n");
+        let md = format!(
+            "# Guide\n\n{prose}Example:\n\n```sh\nls -la\necho hi\n```\n\nClosing prose.\n"
+        );
         assert!(
             strip_to_dominant_code_block(&md).is_none(),
             "a docs page was wrongly stripped down to its code example"
@@ -1163,13 +1199,17 @@ mod tests {
         // A short command snippet is not a file view.
         assert!(strip_to_dominant_code_block("Run:\n\n```sh\nls\ncd /\npwd\n```\n").is_none());
         // No code at all → never touched.
-        assert!(strip_to_dominant_code_block("# Title\n\nProse and [a link](/x). No code.\n").is_none());
+        assert!(
+            strip_to_dominant_code_block("# Title\n\nProse and [a link](/x). No code.\n").is_none()
+        );
     }
 
     #[test]
     fn html_to_markdown_strips_forge_chrome_end_to_end() {
         // A forge blob page: <nav> + file tree, then the file in <pre><code>.
-        let code: String = (1..=40).map(|n| format!("<span class=\"line\">x{n} = {n}</span>\n")).collect();
+        let code: String = (1..=40)
+            .map(|n| format!("<span class=\"line\">x{n} = {n}</span>\n"))
+            .collect();
         let html = format!(
             "<html><body>\
              <nav><a href=\"/r\">Code</a><a href=\"/r/issues\">Issues</a></nav>\

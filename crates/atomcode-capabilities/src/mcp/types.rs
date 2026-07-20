@@ -202,6 +202,9 @@ mod tests {
             "annotations": { "readOnlyHint": true, "destructiveHint": true }
         }))
         .unwrap();
-        assert!(!contradictory.is_read_only(), "destructiveHint:true must veto readOnlyHint");
+        assert!(
+            !contradictory.is_read_only(),
+            "destructiveHint:true must veto readOnlyHint"
+        );
     }
 }

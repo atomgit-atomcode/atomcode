@@ -85,9 +85,7 @@ pub fn is_offline_active() -> bool {
 
 /// Store the environment-level mirror/registry note (blank/whitespace → cleared).
 pub fn set_offline_note(note: Option<String>) {
-    let cleaned = note
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let cleaned = note.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     *NOTE.lock().unwrap() = cleaned;
 }
 
@@ -156,7 +154,10 @@ mod tests {
         seed_offline_verdict(OfflineMode::Auto, None);
         assert!(!is_offline_active(), "auto starts optimistic-online");
         mark_network_unreachable();
-        assert!(is_offline_active(), "auto flips offline after a network failure");
+        assert!(
+            is_offline_active(),
+            "auto flips offline after a network failure"
+        );
     }
 
     #[test]
@@ -164,7 +165,10 @@ mod tests {
         let _g = fresh();
         seed_offline_verdict(OfflineMode::Off, None);
         mark_network_unreachable();
-        assert!(!is_offline_active(), "explicit off is never flipped by detection");
+        assert!(
+            !is_offline_active(),
+            "explicit off is never flipped by detection"
+        );
     }
 
     #[test]
@@ -172,11 +176,17 @@ mod tests {
         // env None → follows mode
         assert!(offline_resolved(OfflineMode::On, None));
         assert!(!offline_resolved(OfflineMode::Off, None));
-        assert!(!offline_resolved(OfflineMode::Auto, None), "auto is optimistic-online for pre-seed decisions");
+        assert!(
+            !offline_resolved(OfflineMode::Auto, None),
+            "auto is optimistic-online for pre-seed decisions"
+        );
         // env wins over mode
         assert!(offline_resolved(OfflineMode::Off, Some("on")));
         assert!(!offline_resolved(OfflineMode::On, Some("off")));
-        assert!(!offline_resolved(OfflineMode::On, Some("auto")), "env auto overrides config on, and auto is optimistic here");
+        assert!(
+            !offline_resolved(OfflineMode::On, Some("auto")),
+            "env auto overrides config on, and auto is optimistic here"
+        );
     }
 
     #[test]

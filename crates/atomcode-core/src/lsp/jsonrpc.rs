@@ -61,14 +61,22 @@ mod tests {
     fn encode_format() {
         let body = b"{\"jsonrpc\":\"2.0\"}";
         let encoded = encode(body);
-        let expected = format!("Content-Length: {}\r\n\r\n{}", body.len(), "{\"jsonrpc\":\"2.0\"}");
+        let expected = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            "{\"jsonrpc\":\"2.0\"}"
+        );
         assert_eq!(encoded, expected.as_bytes());
     }
 
     #[tokio::test]
     async fn read_message_parses() {
         let body = b"{\"jsonrpc\":\"2.0\",\"id\":1}";
-        let raw = format!("Content-Length: {}\r\n\r\n{}", body.len(), std::str::from_utf8(body).unwrap());
+        let raw = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
         let cursor = std::io::Cursor::new(raw.into_bytes());
         let mut reader = BufReader::new(cursor);
         let msg = read_message(&mut reader).await.unwrap();

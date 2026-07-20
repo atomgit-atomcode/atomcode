@@ -49,8 +49,13 @@ fn tilde_rest(raw: &str) -> Option<&str> {
     if raw == "~" {
         return Some("");
     }
-    raw.strip_prefix("~/")
-        .or_else(|| if cfg!(windows) { raw.strip_prefix(r"~\") } else { None })
+    raw.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            raw.strip_prefix(r"~\")
+        } else {
+            None
+        }
+    })
 }
 
 /// The user's real home directory, resolving `SUDO_USER` first (so `atomcode`
@@ -87,7 +92,9 @@ fn get_user_home(username: &str) -> Option<PathBuf> {
             &mut result,
         );
         if ret == 0 && !result.is_null() {
-            let home = std::ffi::CStr::from_ptr(pwd.pw_dir).to_string_lossy().into_owned();
+            let home = std::ffi::CStr::from_ptr(pwd.pw_dir)
+                .to_string_lossy()
+                .into_owned();
             return Some(PathBuf::from(home));
         }
     }
@@ -111,8 +118,14 @@ mod tests {
             Some(PathBuf::from("/Users/csdn/.atomcode/x"))
         );
         // A bare `~` (and `~/`) is the home dir itself.
-        assert_eq!(expand_tilde_with_home("~", Some(home)), Some(PathBuf::from("/Users/csdn")));
-        assert_eq!(expand_tilde_with_home("~/", Some(home)), Some(PathBuf::from("/Users/csdn")));
+        assert_eq!(
+            expand_tilde_with_home("~", Some(home)),
+            Some(PathBuf::from("/Users/csdn"))
+        );
+        assert_eq!(
+            expand_tilde_with_home("~/", Some(home)),
+            Some(PathBuf::from("/Users/csdn"))
+        );
     }
 
     #[test]
@@ -124,7 +137,10 @@ mod tests {
             expand_tilde_with_home("~//etc/passwd", Some(home)),
             Some(PathBuf::from("/Users/csdn/etc/passwd"))
         );
-        assert_eq!(expand_tilde_with_home("~//", Some(home)), Some(PathBuf::from("/Users/csdn")));
+        assert_eq!(
+            expand_tilde_with_home("~//", Some(home)),
+            Some(PathBuf::from("/Users/csdn"))
+        );
     }
 
     #[test]
@@ -149,7 +165,10 @@ mod tests {
     #[test]
     fn backslash_is_literal_on_unix() {
         // On Unix `\` is an ordinary filename char, so `~\foo` is not a tilde form.
-        assert_eq!(expand_tilde_with_home(r"~\foo", Some(Path::new("/Users/csdn"))), None);
+        assert_eq!(
+            expand_tilde_with_home(r"~\foo", Some(Path::new("/Users/csdn"))),
+            None
+        );
     }
 
     #[cfg(windows)]

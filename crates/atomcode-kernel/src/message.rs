@@ -663,7 +663,10 @@ impl Conversation {
             (
                 epoch_after,
                 removed,
-                Some(Conversation { messages: candidate, cache_epoch: epoch_after }),
+                Some(Conversation {
+                    messages: candidate,
+                    cache_epoch: epoch_after,
+                }),
             )
         } else {
             // REFUSE: messages byte-identical, epoch unchanged.

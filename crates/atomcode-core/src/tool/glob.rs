@@ -105,7 +105,12 @@ impl Tool for GlobTool {
             glob_search(&search_dir, &name_pattern, &wd, &pattern)
         })
         .await
-        .unwrap_or_else(|_| format!("No files matching '{}' (search task failed)", parsed.pattern));
+        .unwrap_or_else(|_| {
+            format!(
+                "No files matching '{}' (search task failed)",
+                parsed.pattern
+            )
+        });
 
         Ok(ToolResult {
             call_id: String::new(),
@@ -367,7 +372,7 @@ fn derive_name_pattern(pattern: &str) -> String {
 mod tests {
     use super::*;
     use crate::tool::ToolContext;
-    
+
     use tempfile::TempDir;
 
     /// P0 #4: when a glob's search dir doesn't exist, workspace-walk for dirs
@@ -476,7 +481,10 @@ mod tests {
     fn derive_search_dir_chinese_path() {
         let base = "/tmp/workspace";
         assert_eq!(derive_search_dir(base, "**/*.txt"), base);
-        assert_eq!(derive_search_dir(base, "测试/**/*.txt"), format!("{}/测试", base));
+        assert_eq!(
+            derive_search_dir(base, "测试/**/*.txt"),
+            format!("{}/测试", base)
+        );
         assert_eq!(
             derive_search_dir(base, "项目/模块/**/*.rs"),
             format!("{}/项目/模块", base)
@@ -487,7 +495,10 @@ mod tests {
     fn derive_name_pattern_mixed_chinese_english() {
         assert_eq!(derive_name_pattern("**/report-报告.txt"), "report-报告.txt");
         assert_eq!(derive_name_pattern("**/测试_test.py"), "测试_test.py");
-        assert_eq!(derive_name_pattern("src/组件/**/Button*.vue"), "Button*.vue");
+        assert_eq!(
+            derive_name_pattern("src/组件/**/Button*.vue"),
+            "Button*.vue"
+        );
     }
 
     #[test]
@@ -579,7 +590,9 @@ mod tests {
 
     #[test]
     fn test_should_skip_path_node_modules() {
-        assert!(should_skip_path(std::path::Path::new("/project/node_modules/pkg/file.js")));
+        assert!(should_skip_path(std::path::Path::new(
+            "/project/node_modules/pkg/file.js"
+        )));
     }
 
     #[test]
@@ -589,18 +602,24 @@ mod tests {
 
     #[test]
     fn test_should_skip_path_target() {
-        assert!(should_skip_path(std::path::Path::new("/project/target/debug/app")));
+        assert!(should_skip_path(std::path::Path::new(
+            "/project/target/debug/app"
+        )));
     }
 
     #[test]
     fn test_should_skip_path_normal() {
-        assert!(!should_skip_path(std::path::Path::new("/project/src/main.rs")));
+        assert!(!should_skip_path(std::path::Path::new(
+            "/project/src/main.rs"
+        )));
         assert!(!should_skip_path(std::path::Path::new("/project/测试.txt")));
     }
 
     #[test]
     fn test_should_skip_path_venv_prefix() {
-        assert!(should_skip_path(std::path::Path::new("/project/.venv-test/lib/python.py")));
+        assert!(should_skip_path(std::path::Path::new(
+            "/project/.venv-test/lib/python.py"
+        )));
     }
 
     // --- 跨平台中文文件名搜索测试 (使用 ignore crate) ---
@@ -665,7 +684,11 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("组件")).unwrap();
         std::fs::create_dir_all(dir.path().join("components")).unwrap();
         std::fs::write(dir.path().join("组件/按钮.vue"), "<template></template>").unwrap();
-        std::fs::write(dir.path().join("components/Button.vue"), "<template></template>").unwrap();
+        std::fs::write(
+            dir.path().join("components/Button.vue"),
+            "<template></template>",
+        )
+        .unwrap();
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let tool = GlobTool;
@@ -737,7 +760,10 @@ mod tests {
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let tool = GlobTool;
-        let r = tool.execute(r#"{"pattern":"**/*.md"}"#, &ctx).await.unwrap();
+        let r = tool
+            .execute(r#"{"pattern":"**/*.md"}"#, &ctx)
+            .await
+            .unwrap();
         assert!(r.success, "glob should succeed: {}", r.output);
         assert!(
             r.output.contains("visible.md"),
@@ -825,7 +851,10 @@ mod tests {
         let tool = GlobTool;
 
         // 搜索所有 .txt 文件（递归）
-        let r = tool.execute(r#"{"pattern":"**/*.txt"}"#, &ctx).await.unwrap();
+        let r = tool
+            .execute(r#"{"pattern":"**/*.txt"}"#, &ctx)
+            .await
+            .unwrap();
         assert!(r.success, "glob should succeed: {}", r.output);
         assert!(
             r.output.contains("测试.txt"),
@@ -834,7 +863,10 @@ mod tests {
         );
 
         // 搜索指定中文名文件
-        let r = tool.execute(r#"{"pattern":"**/测试.txt"}"#, &ctx).await.unwrap();
+        let r = tool
+            .execute(r#"{"pattern":"**/测试.txt"}"#, &ctx)
+            .await
+            .unwrap();
         assert!(r.success, "glob should succeed: {}", r.output);
         assert!(
             r.output.contains("测试.txt"),
@@ -889,12 +921,28 @@ mod tests {
         let tool = GlobTool;
 
         let r = tool.execute(r#"{"pattern":"*.ts"}"#, &ctx).await.unwrap();
-        assert!(r.output.contains("索引.ts"), "must find '索引.ts': {}", r.output);
-        assert!(r.output.contains("index.ts"), "must find 'index.ts': {}", r.output);
+        assert!(
+            r.output.contains("索引.ts"),
+            "must find '索引.ts': {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("index.ts"),
+            "must find 'index.ts': {}",
+            r.output
+        );
 
         let r = tool.execute(r#"{"pattern":"*.py"}"#, &ctx).await.unwrap();
-        assert!(r.output.contains("工具_辅助.py"), "must find '工具_辅助.py': {}", r.output);
-        assert!(r.output.contains("utils-helper.py"), "must find 'utils-helper.py': {}", r.output);
+        assert!(
+            r.output.contains("工具_辅助.py"),
+            "must find '工具_辅助.py': {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("utils-helper.py"),
+            "must find 'utils-helper.py': {}",
+            r.output
+        );
     }
 
     #[tokio::test]
@@ -909,9 +957,21 @@ mod tests {
         let tool = GlobTool;
         let r = tool.execute(r#"{"pattern":"*.txt"}"#, &ctx).await.unwrap();
 
-        assert!(r.output.contains("テスト.txt"), "must find Japanese filename: {}", r.output);
-        assert!(r.output.contains("테스트.txt"), "must find Korean filename: {}", r.output);
-        assert!(r.output.contains("🎉party.txt"), "must find emoji filename: {}", r.output);
+        assert!(
+            r.output.contains("テスト.txt"),
+            "must find Japanese filename: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("테스트.txt"),
+            "must find Korean filename: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("🎉party.txt"),
+            "must find emoji filename: {}",
+            r.output
+        );
     }
 
     // --- 回归: 确认不再使用 Windows find.exe ---

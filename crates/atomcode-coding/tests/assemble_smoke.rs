@@ -21,7 +21,10 @@ async fn assembles_and_runs_a_tool_end_to_end() {
             }),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let cfg = CodingAgentConfig::new("k", "http://localhost:0", "mock-model", ".");
@@ -29,7 +32,19 @@ async fn assembles_and_runs_a_tool_end_to_end() {
         .run_to_completion("list the current directory", AutoRespond::AllowAll)
         .await;
 
-    assert_eq!(outcome.tool_results.len(), 1, "list_directory should have executed exactly once");
-    assert!(outcome.error.is_none(), "clean run expected, got: {:?}", outcome.error);
-    assert!(outcome.text.contains("done"), "final assistant text: {:?}", outcome.text);
+    assert_eq!(
+        outcome.tool_results.len(),
+        1,
+        "list_directory should have executed exactly once"
+    );
+    assert!(
+        outcome.error.is_none(),
+        "clean run expected, got: {:?}",
+        outcome.error
+    );
+    assert!(
+        outcome.text.contains("done"),
+        "final assistant text: {:?}",
+        outcome.text
+    );
 }

@@ -74,9 +74,8 @@ pub fn format_compaction_mark(
         })
         .into_owned()
     } else {
-        let saved = fmt_compaction_tokens(
-            estimated_tokens_before.saturating_sub(estimated_tokens_after),
-        );
+        let saved =
+            fmt_compaction_tokens(estimated_tokens_before.saturating_sub(estimated_tokens_after));
         t(Msg::CompactMarkStub { saved: &saved }).into_owned()
     }
 }
@@ -118,10 +117,7 @@ fn fmt_compaction_tokens(tokens: usize) -> String {
 /// Determine the initial locale from (in priority order):
 /// CLI `--lang` flag, config file `language` field, environment
 /// variables `LC_ALL` / `LC_MESSAGES` / `LANG`.
-pub fn resolve_initial_locale(
-    cli_lang: Option<&str>,
-    config_lang: Option<Locale>,
-) -> Locale {
+pub fn resolve_initial_locale(cli_lang: Option<&str>, config_lang: Option<Locale>) -> Locale {
     resolve_initial_locale_with_env(cli_lang, config_lang, &|k| std::env::var(k).ok())
 }
 
@@ -303,8 +299,14 @@ mod tests {
                 cached_pct: None,
             },
         );
-        assert!(without.trim_end().ends_with("152.00K tokens"), "got: {without}");
-        assert!(!without.contains("cached"), "no annotation when None: {without}");
+        assert!(
+            without.trim_end().ends_with("152.00K tokens"),
+            "got: {without}"
+        );
+        assert!(
+            !without.contains("cached"),
+            "no annotation when None: {without}"
+        );
     }
 
     #[test]
@@ -375,8 +377,13 @@ mod tests {
 
     #[test]
     fn env_zh_cn_resolves_to_zh_cn() {
-        let env =
-            |k: &str| if k == "LANG" { Some("zh_CN.UTF-8".into()) } else { None };
+        let env = |k: &str| {
+            if k == "LANG" {
+                Some("zh_CN.UTF-8".into())
+            } else {
+                None
+            }
+        };
         assert_eq!(
             resolve_initial_locale_with_env(None, None, &env),
             Locale::ZhCn
@@ -385,7 +392,13 @@ mod tests {
 
     #[test]
     fn env_zh_tw_maps_to_zh_cn() {
-        let env = |k: &str| if k == "LANG" { Some("zh_TW".into()) } else { None };
+        let env = |k: &str| {
+            if k == "LANG" {
+                Some("zh_TW".into())
+            } else {
+                None
+            }
+        };
         assert_eq!(
             resolve_initial_locale_with_env(None, None, &env),
             Locale::ZhCn
@@ -461,7 +474,10 @@ mod tests {
             after: "9.1K",
         });
         assert!(s.contains("12"), "message count missing: {s}");
-        assert!(s.contains("48.2K") && s.contains("9.1K"), "token figures missing: {s}");
+        assert!(
+            s.contains("48.2K") && s.contains("9.1K"),
+            "token figures missing: {s}"
+        );
         assert!(s.contains('→'), "before→after arrow missing: {s}");
         assert!(s.contains('~'), "estimate marker missing: {s}");
         assert!(s.contains("tok"), "token unit missing: {s}");
@@ -471,7 +487,10 @@ mod tests {
     fn compact_mark_stub_renders_saved_without_arrow() {
         let s = crate::i18n::t(crate::i18n::Msg::CompactMarkStub { saved: "6.0K" });
         assert!(s.contains("6.0K"), "saved figure missing: {s}");
-        assert!(!s.contains('→'), "stub marker shows a single figure, no arrow: {s}");
+        assert!(
+            !s.contains('→'),
+            "stub marker shows a single figure, no arrow: {s}"
+        );
         assert!(s.contains("tok"), "token unit missing: {s}");
     }
 
@@ -576,8 +595,14 @@ mod tests {
         check!(Msg::UsagePlanTitle);
         check!(Msg::UsagePlanActive);
         check!(Msg::UsagePlanExpired);
-        check!(Msg::UsagePlanClaimedExpires { claimed: "2026-06-01", expires: "2026-07-01" });
-        check!(Msg::UsagePlanRemaining { remaining: 5, total: 30 });
+        check!(Msg::UsagePlanClaimedExpires {
+            claimed: "2026-06-01",
+            expires: "2026-07-01"
+        });
+        check!(Msg::UsagePlanRemaining {
+            remaining: 5,
+            total: 30
+        });
         check!(Msg::UsageCopied);
     }
 }

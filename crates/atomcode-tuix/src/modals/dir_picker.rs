@@ -248,7 +248,10 @@ fn build_menu_payload(p: &DirPicker) -> MenuPayload {
     MenuPayload {
         items,
         selected: p.selected,
-            kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
+        kind: crate::render::MenuKind::TwoColumn {
+            row_prefix: "",
+            selected_marker: "▸",
+        },
     }
 }
 
@@ -299,7 +302,10 @@ mod tests {
         p.down();
         assert_eq!(p.selected, 1);
         p.down();
-        assert_eq!(p.selected, 1, "clamps to the 2 filtered results, not all 3 dirs");
+        assert_eq!(
+            p.selected, 1,
+            "clamps to the 2 filtered results, not all 3 dirs"
+        );
     }
 
     #[test]
@@ -323,7 +329,10 @@ mod tests {
         p.on_char('/');
         p.on_char('x');
         assert_eq!(p.query, "~/x");
-        assert_eq!(p.selected, 0, "typing re-focuses the typed path, not a recent dir");
+        assert_eq!(
+            p.selected, 0,
+            "typing re-focuses the typed path, not a recent dir"
+        );
         p.on_backspace();
         assert_eq!(p.query, "~/");
     }

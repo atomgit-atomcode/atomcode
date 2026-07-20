@@ -90,7 +90,10 @@ async fn adapter_maps_bad_arguments_to_tool_error() {
     let adapter = McpToolAdapter::new(registry, infos.into_iter().next().unwrap());
 
     let result = adapter.execute("not json", &ctx()).await;
-    assert!(result.is_error, "invalid JSON args must become a tool error");
+    assert!(
+        result.is_error,
+        "invalid JSON args must become a tool error"
+    );
     assert!(result.content.contains("invalid MCP tool arguments"));
 }
 
@@ -106,8 +109,10 @@ async fn adapter_passes_kernel_tool_conformance() {
         .expect("stdio MCP server should connect");
     let registry = registry.share();
     let infos = registry.list_all_tools().await;
-    let adapter: Arc<dyn Tool> =
-        Arc::new(McpToolAdapter::new(registry, infos.into_iter().next().unwrap()));
+    let adapter: Arc<dyn Tool> = Arc::new(McpToolAdapter::new(
+        registry,
+        infos.into_iter().next().unwrap(),
+    ));
 
     let report = conformance::tool::check(adapter, &[r#"{"message":"x"}"#]).await;
     report.assert_conformant();

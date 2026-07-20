@@ -94,7 +94,12 @@ pub(crate) fn chain_has_transient_io(err: &(dyn std::error::Error + 'static)) ->
         if let Some(io) = e.downcast_ref::<std::io::Error>() {
             if matches!(
                 io.kind(),
-                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | NotConnected | TimedOut
+                ConnectionReset
+                    | ConnectionAborted
+                    | BrokenPipe
+                    | UnexpectedEof
+                    | NotConnected
+                    | TimedOut
             ) {
                 return true;
             }
@@ -130,7 +135,10 @@ pub(crate) fn err_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// (e.g. a malformed body) keep the verbatim `stream read error: <chain>` form.
 pub(crate) fn stream_read_error_message(err: &(dyn std::error::Error + 'static)) -> String {
     if chain_has_transient_io(err) {
-        format!("网络连接中断:远端关闭或重置了连接(已自动重连仍失败,可重试)。详情: {}", err_chain(err))
+        format!(
+            "网络连接中断:远端关闭或重置了连接(已自动重连仍失败,可重试)。详情: {}",
+            err_chain(err)
+        )
     } else {
         format!("stream read error: {}", err_chain(err))
     }
@@ -149,7 +157,10 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
     }
     // HTTP-date form: wait until that instant (a past date → retry now = ZERO).
     let when = httpdate::parse_http_date(trimmed).ok()?;
-    Some(when.duration_since(std::time::SystemTime::now()).unwrap_or(Duration::ZERO))
+    Some(
+        when.duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 /// Exponential backoff with real ±25% jitter, capped at `max_delay`. `attempt`
@@ -231,23 +242,35 @@ mod tests {
         // is stable. HTTP-date has 1s resolution; allow slack for test execution time.
         let future = std::time::SystemTime::now() + Duration::from_secs(3600);
         let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, HeaderValue::from_str(&httpdate::fmt_http_date(future)).unwrap());
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(future)).unwrap(),
+        );
         let got = parse_retry_after(&h).expect("future HTTP-date must parse");
-        assert!(got.as_secs() >= 3590 && got.as_secs() <= 3600, "got {got:?}");
+        assert!(
+            got.as_secs() >= 3590 && got.as_secs() <= 3600,
+            "got {got:?}"
+        );
     }
 
     #[test]
     fn parse_retry_after_http_date_past_is_zero() {
         // A past HTTP-date means "retry now" → ZERO (not None, not an underflow panic).
         let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
         assert_eq!(parse_retry_after(&h), Some(Duration::ZERO));
     }
 
     #[test]
     fn parse_retry_after_garbage_is_none() {
         let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, HeaderValue::from_static("not-a-date-or-number"));
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("not-a-date-or-number"),
+        );
         assert_eq!(parse_retry_after(&h), None);
     }
 
@@ -289,8 +312,14 @@ mod tests {
             base_delay: Duration::from_millis(1000),
             max_delay: Duration::from_secs(10),
         };
-        assert_eq!(compute_backoff_jittered(1, &policy, 0.0), Duration::from_millis(750));
-        assert_eq!(compute_backoff_jittered(1, &policy, 0.5), Duration::from_millis(1000));
+        assert_eq!(
+            compute_backoff_jittered(1, &policy, 0.0),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            compute_backoff_jittered(1, &policy, 0.5),
+            Duration::from_millis(1000)
+        );
         let hi = compute_backoff_jittered(1, &policy, 0.999);
         assert!(
             (Duration::from_millis(1240)..Duration::from_millis(1250)).contains(&hi),
@@ -316,7 +345,10 @@ mod tests {
         let d1 = compute_backoff_jittered(1, &p, 0.5);
         let d2 = compute_backoff_jittered(2, &p, 0.5);
         let d3 = compute_backoff_jittered(3, &p, 0.5);
-        assert!(d1 < d2 && d2 < d3, "backoff must grow: {d1:?} {d2:?} {d3:?}");
+        assert!(
+            d1 < d2 && d2 < d3,
+            "backoff must grow: {d1:?} {d2:?} {d3:?}"
+        );
     }
 
     #[test]
@@ -392,7 +424,10 @@ mod tests {
             );
         }
         // A bare io error (no wrapper) is detected too.
-        assert!(chain_has_transient_io(&Error::new(ErrorKind::BrokenPipe, "bp")));
+        assert!(chain_has_transient_io(&Error::new(
+            ErrorKind::BrokenPipe,
+            "bp"
+        )));
     }
 
     #[test]
@@ -402,11 +437,23 @@ mod tests {
         // `Connection timed out (os error 110)` (Linux ETIMEDOUT → ErrorKind::TimedOut)
         // must be treated as a transport drop — both for the plain-language message
         // and for open-path retry.
-        let e = Wrap(Error::new(ErrorKind::TimedOut, "Connection timed out (os error 110)"));
-        assert!(chain_has_transient_io(&e), "ETIMEDOUT buried in the chain is a transport drop");
+        let e = Wrap(Error::new(
+            ErrorKind::TimedOut,
+            "Connection timed out (os error 110)",
+        ));
+        assert!(
+            chain_has_transient_io(&e),
+            "ETIMEDOUT buried in the chain is a transport drop"
+        );
         let msg = stream_read_error_message(&e);
-        assert!(msg.contains("网络连接中断"), "leads with a plain-language notice: {msg}");
-        assert!(msg.contains("os error 110"), "still appends the raw cause: {msg}");
+        assert!(
+            msg.contains("网络连接中断"),
+            "leads with a plain-language notice: {msg}"
+        );
+        assert!(
+            msg.contains("os error 110"),
+            "still appends the raw cause: {msg}"
+        );
     }
 
     #[test]
@@ -414,8 +461,14 @@ mod tests {
         use std::io::{Error, ErrorKind};
         // NotFound / PermissionDenied are not transport hiccups — must NOT
         // be retried (re-sending won't help and could mask a real fault).
-        assert!(!chain_has_transient_io(&Wrap(Error::new(ErrorKind::NotFound, "nf"))));
-        assert!(!chain_has_transient_io(&Wrap(Error::new(ErrorKind::PermissionDenied, "pd"))));
+        assert!(!chain_has_transient_io(&Wrap(Error::new(
+            ErrorKind::NotFound,
+            "nf"
+        ))));
+        assert!(!chain_has_transient_io(&Wrap(Error::new(
+            ErrorKind::PermissionDenied,
+            "pd"
+        ))));
         // An error chain with no io::Error at all → not classified transient.
         #[derive(Debug)]
         struct Plain;
@@ -435,10 +488,19 @@ mod tests {
         // ("error sending request") hides the cause; err_chain must surface
         // the buried "connection reset by peer" so the next failure is
         // diagnosable at a glance.
-        let e = Wrap(Error::new(ErrorKind::ConnectionReset, "connection reset by peer (os error 54)"));
+        let e = Wrap(Error::new(
+            ErrorKind::ConnectionReset,
+            "connection reset by peer (os error 54)",
+        ));
         let s = err_chain(&e);
-        assert!(s.contains("error sending request"), "keeps the top message: {s}");
-        assert!(s.contains("connection reset by peer (os error 54)"), "appends the cause: {s}");
+        assert!(
+            s.contains("error sending request"),
+            "keeps the top message: {s}"
+        );
+        assert!(
+            s.contains("connection reset by peer (os error 54)"),
+            "appends the cause: {s}"
+        );
     }
 
     #[test]
@@ -453,8 +515,14 @@ mod tests {
             "远程主机强迫关闭了一个现有的连接。 (os error 10054)",
         ));
         let msg = stream_read_error_message(&e);
-        assert!(msg.contains("网络连接中断"), "leads with a plain-language notice: {msg}");
-        assert!(msg.contains("os error 10054"), "still appends the raw cause for diagnosis: {msg}");
+        assert!(
+            msg.contains("网络连接中断"),
+            "leads with a plain-language notice: {msg}"
+        );
+        assert!(
+            msg.contains("os error 10054"),
+            "still appends the raw cause for diagnosis: {msg}"
+        );
     }
 
     #[test]
@@ -465,7 +533,13 @@ mod tests {
         // a connection interruption.
         let e = Wrap(Error::new(ErrorKind::InvalidData, "bad frame"));
         let msg = stream_read_error_message(&e);
-        assert!(msg.starts_with("stream read error:"), "verbatim form for logical errors: {msg}");
-        assert!(!msg.contains("网络连接中断"), "must not mislabel a logical error: {msg}");
+        assert!(
+            msg.starts_with("stream read error:"),
+            "verbatim form for logical errors: {msg}"
+        );
+        assert!(
+            !msg.contains("网络连接中断"),
+            "must not mislabel a logical error: {msg}"
+        );
     }
 }

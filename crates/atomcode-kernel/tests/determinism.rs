@@ -23,7 +23,13 @@ async fn fixed_clock_makes_elapsed_ms_deterministic() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     let mut elapsed = None;
     while let Some(ev) = handle.events.recv().await {
@@ -36,5 +42,9 @@ async fn fixed_clock_makes_elapsed_ms_deterministic() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
-    assert_eq!(elapsed, Some(0), "a FixedClock makes elapsed_ms reproducibly 0");
+    assert_eq!(
+        elapsed,
+        Some(0),
+        "a FixedClock makes elapsed_ms reproducibly 0"
+    );
 }

@@ -161,7 +161,13 @@ where
                         let cx = cx.clone();
                         async move {
                             dispatch::run_prompt_turn(
-                                cx, sessions, sid, text, images, responder, auto_approve,
+                                cx,
+                                sessions,
+                                sid,
+                                text,
+                                images,
+                                responder,
+                                auto_approve,
                             )
                             .await
                         }
@@ -204,7 +210,10 @@ where
                     )?;
                     Ok(Handled::Yes)
                 } else {
-                    Ok(Handled::No { message, retry: false })
+                    Ok(Handled::No {
+                        message,
+                        retry: false,
+                    })
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),

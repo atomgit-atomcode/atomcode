@@ -707,7 +707,10 @@ mod tests {
         // JSON5/JS semantics: the FIRST `*/` closes; a second one leaks and serde_json
         // rejects it (rather than silently swallowing to the second `*/`).
         let stripped = strip_jsonc_comments("{ \"a\": 1 } /* outer /* inner */ tail */");
-        assert!(serde_json::from_str::<Value>(&stripped).is_err(), "leftover `tail */` must fail to parse");
+        assert!(
+            serde_json::from_str::<Value>(&stripped).is_err(),
+            "leftover `tail */` must fail to parse"
+        );
     }
 
     #[test]
@@ -937,19 +940,31 @@ mod tests {
         let dir = std::env::temp_dir().join("ac_autoapprove_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(".mcp.json"), r#"{"mcpServers":{"srv":{"command":"x"}}}"#).unwrap();
+        std::fs::write(
+            dir.join(".mcp.json"),
+            r#"{"mcpServers":{"srv":{"command":"x"}}}"#,
+        )
+        .unwrap();
 
         add_auto_approved_tool(&dir, "srv", "query").expect("write ok");
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
-        let arr = written["mcpServers"]["srv"]["autoApprove"].as_array().expect("autoApprove array");
+        let arr = written["mcpServers"]["srv"]["autoApprove"]
+            .as_array()
+            .expect("autoApprove array");
         assert!(arr.iter().any(|v| v == "query"));
 
         // Idempotent: second call must not duplicate.
         add_auto_approved_tool(&dir, "srv", "query").unwrap();
         let again: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
-        assert_eq!(again["mcpServers"]["srv"]["autoApprove"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            again["mcpServers"]["srv"]["autoApprove"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

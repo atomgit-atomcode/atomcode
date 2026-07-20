@@ -22,8 +22,13 @@ fn helper_sends_token_and_returns_password() {
     let h = std::thread::spawn(move || {
         let (mut s, _) = l.accept().unwrap();
         let mut line = String::new();
-        BufReader::new(s.try_clone().unwrap()).read_line(&mut line).unwrap();
-        assert!(line.contains("\"token\":\"tok\""), "must send token: {line}");
+        BufReader::new(s.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert!(
+            line.contains("\"token\":\"tok\""),
+            "must send token: {line}"
+        );
         s.write_all(b"{\"password\":\"pw\"}\n").unwrap();
     });
     let pw = atomcode::askpass::run_askpass("[sudo] password:", &sock2, "tok");

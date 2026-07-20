@@ -203,7 +203,9 @@ pub async fn code(args: CodeArgs) -> Result<()> {
             E::Connected { name } => eprintln!("  mcp ✓ {name}"),
             E::Failed { name, error } => eprintln!("  mcp ✗ {name}: {error}"),
             E::Warning { name, message } => eprintln!("  mcp ! {name}: {message}"),
-            E::BlockedUntrusted { name } => eprintln!("  mcp ⊘ {name}: withheld (untrusted project; run `/mcp trust` in atomcode)"),
+            E::BlockedUntrusted { name } => eprintln!(
+                "  mcp ⊘ {name}: withheld (untrusted project; run `/mcp trust` in atomcode)"
+            ),
         }
     }
     let session_id = runtime.session.as_ref().map(|session| session.id.clone());

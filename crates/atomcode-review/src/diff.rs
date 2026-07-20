@@ -125,11 +125,26 @@ mod tests {
     fn annotates_add_del_context_with_real_numbers() {
         let diff = "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -10,3 +10,4 @@ func main() {\n ctx\n-old\n+new1\n+new2\n";
         let got = annotate_diff_line_numbers(diff);
-        assert!(got.contains("diff --git a/a.go b/a.go\n"), "metadata kept verbatim");
-        assert!(got.contains("10:  ctx"), "context uses NEW number, got:\n{got}");
-        assert!(got.contains("11: -old"), "deletion uses OLD number, got:\n{got}");
-        assert!(got.contains("11: +new1"), "addition uses NEW number, got:\n{got}");
-        assert!(got.contains("12: +new2"), "second addition increments, got:\n{got}");
+        assert!(
+            got.contains("diff --git a/a.go b/a.go\n"),
+            "metadata kept verbatim"
+        );
+        assert!(
+            got.contains("10:  ctx"),
+            "context uses NEW number, got:\n{got}"
+        );
+        assert!(
+            got.contains("11: -old"),
+            "deletion uses OLD number, got:\n{got}"
+        );
+        assert!(
+            got.contains("11: +new1"),
+            "addition uses NEW number, got:\n{got}"
+        );
+        assert!(
+            got.contains("12: +new2"),
+            "second addition increments, got:\n{got}"
+        );
     }
 
     #[test]
@@ -137,14 +152,20 @@ mod tests {
         let diff = "+++ b/a.go\n@@ -1,1 +1,1 @@\n+x\n@@ -50,1 +60,1 @@\n+y\n";
         let got = annotate_diff_line_numbers(diff);
         assert!(got.contains("1: +x"));
-        assert!(got.contains("60: +y"), "second hunk restarts at its own start:\n{got}");
+        assert!(
+            got.contains("60: +y"),
+            "second hunk restarts at its own start:\n{got}"
+        );
     }
 
     #[test]
     fn passthrough_outside_hunks_and_no_newline_marker() {
         let diff = "+++ b/a.go\n@@ -1,1 +1,1 @@\n+x\n\\ No newline at end of file\n";
         let got = annotate_diff_line_numbers(diff);
-        assert!(got.contains("\\ No newline at end of file\n"), "marker kept verbatim");
+        assert!(
+            got.contains("\\ No newline at end of file\n"),
+            "marker kept verbatim"
+        );
         // Garbage input degrades to passthrough.
         assert_eq!(annotate_diff_line_numbers("hello\nworld"), "hello\nworld");
     }

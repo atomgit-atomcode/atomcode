@@ -11,9 +11,8 @@ struct AtomGitRequestSigner {
 
 impl RequestSigner for AtomGitRequestSigner {
     fn sign(&self, body: &[u8]) -> Result<SignedAuth, RequestSigningError> {
-        let auth = get_valid_auth_session().map_err(|error| {
-            RequestSigningError::CredentialsUnavailable(error.to_string())
-        })?;
+        let auth = get_valid_auth_session()
+            .map_err(|error| RequestSigningError::CredentialsUnavailable(error.to_string()))?;
         let mut nonce = [0u8; 16];
         getrandom::getrandom(&mut nonce).map_err(|error| {
             RequestSigningError::SigningFailed(format!("secure nonce generation failed: {error}"))

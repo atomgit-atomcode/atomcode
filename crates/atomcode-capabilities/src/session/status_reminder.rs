@@ -104,7 +104,10 @@ mod tests {
 
     #[test]
     fn render_has_date_context_and_round_wrapped() {
-        let dt = Local.with_ymd_and_hms(2026, 6, 15, 17, 34, 0).single().unwrap();
+        let dt = Local
+            .with_ymd_and_hms(2026, 6, 15, 17, 34, 0)
+            .single()
+            .unwrap();
         let s = StatusReminderHook::render(dt, &ctx(3, 128_000, 40_000));
         assert!(
             s.starts_with("<system-reminder>") && s.ends_with("</system-reminder>"),
@@ -114,11 +117,17 @@ mod tests {
         // models (deepseek-v4-flash) editorialize ("要休息了吗？快 1 点了"), and relative-date
         // resolution for `recall` needs only the date.
         assert!(s.contains("Current date: 2026-06-15 (Mon)"), "{s}");
-        assert!(!s.contains("local time"), "must not carry wall-clock time: {s}");
+        assert!(
+            !s.contains("local time"),
+            "must not carry wall-clock time: {s}"
+        );
         assert!(!s.contains("17:34"), "must not carry wall-clock time: {s}");
         // NO context-usage gauge is pushed to the model, even when the window IS known —
         // pressure is handled silently by auto-compaction (matches codex/opencode).
-        assert!(!s.contains("Context window"), "must not push a context-usage gauge: {s}");
+        assert!(
+            !s.contains("Context window"),
+            "must not push a context-usage gauge: {s}"
+        );
         assert!(!s.contains('%'), "must not push any usage percentage: {s}");
         // Round counter shows the CURRENT round only — the `of N (max)` ceiling
         // is deliberately NOT surfaced (countdown pressures weak models into
@@ -134,10 +143,19 @@ mod tests {
         // "Context window: … (95%)". It must NOT be surfaced to the model: pressure is handled
         // silently by auto-compaction, and pushing the gauge made weak models false-complete or
         // nag the user to compact. Only date + round remain.
-        let dt = Local.with_ymd_and_hms(2026, 6, 15, 9, 0, 0).single().unwrap();
+        let dt = Local
+            .with_ymd_and_hms(2026, 6, 15, 9, 0, 0)
+            .single()
+            .unwrap();
         let s = StatusReminderHook::render(dt, &ctx(2, 128_000, 121_600));
-        assert!(!s.contains("Context window"), "no context-usage gauge pushed to the model: {s}");
-        assert!(!s.contains('%'), "no usage percentage pushed to the model: {s}");
+        assert!(
+            !s.contains("Context window"),
+            "no context-usage gauge pushed to the model: {s}"
+        );
+        assert!(
+            !s.contains('%'),
+            "no usage percentage pushed to the model: {s}"
+        );
         assert!(s.contains("Current date"), "date is still carried: {s}");
         assert!(s.contains("Turn round: 2"), "{s}");
         assert!(!s.contains("(max)"), "no countdown ceiling: {s}");
@@ -152,8 +170,11 @@ mod tests {
         hook.pre_request(&mut r1, &ctx(1, 128_000, 0)).await;
         assert_eq!(r1, before, "round 1 must not inject a reminder");
         // Round 2: exactly one wrapped tail appended.
-        let mut r2 =
-            vec![Message::system("s"), Message::user("hi"), Message::assistant("a", vec![])];
+        let mut r2 = vec![
+            Message::system("s"),
+            Message::user("hi"),
+            Message::assistant("a", vec![]),
+        ];
         hook.pre_request(&mut r2, &ctx(2, 128_000, 1_000)).await;
         assert_eq!(r2.len(), 4, "round 2 appends exactly one tail");
         assert!(

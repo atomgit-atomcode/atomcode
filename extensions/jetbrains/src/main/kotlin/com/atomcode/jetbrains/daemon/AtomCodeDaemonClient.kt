@@ -20,6 +20,8 @@ class AtomCodeDaemonClient(
 
     private val baseUrl = "http://$host:$port"
 
+    internal fun loginCoordinatorKey(): String = baseUrl
+
     fun health(): CompletableFuture<HealthResponse> =
         send("GET", "/health").thenApply {
             HealthResponse(
@@ -27,6 +29,7 @@ class AtomCodeDaemonClient(
                 version = it.jsonString("version").orEmpty(),
                 service = it.jsonString("service").orEmpty(),
                 binaryHash = it.jsonString("binary_hash"),
+                instanceId = it.jsonString("instance_id"),
             )
         }
 
@@ -66,6 +69,7 @@ class AtomCodeDaemonClient(
         send("GET", "/auth/status").thenApply { raw ->
             AuthStatusResponse(
                 loggedIn = raw.jsonBoolean("logged_in") ?: false,
+                expired = raw.jsonBoolean("expired") ?: false,
                 authPath = raw.jsonString("auth_path").orEmpty(),
                 userName = raw.jsonNestedObject("user")?.let {
                     it.jsonString("name") ?: it.jsonString("username") ?: it.jsonString("email")
@@ -74,11 +78,13 @@ class AtomCodeDaemonClient(
         }
 
     fun startLogin(openBrowser: Boolean = true): CompletableFuture<LoginStartResponse> =
-        send("POST", "/auth/login/start", """{"open_browser":$openBrowser}""").thenApply { raw ->
+        send("POST", "/auth/login/start", """{"open_browser":$openBrowser,"protocol_version":2}""").thenApply { raw ->
             LoginStartResponse(
                 loginId = raw.jsonString("login_id").orEmpty(),
                 url = raw.jsonString("url").orEmpty(),
                 expiresInSeconds = raw.jsonInt("expires_in_seconds") ?: 600,
+                daemonInstanceId = raw.jsonString("daemon_instance_id"),
+                protocolVersion = raw.jsonInt("protocol_version") ?: 1,
             )
         }
 
@@ -89,6 +95,9 @@ class AtomCodeDaemonClient(
                 userName = raw.jsonNestedObject("user")?.let {
                     it.jsonString("name") ?: it.jsonString("username") ?: it.jsonString("email")
                 },
+                code = raw.jsonString("code"),
+                message = raw.jsonString("message"),
+                retryAfterMs = raw.jsonInt("retry_after_ms"),
             )
         }
 
@@ -360,7 +369,7 @@ class AtomCodeDaemonClient(
 
         return client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
             if (response.statusCode() >= 400) {
-                throw IllegalStateException(formatDaemonHttpError(response.statusCode(), response.body()))
+                throw DaemonHttpException.from(response.statusCode(), response.body())
             }
             response.body()
         }
@@ -376,6 +385,23 @@ class AtomCodeDaemonClient(
             builder.header("Authorization", "Bearer $it")
         }
         return builder
+    }
+}
+
+class DaemonHttpException(
+    val statusCode: Int,
+    val code: String?,
+    val retryable: Boolean,
+    message: String,
+) : IllegalStateException(message) {
+    companion object {
+        internal fun from(statusCode: Int, body: String): DaemonHttpException =
+            DaemonHttpException(
+                statusCode = statusCode,
+                code = body.jsonString("code"),
+                retryable = body.jsonBoolean("retryable") ?: (statusCode >= 500),
+                message = formatDaemonHttpError(statusCode, body),
+            )
     }
 }
 

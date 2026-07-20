@@ -34,7 +34,11 @@ impl SkillCatalogHook {
 /// Count of the leading run of `Role::System` messages — the insert point that
 /// lands the catalog right after persona + any context block already injected.
 fn leading_system_count(convo: &Conversation) -> usize {
-    convo.messages.iter().take_while(|m| m.role == Role::System).count()
+    convo
+        .messages
+        .iter()
+        .take_while(|m| m.role == Role::System)
+        .count()
 }
 
 #[async_trait]
@@ -78,7 +82,10 @@ mod tests {
         let mut c = convo_with_persona();
         hook.session_start(&mut c, false).await;
         assert_eq!(c.messages[0].text, "PERSONA");
-        assert!(c.messages[1].text.starts_with(CATALOG_HEADER), "catalog after persona");
+        assert!(
+            c.messages[1].text.starts_with(CATALOG_HEADER),
+            "catalog after persona"
+        );
         assert_eq!(c.messages[2].role, Role::User, "before the user message");
     }
 
@@ -113,6 +120,9 @@ mod tests {
         c.push(Message::user("hi"));
         hook.session_start(&mut c, true).await;
         assert_eq!(c.messages.len(), 2, "stale catalog pruned");
-        assert!(c.messages.iter().all(|m| !m.text.starts_with(CATALOG_HEADER)));
+        assert!(c
+            .messages
+            .iter()
+            .all(|m| !m.text.starts_with(CATALOG_HEADER)));
     }
 }

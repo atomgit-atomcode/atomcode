@@ -5,6 +5,7 @@ data class HealthResponse(
     val version: String,
     val service: String,
     val binaryHash: String? = null,
+    val instanceId: String? = null,
 )
 
 data class ProjectState(
@@ -27,6 +28,7 @@ data class ConfigResponse(
 
 data class AuthStatusResponse(
     val loggedIn: Boolean,
+    val expired: Boolean = false,
     val authPath: String,
     val userName: String?,
 )
@@ -35,11 +37,16 @@ data class LoginStartResponse(
     val loginId: String,
     val url: String,
     val expiresInSeconds: Int,
+    val daemonInstanceId: String? = null,
+    val protocolVersion: Int = 1,
 )
 
 data class LoginPollResponse(
     val status: String,
     val userName: String?,
+    val code: String? = null,
+    val message: String? = null,
+    val retryAfterMs: Int? = null,
 )
 
 data class ProviderInfo(

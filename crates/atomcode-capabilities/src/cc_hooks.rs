@@ -202,7 +202,9 @@ pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
 /// (`edit_*` still matches `edit_file`). Full regex (`.`, `[...]`, `()`) is NOT
 /// supported — such a matcher is treated literally and simply won't match.
 fn matches_tool(matcher: &Option<String>, tool_name: &str) -> bool {
-    let Some(pat) = matcher.as_deref() else { return true };
+    let Some(pat) = matcher.as_deref() else {
+        return true;
+    };
     if pat.is_empty() || pat == "*" {
         return true;
     }
@@ -263,7 +265,10 @@ fn shell_command(command: &str) -> tokio::process::Command {
 /// (b) tell a DELIBERATE exit-2 block from a hook that merely failed to launch (see
 /// [`deliberate_block_reason`]). The OUTER `None` (timeout / spawn-failure) → the
 /// caller treats it as a silent continue.
-async fn run_command_hook(hook: &HookConfig, stdin_json: &str) -> Option<(Option<i32>, String, String)> {
+async fn run_command_hook(
+    hook: &HookConfig,
+    stdin_json: &str,
+) -> Option<(Option<i32>, String, String)> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
@@ -304,7 +309,9 @@ async fn run_command_hook(hook: &HookConfig, stdin_json: &str) -> Option<(Option
         ))
     };
 
-    (tokio::time::timeout(Duration::from_millis(hook.timeout_ms), fut).await).ok().flatten()
+    (tokio::time::timeout(Duration::from_millis(hook.timeout_ms), fut).await)
+        .ok()
+        .flatten()
 }
 
 /// CC's exit-code contract: exit **2** (and only 2) requests a BLOCK — stop the tool
@@ -443,7 +450,10 @@ impl CCExternalHooks {
 
     /// Load user + project `hooks.json` for `project_dir`.
     pub fn load(project_dir: &Path) -> Self {
-        Self::new(load_hooks_config(project_dir), project_dir.to_string_lossy().into_owned())
+        Self::new(
+            load_hooks_config(project_dir),
+            project_dir.to_string_lossy().into_owned(),
+        )
     }
 
     /// Like [`load`](Self::load), but APPEND `extra` hooks the driver resolved out of band
@@ -474,7 +484,9 @@ impl CCExternalHooks {
     fn matching(&self, event: HookEvent, tool: Option<&str>) -> Vec<&HookConfig> {
         self.hooks
             .iter()
-            .filter(|h| h.event == event && tool.map(|t| matches_tool(&h.matcher, t)).unwrap_or(true))
+            .filter(|h| {
+                h.event == event && tool.map(|t| matches_tool(&h.matcher, t)).unwrap_or(true)
+            })
             .collect()
     }
 }
@@ -540,11 +552,11 @@ impl LifecycleHooks for CCExternalHooks {
             let Some((exit_code, stdout, stderr)) = out else {
                 continue; // timeout / spawn failure → silent continue.
             };
-            let decided = last_json_line(&stdout)
-                .and_then(|v| serde_json::from_value::<Decision>(v).ok());
+            let decided =
+                last_json_line(&stdout).and_then(|v| serde_json::from_value::<Decision>(v).ok());
             if let Some(d) = &decided {
-                let blocks = d.decision.as_deref() == Some("block")
-                    || d.action.as_deref() == Some("block");
+                let blocks =
+                    d.decision.as_deref() == Some("block") || d.action.as_deref() == Some("block");
                 if blocks {
                     return Err(d
                         .reason
@@ -611,11 +623,14 @@ impl CCExternalHooks {
         match request_approval_decision(rt, APPROVAL_KIND, call, &call.name).await {
             Err(degraded) => degraded, // Null → fail closed (shared channel-failure deny).
             Ok(PermissionDecision::AllowOnce | PermissionDecision::AllowAlways) => {
-                BeforeOutcome::Allow { reason: Some("approved (hook ask)".into()) }
+                BeforeOutcome::Allow {
+                    reason: Some("approved (hook ask)".into()),
+                }
             }
-            Ok(PermissionDecision::Deny) => {
-                BeforeOutcome::deny(format!("denied by approval prompt (hook ask): {}", call.name))
-            }
+            Ok(PermissionDecision::Deny) => BeforeOutcome::deny(format!(
+                "denied by approval prompt (hook ask): {}",
+                call.name
+            )),
         }
     }
 }
@@ -630,8 +645,8 @@ impl ToolMiddleware for CCExternalHooks {
     ) -> BeforeOutcome {
         // PreToolUse stdin: tool_input is the PARSED args object (CC sends an
         // object, not a string), falling back to the raw string if unparseable.
-        let tool_input: Value =
-            serde_json::from_str(&call.arguments).unwrap_or_else(|_| Value::String(call.arguments.clone()));
+        let tool_input: Value = serde_json::from_str(&call.arguments)
+            .unwrap_or_else(|_| Value::String(call.arguments.clone()));
         let payload = serde_json::json!({
             "session_id": self.session_id,
             "hook_event_name": HookEvent::PreToolUse.cc_name(),
@@ -651,8 +666,8 @@ impl ToolMiddleware for CCExternalHooks {
             let Some((exit_code, stdout, stderr)) = run_command_hook(hook, &payload).await else {
                 continue;
             };
-            let decided = last_json_line(&stdout)
-                .and_then(|v| serde_json::from_value::<Decision>(v).ok());
+            let decided =
+                last_json_line(&stdout).and_then(|v| serde_json::from_value::<Decision>(v).ok());
 
             // Apply an arg rewrite (CC updatedInput / atomcode modify).
             if let Some(d) = &decided {
@@ -755,19 +770,27 @@ impl ToolMiddleware for CCExternalHooks {
         // there is little to gain from the session_*-style concurrency here).
         let mut outcome = AfterOutcome::Proceed;
         for hook in self.hooks.iter().filter(|h| {
-            h.event == HookEvent::PostToolUse
-                && post_tool_matches(&h.matcher, tool_name.as_deref())
+            h.event == HookEvent::PostToolUse && post_tool_matches(&h.matcher, tool_name.as_deref())
         }) {
             let Some((_code, stdout, _stderr)) = run_command_hook(hook, &payload).await else {
                 continue;
             };
-            if let Some(d) = last_json_line(&stdout).and_then(|v| serde_json::from_value::<Decision>(v).ok()) {
-                if let Some(new_out) = d.hook_specific.as_ref().and_then(|hs| hs.updated_tool_output.clone()) {
+            if let Some(d) =
+                last_json_line(&stdout).and_then(|v| serde_json::from_value::<Decision>(v).ok())
+            {
+                if let Some(new_out) = d
+                    .hook_specific
+                    .as_ref()
+                    .and_then(|hs| hs.updated_tool_output.clone())
+                {
                     result.content = new_out;
                 }
                 if d.decision.as_deref() == Some("block") {
                     outcome = AfterOutcome::Block {
-                        reason: d.reason.clone().unwrap_or_else(|| "blocked by PostToolUse hook".into()),
+                        reason: d
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "blocked by PostToolUse hook".into()),
                     };
                 }
             }
@@ -801,8 +824,14 @@ mod tests {
     #[test]
     fn parse_event_both_spellings() {
         assert_eq!(HookEvent::parse("PreToolUse"), Some(HookEvent::PreToolUse));
-        assert_eq!(HookEvent::parse("pre_tool_use"), Some(HookEvent::PreToolUse));
-        assert_eq!(HookEvent::parse("UserPromptSubmit"), Some(HookEvent::UserPromptSubmit));
+        assert_eq!(
+            HookEvent::parse("pre_tool_use"),
+            Some(HookEvent::PreToolUse)
+        );
+        assert_eq!(
+            HookEvent::parse("UserPromptSubmit"),
+            Some(HookEvent::UserPromptSubmit)
+        );
         assert_eq!(HookEvent::parse("nonsense"), None);
     }
 
@@ -826,8 +855,14 @@ mod tests {
         // Whitespace around alternatives is tolerated.
         assert!(matches_tool(&Some("Edit | Write".into()), "Write"));
         // `*` is a wildcard anywhere, not just trailing.
-        assert!(matches_tool(&Some("mcp__github__*".into()), "mcp__github__get_issue"));
-        assert!(!matches_tool(&Some("mcp__github__*".into()), "mcp__gitlab__get_issue"));
+        assert!(matches_tool(
+            &Some("mcp__github__*".into()),
+            "mcp__github__get_issue"
+        ));
+        assert!(!matches_tool(
+            &Some("mcp__github__*".into()),
+            "mcp__gitlab__get_issue"
+        ));
         assert!(matches_tool(&Some("*_file".into()), "edit_file"));
         // Exact stays exact (no accidental substring match).
         assert!(!matches_tool(&Some("Edit".into()), "MultiEdit"));
@@ -849,9 +884,8 @@ mod tests {
         assert_eq!(h.plugin_root.as_deref(), Some(Path::new("/plugins/foo")));
 
         // Omitted timeout → default; legacy snake_case event still parses.
-        let h2 =
-            HookConfig::from_plugin_spec("post_tool_use", None, "x".into(), None, "/p".into())
-                .unwrap();
+        let h2 = HookConfig::from_plugin_spec("post_tool_use", None, "x".into(), None, "/p".into())
+            .unwrap();
         assert_eq!(h2.event, HookEvent::PostToolUse);
         assert_eq!(h2.timeout_ms, 10_000);
 
@@ -886,10 +920,15 @@ mod tests {
     fn decision_precedence_deny_beats_allow() {
         let d = stronger(
             BeforeOutcome::Allow { reason: None },
-            BeforeOutcome::Deny { reason: "no".into() },
+            BeforeOutcome::Deny {
+                reason: "no".into(),
+            },
         );
         assert!(d.is_deny());
-        let a = stronger(BeforeOutcome::Proceed, BeforeOutcome::Allow { reason: None });
+        let a = stronger(
+            BeforeOutcome::Proceed,
+            BeforeOutcome::Allow { reason: None },
+        );
         assert!(matches!(a, BeforeOutcome::Allow { .. }));
     }
 
@@ -900,7 +939,10 @@ mod tests {
         )
         .unwrap();
         let d: Decision = serde_json::from_value(v).unwrap();
-        assert_eq!(d.hook_specific.unwrap().permission_decision.as_deref(), Some("deny"));
+        assert_eq!(
+            d.hook_specific.unwrap().permission_decision.as_deref(),
+            Some("deny")
+        );
     }
 
     #[tokio::test]
@@ -917,7 +959,11 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
         let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
-        let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: "{}".into() };
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
         let out = cc.before(&mut call, &tool, &rt).await;
         assert!(out.is_deny(), "CC deny must block: {out:?}");
     }
@@ -942,9 +988,16 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(20)));
         let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
-        let mut call = ToolCall { id: "1".into(), name: "edit_file".into(), arguments: "{}".into() };
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "edit_file".into(),
+            arguments: "{}".into(),
+        };
         let out = cc.before(&mut call, &tool, &rt).await;
-        assert!(out.is_deny(), "hook ask with a silent driver must fail closed, not proceed: {out:?}");
+        assert!(
+            out.is_deny(),
+            "hook ask with a silent driver must fail closed, not proceed: {out:?}"
+        );
         let reason = out.deny_reason().unwrap();
         assert!(
             reason.contains("internal channel failure") && reason.contains("not a user"),
@@ -1007,9 +1060,16 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
         let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
-        let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: "{}".into() };
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
         let out = cc.before(&mut call, &tool, &rt).await;
-        assert!(matches!(out, BeforeOutcome::Proceed), "exit 1 must NOT block: {out:?}");
+        assert!(
+            matches!(out, BeforeOutcome::Proceed),
+            "exit 1 must NOT block: {out:?}"
+        );
     }
 
     async fn run_before(cmd: &str) -> BeforeOutcome {
@@ -1024,7 +1084,11 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
         let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
-        let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: "{}".into() };
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
         cc.before(&mut call, &tool, &rt).await
     }
 
@@ -1074,9 +1138,15 @@ mod tests {
         }
         // Reason on stderr (CC convention) is surfaced too.
         let out = run_before("echo DENIED-ON-STDERR >&2; exit 2").await;
-        assert!(out.is_deny(), "exit 2 with stderr reason must block: {out:?}");
+        assert!(
+            out.is_deny(),
+            "exit 2 with stderr reason must block: {out:?}"
+        );
         if let BeforeOutcome::Deny { reason } = out {
-            assert!(reason.contains("DENIED-ON-STDERR"), "stderr reason surfaced: {reason}");
+            assert!(
+                reason.contains("DENIED-ON-STDERR"),
+                "stderr reason surfaced: {reason}"
+            );
         }
     }
 
@@ -1086,7 +1156,10 @@ mod tests {
     #[tokio::test]
     async fn before_bare_exit_2_does_not_block() {
         let out = run_before("exit 2").await;
-        assert!(matches!(out, BeforeOutcome::Proceed), "bare exit 2 must NOT block: {out:?}");
+        assert!(
+            matches!(out, BeforeOutcome::Proceed),
+            "bare exit 2 must NOT block: {out:?}"
+        );
     }
 
     /// Exit 2 whose stderr is a command launch failure (the real incident: a plugin's
@@ -1094,8 +1167,14 @@ mod tests {
     /// "can't open file ..." and exits 2) is a broken hook → must NOT block.
     #[tokio::test]
     async fn before_launch_failure_exit_2_does_not_block() {
-        let out = run_before("echo \"can't open file '/x.py': [Errno 2] No such file or directory\" >&2; exit 2").await;
-        assert!(matches!(out, BeforeOutcome::Proceed), "launch-failure exit 2 must NOT block: {out:?}");
+        let out = run_before(
+            "echo \"can't open file '/x.py': [Errno 2] No such file or directory\" >&2; exit 2",
+        )
+        .await;
+        assert!(
+            matches!(out, BeforeOutcome::Proceed),
+            "launch-failure exit 2 must NOT block: {out:?}"
+        );
     }
 
     /// UserPromptSubmit mirrors `before`: a DELIBERATE exit 2 (with a reason) blocks the
@@ -1106,11 +1185,17 @@ mod tests {
         let mut text = "hi".to_string();
         let err = cc.user_prompt_submit(&mut text).await;
         assert!(err.is_err(), "deliberate exit 2 blocks the prompt");
-        assert!(err.unwrap_err().contains("BLOCKED"), "block reason is surfaced");
+        assert!(
+            err.unwrap_err().contains("BLOCKED"),
+            "block reason is surfaced"
+        );
 
         let cc = CCExternalHooks::new(vec![prompt_hook("exit 1")], "/tmp");
         let mut text = "hi".to_string();
-        assert!(cc.user_prompt_submit(&mut text).await.is_ok(), "exit 1 must NOT block");
+        assert!(
+            cc.user_prompt_submit(&mut text).await.is_ok(),
+            "exit 1 must NOT block"
+        );
         assert_eq!(text, "hi", "no stdout ⇒ prompt unchanged");
     }
 
@@ -1123,7 +1208,10 @@ mod tests {
         // Bare exit 2, no output.
         let cc = CCExternalHooks::new(vec![prompt_hook("exit 2")], "/tmp");
         let mut text = "hi".to_string();
-        assert!(cc.user_prompt_submit(&mut text).await.is_ok(), "bare exit 2 must NOT block");
+        assert!(
+            cc.user_prompt_submit(&mut text).await.is_ok(),
+            "bare exit 2 must NOT block"
+        );
         assert_eq!(text, "hi", "prompt unchanged");
 
         // Exit 2 with a python "can't open file" launch failure on stderr (the incident).
@@ -1151,10 +1239,19 @@ mod tests {
         assert!(deliberate_block_reason("", "").is_none());
         assert!(deliberate_block_reason("  ", " \n").is_none());
         // A real reason (stdout or stderr) → deliberate block, surfaced verbatim.
-        assert_eq!(deliberate_block_reason("nope, blocked", "").as_deref(), Some("nope, blocked"));
-        assert_eq!(deliberate_block_reason("", "policy: denied").as_deref(), Some("policy: denied"));
+        assert_eq!(
+            deliberate_block_reason("nope, blocked", "").as_deref(),
+            Some("nope, blocked")
+        );
+        assert_eq!(
+            deliberate_block_reason("", "policy: denied").as_deref(),
+            Some("policy: denied")
+        );
         // stdout wins over stderr when both present.
-        assert_eq!(deliberate_block_reason("from-out", "from-err").as_deref(), Some("from-out"));
+        assert_eq!(
+            deliberate_block_reason("from-out", "from-err").as_deref(),
+            Some("from-out")
+        );
     }
 
     #[test]
@@ -1186,18 +1283,42 @@ mod tests {
         let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
 
         // before() records call_id "1" → "bash"; after() then matches matcher "bash".
-        let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: "{}".into() };
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
         let _ = cc.before(&mut call, &tool, &rt).await;
-        let mut result = ToolResult { call_id: "1".into(), content: "orig".into(), is_error: false, images: vec![] };
+        let mut result = ToolResult {
+            call_id: "1".into(),
+            content: "orig".into(),
+            is_error: false,
+            images: vec![],
+        };
         cc.after(&mut result).await;
-        assert_eq!(result.content, "REWRITTEN", "matcher 'bash' must fire for tool bash");
+        assert_eq!(
+            result.content, "REWRITTEN",
+            "matcher 'bash' must fire for tool bash"
+        );
 
         // A different tool ("grep") does NOT match matcher "bash" → output untouched.
-        let mut call = ToolCall { id: "2".into(), name: "grep".into(), arguments: "{}".into() };
+        let mut call = ToolCall {
+            id: "2".into(),
+            name: "grep".into(),
+            arguments: "{}".into(),
+        };
         let _ = cc.before(&mut call, &tool, &rt).await;
-        let mut result = ToolResult { call_id: "2".into(), content: "orig".into(), is_error: false, images: vec![] };
+        let mut result = ToolResult {
+            call_id: "2".into(),
+            content: "orig".into(),
+            is_error: false,
+            images: vec![],
+        };
         cc.after(&mut result).await;
-        assert_eq!(result.content, "orig", "matcher 'bash' must NOT fire for tool grep");
+        assert_eq!(
+            result.content, "orig",
+            "matcher 'bash' must NOT fire for tool grep"
+        );
     }
 
     /// F4: the configured session_id is threaded into the CC payload (the hook greps its
@@ -1214,7 +1335,10 @@ mod tests {
         let cc = CCExternalHooks::new(vec![hook], "/tmp").with_session_id("sess-xyz");
         let mut text = "hi".to_string();
         assert!(cc.user_prompt_submit(&mut text).await.is_ok());
-        assert!(text.contains("MATCHED"), "session_id must reach the payload: {text}");
+        assert!(
+            text.contains("MATCHED"),
+            "session_id must reach the payload: {text}"
+        );
     }
 
     fn prompt_hook(cmd: &str) -> HookConfig {
@@ -1233,7 +1357,10 @@ mod tests {
     /// structurally by `join_all`, not asserted via flaky wall-clock timing.
     #[tokio::test]
     async fn user_prompt_aggregates_multiple_hooks_in_order() {
-        let cc = CCExternalHooks::new(vec![prompt_hook("echo AAA"), prompt_hook("echo BBB")], "/tmp");
+        let cc = CCExternalHooks::new(
+            vec![prompt_hook("echo AAA"), prompt_hook("echo BBB")],
+            "/tmp",
+        );
         let mut text = "hi".to_string();
         cc.user_prompt_submit(&mut text).await.unwrap();
         let (a, b) = (text.find("AAA"), text.find("BBB"));

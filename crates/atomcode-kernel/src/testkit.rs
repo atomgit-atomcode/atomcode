@@ -4,21 +4,19 @@ use crate::agent::{Agent, AutoRespond};
 use crate::event::AgentCommand;
 use crate::event::StopReason;
 use crate::hook::{LifecycleHooks, RateLimitDecision, RateLimitHint, TurnCtx};
-use crate::tool::MountedTools;
-use crate::message::{
-    CompactionPlan, CompactionStrategy, CompactionView, Conversation, Message,
-};
+use crate::message::{CompactionPlan, CompactionStrategy, CompactionView, Conversation, Message};
 use crate::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use crate::provider::{ChatOptions, LlmProvider};
 use crate::request::RequestCtx;
 use crate::stream::{ProviderError, StreamEvent};
+use crate::tool::MountedTools;
 use crate::tool::{RiskLevel, Tool, ToolCall, ToolContext, ToolDef, ToolResult};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -64,8 +62,10 @@ impl LlmProvider for MockProvider {
         _tools: &[ToolDef],
         _options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
-        let snapshot: Vec<(String, String)> =
-            messages.iter().map(|m| (format!("{:?}", m.role), m.text.clone())).collect();
+        let snapshot: Vec<(String, String)> = messages
+            .iter()
+            .map(|m| (format!("{:?}", m.role), m.text.clone()))
+            .collect();
         self.received.lock().unwrap().push(snapshot);
         let events = self
             .turns
@@ -88,11 +88,17 @@ pub struct ScriptedProvider {
 impl ScriptedProvider {
     /// `chat_stream` returns `Err(e)` — a failed open.
     pub fn open_error(e: ProviderError) -> Self {
-        Self { open_error: Some(e), events: Mutex::new(None) }
+        Self {
+            open_error: Some(e),
+            events: Mutex::new(None),
+        }
     }
     /// `chat_stream` opens OK and yields `events` once.
     pub fn events(events: Vec<StreamEvent>) -> Self {
-        Self { open_error: None, events: Mutex::new(Some(events)) }
+        Self {
+            open_error: None,
+            events: Mutex::new(Some(events)),
+        }
     }
 }
 
@@ -201,7 +207,12 @@ impl RecordingProvider {
     /// Just the `ChatOptions` received on each call, in call order — convenience
     /// for tests that only assert which options reached the provider.
     pub fn recorded_options(&self) -> Vec<ChatOptions> {
-        self.calls.lock().unwrap().iter().map(|(_, _, o)| o.clone()).collect()
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, o)| o.clone())
+            .collect()
     }
 }
 
@@ -219,7 +230,10 @@ impl LlmProvider for RecordingProvider {
         tools: &[ToolDef],
         options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
-        self.calls.lock().unwrap().push((messages.to_vec(), tools.to_vec(), options.clone()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((messages.to_vec(), tools.to_vec(), options.clone()));
         let events = self
             .turns
             .lock()
@@ -249,7 +263,9 @@ impl SilentStreamProvider {
     /// e.g. `vec![StreamEvent::TextDelta("hi".into())]` to go silent AFTER some
     /// output (bounds inter-token latency).
     pub fn new(prefix: Vec<StreamEvent>) -> Self {
-        Self { prefix: Mutex::new(Some(prefix)) }
+        Self {
+            prefix: Mutex::new(Some(prefix)),
+        }
     }
 }
 
@@ -312,13 +328,22 @@ pub struct EchoTool;
 
 #[async_trait]
 impl Tool for EchoTool {
-    fn name(&self) -> &str { "echo" }
-    fn description(&self) -> &str { "Echo the arguments back" }
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn description(&self) -> &str {
+        "Echo the arguments back"
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}})
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: format!("echo: {args}"), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: format!("echo: {args}"),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -339,14 +364,23 @@ impl CountingTool {
 
 #[async_trait]
 impl Tool for CountingTool {
-    fn name(&self) -> &str { "count" }
-    fn description(&self) -> &str { "Increments a shared counter each time it executes" }
+    fn name(&self) -> &str {
+        "count"
+    }
+    fn description(&self) -> &str {
+        "Increments a shared counter each time it executes"
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {"k": {"type": "string"}}})
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
-        ToolResult { call_id: String::new(), content: format!("count#{n} args={args}"), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: format!("count#{n} args={args}"),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -371,14 +405,22 @@ pub struct InjectCommandTool {
 
 impl InjectCommandTool {
     pub fn new(commands: DeferredCommands, to_send: AgentCommand) -> Self {
-        Self { commands, to_send: Mutex::new(Some(to_send)), fired: AtomicBool::new(false) }
+        Self {
+            commands,
+            to_send: Mutex::new(Some(to_send)),
+            fired: AtomicBool::new(false),
+        }
     }
 }
 
 #[async_trait]
 impl Tool for InjectCommandTool {
-    fn name(&self) -> &str { "inject" }
-    fn description(&self) -> &str { "Injects a pre-configured AgentCommand mid-turn (test only)" }
+    fn name(&self) -> &str {
+        "inject"
+    }
+    fn description(&self) -> &str {
+        "Injects a pre-configured AgentCommand mid-turn (test only)"
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {}})
     }
@@ -398,7 +440,12 @@ impl Tool for InjectCommandTool {
                 tokio::task::yield_now().await;
             }
         }
-        ToolResult { call_id: String::new(), content: "injected".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "injected".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -407,8 +454,12 @@ pub struct RiskyWriteTool;
 
 #[async_trait]
 impl Tool for RiskyWriteTool {
-    fn name(&self) -> &str { "risky_write" }
-    fn description(&self) -> &str { "Pretend to write a file (risky)" }
+    fn name(&self) -> &str {
+        "risky_write"
+    }
+    fn description(&self) -> &str {
+        "Pretend to write a file (risky)"
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}})
     }
@@ -416,7 +467,12 @@ impl Tool for RiskyWriteTool {
         RiskLevel::Risky
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: format!("wrote: {args}"), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: format!("wrote: {args}"),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -428,7 +484,9 @@ pub struct ContinueOnceHook {
 
 impl ContinueOnceHook {
     pub fn new() -> Self {
-        Self { used: AtomicBool::new(false) }
+        Self {
+            used: AtomicBool::new(false),
+        }
     }
 }
 
@@ -459,7 +517,9 @@ pub struct ApprovalMiddleware {
 
 impl ApprovalMiddleware {
     pub fn new() -> Self {
-        Self { granted: Arc::new(Mutex::new(HashSet::new())) }
+        Self {
+            granted: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
     fn grant_key(call: &ToolCall) -> String {
         format!("{}::{}", call.name, call.arguments)
@@ -515,7 +575,9 @@ pub struct RecorderHook {
 
 impl RecorderHook {
     pub fn new() -> Self {
-        Self { log: Arc::new(Mutex::new(Vec::new())) }
+        Self {
+            log: Arc::new(Mutex::new(Vec::new())),
+        }
     }
     fn record(&self, name: &str) {
         self.log.lock().unwrap().push(name.to_string());
@@ -530,18 +592,50 @@ impl Default for RecorderHook {
 
 #[async_trait]
 impl LifecycleHooks for RecorderHook {
-    async fn session_start(&self, _convo: &mut Conversation, _resumed: bool) { self.record("session_start"); }
-    async fn user_prompt_submit(&self, _text: &mut String) -> Result<(), String> { self.record("user_prompt_submit"); Ok(()) }
-    async fn turn_start(&self, _convo: &mut Conversation) { self.record("turn_start"); }
-    async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) { self.record("pre_request"); }
-    async fn on_request(&self, _messages: &[Message], _tools: &[ToolDef], _options: &ChatOptions, _ctx: &TurnCtx) { self.record("on_request"); }
-    async fn on_text_delta(&self, _delta: &mut String) { self.record("on_text_delta"); }
-    async fn on_reasoning_delta(&self, _delta: &mut String) { self.record("on_reasoning_delta"); }
-    async fn on_model_response(&self, _response: &mut Message) { self.record("on_model_response"); }
-    async fn offer_continuation(&self, _convo: &Conversation) -> Option<String> { self.record("offer_continuation"); None }
-    async fn turn_complete(&self, _convo: &Conversation, _reason: &StopReason, _ctx: &TurnCtx) { self.record("turn_complete"); }
-    async fn on_error(&self, _error: &str) { self.record("on_error"); }
-    async fn session_end(&self, _convo: &Conversation) { self.record("session_end"); }
+    async fn session_start(&self, _convo: &mut Conversation, _resumed: bool) {
+        self.record("session_start");
+    }
+    async fn user_prompt_submit(&self, _text: &mut String) -> Result<(), String> {
+        self.record("user_prompt_submit");
+        Ok(())
+    }
+    async fn turn_start(&self, _convo: &mut Conversation) {
+        self.record("turn_start");
+    }
+    async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) {
+        self.record("pre_request");
+    }
+    async fn on_request(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+        _ctx: &TurnCtx,
+    ) {
+        self.record("on_request");
+    }
+    async fn on_text_delta(&self, _delta: &mut String) {
+        self.record("on_text_delta");
+    }
+    async fn on_reasoning_delta(&self, _delta: &mut String) {
+        self.record("on_reasoning_delta");
+    }
+    async fn on_model_response(&self, _response: &mut Message) {
+        self.record("on_model_response");
+    }
+    async fn offer_continuation(&self, _convo: &Conversation) -> Option<String> {
+        self.record("offer_continuation");
+        None
+    }
+    async fn turn_complete(&self, _convo: &Conversation, _reason: &StopReason, _ctx: &TurnCtx) {
+        self.record("turn_complete");
+    }
+    async fn on_error(&self, _error: &str) {
+        self.record("on_error");
+    }
+    async fn session_end(&self, _convo: &Conversation) {
+        self.record("session_end");
+    }
 }
 
 /// Projects current context-utilization back into the request as a TAIL reminder
@@ -553,7 +647,10 @@ pub struct BudgetReminderHook;
 #[async_trait]
 impl LifecycleHooks for BudgetReminderHook {
     async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
-        let util = messages.iter().rev().find_map(|m| m.meta.as_ref().map(|x| x.utilization));
+        let util = messages
+            .iter()
+            .rev()
+            .find_map(|m| m.meta.as_ref().map(|x| x.utilization));
         if let Some(u) = util {
             messages.push(Message::user(format!("[ctx {:.0}%]", u * 100.0)));
         }
@@ -616,7 +713,12 @@ impl Tool for DangerousBashTool {
         }
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: format!("ran: {args}"), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: format!("ran: {args}"),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -694,18 +796,27 @@ pub struct MarkerHook {
 
 impl MarkerHook {
     pub fn new(marker: impl Into<String>, log: Arc<Mutex<Vec<String>>>) -> Self {
-        Self { marker: marker.into(), log }
+        Self {
+            marker: marker.into(),
+            log,
+        }
     }
 }
 
 #[async_trait]
 impl LifecycleHooks for MarkerHook {
     async fn session_start(&self, convo: &mut Conversation, _resumed: bool) {
-        self.log.lock().unwrap().push(format!("session_start:{}", self.marker));
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("session_start:{}", self.marker));
         convo.push(Message::system(format!("[{}]", self.marker)));
     }
     async fn turn_start(&self, convo: &mut Conversation) {
-        self.log.lock().unwrap().push(format!("turn_start:{}", self.marker));
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("turn_start:{}", self.marker));
         convo.push(Message::system(format!("[{}]", self.marker)));
     }
 }
@@ -740,8 +851,16 @@ pub struct RewritePromptHook {
 }
 
 impl RewritePromptHook {
-    pub fn new(name: impl Into<String>, suffix: impl Into<String>, log: Arc<Mutex<Vec<String>>>) -> Self {
-        Self { name: name.into(), suffix: suffix.into(), log }
+    pub fn new(
+        name: impl Into<String>,
+        suffix: impl Into<String>,
+        log: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            suffix: suffix.into(),
+            log,
+        }
     }
 }
 
@@ -763,8 +882,16 @@ pub struct BlockingPromptHook {
 }
 
 impl BlockingPromptHook {
-    pub fn new(name: impl Into<String>, reason: impl Into<String>, log: Arc<Mutex<Vec<String>>>) -> Self {
-        Self { name: name.into(), reason: reason.into(), log }
+    pub fn new(
+        name: impl Into<String>,
+        reason: impl Into<String>,
+        log: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            reason: reason.into(),
+            log,
+        }
     }
 }
 
@@ -787,8 +914,16 @@ pub struct ObservingTurnEndHook {
 }
 
 impl ObservingTurnEndHook {
-    pub fn new(name: impl Into<String>, reply: Option<String>, log: Arc<Mutex<Vec<String>>>) -> Self {
-        Self { name: name.into(), reply, log }
+    pub fn new(
+        name: impl Into<String>,
+        reply: Option<String>,
+        log: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            reply,
+            log,
+        }
     }
 }
 
@@ -886,7 +1021,13 @@ impl CompactionStrategy for StubToolResultsStrategy {
             .iter()
             .map(|&i| (i, "[elided]".to_string()))
             .collect();
-        CompactionPlan { drain_from: 0, drain_to: 0, summary: None, rewrites, resume_note: None }
+        CompactionPlan {
+            drain_from: 0,
+            drain_to: 0,
+            summary: None,
+            rewrites,
+            resume_note: None,
+        }
     }
 }
 
@@ -1011,13 +1152,12 @@ impl Tool for SubAgentTool {
         // `.cancel_token(ctx.cancel.child_token())` wired above. (`run_to_completion`
         // already spawns the child SESSION detached; spawning the DRIVER here too
         // makes the whole child genuinely independent of the parent tool future.)
-        let outcome = tokio::spawn(async move {
-            child.run_to_completion(task, AutoRespond::AllowAll).await
-        })
-        .await
-        // A child run task should not itself panic; if it did (or was aborted),
-        // surface a failure outcome rather than unwrapping.
-        .unwrap_or_default();
+        let outcome =
+            tokio::spawn(async move { child.run_to_completion(task, AutoRespond::AllowAll).await })
+                .await
+                // A child run task should not itself panic; if it did (or was aborted),
+                // surface a failure outcome rather than unwrapping.
+                .unwrap_or_default();
         // Surface the child's work as this tool's content. Prefer the child's
         // assistant text; if it produced none (a tool-only child, e.g. a probe),
         // fall back to its tool-result contents so the child's actual output still
@@ -1039,7 +1179,12 @@ impl Tool for SubAgentTool {
         } else {
             // Tool-only child (e.g. a probe): fall back to its tool-result contents
             // so the child's actual output still flows back up.
-            outcome.tool_results.iter().map(|r| r.content.clone()).collect::<Vec<_>>().join("\n")
+            outcome
+                .tool_results
+                .iter()
+                .map(|r| r.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
         };
         ToolResult {
             // call_id is set by the kernel after execute returns.
@@ -1162,7 +1307,9 @@ impl DeferredSteerProvider {
         turns: Vec<Vec<StreamEvent>>,
         inject_on_call: usize,
         inject_text: impl Into<String>,
-        inject_cmd: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::event::AgentCommand>>>>,
+        inject_cmd: Arc<
+            Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::event::AgentCommand>>>,
+        >,
     ) -> Self {
         Self {
             inner: MockProvider::new(turns),
@@ -1180,15 +1327,22 @@ impl DeferredSteerProvider {
 
 #[async_trait]
 impl LlmProvider for DeferredSteerProvider {
-    fn model_name(&self) -> &str { "deferred-steer" }
-    fn context_window(&self) -> u32 { 0 }
+    fn model_name(&self) -> &str {
+        "deferred-steer"
+    }
+    fn context_window(&self) -> u32 {
+        0
+    }
     async fn chat_stream(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
         options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
-        let call_n = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let call_n = self
+            .call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         if call_n == self.inject_on_call {
             // Inject steer into the driver's cmd_rx. The steer is now in the channel
             // and will be processed into steer.lock() at the next driver select! poll.
@@ -1226,13 +1380,22 @@ pub struct NoopTool;
 
 #[async_trait]
 impl Tool for NoopTool {
-    fn name(&self) -> &str { "noop" }
-    fn description(&self) -> &str { "Does nothing and returns Ok" }
+    fn name(&self) -> &str {
+        "noop"
+    }
+    fn description(&self) -> &str {
+        "Does nothing and returns Ok"
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {}})
     }
     async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "noop".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "noop".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -1326,7 +1489,10 @@ mod tests {
     async fn scripted_rate_limit_hook_returns_programmed_decision() {
         let hook = ScriptedRateLimitHook::new(RateLimitDecision::WaitAndRetry { secs: 7 });
         let got = hook
-            .on_rate_limit(&RateLimitHint { http_status: Some(429), retry_after_secs: None })
+            .on_rate_limit(&RateLimitHint {
+                http_status: Some(429),
+                retry_after_secs: None,
+            })
             .await;
         assert_eq!(got, Some(RateLimitDecision::WaitAndRetry { secs: 7 }));
     }

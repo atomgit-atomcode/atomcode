@@ -148,7 +148,10 @@ fn plugin_all_cc_hooks(assets: &InstalledPluginAssets) -> Vec<PluginCcHook> {
     if let Some(cc_map) = assets.manifest.inline_cc_hooks() {
         hooks.extend(expand_cc_hooks(cc_map, &assets.plugin_dir));
     }
-    hooks.extend(plugin_file_cc_hooks_for(&assets.plugin_dir, &assets.manifest));
+    hooks.extend(plugin_file_cc_hooks_for(
+        &assets.plugin_dir,
+        &assets.manifest,
+    ));
     dedup_hooks(hooks)
 }
 
@@ -262,7 +265,8 @@ pub fn iter_installed_plugin_assets() -> Vec<InstalledPluginAssets> {
                             }
                             let mut manifest = load_plugin_manifest(&abs).unwrap_or_default();
                             if manifest.skills.is_none() && abs.join("SKILL.md").exists() {
-                                manifest.skills = Some(super::manifest::PathOrList::One("./".into()));
+                                manifest.skills =
+                                    Some(super::manifest::PathOrList::One("./".into()));
                             }
                             result.push(InstalledPluginAssets {
                                 plugin: e.plugin,
@@ -298,7 +302,8 @@ mod tests {
         std::fs::write(
             dir.join("hooks/hooks.json"),
             r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let hooks = plugin_file_cc_hooks(dir);
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0].event, "SessionStart");
@@ -312,7 +317,8 @@ mod tests {
         std::fs::write(
             tmp.path().join("hooks.json"),
             r#"{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"c"}]}]}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let hooks = plugin_file_cc_hooks(tmp.path());
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0].event, "PreToolUse");
@@ -330,8 +336,13 @@ mod tests {
 
     #[test]
     fn dedup_hooks_drops_identical_event_matcher_command() {
-        let mk = |c: &str| PluginCcHook { event: "SessionStart".into(), matcher: None,
-            command: c.into(), timeout_secs: None, plugin_root: PathBuf::from("/x") };
+        let mk = |c: &str| PluginCcHook {
+            event: "SessionStart".into(),
+            matcher: None,
+            command: c.into(),
+            timeout_secs: None,
+            plugin_root: PathBuf::from("/x"),
+        };
         let out = dedup_hooks(vec![mk("a"), mk("a"), mk("b")]);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].command, "a");
@@ -345,19 +356,29 @@ mod tests {
         std::fs::create_dir_all(dir.join("cfg")).unwrap();
         std::fs::write(dir.join("cfg/h.json"), "{ not json").unwrap();
         std::fs::create_dir_all(dir.join("hooks")).unwrap();
-        std::fs::write(dir.join("hooks/hooks.json"),
-            r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo default"}]}]}"#).unwrap();
+        std::fs::write(
+            dir.join("hooks/hooks.json"),
+            r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo default"}]}]}"#,
+        )
+        .unwrap();
         let manifest: crate::plugin::manifest::PluginManifest =
             serde_json::from_str(r#"{"name":"p","hooks":"cfg/h.json"}"#).unwrap();
         let hooks = plugin_file_cc_hooks_for(dir, &manifest);
-        assert!(hooks.is_empty(), "malformed declared path must not fall back to default drill");
+        assert!(
+            hooks.is_empty(),
+            "malformed declared path must not fall back to default drill"
+        );
     }
 
     #[test]
     fn dedup_collapses_none_and_empty_matcher() {
-        let mk = |m: Option<&str>| PluginCcHook { event: "SessionStart".into(),
-            matcher: m.map(|s| s.into()), command: "c".into(), timeout_secs: None,
-            plugin_root: std::path::PathBuf::from("/x") };
+        let mk = |m: Option<&str>| PluginCcHook {
+            event: "SessionStart".into(),
+            matcher: m.map(|s| s.into()),
+            command: "c".into(),
+            timeout_secs: None,
+            plugin_root: std::path::PathBuf::from("/x"),
+        };
         let out = dedup_hooks(vec![mk(None), mk(Some(""))]);
         assert_eq!(out.len(), 1);
     }
@@ -366,17 +387,37 @@ mod tests {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join(name);
         std::fs::create_dir_all(&repo).unwrap();
-        Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["config", "user.name", "t"]).current_dir(&repo).status().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
         std::fs::create_dir_all(repo.join("skills/foo")).unwrap();
         std::fs::write(
             repo.join("skills/foo/SKILL.md"),
             "---\nname: foo\ndescription: f\n---\nbody",
         )
         .unwrap();
-        Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo).status().unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
         repo
     }
 
@@ -402,20 +443,48 @@ mod tests {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join("hp");
         std::fs::create_dir_all(repo.join("hooks")).unwrap();
-        std::fs::write(repo.join("hooks/hooks.json"),
-            r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]}"#).unwrap();
-        for a in [["init","-q"].as_slice()] { std::process::Command::new("git").args(a).current_dir(&repo).status().unwrap(); }
-        std::process::Command::new("git").args(["config","user.email","t@t"]).current_dir(&repo).status().unwrap();
-        std::process::Command::new("git").args(["config","user.name","t"]).current_dir(&repo).status().unwrap();
-        std::process::Command::new("git").args(["add","-A"]).current_dir(&repo).status().unwrap();
-        std::process::Command::new("git").args(["commit","-q","-m","i"]).current_dir(&repo).status().unwrap();
+        std::fs::write(
+            repo.join("hooks/hooks.json"),
+            r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]}"#,
+        )
+        .unwrap();
+        for a in [["init", "-q"].as_slice()] {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+        }
+        std::process::Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "i"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
         crate::plugin::marketplace::add_marketplace(&format!("file://{}", repo.display())).unwrap();
         crate::plugin::installer::install("hp", "hp", InstallScope::User).unwrap();
 
         // Untrusted by default → no hooks loaded, but status reports it.
         assert!(installed_plugin_cc_hooks().is_empty());
         let status = installed_plugin_hook_trust_status();
-        let e = status.iter().find(|s| s.plugin == "hp").expect("status entry");
+        let e = status
+            .iter()
+            .find(|s| s.plugin == "hp")
+            .expect("status entry");
         assert_eq!(e.hook_count, 1);
         assert!(!e.trusted);
         assert_eq!(e.events, vec!["SessionStart".to_string()]);
@@ -435,30 +504,58 @@ mod tests {
             let work = tempfile::tempdir().unwrap().keep();
             let repo = work.join(name);
             std::fs::create_dir_all(repo.join("hooks")).unwrap();
-            std::fs::write(repo.join("hooks/hooks.json"),
-                format!(r#"{{"SessionStart":[{{"hooks":[{{"type":"command","command":"{cmd}"}}]}}]}}"#)).unwrap();
-            for args in [["init","-q"].as_slice(), &["config","user.email","t@t"], &["config","user.name","t"], &["add","-A"], &["commit","-q","-m","i"]] {
-                std::process::Command::new("git").args(args).current_dir(&repo).status().unwrap();
+            std::fs::write(
+                repo.join("hooks/hooks.json"),
+                format!(
+                    r#"{{"SessionStart":[{{"hooks":[{{"type":"command","command":"{cmd}"}}]}}]}}"#
+                ),
+            )
+            .unwrap();
+            for args in [
+                ["init", "-q"].as_slice(),
+                &["config", "user.email", "t@t"],
+                &["config", "user.name", "t"],
+                &["add", "-A"],
+                &["commit", "-q", "-m", "i"],
+            ] {
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .status()
+                    .unwrap();
             }
             repo
         };
         // Existing plugin installed BEFORE migration.
         let repo1 = mk_hook_repo("hp1", "echo one");
-        crate::plugin::marketplace::add_marketplace(&format!("file://{}", repo1.display())).unwrap();
+        crate::plugin::marketplace::add_marketplace(&format!("file://{}", repo1.display()))
+            .unwrap();
         crate::plugin::installer::install("hp1", "hp1", InstallScope::User).unwrap();
-        assert!(installed_plugin_cc_hooks().is_empty(), "untrusted before migration");
+        assert!(
+            installed_plugin_cc_hooks().is_empty(),
+            "untrusted before migration"
+        );
 
         // Upgrade boundary → grandfather blesses the existing plugin.
         ensure_migrated();
-        assert_eq!(installed_plugin_cc_hooks().len(), 1, "existing plugin grandfathered");
+        assert_eq!(
+            installed_plugin_cc_hooks().len(),
+            1,
+            "existing plugin grandfathered"
+        );
 
         // A NEW plugin installed AFTER migration stays untrusted (marker set).
         let repo2 = mk_hook_repo("hp2", "echo two");
-        crate::plugin::marketplace::add_marketplace(&format!("file://{}", repo2.display())).unwrap();
+        crate::plugin::marketplace::add_marketplace(&format!("file://{}", repo2.display()))
+            .unwrap();
         crate::plugin::installer::install("hp2", "hp2", InstallScope::User).unwrap();
         ensure_migrated(); // idempotent no-op (marker exists)
         let loaded = installed_plugin_cc_hooks();
-        assert_eq!(loaded.len(), 1, "new post-migration plugin NOT auto-trusted");
+        assert_eq!(
+            loaded.len(),
+            1,
+            "new post-migration plugin NOT auto-trusted"
+        );
         assert!(loaded.iter().all(|h| h.command == "echo one"));
     }
 
@@ -469,11 +566,28 @@ mod tests {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join("cp");
         std::fs::create_dir_all(repo.join("cfg")).unwrap();
-        std::fs::write(repo.join("plugin.json"), r#"{"name":"cp","hooks":"cfg/h.json"}"#).unwrap();
-        std::fs::write(repo.join("cfg/h.json"),
-            r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo custom"}]}]}"#).unwrap();
-        for args in [["init","-q"].as_slice(), &["config","user.email","t@t"], &["config","user.name","t"], &["add","-A"], &["commit","-q","-m","i"]] {
-            std::process::Command::new("git").args(args).current_dir(&repo).status().unwrap();
+        std::fs::write(
+            repo.join("plugin.json"),
+            r#"{"name":"cp","hooks":"cfg/h.json"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("cfg/h.json"),
+            r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo custom"}]}]}"#,
+        )
+        .unwrap();
+        for args in [
+            ["init", "-q"].as_slice(),
+            &["config", "user.email", "t@t"],
+            &["config", "user.name", "t"],
+            &["add", "-A"],
+            &["commit", "-q", "-m", "i"],
+        ] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap();
         }
         crate::plugin::marketplace::add_marketplace(&format!("file://{}", repo.display())).unwrap();
         crate::plugin::installer::install("cp", "cp", InstallScope::User).unwrap();
@@ -491,8 +605,14 @@ mod tests {
         let assets = iter_installed_plugin_assets();
         eprintln!("=== DEBUG: {} installed plugin assets ===", assets.len());
         for a in &assets {
-            eprintln!("  plugin={} marketplace={} plugin_dir={:?} skills_path={:?} skills_dirs={:?}",
-                a.plugin, a.marketplace, a.plugin_dir, a.manifest.skills_path(), a.skills_dirs());
+            eprintln!(
+                "  plugin={} marketplace={} plugin_dir={:?} skills_path={:?} skills_dirs={:?}",
+                a.plugin,
+                a.marketplace,
+                a.plugin_dir,
+                a.manifest.skills_path(),
+                a.skills_dirs()
+            );
             for sd in a.skills_dirs() {
                 eprintln!("    skills_dir {:?} exists={}", sd, sd.exists());
                 if sd.is_dir() {
@@ -501,10 +621,16 @@ mod tests {
                         let name = p.file_name().unwrap().to_string_lossy();
                         let is_dir = p.is_dir();
                         let has_skill_md = p.join("SKILL.md").exists();
-                        eprintln!("      {} is_dir={} has_skill_md={}", name, is_dir, has_skill_md);
+                        eprintln!(
+                            "      {} is_dir={} has_skill_md={}",
+                            name, is_dir, has_skill_md
+                        );
                         if is_dir && has_skill_md {
                             let content = std::fs::read_to_string(p.join("SKILL.md")).unwrap();
-                            eprintln!("        SKILL.md first 100 chars: {:?}", &content.chars().take(100).collect::<String>());
+                            eprintln!(
+                                "        SKILL.md first 100 chars: {:?}",
+                                &content.chars().take(100).collect::<String>()
+                            );
                             // Try parsing just this one skill
                             let mut tmp_reg = crate::skills::SkillRegistry::new();
                             tmp_reg.load_dir(&sd, Some("__test__"));
@@ -518,7 +644,11 @@ mod tests {
         let skills = reg.list();
         eprintln!("=== DEBUG: {} skills loaded ===", skills.len());
         for (name, description) in &skills {
-            eprintln!("  SKILL: {} - {}", name, description.chars().take(60).collect::<String>());
+            eprintln!(
+                "  SKILL: {} - {}",
+                name,
+                description.chars().take(60).collect::<String>()
+            );
         }
     }
 }

@@ -548,7 +548,10 @@ fn default_notification_min_duration_secs() -> u64 {
 /// any other env value enables; `None` ⇒ use the config value.
 fn ai_session_naming_from_parts(env_val: Option<&str>, config_val: bool) -> bool {
     match env_val {
-        Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
         None => config_val,
     }
 }
@@ -666,7 +669,9 @@ fn render_network_section(cfg: &NetworkConfig) -> String {
     let mut out = String::new();
     out.push_str("\n# Network proxy policy shared by all outbound HTTP clients.\n");
     out.push_str("# Modes:\n");
-    out.push_str("# - follow_system  -> follow the launch environment / system proxy state (default)\n");
+    out.push_str(
+        "# - follow_system  -> follow the launch environment / system proxy state (default)\n",
+    );
     out.push_str(
         "# - default_proxy  -> pin the proxy values below and reuse them on future launches\n",
     );
@@ -844,9 +849,7 @@ impl Config {
                 .keys()
                 .min()
                 .map(String::as_str)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("No providers configured — run /login or /provider")
-                })
+                .ok_or_else(|| anyhow::anyhow!("No providers configured — run /login or /provider"))
         };
         let name: &str = if name.is_empty() { fallback()? } else { name };
         match self.providers.get(name) {
@@ -916,9 +919,7 @@ impl Config {
         // provider — and because it exists, onboarding won't fire, so there's no
         // recovery hint. Reject it here so we fall back to onboarding instead.
         if seed.default_provider.is_empty() {
-            return SeedOutcome::Invalid(
-                "seed config has no default_provider set".to_string(),
-            );
+            return SeedOutcome::Invalid("seed config has no default_provider set".to_string());
         }
         if !seed.providers.contains_key(&seed.default_provider) {
             return SeedOutcome::Invalid(format!(
@@ -1058,8 +1059,7 @@ mod tests {
     fn seed_missing_source_file_is_invalid_not_panic() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("config.toml");
-        let outcome =
-            Config::seed_user_config(&target, Some(&dir.path().join("nope.toml")));
+        let outcome = Config::seed_user_config(&target, Some(&dir.path().join("nope.toml")));
         assert!(matches!(outcome, SeedOutcome::Invalid(_)));
         assert!(!target.exists());
     }
@@ -1146,7 +1146,7 @@ mod tests {
     fn ui_todo_env_off_overrides() {
         assert!(!super::todo_enabled_from_env(Some("0"), true));
         assert!(super::todo_enabled_from_env(Some("1"), false));
-        assert!(super::todo_enabled_from_env(None, true));  // 无 env → 用 config 值
+        assert!(super::todo_enabled_from_env(None, true)); // 无 env → 用 config 值
     }
 
     #[test]

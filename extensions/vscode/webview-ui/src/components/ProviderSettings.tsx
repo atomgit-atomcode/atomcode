@@ -11,6 +11,7 @@ export function ProviderSettings() {
   const [model, setModel] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
+  const authUsable = state.auth?.logged_in === true && state.auth.expired !== true;
 
   function submitProvider(e: React.FormEvent) {
     e.preventDefault();
@@ -39,7 +40,7 @@ export function ProviderSettings() {
         <div className="settings-header">
           <div>
             <h3>{t('provider.settingsTitle')}</h3>
-            <p>{state.auth?.logged_in ? t('setup.signedInAs', { name: state.auth.user?.username || t('setup.atomgitUser') }) : t('provider.notSignedIn')}</p>
+            <p>{authUsable ? t('setup.signedInAs', { name: state.auth?.user?.username || t('setup.atomgitUser') }) : t('provider.notSignedIn')}</p>
           </div>
           <button className="ghost-btn" onClick={() => dispatch({ type: 'TOGGLE_SETTINGS' })}>×</button>
         </div>

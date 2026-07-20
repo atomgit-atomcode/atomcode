@@ -25,7 +25,13 @@ pub fn plugin_id(plugin: &str, marketplace: &str) -> String {
 pub fn plugin_hook_set_hash(hooks: &[PluginCcHook]) -> String {
     let mut triples: Vec<(&str, &str, &str)> = hooks
         .iter()
-        .map(|h| (h.event.as_str(), h.matcher.as_deref().unwrap_or(""), h.command.as_str()))
+        .map(|h| {
+            (
+                h.event.as_str(),
+                h.matcher.as_deref().unwrap_or(""),
+                h.command.as_str(),
+            )
+        })
         .collect();
     triples.sort_unstable();
     let mut hasher = Sha256::new();
@@ -114,8 +120,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn mk(event: &str, matcher: Option<&str>, command: &str) -> PluginCcHook {
-        PluginCcHook { event: event.into(), matcher: matcher.map(|s| s.into()),
-            command: command.into(), timeout_secs: None, plugin_root: PathBuf::from("/x") }
+        PluginCcHook {
+            event: event.into(),
+            matcher: matcher.map(|s| s.into()),
+            command: command.into(),
+            timeout_secs: None,
+            plugin_root: PathBuf::from("/x"),
+        }
     }
 
     #[test]
@@ -128,7 +139,10 @@ mod tests {
     #[test]
     fn hash_changes_on_command_change_not_on_timeout() {
         let base = plugin_hook_set_hash(&[mk("SessionStart", None, "x")]);
-        assert_ne!(base, plugin_hook_set_hash(&[mk("SessionStart", None, "x2")]));
+        assert_ne!(
+            base,
+            plugin_hook_set_hash(&[mk("SessionStart", None, "x2")])
+        );
         let mut with_timeout = mk("SessionStart", None, "x");
         with_timeout.timeout_secs = Some(30);
         assert_eq!(base, plugin_hook_set_hash(&[with_timeout]));

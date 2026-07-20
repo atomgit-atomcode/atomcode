@@ -20,8 +20,17 @@ use atomcode_kernel::tool::ToolRegistry;
 use std::sync::{Arc, Mutex};
 
 /// Drains events until TurnComplete (collecting any Error messages along the way).
-async fn drive_collect_errors(handle: &mut atomcode_kernel::agent::AgentHandle, text: &str) -> Vec<String> {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
+async fn drive_collect_errors(
+    handle: &mut atomcode_kernel::agent::AgentHandle,
+    text: &str,
+) -> Vec<String> {
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: text.into(),
+            images: vec![],
+        })
+        .unwrap();
     let mut errors = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         match ev {
@@ -90,7 +99,13 @@ async fn pre_request_hooks_compose() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -104,8 +119,14 @@ async fn pre_request_hooks_compose() {
     let texts: Vec<String> = calls[0].0.iter().map(|m| m.text.clone()).collect();
     let a = texts.iter().position(|t| t == "[tail-A]");
     let b = texts.iter().position(|t| t == "[tail-B]");
-    assert!(a.is_some() && b.is_some(), "both tails must reach the provider; wire = {texts:?}");
-    assert!(a < b, "tails must appear in registration order (A before B); wire = {texts:?}");
+    assert!(
+        a.is_some() && b.is_some(),
+        "both tails must reach the provider; wire = {texts:?}"
+    );
+    assert!(
+        a < b,
+        "tails must appear in registration order (A before B); wire = {texts:?}"
+    );
 }
 
 /// `user_prompt_submit`: hook A rewrites the text, hook B BLOCKS (Err), hook C
@@ -125,7 +146,11 @@ async fn user_prompt_submit_short_circuits_on_first_block() {
         .provider(provider)
         .tools(reg.mount(&[] as &[&str]))
         .hook(Arc::new(RewritePromptHook::new("A", " +A", log.clone())))
-        .hook(Arc::new(BlockingPromptHook::new("B", "policy violation", log.clone())))
+        .hook(Arc::new(BlockingPromptHook::new(
+            "B",
+            "policy violation",
+            log.clone(),
+        )))
         .hook(Arc::new(RewritePromptHook::new("C", " +C", log.clone())))
         .build()
         .spawn();
@@ -135,13 +160,21 @@ async fn user_prompt_submit_short_circuits_on_first_block() {
     let _ = handle.task.await;
 
     let fired = log.lock().unwrap().clone();
-    assert_eq!(fired, vec!["A".to_string(), "B".to_string()], "A then B ran; C must NOT (short-circuit); fired = {fired:?}");
+    assert_eq!(
+        fired,
+        vec!["A".to_string(), "B".to_string()],
+        "A then B ran; C must NOT (short-circuit); fired = {fired:?}"
+    );
     assert!(
         errors.iter().any(|e| e.contains("policy violation")),
         "the blocked prompt must surface an Error carrying the block reason; errors = {errors:?}"
     );
     // The prompt never entered the loop → the provider was never called.
-    assert_eq!(calls.lock().unwrap().len(), 0, "a blocked prompt must NOT run a turn (no LLM call)");
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        0,
+        "a blocked prompt must NOT run a turn (no LLM call)"
+    );
 }
 
 /// `offer_continuation`: hook A → None, hook B → Some("continue-B"), hook C → Some("continue-C").
@@ -156,8 +189,14 @@ async fn turn_end_first_some_wins() {
     // Round 2: model stops again → offer_continuation fires; this time each hook has already
     // observed once so they return None → the turn completes.
     let provider = Arc::new(RecordingProvider::new(vec![
-        vec![StreamEvent::TextDelta("first".into()), StreamEvent::Done { truncated: false }],
-        vec![StreamEvent::TextDelta("second".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("first".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("second".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
 
@@ -165,12 +204,26 @@ async fn turn_end_first_some_wins() {
         .provider(provider)
         .tools(reg.mount(&["echo"]))
         .hook(Arc::new(ObservingTurnEndHook::new("A", None, log.clone())))
-        .hook(Arc::new(ObservingTurnEndHook::new("B", Some("continue-B".into()), log.clone())))
-        .hook(Arc::new(ObservingTurnEndHook::new("C", Some("continue-C".into()), log.clone())))
+        .hook(Arc::new(ObservingTurnEndHook::new(
+            "B",
+            Some("continue-B".into()),
+            log.clone(),
+        )))
+        .hook(Arc::new(ObservingTurnEndHook::new(
+            "C",
+            Some("continue-C".into()),
+            log.clone(),
+        )))
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -189,7 +242,11 @@ async fn turn_end_first_some_wins() {
 
     // The continuation that got injected is the FIRST Some = "continue-B", NOT C's.
     let calls = calls.lock().unwrap();
-    assert!(calls.len() >= 2, "the loop must have continued (>=2 LLM calls); got {}", calls.len());
+    assert!(
+        calls.len() >= 2,
+        "the loop must have continued (>=2 LLM calls); got {}",
+        calls.len()
+    );
     let round2_texts: Vec<String> = calls[1].0.iter().map(|m| m.text.clone()).collect();
     assert!(
         round2_texts.iter().any(|t| t == "continue-B"),

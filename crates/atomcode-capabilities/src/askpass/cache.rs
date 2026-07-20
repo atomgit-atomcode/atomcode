@@ -13,7 +13,10 @@ pub struct PasswordCache {
 
 impl PasswordCache {
     pub fn new(ttl: Duration) -> Self {
-        Self { ttl, inner: Mutex::new(HashMap::new()) }
+        Self {
+            ttl,
+            inner: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn get(&self, key: &str, now: Instant) -> Option<Zeroizing<String>> {
@@ -29,7 +32,10 @@ impl PasswordCache {
     }
 
     pub fn put(&self, key: &str, pw: Zeroizing<String>, now: Instant) {
-        self.inner.lock().unwrap().insert(key.to_string(), (pw, now));
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), (pw, now));
     }
 
     pub fn clear(&self) {
@@ -56,7 +62,10 @@ mod tests {
         );
         // Past TTL → miss (and entry dropped).
         assert!(c.get("sudo", t0 + Duration::from_secs(301)).is_none());
-        assert!(c.get("sudo", t0 + Duration::from_secs(10)).is_none(), "expired entry must be evicted");
+        assert!(
+            c.get("sudo", t0 + Duration::from_secs(10)).is_none(),
+            "expired entry must be evicted"
+        );
     }
 
     #[test]

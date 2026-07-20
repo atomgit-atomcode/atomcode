@@ -102,8 +102,11 @@ impl UserInputPanel {
         request_id: u64,
         r: &atomcode_capabilities::tools::request_user_input::UserInputRequest,
     ) -> Self {
-        let options: Vec<(String, Option<String>)> =
-            r.options.iter().map(|o| (o.label.clone(), o.description.clone())).collect();
+        let options: Vec<(String, Option<String>)> = r
+            .options
+            .iter()
+            .map(|o| (o.label.clone(), o.description.clone()))
+            .collect();
         // One checkbox slot per concrete option PLUS the trailing "Other" row.
         let checked = vec![false; options.len() + 1];
         Self {
@@ -244,7 +247,9 @@ impl UserInputPanel {
     pub fn build_response(
         &self,
     ) -> Option<atomcode_capabilities::tools::request_user_input::UserInputResponse> {
-        use atomcode_capabilities::tools::request_user_input::{UserInputMode::*, UserInputResponse};
+        use atomcode_capabilities::tools::request_user_input::{
+            UserInputMode::*, UserInputResponse,
+        };
         match self.mode {
             Single => {
                 let selected = if self.cursor < self.options.len() {
@@ -256,7 +261,11 @@ impl UserInputPanel {
                     }
                     vec![custom.to_string()]
                 };
-                Some(UserInputResponse { declined: false, selected, text: None })
+                Some(UserInputResponse {
+                    declined: false,
+                    selected,
+                    text: None,
+                })
             }
             Multiple => {
                 let mut selected = self.chosen();
@@ -270,7 +279,11 @@ impl UserInputPanel {
                 if selected.is_empty() {
                     return None; // nothing chosen → Submit is a no-op
                 }
-                Some(UserInputResponse { declined: false, selected, text: None })
+                Some(UserInputResponse {
+                    declined: false,
+                    selected,
+                    text: None,
+                })
             }
             Text => Some(UserInputResponse {
                 declined: false,
@@ -311,7 +324,10 @@ pub const STREAM_STALL_HINT: std::time::Duration = std::time::Duration::from_sec
 /// local tool (a 30s build) emits no events but is not a network stall, so warning
 /// there would be a false positive. `None` elapsed (no activity stamped yet) never
 /// warns. Pure (no clock) so the threshold logic is unit-testable.
-pub fn stream_stalled_for(awaiting_model: bool, since_activity: Option<std::time::Duration>) -> bool {
+pub fn stream_stalled_for(
+    awaiting_model: bool,
+    since_activity: Option<std::time::Duration>,
+) -> bool {
     awaiting_model && since_activity.is_some_and(|d| d >= STREAM_STALL_HINT)
 }
 
@@ -959,7 +975,10 @@ impl UiState {
     pub fn stream_stalled(&self) -> bool {
         let awaiting_model = matches!(self.phase, UiPhase::Streaming)
             && THINKING_LABELS.contains(&self.spinner_label.as_str());
-        stream_stalled_for(awaiting_model, self.last_stream_activity.map(|t| t.elapsed()))
+        stream_stalled_for(
+            awaiting_model,
+            self.last_stream_activity.map(|t| t.elapsed()),
+        )
     }
 
     /// Whether a running compaction's summary has stalled past
@@ -967,7 +986,10 @@ impl UiState {
     /// `compacting` instead of a THINKING_LABEL (the spinner shows
     /// "Compacting…", not a thinking label, during a compaction).
     pub fn compaction_stalled(&self) -> bool {
-        stream_stalled_for(self.compacting, self.last_stream_activity.map(|t| t.elapsed()))
+        stream_stalled_for(
+            self.compacting,
+            self.last_stream_activity.map(|t| t.elapsed()),
+        )
     }
 
     fn current_thinking(&self) -> &'static str {
@@ -1229,7 +1251,10 @@ impl UiState {
     }
 
     fn refresh_sub_agent_label(&mut self) {
-        self.spinner_label = format!("Sub-agents {}/{}", self.sub_agent_done, self.sub_agent_total);
+        self.spinner_label = format!(
+            "Sub-agents {}/{}",
+            self.sub_agent_done, self.sub_agent_total
+        );
     }
 
     /// End the dispatch — clears descriptors so subsequent thinks/tools
@@ -1353,8 +1378,7 @@ impl UiState {
         //   ASCII   → classic `|/-\` for legacy terminals whose font lacks
         //   the Braille block (notably Windows legacy conhost); those already
         //   run with unicode_symbols = false, so they take this path.
-        const UNICODE_FRAMES: &[&str] =
-            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        const UNICODE_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         const ASCII_FRAMES: &[&str] = &["|", "/", "-", "\\"];
         let frames = if self.unicode_symbols {
             UNICODE_FRAMES
@@ -1425,7 +1449,10 @@ mod tests {
         use std::time::Duration;
         // Awaiting model + silent at/over the threshold → warn (network may be down).
         assert!(stream_stalled_for(true, Some(STREAM_STALL_HINT)));
-        assert!(stream_stalled_for(true, Some(STREAM_STALL_HINT + Duration::from_secs(5))));
+        assert!(stream_stalled_for(
+            true,
+            Some(STREAM_STALL_HINT + Duration::from_secs(5))
+        ));
         // Awaiting model but a chunk arrived recently → no warn (stream is alive).
         assert!(!stream_stalled_for(true, Some(Duration::from_secs(1))));
         // No activity recorded yet (fresh turn) → no warn, so it can't flash on submit.
@@ -1470,7 +1497,10 @@ mod tests {
         // must not fabricate a snapshot (gauge stays empty until the next turn).
         let mut s = UiState::new();
         s.restore_context(0, 0);
-        assert!(s.last_context.is_none(), "must not seed a snapshot from 0/0");
+        assert!(
+            s.last_context.is_none(),
+            "must not seed a snapshot from 0/0"
+        );
     }
 
     #[test]
@@ -1562,9 +1592,15 @@ mod tests {
         let mut s = UiState::new();
         s.on_submit(); // phase=Streaming, spinner = a THINKING_LABEL
         s.last_stream_activity = Some(std::time::Instant::now() - STREAM_STALL_HINT * 2);
-        assert!(s.stream_stalled(), "silent model stream past threshold must warn");
+        assert!(
+            s.stream_stalled(),
+            "silent model stream past threshold must warn"
+        );
         s.on_tool_call_started("Bash"); // spinner = "Running Bash" — not a thinking label
-        assert!(!s.stream_stalled(), "a slow tool must NOT trip the network warning");
+        assert!(
+            !s.stream_stalled(),
+            "a slow tool must NOT trip the network warning"
+        );
     }
 
     #[test]
@@ -1701,10 +1737,11 @@ mod tests {
         // Turn 1: simulate paste sites' increment-then-push pattern.
         s.session_image_count += 1;
         let n1 = s.session_image_count;
-        s.pending_images.push(atomcode_core::conversation::message::ImagePart {
-            media_type: "image/png".into(),
-            data: "AAAA".into(),
-        });
+        s.pending_images
+            .push(atomcode_core::conversation::message::ImagePart {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            });
         s.pending_image_hashes.push(0xdead_beef);
         // Submit drains pending_images / hashes (mirrors event_loop logic).
         let _ = std::mem::take(&mut s.pending_images);
@@ -1852,9 +1889,17 @@ mod tests {
             .insert("b1".into(), ActiveToolBatch { call_ids: vec![] });
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_tool_call_streaming("Bash(a)");
-        assert_eq!(s.phase_started_at, Some(anchor), "streaming restarted the batch clock");
+        assert_eq!(
+            s.phase_started_at,
+            Some(anchor),
+            "streaming restarted the batch clock"
+        );
         s.on_tool_call_started("Bash(b)");
-        assert_eq!(s.phase_started_at, Some(anchor), "started restarted the batch clock");
+        assert_eq!(
+            s.phase_started_at,
+            Some(anchor),
+            "started restarted the batch clock"
+        );
     }
 
     #[test]
@@ -1885,7 +1930,11 @@ mod tests {
             .insert("b1".into(), ActiveToolBatch { call_ids: vec![] });
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_thinking();
-        assert_eq!(s.phase_started_at, Some(anchor), "thinking restarted the batch clock");
+        assert_eq!(
+            s.phase_started_at,
+            Some(anchor),
+            "thinking restarted the batch clock"
+        );
     }
 
     #[test]
@@ -1896,7 +1945,10 @@ mod tests {
         let before = s.phase_started_at.unwrap();
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_thinking();
-        assert!(s.phase_started_at.unwrap() > before, "think must reset the clock outside a batch");
+        assert!(
+            s.phase_started_at.unwrap() > before,
+            "think must reset the clock outside a batch"
+        );
     }
 
     #[test]
@@ -1947,7 +1999,9 @@ mod tests {
         s.on_submit();
         s.on_tool_call_started("read_file");
         assert!(s.spinner_label.contains("read_file"));
-        let tasks = (0..6).map(|i| task_info(&format!("a{}.rs", i), "")).collect();
+        let tasks = (0..6)
+            .map(|i| task_info(&format!("a{}.rs", i), ""))
+            .collect();
         s.on_sub_agent_dispatch_start(tasks);
         assert_eq!(s.spinner_label, "Sub-agents 0/6");
     }
@@ -2132,7 +2186,10 @@ mod tests {
 
         s.on_turn_cancelled();
         assert!(s.active_todos.is_some(), "panel must survive cancellation");
-        assert!(!s.todo_titles.is_empty(), "titles must survive cancellation");
+        assert!(
+            !s.todo_titles.is_empty(),
+            "titles must survive cancellation"
+        );
 
         s.on_error();
         assert!(s.active_todos.is_some(), "panel must survive error");
@@ -2146,9 +2203,21 @@ mod tests {
             tool: "bash".into(),
             detail: "rm -rf build/".into(),
             options: vec![
-                ApprovalOption { label: "Allow once".into(), kind: ApprovalKind::AllowOnce, accel: 'y' },
-                ApprovalOption { label: "Always allow bash".into(), kind: ApprovalKind::AlwaysAllow, accel: 'a' },
-                ApprovalOption { label: "Deny".into(), kind: ApprovalKind::Deny, accel: 'n' },
+                ApprovalOption {
+                    label: "Allow once".into(),
+                    kind: ApprovalKind::AllowOnce,
+                    accel: 'y',
+                },
+                ApprovalOption {
+                    label: "Always allow bash".into(),
+                    kind: ApprovalKind::AlwaysAllow,
+                    accel: 'a',
+                },
+                ApprovalOption {
+                    label: "Deny".into(),
+                    kind: ApprovalKind::Deny,
+                    accel: 'n',
+                },
             ],
             selected: 0,
             cache_key: String::new(),
@@ -2166,19 +2235,28 @@ mod tests {
 
     #[test]
     fn user_input_panel_navigation_toggle_and_chosen() {
+        use crate::state::UserInputPanel;
         use atomcode_capabilities::tools::request_user_input::{
             UserInputMode, UserInputOption, UserInputRequest,
         };
-        use crate::state::UserInputPanel;
 
         let single_req = UserInputRequest {
             header: "Auth".into(),
             question: "Which flow?".into(),
             mode: UserInputMode::Single,
             options: vec![
-                UserInputOption { label: "OAuth".into(), description: None },
-                UserInputOption { label: "API key".into(), description: None },
-                UserInputOption { label: "Device".into(), description: None },
+                UserInputOption {
+                    label: "OAuth".into(),
+                    description: None,
+                },
+                UserInputOption {
+                    label: "API key".into(),
+                    description: None,
+                },
+                UserInputOption {
+                    label: "Device".into(),
+                    description: None,
+                },
             ],
         };
         let mut p = UserInputPanel::new(7, &single_req);
@@ -2189,7 +2267,10 @@ mod tests {
         for _ in 0..10 {
             p.move_down();
         }
-        assert_eq!(p.cursor, 3, "single move_down clamps at the Other row (options.len())");
+        assert_eq!(
+            p.cursor, 3,
+            "single move_down clamps at the Other row (options.len())"
+        );
         assert!(p.is_other_row(), "single cursor clamps at the Other row");
         // move_up clamps at 0.
         for _ in 0..10 {
@@ -2199,12 +2280,18 @@ mod tests {
         // Single is cursor-as-radio: chosen() reads the cursor row's label.
         p.move_down(); // cursor → "API key"
         assert_eq!(p.chosen(), vec!["API key".to_string()]);
-        let resp = p.build_response().expect("single with a cursor selection submits");
+        let resp = p
+            .build_response()
+            .expect("single with a cursor selection submits");
         assert_eq!(resp.selected, vec!["API key".to_string()]);
         assert_eq!(resp.text, None);
         // Moving the cursor changes the radio selection.
         p.move_up();
-        assert_eq!(p.chosen(), vec!["OAuth".to_string()], "single radio follows the cursor");
+        assert_eq!(
+            p.chosen(),
+            vec!["OAuth".to_string()],
+            "single radio follows the cursor"
+        );
 
         // Single: cursor on the "Other" row + typed custom text submits it.
         for _ in 0..10 {
@@ -2221,13 +2308,19 @@ mod tests {
             other_empty.move_down();
         }
         assert!(other_empty.is_other_row());
-        assert!(other_empty.build_response().is_none(), "empty Other on single does not submit");
+        assert!(
+            other_empty.build_response().is_none(),
+            "empty Other on single does not submit"
+        );
 
         // Multiple: toggle flips the highlighted option; chosen() = all checked.
-        let mut m = UserInputPanel::new(9, &UserInputRequest {
-            mode: UserInputMode::Multiple,
-            ..single_req.clone()
-        });
+        let mut m = UserInputPanel::new(
+            9,
+            &UserInputRequest {
+                mode: UserInputMode::Multiple,
+                ..single_req.clone()
+            },
+        );
         m.toggle(); // check "OAuth"
         m.move_down();
         m.move_down();
@@ -2242,11 +2335,14 @@ mod tests {
         assert_eq!(resp.selected, vec!["OAuth".to_string(), "x".to_string()]);
 
         // Text: chosen() is empty (answer rides `text`).
-        let mut t = UserInputPanel::new(1, &UserInputRequest {
-            mode: UserInputMode::Text,
-            options: vec![],
-            ..single_req.clone()
-        });
+        let mut t = UserInputPanel::new(
+            1,
+            &UserInputRequest {
+                mode: UserInputMode::Text,
+                options: vec![],
+                ..single_req.clone()
+            },
+        );
         t.text.push_str("hello");
         assert!(t.chosen().is_empty(), "text mode has no selected labels");
         assert_eq!(t.text, "hello");
@@ -2257,12 +2353,15 @@ mod tests {
     fn on_user_input_resolved_clears_panel_and_resumes() {
         use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputRequest};
         let mut s = UiState::new();
-        s.user_input_panel = Some(crate::state::UserInputPanel::new(3, &UserInputRequest {
-            header: "H".into(),
-            question: "Q?".into(),
-            mode: UserInputMode::Text,
-            options: vec![],
-        }));
+        s.user_input_panel = Some(crate::state::UserInputPanel::new(
+            3,
+            &UserInputRequest {
+                header: "H".into(),
+                question: "Q?".into(),
+                mode: UserInputMode::Text,
+                options: vec![],
+            },
+        ));
         s.phase = UiPhase::UserInput;
         s.on_user_input_resolved();
         assert!(s.user_input_panel.is_none(), "panel cleared on resolve");
@@ -2274,11 +2373,17 @@ mod tests {
         let mut st = UiState::new();
         st.on_steer_sent();
         st.on_steer_sent();
-        assert_eq!(st.steer_pending, 2, "two steers dispatched, none folded yet");
+        assert_eq!(
+            st.steer_pending, 2,
+            "two steers dispatched, none folded yet"
+        );
         st.on_steered(1); // kernel confirms one fold
         assert_eq!(st.steer_pending, 1, "drains as folds are confirmed");
         st.on_steered(1);
-        assert_eq!(st.steer_pending, 0, "back to zero once all folded — a draining indicator");
+        assert_eq!(
+            st.steer_pending, 0,
+            "back to zero once all folded — a draining indicator"
+        );
         st.on_steered(3); // spurious / cross-client fold never underflows
         assert_eq!(st.steer_pending, 0, "saturating: never goes negative");
         // Every turn-end path clears it, parity with the other per-turn counters.

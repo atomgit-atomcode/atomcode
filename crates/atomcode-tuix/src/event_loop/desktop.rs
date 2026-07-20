@@ -66,7 +66,11 @@ pub fn candidate_apps(_home: &Path, env: &impl Fn(&str) -> Option<String>) -> Ve
     }
     let mut out = Vec::new();
     for (name, dir, exe) in [
-        ("AtomCode Desktop", "AtomCode Desktop", "AtomCode Desktop.exe"),
+        (
+            "AtomCode Desktop",
+            "AtomCode Desktop",
+            "AtomCode Desktop.exe",
+        ),
         ("AtomCode Air", "AtomCode Air", "AtomCode Air.exe"),
     ] {
         for base in &bases {
@@ -147,7 +151,11 @@ mod tests {
     use super::*;
 
     fn cand(name: &'static str, path: &str) -> Candidate {
-        Candidate { display_name: name, path: PathBuf::from(path), launch: LaunchKind::Spawn }
+        Candidate {
+            display_name: name,
+            path: PathBuf::from(path),
+            launch: LaunchKind::Spawn,
+        }
     }
 
     #[test]

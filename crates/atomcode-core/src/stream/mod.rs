@@ -127,8 +127,14 @@ mod runaway_tests {
     #[test]
     fn normal_prose_never_trips() {
         let mut d = RunawayDetector::new(1024);
-        assert_eq!(d.feed("Here is a perfectly fine response with no repetition."), None);
-        assert_eq!(d.feed(" Even with some emphasis. Even with     spaces."), None);
+        assert_eq!(
+            d.feed("Here is a perfectly fine response with no repetition."),
+            None
+        );
+        assert_eq!(
+            d.feed(" Even with some emphasis. Even with     spaces."),
+            None
+        );
     }
 
     #[test]
@@ -147,7 +153,10 @@ mod runaway_tests {
         let mut d = RunawayDetector::new(5);
         assert!(d.feed("aa").is_none());
         assert!(d.feed("aa").is_none());
-        assert!(d.feed("a").expect("split runaway must still trip").contains("'a'"));
+        assert!(d
+            .feed("a")
+            .expect("split runaway must still trip")
+            .contains("'a'"));
     }
 
     #[test]

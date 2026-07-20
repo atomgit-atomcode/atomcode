@@ -12,13 +12,18 @@ pub fn encode(body: &[u8]) -> Vec<u8> {
 
 /// Read one framed message body: parse the header block (until the blank line), then
 /// read exactly `Content-Length` bytes. Errors on EOF / missing header.
-pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> std::io::Result<Vec<u8>> {
+pub async fn read_message<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+) -> std::io::Result<Vec<u8>> {
     let mut content_length: Option<usize> = None;
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "LSP stream closed"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "LSP stream closed",
+            ));
         }
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
@@ -28,8 +33,12 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> st
             content_length = v.trim().parse().ok();
         }
     }
-    let len = content_length
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "LSP message: no Content-Length"))?;
+    let len = content_length.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "LSP message: no Content-Length",
+        )
+    })?;
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
     Ok(body)

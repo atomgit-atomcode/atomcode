@@ -85,8 +85,8 @@ pub fn shell_command(command: &str) -> tokio::process::Command {
 #[cfg(target_os = "windows")]
 pub fn is_running_as_admin() -> bool {
     use windows_sys::Win32::Security::{
-        AllocateAndInitializeSid, CheckTokenMembership, FreeSid,
-        SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY, PSID,
+        AllocateAndInitializeSid, CheckTokenMembership, FreeSid, PSID, SECURITY_NT_AUTHORITY,
+        SID_IDENTIFIER_AUTHORITY,
     };
 
     unsafe {
@@ -98,12 +98,10 @@ pub fn is_running_as_admin() -> bool {
         // (DOMAIN_ALIAS_RID_ADMINS) to avoid pulling in the
         // Win32_System_SystemServices feature flag.
         let result = AllocateAndInitializeSid(
-            &authority,
-            2,     // nSubAuthorityCount
-            32,    // SECURITY_BUILTIN_DOMAIN_RID
-            544,   // DOMAIN_ALIAS_RID_ADMINS
-            0, 0, 0, 0, 0, 0,
-            &mut sid,
+            &authority, 2,   // nSubAuthorityCount
+            32,  // SECURITY_BUILTIN_DOMAIN_RID
+            544, // DOMAIN_ALIAS_RID_ADMINS
+            0, 0, 0, 0, 0, 0, &mut sid,
         );
 
         if result == 0 {

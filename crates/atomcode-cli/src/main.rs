@@ -25,13 +25,12 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
-use atomcode_config::config::Config;
 use atomcode_capabilities::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
     merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthLoginOptions, McpRegistry,
     McpTokenStore, McpTransportConfig,
 };
-use atomcode_core::session::SessionManager;
+use atomcode_config::config::Config;
 
 use atomcode_auth as auth;
 use atomcode_telemetry::{
@@ -1484,18 +1483,16 @@ async fn run() -> Result<i32> {
         (Some(mcp_registry), Some(rx))
     };
 
-
     // Continue the previous session only when the user explicitly opts
     // in via `-c` / `--continue`. Bare `atomcode` starts a fresh
     // session — no auto-resume, no scrollback replay. Users who want to
     // pick a specific older session can still use `/resume` inside the
     // TUI.
-    let session_to_continue = if cli.continue_last {
-        let session_manager = SessionManager::new(&working_dir);
-        match session_manager.latest() {
-            Ok(Some(session)) => Some(session),
-            _ => None,
-        }
+    let resume_session_id = if cli.continue_last {
+        atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?
+            .into_iter()
+            .find(|entry| entry.message_count > 0)
+            .map(|entry| entry.id)
     } else {
         None
     };
@@ -1525,16 +1522,18 @@ async fn run() -> Result<i32> {
         atomcode_coding::ProviderBootstrap::RecoverAuthentication
     };
     eprintln!("[engine] active (model {})", runtime_cfg.model);
-    let external_session = session_to_continue.as_ref().map(|session| {
-        (
-            session.id.as_str().to_string(),
-            atomcode_daemon::legacy_convert::snapshot_to_kernel(
-                &session.to_conversation_snapshot(),
-            ),
-        )
-    });
     let (native_runtime, native_coding_cfg) =
-        spawn_native_cli_runtime(&runtime_cfg, external_session, provider_bootstrap).await?;
+        spawn_native_cli_runtime(&runtime_cfg, resume_session_id.clone(), provider_bootstrap)
+            .await?;
+    // TUI replay remains a presentation projection during S4; runtime resume above
+    // has already converged and loaded the native snapshot under one lease.
+    let session_to_continue = resume_session_id
+        .as_deref()
+        .map(atomcode_daemon::legacy_convert::find_catalog_session_view)
+        .transpose()?
+        .flatten()
+        .map(atomcode_tuix::session::Session::from_catalog_view)
+        .transpose()?;
     let (mut native_headless_runtime, mut native_tui_runtime) = if is_headless {
         (Some(native_runtime), None)
     } else {
@@ -1553,7 +1552,7 @@ async fn run() -> Result<i32> {
         std::sync::Arc::new(
             move |config: &atomcode_config::config::Config,
                   working_dir: &std::path::Path,
-                  session: &atomcode_core::session::Session| {
+                  session: &atomcode_tuix::session::Session| {
                 spawn_deferred_tui_runtime(
                     runtime_config_from(
                         config,
@@ -1738,12 +1737,11 @@ async fn run() -> Result<i32> {
 
 fn spawn_deferred_tui_runtime(
     cfg: atomcode_coding::CodingRuntimeConfig,
-    session: &atomcode_core::session::Session,
+    session: &atomcode_tuix::session::Session,
 ) -> atomcode_tuix::SpawnedRuntime {
     let session_id = session.id.as_str().to_string();
-    let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
-        &session.to_conversation_snapshot(),
-    );
+    let snapshot =
+        atomcode_daemon::legacy_convert::snapshot_to_kernel(&session.to_conversation_snapshot());
     let (native_control, mut events, runtime_state) =
         atomcode_daemon::spawn_native_runtime_for_session_deferred(
             cfg,
@@ -1763,9 +1761,7 @@ fn spawn_deferred_tui_runtime(
         }
     });
     atomcode_tuix::SpawnedRuntime {
-        endpoint: atomcode_tuix::RuntimeEndpoint {
-            native: control,
-        },
+        endpoint: atomcode_tuix::RuntimeEndpoint { native: control },
         event_rx,
         session_id: Some(session_id),
     }
@@ -1799,9 +1795,7 @@ fn into_tui_native_runtime(
         control_for_events.detach_delivery_event_tx();
     });
     atomcode_tuix::SpawnedRuntime {
-        endpoint: atomcode_tuix::RuntimeEndpoint {
-            native: control,
-        },
+        endpoint: atomcode_tuix::RuntimeEndpoint { native: control },
         event_rx,
         session_id,
     }
@@ -1900,35 +1894,42 @@ fn runtime_config_from(
 
 async fn spawn_native_cli_runtime(
     cfg: &atomcode_coding::CodingRuntimeConfig,
-    external_session: Option<(String, atomcode_kernel::message::SessionSnapshot)>,
+    resume_session_id: Option<String>,
     bootstrap: atomcode_coding::ProviderBootstrap,
 ) -> anyhow::Result<(
     atomcode_coding::CodingRuntime,
     atomcode_coding::CodingAgentConfig,
 )> {
     let agent = cfg.agent_config();
+    let (session, imported_lease) = match resume_session_id {
+        Some(id) => {
+            let manager =
+                atomcode_capabilities::session::SessionManager::for_project(&agent.working_dir);
+            let lease = manager.acquire_lease(&id)?;
+            atomcode_daemon::legacy_convert::converge_session(&manager, &lease)?;
+            (atomcode_coding::SessionMode::Resume(id), Some(lease))
+        }
+        None => (atomcode_coding::SessionMode::Fresh, None),
+    };
     let prepare = atomcode_coding::PrepareOptions {
-        session: external_session
-            .map(|(id, snapshot)| atomcode_coding::SessionMode::ExternalSnapshot {
-                id,
-                snapshot,
-            })
-            .unwrap_or(atomcode_coding::SessionMode::Fresh),
+        session,
         plugin_skill_dirs: atomcode_daemon::gather_plugin_skill_dirs(),
         mcp: cfg.mcp,
         rate_limit_source: Some(atomcode_daemon::coding_plan_rate_limit_source()),
         ..atomcode_coding::PrepareOptions::default()
     };
-    let runtime = atomcode_coding::CodingRuntime::start_with_bootstrap(
-        atomcode_coding::CodingRuntimeStart {
-            agent: agent.clone(),
-            prepare,
-            provider_factory: atomcode_daemon::coding_provider_factory(),
-            plugin_hooks: atomcode_daemon::installed_plugin_hook_source(),
-        },
-        bootstrap,
-    )
-    .await
+    let start = atomcode_coding::CodingRuntimeStart {
+        agent: agent.clone(),
+        prepare,
+        provider_factory: atomcode_daemon::coding_provider_factory(),
+        plugin_hooks: atomcode_daemon::installed_plugin_hook_source(),
+    };
+    let runtime = match imported_lease {
+        Some(lease) => {
+            atomcode_coding::CodingRuntime::start_with_session_lease(start, bootstrap, lease).await
+        }
+        None => atomcode_coding::CodingRuntime::start_with_bootstrap(start, bootstrap).await,
+    }
     .map_err(anyhow::Error::new)?;
     if cfg.dangerously_skip_permissions {
         runtime
@@ -2511,10 +2512,11 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
 
             println!();
 
-            let untrusted: Vec<_> = atomcode_capabilities::plugin::installed_plugin_hook_trust_status()
-                .into_iter()
-                .filter(|s| !s.trusted)
-                .collect();
+            let untrusted: Vec<_> =
+                atomcode_capabilities::plugin::installed_plugin_hook_trust_status()
+                    .into_iter()
+                    .filter(|s| !s.trusted)
+                    .collect();
             if !untrusted.is_empty() {
                 println!("Untrusted plugin hooks (not loaded):");
                 for s in &untrusted {
@@ -2670,7 +2672,8 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                     // ── Build the command ────────────────────────────
                     let ctx_json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
 
-                    let mut cmd = atomcode_capabilities::process_utils::shell_command(&hook.command);
+                    let mut cmd =
+                        atomcode_capabilities::process_utils::shell_command(&hook.command);
                     cmd.env("ATOMCODE_HOOK_EVENT", &event_str)
                         .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
                         .kill_on_drop(true);
@@ -3002,9 +3005,12 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                     plugin,
                     marketplace: mp,
                 } => {
-                    let info =
-                        installer::install(&plugin, &mp, atomcode_capabilities::plugin::InstallScope::User)
-                            .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
+                    let info = installer::install(
+                        &plugin,
+                        &mp,
+                        atomcode_capabilities::plugin::InstallScope::User,
+                    )
+                    .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
                     println!("  installed `{}@{}`", info.plugin, info.marketplace);
                     installed_plugin_name = info.plugin;
                 }
@@ -3064,8 +3070,12 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                     plugin,
                     marketplace: mp,
                 } => {
-                    installer::uninstall(&plugin, &mp, atomcode_capabilities::plugin::InstallScope::User)
-                        .map_err(|e| anyhow::anyhow!("uninstall: {:#}", e))?;
+                    installer::uninstall(
+                        &plugin,
+                        &mp,
+                        atomcode_capabilities::plugin::InstallScope::User,
+                    )
+                    .map_err(|e| anyhow::anyhow!("uninstall: {:#}", e))?;
                     println!("  uninstalled `{}@{}`", plugin, mp);
                 }
                 PluginSpec::Bare { plugin } => {
@@ -3075,7 +3085,9 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                         .filter(|p| {
                             p.plugin == plugin
                                 || p.plugin
-                                    == atomcode_capabilities::plugin::marketplace::sanitize_name(&plugin)
+                                    == atomcode_capabilities::plugin::marketplace::sanitize_name(
+                                        &plugin,
+                                    )
                         })
                         .collect();
                     match matches.len() {
@@ -3514,8 +3526,8 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        runtime_config_from, close_thinking_chunk, format_thinking_chunk, format_verbose_tool_chunk,
-        resolve_working_dir, truncate_log_line,
+        close_thinking_chunk, format_thinking_chunk, format_verbose_tool_chunk,
+        resolve_working_dir, runtime_config_from, truncate_log_line,
     };
     use std::path::PathBuf;
 
@@ -3753,5 +3765,4 @@ mod tests {
             "[thinking] I should check the file\n[tool→ read_file]\n"
         );
     }
-
 }

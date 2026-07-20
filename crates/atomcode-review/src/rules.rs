@@ -160,7 +160,10 @@ const RULE_DOCS: &[(&str, &str)] = &[
 /// Matches the lowercased base name against the ordered table — first hit wins.
 pub fn match_rule(path: &str) -> Option<&'static str> {
     let base = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-    MATCHERS.iter().find(|(pat, _)| wildcard_match(pat, &base)).map(|(_, name)| *name)
+    MATCHERS
+        .iter()
+        .find(|(pat, _)| wildcard_match(pat, &base))
+        .map(|(_, name)| *name)
 }
 
 /// Changed file paths of a unified diff, parsed from `+++ b/<path>` lines
@@ -168,7 +171,9 @@ pub fn match_rule(path: &str) -> Option<&'static str> {
 pub fn changed_files_from_diff(diff: &str) -> Vec<String> {
     let mut files = Vec::new();
     for line in diff.lines() {
-        let Some(rest) = line.strip_prefix("+++ ") else { continue };
+        let Some(rest) = line.strip_prefix("+++ ") else {
+            continue;
+        };
         let path = rest.trim();
         if path == "/dev/null" {
             continue;
@@ -187,7 +192,8 @@ pub fn changed_files_from_diff(diff: &str) -> Vec<String> {
 pub fn render_rules_section(files: &[String], rules_dir: Option<&Path>) -> String {
     // rule name -> files, preserving first-appearance order.
     let mut order: Vec<&'static str> = Vec::new();
-    let mut groups: std::collections::HashMap<&'static str, Vec<&str>> = std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<&'static str, Vec<&str>> =
+        std::collections::HashMap::new();
     for f in files {
         if let Some(rule) = match_rule(f) {
             if !groups.contains_key(rule) {
@@ -229,7 +235,11 @@ fn load_rule_doc(name: &str, rules_dir: Option<&Path>) -> String {
             }
         }
     }
-    RULE_DOCS.iter().find(|(n, _)| *n == name).map(|(_, d)| (*d).to_string()).unwrap_or_default()
+    RULE_DOCS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, d)| (*d).to_string())
+        .unwrap_or_default()
 }
 
 /// Minimal `*` wildcard match (the only metachar our table uses).
@@ -282,7 +292,14 @@ mod tests {
 
     #[test]
     fn low_signal_file_covers_common_lockfiles() {
-        for p in ["Cargo.lock", "go.sum", "web/package-lock.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock"] {
+        for p in [
+            "Cargo.lock",
+            "go.sum",
+            "web/package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "poetry.lock",
+        ] {
             assert!(is_low_signal_file(p), "{p} should be low-signal");
         }
         for p in ["src/main.rs", "pkg/a.go", "go.mod", "README.md"] {
@@ -292,9 +309,17 @@ mod tests {
 
     #[test]
     fn matcher_order_specific_before_generic() {
-        assert_eq!(match_rule("web/package.json"), Some("package_json"), "specific beats *.json");
+        assert_eq!(
+            match_rule("web/package.json"),
+            Some("package_json"),
+            "specific beats *.json"
+        );
         assert_eq!(match_rule("conf/settings.json"), Some("json"));
-        assert_eq!(match_rule("mapper/UserMapper.xml"), Some("mapper_dao_xml"), "case-insensitive base");
+        assert_eq!(
+            match_rule("mapper/UserMapper.xml"),
+            Some("mapper_dao_xml"),
+            "case-insensitive base"
+        );
         assert_eq!(match_rule("requirements-dev.txt"), Some("python_deps"));
         assert_eq!(match_rule("internal/foo/bar.go"), Some("go"));
         assert_eq!(match_rule("assets/data.bin"), None);
@@ -305,14 +330,24 @@ mod tests {
         let diff = "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n+x\n\
                     diff --git a/x.sql b/x.sql\n--- a/x.sql\n+++ b/x.sql\n@@ -1 +1 @@\n+y\n\
                     diff --git a/gone.py b/gone.py\n--- a/gone.py\n+++ /dev/null\n";
-        assert_eq!(changed_files_from_diff(diff), vec!["a.go".to_string(), "x.sql".to_string()]);
+        assert_eq!(
+            changed_files_from_diff(diff),
+            vec!["a.go".to_string(), "x.sql".to_string()]
+        );
     }
 
     #[test]
     fn render_groups_scope_files_and_renders_doc_once() {
-        let files = vec!["svc/a.go".to_string(), "svc/b.go".to_string(), "db/schema.sql".to_string()];
+        let files = vec![
+            "svc/a.go".to_string(),
+            "svc/b.go".to_string(),
+            "db/schema.sql".to_string(),
+        ];
         let s = render_rules_section(&files, None);
-        assert!(s.contains("Applies to: svc/a.go, svc/b.go"), "same-language files grouped:\n{s}");
+        assert!(
+            s.contains("Applies to: svc/a.go, svc/b.go"),
+            "same-language files grouped:\n{s}"
+        );
         assert!(s.contains("Applies to: db/schema.sql"));
         assert_eq!(s.matches("[Go]").count(), 1, "go doc rendered once");
         assert!(s.contains("[SQL]"));
@@ -328,7 +363,10 @@ mod tests {
         let s = render_rules_section(&["a.go".to_string()], Some(&dir));
         assert!(s.contains("[Go-TUNED]"), "dir override wins:\n{s}");
         let s2 = render_rules_section(&["x.sql".to_string()], Some(&dir));
-        assert!(s2.contains("[SQL]"), "missing override falls back to built-in");
+        assert!(
+            s2.contains("[SQL]"),
+            "missing override falls back to built-in"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -8,14 +8,14 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
-use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
+use atomcode_config::config::provider::ProviderConfig;
 
 use crate::auth::oauth::{get_stored_auth, refresh_access_token};
-use atomcode_auth::gateway_crypto::{self as crypto, SignError, SignInput};
 use crate::i18n::{t, Msg};
+use atomcode_auth::gateway_crypto::{self as crypto, SignError, SignInput};
 
 use super::{LlmProvider, ReasoningPolicy};
 
@@ -1870,8 +1870,8 @@ mod tests {
         // `reasoning_history = "exclude"` forces Exclude even on a model that
         // the heuristic would route to Include (deepseek-v4-pro).
         use super::OpenAiProvider;
-        use atomcode_config::config::provider::ProviderConfig;
         use crate::provider::{LlmProvider, ReasoningPolicy};
+        use atomcode_config::config::provider::ProviderConfig;
         let cfg = ProviderConfig {
             provider_type: "openai".into(),
             api_key: Some("sk-test".into()),
@@ -2440,8 +2440,8 @@ mod tests {
     //   * 1 short chunk + tool_call + abrupt close     → Done(truncated=true)
     //     (model was making tool progress; let resume retry try again)
 
-    use atomcode_config::config::provider::ProviderConfig;
     use crate::provider::LlmProvider;
+    use atomcode_config::config::provider::ProviderConfig;
     use futures::StreamExt;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

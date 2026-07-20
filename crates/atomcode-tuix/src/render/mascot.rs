@@ -41,7 +41,8 @@ mod tests {
         for (i, row) in MASCOT_ROWS.iter().enumerate() {
             assert_eq!(row.len(), 2 * MASCOT_WIDTH, "row {i} wrong width");
             assert!(
-                row.bytes().all(|b| matches!(b, b'.' | b'o' | b'e' | b'w' | b'k')),
+                row.bytes()
+                    .all(|b| matches!(b, b'.' | b'o' | b'e' | b'w' | b'k')),
                 "row {i} has an illegal legend char"
             );
         }
@@ -58,7 +59,15 @@ mod tests {
         // Each eye must be a glossy pupil: exactly one white highlight (top-left)
         // and the remaining three quadrants black.
         let eye_row = MASCOT_ROWS[1];
-        assert_eq!(eye_row.matches('w').count(), 2, "one white highlight per eye (2 eyes)");
-        assert_eq!(eye_row.matches('e').count(), 4, "eyebrow above each eye (2 cells × 2 eyes)");
+        assert_eq!(
+            eye_row.matches('w').count(),
+            2,
+            "one white highlight per eye (2 eyes)"
+        );
+        assert_eq!(
+            eye_row.matches('e').count(),
+            4,
+            "eyebrow above each eye (2 cells × 2 eyes)"
+        );
     }
 }

@@ -90,6 +90,18 @@ class DaemonClientHelpersTest {
     }
 
     @Test
+    fun `daemon HTTP exception preserves structured retry metadata`() {
+        val error = DaemonHttpException.from(
+            503,
+            """{"error":"temporarily unavailable","code":"login_poll_unavailable","retryable":true}""",
+        )
+
+        assertEquals(503, error.statusCode)
+        assertEquals("login_poll_unavailable", error.code)
+        assertEquals(true, error.retryable)
+    }
+
+    @Test
     fun `urlPathEncoded handles empty string`() {
         assertEquals("", "".urlPathEncoded())
     }

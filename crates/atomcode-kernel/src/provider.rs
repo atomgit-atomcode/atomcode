@@ -130,10 +130,23 @@ mod tests {
 
     #[test]
     fn reasoning_effort_from_config_maps_levels() {
-        assert_eq!(ReasoningEffort::from_config(Some("low")), Some(ReasoningEffort::Low));
-        assert_eq!(ReasoningEffort::from_config(Some("medium")), Some(ReasoningEffort::Medium));
-        assert_eq!(ReasoningEffort::from_config(Some("high")), Some(ReasoningEffort::High));
-        assert_eq!(ReasoningEffort::from_config(Some("MAX")), Some(ReasoningEffort::Max), "case-insensitive");
+        assert_eq!(
+            ReasoningEffort::from_config(Some("low")),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            ReasoningEffort::from_config(Some("medium")),
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(
+            ReasoningEffort::from_config(Some("high")),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(
+            ReasoningEffort::from_config(Some("MAX")),
+            Some(ReasoningEffort::Max),
+            "case-insensitive"
+        );
         // off / empty / unset / unknown → no opinion (None), never a panic.
         assert_eq!(ReasoningEffort::from_config(Some("off")), None);
         assert_eq!(ReasoningEffort::from_config(Some("")), None);
@@ -144,10 +157,17 @@ mod tests {
     #[test]
     fn chat_options_default_is_neutral() {
         let o = ChatOptions::default();
-        assert_eq!(o.reasoning_effort, None, "default reasoning_effort must be None");
+        assert_eq!(
+            o.reasoning_effort, None,
+            "default reasoning_effort must be None"
+        );
         assert_eq!(o.max_tokens, None, "default max_tokens must be None");
         assert_eq!(o.temperature, None, "default temperature must be None");
-        assert_eq!(o.tool_choice, ToolChoice::Auto, "default tool_choice must be Auto");
+        assert_eq!(
+            o.tool_choice,
+            ToolChoice::Auto,
+            "default tool_choice must be Auto"
+        );
 
         // serde round-trips losslessly.
         let json = serde_json::to_string(&o).unwrap();
@@ -161,17 +181,36 @@ mod tests {
             temperature: Some(0.2),
             tool_choice: ToolChoice::Required,
         };
-        let back: ChatOptions = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        let back: ChatOptions =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
         assert_eq!(full, back, "populated ChatOptions must serde round-trip");
     }
 
     #[test]
     fn reasoning_effort_and_tool_choice_serialize_to_stable_tags() {
-        assert_eq!(serde_json::to_string(&ReasoningEffort::Low).unwrap(), "\"Low\"");
-        assert_eq!(serde_json::to_string(&ReasoningEffort::Medium).unwrap(), "\"Medium\"");
-        assert_eq!(serde_json::to_string(&ReasoningEffort::High).unwrap(), "\"High\"");
-        assert_eq!(serde_json::to_string(&ToolChoice::Auto).unwrap(), "\"Auto\"");
-        assert_eq!(serde_json::to_string(&ToolChoice::Required).unwrap(), "\"Required\"");
-        assert_eq!(serde_json::to_string(&ToolChoice::None).unwrap(), "\"None\"");
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::Low).unwrap(),
+            "\"Low\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::Medium).unwrap(),
+            "\"Medium\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::High).unwrap(),
+            "\"High\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::Auto).unwrap(),
+            "\"Auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::Required).unwrap(),
+            "\"Required\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::None).unwrap(),
+            "\"None\""
+        );
     }
 }

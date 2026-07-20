@@ -36,12 +36,17 @@ pub fn parse_loop_arg(arg: &str) -> LoopArg {
         if !(10..=86_400).contains(&secs) {
             return LoopArg::Error("间隔需在 10s–24h 之间".into());
         }
-        return LoopArg::Interval { secs, payload: payload.to_string() };
+        return LoopArg::Interval {
+            secs,
+            payload: payload.to_string(),
+        };
     }
     if t.split_whitespace().next() == Some("/loop") {
         return LoopArg::Error("不能对 /loop 自身循环".into());
     }
-    LoopArg::SelfPaced { prompt: t.to_string() }
+    LoopArg::SelfPaced {
+        prompt: t.to_string(),
+    }
 }
 
 /// `30s` / `5m` / `1h` → seconds. None if not an interval token.
@@ -67,7 +72,10 @@ mod tests {
     fn parses_interval_and_slash() {
         assert_eq!(
             parse_loop_arg("5m /diff"),
-            LoopArg::Interval { secs: 300, payload: "/diff".into() }
+            LoopArg::Interval {
+                secs: 300,
+                payload: "/diff".into()
+            }
         );
     }
 
@@ -75,7 +83,10 @@ mod tests {
     fn parses_interval_and_prompt() {
         assert_eq!(
             parse_loop_arg("30s check build"),
-            LoopArg::Interval { secs: 30, payload: "check build".into() }
+            LoopArg::Interval {
+                secs: 30,
+                payload: "check build".into()
+            }
         );
     }
 
@@ -83,7 +94,9 @@ mod tests {
     fn bare_prompt_is_self_paced() {
         assert_eq!(
             parse_loop_arg("watch CI until green"),
-            LoopArg::SelfPaced { prompt: "watch CI until green".into() }
+            LoopArg::SelfPaced {
+                prompt: "watch CI until green".into()
+            }
         );
     }
 
@@ -125,7 +138,9 @@ mod tests {
         assert_eq!(parse_interval("999999999999999999h"), None);
         assert_eq!(
             parse_loop_arg("999999999999999999m x"),
-            LoopArg::SelfPaced { prompt: "999999999999999999m x".into() }
+            LoopArg::SelfPaced {
+                prompt: "999999999999999999m x".into()
+            }
         );
     }
 }

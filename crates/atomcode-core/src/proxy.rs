@@ -9,7 +9,9 @@ pub use atomcode_config::proxy::*;
 /// `no_proxy` mode, otherwise leave reqwest's env-based proxy detection intact.
 pub fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     atomcode_config::proxy::ensure_runtime_initialized();
-    if std::env::var(atomcode_config::proxy::MODE_ENV).ok().as_deref()
+    if std::env::var(atomcode_config::proxy::MODE_ENV)
+        .ok()
+        .as_deref()
         == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
     {
         builder.no_proxy()
@@ -23,7 +25,9 @@ pub fn apply_blocking_proxy_policy(
     builder: reqwest::blocking::ClientBuilder,
 ) -> reqwest::blocking::ClientBuilder {
     atomcode_config::proxy::ensure_runtime_initialized();
-    if std::env::var(atomcode_config::proxy::MODE_ENV).ok().as_deref()
+    if std::env::var(atomcode_config::proxy::MODE_ENV)
+        .ok()
+        .as_deref()
         == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
     {
         builder.no_proxy()

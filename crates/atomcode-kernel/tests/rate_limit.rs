@@ -4,15 +4,15 @@
 //!   1. Pause  → emits AgentEvent::RateLimited (NOT Error) + TurnComplete{RateLimited}
 //!   2. WaitAndRetry{secs:0} → sleeps 0 s, re-issues the round, turn succeeds with text
 
+use async_trait::async_trait;
 use atomcode_kernel::agent::{Agent, AgentHandle};
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
-use atomcode_kernel::hook::{RateLimitDecision, LifecycleHooks};
+use atomcode_kernel::hook::{LifecycleHooks, RateLimitDecision};
 use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::testkit::ScriptedRateLimitHook;
 use atomcode_kernel::tool::{ToolDef, ToolRegistry};
-use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -20,13 +20,13 @@ use std::sync::Arc;
 // ── shared helpers ────────────────────────────────────────────────────────────
 
 fn send(text: &str) -> AgentCommand {
-    AgentCommand::SendMessage { text: text.into(), images: vec![] }
+    AgentCommand::SendMessage {
+        text: text.into(),
+        images: vec![],
+    }
 }
 
-fn spawn_agent(
-    provider: Arc<dyn LlmProvider>,
-    hook: Arc<dyn LifecycleHooks>,
-) -> AgentHandle {
+fn spawn_agent(provider: Arc<dyn LlmProvider>, hook: Arc<dyn LifecycleHooks>) -> AgentHandle {
     let reg = ToolRegistry::new();
     Agent::builder()
         .provider(provider)
@@ -44,7 +44,9 @@ struct Once429Provider {
 
 impl Once429Provider {
     fn new() -> Self {
-        Self { calls: AtomicU32::new(0) }
+        Self {
+            calls: AtomicU32::new(0),
+        }
     }
 }
 
@@ -100,17 +102,24 @@ async fn rate_limit_pause_emits_ratelimited_not_error() {
     }
 
     assert!(
-        collected.iter().any(|e| matches!(e, AgentEvent::RateLimited { .. })),
+        collected
+            .iter()
+            .any(|e| matches!(e, AgentEvent::RateLimited { .. })),
         "must emit RateLimited: {collected:?}"
     );
     assert!(
-        !collected.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        !collected
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { .. })),
         "must NOT emit Error on pause: {collected:?}"
     );
     assert!(
-        collected
-            .iter()
-            .any(|e| matches!(e, AgentEvent::TurnComplete { reason: StopReason::RateLimited })),
+        collected.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnComplete {
+                reason: StopReason::RateLimited
+            }
+        )),
         "TurnComplete must carry RateLimited reason: {collected:?}"
     );
 }
@@ -123,7 +132,9 @@ struct MidStream429Provider {
 
 impl MidStream429Provider {
     fn new() -> Self {
-        Self { calls: AtomicU32::new(0) }
+        Self {
+            calls: AtomicU32::new(0),
+        }
     }
 }
 
@@ -165,7 +176,9 @@ impl LlmProvider for MidStream429Provider {
 #[tokio::test]
 async fn mid_stream_429_wait_and_retry_resumes() {
     let provider = Arc::new(MidStream429Provider::new());
-    let hook = Arc::new(ScriptedRateLimitHook::new(RateLimitDecision::WaitAndRetry { secs: 0 }));
+    let hook = Arc::new(ScriptedRateLimitHook::new(
+        RateLimitDecision::WaitAndRetry { secs: 0 },
+    ));
 
     let handle = spawn_agent(provider, hook);
     handle.commands.send(send("go")).unwrap();
@@ -181,17 +194,24 @@ async fn mid_stream_429_wait_and_retry_resumes() {
     }
 
     assert!(
-        collected.iter().any(|e| matches!(e, AgentEvent::RateLimited { .. })),
+        collected
+            .iter()
+            .any(|e| matches!(e, AgentEvent::RateLimited { .. })),
         "must emit RateLimited on mid-stream 429: {collected:?}"
     );
     assert!(
-        !collected.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        !collected
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { .. })),
         "must NOT emit Error when WaitAndRetry succeeds: {collected:?}"
     );
     assert!(
-        collected
-            .iter()
-            .any(|e| matches!(e, AgentEvent::TurnComplete { reason: StopReason::Stopped })),
+        collected.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnComplete {
+                reason: StopReason::Stopped
+            }
+        )),
         "turn must complete with Stopped after mid-stream 429 retry: {collected:?}"
     );
 }
@@ -201,7 +221,9 @@ async fn mid_stream_429_wait_and_retry_resumes() {
 #[tokio::test]
 async fn rate_limit_wait_then_resumes_turn() {
     let provider = Arc::new(Once429Provider::new());
-    let hook = Arc::new(ScriptedRateLimitHook::new(RateLimitDecision::WaitAndRetry { secs: 0 }));
+    let hook = Arc::new(ScriptedRateLimitHook::new(
+        RateLimitDecision::WaitAndRetry { secs: 0 },
+    ));
 
     let handle = spawn_agent(provider, hook);
     handle.commands.send(send("go")).unwrap();
@@ -223,9 +245,12 @@ async fn rate_limit_wait_then_resumes_turn() {
         "turn must resume and produce content: {collected:?}"
     );
     assert!(
-        collected
-            .iter()
-            .any(|e| matches!(e, AgentEvent::TurnComplete { reason: StopReason::Stopped })),
+        collected.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnComplete {
+                reason: StopReason::Stopped
+            }
+        )),
         "turn must end with Stopped after successful retry: {collected:?}"
     );
 }

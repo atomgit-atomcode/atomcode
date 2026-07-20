@@ -315,7 +315,10 @@ mod tests {
         // a transient 429 as "5-hour window exhausted").
         let d = decide_from_windows(
             &[win_sized(18000, 7200, false), win_sized(3600, 90, false)],
-            &RateLimitHint { http_status: Some(429), retry_after_secs: Some(15) },
+            &RateLimitHint {
+                http_status: Some(429),
+                retry_after_secs: Some(15),
+            },
         );
         assert_eq!(d, RateLimitDecision::WaitAndRetry { secs: 15 });
     }
@@ -331,7 +334,10 @@ mod tests {
         assert_eq!(
             decide_from_windows(
                 &[win_sized(18000, 14160, false)],
-                &RateLimitHint { http_status: Some(429), retry_after_secs: Some(20) },
+                &RateLimitHint {
+                    http_status: Some(429),
+                    retry_after_secs: Some(20)
+                },
             ),
             RateLimitDecision::WaitAndRetry { secs: 20 },
         );
@@ -339,10 +345,20 @@ mod tests {
         // time/countdown (that's what read as the bogus "5小时窗口已用尽 3h56m").
         match decide_from_windows(
             &[win_sized(18000, 14160, false)],
-            &RateLimitHint { http_status: Some(429), retry_after_secs: None },
+            &RateLimitHint {
+                http_status: Some(429),
+                retry_after_secs: None,
+            },
         ) {
-            RateLimitDecision::Pause { reset_at_display, secs_until_reset, .. } => {
-                assert!(reset_at_display.is_empty(), "must not show a healthy window's reset time");
+            RateLimitDecision::Pause {
+                reset_at_display,
+                secs_until_reset,
+                ..
+            } => {
+                assert!(
+                    reset_at_display.is_empty(),
+                    "must not show a healthy window's reset time"
+                );
                 assert_eq!(secs_until_reset, None);
             }
             RateLimitDecision::WaitAndRetry { .. } => {}

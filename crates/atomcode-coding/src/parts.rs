@@ -26,8 +26,8 @@ use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry};
 use atomcode_capabilities::memory::MemoryHook;
 use atomcode_capabilities::provider::model_suggests_vision;
 use atomcode_capabilities::session::{
-    RecallTool, SessionContextHook, SessionLease, SessionManager, SnapshotHook, StatusReminderHook,
-    TranscriptHook,
+    PresentationFile, RecallTool, SessionContextHook, SessionLease, SessionManager, SessionMeta,
+    SnapshotHook, StatusReminderHook, StorageOwner, TranscriptHook,
 };
 use atomcode_capabilities::skills::{
     register_skill_tools, standard_skill_dirs, SkillCatalogHook, SkillRegistry,
@@ -422,6 +422,17 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             let id = uuid::Uuid::new_v4().to_string();
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
             let lease = session_lease(&manager, &id, reuse_lease.as_ref())?;
+            let now = atomcode_capabilities::session::now_ms();
+            let mut meta = SessionMeta::new(&id, cfg.working_dir.to_string_lossy().as_ref(), now);
+            meta.owner = StorageOwner::Native;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&SessionSnapshot::new(Vec::new())),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .map_err(io::Error::from)?;
             Some(SessionBinding {
                 id,
                 manager,
@@ -498,7 +509,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     hooks.push(Arc::new(SkillCatalogHook::new(skill_catalog)));
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
-        let snapshot_hook = Arc::new(SnapshotHook::new(b.manager.clone(), &b.id, &wd));
+        let snapshot_hook =
+            Arc::new(SnapshotHook::new(b.manager.clone(), &b.id, &wd).with_lease(b.lease.clone()));
         compaction_checkpoint = Some(snapshot_hook.clone());
         hooks.push(snapshot_hook);
         hooks.push(Arc::new(TranscriptHook::new(b.manager.clone(), &b.id)));
@@ -627,7 +639,12 @@ fn session_lease(
     reuse_lease: Option<&SessionLease>,
 ) -> io::Result<SessionLease> {
     match reuse_lease.filter(|lease| lease.id() == id) {
-        Some(lease) => Ok(lease.clone()),
+        Some(lease) => {
+            manager
+                .validate_active_lease(lease)
+                .map_err(io::Error::from)?;
+            Ok(lease.clone())
+        }
         None => manager.acquire_lease(id).map_err(Into::into),
     }
 }
@@ -974,7 +991,11 @@ const ATOMCODE_PERSONA_PREFIX: &str =
 /// system prompt. A v2 resume must restore that prompt, while a model switch must
 /// replace the old model identity instead of retaining or duplicating it.
 fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, model: &str) {
-    let persona = coding_persona(model, crate::persona::todo_switch_enabled(), crate::persona::request_user_input_switch_enabled());
+    let persona = coding_persona(
+        model,
+        crate::persona::todo_switch_enabled(),
+        crate::persona::request_user_input_switch_enabled(),
+    );
     let is_persona = |message: &Message| {
         message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
     };
@@ -1128,7 +1149,11 @@ mod tests {
         // the persona string (captured and reconciled).  We hold the serial lock, so this
         // is safe.
         let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
-        let persona = coding_persona("deepseek-v4-flash", crate::persona::todo_switch_enabled(), crate::persona::request_user_input_switch_enabled());
+        let persona = coding_persona(
+            "deepseek-v4-flash",
+            crate::persona::todo_switch_enabled(),
+            crate::persona::request_user_input_switch_enabled(),
+        );
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(persona.clone()),
             Message::system("SESSION CONTEXT"),
@@ -1209,6 +1234,12 @@ mod tests {
         persistent.session = SessionMode::Fresh;
         let parts = prepare(&cfg, persistent).await.unwrap();
         assert!(parts.compaction_checkpoint.is_some());
+        let binding = parts.session.as_ref().unwrap();
+        assert_eq!(
+            binding.manager.read_meta(&binding.id).unwrap().owner,
+            StorageOwner::Native
+        );
+        assert!(binding.manager.load_snapshot(&binding.id).is_ok());
 
         let ephemeral = prepare(&cfg, io_free_opts()).await.unwrap();
         assert!(ephemeral.compaction_checkpoint.is_none());

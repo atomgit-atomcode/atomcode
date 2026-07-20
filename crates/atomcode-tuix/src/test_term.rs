@@ -661,7 +661,11 @@ mod tests {
         let mut vt = VirtualTerminal::new(10, 1);
         vt.feed("\x1b[1;1H你".as_bytes());
         assert_eq!(vt.cell_at(0, 0).ch, '你');
-        assert_eq!(vt.cell_at(0, 1).ch, ' ', "default: continuation stays blank");
+        assert_eq!(
+            vt.cell_at(0, 1).ch,
+            ' ',
+            "default: continuation stays blank"
+        );
     }
 
     #[test]

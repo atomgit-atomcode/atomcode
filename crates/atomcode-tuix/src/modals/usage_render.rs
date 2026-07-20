@@ -39,7 +39,9 @@ pub fn sparkline(values: &[u64], width: usize) -> String {
     let buckets: Vec<u64> = (0..width)
         .map(|i| {
             let lo = i * values.len() / width;
-            let hi = ((i + 1) * values.len() / width).max(lo + 1).min(values.len());
+            let hi = ((i + 1) * values.len() / width)
+                .max(lo + 1)
+                .min(values.len());
             let slice = &values[lo..hi];
             slice.iter().sum::<u64>() / slice.len() as u64
         })
@@ -69,7 +71,7 @@ pub struct HeatCell {
     pub week_col: usize, // 0-based column (week index from the first date)
     pub level: u8,       // 0..=5 intensity
     pub month_start: bool,
-    pub month: u8,       // 1..=12
+    pub month: u8, // 1..=12
 }
 
 /// 0..=5 intensity per day. Level 0 = zero activity.
@@ -139,7 +141,9 @@ pub fn calendar_layout(rows: &[(String, u64)]) -> Vec<HeatCell> {
     let mut out = Vec::with_capacity(rows.len());
     let mut prev_month = 0u32;
     for (i, (date, _)) in rows.iter().enumerate() {
-        let Some((y, m, d)) = parse_ymd(date) else { continue };
+        let Some((y, m, d)) = parse_ymd(date) else {
+            continue;
+        };
         let epoch = days_from_civil(y, m, d);
         out.push(HeatCell {
             weekday: weekday_of(epoch),
@@ -209,7 +213,11 @@ pub fn braille_plot(series: &[Vec<u64>], width_cells: usize, height_cells: usize
 ///
 /// Each series is plotted independently (single-series call for per-model colouring)
 /// or merged (multi-series call). Y-scale is shared across all series via gmax.
-pub fn braille_line_plot(series: &[Vec<u64>], width_cells: usize, height_cells: usize) -> Vec<Vec<u8>> {
+pub fn braille_line_plot(
+    series: &[Vec<u64>],
+    width_cells: usize,
+    height_cells: usize,
+) -> Vec<Vec<u8>> {
     let mut grid = vec![vec![0u8; width_cells.max(1)]; height_cells.max(1)];
     if width_cells == 0 || height_cells == 0 {
         return grid;
@@ -279,7 +287,10 @@ mod tests {
         // 0% → no filled blocks, entire track is ░
         let zero = progress_bar(0.0, 10);
         assert_eq!(zero.chars().filter(|c| *c == '█').count(), 0);
-        assert!(zero.chars().all(|c| c == '░'), "0% bar should be all ░, got: {zero}");
+        assert!(
+            zero.chars().all(|c| c == '░'),
+            "0% bar should be all ░, got: {zero}"
+        );
         assert_eq!(progress_bar(100.0, 10), "██████████");
         // 9% of 10 cells ≈ 0.9 cell → at least one partial/edge cell, not full
         let b = progress_bar(9.0, 10);
@@ -319,7 +330,11 @@ mod tests {
         assert_eq!(levels[0], 0, "zero must be level 0");
         assert_eq!(levels[4], 5, "max value must be level 5");
         for w in levels.windows(2) {
-            assert!(w[0] <= w[1], "levels must be non-decreasing; got {:?}", levels);
+            assert!(
+                w[0] <= w[1],
+                "levels must be non-decreasing; got {:?}",
+                levels
+            );
         }
     }
 
@@ -339,15 +354,27 @@ mod tests {
             assert!(has_dot, "dot column {dx} has no dots — line has a gap");
         }
         // Rising series: bottom-left cell has dots, top-right cell has dots
-        assert!(grid[1][0] != 0, "bottom-left cell should have dots for rising series");
-        assert!(grid[0][3] != 0, "top-right cell should have dots for rising series");
+        assert!(
+            grid[1][0] != 0,
+            "bottom-left cell should have dots for rising series"
+        );
+        assert!(
+            grid[0][3] != 0,
+            "top-right cell should have dots for rising series"
+        );
     }
 
     #[test]
     fn braille_line_plot_flat_zero_stays_bottom() {
         let flat = braille_line_plot(&[vec![0, 0, 0, 0]], 2, 2);
-        assert!(flat[1].iter().any(|&c| c != 0), "flat-zero series should land in bottom row");
-        assert!(flat[0].iter().all(|&c| c == 0), "flat-zero series should not touch top row");
+        assert!(
+            flat[1].iter().any(|&c| c != 0),
+            "flat-zero series should land in bottom row"
+        );
+        assert!(
+            flat[0].iter().all(|&c| c == 0),
+            "flat-zero series should not touch top row"
+        );
     }
 
     #[test]
@@ -370,9 +397,9 @@ mod tests {
     fn braille_plot_rising_series_lands_dots() {
         // one rising series over a 4-cell-wide, 2-cell-high plot
         let grid = braille_plot(&[vec![0, 1, 2, 3, 4, 5, 6, 7]], 4, 2);
-        assert_eq!(grid.len(), 2);          // height rows
-        assert_eq!(grid[0].len(), 4);       // width cells
-        // rising series: bottom-left cell has dots, top-right cell has dots
+        assert_eq!(grid.len(), 2); // height rows
+        assert_eq!(grid[0].len(), 4); // width cells
+                                      // rising series: bottom-left cell has dots, top-right cell has dots
         assert!(grid[1][0] != 0, "bottom-left should have dots");
         assert!(grid[0][3] != 0, "top-right should have dots");
         // flat-zero series → only the bottom row lights up

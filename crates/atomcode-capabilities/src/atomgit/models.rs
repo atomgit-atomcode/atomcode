@@ -125,9 +125,11 @@ mod tests {
 
     #[test]
     fn pr_number_as_string_or_int() {
-        let a: PullRequest = serde_json::from_str(r#"{"number":"7","title":"t","state":"open"}"#).unwrap();
+        let a: PullRequest =
+            serde_json::from_str(r#"{"number":"7","title":"t","state":"open"}"#).unwrap();
         assert_eq!(a.number, 7);
-        let b: PullRequest = serde_json::from_str(r#"{"number":42,"title":"t","state":"open"}"#).unwrap();
+        let b: PullRequest =
+            serde_json::from_str(r#"{"number":42,"title":"t","state":"open"}"#).unwrap();
         assert_eq!(b.number, 42);
     }
 
@@ -140,10 +142,9 @@ mod tests {
         assert_eq!(r.owner.login, "o");
         assert!(r.private);
 
-        let pr: PullRequest = serde_json::from_str(
-            r#"{"number":1,"head":{"ref":"feat"},"base":{"ref":"main"}}"#,
-        )
-        .unwrap();
+        let pr: PullRequest =
+            serde_json::from_str(r#"{"number":1,"head":{"ref":"feat"},"base":{"ref":"main"}}"#)
+                .unwrap();
         assert_eq!(pr.head.ref_, "feat");
         assert_eq!(pr.base.ref_, "main");
     }

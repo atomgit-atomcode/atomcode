@@ -46,8 +46,16 @@ pub struct Diagnostic {
 impl Diagnostic {
     /// `file:line:col [SEVERITY] code message (source)` — one line per diagnostic.
     pub fn display_line(&self) -> String {
-        let code = self.code.as_deref().map(|c| format!(" {c}")).unwrap_or_default();
-        let src = self.source.as_deref().map(|s| format!(" ({s})")).unwrap_or_default();
+        let code = self
+            .code
+            .as_deref()
+            .map(|c| format!(" {c}"))
+            .unwrap_or_default();
+        let src = self
+            .source
+            .as_deref()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
         format!(
             "{}:{}:{} [{}]{} {}{}",
             self.file,
@@ -87,8 +95,15 @@ mod tests {
             source: Some("rustc".into()),
             code: Some("E0308".into()),
         };
-        assert_eq!(d.display_line(), "src/main.rs:10:5 [ERROR] E0308 type mismatch (rustc)");
-        let d2 = Diagnostic { code: None, source: None, ..d };
+        assert_eq!(
+            d.display_line(),
+            "src/main.rs:10:5 [ERROR] E0308 type mismatch (rustc)"
+        );
+        let d2 = Diagnostic {
+            code: None,
+            source: None,
+            ..d
+        };
         assert_eq!(d2.display_line(), "src/main.rs:10:5 [ERROR] type mismatch");
     }
 }

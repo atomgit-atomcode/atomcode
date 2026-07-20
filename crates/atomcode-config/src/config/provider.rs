@@ -257,7 +257,10 @@ mod tests {
         // Round-trips on save, and `None` is not emitted (existing configs stay clean).
         let s = toml::to_string(&cfg).expect("serialize");
         assert!(s.contains("capable_model = 1"), "set rank must serialize");
-        let none_cfg = ProviderConfig { capable_model: None, ..cfg };
+        let none_cfg = ProviderConfig {
+            capable_model: None,
+            ..cfg
+        };
         let s2 = toml::to_string(&none_cfg).expect("serialize");
         assert!(!s2.contains("capable_model"), "None must not be serialized");
     }

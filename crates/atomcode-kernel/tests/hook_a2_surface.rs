@@ -13,6 +13,7 @@
 //!   * `on_request` — read-only wire observation AFTER `pre_request` projects, so
 //!     telemetry/datalog/cache-RCA sees the FINAL outgoing request.
 
+use async_trait::async_trait;
 use atomcode_kernel::agent::{Agent, AgentHandle};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::hook::{HookChain, LifecycleHooks, NoopHooks, TurnCtx};
@@ -21,17 +22,26 @@ use atomcode_kernel::provider::ChatOptions;
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::{EchoTool, RecordingProvider};
 use atomcode_kernel::tool::{ToolCall, ToolDef, ToolRegistry};
-use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 
 const PERSONA: &str = "you are a neutral test agent";
 
 fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
-    ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args.into(),
+    }
 }
 
 async fn drive_one_turn(handle: &mut AgentHandle, text: &str) {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: text.into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -88,7 +98,13 @@ async fn on_text_delta_redacts_streamed_output() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     // Collect the LIVE streamed deltas.
     let mut streamed = String::new();
@@ -132,7 +148,10 @@ async fn on_text_delta_redacts_streamed_output() {
         assistant.text
     );
     // Consistency: stream and storage agree byte-for-byte.
-    assert_eq!(streamed, assistant.text, "streamed text and stored text must be identical");
+    assert_eq!(
+        streamed, assistant.text,
+        "streamed text and stored text must be identical"
+    );
 }
 
 // CLAIM 33a': the reasoning→content PROMOTION (recovering a misrouted answer) must pass
@@ -155,7 +174,13 @@ async fn promoted_reasoning_passes_through_the_text_delta_redaction_seam() {
         .hook(Arc::new(DeltaRedactHook))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     let mut streamed = String::new();
     while let Some(ev) = handle.events.recv().await {
@@ -167,16 +192,33 @@ async fn promoted_reasoning_passes_through_the_text_delta_redaction_seam() {
     }
     // The promoted body reached the driver as TEXT, REDACTED by on_text_delta (not the raw
     // secret) — proving the promotion does not bypass the content-scrub seam.
-    assert!(streamed.contains("[REDACTED]"), "promoted body must be emitted as text; got {streamed:?}");
-    assert!(!streamed.contains("SECRET"), "promoted body must be scrubbed by on_text_delta; got {streamed:?}");
+    assert!(
+        streamed.contains("[REDACTED]"),
+        "promoted body must be emitted as text; got {streamed:?}"
+    );
+    assert!(
+        !streamed.contains("SECRET"),
+        "promoted body must be scrubbed by on_text_delta; got {streamed:?}"
+    );
 
     let snapshot = capture_snapshot(&mut handle).await;
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
-    let assistant =
-        snapshot.messages.iter().find(|m| m.role == Role::Assistant).expect("an assistant message");
-    assert!(!assistant.text.contains("SECRET"), "stored promoted content must be scrubbed; got {:?}", assistant.text);
-    assert!(assistant.text.contains("[REDACTED]"), "stored content must show the redaction; got {:?}", assistant.text);
+    let assistant = snapshot
+        .messages
+        .iter()
+        .find(|m| m.role == Role::Assistant)
+        .expect("an assistant message");
+    assert!(
+        !assistant.text.contains("SECRET"),
+        "stored promoted content must be scrubbed; got {:?}",
+        assistant.text
+    );
+    assert!(
+        assistant.text.contains("[REDACTED]"),
+        "stored content must show the redaction; got {:?}",
+        assistant.text
+    );
 }
 
 // ── Item 1b: on_reasoning_delta closes the reasoning redaction leak ───────────
@@ -219,7 +261,13 @@ async fn on_reasoning_delta_redacts_reasoning() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     // Collect the LIVE streamed reasoning.
     let mut streamed_reasoning = String::new();
@@ -304,7 +352,13 @@ async fn cleared_delta_emits_no_event() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     // ZERO AgentEvent::TextDelta events must reach the driver (each chunk was
     // cleared → suppressed, not emitted as "").
@@ -396,9 +450,15 @@ async fn session_start_resumed_flag_lets_seed_hook_skip() {
     fresh.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = fresh.task.await;
 
-    let fresh_seed_count =
-        snapshot.messages.iter().filter(|m| m.text == SEED_MARKER).count();
-    assert_eq!(fresh_seed_count, 1, "a FRESH session must seed exactly once; got {fresh_seed_count}");
+    let fresh_seed_count = snapshot
+        .messages
+        .iter()
+        .filter(|m| m.text == SEED_MARKER)
+        .count();
+    assert_eq!(
+        fresh_seed_count, 1,
+        "a FRESH session must seed exactly once; got {fresh_seed_count}"
+    );
 
     // Resumed session: the seed marker must NOT be re-injected. The resumed
     // conversation must equal EXACTLY the snapshot's messages (no duplicate seed)
@@ -415,8 +475,11 @@ async fn session_start_resumed_flag_lets_seed_hook_skip() {
     let _ = resumed.task.await;
 
     // No double-seed: still exactly ONE seed marker (the one already in the snapshot).
-    let resumed_seed_count =
-        resumed_snapshot.messages.iter().filter(|m| m.text == SEED_MARKER).count();
+    let resumed_seed_count = resumed_snapshot
+        .messages
+        .iter()
+        .filter(|m| m.text == SEED_MARKER)
+        .count();
     assert_eq!(
         resumed_seed_count, 1,
         "a RESUMED session must NOT re-inject the seed (no double-seed); got {resumed_seed_count}"
@@ -491,7 +554,10 @@ async fn on_request_observes_final_wire() {
             StreamEvent::ToolCall(tool_call("c1", "echo", "{\"text\":\"hi\"}")),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
 
@@ -517,8 +583,18 @@ async fn on_request_observes_final_wire() {
     let recorded = calls.lock().unwrap();
 
     // (a) BOTH rounds captured.
-    assert_eq!(seen.len(), 2, "on_request must fire once per round (2 rounds); got {}", seen.len());
-    assert_eq!(recorded.len(), 2, "provider should have received 2 calls; got {}", recorded.len());
+    assert_eq!(
+        seen.len(),
+        2,
+        "on_request must fire once per round (2 rounds); got {}",
+        seen.len()
+    );
+    assert_eq!(
+        recorded.len(),
+        2,
+        "provider should have received 2 calls; got {}",
+        recorded.len()
+    );
 
     // (b) round/epoch carried via TurnCtx, in order.
     assert_eq!(seen[0].round, 1, "first observed round must be 1");
@@ -540,9 +616,19 @@ async fn on_request_observes_final_wire() {
             "the pre_request projection must be present in the observed/recorded wire on round {i}"
         );
         // tools + options also reach the observer (final wire is complete).
-        assert_eq!(obs.tools_len, recorded[i].1.len(), "tool count must match the wire on round {i}");
-        assert_eq!(obs.options, recorded[i].2, "options must match the wire on round {i}");
-        assert_eq!(obs.cache_epoch, 0, "no compaction → cache_epoch stays 0 on round {i}");
+        assert_eq!(
+            obs.tools_len,
+            recorded[i].1.len(),
+            "tool count must match the wire on round {i}"
+        );
+        assert_eq!(
+            obs.options, recorded[i].2,
+            "options must match the wire on round {i}"
+        );
+        assert_eq!(
+            obs.cache_epoch, 0,
+            "no compaction → cache_epoch stays 0 on round {i}"
+        );
     }
 }
 
@@ -553,20 +639,32 @@ async fn noop_and_empty_hookchain_have_new_methods_as_noop() {
     // on_text_delta: no-op leaves the delta unchanged.
     let mut delta = "untouched SECRET".to_string();
     NoopHooks.on_text_delta(&mut delta).await;
-    assert_eq!(delta, "untouched SECRET", "NoopHooks::on_text_delta must not mutate");
+    assert_eq!(
+        delta, "untouched SECRET",
+        "NoopHooks::on_text_delta must not mutate"
+    );
 
     let chain = HookChain::new(vec![]);
     let mut delta2 = "also untouched".to_string();
     chain.on_text_delta(&mut delta2).await;
-    assert_eq!(delta2, "also untouched", "empty HookChain::on_text_delta must not mutate");
+    assert_eq!(
+        delta2, "also untouched",
+        "empty HookChain::on_text_delta must not mutate"
+    );
 
     // on_reasoning_delta: no-op leaves the reasoning delta unchanged (symmetric).
     let mut rdelta = "reasoning SECRET".to_string();
     NoopHooks.on_reasoning_delta(&mut rdelta).await;
-    assert_eq!(rdelta, "reasoning SECRET", "NoopHooks::on_reasoning_delta must not mutate");
+    assert_eq!(
+        rdelta, "reasoning SECRET",
+        "NoopHooks::on_reasoning_delta must not mutate"
+    );
     let mut rdelta2 = "also reasoning".to_string();
     chain.on_reasoning_delta(&mut rdelta2).await;
-    assert_eq!(rdelta2, "also reasoning", "empty HookChain::on_reasoning_delta must not mutate");
+    assert_eq!(
+        rdelta2, "also reasoning",
+        "empty HookChain::on_reasoning_delta must not mutate"
+    );
 
     // session_start(resumed): no-op leaves the conversation unchanged either way.
     let mut convo = Conversation::new();
@@ -574,7 +672,10 @@ async fn noop_and_empty_hookchain_have_new_methods_as_noop() {
     NoopHooks.session_start(&mut convo, true).await;
     chain.session_start(&mut convo, false).await;
     chain.session_start(&mut convo, true).await;
-    assert!(convo.messages.is_empty(), "no-op session_start must not push any message");
+    assert!(
+        convo.messages.is_empty(),
+        "no-op session_start must not push any message"
+    );
 
     // on_request: read-only no-op (just must not panic).
     let msgs: Vec<Message> = vec![Message::user("hi")];

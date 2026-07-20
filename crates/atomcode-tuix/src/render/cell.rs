@@ -211,11 +211,7 @@ pub fn push_str_cells(row: &mut Vec<Cell>, s: &str, style: &CellStyle) {
 /// Non-SGR CSI sequences (cursor moves, DSR, etc.) are silently
 /// dropped — they should have been scrubbed upstream; this is
 /// belt-and-suspenders.
-pub fn push_str_cells_sgr(
-    row: &mut Vec<Cell>,
-    s: &str,
-    mut working_style: CellStyle,
-) -> CellStyle {
+pub fn push_str_cells_sgr(row: &mut Vec<Cell>, s: &str, mut working_style: CellStyle) -> CellStyle {
     let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
@@ -552,7 +548,8 @@ pub fn serialize_frames_tight(prev: &[Vec<Cell>], next: &[Vec<Cell>]) -> Vec<u8>
         let p = prev.get(r).map(Vec::as_slice).unwrap_or(&[]);
         let n = next.get(r).map(Vec::as_slice).unwrap_or(&[]);
         let max_cols = p.len().max(n.len());
-        let changed = (0..max_cols).any(|c| p.get(c).unwrap_or(&blank) != n.get(c).unwrap_or(&blank));
+        let changed =
+            (0..max_cols).any(|c| p.get(c).unwrap_or(&blank) != n.get(c).unwrap_or(&blank));
         if !changed {
             continue;
         }
@@ -789,7 +786,11 @@ mod tests {
 
         // Truecolor `38;2;R;G;B` should also resolve to Rgb.
         let mut row3: Vec<Cell> = Vec::new();
-        push_str_cells_sgr(&mut row3, "\x1b[38;2;10;20;30mY\x1b[0m", CellStyle::default());
+        push_str_cells_sgr(
+            &mut row3,
+            "\x1b[38;2;10;20;30mY\x1b[0m",
+            CellStyle::default(),
+        );
         assert_eq!(row3.len(), 1);
         assert_eq!(
             row3[0].style.fg,
@@ -1335,7 +1336,11 @@ mod tests {
         let prev = vec![vec![Cell::blank(); 5]];
         let next = vec![rule];
         let s = String::from_utf8(serialize_frames_tight(&prev, &next)).unwrap();
-        assert!(s.starts_with("\x1b[1;1H\x1b[K"), "row opens with CUP+EL: {:?}", s);
+        assert!(
+            s.starts_with("\x1b[1;1H\x1b[K"),
+            "row opens with CUP+EL: {:?}",
+            s
+        );
         // 'H' is the final byte of a CUP; exactly one for the whole row.
         assert_eq!(s.matches('H').count(), 1, "exactly one CUP, got: {:?}", s);
         assert!(s.contains("─────"), "dashes must be contiguous: {:?}", s);
@@ -1356,16 +1361,33 @@ mod tests {
         // re-stream only "he" (never re-emit the stale tail).
         let prev_row: Vec<Cell> = "hello"
             .chars()
-            .map(|ch| Cell { ch, style: CellStyle::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: CellStyle::default(),
+                width: 1,
+            })
             .collect();
         let next_row: Vec<Cell> = "he"
             .chars()
-            .map(|ch| Cell { ch, style: CellStyle::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: CellStyle::default(),
+                width: 1,
+            })
             .collect();
-        let s = String::from_utf8(serialize_frames_tight(&vec![prev_row], &vec![next_row])).unwrap();
-        assert!(s.contains("\x1b[1;1H\x1b[K"), "row cleared with EL: {:?}", s);
+        let s =
+            String::from_utf8(serialize_frames_tight(&vec![prev_row], &vec![next_row])).unwrap();
+        assert!(
+            s.contains("\x1b[1;1H\x1b[K"),
+            "row cleared with EL: {:?}",
+            s
+        );
         assert!(s.contains("he"));
-        assert!(!s.contains("llo"), "stale tail must not be re-emitted: {:?}", s);
+        assert!(
+            !s.contains("llo"),
+            "stale tail must not be re-emitted: {:?}",
+            s
+        );
     }
 
     #[test]
@@ -1377,7 +1399,11 @@ mod tests {
         let prev = vec![vec![Cell::blank(); row.len()]];
         let next = vec![row];
         let s = String::from_utf8(serialize_frames_tight(&prev, &next)).unwrap();
-        assert!(s.contains("a你b"), "glyph emitted once, no phantom cont: {:?}", s);
+        assert!(
+            s.contains("a你b"),
+            "glyph emitted once, no phantom cont: {:?}",
+            s
+        );
         assert_eq!(s.matches('H').count(), 1, "single CUP for the row: {:?}", s);
     }
 
@@ -1386,11 +1412,19 @@ mod tests {
         // Row went from content to all-blank → only CUP+EL, nothing streamed.
         let prev_row: Vec<Cell> = "xy"
             .chars()
-            .map(|ch| Cell { ch, style: CellStyle::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: CellStyle::default(),
+                width: 1,
+            })
             .collect();
         let next = vec![vec![Cell::blank(); 2]];
         let s = String::from_utf8(serialize_frames_tight(&vec![prev_row], &next)).unwrap();
-        assert_eq!(s, "\x1b[1;1H\x1b[K", "blank row emits only the clear: {:?}", s);
+        assert_eq!(
+            s, "\x1b[1;1H\x1b[K",
+            "blank row emits only the clear: {:?}",
+            s
+        );
     }
 
     /// Reverse: wide→narrow at same cell index. The wide char's

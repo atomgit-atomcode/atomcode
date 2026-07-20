@@ -69,9 +69,10 @@ impl Tool for WriteFileTool {
             }
         };
         if super::is_sensitive_input_path(&parsed.file_path) {
-            return ApprovalRequirement::RequireApproval(
-                format!("Writing to sensitive system path: {}", parsed.file_path),
-            );
+            return ApprovalRequirement::RequireApproval(format!(
+                "Writing to sensitive system path: {}",
+                parsed.file_path
+            ));
         }
         // Overwriting existing files is blocked in execute() — no need to
         // RequireApproval here. Only new file creation is auto-approved.

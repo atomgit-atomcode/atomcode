@@ -262,17 +262,26 @@ impl HttpClient {
 
         let mut req = self.client.post(&self.url).json(&request);
 
-        let user_has_accept = self.headers.keys().any(|k| k.eq_ignore_ascii_case("accept"));
+        let user_has_accept = self
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("accept"));
         if !user_has_accept {
             req = req.header("Accept", MCP_HTTP_ACCEPT);
         }
 
-        let user_has_authorization = self.headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
+        let user_has_authorization = self
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("authorization"));
         for (key, value) in &self.headers {
             req = req.header(key, value);
         }
 
-        let user_has_session = self.headers.keys().any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+        let user_has_session = self
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
         if !user_has_session {
             if let Some(sid) = self.session_id().await {
                 req = req.header("Mcp-Session-Id", sid);
@@ -636,7 +645,11 @@ mod session_tests {
         if let Some(s) = session {
             out.push_str(&format!("Mcp-Session-Id: {s}\r\n"));
         }
-        out.push_str(&format!("Content-Length: {}\r\nConnection: keep-alive\r\n\r\n{}", body.len(), body));
+        out.push_str(&format!(
+            "Content-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+            body.len(),
+            body
+        ));
         out
     }
 

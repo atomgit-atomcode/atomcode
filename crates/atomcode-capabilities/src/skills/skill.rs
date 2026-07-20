@@ -37,7 +37,9 @@ impl Skill {
         let mut i = 0;
         while i < t.len() {
             let rest = &t[i..];
-            if let Some((value, len)) = match_substitution(rest, &positional, arguments, session_id, skill_dir.as_ref()) {
+            if let Some((value, len)) =
+                match_substitution(rest, &positional, arguments, session_id, skill_dir.as_ref())
+            {
                 result.push_str(value);
                 i += len;
             } else {
@@ -176,7 +178,11 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
             fm.description = fm_value(v);
         } else if let Some(v) = line.strip_prefix("allowed-tools:") {
             // AgentSkills spec is space-delimited; also accept commas (Claude Code compat).
-            fm.allowed_tools = v.split([' ', ',']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            fm.allowed_tools = v
+                .split([' ', ','])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
     }
     (fm, body.to_string())
@@ -228,11 +234,20 @@ fn validate_skill_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 64 {
         return Err(format!("skill name '{name}' must be 1-64 characters"));
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/')
+    {
         return Err(format!("skill name '{name}' has invalid characters"));
     }
-    if name.starts_with(['/', '-']) || name.ends_with(['/', '-']) || name.contains("//") || name.contains("--") {
-        return Err(format!("skill name '{name}' has a bad slash/hyphen position"));
+    if name.starts_with(['/', '-'])
+        || name.ends_with(['/', '-'])
+        || name.contains("//")
+        || name.contains("--")
+    {
+        return Err(format!(
+            "skill name '{name}' has a bad slash/hyphen position"
+        ));
     }
     Ok(())
 }
@@ -248,23 +263,49 @@ fn make_name(base: &str, namespace: Option<&str>) -> String {
 /// Parse a flat `name.md` skill (name = file stem unless overridden in frontmatter).
 pub(crate) fn parse_skill_file(path: &Path, namespace: Option<&str>) -> Result<Skill, String> {
     let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let stem = path.file_stem().and_then(|s| s.to_str()).ok_or("invalid file name")?;
-    build_skill(&content, stem, path.parent().unwrap_or(Path::new(".")), path, namespace)
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("invalid file name")?;
+    build_skill(
+        &content,
+        stem,
+        path.parent().unwrap_or(Path::new(".")),
+        path,
+        namespace,
+    )
 }
 
 /// Parse a directory-style `<dir>/SKILL.md` (name = directory name unless overridden).
-pub(crate) fn parse_skill_dir(skill_dir: &Path, skill_md: &Path, namespace: Option<&str>) -> Result<Skill, String> {
+pub(crate) fn parse_skill_dir(
+    skill_dir: &Path,
+    skill_md: &Path,
+    namespace: Option<&str>,
+) -> Result<Skill, String> {
     let content = std::fs::read_to_string(skill_md).map_err(|e| e.to_string())?;
-    let dir_name = skill_dir.file_name().and_then(|s| s.to_str()).ok_or("invalid directory name")?;
+    let dir_name = skill_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("invalid directory name")?;
     build_skill(&content, dir_name, skill_dir, skill_md, namespace)
 }
 
-fn build_skill(content: &str, default_name: &str, skill_dir: &Path, source: &Path, namespace: Option<&str>) -> Result<Skill, String> {
+fn build_skill(
+    content: &str,
+    default_name: &str,
+    skill_dir: &Path,
+    source: &Path,
+    namespace: Option<&str>,
+) -> Result<Skill, String> {
     let (fm, template) = parse_frontmatter(content);
     let base = fm.name.as_deref().unwrap_or(default_name);
     validate_skill_name(base)?;
     let name = make_name(base, namespace);
-    let description = if fm.description.is_empty() { first_paragraph(&template) } else { fm.description };
+    let description = if fm.description.is_empty() {
+        first_paragraph(&template)
+    } else {
+        fm.description
+    };
     Ok(Skill {
         name,
         description,
@@ -294,8 +335,18 @@ mod tests {
     fn expand_arguments_full_and_positional() {
         // $ARGUMENTS = all args; positional $N / $ARGUMENTS[N] are 0-based ($0 = first).
         // A template WITHOUT $ARGUMENTS still gets the full args appended (production behavior).
-        assert_eq!(skill("do $ARGUMENTS now").expand("a b c", ""), "do a b c now");
-        assert_eq!(skill("first=$0 second=$1").expand("a b", "").lines().next().unwrap(), "first=a second=b");
+        assert_eq!(
+            skill("do $ARGUMENTS now").expand("a b c", ""),
+            "do a b c now"
+        );
+        assert_eq!(
+            skill("first=$0 second=$1")
+                .expand("a b", "")
+                .lines()
+                .next()
+                .unwrap(),
+            "first=a second=b"
+        );
         assert_eq!(skill("idx=$ARGUMENTS[1]").expand("a b", ""), "idx=b");
     }
 
@@ -330,7 +381,10 @@ mod tests {
         let (fm, body) = parse_frontmatter("---\nname: my-skill\ndescription: \"does X\"\nallowed-tools: read_file, bash\n---\nbody here\n");
         assert_eq!(fm.name.as_deref(), Some("my-skill"));
         assert_eq!(fm.description, "does X");
-        assert_eq!(fm.allowed_tools, vec!["read_file".to_string(), "bash".to_string()]);
+        assert_eq!(
+            fm.allowed_tools,
+            vec!["read_file".to_string(), "bash".to_string()]
+        );
         assert_eq!(body.trim(), "body here");
     }
 
@@ -356,9 +410,18 @@ mod tests {
 
     #[test]
     fn frontmatter_single_quotes_and_space_tools() {
-        let (fm, _) = parse_frontmatter("---\nname: 'my-skill'\nallowed-tools: read_file bash grep\n---\nbody\n");
+        let (fm, _) = parse_frontmatter(
+            "---\nname: 'my-skill'\nallowed-tools: read_file bash grep\n---\nbody\n",
+        );
         assert_eq!(fm.name.as_deref(), Some("my-skill"));
-        assert_eq!(fm.allowed_tools, vec!["read_file".to_string(), "bash".to_string(), "grep".to_string()]);
+        assert_eq!(
+            fm.allowed_tools,
+            vec![
+                "read_file".to_string(),
+                "bash".to_string(),
+                "grep".to_string()
+            ]
+        );
     }
 
     #[test]

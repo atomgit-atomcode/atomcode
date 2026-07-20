@@ -68,7 +68,9 @@ fn save_store(store: &TrustStore) -> anyhow::Result<()> {
 
 /// True iff `project_dir` is recorded as trusted.
 pub fn is_project_trusted(project_dir: &Path) -> bool {
-    load_store().projects.contains_key(&project_trust_key(project_dir))
+    load_store()
+        .projects
+        .contains_key(&project_trust_key(project_dir))
 }
 
 /// Record `project_dir` as trusted (idempotent, atomic).
@@ -77,7 +79,9 @@ pub fn trust_project(project_dir: &Path) -> anyhow::Result<()> {
     store.version = 1;
     store.projects.insert(
         project_trust_key(project_dir),
-        TrustEntry { path: project_dir.display().to_string() },
+        TrustEntry {
+            path: project_dir.display().to_string(),
+        },
     );
     save_store(&store)
 }
@@ -88,7 +92,11 @@ pub fn trust_project(project_dir: &Path) -> anyhow::Result<()> {
 /// Returns `Ok(false)` if the project was not trusted to begin with (no-op, no save).
 pub fn untrust_project(project_dir: &Path) -> anyhow::Result<bool> {
     let mut store = load_store();
-    if store.projects.remove(&project_trust_key(project_dir)).is_some() {
+    if store
+        .projects
+        .remove(&project_trust_key(project_dir))
+        .is_some()
+    {
         save_store(&store)?;
         Ok(true)
     } else {
@@ -107,7 +115,10 @@ pub struct TrustPartition {
 /// `blocked`; everything else is `allowed`. When trusted, all are `allowed`.
 pub fn partition_by_trust(configs: Vec<McpServerConfig>, project_dir: &Path) -> TrustPartition {
     if is_project_trusted(project_dir) {
-        return TrustPartition { allowed: configs, blocked: Vec::new() };
+        return TrustPartition {
+            allowed: configs,
+            blocked: Vec::new(),
+        };
     }
     let (blocked, allowed): (Vec<_>, Vec<_>) = configs
         .into_iter()
@@ -117,8 +128,8 @@ pub fn partition_by_trust(configs: Vec<McpServerConfig>, project_dir: &Path) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::config::McpTransportConfig;
+    use super::*;
     use serial_test::serial;
     use std::path::Path;
 
@@ -166,7 +177,10 @@ mod tests {
     fn corrupt_store_is_fail_closed() {
         let dir = with_temp_store("store2.json");
         std::fs::write(dir.path().join("store2.json"), b"{ not json").unwrap();
-        assert!(!is_project_trusted(Path::new("/tmp/x")), "corrupt store => untrusted");
+        assert!(
+            !is_project_trusted(Path::new("/tmp/x")),
+            "corrupt store => untrusted"
+        );
     }
 
     #[test]
@@ -179,8 +193,20 @@ mod tests {
             cfg("user-ok", McpConfigSource::User),
         ];
         let part = partition_by_trust(configs, proj);
-        assert_eq!(part.blocked.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["evil"]);
-        assert_eq!(part.allowed.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["user-ok"]);
+        assert_eq!(
+            part.blocked
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["evil"]
+        );
+        assert_eq!(
+            part.allowed
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user-ok"]
+        );
     }
 
     #[test]
@@ -189,8 +215,14 @@ mod tests {
         let _g = with_temp_store("store_un3.json");
         let proj = Path::new("/tmp/double-untrust");
         trust_project(proj).unwrap();
-        assert!(untrust_project(proj).unwrap(), "first untrust should be true");
-        assert!(!untrust_project(proj).unwrap(), "second untrust should be false");
+        assert!(
+            untrust_project(proj).unwrap(),
+            "first untrust should be true"
+        );
+        assert!(
+            !untrust_project(proj).unwrap(),
+            "second untrust should be false"
+        );
     }
 
     #[test]
@@ -199,7 +231,10 @@ mod tests {
         let _g = with_temp_store("store4.json");
         let proj = Path::new("/tmp/proj-trusted");
         trust_project(proj).unwrap();
-        let configs = vec![cfg("p", McpConfigSource::Project), cfg("u", McpConfigSource::User)];
+        let configs = vec![
+            cfg("p", McpConfigSource::Project),
+            cfg("u", McpConfigSource::User),
+        ];
         let part = partition_by_trust(configs, proj);
         assert!(part.blocked.is_empty());
         assert_eq!(part.allowed.len(), 2);

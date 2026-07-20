@@ -350,7 +350,11 @@ mod tests {
         );
         // Distinct shades, else the split is pointless; and never the red magenta.
         assert_ne!(Palette::SHELL_LIGHT, Palette::SHELL_DARK);
-        assert_ne!(Palette::SHELL_DARK, Palette::BRAND, "shell must not be the red brand magenta");
+        assert_ne!(
+            Palette::SHELL_DARK,
+            Palette::BRAND,
+            "shell must not be the red brand magenta"
+        );
         md_theme::set_theme_mode(false); // restore default
     }
 

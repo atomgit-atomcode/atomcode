@@ -25,14 +25,13 @@ pub mod hook;
 pub use atomcode_config::i18n;
 pub mod live;
 // `locale` fully lives in `atomcode-config` now (re-export shim removed).
+mod fs_atomic;
 pub mod lsp;
 pub mod mcp;
-pub mod proxy;
-pub mod provider;
-pub mod semantic;
-pub mod session;
 pub mod plugin;
-mod fs_atomic;
+pub mod provider;
+pub mod proxy;
+pub mod semantic;
 pub mod skill;
 pub mod skill_render;
 pub mod stream;

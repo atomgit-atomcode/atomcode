@@ -80,7 +80,9 @@ pub enum BeforeOutcome {
 impl BeforeOutcome {
     /// Block a call with a reason — ergonomic constructor (former `Err(reason)`).
     pub fn deny(reason: impl Into<String>) -> Self {
-        BeforeOutcome::Deny { reason: reason.into() }
+        BeforeOutcome::Deny {
+            reason: reason.into(),
+        }
     }
     /// True iff this is a [`Deny`](BeforeOutcome::Deny).
     pub fn is_deny(&self) -> bool {

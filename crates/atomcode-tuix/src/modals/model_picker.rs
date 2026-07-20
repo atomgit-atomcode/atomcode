@@ -202,7 +202,11 @@ impl Modal for ModelPicker {
                     );
                 }
                 renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::ModelSwitched { provider: &chosen, model: &display }).into_owned(),
+                    crate::i18n::t(crate::i18n::Msg::ModelSwitched {
+                        provider: &chosen,
+                        model: &display,
+                    })
+                    .into_owned(),
                 ));
                 renderer.flush();
                 Ok(ModalAction::Close)
@@ -260,15 +264,15 @@ fn build_menu_payload(p: &ModelPicker, ctx: &LoopCtx) -> MenuPayload {
         } else if p.query.is_empty() {
             "(no providers match)".to_string()
         } else {
-            format!(
-                "(no providers match \"{}\" — Backspace to clear)",
-                p.query
-            )
+            format!("(no providers match \"{}\" — Backspace to clear)", p.query)
         };
         return MenuPayload {
             items: vec![(label, String::new())],
             selected: 0,
-            kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
+            kind: crate::render::MenuKind::TwoColumn {
+                row_prefix: "",
+                selected_marker: "▸",
+            },
         };
     }
     let items: Vec<(String, String)> = p
@@ -288,7 +292,10 @@ fn build_menu_payload(p: &ModelPicker, ctx: &LoopCtx) -> MenuPayload {
     MenuPayload {
         items,
         selected: p.selected,
-        kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
+        kind: crate::render::MenuKind::TwoColumn {
+            row_prefix: "",
+            selected_marker: "▸",
+        },
     }
 }
 
@@ -333,7 +340,10 @@ mod tests {
     #[test]
     fn open_shows_all_providers_initially() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let p = ModelPicker::open(&config);
@@ -346,7 +356,10 @@ mod tests {
     #[test]
     fn update_filter_matches_by_name_case_insensitive() {
         let config = make_config(
-            vec![("Alpha", "openai", "gpt-4"), ("Beta", "anthropic", "claude-3")],
+            vec![
+                ("Alpha", "openai", "gpt-4"),
+                ("Beta", "anthropic", "claude-3"),
+            ],
             "Alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -359,7 +372,10 @@ mod tests {
     #[test]
     fn update_filter_matches_by_provider_type() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -372,7 +388,10 @@ mod tests {
     #[test]
     fn update_filter_matches_by_model() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -385,7 +404,10 @@ mod tests {
     #[test]
     fn update_filter_empty_query_shows_all() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -400,7 +422,10 @@ mod tests {
     #[test]
     fn update_filter_resets_selection_to_zero() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -413,7 +438,11 @@ mod tests {
     #[test]
     fn down_and_up_stay_within_filtered_bounds() {
         let config = make_config(
-            vec![("a", "openai", "gpt-4"), ("b", "anthropic", "claude-3"), ("c", "openai", "gpt-3.5")],
+            vec![
+                ("a", "openai", "gpt-4"),
+                ("b", "anthropic", "claude-3"),
+                ("c", "openai", "gpt-3.5"),
+            ],
             "a",
         );
         let mut p = ModelPicker::open(&config);
@@ -434,7 +463,10 @@ mod tests {
     #[test]
     fn chosen_returns_provider_at_selected() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let p = ModelPicker::open(&config);
@@ -443,10 +475,7 @@ mod tests {
 
     #[test]
     fn chosen_returns_none_when_filter_empty() {
-        let config = make_config(
-            vec![("alpha", "openai", "gpt-4")],
-            "alpha",
-        );
+        let config = make_config(vec![("alpha", "openai", "gpt-4")], "alpha");
         let mut p = ModelPicker::open(&config);
         p.query = "zzz".to_string();
         p.update_filter(&config);

@@ -17,7 +17,9 @@ use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
 
-use super::{now_ms, SessionManager, SessionMeta, TurnStat};
+use super::{
+    now_ms, PresentationFile, SessionLease, SessionManager, SessionMeta, StorageOwner, TurnStat,
+};
 
 /// Per-turn accumulation (reset each turn): duration, round/tool counts, and the final
 /// model request's token/context figures.
@@ -36,6 +38,7 @@ pub struct SnapshotHook {
     mgr: Arc<SessionManager>,
     session_id: String,
     working_dir: String,
+    lease: Option<SessionLease>,
     accum: Mutex<TurnAccum>,
 }
 
@@ -49,8 +52,14 @@ impl SnapshotHook {
             mgr,
             session_id: session_id.into(),
             working_dir: working_dir.into(),
+            lease: None,
             accum: Mutex::new(TurnAccum::default()),
         }
+    }
+
+    pub fn with_lease(mut self, lease: SessionLease) -> Self {
+        self.lease = Some(lease);
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, TurnAccum> {
@@ -58,8 +67,73 @@ impl SnapshotHook {
     }
 }
 
+fn reindex_compacted_sidecars(
+    before: &SessionSnapshot,
+    after: &SessionSnapshot,
+    meta: &mut SessionMeta,
+    presentation: &mut PresentationFile,
+) {
+    if before.messages.len() != after.messages.len() {
+        let prefix = before
+            .messages
+            .iter()
+            .zip(&after.messages)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let suffix = before.messages[prefix..]
+            .iter()
+            .rev()
+            .zip(after.messages[prefix..].iter().rev())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let old_end = before.messages.len().saturating_sub(suffix);
+        let new_end = after.messages.len().saturating_sub(suffix);
+        meta.turn_stats.retain_mut(|stat| {
+            if stat.after_message > prefix && stat.after_message < old_end {
+                false
+            } else {
+                if stat.after_message >= old_end {
+                    stat.after_message = new_end + stat.after_message.saturating_sub(old_end);
+                }
+                true
+            }
+        });
+    }
+    let surviving_turn_ids: std::collections::BTreeSet<_> = meta
+        .turn_stats
+        .iter()
+        .filter_map(|stat| (stat.turn_id != 0).then_some(stat.turn_id))
+        .collect();
+    presentation.retain_turns(&surviving_turn_ids);
+    meta.message_count = u32::try_from(after.messages.len()).unwrap_or(u32::MAX);
+    meta.turn_count = u32::try_from(meta.turn_stats.len()).unwrap_or(u32::MAX);
+    meta.updated_at = now_ms();
+}
+
 impl CompactionCheckpoint for SnapshotHook {
     fn save(&self, snapshot: &SessionSnapshot) -> Result<(), CompactionCheckpointError> {
+        if let Some(lease) = &self.lease {
+            let old_snapshot = self
+                .mgr
+                .load_snapshot(&self.session_id)
+                .map_err(|error| CompactionCheckpointError::new(error.to_string()))?;
+            let mut meta = self
+                .mgr
+                .read_meta(&self.session_id)
+                .map_err(|error| CompactionCheckpointError::new(error.to_string()))?;
+            let mut presentation = match self.mgr.read_presentation(&self.session_id) {
+                Ok(presentation) => presentation,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    PresentationFile::default()
+                }
+                Err(error) => return Err(CompactionCheckpointError::new(error.to_string())),
+            };
+            reindex_compacted_sidecars(&old_snapshot, snapshot, &mut meta, &mut presentation);
+            return self
+                .mgr
+                .commit_native_runtime_mutation(lease, snapshot, &presentation, &meta)
+                .map_err(|error| CompactionCheckpointError::new(error.to_string()));
+        }
         self.mgr
             .save_snapshot(&self.session_id, snapshot)
             .map_err(|error| CompactionCheckpointError::new(error.to_string()))
@@ -106,10 +180,6 @@ impl LifecycleHooks for SnapshotHook {
         // resume seeds past THIS turn even when it stored nothing.
         snap.turn_counter = snap.turn_counter.max(ctx.turn_id);
         snap.request_counter = snap.request_counter.max(ctx.request_id);
-        if let Err(e) = self.mgr.save_snapshot(&self.session_id, &snap) {
-            eprintln!("[SnapshotHook] save_snapshot failed: {e}");
-        }
-
         let now = now_ms();
         let (duration_ms, round_count, tool_call_count, total_tokens, used_tokens, ctx_window) = {
             let a = self.lock();
@@ -124,31 +194,58 @@ impl LifecycleHooks for SnapshotHook {
         };
 
         let msg_count = convo.messages.len();
-        let fresh = SessionMeta::new(&self.session_id, &self.working_dir, now);
-        if let Err(error) = self
-            .mgr
-            .update_meta_or_insert(&self.session_id, fresh, |meta| {
-                meta.updated_at = now;
-                meta.turn_count = meta.turn_count.saturating_add(1);
-                meta.message_count = msg_count as u32;
-                // New stats use stable turn ids and are pruned explicitly from the
-                // surviving-turn set. Keep the mutable message-position rule only
-                // for pre-S1d stats that have not been converted yet.
-                meta.turn_stats
-                    .retain(|s| s.turn_id != 0 || s.after_message <= msg_count);
-                meta.turn_stats.push(TurnStat {
-                    after_message: msg_count,
-                    turn_id: ctx.turn_id,
-                    round_count,
-                    tool_call_count,
-                    duration_ms,
-                    total_tokens,
-                    errored: *reason != StopReason::Stopped,
-                    used_tokens,
-                    ctx_window,
-                });
-            })
-        {
+        let update_meta = |meta: &mut SessionMeta| {
+            meta.updated_at = now;
+            meta.turn_count = meta.turn_count.saturating_add(1);
+            meta.message_count = msg_count as u32;
+            meta.turn_stats
+                .retain(|s| s.turn_id != 0 || s.after_message <= msg_count);
+            meta.turn_stats.push(TurnStat {
+                after_message: msg_count,
+                turn_id: ctx.turn_id,
+                round_count,
+                tool_call_count,
+                duration_ms,
+                total_tokens,
+                errored: *reason != StopReason::Stopped,
+                used_tokens,
+                ctx_window,
+            });
+        };
+        let result = if let Some(lease) = &self.lease {
+            let mut meta = match self.mgr.read_meta(&self.session_id) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    eprintln!("[SnapshotHook] read_meta failed: {error}");
+                    return;
+                }
+            };
+            if meta.owner != StorageOwner::Native {
+                eprintln!("[SnapshotHook] terminal rejected non-native owner");
+                return;
+            }
+            update_meta(&mut meta);
+            let presentation = match self.mgr.read_presentation(&self.session_id) {
+                Ok(presentation) => presentation,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    PresentationFile::default()
+                }
+                Err(error) => {
+                    eprintln!("[SnapshotHook] read_presentation failed: {error}");
+                    return;
+                }
+            };
+            self.mgr
+                .commit_native_runtime_mutation(lease, &snap, &presentation, &meta)
+        } else {
+            if let Err(error) = self.mgr.save_snapshot(&self.session_id, &snap) {
+                eprintln!("[SnapshotHook] save_snapshot failed: {error}");
+            }
+            let fresh = SessionMeta::new(&self.session_id, &self.working_dir, now);
+            self.mgr
+                .update_meta_or_insert(&self.session_id, fresh, update_meta)
+        };
+        if let Err(error) = result {
             eprintln!("[SnapshotHook] update_meta failed: {error}");
         }
     }
@@ -182,6 +279,78 @@ mod tests {
         CompactionCheckpoint::save(&hook, &snapshot).expect("checkpoint save");
 
         assert_eq!(manager.load_snapshot("compact-now").unwrap(), snapshot);
+    }
+
+    #[test]
+    fn leased_compaction_checkpoint_reindexes_meta_and_presentation() {
+        use crate::session::{DisplayAnchor, PresentationEntry, PresentationRole};
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::with_root(dir.path()));
+        let id = "compact-sidecars";
+        let before = SessionSnapshot::new(vec![
+            Message::user("u1"),
+            Message::assistant("a1", Vec::new()),
+            Message::user("u2"),
+            Message::assistant("a2", Vec::new()),
+            Message::user("u3"),
+            Message::assistant("a3", Vec::new()),
+        ]);
+        manager.save_snapshot(id, &before).unwrap();
+        let stat = |after_message, turn_id| TurnStat {
+            after_message,
+            turn_id,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 10,
+        };
+        let mut meta = SessionMeta::new(id, "/p", 1);
+        meta.owner = StorageOwner::Native;
+        meta.turn_stats = vec![stat(2, 1), stat(4, 2), stat(6, 3)];
+        meta.turn_count = 3;
+        meta.message_count = 6;
+        manager.write_meta(&meta).unwrap();
+        manager
+            .write_presentation(
+                id,
+                &PresentationFile {
+                    v: crate::session::presentation::PRESENTATION_VERSION,
+                    entries: vec![
+                        PresentationEntry {
+                            anchor: DisplayAnchor::AfterTurn { turn_id: 1 },
+                            role: PresentationRole::Assistant,
+                            text: "drop".into(),
+                        },
+                        PresentationEntry {
+                            anchor: DisplayAnchor::AfterTurn { turn_id: 2 },
+                            role: PresentationRole::Assistant,
+                            text: "keep".into(),
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        let hook = SnapshotHook::new(manager.clone(), id, "/p").with_lease(lease);
+        let after = SessionSnapshot::new(vec![
+            Message::user("summary"),
+            Message::user("u3"),
+            Message::assistant("a3", Vec::new()),
+        ]);
+
+        CompactionCheckpoint::save(&hook, &after).unwrap();
+
+        let meta = manager.read_meta(id).unwrap();
+        assert_eq!(meta.turn_stats.len(), 2);
+        assert_eq!(meta.turn_stats[0].after_message, 1);
+        assert_eq!(meta.turn_stats[1].after_message, 3);
+        let presentation = manager.read_presentation(id).unwrap();
+        assert_eq!(presentation.entries.len(), 1);
+        assert_eq!(presentation.entries[0].text, "keep");
     }
 
     fn resp(tool_calls: usize, used: u32) -> Message {

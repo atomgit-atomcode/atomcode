@@ -26,7 +26,9 @@ fn suppress_console_window(_cmd: &mut Command) {}
 
 pub fn detect_repo_origin(cwd: &Path) -> RepoOrigin {
     let mut cmd = Command::new("git");
-    cmd.args(["-C"]).arg(cwd).args(["remote", "get-url", "origin"]);
+    cmd.args(["-C"])
+        .arg(cwd)
+        .args(["remote", "get-url", "origin"]);
     suppress_console_window(&mut cmd);
     let output = cmd.output();
     match output {

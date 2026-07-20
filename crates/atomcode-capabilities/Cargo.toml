@@ -175,7 +175,7 @@ mcp = [
 # coexist) — a per-turn compacted <id>.snapshot for RESUME + an append-only,
 # never-compacted <id>.jsonl transcript for RECALL — plus the SnapshotHook /
 # TranscriptHook / recall tool / current-date hook that drive it. Opt-in (NOT default).
-session = ["dep:dirs", "dep:chrono", "dep:fs2"]
+session = ["dep:dirs", "dep:chrono", "dep:fs2", "dep:atomcode-config"]
 # User-driven persistent memory: the production memory.md store (global
 # $ATOMCODE_HOME/memory.md + per-project <root>/.atomcode/memory.md, same files so
 # old/new coexist) + a MemoryHook that injects the merged entries at session_start.

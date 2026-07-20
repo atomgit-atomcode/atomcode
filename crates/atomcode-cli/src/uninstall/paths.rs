@@ -4,9 +4,9 @@
 // `cfg(unix)` for the production path and `cfg(all(not(unix), test))`
 // for the cross-platform test stub. A Windows non-test build sees
 // neither, so the import would be flagged unused.
-use std::path::PathBuf;
 #[cfg(any(unix, test))]
 use std::path::Path;
+use std::path::PathBuf;
 
 /// Return the atomcode data root (`$ATOMCODE_HOME` when set, or
 /// `~/.atomcode/` by default). Routes through [`atomcode_config::config::Config::config_dir`]

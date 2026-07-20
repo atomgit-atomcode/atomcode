@@ -39,7 +39,12 @@ impl Tool for ProbeTool {
         RiskLevel::Risky
     }
     async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "probe".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "probe".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -59,7 +64,11 @@ pub async fn check(mw: Arc<dyn ToolMiddleware>) -> ConformanceReport {
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
     // before(): bounded, no panic, returns Ok|Err.
-    let mut call = ToolCall { id: "c1".into(), name: "conformance_probe".into(), arguments: "{}".into() };
+    let mut call = ToolCall {
+        id: "c1".into(),
+        name: "conformance_probe".into(),
+        arguments: "{}".into(),
+    };
     let before_fut = async { mw.before(&mut call, &tool, &rt).await };
     match with_timeout(DEFAULT_CHECK_TIMEOUT, catch_async(before_fut)).await {
         Ok(Ok(res)) => r.record(
@@ -85,12 +94,25 @@ pub async fn check(mw: Arc<dyn ToolMiddleware>) -> ConformanceReport {
     }
 
     // after(): bounded, no panic — distinct clauses so a failure pinpoints panic vs park.
-    let mut result = ToolResult { call_id: "c1".into(), content: "result body".into(), is_error: false, images: vec![] };
+    let mut result = ToolResult {
+        call_id: "c1".into(),
+        content: "result body".into(),
+        is_error: false,
+        images: vec![],
+    };
     let after_fut = async { mw.after(&mut result).await };
     match with_timeout(DEFAULT_CHECK_TIMEOUT, catch_async(after_fut)).await {
         Ok(Ok(_)) => r.record("after_returns", true, ""),
-        Ok(Err(p)) => r.record("after_no_panic", false, format!("after() panicked: {p} — transform/observe the result in place, never panic")),
-        Err(t) => r.record("after_terminates", false, format!("after() {t} — after() must return, bounded")),
+        Ok(Err(p)) => r.record(
+            "after_no_panic",
+            false,
+            format!("after() panicked: {p} — transform/observe the result in place, never panic"),
+        ),
+        Err(t) => r.record(
+            "after_terminates",
+            false,
+            format!("after() {t} — after() must return, bounded"),
+        ),
     }
 
     drain.abort();

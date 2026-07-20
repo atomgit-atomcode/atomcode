@@ -22,8 +22,8 @@ pub(crate) mod loop_ctrl;
 pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
-pub(crate) mod usage_monitor;
 pub(crate) mod ui_event;
+pub(crate) mod usage_monitor;
 use commands::{
     attach_live_session, dispatch_undo, execute_slash_command, format_rate_limited_line,
 };
@@ -37,10 +37,10 @@ use anyhow::Result;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCompletion};
 use atomcode_coding::CodingRuntimeHandle;
 use atomcode_config::config::Config;
-use ui_event::{UiAgentPhase as AgentPhase, UiEvent as AgentEvent};
-use atomcode_core::session::{SessionId, SessionManager};
+use crate::session::{Session, SessionId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::{mpsc, watch};
+use ui_event::{UiAgentPhase as AgentPhase, UiEvent as AgentEvent};
 
 use atomcode_core::conversation::message::ImagePart;
 use base64::Engine;
@@ -67,7 +67,7 @@ fn runtime_user_input(text: String, images: Vec<ImagePart>) -> atomcode_coding::
         text,
         images: images
             .iter()
-            .map(crate::runtime_convert::image_to_kernel)
+            .map(atomcode_daemon::legacy_convert::image_to_kernel)
             .collect(),
     }
 }
@@ -541,13 +541,22 @@ mod image_path_tests {
         let v = KeyCode::Char('v');
         // Canonical + the Windows-Terminal alternate both trigger.
         assert!(is_paste_image_chord(v, KeyModifiers::CONTROL));
-        assert!(is_paste_image_chord(v, KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert!(is_paste_image_chord(
+            v,
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ));
         // Ctrl+Shift+V stays a terminal "paste as plain text" passthrough.
-        assert!(!is_paste_image_chord(v, KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        assert!(!is_paste_image_chord(
+            v,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        ));
         // Not a paste chord without Ctrl, or on a different key.
         assert!(!is_paste_image_chord(v, KeyModifiers::ALT));
         assert!(!is_paste_image_chord(v, KeyModifiers::NONE));
-        assert!(!is_paste_image_chord(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert!(!is_paste_image_chord(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL
+        ));
     }
 
     /// Materialise a small file at `<dir>/<name>` whose contents are
@@ -825,9 +834,7 @@ enum RuntimeUiAvailability {
 
 fn runtime_ui_availability(phase: atomcode_coding::RuntimePhase) -> RuntimeUiAvailability {
     match phase {
-        atomcode_coding::RuntimePhase::AwaitingProvider => {
-            RuntimeUiAvailability::AwaitingProvider
-        }
+        atomcode_coding::RuntimePhase::AwaitingProvider => RuntimeUiAvailability::AwaitingProvider,
         atomcode_coding::RuntimePhase::Failed => RuntimeUiAvailability::Failed,
         atomcode_coding::RuntimePhase::ShuttingDown | atomcode_coding::RuntimePhase::Stopped => {
             RuntimeUiAvailability::Stopped
@@ -1126,9 +1133,7 @@ impl DeferredRuntimeControl {
             atomcode_coding::DeferredRuntimeState::Starting => {
                 command_allowed_while_starting(command)
             }
-            atomcode_coding::DeferredRuntimeState::Ready(handle) => {
-                handle.accepts(command)
-            }
+            atomcode_coding::DeferredRuntimeState::Ready(handle) => handle.accepts(command),
             atomcode_coding::DeferredRuntimeState::Failed(_) => {
                 matches!(command, atomcode_coding::DriverCommand::Shutdown)
             }
@@ -1236,7 +1241,9 @@ impl RuntimeControl {
             Self::Ready(_) => self.dispatch(command),
             Self::Deferred(deferred) => match &*deferred.state.borrow() {
                 atomcode_coding::DeferredRuntimeState::Starting => deferred.send(command),
-                atomcode_coding::DeferredRuntimeState::Ready(handle) if handle.accepts(&command) => {
+                atomcode_coding::DeferredRuntimeState::Ready(handle)
+                    if handle.accepts(&command) =>
+                {
                     deferred.send(command)
                 }
                 atomcode_coding::DeferredRuntimeState::Ready(_)
@@ -1297,12 +1304,12 @@ impl RuntimeControl {
                 runtime_id,
                 event_tx,
             }),
-            Self::Deferred(deferred) if deferred.normal_operation_allowed() => deferred.send(
-                atomcode_coding::DriverCommand::RestoreSnapshotCorrelated {
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::RestoreSnapshotCorrelated {
                     snapshot,
                     correlation_id,
-                },
-            ),
+                })
+            }
             Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
     }
@@ -1363,12 +1370,11 @@ pub struct SpawnedRuntime {
 /// `/resume`). The CLI injects the CodingRuntime factory here. It receives the
 /// CURRENT config + working dir (so it tracks `/model` / `/provider` / `/cd`)
 /// and returns the runtime control plane with its event receiver.
-pub type RuntimeSpawnOverride =
-    std::sync::Arc<
-        dyn Fn(&Config, &std::path::Path, &atomcode_core::session::Session) -> SpawnedRuntime
-            + Send
-            + Sync,
-    >;
+pub type RuntimeSpawnOverride = std::sync::Arc<
+    dyn Fn(&Config, &std::path::Path, &Session) -> SpawnedRuntime
+        + Send
+        + Sync,
+>;
 
 /// Runtime-owned handoff state while leaving Live sync mode. Keeping the
 /// fallback receiver and LiveSession here makes rollback an ownership transfer,
@@ -1376,7 +1382,7 @@ pub type RuntimeSpawnOverride =
 pub(crate) struct PendingLocalRuntimeSync {
     pub(crate) restore_id: u64,
     pub(crate) runtime_id: bg_runtime::RuntimeId,
-    pub(crate) session_id: atomcode_core::session::SessionId,
+    pub(crate) session_id: SessionId,
     pub(crate) live_session: std::sync::Arc<atomcode_core::live::LiveSession>,
     pub(crate) handoff: atomcode_core::live::IdleHandoff,
     pub(crate) deadline: std::time::Instant,
@@ -1402,10 +1408,10 @@ impl PendingLocalRuntimeSync {
 fn local_restore_scope_matches(
     expected_restore_id: u64,
     expected_runtime_id: bg_runtime::RuntimeId,
-    expected_session_id: &atomcode_core::session::SessionId,
+    expected_session_id: &SessionId,
     restore_id: u64,
     runtime_id: bg_runtime::RuntimeId,
-    session_id: &atomcode_core::session::SessionId,
+    session_id: &SessionId,
 ) -> bool {
     expected_restore_id == restore_id
         && expected_runtime_id == runtime_id
@@ -1425,13 +1431,13 @@ mod local_restore_scope_tests {
     use atomcode_coding::{
         DeferredRuntimeState, DriverCommand, ProviderUnavailableReason, UserInput,
     };
-    use atomcode_core::session::SessionId;
+    use crate::session::SessionId;
     use tokio::sync::{mpsc, watch};
 
     #[test]
     fn acknowledgement_requires_restore_runtime_and_session_identity() {
-        let expected_session = SessionId::from_string("session-a".into());
-        let other_session = SessionId::from_string("session-b".into());
+        let expected_session: SessionId = "session-a".into();
+        let other_session: SessionId = "session-b".into();
         let runtime = RuntimeId::new(3);
 
         assert!(local_restore_scope_matches(
@@ -1520,8 +1526,7 @@ mod local_restore_scope_tests {
     #[tokio::test]
     async fn ready_runtime_delivery_event_sender_detaches_with_runtime_forwarder() {
         let (handle, _owner) = coding_runtime_control_channel();
-        let (event_tx, mut event_rx) =
-            mpsc::unbounded_channel::<bg_runtime::RuntimeEventPayload>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<bg_runtime::RuntimeEventPayload>();
         let runtime = RuntimeControl::ready_with_event_tx(handle, event_tx.clone());
 
         runtime.detach_delivery_event_tx();
@@ -1592,7 +1597,10 @@ mod local_restore_scope_tests {
             .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
             .is_err());
         assert!(runtime.dispatch(DriverCommand::Shutdown).is_ok());
-        assert!(matches!(command_rx.recv().await, Some(DriverCommand::Shutdown)));
+        assert!(matches!(
+            command_rx.recv().await,
+            Some(DriverCommand::Shutdown)
+        ));
 
         adapter.shutdown().await.unwrap();
     }
@@ -1604,10 +1612,7 @@ mod local_restore_scope_tests {
         let runtime = RuntimeControl::deferred(command_tx, state_rx);
         let prompt = DriverCommand::Submit(UserInput::from("background task"));
 
-        assert_eq!(
-            runtime.ui_availability(),
-            RuntimeUiAvailability::Starting
-        );
+        assert_eq!(runtime.ui_availability(), RuntimeUiAvailability::Starting);
         assert!(runtime.dispatch(prompt.clone()).is_err());
         assert!(runtime.dispatch_when_ready(prompt).is_ok());
         assert!(matches!(
@@ -1637,8 +1642,7 @@ pub struct LoopCtx {
     pub pending_runtime_request_id: Option<atomcode_kernel::event::RequestId>,
     /// Cache of "Always Allow" tool/command decisions for the active TUI session.
     pub allowed_always: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    pub native_tools:
-        std::collections::HashMap<String, (String, std::time::Instant)>,
+    pub native_tools: std::collections::HashMap<String, (String, std::time::Instant)>,
     /// Force-exit watchdog deadline. Armed by [`arm_shutdown_watchdog`] when the
     /// user genuinely asks to leave (`/quit`, `/exit`, a confirmed Ctrl+C). The
     /// normal exit is the graceful break (Idle + `cmd_tx` closed); this is the
@@ -1663,13 +1667,12 @@ pub struct LoopCtx {
     pub history: History,
     pub input_rx: mpsc::UnboundedReceiver<InputEvent>,
     pub commands: CommandRegistry,
-    pub session_manager: SessionManager,
     /// Session actively being accumulated. Updated on TurnComplete /
     /// TurnCancelled (both carry the latest `messages` slice), saved to
     /// disk via `session_manager` on the same events so `/resume` after
     /// a quit sees the conversation. Replaced wholesale when the user
     /// resumes another session via `/resume` + SessionPicker.
-    pub current_session: atomcode_core::session::Session,
+    pub current_session: Session,
     /// Shared "new version available" hint. Populated by the detached
     /// version-check task spawned from `run()`; read by `build_status`
     /// on each redraw. `None` = no hint (either check still pending,
@@ -1697,8 +1700,7 @@ pub struct LoopCtx {
     /// TurnComplete (30s cooldown). Read on every redraw to construct
     /// the right-aligned usage hint when usage_percent ≥ 80% and the
     /// current model is on a CodingPlan provider.
-    pub usage_slot:
-        std::sync::Arc<std::sync::Mutex<Option<atomcode_codingplan::types::UsageInfo>>>,
+    pub usage_slot: std::sync::Arc<std::sync::Mutex<Option<atomcode_codingplan::types::UsageInfo>>>,
     /// Last time `usage_monitor::spawn_check` was invoked. Used to
     /// enforce `usage_monitor::USAGE_COOLDOWN` on TurnComplete-triggered
     /// refreshes. `None` = no check has run yet this session.
@@ -1806,7 +1808,7 @@ pub struct LoopCtx {
     /// `--continue`). Replayed into scrollback AND restored into the
     /// runtime model context through native restore on first
     /// `run_loop` entry, then dropped — matching `/resume` behaviour.
-    pub replay_on_start: Option<atomcode_core::session::Session>,
+    pub replay_on_start: Option<Session>,
     /// Lazy file/dir index for `@`-mention popup. Built on first `@`
     /// keystroke via `FileIndex::filter`; session-life cache.
     pub file_index: file_index::FileIndex,
@@ -5698,7 +5700,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     ctx.bg_manager.apply_background_event(
                         runtime_event.runtime_id,
                         runtime_event.event,
-                        &ctx.session_manager,
                     );
                 }
             }
@@ -6119,7 +6120,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     ctx.bg_manager.apply_background_event(
                         runtime_event.runtime_id,
                         runtime_event.event,
-                        &ctx.session_manager,
                     );
                 }
             }
@@ -8004,7 +8004,8 @@ fn handle_idle_key(
                     app.state.on_submit();
                 } else {
                     // —— 原有逻辑，原样保留 ——
-                    let submitted = ctx.runtime
+                    let submitted = ctx
+                        .runtime
                         .dispatch(atomcode_coding::DriverCommand::Submit(runtime_user_input(
                             expanded, images,
                         )))
@@ -9040,7 +9041,8 @@ fn handle_streaming_key(
                     // Steer into the running turn: the kernel folds this at the next
                     // round boundary (see AgentEvent::Steered). No local queue. Count
                     // it as PENDING now; the Steered event drains it once folded.
-                    if ctx.runtime
+                    if ctx
+                        .runtime
                         .dispatch(atomcode_coding::DriverCommand::Submit(runtime_user_input(
                             expanded, q_images,
                         )))
@@ -9263,7 +9265,10 @@ fn approval_choice_to_decision(choice: ApprovalChoice) -> atomcode_core::tool::P
 fn get_approval_cache_key(tool: &str, args: &str) -> String {
     if tool == "bash" {
         let command = if let Ok(val) = serde_json::from_str::<serde_json::Value>(args) {
-            val.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string()
+            val.get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
         } else {
             args.to_string()
         };
@@ -9440,8 +9445,14 @@ mod user_input_key_tests {
                 question: "Q?".into(),
                 mode,
                 options: vec![
-                    UserInputOption { label: "A".into(), description: None },
-                    UserInputOption { label: "B".into(), description: None },
+                    UserInputOption {
+                        label: "A".into(),
+                        description: None,
+                    },
+                    UserInputOption {
+                        label: "B".into(),
+                        description: None,
+                    },
                 ],
             },
         )
@@ -9450,7 +9461,11 @@ mod user_input_key_tests {
     // Esc always declines, regardless of mode.
     #[test]
     fn esc_declines_in_every_mode() {
-        for m in [UserInputMode::Single, UserInputMode::Multiple, UserInputMode::Text] {
+        for m in [
+            UserInputMode::Single,
+            UserInputMode::Multiple,
+            UserInputMode::Text,
+        ] {
             let resp = user_input_response_for(&panel(m), KeyCode::Esc).expect("Esc resolves");
             assert!(resp.declined, "Esc must decline");
         }
@@ -9504,7 +9519,11 @@ mod user_input_key_tests {
         for _ in 0..10 {
             p.move_down();
         }
-        assert_eq!(p.cursor, p.options.len(), "single cursor must stop at Other row");
+        assert_eq!(
+            p.cursor,
+            p.options.len(),
+            "single cursor must stop at Other row"
+        );
         assert!(p.is_other_row(), "last row is the Other row");
     }
 
@@ -9531,7 +9550,7 @@ mod user_input_key_tests {
         p.move_down();
         p.toggle(); // check "B" (cursor 1)
         p.push_custom('x'); // custom_text="x"; no separate auto-check needed
-        // Enter on option/Other rows is NOT a submit — returns None.
+                            // Enter on option/Other rows is NOT a submit — returns None.
         assert!(
             user_input_response_for(&p, KeyCode::Enter).is_none(),
             "Enter on option row must NOT submit in multiple mode"
@@ -9544,8 +9563,12 @@ mod user_input_key_tests {
         );
         p.move_down(); // cursor 3 (Submit)
         assert!(p.is_submit_row(), "cursor should be on Submit row");
-        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter on Submit row resolves");
-        assert_eq!(resp.selected, vec!["A".to_string(), "B".to_string(), "x".to_string()]);
+        let resp =
+            user_input_response_for(&p, KeyCode::Enter).expect("Enter on Submit row resolves");
+        assert_eq!(
+            resp.selected,
+            vec!["A".to_string(), "B".to_string(), "x".to_string()]
+        );
         assert_eq!(resp.text, None);
     }
 
@@ -9556,7 +9579,7 @@ mod user_input_key_tests {
     fn multiple_custom_text_included_after_enter_on_other_row() {
         let mut p = panel(UserInputMode::Multiple);
         p.toggle(); // check "A"
-        // Move to Other row and type custom text.
+                    // Move to Other row and type custom text.
         p.move_down(); // cursor 1 (B)
         p.move_down(); // cursor 2 (Other)
         assert!(p.is_other_row());
@@ -9576,8 +9599,14 @@ mod user_input_key_tests {
         assert!(p.is_submit_row());
         let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter on Submit resolves");
         // Both checked "A" and custom "hi" must appear.
-        assert!(resp.selected.contains(&"A".to_string()), "checked option included");
-        assert!(resp.selected.contains(&"hi".to_string()), "custom text included despite Enter on Other");
+        assert!(
+            resp.selected.contains(&"A".to_string()),
+            "checked option included"
+        );
+        assert!(
+            resp.selected.contains(&"hi".to_string()),
+            "custom text included despite Enter on Other"
+        );
     }
 
     // FIX 1: Multiple — number key on Other row's index moves cursor (not toggle).
@@ -9591,7 +9620,10 @@ mod user_input_key_tests {
         assert!(p.is_other_row(), "cursor moved to Other row");
         // No checkbox was toggled — checked[other_index] should still be false
         // (but that field is unused for Other; the invariant is that custom_text is empty).
-        assert!(p.custom_text.is_empty(), "custom_text untouched by cursor move");
+        assert!(
+            p.custom_text.is_empty(),
+            "custom_text untouched by cursor move"
+        );
         // build_response with nothing checked and no custom text → None.
         // Move to Submit.
         p.move_down();
@@ -9622,12 +9654,8 @@ mod user_input_key_tests {
         assert!(
             user_input_response_for(&panel(UserInputMode::Multiple), KeyCode::Char(' ')).is_none()
         );
-        assert!(
-            user_input_response_for(&panel(UserInputMode::Text), KeyCode::Char('x')).is_none()
-        );
-        assert!(
-            user_input_response_for(&panel(UserInputMode::Text), KeyCode::Backspace).is_none()
-        );
+        assert!(user_input_response_for(&panel(UserInputMode::Text), KeyCode::Char('x')).is_none());
+        assert!(user_input_response_for(&panel(UserInputMode::Text), KeyCode::Backspace).is_none());
     }
 
     // Ctrl+C must NOT be handled by `user_input_response_for` (which is
@@ -9654,7 +9682,10 @@ mod user_input_key_tests {
         use atomcode_capabilities::tools::request_user_input::UserInputResponse;
         let resp = UserInputResponse::declined();
         assert!(resp.declined, "Ctrl+C must produce a declined response");
-        assert!(resp.selected.is_empty(), "declined response must have no selections");
+        assert!(
+            resp.selected.is_empty(),
+            "declined response must have no selections"
+        );
         assert!(resp.text.is_none(), "declined response must have no text");
     }
 
@@ -9701,12 +9732,13 @@ mod user_input_key_tests {
         p.toggle_index(0); // '1' → check "A"
         p.toggle_index(1); // '2' → check "B"
         p.toggle_index(0); // '1' again → uncheck "A"
-        // Navigate to Submit row and confirm.
+                           // Navigate to Submit row and confirm.
         for _ in 0..=p.options.len() {
             p.move_down();
         }
         assert!(p.is_submit_row(), "cursor must be on Submit row");
-        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter on Submit row resolves");
+        let resp =
+            user_input_response_for(&p, KeyCode::Enter).expect("Enter on Submit row resolves");
         assert_eq!(resp.selected, vec!["B".to_string()]);
     }
 
@@ -9716,7 +9748,7 @@ mod user_input_key_tests {
     fn multiple_enter_on_option_row_does_not_submit() {
         let mut p = panel(UserInputMode::Multiple);
         p.toggle(); // check "A" at cursor 0
-        // Enter on cursor 0 (option "A") must NOT resolve.
+                    // Enter on cursor 0 (option "A") must NOT resolve.
         assert!(
             user_input_response_for(&p, KeyCode::Enter).is_none(),
             "Enter on option row in multiple must NOT submit"
@@ -9742,9 +9774,18 @@ mod user_input_key_tests {
             p.move_down();
         }
         let expected = p.options.len() + 1;
-        assert_eq!(p.cursor, expected, "cursor must stop at Submit row (index {expected})");
-        assert!(p.is_submit_row(), "is_submit_row() must be true at Submit row");
-        assert!(!p.is_other_row(), "is_other_row() must be false at Submit row");
+        assert_eq!(
+            p.cursor, expected,
+            "cursor must stop at Submit row (index {expected})"
+        );
+        assert!(
+            p.is_submit_row(),
+            "is_submit_row() must be true at Submit row"
+        );
+        assert!(
+            !p.is_other_row(),
+            "is_other_row() must be false at Submit row"
+        );
     }
 
     // Single: unchanged — has no Submit row; cursor stops at Other (options.len()).
@@ -9754,24 +9795,39 @@ mod user_input_key_tests {
         for _ in 0..10 {
             p.move_down();
         }
-        assert_eq!(p.cursor, p.options.len(), "single cursor must stop at Other row");
+        assert_eq!(
+            p.cursor,
+            p.options.len(),
+            "single cursor must stop at Other row"
+        );
         assert!(p.is_other_row(), "is_other_row() must be true");
         assert!(!p.is_submit_row(), "single must have no Submit row");
-        assert!(p.submit_index().is_none(), "submit_index() must be None for single");
+        assert!(
+            p.submit_index().is_none(),
+            "submit_index() must be None for single"
+        );
     }
 
     // Row-count equality: multiple panel's row_count must count the Submit row.
     // Single panel's row_count must NOT include a Submit row.
     #[test]
     fn row_count_includes_submit_row_for_multiple_not_single() {
-        use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputOption, UserInputRequest};
+        use atomcode_capabilities::tools::request_user_input::{
+            UserInputMode, UserInputOption, UserInputRequest,
+        };
         let req = UserInputRequest {
             header: "H".into(),
             question: "Q?".into(),
             mode: UserInputMode::Multiple,
             options: vec![
-                UserInputOption { label: "A".into(), description: None },
-                UserInputOption { label: "B".into(), description: None },
+                UserInputOption {
+                    label: "A".into(),
+                    description: None,
+                },
+                UserInputOption {
+                    label: "B".into(),
+                    description: None,
+                },
             ],
         };
         let p_multi = UserInputPanel::new(1, &req);
@@ -9779,7 +9835,9 @@ mod user_input_key_tests {
         assert_eq!(p_multi.options.len() + 1, 3);
         // last navigable row must be Submit
         let mut pm = p_multi;
-        for _ in 0..10 { pm.move_down(); }
+        for _ in 0..10 {
+            pm.move_down();
+        }
         assert!(pm.is_submit_row());
 
         let req_single = UserInputRequest {
@@ -9789,13 +9847,21 @@ mod user_input_key_tests {
                 question: "Q?".into(),
                 mode: UserInputMode::Single,
                 options: vec![
-                    UserInputOption { label: "A".into(), description: None },
-                    UserInputOption { label: "B".into(), description: None },
+                    UserInputOption {
+                        label: "A".into(),
+                        description: None,
+                    },
+                    UserInputOption {
+                        label: "B".into(),
+                        description: None,
+                    },
                 ],
             }
         };
         let mut ps = UserInputPanel::new(2, &req_single);
-        for _ in 0..10 { ps.move_down(); }
+        for _ in 0..10 {
+            ps.move_down();
+        }
         assert!(ps.is_other_row(), "single stops at Other");
         assert!(!ps.is_submit_row(), "single has no Submit row");
     }
@@ -10774,16 +10840,15 @@ mod ctrl_o_hint_gating_tests {
 }
 
 fn kernel_stop_reason(reason: atomcode_kernel::event::StopReason) -> ui_event::UiTurnStopReason {
-    use ui_event::UiTurnStopReason as Core;
     use atomcode_kernel::event::StopReason as Kernel;
+    use ui_event::UiTurnStopReason as Core;
     match reason {
         Kernel::Stopped => Core::Natural,
         Kernel::MaxRounds | Kernel::MaxContinuations => Core::TurnLimit,
         Kernel::Cancelled => Core::Cancelled,
-        Kernel::ProviderError
-        | Kernel::Timeout
-        | Kernel::PromptRejected
-        | Kernel::RateLimited => Core::Error,
+        Kernel::ProviderError | Kernel::Timeout | Kernel::PromptRejected | Kernel::RateLimited => {
+            Core::Error
+        }
         _ => Core::Error,
     }
 }
@@ -10837,9 +10902,10 @@ fn project_kernel_event(
                 arguments: call.arguments,
             })
         }
-        Kernel::ToolProgress { call_id, message } => {
-            Some(AgentEvent::ToolOutputChunk { call_id, chunk: message })
-        }
+        Kernel::ToolProgress { call_id, message } => Some(AgentEvent::ToolOutputChunk {
+            call_id,
+            chunk: message,
+        }),
         Kernel::ToolResult { result } => {
             let (name, started) = ctx
                 .native_tools
@@ -10951,11 +11017,9 @@ fn handle_runtime_event(
                                 state.phase = UiPhase::UserInput;
                                 redraw_idle_plain(buf, state, ctx, renderer);
                             }
-                            Err(_) => deliver_user_input(
-                                ctx,
-                                request.id,
-                                UserInputResponse::declined(),
-                            ),
+                            Err(_) => {
+                                deliver_user_input(ctx, request.id, UserInputResponse::declined())
+                            }
                         }
                         return;
                     }
@@ -11027,9 +11091,7 @@ fn handle_runtime_event(
                             let total_tokens = stats
                                 .last_usage
                                 .as_ref()
-                                .map(|meta| {
-                                    (meta.tokens.prompt + meta.tokens.completion) as usize
-                                })
+                                .map(|meta| (meta.tokens.prompt + meta.tokens.completion) as usize)
                                 .unwrap_or_default();
                             AgentEvent::TurnComplete {
                                 duration: stats.duration,
@@ -11238,14 +11300,11 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::ProviderDeactivationFinished(Err(error)) => {
-                    let message = format!(
-                        "credentials removed, but provider deactivation failed: {error}"
-                    );
+                    let message =
+                        format!("credentials removed, but provider deactivation failed: {error}");
                     renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::CmdLogoutFailed {
-                            error: &message,
-                        })
-                        .into_owned(),
+                        crate::i18n::t(crate::i18n::Msg::CmdLogoutFailed { error: &message })
+                            .into_owned(),
                     ));
                     renderer.flush();
                     return;
@@ -11357,14 +11416,6 @@ fn handle_undo_success(
     ctx.current_session.touch();
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
-    if let Err(error) = ctx.session_manager.save(&ctx.current_session) {
-        renderer.render(UiLine::Error(
-            crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
-                error: &error.to_string(),
-            })
-            .into_owned(),
-        ));
-    }
     crate::modals::session_picker::replay_session(renderer, state, &ctx.current_session, true);
     buf.set_restored_text(restored_prompt);
     renderer.render(UiLine::CommandOutput(
@@ -11424,14 +11475,6 @@ fn handle_snapshot_restore_finished(
             ctx.current_session.touch();
             ctx.bg_manager
                 .set_foreground_session(ctx.current_session.clone());
-            if let Err(error) = ctx.session_manager.save(&ctx.current_session) {
-                renderer.render(UiLine::Error(
-                    crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
-                        error: &error.to_string(),
-                    })
-                    .into_owned(),
-                ));
-            }
             renderer.render(UiLine::CommandOutput(
                 "本地会话已接管 runtime 实际快照".to_string(),
             ));
@@ -11479,10 +11522,7 @@ fn persist_native_compaction_snapshot(
     persist_current_session(ctx, core_snapshot, renderer)
 }
 
-fn mirror_compaction_finished_event(
-    event: &CodingRuntimeEvent,
-    ctx: &LoopCtx,
-) {
+fn mirror_compaction_finished_event(event: &CodingRuntimeEvent, ctx: &LoopCtx) {
     let Some(live) = &ctx.sync_session else {
         return;
     };
@@ -11507,15 +11547,11 @@ fn mirror_compaction_finished_event(
         CompactionCompletion::Interrupted {
             trigger: CompactTrigger::Manual { .. },
             ..
-        } => {
-            Some(atomcode_config::i18n::format_compaction_interrupted())
-        }
+        } => Some(atomcode_config::i18n::format_compaction_interrupted()),
         CompactionCompletion::Failed {
             trigger: CompactTrigger::Manual { .. },
             error,
-        } => {
-            Some(format!("compact failed: {error}"))
-        }
+        } => Some(format!("compact failed: {error}")),
         _ => None,
     };
     if let Some(txt) = text {
@@ -12655,7 +12691,7 @@ fn handle_agent_event(
                 .unwrap_or((0, 0));
             ctx.current_session
                 .turn_stats
-                .push(atomcode_core::session::TurnStat {
+                .push(crate::session::TurnStat {
                     after_message: snapshot.messages.len(),
                     turn_count,
                     tool_call_count,
@@ -12916,10 +12952,6 @@ fn handle_agent_event(
             // resetting on a redundant broadcast.
             if ctx.working_dir != new_dir {
                 commands::apply_cd(ctx, new_dir.clone());
-                // 新项目的会话要存进新项目的 hash 目录。session_manager 只在启动
-                // 时按初始目录构建，不重建的话切项目后的新会话会写进旧项目，
-                // /resume 与手机端项目列表都会在错误的项目下看到它。
-                ctx.session_manager = atomcode_core::session::SessionManager::new(&new_dir);
                 commands::reset_to_new_session(ctx, state, renderer);
             }
         }
@@ -13406,14 +13438,6 @@ fn handle_agent_event(
             ctx.current_session.touch();
             ctx.bg_manager
                 .set_foreground_session(ctx.current_session.clone());
-            if let Err(error) = ctx.session_manager.save(&ctx.current_session) {
-                renderer.render(UiLine::Error(
-                    crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
-                        error: &error.to_string(),
-                    })
-                    .into_owned(),
-                ));
-            }
             renderer.render(UiLine::CommandOutput(
                 "本地会话已接管 runtime 实际快照".to_string(),
             ));
@@ -13509,9 +13533,9 @@ fn handle_agent_event(
             if mode == crate::state::AgentMode::Build {
                 state.build_badge_visible = true;
             }
-            let _ = ctx.runtime.dispatch(atomcode_coding::DriverCommand::SetMode(
-                runtime_mode(mode),
-            ));
+            let _ = ctx
+                .runtime
+                .dispatch(atomcode_coding::DriverCommand::SetMode(runtime_mode(mode)));
             renderer.render(UiLine::CommandOutput(format!(
                 "  Switched to {} mode.\n",
                 mode.label()
@@ -13531,7 +13555,7 @@ fn handle_agent_event(
                 session_id,
                 ctx.sync_session.is_some()
             );
-            let sid = atomcode_core::session::SessionId::from_string(session_id);
+            let sid = session_id;
             // 自回声守卫：TUI 自己发起的切换（/new、/resume 等，见 sync_local_session_switch）
             // 会经 live_switch_session 广播、再经转发器回流到这里。此时本地切换已完成、
             // ctx.current_session.id 已是目标 id，无需重复清场/回放/重挂——直接忽略，避免
@@ -13544,7 +13568,30 @@ fn handle_agent_event(
                 );
                 return;
             }
-            let loaded = atomcode_core::session::SessionManager::load_any(&sid).ok();
+            let loaded = match atomcode_daemon::legacy_convert::find_catalog_session_view(&sid) {
+                Ok(session) => session
+                    .map(Session::from_catalog_view)
+                    .transpose(),
+                Err(error) => {
+                    renderer.render(UiLine::Error(format!(
+                        "Failed to resolve session {}: {error}",
+                        sid.as_str()
+                    )));
+                    renderer.flush();
+                    return;
+                }
+            };
+            let loaded = match loaded {
+                Ok(session) => session,
+                Err(error) => {
+                    renderer.render(UiLine::Error(format!(
+                        "Failed to decode session {}: {error}",
+                        sid
+                    )));
+                    renderer.flush();
+                    return;
+                }
+            };
 
             // 重置对话与计数（无论加载成功与否都先清场）。
             ctx.runtime
@@ -13577,8 +13624,7 @@ fn handle_agent_event(
                     // 罕见：磁盘上找不到该会话（如 webui 刚新建、广播早于落盘）。
                     // 退回旧行为：用指定 id 建一个空白会话，保证三端落同一文件。
                     ctx.current_session_id = None;
-                    let mut new_session =
-                        atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+                    let mut new_session = Session::default_session(ctx.working_dir.clone());
                     new_session.id = sid;
                     new_session
                 }
@@ -13590,7 +13636,7 @@ fn handle_agent_event(
             // 把历史灌进 agent 会话，使后续回合带上下文（空会话则等价于清空）。
             ctx.runtime
                 .dispatch(atomcode_coding::DriverCommand::RestoreSnapshot(
-                    crate::runtime_convert::snapshot_to_kernel(
+                    atomcode_daemon::legacy_convert::snapshot_to_kernel(
                         &target_session.to_conversation_snapshot(),
                     ),
                 ))
@@ -13694,22 +13740,27 @@ fn apply_ai_session_name(ctx: &mut LoopCtx, name: String, renderer: &mut dyn Ren
     ) {
         return;
     }
+    match atomcode_daemon::legacy_convert::apply_ai_catalog_name(
+        ctx.current_session.id.as_str(),
+        &name,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("session save failed: {e}")));
+            renderer.flush();
+            return;
+        }
+    }
     ctx.current_session.name = name;
     ctx.current_session.ai_named = true;
     ctx.current_session.touch();
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
-    if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
-        renderer.render(UiLine::Error(format!("session save failed: {e}")));
-        renderer.flush();
-    }
 }
 
-/// Copy the latest conversation into `ctx.current_session`, auto-name
-/// the session from the first real user message, and write the session
-/// file to disk. Called on every TurnComplete and TurnCancelled so
-/// `/resume` can find the conversation after a quit. No-op only when both
-/// the recent working set and compressed history are empty.
+/// Keep the transitional UI projection in sync. Durable persistence belongs to
+/// the native runtime hooks; this function must never write core JSON.
 fn persist_current_session(
     ctx: &mut LoopCtx,
     snapshot: atomcode_core::conversation::ConversationSnapshot,
@@ -13721,26 +13772,12 @@ fn persist_current_session(
     apply_session_snapshot(&mut ctx.current_session, snapshot);
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
-    // Surface save failures instead of silently swallowing them.
-    // Previously this was `let _ = session_manager.save(...)`, which
-    // hid disk-full / permission / read-only / invalid-path errors —
-    // users would `/resume` on the next launch, see nothing, and
-    // assume "the session was lost" with no idea anything went wrong.
-    if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
-        renderer.render(UiLine::Error(
-            crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
-                error: &e.to_string(),
-            })
-            .into_owned(),
-        ));
-        renderer.flush();
-        return false;
-    }
+    let _ = renderer;
     true
 }
 
 pub(crate) fn apply_session_snapshot(
-    session: &mut atomcode_core::session::Session,
+    session: &mut crate::session::Session,
     snapshot: atomcode_core::conversation::ConversationSnapshot,
 ) {
     if snapshot.messages.is_empty() && snapshot.cold_summaries.is_empty() {
@@ -13798,11 +13835,12 @@ fn is_synthetic_user_text(text: &str) -> bool {
 #[cfg(test)]
 mod session_naming_tests {
     use super::{apply_session_snapshot, is_synthetic_user_text};
+    use crate::session::Session;
 
     #[test]
     fn apply_session_snapshot_renames_from_first_real_user() {
         use atomcode_core::conversation::message::{Message, Role};
-        let mut session = atomcode_core::session::Session::default_session(
+        let mut session = Session::default_session(
             std::path::PathBuf::from("/tmp/project"),
         );
         let messages = vec![
@@ -13825,7 +13863,7 @@ mod session_naming_tests {
     #[test]
     fn apply_session_snapshot_preserves_custom_name() {
         use atomcode_core::conversation::message::{Message, Role};
-        let mut session = atomcode_core::session::Session::default_session(
+        let mut session = Session::default_session(
             std::path::PathBuf::from("/tmp/project"),
         );
         session.name = "manual name".to_string();
@@ -13847,7 +13885,7 @@ mod session_naming_tests {
             message::{Message, Role},
             ConversationSnapshot,
         };
-        let mut session = atomcode_core::session::Session::default_session(
+        let mut session = Session::default_session(
             std::path::PathBuf::from("/tmp/project"),
         );
 
@@ -13868,7 +13906,7 @@ mod session_naming_tests {
             message::{Message, Role},
             ConversationSnapshot,
         };
-        let mut session = atomcode_core::session::Session::default_session(
+        let mut session = Session::default_session(
             std::path::PathBuf::from("/tmp/project"),
         );
         session.messages = vec![Message::new(Role::User, "stale recent turn")];
@@ -13962,8 +14000,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     let no_provider = matches!(
         runtime_availability,
         RuntimeUiAvailability::AwaitingProvider
-    )
-        || (ctx.config.providers.is_empty() && atomcode_auth::get_stored_auth().is_none());
+    ) || (ctx.config.providers.is_empty()
+        && atomcode_auth::get_stored_auth().is_none());
     let runtime_failed = matches!(runtime_availability, RuntimeUiAvailability::Failed);
     // Open-source build pointed at an AtomGit gateway: any chat will
     // fail-fast with `CpOfficialBuildRequired`. Surface that diagnosis

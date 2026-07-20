@@ -38,6 +38,71 @@ async fn start_native_runtime_with_session_bootstrap(
 ) -> Result<(atomcode_coding::CodingRuntime, CodingAgentConfig), atomcode_coding::RuntimeStartError>
 {
     let coding_cfg = coding_config_from_runtime(&cfg);
+    let (session, imported_lease) = match session {
+        SessionMode::Resume(id) => {
+            let manager = atomcode_capabilities::session::SessionManager::for_project(
+                &coding_cfg.working_dir,
+            );
+            let lease = manager.acquire_lease(&id).map_err(|error| {
+                atomcode_coding::RuntimeStartError::Prepare(std::io::Error::from(error))
+            })?;
+            crate::legacy_convert::converge_session(&manager, &lease).map_err(|error| {
+                atomcode_coding::RuntimeStartError::Prepare(std::io::Error::other(error))
+            })?;
+            (SessionMode::Resume(id), Some(lease))
+        }
+        SessionMode::ExternalSnapshot { id, snapshot } => {
+            let manager = atomcode_capabilities::session::SessionManager::for_project(
+                &coding_cfg.working_dir,
+            );
+            let lease = manager.acquire_lease(&id).map_err(|error| {
+                atomcode_coding::RuntimeStartError::Prepare(std::io::Error::from(error))
+            })?;
+            let has_existing = [
+                manager.meta_path(&id),
+                manager.snapshot_path(&id),
+                manager.legacy_path(&id),
+            ]
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                atomcode_coding::RuntimeStartError::Prepare(std::io::Error::from(error))
+            })?
+            .iter()
+            .any(|path| path.exists());
+            if has_existing {
+                crate::legacy_convert::converge_session(&manager, &lease).map_err(|error| {
+                    atomcode_coding::RuntimeStartError::Prepare(std::io::Error::other(error))
+                })?;
+            } else {
+                let now = atomcode_capabilities::session::now_ms();
+                let mut meta = atomcode_capabilities::session::SessionMeta::new(
+                    &id,
+                    coding_cfg.working_dir.to_string_lossy(),
+                    now,
+                );
+                meta.owner = atomcode_capabilities::session::StorageOwner::Native;
+                meta.message_count = u32::try_from(snapshot.messages.len()).map_err(|_| {
+                    atomcode_coding::RuntimeStartError::Prepare(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "external snapshot has too many messages",
+                    ))
+                })?;
+                manager
+                    .commit_native_import(
+                        &lease,
+                        Some(&snapshot),
+                        Some(&atomcode_capabilities::session::PresentationFile::default()),
+                        &meta,
+                    )
+                    .map_err(|error| {
+                        atomcode_coding::RuntimeStartError::Prepare(std::io::Error::from(error))
+                    })?;
+            }
+            (SessionMode::Resume(id), Some(lease))
+        }
+        other => (other, None),
+    };
     let prepare = PrepareOptions {
         session,
         skill_dirs: None,
@@ -48,16 +113,19 @@ async fn start_native_runtime_with_session_bootstrap(
         review: true,
         rate_limit_source: Some(crate::coding_plan_rate_limit_source()),
     };
-    let runtime = atomcode_coding::CodingRuntime::start_with_bootstrap(
-        atomcode_coding::CodingRuntimeStart {
-            agent: coding_cfg.clone(),
-            prepare,
-            provider_factory: crate::coding_provider_factory(),
-            plugin_hooks: crate::installed_plugin_hook_source(),
-        },
-        bootstrap,
-    )
-    .await?;
+    let start = atomcode_coding::CodingRuntimeStart {
+        agent: coding_cfg.clone(),
+        prepare,
+        provider_factory: crate::coding_provider_factory(),
+        plugin_hooks: crate::installed_plugin_hook_source(),
+    };
+    let runtime = match imported_lease {
+        Some(lease) => {
+            atomcode_coding::CodingRuntime::start_with_session_lease(start, bootstrap, lease)
+                .await?
+        }
+        None => atomcode_coding::CodingRuntime::start_with_bootstrap(start, bootstrap).await?,
+    };
     Ok((runtime, coding_cfg))
 }
 
@@ -204,20 +272,13 @@ mod tests {
     async fn deferred_runtime_publishes_authoritative_awaiting_provider_handle() {
         let working_dir = tempfile::tempdir().unwrap();
         let config = atomcode_config::config::Config::default();
-        let cfg = CodingRuntimeConfig::from_config(
-            &config,
-            working_dir.path(),
-            None,
-            None,
-            false,
-            true,
+        let cfg =
+            CodingRuntimeConfig::from_config(&config, working_dir.path(), None, None, false, true);
+        let (control_tx, _event_rx, mut state_rx) = spawn_native_runtime_for_session_deferred(
+            cfg,
+            "deferred-test".into(),
+            atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         );
-        let (control_tx, _event_rx, mut state_rx) =
-            spawn_native_runtime_for_session_deferred(
-                cfg,
-                "deferred-test".into(),
-                atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
-            );
 
         tokio::time::timeout(std::time::Duration::from_secs(5), state_rx.changed())
             .await
@@ -248,22 +309,14 @@ mod tests {
         std::env::set_var("ATOMCODE_HOME", home.path());
         let config = atomcode_config::config::Config::default();
         let cfg = || {
-            CodingRuntimeConfig::from_config(
-                &config,
-                working_dir.path(),
-                None,
-                None,
-                false,
-                true,
-            )
+            CodingRuntimeConfig::from_config(&config, working_dir.path(), None, None, false, true)
         };
         let snapshot = || atomcode_kernel::message::SessionSnapshot::new(Vec::new());
-        let (first_tx, _first_events, mut first_state) =
-            spawn_native_runtime_for_session_deferred(
-                cfg(),
-                "same-deferred-session".into(),
-                snapshot(),
-            );
+        let (first_tx, _first_events, mut first_state) = spawn_native_runtime_for_session_deferred(
+            cfg(),
+            "same-deferred-session".into(),
+            snapshot(),
+        );
         tokio::time::timeout(std::time::Duration::from_secs(5), first_state.changed())
             .await
             .unwrap()

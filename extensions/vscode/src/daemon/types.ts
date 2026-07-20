@@ -55,6 +55,8 @@ export interface HealthResponse {
   status: string;
   version: string;
   service: string;
+  instance_id?: string;
+  capabilities?: string[];
 }
 
 // Project
@@ -98,6 +100,7 @@ export interface UserInfo {
 
 export interface AuthStatusResponse {
   logged_in: boolean;
+  expired: boolean;
   auth_path: string;
   user: UserInfo | null;
   token: {
@@ -112,11 +115,16 @@ export interface LoginStartResponse {
   login_id: string;
   url: string;
   expires_in_seconds: number;
+  daemon_instance_id?: string;
+  protocol_version: number;
 }
 
 export interface LoginPollResponse {
-  status: 'pending' | 'authorized';
+  status: 'pending' | 'authorized' | 'expired' | 'cancelled' | 'failed';
   user: UserInfo | null;
+  code?: string;
+  message?: string;
+  retry_after_ms?: number;
 }
 
 export interface ProviderInfo {

@@ -6,6 +6,7 @@
 //! success terminal and an error terminal, and that a prompt BLOCKED before any turn
 //! ran does NOT fire it (no turn → no terminal).
 
+use async_trait::async_trait;
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
@@ -13,7 +14,6 @@ use atomcode_kernel::message::Conversation;
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::testkit::{MockProvider, RejectPromptHook, ScriptedProvider};
 use atomcode_kernel::tool::ToolRegistry;
-use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 
 /// Captures the `StopReason` of every `turn_complete` it observes.
@@ -30,12 +30,18 @@ impl LifecycleHooks for ReasonRecorder {
 }
 
 fn send(text: &str) -> AgentCommand {
-    AgentCommand::SendMessage { text: text.into(), images: vec![] }
+    AgentCommand::SendMessage {
+        text: text.into(),
+        images: vec![],
+    }
 }
 
 /// Drive a single SendMessage through an agent built from `provider` + `hooks`,
 /// returning after the first `TurnComplete` event.
-async fn drive_one_turn(provider: Arc<dyn atomcode_kernel::provider::LlmProvider>, hooks: Arc<dyn LifecycleHooks>) {
+async fn drive_one_turn(
+    provider: Arc<dyn atomcode_kernel::provider::LlmProvider>,
+    hooks: Arc<dyn LifecycleHooks>,
+) {
     let mut handle = Agent::builder()
         .provider(provider)
         .tools(ToolRegistry::new().mount(&[]))
@@ -103,7 +109,9 @@ async fn fires_with_provider_error_on_mid_stream_error() {
 #[tokio::test]
 async fn does_not_fire_when_prompt_is_rejected() {
     // The provider must never be called — script nothing meaningful.
-    let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Done { truncated: false }]]));
+    let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Done {
+        truncated: false,
+    }]]));
     let rec = Arc::new(ReasonRecorder::default());
     let reasons = rec.reasons.clone();
 
@@ -117,7 +125,12 @@ async fn does_not_fire_when_prompt_is_rejected() {
     handle.commands.send(send("go")).unwrap();
     let mut saw_rejected = false;
     while let Some(ev) = handle.events.recv().await {
-        if matches!(ev, AgentEvent::TurnComplete { reason: StopReason::PromptRejected }) {
+        if matches!(
+            ev,
+            AgentEvent::TurnComplete {
+                reason: StopReason::PromptRejected
+            }
+        ) {
             saw_rejected = true;
             break;
         }
@@ -128,7 +141,10 @@ async fn does_not_fire_when_prompt_is_rejected() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
-    assert!(saw_rejected, "a blocked prompt still emits TurnComplete{{PromptRejected}} to the driver");
+    assert!(
+        saw_rejected,
+        "a blocked prompt still emits TurnComplete{{PromptRejected}} to the driver"
+    );
     assert!(
         reasons.lock().unwrap().is_empty(),
         "a blocked prompt runs no turn, so turn_complete must NOT fire; got {:?}",

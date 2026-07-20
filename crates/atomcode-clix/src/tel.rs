@@ -63,7 +63,9 @@ fn load_telemetry_config(config_override: Option<&Path>) -> TelemetryConfig {
         Ok(t) => t,
         Err(_) => return TelemetryConfig::default(),
     };
-    toml::from_str::<TelFile>(&text).map(|f| f.telemetry).unwrap_or_default()
+    toml::from_str::<TelFile>(&text)
+        .map(|f| f.telemetry)
+        .unwrap_or_default()
 }
 
 /// Build the telemetry sink: resolve the 5-level opt-out (offline + env×2 + cli + config),
@@ -74,7 +76,15 @@ pub fn build_sink(config_override: Option<&Path>, no_telemetry: bool) -> Arc<Tel
     let cfg = load_telemetry_config(config_override);
     // clix does not participate in offline_mode (it never seeds the offline verdict),
     // so telemetry is not offline-gated here — pass false explicitly, not a bug.
-    let resolved = resolve(&cfg, &CliOverride { disabled: no_telemetry }, atomcode_dir(), &ProcessEnv, false);
+    let resolved = resolve(
+        &cfg,
+        &CliOverride {
+            disabled: no_telemetry,
+        },
+        atomcode_dir(),
+        &ProcessEnv,
+        false,
+    );
     Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into())
 }
 
@@ -164,7 +174,11 @@ mod tests {
         ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
             Ok(Box::pin(futures::stream::iter(vec![
                 StreamEvent::TextDelta("ok".into()),
-                StreamEvent::Usage(TokenUsage { prompt: 400, completion: 20, cached: 0 }),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 400,
+                    completion: 20,
+                    cached: 0,
+                }),
                 StreamEvent::Done { truncated: false },
             ])))
         }
@@ -187,7 +201,10 @@ mod tests {
             .iter()
             .filter(|r| matches!(r.event, atomcode_telemetry::Event::LlmChat { .. }))
             .count();
-        assert_eq!(n, 1, "the standalone review provider must meter each LLM round");
+        assert_eq!(
+            n, 1,
+            "the standalone review provider must meter each LLM round"
+        );
     }
 
     #[test]

@@ -47,8 +47,7 @@ pub fn isolate_home() {
         if std::env::var_os("ATOMCODE_HOME").is_some() {
             return; // explicit override (real run, or a test that set its own) wins
         }
-        let dir =
-            std::env::temp_dir().join(format!("atomcode-test-home-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("atomcode-test-home-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("ATOMCODE_HOME", &dir);
     });

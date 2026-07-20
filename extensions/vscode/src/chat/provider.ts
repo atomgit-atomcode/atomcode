@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { DaemonClient } from '../daemon/client';
+import { DaemonClient, DaemonHttpError } from '../daemon/client';
 import {
   AuthStatusResponse,
   ChatRequest,
@@ -129,7 +129,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _sessionRuntimes = new Map<string, SessionRuntime>();
   private _pendingMessages = new Map<string, any[]>();
   private _loginId?: string;
-  private _loginPoll?: ReturnType<typeof setInterval>;
+  private _loginGeneration = 0;
+  private _loginInFlight = false;
   private _loginStartedFromCommand = false;
   private _workspacePathCache?: { root: string; builtAt: number; items: WorkspacePathItem[] };
   private _approvalModeState: ApprovalModeState = initApprovalModeState('build');
@@ -185,7 +186,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   public dispose() {
-    this._clearLoginPoll();
+    this._loginGeneration += 1;
+    const loginId = this._loginId;
+    this._loginId = undefined;
+    if (loginId) void this._client.cancelLogin(loginId).catch(() => undefined);
     this._configWatcher?.dispose();
   }
 
@@ -1294,47 +1298,74 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       providers: providers?.providers ?? [],
       defaultProvider: providers?.default_provider ?? config?.default_provider ?? '',
       currentModel: defaultProvider?.model || models?.find((m) => m.is_default)?.model || '',
-      setupRequired: !auth?.logged_in || (providers?.providers.length ?? 0) === 0,
+      setupRequired: !auth?.logged_in || auth.expired || (providers?.providers.length ?? 0) === 0,
     });
   }
 
   private async _startLogin() {
+    if (this._loginInFlight) return;
+    this._loginInFlight = true;
     try {
       await this._cancelLogin();
       const login = await this._client.startLogin(true);
       this._loginId = login.login_id;
+      const generation = ++this._loginGeneration;
       this._broadcastMessage({ type: 'loginStarted', loginId: login.login_id, url: login.url });
-
-      this._loginPoll = setInterval(() => {
-        void this._pollLogin();
-      }, 2000);
-      await this._pollLogin();
+      await this._pollLogin(login.login_id, generation, login.expires_in_seconds);
     } catch (e) {
       this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
+    } finally {
+      this._loginInFlight = false;
     }
   }
 
-  private async _pollLogin() {
-    if (!this._loginId) return;
+  private async _pollLogin(loginId: string, generation: number, expiresInSeconds: number) {
+    const deadline = Date.now() + Math.max(1, expiresInSeconds) * 1000;
     try {
-      const result = await this._client.pollLogin(this._loginId);
-      if (result.status === 'pending') {
-        this._broadcastMessage({ type: 'loginPending' });
+      while (this._loginId === loginId && this._loginGeneration === generation) {
+        if (Date.now() >= deadline) {
+          await this._client.cancelLogin(loginId).catch(() => undefined);
+          throw new Error('Login timed out; start a new login.');
+        }
+
+        let result;
+        try {
+          result = await this._client.pollLogin(loginId);
+        } catch (error) {
+          if (error instanceof DaemonHttpError && error.retryable && Date.now() < deadline) {
+            this._broadcastMessage({ type: 'loginPending' });
+            await delay(2000);
+            continue;
+          }
+          throw error;
+        }
+
+        if (result.status === 'pending') {
+          this._broadcastMessage({ type: 'loginPending' });
+          await delay(result.retry_after_ms ?? 2000);
+          continue;
+        }
+        if (result.status !== 'authorized') {
+          throw new Error(result.message || `Login ${result.status}; start a new login.`);
+        }
+
+        if (this._loginId !== loginId || this._loginGeneration !== generation) return;
+        this._loginId = undefined;
+        this._broadcastMessage({ type: 'loginAuthorized', user: result.user });
+        if (this._loginStartedFromCommand) {
+          this._postMessage({
+            type: 'assistantMessage',
+            text: vscode.l10n.t('Signed in as {name}.', { name: result.user?.name || result.user?.username || vscode.l10n.t('AtomGit user') }),
+          });
+          this._loginStartedFromCommand = false;
+        }
+        await this._sendSetupState();
         return;
       }
-      this._clearLoginPoll();
-      this._loginId = undefined;
-      this._broadcastMessage({ type: 'loginAuthorized', user: result.user });
-      if (this._loginStartedFromCommand) {
-        this._postMessage({
-          type: 'assistantMessage',
-          text: vscode.l10n.t('Signed in as {name}.', { name: result.user?.name || result.user?.username || vscode.l10n.t('AtomGit user') }),
-        });
-        this._loginStartedFromCommand = false;
-      }
-      await this._sendSetupState();
     } catch (e) {
-      this._clearLoginPoll();
+      if (this._loginGeneration !== generation) return;
+      this._loginGeneration += 1;
+      this._loginId = undefined;
       this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
       if (this._loginStartedFromCommand) {
         this._postMessage({ type: 'error', message: this._messageFromError(e) });
@@ -1344,7 +1375,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _cancelLogin() {
-    this._clearLoginPoll();
+    this._loginGeneration += 1;
     if (this._loginId) {
       const id = this._loginId;
       this._loginId = undefined;
@@ -1352,19 +1383,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private _clearLoginPoll() {
-    if (this._loginPoll) {
-      clearInterval(this._loginPoll);
-      this._loginPoll = undefined;
-    }
-  }
-
   private async _ensureLoggedInForCodingPlan(announceInChat = false): Promise<boolean> {
+    let ownsLogin = false;
     try {
       const auth = await this._client.authStatus();
-      if (auth.logged_in) {
+      if (auth.logged_in && !auth.expired) {
         return true;
       }
+      if (this._loginInFlight) {
+        while (this._loginInFlight) await delay(100);
+        const refreshed = await this._client.authStatus();
+        return refreshed.logged_in && !refreshed.expired;
+      }
+      this._loginInFlight = true;
+      ownsLogin = true;
 
       if (announceInChat) {
         this._postMessage({
@@ -1377,14 +1409,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._cancelLogin();
       const login = await this._client.startLogin(true);
       this._loginId = login.login_id;
+      const generation = ++this._loginGeneration;
+      const deadline = Date.now() + Math.max(1, login.expires_in_seconds) * 1000;
       this._broadcastMessage({ type: 'loginStarted', loginId: login.login_id, url: login.url });
 
-      while (this._loginId === login.login_id) {
-        const result = await this._client.pollLogin(login.login_id);
+      while (this._loginId === login.login_id && this._loginGeneration === generation) {
+        if (Date.now() >= deadline) {
+          await this._cancelLogin();
+          throw new Error('Login timed out; start a new login.');
+        }
+        let result;
+        try {
+          result = await this._client.pollLogin(login.login_id);
+        } catch (error) {
+          if (error instanceof DaemonHttpError && error.retryable && Date.now() < deadline) {
+            await delay(2000);
+            continue;
+          }
+          throw error;
+        }
         if (result.status === 'pending') {
           this._broadcastMessage({ type: 'loginPending' });
-          await delay(2000);
+          await delay(result.retry_after_ms ?? 2000);
           continue;
+        }
+        if (result.status !== 'authorized') {
+          throw new Error(result.message || `Login ${result.status}; start a new login.`);
         }
 
         this._loginId = undefined;
@@ -1401,7 +1451,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       return false;
     } catch (e) {
-      this._clearLoginPoll();
+      this._loginGeneration += 1;
       this._loginId = undefined;
       const message = this._messageFromError(e);
       this._broadcastMessage({ type: 'setupError', message });
@@ -1409,6 +1459,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postMessage({ type: 'error', message });
       }
       return false;
+    } finally {
+      if (ownsLogin) this._loginInFlight = false;
     }
   }
 

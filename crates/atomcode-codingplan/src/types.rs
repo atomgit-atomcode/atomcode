@@ -45,8 +45,7 @@ impl PlanType {
 
     /// Cascade order: highest tier first. Used by `step_claim` to walk
     /// `Max → Pro → Lite` and stop at the first successful claim.
-    pub const CASCADE_ORDER: &'static [PlanType] =
-        &[PlanType::Max, PlanType::Pro, PlanType::Lite];
+    pub const CASCADE_ORDER: &'static [PlanType] = &[PlanType::Max, PlanType::Pro, PlanType::Lite];
 
     /// Best-effort map of a `StatusResponse.codingplan_free.plan_name`
     /// (e.g. `"CodingPlan Lite"` / `"CodingPlan Pro"` / `"CodingPlan Max"`)
@@ -364,11 +363,23 @@ mod tests {
     /// permanent "list updated" false positive on Lite/Pro.
     #[test]
     fn plan_type_from_plan_name() {
-        assert_eq!(PlanType::from_plan_name("CodingPlan Lite"), Some(PlanType::Lite));
-        assert_eq!(PlanType::from_plan_name("CodingPlan Pro"), Some(PlanType::Pro));
-        assert_eq!(PlanType::from_plan_name("CodingPlan Max"), Some(PlanType::Max));
+        assert_eq!(
+            PlanType::from_plan_name("CodingPlan Lite"),
+            Some(PlanType::Lite)
+        );
+        assert_eq!(
+            PlanType::from_plan_name("CodingPlan Pro"),
+            Some(PlanType::Pro)
+        );
+        assert_eq!(
+            PlanType::from_plan_name("CodingPlan Max"),
+            Some(PlanType::Max)
+        );
         // Case-insensitive.
-        assert_eq!(PlanType::from_plan_name("codingplan lite"), Some(PlanType::Lite));
+        assert_eq!(
+            PlanType::from_plan_name("codingplan lite"),
+            Some(PlanType::Lite)
+        );
         // Unrecognised tiers (Free / empty / junk) → None so the caller skips
         // rather than defaulting to Max and re-introducing the false positive.
         assert_eq!(PlanType::from_plan_name("CodingPlan Free"), None);

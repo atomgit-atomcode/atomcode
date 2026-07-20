@@ -5,19 +5,19 @@
 //! Phase A1 carries the proven hot-path code into. The kernel knows nothing
 //! about approval, persona, or code-intelligence.
 
-pub mod clock;
-pub mod checkpoint;
-pub mod message;
-pub mod tool;
-pub mod stream;
-pub mod provider;
-pub mod event;
-pub mod request;
-pub mod middleware;
-pub mod hook;
 pub mod agent;
+pub mod checkpoint;
+pub mod clock;
 pub mod conformance;
+pub mod event;
+pub mod hook;
+pub mod message;
+pub mod middleware;
+pub mod provider;
+pub mod request;
+pub mod stream;
 pub mod testkit;
+pub mod tool;
 
 /// Test-only `ATOMCODE_HOME` isolation ([`test_support::isolate_home`]), shared by
 /// every workspace crate whose tests persist sessions/config/memory. Gated behind the

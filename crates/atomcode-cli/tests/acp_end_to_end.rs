@@ -143,7 +143,11 @@ async fn initialize_new_prompt_streams_and_stops() {
 
     // initialize: protocol echoed + image prompt capability advertised.
     let init_json = serde_json::to_value(&init).unwrap();
-    assert_eq!(init.protocol_version, ProtocolVersion::V1, "protocol echoed");
+    assert_eq!(
+        init.protocol_version,
+        ProtocolVersion::V1,
+        "protocol echoed"
+    );
     assert_eq!(
         init_json["agentCapabilities"]["promptCapabilities"]["image"], true,
         "image prompt capability must be advertised: {init_json}"
@@ -158,7 +162,9 @@ async fn initialize_new_prompt_streams_and_stops() {
 
     // streaming: an agent_message_chunk carrying exactly "hello" was received.
     let got = updates.lock().unwrap().clone();
-    let hello = got.iter().find(|u| u["sessionUpdate"] == "agent_message_chunk");
+    let hello = got
+        .iter()
+        .find(|u| u["sessionUpdate"] == "agent_message_chunk");
     let hello = hello.unwrap_or_else(|| panic!("no agent_message_chunk in updates: {got:?}"));
     assert_eq!(
         hello["content"]["text"], "hello",
@@ -280,8 +286,11 @@ async fn error_turn_does_not_poison_next_prompt_on_same_session() {
         "second prompt must end with end_turn (not be poisoned by stale TurnComplete): {second_json}"
     );
     let got = updates.lock().unwrap().clone();
-    let hello = got.iter().find(|u| u["sessionUpdate"] == "agent_message_chunk");
-    let hello = hello.unwrap_or_else(|| panic!("no agent_message_chunk from second prompt: {got:?}"));
+    let hello = got
+        .iter()
+        .find(|u| u["sessionUpdate"] == "agent_message_chunk");
+    let hello =
+        hello.unwrap_or_else(|| panic!("no agent_message_chunk from second prompt: {got:?}"));
     assert_eq!(
         hello["content"]["text"], "hello",
         "second prompt must stream 'hello': {hello}"

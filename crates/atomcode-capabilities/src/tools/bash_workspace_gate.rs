@@ -59,12 +59,16 @@ fn has_dynamic_token(t: &str) -> bool {
 
 /// Filesystem-destructive commands that take a path operand. `dd` writes only its `of=` operand;
 /// `cp` writes only its LAST (dest) operand — both handled specially in [`extract_targets`].
-const DESTRUCTIVE_CMDS: &[&str] = &["rm", "rmdir", "unlink", "mv", "cp", "shred", "truncate", "dd"];
+const DESTRUCTIVE_CMDS: &[&str] = &[
+    "rm", "rmdir", "unlink", "mv", "cp", "shred", "truncate", "dd",
+];
 
 /// Leading wrapper commands to skip when finding a segment's effective command. Conservative:
 /// unknown wrappers just mean we don't recognize the destructive command (→ `Proceed`, and
 /// `ApprovalMiddleware` still catches the wrapped-Risky forms like `sudo`).
-const WRAPPERS: &[&str] = &["sudo", "doas", "env", "timeout", "nice", "ionice", "stdbuf", "time", "command", "builtin"];
+const WRAPPERS: &[&str] = &[
+    "sudo", "doas", "env", "timeout", "nice", "ionice", "stdbuf", "time", "command", "builtin",
+];
 
 /// Redirect targets that are not real file writes (fd dups / the null device).
 fn is_noop_redirect_target(t: &str) -> bool {
@@ -382,7 +386,11 @@ fn extract_targets(cmd: &str, args: &[String]) -> Option<Vec<String>> {
                 if has_dynamic_token(of) {
                     return None;
                 }
-                return Some(if of.is_empty() { vec![] } else { vec![of.to_string()] });
+                return Some(if of.is_empty() {
+                    vec![]
+                } else {
+                    vec![of.to_string()]
+                });
             }
         }
         return Some(vec![]); // no of= → writes stdout, not a file
@@ -558,7 +566,11 @@ pub struct BashWorkspaceGate {
 impl BashWorkspaceGate {
     /// Gate over the LIVE (mutable) working dir handle.
     pub fn new(cwd: Arc<RwLock<PathBuf>>) -> Self {
-        Self { store: Arc::new(InMemoryPermissionStore::new()), cwd, kind: APPROVAL_KIND.to_string() }
+        Self {
+            store: Arc::new(InMemoryPermissionStore::new()),
+            cwd,
+            kind: APPROVAL_KIND.to_string(),
+        }
     }
 
     /// Gate over a FIXED workspace root (tests / assemblies that pin an immutable working dir).
@@ -568,12 +580,21 @@ impl BashWorkspaceGate {
 
     /// Use a caller-supplied grant store (tests).
     pub fn with_store(cwd: Arc<RwLock<PathBuf>>, store: Arc<dyn PermissionStore>) -> Self {
-        Self { store, cwd, kind: APPROVAL_KIND.to_string() }
+        Self {
+            store,
+            cwd,
+            kind: APPROVAL_KIND.to_string(),
+        }
     }
 
     /// Round-trip the driver for an approval decision (same wire shape as `ApprovalMiddleware`,
     /// so the existing prompt UI renders it unchanged).
-    async fn prompt(&self, call: &ToolCall, tool: &Arc<dyn Tool>, rt: &RequestCtx) -> PermissionDecision {
+    async fn prompt(
+        &self,
+        call: &ToolCall,
+        tool: &Arc<dyn Tool>,
+        rt: &RequestCtx,
+    ) -> PermissionDecision {
         let payload = serde_json::to_value(ApprovalRequest {
             call_id: call.id.clone(),
             tool: tool.name().to_string(),
@@ -585,21 +606,33 @@ impl BashWorkspaceGate {
 
     /// Prompt and NEVER remember it — every call re-prompts (used for sensitive targets and for
     /// unresolvable destructive commands). Both allow-once and allow-always proceed without storing.
-    async fn prompt_unremembered(&self, call: &ToolCall, tool: &Arc<dyn Tool>, rt: &RequestCtx) -> BeforeOutcome {
+    async fn prompt_unremembered(
+        &self,
+        call: &ToolCall,
+        tool: &Arc<dyn Tool>,
+        rt: &RequestCtx,
+    ) -> BeforeOutcome {
         match self.prompt(call, tool, rt).await {
             PermissionDecision::AllowOnce | PermissionDecision::AllowAlways => {
-                BeforeOutcome::Allow { reason: Some("destructive bash approved (not remembered)".into()) }
+                BeforeOutcome::Allow {
+                    reason: Some("destructive bash approved (not remembered)".into()),
+                }
             }
-            PermissionDecision::Deny => {
-                BeforeOutcome::deny("a destructive bash command needs approval and was denied".to_string())
-            }
+            PermissionDecision::Deny => BeforeOutcome::deny(
+                "a destructive bash command needs approval and was denied".to_string(),
+            ),
         }
     }
 }
 
 #[async_trait]
 impl ToolMiddleware for BashWorkspaceGate {
-    async fn before(&self, call: &mut ToolCall, tool: &Arc<dyn Tool>, rt: &RequestCtx) -> BeforeOutcome {
+    async fn before(
+        &self,
+        call: &mut ToolCall,
+        tool: &Arc<dyn Tool>,
+        rt: &RequestCtx,
+    ) -> BeforeOutcome {
         if tool.name() != "bash" {
             return BeforeOutcome::Proceed; // not ours
         }
@@ -630,7 +663,10 @@ impl ToolMiddleware for BashWorkspaceGate {
         // Sensitive TARGET → prompt EVERY time, never remembered (mirror WriteApprovalGate).
         // Classified on the resolved target (not a substring of the whole command) so a benign
         // command that merely MENTIONS a secret name (`echo id_rsa >> ./notes.txt`) isn't blocked.
-        if targets.iter().any(|t| path_is_sensitive(&resolve_path(t, &cwd))) {
+        if targets
+            .iter()
+            .any(|t| path_is_sensitive(&resolve_path(t, &cwd)))
+        {
             return self.prompt_unremembered(call, tool, rt).await;
         }
 
@@ -661,14 +697,19 @@ impl ToolMiddleware for BashWorkspaceGate {
                 // dest as out-of-workspace so the move prompts. `!out.contains` avoids a duplicate
                 // when the same dest is already a scan target (`mv ws /outside/x`).
                 for (src, dst) in &mv_pairs {
-                    if path_in_workspace(src, &cwd) && !path_in_workspace(dst, &cwd) && !out.contains(dst) {
+                    if path_in_workspace(src, &cwd)
+                        && !path_in_workspace(dst, &cwd)
+                        && !out.contains(dst)
+                    {
                         out.push(dst.clone());
                     }
                 }
                 let all_in = out.is_empty();
                 // Per-out-target directory grant keys, deduped (multiple targets can share a dir).
-                let mut keys: Vec<String> =
-                    out.iter().map(|t| format!("bashdir::{}", canonical_dir_key(t, &cwd))).collect();
+                let mut keys: Vec<String> = out
+                    .iter()
+                    .map(|t| format!("bashdir::{}", canonical_dir_key(t, &cwd)))
+                    .collect();
                 keys.sort();
                 keys.dedup();
                 (all_in, keys)
@@ -688,15 +729,21 @@ impl ToolMiddleware for BashWorkspaceGate {
         // command ride along (`rm /granted/x && mv ws_file /tmp/stolen`). Empty keys (FS-timeout
         // fallback) → never auto-allow → prompt (fail-closed).
         if !out_keys.is_empty() && out_keys.iter().all(|k| self.store.is_granted(k)) {
-            return BeforeOutcome::Allow { reason: Some("previously granted this session".into()) };
+            return BeforeOutcome::Allow {
+                reason: Some("previously granted this session".into()),
+            };
         }
         match self.prompt(call, tool, rt).await {
-            PermissionDecision::AllowOnce => BeforeOutcome::Allow { reason: Some("approved once".into()) },
+            PermissionDecision::AllowOnce => BeforeOutcome::Allow {
+                reason: Some("approved once".into()),
+            },
             PermissionDecision::AllowAlways => {
                 for k in &out_keys {
                     self.store.grant(k);
                 }
-                BeforeOutcome::Allow { reason: Some("approved always (this folder)".into()) }
+                BeforeOutcome::Allow {
+                    reason: Some("approved always (this folder)".into()),
+                }
             }
             PermissionDecision::Deny => {
                 BeforeOutcome::deny("destructive bash denied by approval policy".to_string())
@@ -722,24 +769,42 @@ mod tests {
     fn non_destructive_commands_pass() {
         assert_eq!(scan("ls -la"), BashScan::NotDestructive);
         assert_eq!(scan("cat file.txt | grep foo"), BashScan::NotDestructive);
-        assert_eq!(scan("git commit -m 'cd into dir and rm stuff'"), BashScan::NotDestructive);
+        assert_eq!(
+            scan("git commit -m 'cd into dir and rm stuff'"),
+            BashScan::NotDestructive
+        );
     }
 
     #[test]
     fn single_file_rm_extracts_target() {
-        assert_eq!(scan("rm /outside/x.txt"), BashScan::Targets(vec!["/outside/x.txt".into()]));
-        assert_eq!(scan("rm -f ./a.txt"), BashScan::Targets(vec!["./a.txt".into()]));
-        assert_eq!(scan("rm -rf src/gen"), BashScan::Targets(vec!["src/gen".into()]));
+        assert_eq!(
+            scan("rm /outside/x.txt"),
+            BashScan::Targets(vec!["/outside/x.txt".into()])
+        );
+        assert_eq!(
+            scan("rm -f ./a.txt"),
+            BashScan::Targets(vec!["./a.txt".into()])
+        );
+        assert_eq!(
+            scan("rm -rf src/gen"),
+            BashScan::Targets(vec!["src/gen".into()])
+        );
     }
 
     #[test]
     fn mv_targets_both_operands() {
-        assert_eq!(scan("mv a.txt /outside/b.txt"), BashScan::Targets(vec!["a.txt".into(), "/outside/b.txt".into()]));
+        assert_eq!(
+            scan("mv a.txt /outside/b.txt"),
+            BashScan::Targets(vec!["a.txt".into(), "/outside/b.txt".into()])
+        );
     }
 
     #[test]
     fn mv_moves_extracts_source_dest_pairs() {
-        assert_eq!(mv_moves("mv a.txt /tmp/b"), vec![("a.txt".to_string(), "/tmp/b".to_string())]);
+        assert_eq!(
+            mv_moves("mv a.txt /tmp/b"),
+            vec![("a.txt".to_string(), "/tmp/b".to_string())]
+        );
         // multi-source → one pair per source, shared dest dir
         assert_eq!(
             mv_moves("mv a b c /tmp/dest"),
@@ -752,7 +817,10 @@ mod tests {
         // `-t DEST` form: every positional is a source
         assert_eq!(
             mv_moves("mv -t /tmp/dest a b"),
-            vec![("a".to_string(), "/tmp/dest".to_string()), ("b".to_string(), "/tmp/dest".to_string())]
+            vec![
+                ("a".to_string(), "/tmp/dest".to_string()),
+                ("b".to_string(), "/tmp/dest".to_string())
+            ]
         );
         // cp is a copy (source stays) → not a move
         assert!(mv_moves("cp a.txt /tmp/b").is_empty());
@@ -765,33 +833,60 @@ mod tests {
     fn escaped_command_is_still_recognized() {
         // `\rm` / `\mv` (leading backslash bypasses aliases but runs the real command) must not
         // slip through as non-destructive.
-        assert_eq!(scan("\\rm /outside/x.txt"), BashScan::Targets(vec!["/outside/x.txt".into()]));
-        assert_eq!(scan("\\mv a.txt /outside/b"), BashScan::Targets(vec!["a.txt".into(), "/outside/b".into()]));
-        assert_eq!(mv_moves("\\mv a.txt /tmp/b"), vec![("a.txt".to_string(), "/tmp/b".to_string())]);
+        assert_eq!(
+            scan("\\rm /outside/x.txt"),
+            BashScan::Targets(vec!["/outside/x.txt".into()])
+        );
+        assert_eq!(
+            scan("\\mv a.txt /outside/b"),
+            BashScan::Targets(vec!["a.txt".into(), "/outside/b".into()])
+        );
+        assert_eq!(
+            mv_moves("\\mv a.txt /tmp/b"),
+            vec![("a.txt".to_string(), "/tmp/b".to_string())]
+        );
     }
 
     #[test]
     fn cp_targets_only_dest() {
         // src is a read; only the dest (last operand) is written.
-        assert_eq!(scan("cp /outside/src ./dst"), BashScan::Targets(vec!["./dst".into()]));
-        assert_eq!(scan("cp -r a b /outside/dest"), BashScan::Targets(vec!["/outside/dest".into()]));
+        assert_eq!(
+            scan("cp /outside/src ./dst"),
+            BashScan::Targets(vec!["./dst".into()])
+        );
+        assert_eq!(
+            scan("cp -r a b /outside/dest"),
+            BashScan::Targets(vec!["/outside/dest".into()])
+        );
     }
 
     #[test]
     fn dd_targets_only_of() {
-        assert_eq!(scan("dd if=/dev/zero of=/outside/big bs=1M"), BashScan::Targets(vec!["/outside/big".into()]));
+        assert_eq!(
+            scan("dd if=/dev/zero of=/outside/big bs=1M"),
+            BashScan::Targets(vec!["/outside/big".into()])
+        );
         assert_eq!(scan("dd if=/dev/sda"), BashScan::NotDestructive); // no of= → writes stdout
     }
 
     #[test]
     fn redirect_targets_gated_fd_dups_skipped() {
-        assert_eq!(scan("echo hi > /outside/out.txt"), BashScan::Targets(vec!["/outside/out.txt".into()]));
-        assert_eq!(scan("echo hi >> ./log.txt"), BashScan::Targets(vec!["./log.txt".into()]));
+        assert_eq!(
+            scan("echo hi > /outside/out.txt"),
+            BashScan::Targets(vec!["/outside/out.txt".into()])
+        );
+        assert_eq!(
+            scan("echo hi >> ./log.txt"),
+            BashScan::Targets(vec!["./log.txt".into()])
+        );
         // fd dup + /dev/null are not file writes.
         assert_eq!(scan("run 2>&1"), BashScan::NotDestructive);
         assert_eq!(scan("run 2>/dev/null"), BashScan::NotDestructive);
         // stderr-to-file IS a file write.
-        assert_eq!(scan("run 2> /outside/err.log"), BashScan::Targets(vec!["/outside/err.log".into()]));
+        assert_eq!(
+            scan("run 2> /outside/err.log"),
+            BashScan::Targets(vec!["/outside/err.log".into()])
+        );
     }
 
     #[test]
@@ -825,7 +920,10 @@ mod tests {
         // With a cd in the mix, a RELATIVE destructive target genuinely can't be resolved.
         assert_eq!(scan("cd /ws && echo x > rel.txt"), BashScan::Unresolvable);
         // A mix: any relative target taints the whole command (fail closed).
-        assert_eq!(scan("cd /ws && rm /abs/a.txt rel.txt"), BashScan::Unresolvable);
+        assert_eq!(
+            scan("cd /ws && rm /abs/a.txt rel.txt"),
+            BashScan::Unresolvable
+        );
     }
 
     #[test]
@@ -837,12 +935,18 @@ mod tests {
 
     #[test]
     fn compound_all_targets_collected() {
-        assert_eq!(scan("rm a.txt && rm /outside/b.txt"), BashScan::Targets(vec!["a.txt".into(), "/outside/b.txt".into()]));
+        assert_eq!(
+            scan("rm a.txt && rm /outside/b.txt"),
+            BashScan::Targets(vec!["a.txt".into(), "/outside/b.txt".into()])
+        );
     }
 
     #[test]
     fn quoted_path_with_spaces() {
-        assert_eq!(scan(r#"rm "/outside/my file.txt""#), BashScan::Targets(vec!["/outside/my file.txt".into()]));
+        assert_eq!(
+            scan(r#"rm "/outside/my file.txt""#),
+            BashScan::Targets(vec!["/outside/my file.txt".into()])
+        );
     }
 
     #[test]
@@ -854,9 +958,18 @@ mod tests {
     #[test]
     fn cp_target_directory_flag_is_a_target() {
         // The destination smuggled via -t / --target-directory must be classified, not dropped.
-        assert_eq!(scan("cp -t /outside a.txt b.txt"), BashScan::Targets(vec!["/outside".into()]));
-        assert_eq!(scan("cp --target-directory=/outside a.txt"), BashScan::Targets(vec!["/outside".into()]));
-        assert_eq!(scan("cp -t/outside a.txt"), BashScan::Targets(vec!["/outside".into()]));
+        assert_eq!(
+            scan("cp -t /outside a.txt b.txt"),
+            BashScan::Targets(vec!["/outside".into()])
+        );
+        assert_eq!(
+            scan("cp --target-directory=/outside a.txt"),
+            BashScan::Targets(vec!["/outside".into()])
+        );
+        assert_eq!(
+            scan("cp -t/outside a.txt"),
+            BashScan::Targets(vec!["/outside".into()])
+        );
     }
 
     #[test]
@@ -872,19 +985,28 @@ mod tests {
     #[test]
     fn noclobber_override_redirect_is_gated() {
         // `>|` (noclobber override) must not be split on the `|` and lose its target.
-        assert_eq!(scan("cat secrets >| /outside/out.txt"), BashScan::Targets(vec!["/outside/out.txt".into()]));
+        assert_eq!(
+            scan("cat secrets >| /outside/out.txt"),
+            BashScan::Targets(vec!["/outside/out.txt".into()])
+        );
     }
 
     #[test]
     fn backslash_newline_continuation_is_joined() {
         // `rm \⏎/outside/x` — the line continuation is removed so the target isn't orphaned.
-        assert_eq!(scan("rm \\\n/outside/x.txt"), BashScan::Targets(vec!["/outside/x.txt".into()]));
+        assert_eq!(
+            scan("rm \\\n/outside/x.txt"),
+            BashScan::Targets(vec!["/outside/x.txt".into()])
+        );
     }
 
     #[test]
     fn dynamic_in_unrelated_arg_is_not_unresolvable() {
         // `$(date)` in an echo ARG must not force the whole (in-workspace) redirect to prompt.
-        assert_eq!(scan(r#"echo "x=$(date)" > log"#), BashScan::Targets(vec!["log".into()]));
+        assert_eq!(
+            scan(r#"echo "x=$(date)" > log"#),
+            BashScan::Targets(vec!["log".into()])
+        );
         // ...but a $()/backtick in the TARGET itself is still unresolvable.
         assert_eq!(scan("echo x > `mktemp`"), BashScan::Unresolvable);
     }
@@ -921,8 +1043,15 @@ mod tests {
     async fn non_bash_tool_is_not_ours() {
         let gate = BashWorkspaceGate::pinned(std::env::temp_dir());
         let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool::default());
-        let mut call = ToolCall { id: "1".into(), name: "read_file".into(), arguments: r#"{"file_path":"a"}"#.into() };
-        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"file_path":"a"}"#.into(),
+        };
+        assert_eq!(
+            gate.before(&mut call, &tool, &silent_rt()).await,
+            BeforeOutcome::Proceed
+        );
     }
 
     #[tokio::test]
@@ -933,7 +1062,10 @@ mod tests {
         let tool = bash_tool();
         let mut call = bash_call("rm a.txt");
         // Proceed → the silent driver is never consulted (would Deny if reached).
-        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+        assert_eq!(
+            gate.before(&mut call, &tool, &silent_rt()).await,
+            BeforeOutcome::Proceed
+        );
     }
 
     #[tokio::test]
@@ -946,7 +1078,10 @@ mod tests {
         let tool = bash_tool();
         let mut call = bash_call(&format!("rm {}", target.to_str().unwrap()));
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "out-of-workspace rm must prompt (fail closed when silent), got {out:?}");
+        assert!(
+            out.is_deny(),
+            "out-of-workspace rm must prompt (fail closed when silent), got {out:?}"
+        );
     }
 
     #[tokio::test]
@@ -957,12 +1092,19 @@ mod tests {
         let secret = outside.path().join("id_rsa");
         std::fs::write(&secret, "k").unwrap();
         let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
-        store.grant(&format!("bashdir::{}", canonical_dir_key(secret.to_str().unwrap(), ws.path())));
-        let gate = BashWorkspaceGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
+        store.grant(&format!(
+            "bashdir::{}",
+            canonical_dir_key(secret.to_str().unwrap(), ws.path())
+        ));
+        let gate =
+            BashWorkspaceGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
         let tool = bash_tool();
         let mut call = bash_call(&format!("rm {}", secret.to_str().unwrap()));
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "sensitive delete must prompt (ignore cache), got {out:?}");
+        assert!(
+            out.is_deny(),
+            "sensitive delete must prompt (ignore cache), got {out:?}"
+        );
     }
 
     #[tokio::test]
@@ -972,7 +1114,10 @@ mod tests {
         let tool = bash_tool();
         let mut call = bash_call("cd /somewhere/else && rm data.bin");
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "unresolvable destructive must prompt (fail closed), got {out:?}");
+        assert!(
+            out.is_deny(),
+            "unresolvable destructive must prompt (fail closed), got {out:?}"
+        );
     }
 
     #[tokio::test]
@@ -987,13 +1132,20 @@ mod tests {
         let sibling = dir_a.join("sibling.txt");
         let other = dir_b.join("other.txt");
         let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
-        store.grant(&format!("bashdir::{}", canonical_dir_key(granted.to_str().unwrap(), ws.path())));
-        let gate = BashWorkspaceGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
+        store.grant(&format!(
+            "bashdir::{}",
+            canonical_dir_key(granted.to_str().unwrap(), ws.path())
+        ));
+        let gate =
+            BashWorkspaceGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
         let tool = bash_tool();
 
         let mut s = bash_call(&format!("rm {}", sibling.to_str().unwrap()));
         assert!(
-            matches!(gate.before(&mut s, &tool, &silent_rt()).await, BeforeOutcome::Allow { .. }),
+            matches!(
+                gate.before(&mut s, &tool, &silent_rt()).await,
+                BeforeOutcome::Allow { .. }
+            ),
             "a sibling delete in the granted folder must auto-approve"
         );
         let mut o = bash_call(&format!("rm {}", other.to_str().unwrap()));
@@ -1014,7 +1166,10 @@ mod tests {
         let tool = bash_tool();
         let mut call = bash_call("mv data.bin /tmp/atomcode-mv-test-backup");
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "mv of a workspace file out to /tmp must prompt (fail closed), got {out:?}");
+        assert!(
+            out.is_deny(),
+            "mv of a workspace file out to /tmp must prompt (fail closed), got {out:?}"
+        );
     }
 
     #[tokio::test]
@@ -1026,7 +1181,10 @@ mod tests {
         let tool = bash_tool();
         let mut call = bash_call("\\mv data.bin /tmp/atomcode-esc-backup");
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "escaped mv of a workspace file out must prompt, got {out:?}");
+        assert!(
+            out.is_deny(),
+            "escaped mv of a workspace file out must prompt, got {out:?}"
+        );
     }
 
     #[tokio::test]
@@ -1037,13 +1195,23 @@ mod tests {
         std::fs::write(ws.path().join("data.bin"), "x").unwrap();
         let granted_dir = std::path::PathBuf::from("/atomcode-test-grant-cover/a");
         let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
-        store.grant(&format!("bashdir::{}", canonical_dir_key(granted_dir.join("x").to_str().unwrap(), ws.path())));
-        let gate = BashWorkspaceGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
+        store.grant(&format!(
+            "bashdir::{}",
+            canonical_dir_key(granted_dir.join("x").to_str().unwrap(), ws.path())
+        ));
+        let gate =
+            BashWorkspaceGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
         let tool = bash_tool();
         // Op in the granted dir + an mv-escape of a workspace file to /tmp.
-        let mut call = bash_call(&format!("rm {}/x && mv data.bin /tmp/atomcode-stolen", granted_dir.to_str().unwrap()));
+        let mut call = bash_call(&format!(
+            "rm {}/x && mv data.bin /tmp/atomcode-stolen",
+            granted_dir.to_str().unwrap()
+        ));
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "the grant must not cover the additional mv-escape target, got {out:?}");
+        assert!(
+            out.is_deny(),
+            "the grant must not cover the additional mv-escape target, got {out:?}"
+        );
     }
 
     #[tokio::test]
@@ -1054,7 +1222,10 @@ mod tests {
         let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
         let tool = bash_tool();
         let mut call = bash_call("mv a.txt b.txt");
-        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+        assert_eq!(
+            gate.before(&mut call, &tool, &silent_rt()).await,
+            BeforeOutcome::Proceed
+        );
     }
 
     #[tokio::test]
@@ -1064,7 +1235,10 @@ mod tests {
         let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
         let tool = bash_tool();
         let mut call = bash_call("mv /tmp/atomcode-a /tmp/atomcode-b");
-        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+        assert_eq!(
+            gate.before(&mut call, &tool, &silent_rt()).await,
+            BeforeOutcome::Proceed
+        );
     }
 
     #[tokio::test]
@@ -1075,7 +1249,10 @@ mod tests {
         let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
         let tool = bash_tool();
         let mut call = bash_call("echo id_rsa >> ./notes.txt");
-        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+        assert_eq!(
+            gate.before(&mut call, &tool, &silent_rt()).await,
+            BeforeOutcome::Proceed
+        );
     }
 
     #[tokio::test]
@@ -1084,7 +1261,10 @@ mod tests {
         let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
         let tool = bash_tool();
         let mut call = bash_call("echo hi > out.txt");
-        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+        assert_eq!(
+            gate.before(&mut call, &tool, &silent_rt()).await,
+            BeforeOutcome::Proceed
+        );
     }
 
     // ---- temp-dir whitelist tests (codex parity) -------------------------------------------
@@ -1097,7 +1277,10 @@ mod tests {
         let tool = bash_tool();
         let mut call = bash_call("cargo build > /tmp/build_all.json");
         // /tmp is a writable temp root (codex parity) → no prompt.
-        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+        assert_eq!(
+            gate.before(&mut call, &tool, &silent_rt()).await,
+            BeforeOutcome::Proceed
+        );
     }
 
     #[cfg(unix)]
@@ -1114,7 +1297,10 @@ mod tests {
             ws.path().to_str().unwrap()
         );
         let mut call = bash_call(&cmd);
-        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+        assert_eq!(
+            gate.before(&mut call, &tool, &silent_rt()).await,
+            BeforeOutcome::Proceed
+        );
     }
 
     #[cfg(unix)]
@@ -1126,7 +1312,10 @@ mod tests {
         let tool = bash_tool();
         let mut call = bash_call("cd /somewhere && echo x > out.txt");
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "cd + relative redirect target must still prompt, got {out:?}");
+        assert!(
+            out.is_deny(),
+            "cd + relative redirect target must still prompt, got {out:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1137,7 +1326,10 @@ mod tests {
         let tool = bash_tool();
         let target = std::env::temp_dir().join("atomcode_gate_probe.json");
         let mut call = bash_call(&format!("echo x > {}", target.to_str().unwrap()));
-        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+        assert_eq!(
+            gate.before(&mut call, &tool, &silent_rt()).await,
+            BeforeOutcome::Proceed
+        );
     }
 
     #[cfg(unix)]
@@ -1149,6 +1341,9 @@ mod tests {
         // /tmp/../atomcode_gate_escape.txt canonicalizes OUT of temp → still out-of-workspace → prompts (fail-closed under silent_rt).
         let mut call = bash_call("echo x > /tmp/../atomcode_gate_escape.txt");
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "a target that escapes /tmp via .. must still prompt, got {out:?}");
+        assert!(
+            out.is_deny(),
+            "a target that escapes /tmp via .. must still prompt, got {out:?}"
+        );
     }
 }

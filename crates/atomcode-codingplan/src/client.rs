@@ -23,7 +23,9 @@ fn apply_blocking_proxy_policy(
     builder: reqwest::blocking::ClientBuilder,
 ) -> reqwest::blocking::ClientBuilder {
     atomcode_config::proxy::ensure_runtime_initialized();
-    if std::env::var(atomcode_config::proxy::MODE_ENV).ok().as_deref()
+    if std::env::var(atomcode_config::proxy::MODE_ENV)
+        .ok()
+        .as_deref()
         == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
     {
         builder.no_proxy()
@@ -328,8 +330,10 @@ fn format_api_error(descriptor: &str, status: reqwest::StatusCode, body: &str) -
 
 /// Backoff between retry attempts for the CodingPlan HTTP requests. Length = number of
 /// RETRIES (2 ⇒ up to 3 total attempts).
-const CODING_PLAN_RETRY_BACKOFFS: [std::time::Duration; 2] =
-    [std::time::Duration::from_millis(400), std::time::Duration::from_millis(1200)];
+const CODING_PLAN_RETRY_BACKOFFS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(400),
+    std::time::Duration::from_millis(1200),
+];
 
 /// A reqwest error worth retrying: a TRANSPORT-layer failure where the request did not reach
 /// the server (connect / timeout / send), so re-sending is safe even for a POST — the server
@@ -347,7 +351,12 @@ fn is_transient_send_error(e: &reqwest::Error) -> bool {
             use std::io::ErrorKind::*;
             if matches!(
                 io.kind(),
-                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | TimedOut | NotConnected
+                ConnectionReset
+                    | ConnectionAborted
+                    | BrokenPipe
+                    | UnexpectedEof
+                    | TimedOut
+                    | NotConnected
             ) {
                 return true;
             }
@@ -393,10 +402,18 @@ mod tests {
     #[test]
     fn with_retries_retries_transient_then_succeeds() {
         let calls = Cell::new(0);
-        let r: Result<i32, &str> = with_retries(&[Duration::ZERO, Duration::ZERO], |_| true, || {
-            calls.set(calls.get() + 1);
-            if calls.get() < 3 { Err("transient") } else { Ok(42) }
-        });
+        let r: Result<i32, &str> = with_retries(
+            &[Duration::ZERO, Duration::ZERO],
+            |_| true,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Err("transient")
+                } else {
+                    Ok(42)
+                }
+            },
+        );
         assert_eq!(r, Ok(42));
         assert_eq!(calls.get(), 3, "two retries then success");
     }
@@ -404,10 +421,14 @@ mod tests {
     #[test]
     fn with_retries_does_not_retry_non_transient() {
         let calls = Cell::new(0);
-        let r: Result<i32, &str> = with_retries(&[Duration::ZERO, Duration::ZERO], |_| false, || {
-            calls.set(calls.get() + 1);
-            Err("permanent")
-        });
+        let r: Result<i32, &str> = with_retries(
+            &[Duration::ZERO, Duration::ZERO],
+            |_| false,
+            || {
+                calls.set(calls.get() + 1);
+                Err("permanent")
+            },
+        );
         assert_eq!(r, Err("permanent"));
         assert_eq!(calls.get(), 1, "non-transient ⇒ no retry");
     }
@@ -415,10 +436,14 @@ mod tests {
     #[test]
     fn with_retries_exhausts_backoffs_then_returns_last_err() {
         let calls = Cell::new(0);
-        let r: Result<i32, &str> = with_retries(&[Duration::ZERO], |_| true, || {
-            calls.set(calls.get() + 1);
-            Err("always")
-        });
+        let r: Result<i32, &str> = with_retries(
+            &[Duration::ZERO],
+            |_| true,
+            || {
+                calls.set(calls.get() + 1);
+                Err("always")
+            },
+        );
         assert_eq!(r, Err("always"));
         assert_eq!(calls.get(), 2, "1 backoff ⇒ 1 retry ⇒ 2 attempts total");
     }

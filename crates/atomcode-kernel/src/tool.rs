@@ -134,7 +134,9 @@ impl Default for ProgressSink {
 
 impl std::fmt::Debug for ProgressSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProgressSink").field("active", &self.inner.is_some()).finish()
+        f.debug_struct("ProgressSink")
+            .field("active", &self.inner.is_some())
+            .finish()
     }
 }
 
@@ -281,25 +283,52 @@ mod tests {
         struct Plain;
         #[async_trait::async_trait]
         impl Tool for Plain {
-            fn name(&self) -> &str { "plain" }
-            fn description(&self) -> &str { "" }
-            fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+            fn name(&self) -> &str {
+                "plain"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
             async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-                ToolResult { call_id: String::new(), content: String::new(), is_error: false, images: vec![] }
+                ToolResult {
+                    call_id: String::new(),
+                    content: String::new(),
+                    is_error: false,
+                    images: vec![],
+                }
             }
         }
         struct RO;
         #[async_trait::async_trait]
         impl Tool for RO {
-            fn name(&self) -> &str { "ro" }
-            fn description(&self) -> &str { "" }
-            fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-            fn read_only_hint(&self) -> bool { true }
+            fn name(&self) -> &str {
+                "ro"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn read_only_hint(&self) -> bool {
+                true
+            }
             async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-                ToolResult { call_id: String::new(), content: String::new(), is_error: false, images: vec![] }
+                ToolResult {
+                    call_id: String::new(),
+                    content: String::new(),
+                    is_error: false,
+                    images: vec![],
+                }
             }
         }
-        assert!(!Plain.parallel_safe("{}"), "default (no read_only_hint) is NOT parallel-safe");
+        assert!(
+            !Plain.parallel_safe("{}"),
+            "default (no read_only_hint) is NOT parallel-safe"
+        );
         assert!(RO.parallel_safe("{}"), "a read-only tool IS parallel-safe");
     }
 
@@ -307,12 +336,25 @@ mod tests {
 
     #[async_trait]
     impl Tool for Dummy {
-        fn name(&self) -> &str { self.0 }
-        fn description(&self) -> &str { "dummy" }
-        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
-        fn risk(&self, _args: &str) -> RiskLevel { self.1 }
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "dummy"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn risk(&self, _args: &str) -> RiskLevel {
+            self.1
+        }
         async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-            ToolResult { call_id: String::new(), content: "ok".into(), is_error: false, images: vec![] }
+            ToolResult {
+                call_id: String::new(),
+                content: "ok".into(),
+                is_error: false,
+                images: vec![],
+            }
         }
     }
 
@@ -330,7 +372,10 @@ mod tests {
         let sink = ProgressSink::new(Arc::new(move |m| c2.lock().unwrap().push(m)));
         sink.emit("a");
         sink.emit("b");
-        assert_eq!(*captured.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]
@@ -346,7 +391,10 @@ mod tests {
         assert_eq!(defs[0].name, "echo");
 
         assert!(mounted.get("echo").is_some());
-        assert!(mounted.get("risky_write").is_none(), "unmounted tool must be inert/invisible");
+        assert!(
+            mounted.get("risky_write").is_none(),
+            "unmounted tool must be inert/invisible"
+        );
     }
 
     #[tokio::test]
@@ -357,6 +405,9 @@ mod tests {
             progress: ProgressSink::noop(),
             requester: None,
         };
-        assert_eq!(ctx.request("ask", serde_json::json!({})).await, serde_json::Value::Null);
+        assert_eq!(
+            ctx.request("ask", serde_json::json!({})).await,
+            serde_json::Value::Null
+        );
     }
 }

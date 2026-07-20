@@ -31,6 +31,9 @@ mod tests {
         assert!(INIT_PROMPT.contains("AGENTS.md"), "targets AGENTS.md");
         // 已存在则增强、不清空重写
         let p = INIT_PROMPT.to_lowercase();
-        assert!(p.contains("exist") && (p.contains("improve") || p.contains("update") || p.contains("preserve")));
+        assert!(
+            p.contains("exist")
+                && (p.contains("improve") || p.contains("update") || p.contains("preserve"))
+        );
     }
 }

@@ -8,10 +8,10 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
-use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
 use crate::tool::{ToolCall, ToolDef};
+use atomcode_config::config::provider::ProviderConfig;
 
 use super::LlmProvider;
 

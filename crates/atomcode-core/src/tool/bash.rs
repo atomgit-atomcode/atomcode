@@ -103,7 +103,10 @@ where
             Ok(v != 0)
         }
         fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<bool, E> {
-            Ok(matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            Ok(matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes"
+            ))
         }
     }
 
@@ -397,10 +400,9 @@ const SNAPSHOT_TIMEOUT_SECS: u64 = 2;
 /// drops out.
 fn is_pure_readonly_command(cmd: &str) -> bool {
     const READONLY_HEAD: &[&str] = &[
-        "echo", "ls", "pwd", "cat", "head", "tail", "wc", "file", "stat",
-        "grep", "rg", "find", "which", "type", "command", "whoami",
-        "hostname", "date", "uname", "env", "printenv", "true", "false",
-        "dirname", "basename", "realpath",
+        "echo", "ls", "pwd", "cat", "head", "tail", "wc", "file", "stat", "grep", "rg", "find",
+        "which", "type", "command", "whoami", "hostname", "date", "uname", "env", "printenv",
+        "true", "false", "dirname", "basename", "realpath",
     ];
     let trimmed = cmd.trim();
     // Allow the two harmless stderr-routing patterns before scanning for
@@ -484,11 +486,8 @@ async fn snapshot_workspace_changes(
         // Child and we want the git process killed, not orphaned.
         .kill_on_drop(true);
     crate::process_utils::suppress_console_window(&mut cmd);
-    let out = match tokio::time::timeout(
-        Duration::from_secs(SNAPSHOT_TIMEOUT_SECS),
-        cmd.output(),
-    )
-    .await
+    let out = match tokio::time::timeout(Duration::from_secs(SNAPSHOT_TIMEOUT_SECS), cmd.output())
+        .await
     {
         Ok(Ok(out)) => out,
         _ => return None,
@@ -544,7 +543,11 @@ impl PgroupChild {
         let pgid = child
             .id()
             .expect("PgroupChild::new called after the child was reaped") as i32;
-        Self { child, pgid, terminated: false }
+        Self {
+            child,
+            pgid,
+            terminated: false,
+        }
     }
 
     /// Graceful pgroup shutdown: SIGTERM → 200ms grace → SIGKILL → reap.
@@ -780,7 +783,10 @@ pub async fn run_shell(
                 return ShellOutcome {
                     stdout: String::new(),
                     stderr: format!("failed to spawn: {e}"),
-                    exit: ShellExit::Exited { success: false, code: None },
+                    exit: ShellExit::Exited {
+                        success: false,
+                        code: None,
+                    },
                     elapsed_secs: start_instant.elapsed().as_secs_f64(),
                 };
             }
@@ -846,7 +852,10 @@ pub async fn run_shell(
                 return ShellOutcome {
                     stdout: String::new(),
                     stderr: format!("failed to spawn: {e}"),
-                    exit: ShellExit::Exited { success: false, code: None },
+                    exit: ShellExit::Exited {
+                        success: false,
+                        code: None,
+                    },
                     elapsed_secs: start_instant.elapsed().as_secs_f64(),
                 };
             }
@@ -872,8 +881,7 @@ pub async fn run_shell(
                     match tokio::time::timeout(idle_timeout, stdout.read(&mut buf)).await {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => {
-                            let chunk =
-                                crate::process_utils::decode_subprocess_output(&buf[..n]);
+                            let chunk = crate::process_utils::decode_subprocess_output(&buf[..n]);
                             stdout_buf.extend_from_slice(&buf[..n]);
                             has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
                             chunk_cb(&sanitize_terminal_output(&chunk));
@@ -893,8 +901,7 @@ pub async fn run_shell(
                     match tokio::time::timeout(idle_timeout, stderr.read(&mut buf)).await {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => {
-                            let chunk =
-                                crate::process_utils::decode_subprocess_output(&buf[..n]);
+                            let chunk = crate::process_utils::decode_subprocess_output(&buf[..n]);
                             stderr_buf.extend_from_slice(&buf[..n]);
                             has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
                             chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
@@ -950,7 +957,12 @@ pub async fn run_shell(
         }
     };
 
-    ShellOutcome { stdout: stdout_str, stderr: stderr_str, exit, elapsed_secs }
+    ShellOutcome {
+        stdout: stdout_str,
+        stderr: stderr_str,
+        exit,
+        elapsed_secs,
+    }
 }
 
 async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
@@ -1009,7 +1021,11 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
             } else {
                 format!("{}\n{}", elapsed_marker, combined)
             };
-            Ok(ToolResult { call_id: String::new(), output, success: effective_success })
+            Ok(ToolResult {
+                call_id: String::new(),
+                output,
+                success: effective_success,
+            })
         }
         ShellExit::KilledIdle => {
             let combined = format_output(&stdout_str, &stderr_str);
@@ -1025,20 +1041,31 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     elapsed_marker, combined
                 )
             };
-            Ok(ToolResult { call_id: String::new(), output, success: false })
+            Ok(ToolResult {
+                call_id: String::new(),
+                output,
+                success: false,
+            })
         }
         ShellExit::KilledTimeout => {
             let combined = format_output(&stdout_str, &stderr_str);
             let elapsed_marker = format!("[elapsed: {:.1}s, killed: timeout]", elapsed_secs);
             let output = if combined.is_empty() {
-                format!("{} [timed out after {}s with no output]", elapsed_marker, timeout_secs)
+                format!(
+                    "{} [timed out after {}s with no output]",
+                    elapsed_marker, timeout_secs
+                )
             } else {
                 format!(
                     "{}\n{}\n\n[timed out after {}s — consider passing a larger `timeout` if this command legitimately takes longer]",
                     elapsed_marker, combined, timeout_secs
                 )
             };
-            Ok(ToolResult { call_id: String::new(), output, success: false })
+            Ok(ToolResult {
+                call_id: String::new(),
+                output,
+                success: false,
+            })
         }
     }
 }
@@ -1117,10 +1144,7 @@ fn check_destructive_command(command: &str) -> Option<String> {
     }
 
     fn token_uses_shell_expansion(token: &str) -> bool {
-        token.contains('$')
-            || token.contains("${")
-            || token.contains("$(")
-            || token.contains('`')
+        token.contains('$') || token.contains("${") || token.contains("$(") || token.contains('`')
     }
 
     fn has_rm_flags(cmd: &str) -> (bool, bool) {
@@ -1185,9 +1209,8 @@ fn check_destructive_command(command: &str) -> Option<String> {
     // Helper: Extract command after wrapper commands
     fn strip_wrappers(cmd_lower: &str) -> String {
         let wrappers = [
-            "env", "nice", "nohup", "timeout", "strace", "ionice",
-            "taskset", "setsid", "screen", "tmux", "script",
-            "unshare", "nsenter", "chroot", "setarch", "linux32", "linux64",
+            "env", "nice", "nohup", "timeout", "strace", "ionice", "taskset", "setsid", "screen",
+            "tmux", "script", "unshare", "nsenter", "chroot", "setarch", "linux32", "linux64",
         ];
 
         let tokens: Vec<&str> = cmd_lower.split_whitespace().collect();
@@ -1212,8 +1235,8 @@ fn check_destructive_command(command: &str) -> Option<String> {
                     // This might be the actual command - check if it's a known destructive command
                     let base = get_base_command(tok);
                     let destructive_commands = [
-                        "rm", "dd", "chmod", "chown", "chgrp", "mkfs",
-                        "format", "drop", "python", "perl", "ruby", "php", "node",
+                        "rm", "dd", "chmod", "chown", "chgrp", "mkfs", "format", "drop", "python",
+                        "perl", "ruby", "php", "node",
                     ];
                     if destructive_commands.contains(&base) || tok.starts_with('/') {
                         break;
@@ -1268,11 +1291,22 @@ fn check_destructive_command(command: &str) -> Option<String> {
 
     // --- Phase 2: Alternative privilege escalation tools ---
     let priv_esc_tools = [
-        "sudo", "doas", "pkexec", "run0", "dzdo", "pfexec",
-        "systemd-run", "runuser", "su", "machinectl",
+        "sudo",
+        "doas",
+        "pkexec",
+        "run0",
+        "dzdo",
+        "pfexec",
+        "systemd-run",
+        "runuser",
+        "su",
+        "machinectl",
     ];
     for tool in priv_esc_tools {
-        if cmd.split_whitespace().any(|tok| get_base_command(tok) == tool) {
+        if cmd
+            .split_whitespace()
+            .any(|tok| get_base_command(tok) == tool)
+        {
             return Some(format!(
                 "Destructive command detected: Privileged execution via {}. Command: {}",
                 tool, command
@@ -1322,8 +1356,8 @@ fn check_destructive_command(command: &str) -> Option<String> {
 
     // --- Phase 2: Subshell execution detection ---
     let shell_interpreters = [
-        "bash", "sh", "zsh", "dash", "ash", "ksh", "csh", "tcsh", "fish",
-        "python", "python3", "python2", "perl", "ruby", "php", "node", "nodejs",
+        "bash", "sh", "zsh", "dash", "ash", "ksh", "csh", "tcsh", "fish", "python", "python3",
+        "python2", "perl", "ruby", "php", "node", "nodejs",
     ];
 
     for shell in shell_interpreters {
@@ -1377,8 +1411,20 @@ fn check_destructive_command(command: &str) -> Option<String> {
 
     // --- Phase 2: Pipe to shell detection (enhanced) ---
     let all_shells = [
-        "sh", "bash", "zsh", "dash", "ash", "ksh", "csh", "tcsh", "fish",
-        "/bin/sh", "/bin/bash", "/usr/bin/bash", "/bin/zsh", "/bin/dash",
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ash",
+        "ksh",
+        "csh",
+        "tcsh",
+        "fish",
+        "/bin/sh",
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/bin/zsh",
+        "/bin/dash",
     ];
 
     if cmd.contains('|') {
@@ -1403,7 +1449,11 @@ fn check_destructive_command(command: &str) -> Option<String> {
                     // Also check if the content contains destructive patterns (echo "rm -rf /path")
                     // Extract quoted content and check it
                     if prev_trimmed.starts_with("echo ") || prev_trimmed.starts_with("printf ") {
-                        let after_cmd = prev_trimmed.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+                        let after_cmd = prev_trimmed
+                            .split_whitespace()
+                            .skip(1)
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         // Remove surrounding quotes
                         let content = after_cmd.trim_matches(|c| c == '"' || c == '\'');
                         if let Some(reason) = check_destructive_command(content) {
@@ -1427,8 +1477,8 @@ fn check_destructive_command(command: &str) -> Option<String> {
     let normalized_stripped_first = normalize_shell_token(stripped_first);
     let stripped_base = get_base_command(&normalized_stripped_first);
 
-    let dynamic_first_token = token_uses_shell_expansion(first_token)
-        || token_uses_shell_expansion(stripped_first);
+    let dynamic_first_token =
+        token_uses_shell_expansion(first_token) || token_uses_shell_expansion(stripped_first);
 
     if dynamic_first_token {
         let (has_recursive, has_force) = has_rm_flags(&cmd);
@@ -1562,7 +1612,10 @@ fn check_destructive_command(command: &str) -> Option<String> {
         // hasn't been committed. Both flag spellings are guarded so
         // `git checkout -f` and `git checkout --force` both prompt.
         ("git checkout -f ", "Force checkout (discards working tree)"),
-        ("git checkout --force", "Force checkout (discards working tree)"),
+        (
+            "git checkout --force",
+            "Force checkout (discards working tree)",
+        ),
         // `git switch --discard-changes` is the modern equivalent of
         // `checkout -f` — same destructive blast radius (clobbers the
         // working tree), same gate.
@@ -1589,12 +1642,10 @@ fn check_destructive_command(command: &str) -> Option<String> {
     // delete with unmerged commits). For these we must match the
     // original `command` so `-D` triggers approval while `-d` stays
     // auto-allowed.
-    let cs_git_patterns: &[(&str, &str)] = &[
-        (
-            "git branch -D",
-            "Force delete branch (-D drops unmerged commits)",
-        ),
-    ];
+    let cs_git_patterns: &[(&str, &str)] = &[(
+        "git branch -D",
+        "Force delete branch (-D drops unmerged commits)",
+    )];
     for (pat, reason) in cs_git_patterns {
         if command.contains(pat) {
             return Some(format!(
@@ -1607,7 +1658,10 @@ fn check_destructive_command(command: &str) -> Option<String> {
     // --- Robust dd detection (handle if=/of= variants) ---
     // dd if=... can be written with spaces: dd if =/dev/zero
     let dd_normalized: String = cmd.split_whitespace().collect();
-    if dd_normalized.starts_with("ddif=") || dd_normalized.contains("if=/dev/") || dd_normalized.contains("if=/dev/") {
+    if dd_normalized.starts_with("ddif=")
+        || dd_normalized.contains("if=/dev/")
+        || dd_normalized.contains("if=/dev/")
+    {
         return Some(format!(
             "Destructive command detected: Raw disk write. Command: {}",
             command
@@ -1641,18 +1695,25 @@ fn check_destructive_command(command: &str) -> Option<String> {
 
     // Enhanced downloader detection (Phase 2)
     let all_downloaders = [
-        "curl", "wget", "aria2c", "http", "lynx", "wget2",
-        "python", "python3", "perl",
+        "curl", "wget", "aria2c", "http", "lynx", "wget2", "python", "python3", "perl",
     ];
     let all_shells = [
         "sh", "bash", "zsh", "dash", "ash", "ksh", "csh", "tcsh", "fish",
     ];
 
     let uses_downloader = all_downloaders.iter().any(|&dl| {
-        cmd.split_whitespace().any(|tok| get_base_command(tok) == dl)
+        cmd.split_whitespace()
+            .any(|tok| get_base_command(tok) == dl)
     });
-    let pipes_to_shell = all_shells.iter().any(|&s| cmd.contains(&format!("| {}", s)))
-        || cmd.contains("| /bin/") && cmd.split('|').last().map(|s| s.contains("sh")).unwrap_or(false);
+    let pipes_to_shell = all_shells
+        .iter()
+        .any(|&s| cmd.contains(&format!("| {}", s)))
+        || cmd.contains("| /bin/")
+            && cmd
+                .split('|')
+                .last()
+                .map(|s| s.contains("sh"))
+                .unwrap_or(false);
 
     if uses_downloader && pipes_to_shell {
         return Some(format!(
@@ -1677,10 +1738,17 @@ fn check_destructive_command(command: &str) -> Option<String> {
     }
 
     // --- Phase 2: Enhanced netcat detection ---
-    let nc_variants = ["nc", "ncat", "netcat", "nc.openbsd", "nc.traditional", "pwncat"];
-    let uses_netcat = cmd.split_whitespace().any(|tok| {
-        nc_variants.contains(&get_base_command(tok))
-    });
+    let nc_variants = [
+        "nc",
+        "ncat",
+        "netcat",
+        "nc.openbsd",
+        "nc.traditional",
+        "pwncat",
+    ];
+    let uses_netcat = cmd
+        .split_whitespace()
+        .any(|tok| nc_variants.contains(&get_base_command(tok)));
     if uses_netcat
         && (cmd.contains(" -e ")
             || cmd.contains(" -c ")
@@ -2587,8 +2655,18 @@ error: could not compile `hermes-tauri` (bin \"hermes-tauri\") due to 1 previous
     async fn run_shell_captures_stdout_and_exit_zero() {
         let dir = TempDir::new().unwrap();
         let outcome = run_shell("echo hello", dir.path(), 30, |_| {}).await;
-        assert!(matches!(outcome.exit, ShellExit::Exited { success: true, code: Some(0) }));
-        assert!(outcome.stdout.contains("hello"), "stdout was: {:?}", outcome.stdout);
+        assert!(matches!(
+            outcome.exit,
+            ShellExit::Exited {
+                success: true,
+                code: Some(0)
+            }
+        ));
+        assert!(
+            outcome.stdout.contains("hello"),
+            "stdout was: {:?}",
+            outcome.stdout
+        );
     }
 
     #[tokio::test]
@@ -2602,7 +2680,11 @@ error: could not compile `hermes-tauri` (bin \"hermes-tauri\") due to 1 previous
             }
             _ => panic!("expected Exited, got other variant"),
         }
-        assert!(outcome.stderr.contains("boom"), "stderr was: {:?}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("boom"),
+            "stderr was: {:?}",
+            outcome.stderr
+        );
     }
 
     #[tokio::test]
@@ -2615,7 +2697,10 @@ error: could not compile `hermes-tauri` (bin \"hermes-tauri\") due to 1 previous
             seen2.lock().unwrap().push_str(c);
         })
         .await;
-        assert!(matches!(outcome.exit, ShellExit::Exited { success: true, .. }));
+        assert!(matches!(
+            outcome.exit,
+            ShellExit::Exited { success: true, .. }
+        ));
         assert!(seen.lock().unwrap().contains("streamed"));
     }
 
@@ -2961,7 +3046,10 @@ mod sanitize_tests {
     // --- Phase 2: Script reverse shell detection ---
     #[test]
     fn destructive_check_catches_script_reverse_shells() {
-        assert!(check_destructive_command("python -c 'import socket; socket.connect((\"host\", 4444))'").is_some());
+        assert!(check_destructive_command(
+            "python -c 'import socket; socket.connect((\"host\", 4444))'"
+        )
+        .is_some());
         assert!(check_destructive_command("perl -e 'use Socket; connect()'").is_some());
         assert!(check_destructive_command("php -r '$s=fsockopen(\"host\", 4444);'").is_some());
     }
@@ -3161,7 +3249,6 @@ mod sanitize_tests {
         );
     }
 
-
     // Regression: a single `[A]` (Always Allow for bash) on a safe command
     // (cargo build, ls, git status) must NOT silently disarm the destructive
     // check for the rest of the session. Real-world incident: model emitted
@@ -3219,11 +3306,11 @@ mod sanitize_tests {
     #[test]
     fn bash_unparseable_args_auto_approve_to_avoid_empty_prompt() {
         let cases = [
-            "{}",                          // missing required `command`
-            r#"{"foo":"bar"}"#,            // unknown key, no command
-            r#"{"command":null}"#,         // wrong type
-            "",                            // not JSON at all
-            "not json",                    // not JSON at all
+            "{}",                  // missing required `command`
+            r#"{"foo":"bar"}"#,    // unknown key, no command
+            r#"{"command":null}"#, // wrong type
+            "",                    // not JSON at all
+            "not json",            // not JSON at all
         ];
         for args in cases {
             assert!(
@@ -3270,12 +3357,13 @@ mod sanitize_tests {
         // filter-branch / filter-repo rewrite every commit they touch —
         // operators almost always want a second look before letting
         // one through, even on local branches.
-        assert!(check_destructive_command(
-            "git filter-branch --tree-filter 'rm secrets.txt' HEAD"
-        )
-        .is_some());
         assert!(
-            check_destructive_command("git filter-repo --path secrets.txt --invert-paths").is_some()
+            check_destructive_command("git filter-branch --tree-filter 'rm secrets.txt' HEAD")
+                .is_some()
+        );
+        assert!(
+            check_destructive_command("git filter-repo --path secrets.txt --invert-paths")
+                .is_some()
         );
     }
 
@@ -3331,8 +3419,13 @@ mod sanitize_tests {
         assert!(check_destructive_command("git status").is_none());
         assert!(check_destructive_command("git diff").is_none());
         assert!(check_destructive_command("git log --oneline -10").is_none());
-        assert!(check_destructive_command("git add crates/atomcode-core/src/tool/bash.rs").is_none());
-        assert!(check_destructive_command("git commit -m 'fix(bash): tighten git destructive patterns'").is_none());
+        assert!(
+            check_destructive_command("git add crates/atomcode-core/src/tool/bash.rs").is_none()
+        );
+        assert!(check_destructive_command(
+            "git commit -m 'fix(bash): tighten git destructive patterns'"
+        )
+        .is_none());
         assert!(check_destructive_command("git push origin release/v4.23.2").is_none());
         assert!(check_destructive_command("git pull --rebase origin main").is_none());
         assert!(check_destructive_command("git checkout main").is_none());
@@ -3799,13 +3892,18 @@ mod shell_tool_def_tests {
         let win = shell_tool_description(true);
         assert!(win.contains("cmd.exe"), "windows desc must name cmd.exe");
         let lc = win.to_lowercase();
-        assert!(lc.contains("heredoc"), "windows desc must warn off heredocs");
+        assert!(
+            lc.contains("heredoc"),
+            "windows desc must warn off heredocs"
+        );
         assert!(
             win.contains("$("),
             "windows desc must warn off command substitution"
         );
         assert!(
-            lc.contains("not bash") || lc.contains("not\u{a0}bash") || lc.contains("cmd.exe, not bash"),
+            lc.contains("not bash")
+                || lc.contains("not\u{a0}bash")
+                || lc.contains("cmd.exe, not bash"),
             "windows desc must say it is not bash"
         );
 

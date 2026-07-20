@@ -86,7 +86,13 @@ mod tests {
     }
     #[test]
     fn failing_payload_stops_after_3() {
-        let mut c = LoopController::new_interval(300, LoopPayload::Slash { cmd: "/x".into(), arg: "".into() });
+        let mut c = LoopController::new_interval(
+            300,
+            LoopPayload::Slash {
+                cmd: "/x".into(),
+                arg: "".into(),
+            },
+        );
         c.due = true;
         c.consecutive_failures = 3;
         assert_eq!(c.decide(true), LoopAction::Stop);

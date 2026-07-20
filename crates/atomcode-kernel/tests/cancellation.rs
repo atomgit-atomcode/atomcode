@@ -9,12 +9,12 @@
 //! Determinism: cancellation is driven by a COOPERATING test tool that fires
 //! `ctx.cancel.cancel()` from inside its own `execute` — no timing races.
 
+use async_trait::async_trait;
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::{EchoTool, RecordingProvider};
 use atomcode_kernel::tool::{Tool, ToolCall, ToolContext, ToolRegistry, ToolResult};
-use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -34,8 +34,10 @@ impl atomcode_kernel::provider::LlmProvider for HangingOpenProvider {
         _: &[Message],
         _: &[atomcode_kernel::tool::ToolDef],
         _: &atomcode_kernel::provider::ChatOptions,
-    ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, atomcode_kernel::stream::ProviderError>
-    {
+    ) -> Result<
+        futures::stream::BoxStream<'static, StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
         futures::future::pending().await
     }
 }
@@ -56,7 +58,10 @@ async fn cancel_aborts_a_turn_hung_in_the_stream_open() {
 
     handle
         .commands
-        .send(AgentCommand::SendMessage { text: "hi".into(), images: vec![] })
+        .send(AgentCommand::SendMessage {
+            text: "hi".into(),
+            images: vec![],
+        })
         .unwrap();
 
     let drive = async {
@@ -81,7 +86,11 @@ async fn cancel_aborts_a_turn_hung_in_the_stream_open() {
     let reason = tokio::time::timeout(std::time::Duration::from_secs(5), drive)
         .await
         .expect("Cancel must abort a turn hung in the stream OPEN — it must not hang");
-    assert_eq!(reason, Some(StopReason::Cancelled), "a cancelled open terminates as Cancelled");
+    assert_eq!(
+        reason,
+        Some(StopReason::Cancelled),
+        "a cancelled open terminates as Cancelled"
+    );
 
     // Cancel = undo: the "hi" prompt must be rolled back, leaving no trace.
     handle.commands.send(AgentCommand::Snapshot).unwrap();
@@ -121,7 +130,12 @@ impl Tool for SelfCancelTool {
     }
     async fn execute(&self, _args: &str, ctx: &ToolContext) -> ToolResult {
         ctx.cancel.cancel();
-        ToolResult { call_id: String::new(), content: "did the work then cancelled".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "did the work then cancelled".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -147,12 +161,21 @@ impl Tool for BlockUntilCancelTool {
     async fn execute(&self, _args: &str, ctx: &ToolContext) -> ToolResult {
         ctx.cancel.cancelled().await;
         self.observed_cancel.store(true, Ordering::SeqCst);
-        ToolResult { call_id: String::new(), content: "observed cancel".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "observed cancel".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
 fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
-    ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args.into(),
+    }
 }
 
 // CLAIM 17a: BETWEEN-TOOLS cancel rolls the turn back. The model returns an
@@ -179,7 +202,10 @@ async fn cancel_between_tools_rolls_back_the_turn() {
             StreamEvent::ToolCall(tool_call("c_echo", "echo", "{\"text\":\"hi\"}")),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("second turn done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("second turn done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
 
@@ -190,7 +216,13 @@ async fn cancel_between_tools_rolls_back_the_turn() {
         .spawn();
 
     // Drive turn 1 and collect the event sequence up to its TurnComplete.
-    handle.commands.send(AgentCommand::SendMessage { text: "do two things".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "do two things".into(),
+            images: vec![],
+        })
+        .unwrap();
     let mut events: Vec<AgentEvent> = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         let stop = matches!(ev, AgentEvent::TurnComplete { .. });
@@ -206,21 +238,38 @@ async fn cancel_between_tools_rolls_back_the_turn() {
         .position(|e| matches!(e, AgentEvent::Cancelled))
         .expect("AgentEvent::Cancelled must be emitted on a cancelled turn");
     assert!(
-        matches!(events.get(cancelled_idx + 1), Some(AgentEvent::TurnComplete { .. })),
+        matches!(
+            events.get(cancelled_idx + 1),
+            Some(AgentEvent::TurnComplete { .. })
+        ),
         "TurnComplete must immediately follow Cancelled; got {events:?}"
     );
 
     // (2) echo was NOT executed (its ToolResult never came through as a real echo).
-    let echo_ran = events.iter().any(|e| matches!(e, AgentEvent::ToolResult { result } if result.content.starts_with("echo: ")));
-    assert!(!echo_ran, "echo must be skipped by the between-tools checkpoint");
+    let echo_ran = events.iter().any(
+        |e| matches!(e, AgentEvent::ToolResult { result } if result.content.starts_with("echo: ")),
+    );
+    assert!(
+        !echo_ran,
+        "echo must be skipped by the between-tools checkpoint"
+    );
     // self_cancel DID run (its real result was emitted before the cancel).
     let cancel_tool_ran = events.iter().any(|e| matches!(e, AgentEvent::ToolResult { result } if result.content.contains("did the work")));
-    assert!(cancel_tool_ran, "self_cancel must have executed (its real result emitted)");
+    assert!(
+        cancel_tool_ran,
+        "self_cancel must have executed (its real result emitted)"
+    );
 
     // (3) ROLL-BACK: the cancelled turn leaves NO trace. Drive a SECOND turn; its
     // first request carries the post-cancel history, which must contain neither
     // turn 1's user message nor either tool_call/result — the whole turn is gone.
-    handle.commands.send(AgentCommand::SendMessage { text: "again".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "again".into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -230,7 +279,11 @@ async fn cancel_between_tools_rolls_back_the_turn() {
     let _ = handle.task.await;
 
     let calls = calls.lock().unwrap();
-    assert!(calls.len() >= 2, "expected >=2 recorded requests; got {}", calls.len());
+    assert!(
+        calls.len() >= 2,
+        "expected >=2 recorded requests; got {}",
+        calls.len()
+    );
     // The second turn's first request = calls[1]; it carries the post-cancel history.
     let history = &calls[1].0;
     assert_no_dangling_tool_calls(history); // trivially holds — turn 1 is gone
@@ -238,16 +291,23 @@ async fn cancel_between_tools_rolls_back_the_turn() {
         !history.iter().any(|m| m.text.contains("do two things")),
         "cancelled turn's user message must be rolled back: {history:?}"
     );
-    let result_ids: std::collections::HashSet<&str> =
-        history.iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+    let result_ids: std::collections::HashSet<&str> = history
+        .iter()
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
     assert!(
         !result_ids.contains("c_cancel") && !result_ids.contains("c_echo"),
         "cancelled turn's tool results must be gone: {history:?}"
     );
-    let has_turn1_calls = history
-        .iter()
-        .any(|m| m.tool_calls.iter().any(|tc| tc.id == "c_cancel" || tc.id == "c_echo"));
-    assert!(!has_turn1_calls, "cancelled turn's assistant tool_calls must be gone: {history:?}");
+    let has_turn1_calls = history.iter().any(|m| {
+        m.tool_calls
+            .iter()
+            .any(|tc| tc.id == "c_cancel" || tc.id == "c_echo")
+    });
+    assert!(
+        !has_turn1_calls,
+        "cancelled turn's assistant tool_calls must be gone: {history:?}"
+    );
 }
 
 // CLAIM 17b: an out-of-band `AgentCommand::Cancel` ends a turn while a long tool
@@ -258,7 +318,9 @@ async fn cancel_between_tools_rolls_back_the_turn() {
 async fn cancel_command_ends_turn() {
     let observed = Arc::new(AtomicBool::new(false));
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(BlockUntilCancelTool { observed_cancel: observed.clone() }));
+    reg.register(Arc::new(BlockUntilCancelTool {
+        observed_cancel: observed.clone(),
+    }));
 
     let provider = Arc::new(RecordingProvider::new(vec![vec![
         StreamEvent::ToolCall(tool_call("c_block", "block_until_cancel", "{}")),
@@ -272,7 +334,13 @@ async fn cancel_command_ends_turn() {
         .spawn();
 
     let commands = handle.commands.clone();
-    handle.commands.send(AgentCommand::SendMessage { text: "run the blocker".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "run the blocker".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     let mut cancelled = false;
     let mut completed = false;
@@ -297,8 +365,14 @@ async fn cancel_command_ends_turn() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
-    assert!(sent_cancel, "we must have reached ToolStarted and sent Cancel");
-    assert!(cancelled, "an out-of-band Cancel must emit AgentEvent::Cancelled");
+    assert!(
+        sent_cancel,
+        "we must have reached ToolStarted and sent Cancel"
+    );
+    assert!(
+        cancelled,
+        "an out-of-band Cancel must emit AgentEvent::Cancelled"
+    );
     assert!(completed, "the cancelled turn must end with TurnComplete");
     assert!(
         observed.load(Ordering::SeqCst),
@@ -338,7 +412,9 @@ impl atomcode_kernel::middleware::ToolMiddleware for GateMiddleware {
         _tool: &Arc<dyn Tool>,
         rt: &atomcode_kernel::request::RequestCtx,
     ) -> atomcode_kernel::middleware::BeforeOutcome {
-        let v = rt.request("approval", serde_json::json!({"tool": call.name})).await;
+        let v = rt
+            .request("approval", serde_json::json!({"tool": call.name}))
+            .await;
         match v.as_str() {
             Some("allow") => atomcode_kernel::middleware::BeforeOutcome::Proceed,
             _ => atomcode_kernel::middleware::BeforeOutcome::deny("denied"),
@@ -375,7 +451,10 @@ async fn cancel_unblocks_pending_middleware_request() {
 
     handle
         .commands
-        .send(AgentCommand::SendMessage { text: "go".into(), images: vec![] })
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
         .unwrap();
 
     let drive = async {
@@ -444,7 +523,10 @@ async fn cancel_mid_round_halts_the_whole_multi_round_turn() {
 
     handle
         .commands
-        .send(AgentCommand::SendMessage { text: "go".into(), images: vec![] })
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
         .unwrap();
 
     let reason = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -488,7 +570,10 @@ async fn cancel_preserves_turn_when_keep_interrupted_context() {
             StreamEvent::ToolCall(tool_call("c_echo", "echo", "{\"text\":\"hi\"}")),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("second turn done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("second turn done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
 
@@ -499,32 +584,52 @@ async fn cancel_preserves_turn_when_keep_interrupted_context() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "do two things".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "do two things".into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
-        if matches!(ev, AgentEvent::TurnComplete { .. }) { break; }
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
+            break;
+        }
     }
-    handle.commands.send(AgentCommand::SendMessage { text: "again".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "again".into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
-        if matches!(ev, AgentEvent::TurnComplete { .. }) { break; }
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
+            break;
+        }
     }
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
     let calls = calls.lock().unwrap();
     let history = &calls[1].0; // second turn's first request = post-cancel history
-    // (1) the cancelled turn is PRESERVED.
+                               // (1) the cancelled turn is PRESERVED.
     assert!(
         history.iter().any(|m| m.text.contains("do two things")),
         "preserved: cancelled user message must remain: {history:?}"
     );
     assert!(
-        history.iter().any(|m| m.tool_calls.iter().any(|tc| tc.id == "c_cancel")),
+        history
+            .iter()
+            .any(|m| m.tool_calls.iter().any(|tc| tc.id == "c_cancel")),
         "preserved: cancelled assistant tool_calls must remain: {history:?}"
     );
     // (2) still API-valid: every tool_call has a result (c_echo was never run → backfilled).
     assert_no_dangling_tool_calls(history);
-    let result_ids: std::collections::HashSet<&str> =
-        history.iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+    let result_ids: std::collections::HashSet<&str> = history
+        .iter()
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
     assert!(
         result_ids.contains("c_echo"),
         "the skipped tool_call must be backfilled with a (cancelled) result: {history:?}"
@@ -544,7 +649,10 @@ async fn preserve_mode_injects_interruption_marker() {
             StreamEvent::ToolCall(tool_call("c_cancel", "self_cancel", "{}")),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("ok".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("ok".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
     let mut handle = atomcode_kernel::agent::Agent::builder()
@@ -553,17 +661,46 @@ async fn preserve_mode_injects_interruption_marker() {
         .keep_interrupted_context(true)
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
-    while let Some(ev) = handle.events.recv().await { if matches!(ev, AgentEvent::TurnComplete { .. }) { break; } }
-    handle.commands.send(AgentCommand::SendMessage { text: "next".into(), images: vec![] }).unwrap();
-    while let Some(ev) = handle.events.recv().await { if matches!(ev, AgentEvent::TurnComplete { .. }) { break; } }
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
+    while let Some(ev) = handle.events.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
+            break;
+        }
+    }
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "next".into(),
+            images: vec![],
+        })
+        .unwrap();
+    while let Some(ev) = handle.events.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
+            break;
+        }
+    }
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
     let calls = calls.lock().unwrap();
     let history = &calls[1].0;
-    let marker = history.iter().find(|m| m.text.contains("interrupted by the user"))
+    let marker = history
+        .iter()
+        .find(|m| m.text.contains("interrupted by the user"))
         .expect("expected an interruption marker user message");
-    assert_eq!(marker.role, Role::User, "marker must be Role::User (wire-safe on all adapters)");
-    assert!(marker.synthetic, "marker must be synthetic so /undo and compaction skip it in prompt counting");
+    assert_eq!(
+        marker.role,
+        Role::User,
+        "marker must be Role::User (wire-safe on all adapters)"
+    );
+    assert!(
+        marker.synthetic,
+        "marker must be synthetic so /undo and compaction skip it in prompt counting"
+    );
 }

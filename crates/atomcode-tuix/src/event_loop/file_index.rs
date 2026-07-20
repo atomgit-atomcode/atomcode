@@ -68,8 +68,7 @@ const ALLOWLIST_DIR_MAX_ENTRIES: usize = 2_000;
 /// 4. Token = characters from `@`'s next byte to the next whitespace
 ///    (or EOF), including bytes after cursor.
 pub fn detect_at_mention(buf: &str, cursor: usize) -> Option<String> {
-    detect_at_mention_range(buf, cursor)
-        .map(|(at_pos, end)| buf[at_pos + 1..end].to_string())
+    detect_at_mention_range(buf, cursor).map(|(at_pos, end)| buf[at_pos + 1..end].to_string())
 }
 
 pub fn format_at_mention_replacement(selected_path: &str) -> String {
@@ -699,14 +698,46 @@ mod tests {
         FileIndex::from_entries(
             PathBuf::from("/tmp"),
             vec![
-                Entry { rel_path: "Cargo.toml".into(), is_dir: false, depth: 1 },
-                Entry { rel_path: "crates/".into(), is_dir: true, depth: 1 },
-                Entry { rel_path: "docker/".into(), is_dir: true, depth: 1 },
-                Entry { rel_path: ".atomcode/".into(), is_dir: true, depth: 1 },
-                Entry { rel_path: "crates/atomcode-cli/".into(), is_dir: true, depth: 2 },
-                Entry { rel_path: "crates/atomcode-tuix/".into(), is_dir: true, depth: 2 },
-                Entry { rel_path: "crates/atomcode-tuix/Cargo.toml".into(), is_dir: false, depth: 3 },
-                Entry { rel_path: "docker/Dockerfile".into(), is_dir: false, depth: 2 },
+                Entry {
+                    rel_path: "Cargo.toml".into(),
+                    is_dir: false,
+                    depth: 1,
+                },
+                Entry {
+                    rel_path: "crates/".into(),
+                    is_dir: true,
+                    depth: 1,
+                },
+                Entry {
+                    rel_path: "docker/".into(),
+                    is_dir: true,
+                    depth: 1,
+                },
+                Entry {
+                    rel_path: ".atomcode/".into(),
+                    is_dir: true,
+                    depth: 1,
+                },
+                Entry {
+                    rel_path: "crates/atomcode-cli/".into(),
+                    is_dir: true,
+                    depth: 2,
+                },
+                Entry {
+                    rel_path: "crates/atomcode-tuix/".into(),
+                    is_dir: true,
+                    depth: 2,
+                },
+                Entry {
+                    rel_path: "crates/atomcode-tuix/Cargo.toml".into(),
+                    is_dir: false,
+                    depth: 3,
+                },
+                Entry {
+                    rel_path: "docker/Dockerfile".into(),
+                    is_dir: false,
+                    depth: 2,
+                },
             ],
         )
     }
@@ -741,11 +772,7 @@ mod tests {
         let result = idx.filter("", "tuix");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         // Should include the depth-2 dir even though we filtered from root.
-        assert!(
-            names.contains(&"crates/atomcode-tuix/"),
-            "got: {:?}",
-            names
-        );
+        assert!(names.contains(&"crates/atomcode-tuix/"), "got: {:?}", names);
     }
 
     #[test]
@@ -857,10 +884,20 @@ mod tests {
 
         // Top-level view (empty filter = direct children only): the
         // gitignored `.claude/` dir is now indexed; `node_modules/` is not.
-        let top: Vec<String> =
-            filter_walk(&idx, "", "").iter().map(|e| e.rel_path.clone()).collect();
-        assert!(top.contains(&".claude/".to_string()), "top-level: {:?}", top);
-        assert!(top.contains(&"kept.txt".to_string()), "top-level: {:?}", top);
+        let top: Vec<String> = filter_walk(&idx, "", "")
+            .iter()
+            .map(|e| e.rel_path.clone())
+            .collect();
+        assert!(
+            top.contains(&".claude/".to_string()),
+            "top-level: {:?}",
+            top
+        );
+        assert!(
+            top.contains(&"kept.txt".to_string()),
+            "top-level: {:?}",
+            top
+        );
         assert!(
             !top.iter().any(|n| n.starts_with("node_modules")),
             "gitignored node_modules must not surface: {:?}",
@@ -884,7 +921,11 @@ mod tests {
             .iter()
             .map(|e| e.rel_path.clone())
             .collect();
-        assert!(nm.is_empty(), "node_modules must stay filtered out: {:?}", nm);
+        assert!(
+            nm.is_empty(),
+            "node_modules must stay filtered out: {:?}",
+            nm
+        );
     }
 
     // A `.claude` dir that is NOT gitignored must still be indexed exactly
@@ -896,11 +937,11 @@ mod tests {
 
         let idx = FileIndex::new(tmp.path().to_path_buf());
         let result = filter_walk(&idx, "", "");
-        let claude_hits = result
-            .iter()
-            .filter(|e| e.rel_path == ".claude/")
-            .count();
-        assert_eq!(claude_hits, 1, "`.claude/` must be indexed once, not duplicated");
+        let claude_hits = result.iter().filter(|e| e.rel_path == ".claude/").count();
+        assert_eq!(
+            claude_hits, 1,
+            "`.claude/` must be indexed once, not duplicated"
+        );
     }
 
     // Regression (review): a `.git` nested inside an allowlisted dir (e.g. a
@@ -920,7 +961,8 @@ mod tests {
             .map(|e| e.rel_path.clone())
             .collect();
         assert!(
-            !all.iter().any(|n| n.contains("/.git/") || n.ends_with("/.git")),
+            !all.iter()
+                .any(|n| n.contains("/.git/") || n.ends_with("/.git")),
             "nested .git must be filtered out: {:?}",
             all
         );
@@ -953,8 +995,10 @@ mod tests {
         let idx = FileIndex::new(tmp.path().to_path_buf());
 
         // The source file survived (main walk still ran after the cap).
-        let top: Vec<String> =
-            filter_walk(&idx, "", "").iter().map(|e| e.rel_path.clone()).collect();
+        let top: Vec<String> = filter_walk(&idx, "", "")
+            .iter()
+            .map(|e| e.rel_path.clone())
+            .collect();
         assert!(
             top.contains(&"main.rs".to_string()),
             "source file must not be starved by a large .claude: {:?}",
@@ -1092,7 +1136,11 @@ mod tests {
         idx.mark_stale();
         let r3 = filter_walk(&idx, "", "");
         let n3: Vec<&str> = r3.iter().map(|e| e.rel_path.as_str()).collect();
-        assert!(n3.contains(&"second.txt"), "TTL refresh should surface new file: {:?}", n3);
+        assert!(
+            n3.contains(&"second.txt"),
+            "TTL refresh should surface new file: {:?}",
+            n3
+        );
         assert!(n3.contains(&"first.txt"), "got: {:?}", n3);
     }
 

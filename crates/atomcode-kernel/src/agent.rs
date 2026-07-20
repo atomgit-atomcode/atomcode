@@ -1,5 +1,5 @@
-use crate::clock::{Clock, SystemClock};
 use crate::checkpoint::{CompactionCheckpoint, CompactionCheckpointError};
+use crate::clock::{Clock, SystemClock};
 use crate::event::{AgentCommand, AgentEvent, StopReason, ToolBatchCall};
 use crate::hook::{
     Continuation, ContinuationKind, ContinuationVisibility, HookChain, LifecycleHooks, TurnCtx,
@@ -254,7 +254,11 @@ fn effective_retry_after(e: &crate::stream::ProviderError) -> Option<u64> {
 fn rate_limit_server_message(e: &crate::stream::ProviderError) -> Option<String> {
     let status = e.http_status.unwrap_or(429);
     let prefix = format!("HTTP {status}: ");
-    let detail = e.message.strip_prefix(&prefix).unwrap_or(e.message.as_str()).trim();
+    let detail = e
+        .message
+        .strip_prefix(&prefix)
+        .unwrap_or(e.message.as_str())
+        .trim();
     (!detail.is_empty()).then(|| detail.to_string())
 }
 
@@ -364,10 +368,7 @@ enum CallPlan {
 /// rewrites their arguments. Object-key order and insignificant whitespace do
 /// not change call identity; array order and malformed input still do.
 fn tool_call_dedup_key(call: &ToolCall) -> (String, String) {
-    (
-        call.name.clone(),
-        canonicalize_tool_args(&call.arguments),
-    )
+    (call.name.clone(), canonicalize_tool_args(&call.arguments))
 }
 
 // KEEP IN SYNC WITH atomcode-core/src/turn/tool_args.rs. The kernel deliberately
@@ -465,8 +466,7 @@ pub(crate) struct SteerInput {
 /// Shared, per-turn steer buffer. `process_send_message` pushes; `run_turn`
 /// drains. `Arc<Mutex>` (not a channel) so `run_turn` can both DRAIN it and
 /// PEEK `is_empty()` at the terminal boundary without consuming.
-pub(crate) type SteerBuf =
-    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<SteerInput>>>;
+pub(crate) type SteerBuf = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<SteerInput>>>;
 
 /// Bidirectional session handle: send AgentCommand, receive AgentEvent.
 pub struct AgentHandle {
@@ -1131,8 +1131,10 @@ impl RunningAgent {
         let turn_token = self.new_turn_token();
         // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
         // so a middleware blocked on approval can be answered out-of-band.
-        let steer: SteerBuf = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-        let mut turn = Box::pin(self.run_turn(convo, turn_token.clone(), rollback_len, steer.clone()));
+        let steer: SteerBuf =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let mut turn =
+            Box::pin(self.run_turn(convo, turn_token.clone(), rollback_len, steer.clone()));
         let mut shutdown = false;
         loop {
             tokio::select! {
@@ -1181,7 +1183,10 @@ impl RunningAgent {
         // run_turn (e.g. Task 2 not yet implemented, or a very late arrival) falls
         // back to the pending deque so the user's prompt is NOT silently lost.
         for s in steer.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
-            pending.push_back(AgentCommand::SendMessage { text: s.text, images: s.images });
+            pending.push_back(AgentCommand::SendMessage {
+                text: s.text,
+                images: s.images,
+            });
         }
         shutdown
     }
@@ -2267,7 +2272,11 @@ impl RunningAgent {
                         id: c.id.clone(),
                         name: c.name.clone(),
                         arguments: c.arguments.clone(),
-                        parallel_safe: self.tools.get(&c.name).map(|t| t.parallel_safe(&c.arguments)).unwrap_or(false),
+                        parallel_safe: self
+                            .tools
+                            .get(&c.name)
+                            .map(|t| t.parallel_safe(&c.arguments))
+                            .unwrap_or(false),
                     })
                     .collect();
                 self.rt.emit(AgentEvent::ToolBatchStarted {
@@ -2471,8 +2480,7 @@ impl RunningAgent {
             // Results aligned to `plans`: `None` for Skip / not-executed slots; the
             // ready `Result(r)` payloads are moved into place so Phase ③ has a
             // single uniform view. Execute slots are filled by the drain below.
-            let mut results: Vec<Option<ToolResult>> =
-                (0..plans.len()).map(|_| None).collect();
+            let mut results: Vec<Option<ToolResult>> = (0..plans.len()).map(|_| None).collect();
             for (i, plan) in plans.iter().enumerate() {
                 if let CallPlan::Result(r) = plan {
                     results[i] = Some(r.clone());
@@ -2529,9 +2537,10 @@ impl RunningAgent {
                     // `change_dir` (which held the exclusive barrier) is visible here.
                     let ctx = ToolContext {
                         working_dir: match &cwd {
-                            Some(c) => c.read().map(|g| g.clone()).unwrap_or_else(|_| {
-                                std::env::current_dir().unwrap_or_default()
-                            }),
+                            Some(c) => c
+                                .read()
+                                .map(|g| g.clone())
+                                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()),
                             None => std::env::current_dir().unwrap_or_default(),
                         },
                         cancel: cancel.clone(),
@@ -3200,7 +3209,10 @@ mod over_window_advisory_tests {
             m.contains("精简") || m.contains("更大窗口"),
             "must give actionable advice (trim / larger window): {m}"
         );
-        assert!(!m.contains("/compact"), "must NOT suggest /compact (already ran): {m}");
+        assert!(
+            !m.contains("/compact"),
+            "must NOT suggest /compact (already ran): {m}"
+        );
     }
 }
 
@@ -3210,7 +3222,12 @@ mod cap_tool_result_tests {
     use crate::tool::ToolResult;
 
     fn res(content: String) -> ToolResult {
-        ToolResult { call_id: String::new(), content, is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content,
+            is_error: false,
+            images: vec![],
+        }
     }
 
     #[test]
@@ -3218,10 +3235,18 @@ mod cap_tool_result_tests {
         // HEAD + 100k filler + TAIL, cap 1000 → both ends survive, middle dropped.
         let mut r = res(format!("HEADHEAD{}TAILTAIL", "x".repeat(100_000)));
         cap_tool_result(&mut r, 1000);
-        assert!(r.content.starts_with("HEADHEAD"), "head preserved: {:?}", &r.content[..16]);
+        assert!(
+            r.content.starts_with("HEADHEAD"),
+            "head preserved: {:?}",
+            &r.content[..16]
+        );
         assert!(r.content.ends_with("TAILTAIL"), "tail preserved");
         assert!(r.content.contains("[truncated:") && r.content.contains("by kernel cap]"));
-        assert!(r.content.len() < 1300, "≈ cap + marker, not 100k; got {}", r.content.len());
+        assert!(
+            r.content.len() < 1300,
+            "≈ cap + marker, not 100k; got {}",
+            r.content.len()
+        );
     }
 
     #[test]
@@ -3541,10 +3566,10 @@ mod parallel_tools_cap_clamp_tests {
 #[cfg(test)]
 mod steer_buffer_tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
     use crate::stream::StreamEvent;
     use crate::testkit::{MockProvider, NoopTool};
     use crate::tool::{ToolCall, ToolRegistry};
+    use std::sync::{Arc, Mutex};
 
     /// Task-1 assertion only: a mid-turn SendMessage is routed into the steer buffer,
     /// NOT pushed into `pending` — so it does NOT open a second TurnStarted event.
@@ -3560,7 +3585,10 @@ mod steer_buffer_tests {
                 }),
                 StreamEvent::Done { truncated: false },
             ],
-            vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::Done { truncated: false },
+            ],
         ]));
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(NoopTool));
@@ -3569,7 +3597,13 @@ mod steer_buffer_tests {
             .tools(reg.mount(&["noop"]))
             .build()
             .spawn();
-        handle.commands.send(AgentCommand::SendMessage { text: "start".into(), images: vec![] }).unwrap();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "start".into(),
+                images: vec![],
+            })
+            .unwrap();
         let mut turn_started = 0u32;
         let steer_tx = handle.commands.clone();
         let mut steered = false;
@@ -3577,10 +3611,17 @@ mod steer_buffer_tests {
             match ev {
                 AgentEvent::TurnStarted => turn_started += 1,
                 AgentEvent::ToolResult { .. } if !steered => {
-                    steer_tx.send(AgentCommand::SendMessage { text: "STEER-ME".into(), images: vec![] }).unwrap();
+                    steer_tx
+                        .send(AgentCommand::SendMessage {
+                            text: "STEER-ME".into(),
+                            images: vec![],
+                        })
+                        .unwrap();
                     steered = true;
                 }
-                AgentEvent::TurnComplete { .. } => { break; }
+                AgentEvent::TurnComplete { .. } => {
+                    break;
+                }
                 _ => {}
             }
         }
@@ -3613,7 +3654,10 @@ mod steer_buffer_tests {
                     }),
                     StreamEvent::Done { truncated: false },
                 ],
-                vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
             ],
             1, // inject on first chat_stream call
             "STEER-ME",
@@ -3629,13 +3673,22 @@ mod steer_buffer_tests {
             .spawn();
         // Fill the deferred sender NOW that we have the handle.
         *deferred_tx.lock().unwrap() = Some(handle.commands.clone());
-        handle.commands.send(AgentCommand::SendMessage { text: "start".into(), images: vec![] }).unwrap();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "start".into(),
+                images: vec![],
+            })
+            .unwrap();
         let mut turn_started = 0u32;
         let mut turn_complete = 0u32;
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::TurnStarted => turn_started += 1,
-                AgentEvent::TurnComplete { .. } => { turn_complete += 1; break; }
+                AgentEvent::TurnComplete { .. } => {
+                    turn_complete += 1;
+                    break;
+                }
                 _ => {}
             }
         }
@@ -3662,8 +3715,14 @@ mod steer_buffer_tests {
         let deferred_tx_clone = deferred_tx.clone();
         let provider = Arc::new(crate::testkit::DeferredSteerProvider::new(
             vec![
-                vec![StreamEvent::TextDelta("first".into()), StreamEvent::Done { truncated: false }],
-                vec![StreamEvent::TextDelta("second".into()), StreamEvent::Done { truncated: false }],
+                vec![
+                    StreamEvent::TextDelta("first".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::TextDelta("second".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
             ],
             1, // inject on first call
             "STEER-TEXT",
@@ -3676,7 +3735,13 @@ mod steer_buffer_tests {
             .build()
             .spawn();
         *deferred_tx.lock().unwrap() = Some(handle.commands.clone());
-        handle.commands.send(AgentCommand::SendMessage { text: "hello".into(), images: vec![] }).unwrap();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "hello".into(),
+                images: vec![],
+            })
+            .unwrap();
         let mut turn_started = 0u32;
         while let Some(ev) = handle.events.recv().await {
             match ev {
@@ -3685,10 +3750,15 @@ mod steer_buffer_tests {
                 _ => {}
             }
         }
-        assert_eq!(turn_started, 1, "the steered text response stays in ONE turn");
+        assert_eq!(
+            turn_started, 1,
+            "the steered text response stays in ONE turn"
+        );
         let calls = received.lock().unwrap();
         assert!(
-            calls.iter().any(|req| req.iter().any(|(_, t)| t.contains("STEER-TEXT"))),
+            calls
+                .iter()
+                .any(|req| req.iter().any(|(_, t)| t.contains("STEER-TEXT"))),
             "a pure-text turn must continue and send the steered prompt; got {calls:?}"
         );
     }
@@ -3712,7 +3782,10 @@ mod steer_buffer_tests {
                     }),
                     StreamEvent::Done { truncated: false },
                 ],
-                vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
             ],
             1, // inject steer on first chat_stream call
             "STEER-COUNT",
@@ -3726,7 +3799,13 @@ mod steer_buffer_tests {
             .build()
             .spawn();
         *deferred_tx.lock().unwrap() = Some(handle.commands.clone());
-        handle.commands.send(AgentCommand::SendMessage { text: "start".into(), images: vec![] }).unwrap();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "start".into(),
+                images: vec![],
+            })
+            .unwrap();
         let mut steered_total = 0usize;
         while let Some(ev) = handle.events.recv().await {
             match ev {
@@ -3735,6 +3814,9 @@ mod steer_buffer_tests {
                 _ => {}
             }
         }
-        assert_eq!(steered_total, 1, "one folded prompt → Steered {{ count: 1 }}");
+        assert_eq!(
+            steered_total, 1,
+            "one folded prompt → Steered {{ count: 1 }}"
+        );
     }
 }

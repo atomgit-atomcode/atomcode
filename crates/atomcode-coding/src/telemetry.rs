@@ -117,7 +117,10 @@ fn classify_llm_error(reason: &str) -> LlmErrorKind {
         LlmErrorKind::StreamInterrupted
     } else if r.contains("context") || r.contains("max_tokens") || r.contains("token limit") {
         LlmErrorKind::ContextOverflow
-    } else if r.contains("connect") || r.contains("dns") || r.contains("network") || r.contains("timeout")
+    } else if r.contains("connect")
+        || r.contains("dns")
+        || r.contains("network")
+        || r.contains("timeout")
     {
         LlmErrorKind::NetworkError
     } else {
@@ -259,7 +262,12 @@ impl LifecycleHooks for TelemetryHook {
                 Role::Tool => tool_result += estimate_message_tokens(m),
                 Role::User => msg += estimate_message_tokens(m),
                 Role::Assistant => {
-                    match m.meta.as_ref().map(|mm| mm.tokens.completion).filter(|&c| c > 0) {
+                    match m
+                        .meta
+                        .as_ref()
+                        .map(|mm| mm.tokens.completion)
+                        .filter(|&c| c > 0)
+                    {
                         Some(real) => anchored += real,
                         None => msg += estimate_message_tokens(m),
                     }
@@ -278,30 +286,32 @@ impl LifecycleHooks for TelemetryHook {
         self.last_system_tokens.store(system, Ordering::Relaxed);
         self.last_message_tokens.store(msg, Ordering::Relaxed);
         self.last_anchored_tokens.store(anchored, Ordering::Relaxed);
-        self.last_tool_result_tokens.store(tool_result, Ordering::Relaxed);
+        self.last_tool_result_tokens
+            .store(tool_result, Ordering::Relaxed);
         self.last_tool_def_tokens.store(tool_def, Ordering::Relaxed);
     }
 
     async fn on_model_response(&self, response: &mut Message) {
         // No meta (e.g. a synthesized/empty response) ⇒ nothing to report.
-        let Some(m) = response.meta.as_ref() else { return };
+        let Some(m) = response.meta.as_ref() else {
+            return;
+        };
 
         // Apportion the EXACT prompt total across zones: the byte/4 estimates only
         // give the RELATIVE split (the provider's true tokenizer is unknown), but the
         // absolute total IS known (the usage report). Scaling the estimates to sum to
         // that total anchors the breakdown to ground truth — strictly more precise
         // than a raw heuristic that can drift 0.7–1.3× from the real total.
-        let (system_tokens, message_tokens, tool_result_tokens, tool_def_tokens) =
-            apportion(
-                m.tokens.prompt,
-                self.last_anchored_tokens.load(Ordering::Relaxed),
-                [
-                    self.last_system_tokens.load(Ordering::Relaxed),
-                    self.last_message_tokens.load(Ordering::Relaxed),
-                    self.last_tool_result_tokens.load(Ordering::Relaxed),
-                    self.last_tool_def_tokens.load(Ordering::Relaxed),
-                ],
-            );
+        let (system_tokens, message_tokens, tool_result_tokens, tool_def_tokens) = apportion(
+            m.tokens.prompt,
+            self.last_anchored_tokens.load(Ordering::Relaxed),
+            [
+                self.last_system_tokens.load(Ordering::Relaxed),
+                self.last_message_tokens.load(Ordering::Relaxed),
+                self.last_tool_result_tokens.load(Ordering::Relaxed),
+                self.last_tool_def_tokens.load(Ordering::Relaxed),
+            ],
+        );
 
         let event = Event::LlmChat {
             duration_ms: m.elapsed_ms as u32,
@@ -336,9 +346,10 @@ impl LifecycleHooks for TelemetryHook {
         // extra had_error one ONLY for an LLM/provider terminal failure — not normal
         // stop, cancel, or the round/continuation fuses (those aren't LLM errors).
         let kind = match reason {
-            StopReason::ProviderError => {
-                last.as_deref().map(classify_llm_error).unwrap_or(LlmErrorKind::Other)
-            }
+            StopReason::ProviderError => last
+                .as_deref()
+                .map(classify_llm_error)
+                .unwrap_or(LlmErrorKind::Other),
             StopReason::Timeout => LlmErrorKind::StreamTimeout,
             _ => return,
         };
@@ -472,7 +483,12 @@ impl MeteredProvider {
         model: impl Into<String>,
         session_id: Option<&str>,
     ) -> Self {
-        Self { inner, attr: Arc::new(Attribution::new(telemetry, vendor, base_url, model, session_id)) }
+        Self {
+            inner,
+            attr: Arc::new(Attribution::new(
+                telemetry, vendor, base_url, model, session_id,
+            )),
+        }
     }
 
     /// Tag every event this provider emits with a `surface` (e.g. `"code_review"`), so
@@ -481,7 +497,10 @@ impl MeteredProvider {
     pub fn with_surface(self, surface: impl Into<String>) -> Self {
         let mut attr = (*self.attr).clone();
         attr.surface = Some(surface.into());
-        Self { inner: self.inner, attr: Arc::new(attr) }
+        Self {
+            inner: self.inner,
+            attr: Arc::new(attr),
+        }
     }
 }
 
@@ -508,7 +527,12 @@ impl LlmProvider for MeteredProvider {
         // LlmChat with the accumulated usage. `unfold`'s step closure is async, so the
         // terminal emit can await — no extra task, the consumer's drain drives it.
         let stream = futures::stream::unfold(
-            (inner_stream, TokenUsage::default(), false, Some((attr, start, messages_count, ctx_window))),
+            (
+                inner_stream,
+                TokenUsage::default(),
+                false,
+                Some((attr, start, messages_count, ctx_window)),
+            ),
             |(mut s, mut usage, had_error, mut pending)| async move {
                 match s.next().await {
                     Some(ev) => {
@@ -560,7 +584,13 @@ mod tests {
     #[tokio::test]
     async fn emits_one_llm_chat_per_response_with_attribution() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://api.example.com/v1", "deepseek-v4", None);
+        let hook = TelemetryHook::new(
+            tel,
+            "openai",
+            "https://api.example.com/v1",
+            "deepseek-v4",
+            None,
+        );
 
         hook.on_request(
             &[Message::user("hi"), Message::user("there")],
@@ -572,7 +602,11 @@ mod tests {
 
         let mut resp = Message::assistant("answer", vec![]);
         resp.meta = Some(MessageMeta {
-            tokens: TokenUsage { prompt: 100, completion: 20, cached: 8 },
+            tokens: TokenUsage {
+                prompt: 100,
+                completion: 20,
+                cached: 8,
+            },
             elapsed_ms: 1234,
             ctx_window: 128_000,
             ..Default::default()
@@ -620,12 +654,21 @@ mod tests {
             description: "run a shell command".into(),
             parameters: serde_json::json!({"type": "object"}),
         }];
-        hook.on_request(&[sys, user, tool_res], &tools, &ChatOptions::default(), &TurnCtx::default())
-            .await;
+        hook.on_request(
+            &[sys, user, tool_res],
+            &tools,
+            &ChatOptions::default(),
+            &TurnCtx::default(),
+        )
+        .await;
 
         let mut resp = Message::assistant("ok", vec![]);
         resp.meta = Some(MessageMeta {
-            tokens: TokenUsage { prompt: 50, completion: 5, cached: 0 },
+            tokens: TokenUsage {
+                prompt: 50,
+                completion: 5,
+                cached: 0,
+            },
             ctx_window: 1000,
             ..Default::default()
         });
@@ -664,7 +707,10 @@ mod tests {
         // No anchor: pure scale of the byte/4 estimates to the exact total.
         let (a, b, c, d) = apportion(100, 0, [10, 20, 30, 40]);
         assert_eq!(a + b + c + d, 100);
-        assert!(d > a && d > b && d > c, "largest estimate keeps the largest share");
+        assert!(
+            d > a && d > b && d > c,
+            "largest estimate keeps the largest share"
+        );
 
         // With an anchor: the REAL portion is preserved untouched in the message zone,
         // only the remainder (60) is distributed across the estimates; sum stays exact.
@@ -687,16 +733,29 @@ mod tests {
         // A past assistant reply carrying a REAL provider completion-token count.
         let mut past = Message::assistant("a prior reply", vec![]);
         past.meta = Some(MessageMeta {
-            tokens: TokenUsage { prompt: 0, completion: 30, cached: 0 },
+            tokens: TokenUsage {
+                prompt: 0,
+                completion: 30,
+                cached: 0,
+            },
             ..Default::default()
         });
         let user = Message::user("next question");
-        hook.on_request(&[sys, past, user], &[], &ChatOptions::default(), &TurnCtx::default())
-            .await;
+        hook.on_request(
+            &[sys, past, user],
+            &[],
+            &ChatOptions::default(),
+            &TurnCtx::default(),
+        )
+        .await;
 
         let mut resp = Message::assistant("ok", vec![]);
         resp.meta = Some(MessageMeta {
-            tokens: TokenUsage { prompt: 100, completion: 5, cached: 0 },
+            tokens: TokenUsage {
+                prompt: 100,
+                completion: 5,
+                cached: 0,
+            },
             ctx_window: 1000,
             ..Default::default()
         });
@@ -715,7 +774,10 @@ mod tests {
             } => {
                 assert_eq!(*input_tokens, 100);
                 assert!(*system_tokens > 0, "system zone scaled from estimate");
-                assert!(*message_tokens >= 30, "real assistant tokens preserved, not scaled away");
+                assert!(
+                    *message_tokens >= 30,
+                    "real assistant tokens preserved, not scaled away"
+                );
                 assert_eq!(
                     system_tokens + message_tokens + tool_result_tokens + tool_def_tokens,
                     100,
@@ -742,14 +804,22 @@ mod tests {
         let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
 
         hook.on_error("HTTP 429: rate limited").await;
-        hook.turn_complete(&Conversation::default(), &StopReason::ProviderError, &TurnCtx::default())
-            .await;
+        hook.turn_complete(
+            &Conversation::default(),
+            &StopReason::ProviderError,
+            &TurnCtx::default(),
+        )
+        .await;
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let records = captured.lock().await;
         assert_eq!(records.len(), 1);
         match &records[0].event {
-            Event::LlmChat { had_error, error_kind, .. } => {
+            Event::LlmChat {
+                had_error,
+                error_kind,
+                ..
+            } => {
                 assert!(*had_error);
                 assert!(matches!(error_kind, Some(LlmErrorKind::RateLimited)));
             }
@@ -763,8 +833,12 @@ mod tests {
         let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
         // A tool error fired on_error, but the turn stopped normally → no LlmChat.
         hook.on_error("tool failed").await;
-        hook.turn_complete(&Conversation::default(), &StopReason::Stopped, &TurnCtx::default())
-            .await;
+        hook.turn_complete(
+            &Conversation::default(),
+            &StopReason::Stopped,
+            &TurnCtx::default(),
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(captured.lock().await.is_empty());
     }
@@ -778,18 +852,31 @@ mod tests {
         let tool: Arc<dyn Tool> = Arc::new(EchoTool);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let rt = RequestCtx::new(tx, None);
-        let mut call = ToolCall { id: "c9".into(), name: "bash".into(), arguments: "{}".into() };
+        let mut call = ToolCall {
+            id: "c9".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
         let _ = mw.before(&mut call, &tool, &rt).await;
         // Approval denied upstream → the kernel hands `after` a "blocked: …" result.
-        let mut result =
-            ToolResult { call_id: "c9".into(), content: "blocked: user denied".into(), is_error: true, images: vec![] };
+        let mut result = ToolResult {
+            call_id: "c9".into(),
+            content: "blocked: user denied".into(),
+            is_error: true,
+            images: vec![],
+        };
         mw.after(&mut result).await;
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let records = captured.lock().await;
         assert_eq!(records.len(), 1);
         match &records[0].event {
-            Event::ToolCall { name, success, error_kind, .. } => {
+            Event::ToolCall {
+                name,
+                success,
+                error_kind,
+                ..
+            } => {
                 assert_eq!(name, "bash");
                 assert!(!success);
                 assert!(matches!(error_kind, Some(ToolErrorKind::DeniedByUser)));
@@ -807,9 +894,18 @@ mod tests {
         let tool: Arc<dyn Tool> = Arc::new(EchoTool);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let rt = RequestCtx::new(tx, None);
-        let mut call = ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() };
+        let mut call = ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
         let _ = mw.before(&mut call, &tool, &rt).await;
-        let mut result = ToolResult { call_id: "c1".into(), content: "ok".into(), is_error: false, images: vec![] };
+        let mut result = ToolResult {
+            call_id: "c1".into(),
+            content: "ok".into(),
+            is_error: false,
+            images: vec![],
+        };
         mw.after(&mut result).await;
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -843,7 +939,11 @@ mod tests {
         ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
             let mut evs = vec![
                 StreamEvent::TextDelta("summary text".into()),
-                StreamEvent::Usage(TokenUsage { prompt: 300, completion: 40, cached: 0 }),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 300,
+                    completion: 40,
+                    cached: 0,
+                }),
             ];
             if self.fail {
                 evs.push(StreamEvent::Error(ProviderError {
@@ -869,7 +969,11 @@ mod tests {
             None,
         );
         let mut stream = dec
-            .chat_stream(&[Message::user("summarize this")], &[], &ChatOptions::default())
+            .chat_stream(
+                &[Message::user("summarize this")],
+                &[],
+                &ChatOptions::default(),
+            )
             .await
             .unwrap();
         // Drain — the terminal LlmChat emit fires when the proxied stream ends.
@@ -885,7 +989,13 @@ mod tests {
         let records = captured.lock().await;
         assert_eq!(records.len(), 1, "exactly one LlmChat for the summary call");
         match &records[0].event {
-            Event::LlmChat { input_tokens, output_tokens, had_error, message_tokens, .. } => {
+            Event::LlmChat {
+                input_tokens,
+                output_tokens,
+                had_error,
+                message_tokens,
+                ..
+            } => {
                 assert_eq!(*input_tokens, 300, "folded from StreamEvent::Usage");
                 assert_eq!(*output_tokens, 40);
                 assert!(!*had_error);
@@ -913,7 +1023,11 @@ mod tests {
         )
         .with_surface("code_review");
         let mut stream = dec
-            .chat_stream(&[Message::user("review this")], &[], &ChatOptions::default())
+            .chat_stream(
+                &[Message::user("review this")],
+                &[],
+                &ChatOptions::default(),
+            )
             .await
             .unwrap();
         while stream.next().await.is_some() {}
@@ -961,15 +1075,21 @@ mod tests {
             "m",
             None,
         );
-        let mut stream =
-            dec.chat_stream(&[Message::user("x")], &[], &ChatOptions::default()).await.unwrap();
+        let mut stream = dec
+            .chat_stream(&[Message::user("x")], &[], &ChatOptions::default())
+            .await
+            .unwrap();
         while stream.next().await.is_some() {}
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let records = captured.lock().await;
         assert_eq!(records.len(), 1);
         match &records[0].event {
-            Event::LlmChat { had_error, error_kind, .. } => {
+            Event::LlmChat {
+                had_error,
+                error_kind,
+                ..
+            } => {
                 assert!(*had_error, "stream Error → had_error");
                 assert!(error_kind.is_some());
             }

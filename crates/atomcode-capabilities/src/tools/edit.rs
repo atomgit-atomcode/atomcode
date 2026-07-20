@@ -78,7 +78,12 @@ impl Tool for EditFileTool {
         let path = resolve_path(&a.file_path, &ctx.working_dir);
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
-            Err(e) => return err(format!("edit_file: cannot read {}: {e}", crate::pathnorm::to_display(&path))),
+            Err(e) => {
+                return err(format!(
+                    "edit_file: cannot read {}: {e}",
+                    crate::pathnorm::to_display(&path)
+                ))
+            }
         };
 
         // Line-ending tolerance: read_file shows the model LF-normalized text (it does
@@ -92,7 +97,11 @@ impl Tool for EditFileTool {
         let (old_match, new_match, count) = if literal > 0 {
             (a.old_string.clone(), a.new_string.clone(), literal)
         } else {
-            let file_eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
+            let file_eol = if content.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
             let old_c = coerce_eol(&a.old_string, file_eol);
             let c = content.matches(&old_c).count();
             (old_c, coerce_eol(&a.new_string, file_eol), c)
@@ -118,7 +127,10 @@ impl Tool for EditFileTool {
                     );
                 }
                 if let Err(e) = tokio::fs::write(&path, &fuzzy_result).await {
-                    return err(format!("edit_file: failed to write {}: {e}", crate::pathnorm::to_display(&path)));
+                    return err(format!(
+                        "edit_file: failed to write {}: {e}",
+                        crate::pathnorm::to_display(&path)
+                    ));
                 }
                 let diff = build_compact_diff(&content, &fuzzy_result);
                 return ok(format!(
@@ -283,7 +295,11 @@ fn try_fuzzy_replace(
 
     let mut result_lines: Vec<String> = content_lines.iter().map(|l| l.to_string()).collect();
 
-    let to_replace = if replace_all { &matches[..] } else { &matches[..1] };
+    let to_replace = if replace_all {
+        &matches[..]
+    } else {
+        &matches[..1]
+    };
     for &(start, end) in to_replace.iter().rev() {
         let original_line = content_lines[start];
         let file_indent = leading_ws_chars(original_line);
@@ -300,7 +316,11 @@ fn try_fuzzy_replace(
                     let total_indent = if signed_relative >= 0 {
                         // Same/deeper than anchor: keep the file's indent prefix
                         // (preserves the tab/space mix) and extend with plain spaces.
-                        format!("{}{}", file_indent_str, " ".repeat(signed_relative as usize))
+                        format!(
+                            "{}{}",
+                            file_indent_str,
+                            " ".repeat(signed_relative as usize)
+                        )
                     } else {
                         // Outdented from anchor: drop chars from the tail of the file's
                         // indent prefix.
@@ -369,11 +389,23 @@ mod tests {
         let old = "fn main() {\n    let x = 1;\n}\n";
         let new = "fn main() {\n    let x = 2;\n}\n";
         let diff = build_compact_diff(old, new);
-        assert!(diff.contains("@@"), "must be a unified diff with a hunk header: {diff}");
-        assert!(diff.contains("-    let x = 1;"), "removed line present: {diff}");
-        assert!(diff.contains("+    let x = 2;"), "added line present: {diff}");
+        assert!(
+            diff.contains("@@"),
+            "must be a unified diff with a hunk header: {diff}"
+        );
+        assert!(
+            diff.contains("-    let x = 1;"),
+            "removed line present: {diff}"
+        );
+        assert!(
+            diff.contains("+    let x = 2;"),
+            "added line present: {diff}"
+        );
         // The change is on file line 2, which falls within lines 1-3 shown in the hunk header.
-        assert!(diff.contains("@@ -1,3 +1,3 @@"), "hunk header shows lines 1-3: {diff}");
+        assert!(
+            diff.contains("@@ -1,3 +1,3 @@"),
+            "hunk header shows lines 1-3: {diff}"
+        );
     }
 
     #[test]
@@ -381,8 +413,15 @@ mod tests {
         let old = String::new();
         let new: String = (0..200).map(|i| format!("line {i}\n")).collect();
         let diff = build_compact_diff(&old, &new);
-        assert!(diff.lines().count() <= 61, "capped: {} lines", diff.lines().count());
-        assert!(diff.contains("more diff lines"), "shows a truncation note: {diff}");
+        assert!(
+            diff.lines().count() <= 61,
+            "capped: {} lines",
+            diff.lines().count()
+        );
+        assert!(
+            diff.contains("more diff lines"),
+            "shows a truncation note: {diff}"
+        );
     }
 
     #[tokio::test]
@@ -452,16 +491,27 @@ mod tests {
     #[tokio::test]
     async fn crlf_file_matches_lf_oldstring_and_preserves_crlf() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("router.js"), "  path: '/help',\r\n  next: 1,\r\n").unwrap();
+        std::fs::write(
+            d.path().join("router.js"),
+            "  path: '/help',\r\n  next: 1,\r\n",
+        )
+        .unwrap();
         let r = EditFileTool
             .execute(
                 r#"{"file_path":"router.js","old_string":"  path: '/help',\n  next: 1,","new_string":"  path: '/proxyCase',\n  next: 1,"}"#,
                 &ctx(d.path()),
             )
             .await;
-        assert!(!r.is_error, "CRLF file must match an LF old_string: {}", r.content);
+        assert!(
+            !r.is_error,
+            "CRLF file must match an LF old_string: {}",
+            r.content
+        );
         let on_disk = std::fs::read_to_string(d.path().join("router.js")).unwrap();
-        assert_eq!(on_disk, "  path: '/proxyCase',\r\n  next: 1,\r\n", "must stay CRLF: {on_disk:?}");
+        assert_eq!(
+            on_disk, "  path: '/proxyCase',\r\n  next: 1,\r\n",
+            "must stay CRLF: {on_disk:?}"
+        );
     }
 
     // A literal match must write new_string VERBATIM — never coerce its line endings.
@@ -479,7 +529,10 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         // The edited LF region stays LF; the unrelated CRLF line is untouched.
-        assert_eq!(std::fs::read_to_string(d.path().join("m.txt")).unwrap(), "head\r\nalpha\nBETA\n");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("m.txt")).unwrap(),
+            "head\r\nalpha\nBETA\n"
+        );
     }
 
     // old_string and new_string that differ ONLY by line-ending form collapse to the
@@ -496,7 +549,11 @@ mod tests {
             )
             .await;
         assert!(r.is_error, "a no-op edit must be refused: {}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("c.txt")).unwrap(), "a\r\nb\r\n", "unchanged");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("c.txt")).unwrap(),
+            "a\r\nb\r\n",
+            "unchanged"
+        );
     }
 
     #[tokio::test]
@@ -504,10 +561,21 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "abc").unwrap();
         let r = EditFileTool
-            .execute(r#"{"file_path":"a.txt","old_string":"","new_string":"X","replace_all":true}"#, &ctx(d.path()))
+            .execute(
+                r#"{"file_path":"a.txt","old_string":"","new_string":"X","replace_all":true}"#,
+                &ctx(d.path()),
+            )
             .await;
-        assert!(r.is_error, "empty old_string must be refused (would insert everywhere): {}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "abc", "unchanged");
+        assert!(
+            r.is_error,
+            "empty old_string must be refused (would insert everywhere): {}",
+            r.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "abc",
+            "unchanged"
+        );
     }
 
     #[tokio::test]
@@ -521,7 +589,10 @@ mod tests {
             )
             .await;
         assert!(!r.is_error, "{}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.rs")).unwrap(), "let x = 9;\nlet y = 2;\n");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.rs")).unwrap(),
+            "let x = 9;\nlet y = 2;\n"
+        );
     }
 
     // The reported "改不动只能写脚本" case: the file is TAB-indented but the model
@@ -532,15 +603,27 @@ mod tests {
     #[tokio::test]
     async fn fuzzy_matches_tab_vs_space_indentation_and_preserves_tabs() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("f.rs"), "fn f() {\n\tlet x = 1;\n\tlet y = 2;\n}\n").unwrap();
+        std::fs::write(
+            d.path().join("f.rs"),
+            "fn f() {\n\tlet x = 1;\n\tlet y = 2;\n}\n",
+        )
+        .unwrap();
         let r = EditFileTool
             .execute(
                 r#"{"file_path":"f.rs","old_string":"    let x = 1;\n    let y = 2;","new_string":"    let x = 9;\n    let y = 2;"}"#,
                 &ctx(d.path()),
             )
             .await;
-        assert!(!r.is_error, "fuzzy whitespace match must succeed: {}", r.content);
-        assert!(r.content.contains("fuzzy"), "should report a fuzzy match: {}", r.content);
+        assert!(
+            !r.is_error,
+            "fuzzy whitespace match must succeed: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("fuzzy"),
+            "should report a fuzzy match: {}",
+            r.content
+        );
         assert_eq!(
             std::fs::read_to_string(d.path().join("f.rs")).unwrap(),
             "fn f() {\n\tlet x = 9;\n\tlet y = 2;\n}\n",
@@ -554,7 +637,11 @@ mod tests {
     #[tokio::test]
     async fn fuzzy_match_preserves_crlf_line_endings() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("f.rs"), "fn f() {\r\n\tlet x = 1;\r\n\tlet y = 2;\r\n}\r\n").unwrap();
+        std::fs::write(
+            d.path().join("f.rs"),
+            "fn f() {\r\n\tlet x = 1;\r\n\tlet y = 2;\r\n}\r\n",
+        )
+        .unwrap();
         // Model copied LF text (read_file strips \r) with SPACE indentation.
         let r = EditFileTool
             .execute(
@@ -576,10 +663,21 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "\tx\n").unwrap();
         let r = EditFileTool
-            .execute(r#"{"file_path":"a.txt","old_string":"  x","new_string":"  y"}"#, &ctx(d.path()))
+            .execute(
+                r#"{"file_path":"a.txt","old_string":"  x","new_string":"  y"}"#,
+                &ctx(d.path()),
+            )
             .await;
-        assert!(r.is_error, "a short fragment must not fuzzy-match: {}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "\tx\n", "unchanged");
+        assert!(
+            r.is_error,
+            "a short fragment must not fuzzy-match: {}",
+            r.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "\tx\n",
+            "unchanged"
+        );
     }
 
     // Regression: indent arithmetic must count *characters*, not bytes. When the file
@@ -590,7 +688,11 @@ mod tests {
     #[tokio::test]
     async fn fuzzy_preserves_multibyte_whitespace_indentation() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("f.py"), "def f():\n\u{3000}x = 1\n\u{3000}y = 2\n").unwrap();
+        std::fs::write(
+            d.path().join("f.py"),
+            "def f():\n\u{3000}x = 1\n\u{3000}y = 2\n",
+        )
+        .unwrap();
         // Model reproduced the body with plain-space indentation → exact match fails,
         // fuzzy path fires.
         let r = EditFileTool

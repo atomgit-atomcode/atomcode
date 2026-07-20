@@ -139,14 +139,28 @@ pub(crate) fn display_path(p: &Path, root: &Path) -> String {
     } else {
         format!(
             ".../{}",
-            comps[comps.len() - 3..].iter().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
+            comps[comps.len() - 3..]
+                .iter()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
         )
     }
 }
 
 pub(crate) fn ok(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: false, images: vec![] }
+    ToolResult {
+        call_id: String::new(),
+        content: content.into(),
+        is_error: false,
+        images: vec![],
+    }
 }
 pub(crate) fn err(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: true, images: vec![] }
+    ToolResult {
+        call_id: String::new(),
+        content: content.into(),
+        is_error: true,
+        images: vec![],
+    }
 }

@@ -18,9 +18,7 @@ use async_trait::async_trait;
 use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::RecordingProvider;
-use atomcode_kernel::tool::{
-    Tool, ToolCall, ToolContext, ToolRegistry, ToolResult,
-};
+use atomcode_kernel::tool::{Tool, ToolCall, ToolContext, ToolRegistry, ToolResult};
 use std::sync::Arc;
 
 /// A tool whose `execute` returns a giant `content` (a runaway third-party tool
@@ -31,8 +29,12 @@ struct HugeTool {
 
 #[async_trait]
 impl Tool for HugeTool {
-    fn name(&self) -> &str { "huge" }
-    fn description(&self) -> &str { "Returns a huge blob of output" }
+    fn name(&self) -> &str {
+        "huge"
+    }
+    fn description(&self) -> &str {
+        "Returns a huge blob of output"
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object"})
     }
@@ -47,15 +49,16 @@ impl Tool for HugeTool {
 }
 
 fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
-    ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args.into(),
+    }
 }
 
 /// Drive one turn that calls `huge` once (round 1), then stops (round 2).
 /// Returns every `AgentEvent::ToolResult` the driver received.
-async fn drive_and_collect_results(
-    max_cap: Option<usize>,
-    huge_size: usize,
-) -> Vec<ToolResult> {
+async fn drive_and_collect_results(max_cap: Option<usize>, huge_size: usize) -> Vec<ToolResult> {
     let provider = Arc::new(RecordingProvider::new(vec![
         vec![
             StreamEvent::ToolCall(tool_call("c1", "huge", "{}")),
@@ -77,7 +80,10 @@ async fn drive_and_collect_results(
     if let Some(c) = max_cap {
         builder = builder.max_tool_result_bytes(c);
     }
-    let outcome = builder.build().run_to_completion("go", AutoRespond::AllowAll).await;
+    let outcome = builder
+        .build()
+        .run_to_completion("go", AutoRespond::AllowAll)
+        .await;
 
     // Cross-check: what the model saw next round (the stored Tool message) must
     // ALSO be capped — assert via the recorded provider calls.
@@ -120,8 +126,15 @@ async fn default_cap_bounds_runaway_tool_result() {
         "result must be ~default cap + marker; got {}",
         r.content.len()
     );
-    assert!(r.content.contains("[truncated:"), "capped result must carry the marker: tail={:?}", &r.content[r.content.len().saturating_sub(80)..]);
-    assert!(r.content.contains("by kernel cap]"), "marker must name the kernel cap");
+    assert!(
+        r.content.contains("[truncated:"),
+        "capped result must carry the marker: tail={:?}",
+        &r.content[r.content.len().saturating_sub(80)..]
+    );
+    assert!(
+        r.content.contains("by kernel cap]"),
+        "marker must name the kernel cap"
+    );
 }
 
 // CLAIM 20b: a builder-configured SMALLER cap is honored.
@@ -131,10 +144,18 @@ async fn builder_configured_smaller_cap_is_honored() {
     assert_eq!(results.len(), 1);
     let r = &results[0];
     let body = r.content.split('\n').next().unwrap();
-    assert!(body.len() <= 1000, "body must be <= the configured 1000-byte cap; got {}", body.len());
+    assert!(
+        body.len() <= 1000,
+        "body must be <= the configured 1000-byte cap; got {}",
+        body.len()
+    );
     assert!(r.content.contains("[truncated:"), "must carry the marker");
     // Far below default → proves the builder value (not the default) is in force.
-    assert!(r.content.len() < 2000, "tiny cap → tiny result; got {}", r.content.len());
+    assert!(
+        r.content.len() < 2000,
+        "tiny cap → tiny result; got {}",
+        r.content.len()
+    );
 }
 
 // CLAIM 20c: a result UNDER the cap is passed through untouched (no marker).
@@ -143,7 +164,11 @@ async fn under_cap_result_is_untouched() {
     let results = drive_and_collect_results(Some(65536), 100).await;
     assert_eq!(results.len(), 1);
     let r = &results[0];
-    assert_eq!(r.content, "a".repeat(100), "small result must be byte-identical (no cap, no marker)");
+    assert_eq!(
+        r.content,
+        "a".repeat(100),
+        "small result must be byte-identical (no cap, no marker)"
+    );
     assert!(!r.content.contains("truncated"));
 }
 

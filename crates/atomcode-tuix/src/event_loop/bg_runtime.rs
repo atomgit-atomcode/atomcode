@@ -1,7 +1,7 @@
+use super::ui_event::UiEvent as AgentEvent;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_config::i18n::{t, Msg};
-use super::ui_event::UiEvent as AgentEvent;
-use atomcode_core::session::{Session, SessionManager};
+use crate::session::Session;
 
 use super::RuntimeEndpoint;
 
@@ -402,15 +402,12 @@ impl BgRuntimeManager {
         &mut self,
         runtime_id: RuntimeId,
         event: RuntimeEventPayload,
-        session_manager: &SessionManager,
     ) {
         let Some(slot) = self.backgrounds.slot_for_runtime_id(runtime_id) else {
             return;
         };
         let terminal = match event {
-            RuntimeEventPayload::Ui(event) => {
-                self.backgrounds.apply_event_to_slot(slot, &event)
-            }
+            RuntimeEventPayload::Ui(event) => self.backgrounds.apply_event_to_slot(slot, &event),
             RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished { completion })
                 if completion.is_manual() =>
             {
@@ -421,7 +418,7 @@ impl BgRuntimeManager {
                             if let Some(snapshot) = outcome.committed_snapshot.as_deref() {
                                 let core_snapshot = super::kernel_snapshot_to_core(snapshot);
                                 super::apply_session_snapshot(&mut bg.session, core_snapshot);
-                                failed = session_manager.save(&bg.session).is_err();
+                                // The background CodingRuntime owns native persistence.
                             } else {
                                 failed = true;
                             }
@@ -440,11 +437,7 @@ impl BgRuntimeManager {
             RuntimeEventPayload::Native(_) => false,
             RuntimeEventPayload::Driver(_) => false,
         };
-        if terminal {
-            if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
-                let _ = session_manager.save(&bg.session);
-            }
-        }
+        let _ = terminal;
     }
 
     #[cfg(test)]
@@ -603,7 +596,7 @@ fn test_endpoint() -> RuntimeEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::session::Session;
+    use crate::session::Session;
     use std::path::PathBuf;
 
     fn session(name: &str) -> Session {
@@ -850,7 +843,6 @@ mod tests {
                     committed_snapshot: None,
                 }),
             }),
-            &SessionManager::new(&project),
         );
 
         assert_eq!(
@@ -888,7 +880,6 @@ mod tests {
                     committed_snapshot: Some(std::sync::Arc::new(snapshot)),
                 }),
             }),
-            &SessionManager::new(&project),
         );
 
         let messages = &manager.backgrounds.slots[0].session.messages;
@@ -918,7 +909,6 @@ mod tests {
                     reason: atomcode_coding::runtime::CompactionInterruption::RuntimeReconfigured,
                 },
             }),
-            &SessionManager::new(&project),
         );
 
         assert_eq!(
@@ -945,7 +935,6 @@ mod tests {
                     error: atomcode_kernel::checkpoint::CompactionCheckpointError::new("disk full"),
                 },
             }),
-            &SessionManager::new(&project),
         );
 
         assert_eq!(
@@ -980,7 +969,6 @@ mod tests {
                     committed_snapshot: None,
                 }),
             }),
-            &SessionManager::new(&project),
         );
 
         assert_eq!(

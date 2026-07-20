@@ -52,7 +52,10 @@ pub enum AgentCommand {
         images: Vec<ImageContent>,
     },
     /// Answer a pending AgentEvent::Request, correlated by id.
-    Respond { id: RequestId, value: serde_json::Value },
+    Respond {
+        id: RequestId,
+        value: serde_json::Value,
+    },
     /// Ask the agent to emit a snapshot of per-message execution stats.
     Snapshot,
     /// MANUAL compaction (e.g. a user `/compact`). Runs the injected
@@ -60,7 +63,9 @@ pub enum AgentCommand {
     /// request is always honored). `focus` optionally steers the strategy toward a
     /// topic. A net-loss/no-op plan is still refused by `apply_plan` (no epoch
     /// burn). Serializable so a web/daemon driver can request it over the wire.
-    Compact { focus: Option<String> },
+    Compact {
+        focus: Option<String>,
+    },
     Cancel,
     Shutdown,
 }
@@ -113,25 +118,40 @@ pub enum AgentEvent {
         total: usize,
         elapsed_ms: u64,
     },
-    ToolStarted { call: ToolCall },
+    ToolStarted {
+        call: ToolCall,
+    },
     /// Live progress from a long-running tool MID-execution (e.g. a sub-agent tool
     /// reporting a per-task update). `call_id` is the executing call's id; `message` is
     /// the tool's free-form status. Purely observational — a driver may render or ignore it.
-    ToolProgress { call_id: String, message: String },
-    ToolResult { result: ToolResult },
+    ToolProgress {
+        call_id: String,
+        message: String,
+    },
+    ToolResult {
+        result: ToolResult,
+    },
     /// Generic middleware ↔ driver round-trip. Kernel is agnostic to kind/payload.
-    Request { id: RequestId, kind: String, payload: serde_json::Value },
+    Request {
+        id: RequestId,
+        kind: String,
+        payload: serde_json::Value,
+    },
     /// Per-LLM-call execution stats (perception side; mirrors the message sidecar).
     Usage(MessageMeta),
     /// Whole-conversation snapshot (reply to Snapshot command). Carries the
     /// LOSSLESS, VERSIONED `SessionSnapshot` — full `Vec<Message>` (role / text /
     /// tool_calls / tool_call_id / meta), suitable for persist + resume.
-    Snapshot { snapshot: SessionSnapshot },
+    Snapshot {
+        snapshot: SessionSnapshot,
+    },
     /// TERMINAL turn event. `reason` (FAILURE PERCEPTION) says WHY the turn ended —
     /// `Stopped` (normal) vs a failure/fuse (`ProviderError`/`Timeout`/`MaxRounds`/
     /// `MaxContinuations`/`Cancelled`/`PromptRejected`). A driver can no longer
     /// mistake a failed turn for an empty success.
-    TurnComplete { reason: StopReason },
+    TurnComplete {
+        reason: StopReason,
+    },
     /// A failure (failed open / mid-stream / timeout / max-rounds / prompt-rejected /
     /// tool error). `message` is the human-readable cause; `http_status` + `code` are
     /// the STRUCTURED error code for provider failures (`None` for kernel-internal ones).
@@ -180,12 +200,16 @@ pub enum AgentEvent {
     /// One or more user prompts were folded ("steered") into the running turn at
     /// a round boundary. `count` folded this round. Drivers relabel their
     /// type-ahead indicator from "queued" to "folded into current turn".
-    Steered { count: usize },
+    Steered {
+        count: usize,
+    },
     /// A compaction is ABOUT TO RUN — emitted before the strategy plans/summarizes
     /// (a manual `/compact` may make a slow one-shot LLM summary call here). Lets a
     /// driver show a "compacting…" progress line before the possibly multi-second
     /// work; the outcome (sizes / committed) is not known yet — see `Compacted`.
-    CompactionStarted { trigger: crate::message::CompactTrigger },
+    CompactionStarted {
+        trigger: crate::message::CompactTrigger,
+    },
     /// A compaction was ATTEMPTED (mirrors `message::CompactReport`). `committed`
     /// distinguishes a real shrink (history rewritten, `epoch` bumped to the NEW
     /// generation, `bytes_after < bytes_before`) from a REFUSED one (net-loss guard
@@ -239,7 +263,10 @@ mod tests {
             r#"{"Compacted":{"trigger":{"Manual":{"focus":null}},"epoch":1,"removed":2,"bytes_before":100,"bytes_after":50,"committed":true}}"#,
         )
         .unwrap();
-        assert!(matches!(event, AgentEvent::Compacted { snapshot: None, .. }));
+        assert!(matches!(
+            event,
+            AgentEvent::Compacted { snapshot: None, .. }
+        ));
     }
 
     #[test]

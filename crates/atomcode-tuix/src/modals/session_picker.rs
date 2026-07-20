@@ -9,7 +9,7 @@
 // F2 renames the selected session.
 
 use anyhow::Result;
-use atomcode_core::session::{Session, SessionMeta};
+use crate::session::{Session, SessionMeta, TurnStat};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
@@ -86,7 +86,7 @@ impl SessionPicker {
         self.confirm_delete = None;
     }
 
-    pub fn chosen_id(&self) -> Option<atomcode_core::session::SessionId> {
+    pub fn chosen_id(&self) -> Option<String> {
         let i = *self.filtered.get(self.selected)?;
         self.sessions.get(i).map(|s| s.id.clone())
     }
@@ -136,7 +136,6 @@ impl Modal for SessionPicker {
                         if let Some(session_meta) = self.sessions.get(idx) {
                             let id = session_meta.id.clone();
                             match perform_session_rename(
-                                &ctx.session_manager,
                                 &id,
                                 &self.rename_buffer,
                             ) {
@@ -159,7 +158,8 @@ impl Modal for SessionPicker {
                                         crate::i18n::t(crate::i18n::Msg::SessionRenamed {
                                             old: &old_name,
                                             new: &new_name,
-                                        }).into_owned(),
+                                        })
+                                        .into_owned(),
                                     ));
                                     renderer.flush();
                                 }
@@ -253,7 +253,14 @@ impl Modal for SessionPicker {
                     // Second Ctrl+D: confirm delete
                     if let Some(session) = self.sessions.get(idx) {
                         let id = session.id.clone();
-                        match ctx.session_manager.delete(&id) {
+                        let project_bucket =
+                            atomcode_capabilities::session::SessionManager::project_hash(
+                                &session.working_dir,
+                            );
+                        match atomcode_daemon::legacy_convert::delete_catalog_session_in_project(
+                            &project_bucket,
+                            id.as_str(),
+                        ) {
                             Ok(()) => {
                                 let name = session.name.clone();
                                 self.sessions.remove(idx);
@@ -269,7 +276,8 @@ impl Modal for SessionPicker {
                                 self.delete_status = Some(
                                     crate::i18n::t(crate::i18n::Msg::SessionDeleted {
                                         name: &name,
-                                    }).into_owned(),
+                                    })
+                                    .into_owned(),
                                 );
                             }
                             Err(e) => {
@@ -277,7 +285,8 @@ impl Modal for SessionPicker {
                                 self.delete_status = Some(
                                     crate::i18n::t(crate::i18n::Msg::SessionDeleteFailed {
                                         error: &e.to_string(),
-                                    }).into_owned(),
+                                    })
+                                    .into_owned(),
                                 );
                             }
                         }
@@ -289,7 +298,8 @@ impl Modal for SessionPicker {
                         self.delete_status = Some(
                             crate::i18n::t(crate::i18n::Msg::SessionDeleteConfirm {
                                 name: &session.name,
-                            }).into_owned(),
+                            })
+                            .into_owned(),
                         );
                     }
                 }
@@ -301,13 +311,20 @@ impl Modal for SessionPicker {
                     // Filter matched nothing — ignore Enter, stay open.
                     return Ok(ModalAction::Continue);
                 };
-                match ctx.session_manager.load(&id) {
+                match atomcode_daemon::legacy_convert::find_catalog_session_view(id.as_str())
+                    .and_then(|view| {
+                        let view = view.ok_or_else(|| {
+                            anyhow::anyhow!("session {} not found", id.as_str())
+                        })?;
+                        Session::from_catalog_view(view)
+                    })
+                {
                     Ok(session) => {
                         ctx.current_session_id = Some(id);
                         replay_session(renderer, state, &session, true);
                         ctx.runtime
                             .dispatch(atomcode_coding::DriverCommand::RestoreSnapshot(
-                                crate::runtime_convert::snapshot_to_kernel(
+                                atomcode_daemon::legacy_convert::snapshot_to_kernel(
                                     &session.to_conversation_snapshot(),
                                 ),
                             ))
@@ -334,7 +351,8 @@ impl Modal for SessionPicker {
                         state.on_turn_complete();
                         let msg = format!("{}", e);
                         renderer.render(UiLine::Error(
-                            crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &msg }).into_owned(),
+                            crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &msg })
+                                .into_owned(),
                         ));
                         renderer.flush();
                         Ok(ModalAction::Close)
@@ -421,7 +439,10 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
         return MenuPayload {
             items: vec![(label, String::new())],
             selected: 0,
-            kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
+            kind: crate::render::MenuKind::TwoColumn {
+                row_prefix: "",
+                selected_marker: "▸",
+            },
         };
     }
     let items: Vec<(String, String)> = p
@@ -430,14 +451,17 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
         .enumerate()
         .map(|(filter_idx, &session_idx)| {
             let s = &p.sessions[session_idx];
-            let msgs = crate::i18n::t(crate::i18n::Msg::SessionMsgCount { count: s.message_count });
+            let msgs = crate::i18n::t(crate::i18n::Msg::SessionMsgCount {
+                count: s.message_count,
+            });
             let desc = format!("{} · {}", msgs, humanize_age(s.updated_at));
             // If in rename editing mode and this is the selected item, show the editing buffer
             if p.rename_editing && filter_idx == p.selected {
                 (
                     crate::i18n::t(crate::i18n::Msg::SessionRenameEditing {
                         buffer: &p.rename_buffer,
-                    }).into_owned(),
+                    })
+                    .into_owned(),
                     desc,
                 )
             } else {
@@ -448,18 +472,19 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
     MenuPayload {
         items,
         selected: p.selected,
-        kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
+        kind: crate::render::MenuKind::TwoColumn {
+            row_prefix: "",
+            selected_marker: "▸",
+        },
     }
 }
 
-fn humanize_age(ts: u64) -> String {
+fn humanize_age(ts_ms: i64) -> String {
     use crate::i18n::{t, Msg};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(ts);
-    let d = now.saturating_sub(ts);
+    let d = atomcode_capabilities::session::now_ms()
+        .saturating_sub(ts_ms)
+        .max(0) as u64
+        / 1000;
     if d < 60 {
         t(Msg::SessionTimeJustNow).into_owned()
     } else if d < 3600 {
@@ -484,7 +509,7 @@ fn humanize_age(ts: u64) -> String {
 /// (old session, or a cancelled turn that recorded no stat) → empty label,
 /// which renders as a plain horizontal rule so the visual interval is still
 /// restored. `done` is fixed on replay (the live rotation is cosmetic).
-fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String {
+fn turn_divider_label(stat: Option<&TurnStat>) -> String {
     match stat {
         Some(s) if s.errored => crate::i18n::t(crate::i18n::Msg::TurnSummaryError {
             turn_count: s.turn_count,
@@ -512,7 +537,9 @@ fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String
 /// live. Mirrors the live [`UiState::last_assistant_response`]: the accumulated
 /// assistant text of the newest turn that produced any (a `User` message is a
 /// turn boundary). Returns `""` when the session has no assistant text.
-fn last_assistant_reply_markdown(messages: &[atomcode_core::conversation::message::Message]) -> String {
+fn last_assistant_reply_markdown(
+    messages: &[atomcode_core::conversation::message::Message],
+) -> String {
     use atomcode_core::conversation::message::{MessageContent, Role};
     // Append `text` to the in-progress turn's reply, paragraph-separated so a
     // turn that emitted prose, then a tool call, then more prose reads cleanly.
@@ -577,7 +604,10 @@ pub(crate) fn replay_session(
     if reset {
         renderer.reset();
     }
-    let resumed = crate::i18n::t(crate::i18n::Msg::SessionResumedLabel { name: &session.name }).into_owned();
+    let resumed = crate::i18n::t(crate::i18n::Msg::SessionResumedLabel {
+        name: &session.name,
+    })
+    .into_owned();
     renderer.render(UiLine::TurnSeparator {
         label: resumed.clone(),
     });
@@ -591,7 +621,8 @@ pub(crate) fn replay_session(
     let mut seen_user = false;
     // Suppress successful todowrite tool RESULTs (the persistent panel is the sole
     // view for todowrite output; errors still show). Track parseable call ids.
-    let mut todowrite_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut todowrite_call_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for (i, m) in session.messages.iter().enumerate() {
         if is_real_user_message(m) {
             if seen_user {
@@ -678,9 +709,7 @@ pub(crate) fn replay_session(
         });
     }
     renderer.render(UiLine::TurnComplete);
-    renderer.render(UiLine::TurnSeparator {
-        label: resumed,
-    });
+    renderer.render(UiLine::TurnSeparator { label: resumed });
     renderer.flush();
     renderer.set_suppress_auto_copy(false);
     renderer.end_sync();
@@ -720,12 +749,11 @@ pub(crate) fn replay_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::session::{SessionId, SessionMeta};
     use std::path::PathBuf;
 
     fn meta(name: &str, msgs: usize) -> SessionMeta {
         SessionMeta {
-            id: SessionId::from_string(format!("id-{name}")),
+            id: format!("id-{name}"),
             name: name.to_string(),
             working_dir: PathBuf::from("/tmp/x"),
             created_at: 0,
@@ -737,7 +765,6 @@ mod tests {
 
     #[test]
     fn turn_divider_label_renders_stats_or_plain_rule() {
-        use atomcode_core::session::TurnStat;
         let s = TurnStat {
             after_message: 4,
             turn_count: 3,
@@ -760,7 +787,10 @@ mod tests {
             "got {normal:?}"
         );
         // Errored turn → ✗ variant.
-        let err = TurnStat { errored: true, ..s.clone() };
+        let err = TurnStat {
+            errored: true,
+            ..s.clone()
+        };
         assert!(super::turn_divider_label(Some(&err)).contains('✗'));
         // No stat (old session / cancelled turn) → empty label → plain rule.
         assert_eq!(super::turn_divider_label(None), "");
@@ -973,7 +1003,6 @@ mod tests {
     #[test]
     fn replay_seeds_todo_panel_and_suppresses_todowrite_result() {
         use atomcode_core::conversation::message::{Message, MessageContent, Role};
-        use atomcode_core::session::Session;
         use atomcode_core::tool::{ToolCall, ToolResult as MToolResult};
 
         #[derive(Default)]
@@ -1086,12 +1115,20 @@ mod tests {
             })
             .collect();
         assert!(
-            !cmd_out.iter().any(|s| s.contains("task A") || s.contains("task B") || s.contains("task C")),
+            !cmd_out
+                .iter()
+                .any(|s| s.contains("task A") || s.contains("task B") || s.contains("task C")),
             "todowrite no longer renders an inline block on replay: {cmd_out:?}"
         );
         // Panel seeded from the transcript's LAST valid todowrite (task C, 1 pending).
-        let panel = state.active_todos.clone().expect("panel seeded from transcript");
-        assert_eq!(panel.total, 1, "last todowrite (task C) seeds the panel: {panel:?}");
+        let panel = state
+            .active_todos
+            .clone()
+            .expect("panel seeded from transcript");
+        assert_eq!(
+            panel.total, 1,
+            "last todowrite (task C) seeds the panel: {panel:?}"
+        );
 
         let tool_call_names: Vec<&str> = rec
             .lines
@@ -1102,10 +1139,16 @@ mod tests {
             })
             .collect();
         assert!(
-            !tool_call_names.iter().any(|n| n.to_lowercase().contains("todo")),
+            !tool_call_names
+                .iter()
+                .any(|n| n.to_lowercase().contains("todo")),
             "todowrite must NOT render as a generic tool row: {tool_call_names:?}"
         );
-        assert_eq!(tool_call_names.len(), 1, "only the non-todowrite call is a tool row: {tool_call_names:?}");
+        assert_eq!(
+            tool_call_names.len(),
+            1,
+            "only the non-todowrite call is a tool row: {tool_call_names:?}"
+        );
 
         let results: Vec<&str> = rec
             .lines
@@ -1116,7 +1159,9 @@ mod tests {
             })
             .collect();
         assert!(
-            !results.iter().any(|s| s.contains("task A") || s.contains("[~]")),
+            !results
+                .iter()
+                .any(|s| s.contains("task A") || s.contains("[~]")),
             "todowrite result must be suppressed: {results:?}"
         );
         assert!(
@@ -1132,7 +1177,6 @@ mod tests {
     #[test]
     fn replay_skips_synthetic_user_messages() {
         use atomcode_core::conversation::message::{Message, Role};
-        use atomcode_core::session::Session;
 
         #[derive(Default)]
         struct Rec {

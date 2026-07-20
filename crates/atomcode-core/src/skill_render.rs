@@ -86,16 +86,24 @@ pub fn render_skill_catalog(entries: &[CatalogEntry]) -> Option<String> {
     // Rank first (source tier), then name for determinism / prompt-cache
     // stability within a tier.
     let mut sorted: Vec<&CatalogEntry> = entries.iter().collect();
-    sorted.sort_by(|a, b| a.source_rank.cmp(&b.source_rank).then_with(|| a.name.cmp(&b.name)));
+    sorted.sort_by(|a, b| {
+        a.source_rank
+            .cmp(&b.source_rank)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     let mut lines: Vec<String> = Vec::new();
     let mut body_bytes = 0usize; // skill-list body only, NOT header+guidance
     let mut omitted = 0usize;
     for e in &sorted {
-        let hint = e.hint.as_deref().map(|h| format!(" {h}")).unwrap_or_default();
+        let hint = e
+            .hint
+            .as_deref()
+            .map(|h| format!(" {h}"))
+            .unwrap_or_default();
         let line = format!("- {}{}: {}", e.name, hint, truncate_desc(&e.description));
         let cost = line.len() + 1; // + newline
-        // Always emit at least the top-ranked skill even if it alone is huge.
+                                   // Always emit at least the top-ranked skill even if it alone is huge.
         if lines.is_empty() || body_bytes + cost <= CATALOG_BYTE_BUDGET {
             body_bytes += cost;
             lines.push(line);
@@ -125,7 +133,12 @@ mod tests {
     use std::path::PathBuf;
 
     fn entry(name: &str, desc: &str, rank: u8) -> CatalogEntry {
-        CatalogEntry { name: name.into(), hint: None, description: desc.into(), source_rank: rank }
+        CatalogEntry {
+            name: name.into(),
+            hint: None,
+            description: desc.into(),
+            source_rank: rank,
+        }
     }
 
     #[test]
@@ -135,9 +148,18 @@ mod tests {
 
     #[test]
     fn source_rank_tiers() {
-        assert_eq!(source_rank(&PathBuf::from("/home/u/.atomcode/skills/x/SKILL.md")), 0);
-        assert_eq!(source_rank(&PathBuf::from("/home/u/.claude/skills/x/SKILL.md")), 1);
-        assert_eq!(source_rank(&PathBuf::from("/home/u/.agents/skills/x/SKILL.md")), 2);
+        assert_eq!(
+            source_rank(&PathBuf::from("/home/u/.atomcode/skills/x/SKILL.md")),
+            0
+        );
+        assert_eq!(
+            source_rank(&PathBuf::from("/home/u/.claude/skills/x/SKILL.md")),
+            1
+        );
+        assert_eq!(
+            source_rank(&PathBuf::from("/home/u/.agents/skills/x/SKILL.md")),
+            2
+        );
         assert_eq!(source_rank(&PathBuf::from("/opt/plugins/foo/SKILL.md")), 3);
     }
 
@@ -152,17 +174,23 @@ mod tests {
         assert!(out.contains("use_skill"));
         // codex-style anti-bypass framing: mandatory-if-matches + justify a skip.
         assert!(out.contains("MUST"), "mandatory-if-matches framing");
-        assert!(out.contains("say why"), "accountability: justify skipping an obvious match");
+        assert!(
+            out.contains("say why"),
+            "accountability: justify skipping an obvious match"
+        );
         assert!(out.contains("- brainstorming: before creative work"));
         assert!(out.contains("- seo: search stuff"));
-        assert!(!out.contains("not shown"), "no omission under budget: {out}");
+        assert!(
+            !out.contains("not shown"),
+            "no omission under budget: {out}"
+        );
     }
 
     #[test]
     fn ranks_curated_before_community() {
         // Names chosen so name-sort would REVERSE the desired order; rank must win.
         let out = render_skill_catalog(&[
-            entry("zzz-native", "d", 0),  // .atomcode
+            entry("zzz-native", "d", 0),    // .atomcode
             entry("aaa-community", "d", 2), // .agents
         ])
         .unwrap();
@@ -181,10 +209,20 @@ mod tests {
             entries.push(entry(&format!("community-{i:02}"), &big, 2));
         }
         let out = render_skill_catalog(&entries).unwrap();
-        assert!(out.contains("- keep-me: critical process skill"), "curated survived:\n{out}");
-        assert!(out.contains("more lower-priority skills not shown"), "omission note present");
+        assert!(
+            out.contains("- keep-me: critical process skill"),
+            "curated survived:\n{out}"
+        );
+        assert!(
+            out.contains("more lower-priority skills not shown"),
+            "omission note present"
+        );
         // Body must respect the budget (allow header+guidance+note overhead).
-        assert!(out.len() < CATALOG_BYTE_BUDGET + GUIDANCE.len() + 400, "budget respected: {}", out.len());
+        assert!(
+            out.len() < CATALOG_BYTE_BUDGET + GUIDANCE.len() + 400,
+            "budget respected: {}",
+            out.len()
+        );
     }
 
     #[test]
@@ -192,13 +230,20 @@ mod tests {
         let long = "d".repeat(PER_SKILL_DESC_CAP + 500);
         let out = render_skill_catalog(&[entry("x", &long, 0)]).unwrap();
         assert!(out.contains('…'), "truncation ellipsis present");
-        assert!(!out.contains(&long), "full over-cap description must not appear verbatim");
+        assert!(
+            !out.contains(&long),
+            "full over-cap description must not appear verbatim"
+        );
     }
 
     #[test]
     fn always_emits_top_ranked_even_if_alone_over_budget() {
         let huge = "d".repeat(PER_SKILL_DESC_CAP); // capped, but line still large
         let out = render_skill_catalog(&[entry("solo", &huge, 0)]).unwrap();
-        assert!(out.contains("- solo: "), "top-ranked always emitted:\n{}", &out[..80.min(out.len())]);
+        assert!(
+            out.contains("- solo: "),
+            "top-ranked always emitted:\n{}",
+            &out[..80.min(out.len())]
+        );
     }
 }

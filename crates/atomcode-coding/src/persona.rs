@@ -46,7 +46,12 @@ pub(crate) fn request_user_input_switch_enabled() -> bool {
 pub(crate) fn memory_tool_enabled() -> bool {
     std::env::var("ATOMCODE_MEMORY_TOOL")
         .ok()
-        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off"
+            )
+        })
         .unwrap_or(true)
 }
 
@@ -404,10 +409,19 @@ mod tests {
     #[test]
     fn request_user_input_guidance_gated() {
         let on = coding_persona("deepseek-v4-flash", false, true);
-        assert!(on.contains("## ASKING THE USER"), "enabled → guidance present");
-        assert!(on.contains("request_user_input"), "enabled → names the tool");
+        assert!(
+            on.contains("## ASKING THE USER"),
+            "enabled → guidance present"
+        );
+        assert!(
+            on.contains("request_user_input"),
+            "enabled → names the tool"
+        );
         let off = coding_persona("deepseek-v4-flash", false, false);
-        assert!(!off.contains("## ASKING THE USER"), "disabled → no guidance");
+        assert!(
+            !off.contains("## ASKING THE USER"),
+            "disabled → no guidance"
+        );
     }
 
     #[test]
@@ -424,7 +438,10 @@ mod tests {
         // `todowrite` tool + hook are mounted (same ATOMCODE_TODO switch), else the
         // model would be told to call a tool that isn't there.
         let on = coding_persona("glm-5.2", true, false);
-        assert!(on.contains("## TASK TRACKING"), "enabled → guidance present");
+        assert!(
+            on.contains("## TASK TRACKING"),
+            "enabled → guidance present"
+        );
         assert!(on.contains("todowrite"), "enabled → names the tool: {on}");
         // Threshold disambiguation: count steps, not tool calls (fixes weak-model
         // miscounting that made GLM under-trigger).
@@ -487,7 +504,10 @@ mod tests {
         // Every round needs a date anchor (round 1 is skipped by StatusReminderHook),
         // else web_search defaults to the training year.
         let p = coding_persona("m", true, false);
-        assert!(p.contains("Today's date:"), "persona must carry a date anchor: {p}");
+        assert!(
+            p.contains("Today's date:"),
+            "persona must carry a date anchor: {p}"
+        );
     }
 
     #[test]
@@ -511,7 +531,10 @@ mod tests {
         assert!(p.contains("VERIFY"));
         assert!(p.contains("## RISKY ACTIONS:"));
         // Skill-trigger nudge is always present (weak-model reinforcement of the catalog).
-        assert!(p.contains("## SKILLS:"), "skill-trigger guidance always present");
+        assert!(
+            p.contains("## SKILLS:"),
+            "skill-trigger guidance always present"
+        );
         assert!(p.contains("use_skill"), "names the skill-loading tool");
         // Anti-bypass: a matching skill must win over an ad-hoc clarifying question
         // (the observed failure: request_user_input pre-empted brainstorming).
@@ -519,7 +542,10 @@ mod tests {
             p.contains("priority over asking the user a clarifying question"),
             "SKILLS must out-prioritize ad-hoc clarifying questions"
         );
-        assert!(p.contains("say why"), "accountability: justify skipping an obvious match");
+        assert!(
+            p.contains("say why"),
+            "accountability: justify skipping an obvious match"
+        );
         // Every mounted tool the discipline/model relies on must be advertised, so the
         // model knows it exists. edit_file in particular: the verify hook keys on it and
         // the persona tells the model to "prefer editing existing files".
@@ -578,7 +604,9 @@ mod tests {
         assert!(p.contains("## PRECEDENCE:"), "has a PRECEDENCE section");
         assert!(p.contains("AGENTS.md"), "names the user instruction files");
         assert!(
-            p.contains("take \nPRECEDENCE") || p.contains("take PRECEDENCE") || p.contains("PRECEDENCE over"),
+            p.contains("take \nPRECEDENCE")
+                || p.contains("take PRECEDENCE")
+                || p.contains("PRECEDENCE over"),
             "states user instructions override the defaults"
         );
         // The precedence section must appear BEFORE the bulk of the default rules so the
@@ -587,7 +615,10 @@ mod tests {
         let exec = p.find("EXECUTION DISCIPLINE").unwrap_or(p.len());
         assert!(prec < exec, "PRECEDENCE precedes the firm rule sections");
         // Safety carve-out preserved (project files can't disable approval gates).
-        assert!(p.contains("not overridable by a project file"), "safety carve-out kept");
+        assert!(
+            p.contains("not overridable by a project file"),
+            "safety carve-out kept"
+        );
     }
 
     #[test]
@@ -710,7 +741,10 @@ mod tests {
         // around ~80% context. The persona must own context management so the model
         // doesn't push that onto the user.
         let p = coding_persona("m", true, false);
-        assert!(p.contains("## CONTEXT MANAGEMENT:"), "context-management section present");
+        assert!(
+            p.contains("## CONTEXT MANAGEMENT:"),
+            "context-management section present"
+        );
         assert!(
             p.contains("start a new conversation"),
             "must explicitly tell the model not to suggest a new conversation"
@@ -821,13 +855,31 @@ mod tests {
         // slip): silently deleting code/tests to clear errors, shipping unverified edits,
         // offloading doable work, quitting after one failure, treating stale memory as truth.
         let p = coding_persona("deepseek-v4-flash", true, false);
-        assert!(p.contains("## EXECUTION DISCIPLINE"), "deepseek must get the block: {p}");
+        assert!(
+            p.contains("## EXECUTION DISCIPLINE"),
+            "deepseek must get the block: {p}"
+        );
         // The five behaviors it must cover.
-        assert!(p.contains("FIX, DON'T HIDE"), "must forbid deleting code to clear errors");
-        assert!(p.contains("VERIFY BEFORE FINISHING"), "must require a passing check");
-        assert!(p.contains("FINISH THE JOB"), "must forbid offloading a doable task");
-        assert!(p.contains("DON'T QUIT EARLY"), "must forbid giving up after one failure");
-        assert!(p.contains("A PAST FAILURE ISN'T A VERDICT"), "must add past-failure skepticism");
+        assert!(
+            p.contains("FIX, DON'T HIDE"),
+            "must forbid deleting code to clear errors"
+        );
+        assert!(
+            p.contains("VERIFY BEFORE FINISHING"),
+            "must require a passing check"
+        );
+        assert!(
+            p.contains("FINISH THE JOB"),
+            "must forbid offloading a doable task"
+        );
+        assert!(
+            p.contains("DON'T QUIT EARLY"),
+            "must forbid giving up after one failure"
+        );
+        assert!(
+            p.contains("A PAST FAILURE ISN'T A VERDICT"),
+            "must add past-failure skepticism"
+        );
         // The rescope must protect standing project instructions from being discounted.
         assert!(
             p.contains("standing project instructions still apply"),
@@ -848,7 +900,10 @@ mod tests {
         }
         for strong in ["claude-opus-4-8", "gpt-5", "m"] {
             let p = coding_persona(strong, true, false);
-            assert!(!p.contains("## EXECUTION DISCIPLINE"), "{strong}: no execution block");
+            assert!(
+                !p.contains("## EXECUTION DISCIPLINE"),
+                "{strong}: no execution block"
+            );
             assert!(!p.contains("## TOOL DISCIPLINE"), "{strong}: no tool block");
         }
     }
@@ -857,7 +912,10 @@ mod tests {
     fn model_needs_firm_execution_is_deepseek_only() {
         assert!(model_needs_firm_execution("deepseek-v4-flash"));
         assert!(model_needs_firm_execution("deepseek-chat"));
-        assert!(!model_needs_firm_execution("glm-5.2"), "GLM excluded from execution block");
+        assert!(
+            !model_needs_firm_execution("glm-5.2"),
+            "GLM excluded from execution block"
+        );
         assert!(!model_needs_firm_execution("GLM-4.6"));
         assert!(!model_needs_firm_execution("claude-opus-4-8"));
     }
@@ -908,35 +966,53 @@ mod tests {
     #[test]
     #[serial_test::serial(offline_verdict)]
     fn offline_block_present_when_offline() {
-        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode};
+        use atomcode_config::config::offline::{
+            reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
+        };
         reset_offline_verdict_for_test();
         seed_offline_verdict(OfflineMode::On, None);
         let p = coding_persona("deepseek-v4-flash", true, false);
-        assert!(p.contains("## OFFLINE ENVIRONMENT:"), "offline block must appear when offline: {p}");
+        assert!(
+            p.contains("## OFFLINE ENVIRONMENT:"),
+            "offline block must appear when offline: {p}"
+        );
         reset_offline_verdict_for_test();
     }
 
     #[test]
     #[serial_test::serial(offline_verdict)]
     fn offline_block_absent_when_online() {
-        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode};
+        use atomcode_config::config::offline::{
+            reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
+        };
         reset_offline_verdict_for_test();
         seed_offline_verdict(OfflineMode::Off, None);
         let p = coding_persona("deepseek-v4-flash", true, false);
-        assert!(!p.contains("## OFFLINE ENVIRONMENT:"), "offline block must NOT appear when online: {p}");
+        assert!(
+            !p.contains("## OFFLINE ENVIRONMENT:"),
+            "offline block must NOT appear when online: {p}"
+        );
         reset_offline_verdict_for_test();
     }
 
     #[test]
     #[serial_test::serial(offline_verdict)]
     fn offline_note_appended_to_block() {
-        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, set_offline_note, OfflineMode};
+        use atomcode_config::config::offline::{
+            reset_offline_verdict_for_test, seed_offline_verdict, set_offline_note, OfflineMode,
+        };
         reset_offline_verdict_for_test();
         seed_offline_verdict(OfflineMode::On, None);
         set_offline_note(Some("npm via nexus.internal".to_string()));
         let p = coding_persona("deepseek-v4-flash", true, false);
-        assert!(p.contains("## OFFLINE ENVIRONMENT:"), "offline block header must appear: {p}");
-        assert!(p.contains("npm via nexus.internal"), "offline note must be appended: {p}");
+        assert!(
+            p.contains("## OFFLINE ENVIRONMENT:"),
+            "offline block header must appear: {p}"
+        );
+        assert!(
+            p.contains("npm via nexus.internal"),
+            "offline note must be appended: {p}"
+        );
         reset_offline_verdict_for_test();
     }
 
@@ -945,7 +1021,10 @@ mod tests {
     fn persona_includes_memory_guidance_when_enabled() {
         std::env::remove_var("ATOMCODE_MEMORY_TOOL");
         let p = coding_persona("glm-5.2", true, false);
-        assert!(p.contains("## MEMORY"), "memory guidance present when tool enabled");
+        assert!(
+            p.contains("## MEMORY"),
+            "memory guidance present when tool enabled"
+        );
     }
 
     #[test]
@@ -953,7 +1032,10 @@ mod tests {
     fn persona_omits_memory_guidance_when_env_off() {
         std::env::set_var("ATOMCODE_MEMORY_TOOL", "0");
         let p = coding_persona("glm-5.2", true, false);
-        assert!(!p.contains("## MEMORY"), "no memory guidance when tool disabled");
+        assert!(
+            !p.contains("## MEMORY"),
+            "no memory guidance when tool disabled"
+        );
         std::env::remove_var("ATOMCODE_MEMORY_TOOL");
     }
 

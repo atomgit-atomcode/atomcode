@@ -55,7 +55,12 @@ pub mod compaction;
 /// home for the rule (and for documenting its single known `sudo` divergence from
 /// production). Internal; compiled only when a feature that persists needs it.
 /// `provider` also needs it: the byte-level wire dump lands under `config_dir()/wire-dump`.
-#[cfg(any(feature = "mcp", feature = "session", feature = "memory", feature = "provider"))]
+#[cfg(any(
+    feature = "mcp",
+    feature = "session",
+    feature = "memory",
+    feature = "provider"
+))]
 pub(crate) mod paths;
 
 /// Shared L1 process utilities (console-window suppression, `shell_command`,
@@ -74,7 +79,12 @@ pub mod pathnorm;
 /// `core::proxy` (reads the process `ATOMCODE_PROXY_MODE` env) so native clients
 /// honor `no_proxy` without `capabilities` depending on `core`. Compiled
 /// whenever a reqwest-using capability is enabled.
-#[cfg(any(feature = "provider", feature = "web", feature = "atomgit", feature = "mcp"))]
+#[cfg(any(
+    feature = "provider",
+    feature = "web",
+    feature = "atomgit",
+    feature = "mcp"
+))]
 pub(crate) mod proxy;
 
 /// Ungated path helpers (leading-`~` expansion, home dir) shared by the `tools` and

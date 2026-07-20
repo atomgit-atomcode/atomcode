@@ -67,7 +67,10 @@ impl Tool for UseSkillTool {
                 if parsed.name.contains(':') {
                     None
                 } else {
-                    registry.get(&format!("skills:{}", crate::skill::normalize_skill_name(&parsed.name)))
+                    registry.get(&format!(
+                        "skills:{}",
+                        crate::skill::normalize_skill_name(&parsed.name)
+                    ))
                 }
             });
 

@@ -112,7 +112,11 @@ fn goal_row_parts(
     let marker = goal_marker(unicode);
     let m = elapsed_secs / 60;
     let s = elapsed_secs % 60;
-    let elapsed = if m == 0 { format!("{s}s") } else { format!("{m}m{s}s") };
+    let elapsed = if m == 0 {
+        format!("{s}s")
+    } else {
+        format!("{m}m{s}s")
+    };
     let icon_w = crate::width::display_width(marker);
     let meta = format!(" · round {round} · {elapsed}");
     let meta_w = crate::width::display_width(&meta);
@@ -171,7 +175,11 @@ fn loop_row_parts(
     let marker = loop_marker(unicode);
     let m = elapsed_secs / 60;
     let s = elapsed_secs % 60;
-    let elapsed = if m == 0 { format!("{s}s") } else { format!("{m}m{s}s") };
+    let elapsed = if m == 0 {
+        format!("{s}s")
+    } else {
+        format!("{m}m{s}s")
+    };
     let icon_w = crate::width::display_width(marker);
     let meta = format!(" · round {round} · {elapsed}");
     let meta_w = crate::width::display_width(&meta);
@@ -212,14 +220,20 @@ enum TodoPanelRow {
     /// A blank spacer row prepended before the Header to add visual breathing
     /// room between the transcript body and the todo panel.
     Spacer,
-    Header { completed: usize, in_progress: usize, total: usize },
+    Header {
+        completed: usize,
+        in_progress: usize,
+        total: usize,
+    },
     Item {
         /// 0-based position in the FULL todo list, rendered as `#{index+1}`.
         index: usize,
         status: atomcode_capabilities::tools::todo::TodoStatus,
         content: String,
     },
-    More { hidden: usize },
+    More {
+        hidden: usize,
+    },
 }
 
 /// Collapse a todo list into at most `max_rows` panel rows (incl. spacer + header).
@@ -241,9 +255,20 @@ fn todo_panel_rows(
     // too short to afford the cosmetic row (max_rows < 2) we drop it, so the
     // panel never emits more rows than max_rows.
     let mut rows = if max_rows >= 2 {
-        vec![TodoPanelRow::Spacer, TodoPanelRow::Header { completed, in_progress, total }]
+        vec![
+            TodoPanelRow::Spacer,
+            TodoPanelRow::Header {
+                completed,
+                in_progress,
+                total,
+            },
+        ]
     } else {
-        vec![TodoPanelRow::Header { completed, in_progress, total }]
+        vec![TodoPanelRow::Header {
+            completed,
+            in_progress,
+            total,
+        }]
     };
     // body_budget = whatever's left after the header (+ spacer when present).
     let body_budget = max_rows.saturating_sub(rows.len());
@@ -256,7 +281,11 @@ fn todo_panel_rows(
     // list overflows the budget do we fall through to the compact folded view.
     if items.len() <= body_budget {
         for (i, (status, content)) in items.iter().enumerate() {
-            rows.push(TodoPanelRow::Item { index: i, status: *status, content: content.clone() });
+            rows.push(TodoPanelRow::Item {
+                index: i,
+                status: *status,
+                content: content.clone(),
+            });
         }
         return rows;
     }
@@ -357,17 +386,29 @@ fn mascot_cell(top_c: Option<Color>, bot_c: Option<Color>) -> Cell {
         (None, None) => Cell::blank(),
         (Some(t), None) => Cell {
             ch: '▀',
-            style: CellStyle { fg: Some(t), bg: None, ..CellStyle::default() },
+            style: CellStyle {
+                fg: Some(t),
+                bg: None,
+                ..CellStyle::default()
+            },
             width: 1,
         },
         (None, Some(b)) => Cell {
             ch: '▄',
-            style: CellStyle { fg: Some(b), bg: None, ..CellStyle::default() },
+            style: CellStyle {
+                fg: Some(b),
+                bg: None,
+                ..CellStyle::default()
+            },
             width: 1,
         },
         (Some(t), Some(b)) => Cell {
             ch: '▀',
-            style: CellStyle { fg: Some(t), bg: Some(b), ..CellStyle::default() },
+            style: CellStyle {
+                fg: Some(t),
+                bg: Some(b),
+                ..CellStyle::default()
+            },
             width: 1,
         },
     }
@@ -926,7 +967,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .as_ref()
             .map(|m| {
                 let base = m.kind.max_visible_rows(h, m.items.len());
-                let has_hint = m.items.last().map(|(n, _)| n.starts_with('—') && n.ends_with('—')).unwrap_or(false);
+                let has_hint = m
+                    .items
+                    .last()
+                    .map(|(n, _)| n.starts_with('—') && n.ends_with('—'))
+                    .unwrap_or(false);
                 let extra = if m.kind == super::MenuKind::Marketplace
                     && m.items.iter().any(|(n, _)| n.starts_with("❯ "))
                 {
@@ -969,11 +1014,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Row 0 carries the `<prefix><Name>(` header. Budget the wrap width for
         // it; continuation lines only carry format_shell_command's 4-space
         // indent, so `cont_pad` re-aligns them under the command text on row 0.
-        let header_cols = crate::width::display_width(prefix)
-            + crate::width::display_width(safe_name)
-            + 1;
+        let header_cols =
+            crate::width::display_width(prefix) + crate::width::display_width(safe_name) + 1;
         let cont_pad = " ".repeat(header_cols.saturating_sub(4));
-        let width = (self.screen.width() as usize).saturating_sub(header_cols).max(8);
+        let width = (self.screen.width() as usize)
+            .saturating_sub(header_cols)
+            .max(8);
         // Display-only: shorten `$HOME/…` → `~/…` so long paths are less likely to
         // overflow the window (like the footer shows `~/…` for the cwd; best-effort —
         // no-op on Windows backslash/casing paths). The executed command and the
@@ -1093,10 +1139,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let mut new_rows = if safe_detail.is_empty() {
             // No detail: simple path — name + meta, all bold
             self.build_mixed_style_rows(
-                &prefix, &prefix_style,
-                &safe_name, &name_style,
-                "", &detail_style,
-                meta, &meta_style,
+                &prefix,
+                &prefix_style,
+                &safe_name,
+                &name_style,
+                "",
+                &detail_style,
+                meta,
+                &meta_style,
                 &safe_name,
             )
         } else if is_bash {
@@ -1106,11 +1156,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // spinner-styled row appended below (after the Ctrl+o hint), so the
             // command stays visually stable while the timer updates.
             self.build_bash_command_rows(
-                "● ", &prefix_style,
-                &safe_name, &name_style,
+                "● ",
+                &prefix_style,
+                &safe_name,
+                &name_style,
                 &detail_style,
                 &safe_detail,
-                "", &meta_style,
+                "",
+                &meta_style,
             )
         } else {
             // Note: full_body intentionally excludes `meta` —
@@ -1122,10 +1175,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let full_body = truncate_body_str(&full_body, 500);
             let detail_display = format!("({})", safe_detail);
             self.build_mixed_style_rows(
-                &prefix, &prefix_style,
-                &safe_name, &name_style,
-                &detail_display, &detail_style,
-                meta, &meta_style,
+                &prefix,
+                &prefix_style,
+                &safe_name,
+                &name_style,
+                &detail_display,
+                &detail_style,
+                meta,
+                &meta_style,
                 &full_body,
             )
         };
@@ -1141,10 +1198,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
             } else {
                 self.style_faint(Role::Muted)
             };
-            let marker = if self.caps.unicode_symbols { "\u{25cb}" } else { "o" };
+            let marker = if self.caps.unicode_symbols {
+                "\u{25cb}"
+            } else {
+                "o"
+            };
             let hint_text = format!("  {marker} {hint}");
             let screen_w = self.screen.width();
-            new_rows.push(build_one_row(&hint_text, &muted, screen_w, self.caps.unicode_symbols));
+            new_rows.push(build_one_row(
+                &hint_text,
+                &muted,
+                screen_w,
+                self.caps.unicode_symbols,
+            ));
         }
 
         // Bash carries its command as a static block above; the live liveness
@@ -1591,7 +1657,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     format!("  {}  {}", padded, desc)
                 }
             }
-            super::MenuKind::TwoColumn { row_prefix, selected_marker } => {
+            super::MenuKind::TwoColumn {
+                row_prefix,
+                selected_marker,
+            } => {
                 // Name left-aligned, desc right-aligned. Rows fill the
                 // full screen width so pad_row_to_width adds no trailing
                 // spaces.  Optional selected_marker (show marker + space
@@ -1623,7 +1692,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         let truncated = crate::width::truncate_to_width(&name, max_name);
                         let truncated_w = unicode_width::UnicodeWidthStr::width(truncated.as_str());
                         let rest = full_w.saturating_sub(indicator_w + truncated_w + sep + desc_w);
-                        format!("{}{}{}{}{}", indicator, truncated, " ".repeat(sep), desc, " ".repeat(rest))
+                        format!(
+                            "{}{}{}{}{}",
+                            indicator,
+                            truncated,
+                            " ".repeat(sep),
+                            desc,
+                            " ".repeat(rest)
+                        )
                     }
                 }
             }
@@ -1646,7 +1722,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         };
 
-        let is_plugin_mgr = matches!(kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
+        let is_plugin_mgr = matches!(
+            kind,
+            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+        );
         let mut style = if selected && !is_plugin_mgr {
             CellStyle {
                 fg: None,
@@ -1827,7 +1906,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             row1.push(Cell {
                 ch: ' ',
                 width: 1,
-                style: if selected { name_style.clone() } else { CellStyle::default() },
+                style: if selected {
+                    name_style.clone()
+                } else {
+                    CellStyle::default()
+                },
             });
         }
 
@@ -1878,7 +1961,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 row.push(Cell {
                     ch: ' ',
                     width: 1,
-                    style: if selected { style2.clone() } else { CellStyle::default() },
+                    style: if selected {
+                        style2.clone()
+                    } else {
+                        CellStyle::default()
+                    },
                 });
             }
             rows.push(row);
@@ -1950,7 +2037,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             });
         }
 
-        let line3_str = format!("  {} available • {} installed • Updated {}", available, installed, updated);
+        let line3_str = format!(
+            "  {} available • {} installed • Updated {}",
+            available, installed, updated
+        );
         let mut row3 = Vec::new();
         push_str_cells_sgr(&mut row3, &line3_str, style2.clone());
         let content_w3 = crate::width::display_width(&line3_str);
@@ -2055,13 +2145,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         if !status.cwd.is_empty() {
             let cwd_full = scrub_controls(&status.cwd);
-            let cwd_display = if cwd_budget > 0 && crate::width::display_width(&cwd_full) > cwd_budget {
-                crate::width::truncate_path(&cwd_full, cwd_budget)
-            } else if cwd_budget == 0 {
-                crate::width::truncate_path(&cwd_full, left_max)
-            } else {
-                cwd_full
-            };
+            let cwd_display =
+                if cwd_budget > 0 && crate::width::display_width(&cwd_full) > cwd_budget {
+                    crate::width::truncate_path(&cwd_full, cwd_budget)
+                } else if cwd_budget == 0 {
+                    crate::width::truncate_path(&cwd_full, left_max)
+                } else {
+                    cwd_full
+                };
             parts.push(cwd_display);
         }
         if !ctx_str.is_empty() {
@@ -2164,7 +2255,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Number of rows the todo panel will occupy — mirrors `build_todo_rows`'
     /// row count without building cells (used by the footer height math).
     fn todo_panel_row_count(&self, todo: &crate::render::TodoProgress) -> usize {
-        todo_panel_rows(&todo.items, todo.completed, todo.in_progress, todo.total, self.todo_panel_cap()).len()
+        todo_panel_rows(
+            &todo.items,
+            todo.completed,
+            todo.in_progress,
+            todo.total,
+            self.todo_panel_cap(),
+        )
+        .len()
     }
 
     /// Build the multi-line todo panel: a header row (`Tasks (N done, M open)`)
@@ -2179,7 +2277,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ) -> Vec<Vec<Cell>> {
         use atomcode_capabilities::tools::todo::TodoStatus;
         let unicode = self.caps.unicode_symbols;
-        let rows = todo_panel_rows(&todo.items, todo.completed, todo.in_progress, todo.total, self.todo_panel_cap());
+        let rows = todo_panel_rows(
+            &todo.items,
+            todo.completed,
+            todo.in_progress,
+            todo.total,
+            self.todo_panel_cap(),
+        );
         // Checkbox glyphs (Tasks-panel style): ☐ open, ✔ done. Emit the ASCII form
         // directly on non-unicode terminals so the cell backstop never has to guess.
         let open_glyph = if unicode { "\u{2610}" } else { "[ ]" };
@@ -2193,7 +2297,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let ellipsis = if unicode { "\u{2026}" } else { "..." };
 
         // An indented item line: `  <glyph> <content>` (content width-fitted).
-        let item_line = |glyph: &str, body: &str, glyph_style: &CellStyle, body_style: &CellStyle| -> Vec<Cell> {
+        let item_line = |glyph: &str,
+                         body: &str,
+                         glyph_style: &CellStyle,
+                         body_style: &CellStyle|
+         -> Vec<Cell> {
             let mut row = Vec::new();
             let gw = crate::width::display_width(glyph);
             let budget = rule_width.saturating_sub(2 + gw + 1); // indent + glyph + space
@@ -2209,7 +2317,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .map(|r| match r {
                 // Blank spacer: empty cell list — paint_footer pads it to width.
                 TodoPanelRow::Spacer => Vec::new(),
-                TodoPanelRow::Header { completed, in_progress, total } => {
+                TodoPanelRow::Header {
+                    completed,
+                    in_progress,
+                    total,
+                } => {
                     // `Tasks` in bold default fg, `(N done, M in progress, K open)` in
                     // detail colour (default fg, no bold) — the label is the anchor,
                     // the counts are subordinate metadata. English regardless of locale.
@@ -2218,24 +2330,44 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     // semantic changed when the header grew the `in progress` counter,
                     // so `open` now answers "how many haven't been touched yet".
                     let open = total.saturating_sub(completed + in_progress);
-                    let bold = CellStyle { bold: true, ..CellStyle::default() };
+                    let bold = CellStyle {
+                        bold: true,
+                        ..CellStyle::default()
+                    };
                     let detail = self.style_for(Role::Secondary);
                     let mut row = Vec::new();
                     push_str_cells(&mut row, "Tasks ", &bold);
-                    push_str_cells(&mut row, &format!("({completed} done, {in_progress} in progress, {open} open)"), &detail);
+                    push_str_cells(
+                        &mut row,
+                        &format!("({completed} done, {in_progress} in progress, {open} open)"),
+                        &detail,
+                    );
                     row
                 }
-                TodoPanelRow::Item { index, status, content } => {
+                TodoPanelRow::Item {
+                    index,
+                    status,
+                    content,
+                } => {
                     let (glyph, glyph_style, body_style) = match status {
                         // Brand magenta + bold for the filled checkbox; bold default fg for the text.
-                        TodoStatus::InProgress => {
-                            (filled_glyph,
-                             CellStyle { bold: true, ..self.style_for(Role::Brand) },
-                             CellStyle { bold: true, ..CellStyle::default() })
-                        }
+                        TodoStatus::InProgress => (
+                            filled_glyph,
+                            CellStyle {
+                                bold: true,
+                                ..self.style_for(Role::Brand)
+                            },
+                            CellStyle {
+                                bold: true,
+                                ..CellStyle::default()
+                            },
+                        ),
                         // Completed items are normally folded; render defensively if one slips through.
                         TodoStatus::Completed => {
-                            let s = CellStyle { faint: true, ..self.style_for(Role::Muted) };
+                            let s = CellStyle {
+                                faint: true,
+                                ..self.style_for(Role::Muted)
+                            };
                             (done_glyph, s.clone(), s)
                         }
                         // Pending items use the same colour as tool detail (default fg) so
@@ -2246,11 +2378,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             (open_glyph, s.clone(), s)
                         }
                     };
-                    item_line(glyph, &format!("#{}  {}", index + 1, content), &glyph_style, &body_style)
+                    item_line(
+                        glyph,
+                        &format!("#{}  {}", index + 1, content),
+                        &glyph_style,
+                        &body_style,
+                    )
                 }
                 TodoPanelRow::More { hidden } => {
                     // Fold indicator, not a task — no checkbox, just an indented muted+faint note.
-                    let style = CellStyle { faint: true, ..self.style_for(Role::Muted) };
+                    let style = CellStyle {
+                        faint: true,
+                        ..self.style_for(Role::Muted)
+                    };
                     let mut row = Vec::new();
                     push_str_cells(&mut row, &format!("  +{hidden} more{ellipsis}"), &style);
                     row
@@ -2294,11 +2434,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let tool_w = crate::width::display_width(&panel.tool);
             // Reserve for the localized frame ("Allow " + "(" + ")?") + the 2-col indent.
             let detail_budget = rule_width.saturating_sub(tool_w + 12);
-            let detail = crate::width::truncate_with_ellipsis(&scrub_controls(&panel.detail), detail_budget);
-            let raw = crate::i18n::t(crate::i18n::Msg::ApprovalHeader { tool: &panel.tool, detail: &detail });
+            let detail =
+                crate::width::truncate_with_ellipsis(&scrub_controls(&panel.detail), detail_budget);
+            let raw = crate::i18n::t(crate::i18n::Msg::ApprovalHeader {
+                tool: &panel.tool,
+                detail: &detail,
+            });
             let header = crate::glyph::downgrade_glyphs(&raw, unicode);
-            let header_trunc = crate::width::truncate_with_ellipsis(&header, rule_width.saturating_sub(2));
-            let style = CellStyle { bold: true, ..CellStyle::default() };
+            let header_trunc =
+                crate::width::truncate_with_ellipsis(&header, rule_width.saturating_sub(2));
+            let style = CellStyle {
+                bold: true,
+                ..CellStyle::default()
+            };
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &style);
             push_str_cells(&mut row, &header_trunc, &style);
@@ -2310,7 +2458,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let mut row = Vec::new();
             let selected = i == panel.selected;
             let marker = if selected {
-                if unicode { "\u{25b8} " } else { "> " } // ▸
+                if unicode {
+                    "\u{25b8} "
+                } else {
+                    "> "
+                } // ▸
             } else {
                 "  "
             };
@@ -2318,7 +2470,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let num_prefix = format!("{}. ", i + 1);
             let num_prefix_width = crate::width::display_width(&num_prefix);
             let style = if selected {
-                CellStyle { reverse: true, ..CellStyle::default() }
+                CellStyle {
+                    reverse: true,
+                    ..CellStyle::default()
+                }
             } else {
                 self.style_for(Role::Secondary)
             };
@@ -2370,7 +2525,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 // Each concrete option: 1 label row + (1 description row if present).
                 for (_, desc) in &panel.options {
                     n += 1;
-                    if desc.as_deref().map(|d| !d.trim().is_empty()).unwrap_or(false) {
+                    if desc
+                        .as_deref()
+                        .map(|d| !d.trim().is_empty())
+                        .unwrap_or(false)
+                    {
                         n += 1;
                     }
                 }
@@ -2413,8 +2572,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Emit a 2-space-indented styled text line, width-truncated.
         let push_line = |out: &mut Vec<Vec<Cell>>, text: &str, style: &CellStyle| {
             let raw = crate::glyph::downgrade_glyphs(text, unicode);
-            let body =
-                crate::width::truncate_with_ellipsis(&scrub_controls(&raw), rule_width.saturating_sub(2));
+            let body = crate::width::truncate_with_ellipsis(
+                &scrub_controls(&raw),
+                rule_width.saturating_sub(2),
+            );
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", style);
             push_str_cells(&mut row, &body, style);
@@ -2438,69 +2599,76 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let other_index = panel.options.len();
                 // Emit one navigable option row (label) + optional description.
                 // `number` is the 1-based display index; `label`/`desc` its text.
-                let emit_option =
-                    |out: &mut Vec<Vec<Cell>>,
-                     idx: usize,
-                     number: usize,
-                     label: &str,
-                     desc: Option<&str>,
-                     checked: bool| {
-                        let on_cursor = idx == panel.cursor;
-                        // Marker: `❯ ` on the cursor row, else two spaces.
-                        let marker = if on_cursor {
-                            if unicode { "\u{276f} " } else { "> " } // ❯
+                let emit_option = |out: &mut Vec<Vec<Cell>>,
+                                   idx: usize,
+                                   number: usize,
+                                   label: &str,
+                                   desc: Option<&str>,
+                                   checked: bool| {
+                    let on_cursor = idx == panel.cursor;
+                    // Marker: `❯ ` on the cursor row, else two spaces.
+                    let marker = if on_cursor {
+                        if unicode {
+                            "\u{276f} "
                         } else {
-                            "  "
-                        };
-                        // Multiple mode prepends a checkbox.
-                        let checkbox = if multiple {
-                            if checked { "[x] " } else { "[ ] " }
-                        } else {
-                            ""
-                        };
-                        let num = format!("{}. ", number);
-                        // Label emphasis: cursor row → bold orange (Plan).
-                        let label_style = if on_cursor {
-                            self.style_bold(Role::Plan)
-                        } else {
-                            self.style_for(Role::Secondary)
-                        };
-                        let chrome_style = if on_cursor {
-                            self.style_for(Role::Plan)
-                        } else {
-                            self.style_for(Role::Secondary)
-                        };
-                        let prefix_width = crate::width::display_width(marker)
-                            + crate::width::display_width(checkbox)
-                            + crate::width::display_width(&num);
-                        let budget = rule_width.saturating_sub(prefix_width);
-                        let lbl = crate::width::truncate_with_ellipsis(&scrub_controls(label), budget);
-                        let mut row = Vec::new();
-                        push_str_cells(&mut row, marker, &chrome_style);
-                        if multiple {
-                            push_str_cells(&mut row, checkbox, &chrome_style);
-                        }
-                        push_str_cells(&mut row, &num, &chrome_style);
-                        push_str_cells(&mut row, &lbl, &label_style);
-                        out.push(row);
-                        // Description: a faint second line, indented under the label.
-                        if let Some(d) = desc {
-                            let dtrim = d.trim();
-                            if !dtrim.is_empty() {
-                                let indent = " ".repeat(prefix_width);
-                                let dbudget = rule_width.saturating_sub(prefix_width);
-                                let draw = crate::glyph::downgrade_glyphs(dtrim, unicode);
-                                let dtext = crate::width::truncate_with_ellipsis(
-                                    &scrub_controls(&draw),
-                                    dbudget,
-                                );
-                                let mut drow = Vec::new();
-                                push_str_cells(&mut drow, &indent, &desc_style);
-                                push_str_cells(&mut drow, &dtext, &desc_style);
-                                out.push(drow);
-                            }
-                        }
+                            "> "
+                        } // ❯
+                    } else {
+                        "  "
                     };
+                    // Multiple mode prepends a checkbox.
+                    let checkbox = if multiple {
+                        if checked {
+                            "[x] "
+                        } else {
+                            "[ ] "
+                        }
+                    } else {
+                        ""
+                    };
+                    let num = format!("{}. ", number);
+                    // Label emphasis: cursor row → bold orange (Plan).
+                    let label_style = if on_cursor {
+                        self.style_bold(Role::Plan)
+                    } else {
+                        self.style_for(Role::Secondary)
+                    };
+                    let chrome_style = if on_cursor {
+                        self.style_for(Role::Plan)
+                    } else {
+                        self.style_for(Role::Secondary)
+                    };
+                    let prefix_width = crate::width::display_width(marker)
+                        + crate::width::display_width(checkbox)
+                        + crate::width::display_width(&num);
+                    let budget = rule_width.saturating_sub(prefix_width);
+                    let lbl = crate::width::truncate_with_ellipsis(&scrub_controls(label), budget);
+                    let mut row = Vec::new();
+                    push_str_cells(&mut row, marker, &chrome_style);
+                    if multiple {
+                        push_str_cells(&mut row, checkbox, &chrome_style);
+                    }
+                    push_str_cells(&mut row, &num, &chrome_style);
+                    push_str_cells(&mut row, &lbl, &label_style);
+                    out.push(row);
+                    // Description: a faint second line, indented under the label.
+                    if let Some(d) = desc {
+                        let dtrim = d.trim();
+                        if !dtrim.is_empty() {
+                            let indent = " ".repeat(prefix_width);
+                            let dbudget = rule_width.saturating_sub(prefix_width);
+                            let draw = crate::glyph::downgrade_glyphs(dtrim, unicode);
+                            let dtext = crate::width::truncate_with_ellipsis(
+                                &scrub_controls(&draw),
+                                dbudget,
+                            );
+                            let mut drow = Vec::new();
+                            push_str_cells(&mut drow, &indent, &desc_style);
+                            push_str_cells(&mut drow, &dtext, &desc_style);
+                            out.push(drow);
+                        }
+                    }
+                };
 
                 for (i, (label, desc)) in panel.options.iter().enumerate() {
                     let checked = panel.checked.get(i).copied().unwrap_or(false);
@@ -2519,12 +2687,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     // checked[other_index], so Enter on Other (a no-op) can never desync it.
                     let other_has_text = !panel.custom_text.trim().is_empty();
                     let marker = if on_cursor {
-                        if unicode { "\u{276f} " } else { "> " }
+                        if unicode {
+                            "\u{276f} "
+                        } else {
+                            "> "
+                        }
                     } else {
                         "  "
                     };
                     let checkbox = if multiple {
-                        if other_has_text { "[x] " } else { "[ ] " }
+                        if other_has_text {
+                            "[x] "
+                        } else {
+                            "[ ] "
+                        }
                     } else {
                         ""
                     };
@@ -2577,7 +2753,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             self.style_for(Role::Secondary)
                         };
                         // Reserve 1 column for the cursor glyph when on cursor.
-                        let text_budget = if on_cursor { budget.saturating_sub(1) } else { budget };
+                        let text_budget = if on_cursor {
+                            budget.saturating_sub(1)
+                        } else {
+                            budget
+                        };
                         let text = crate::width::truncate_with_ellipsis(
                             &scrub_controls(&panel.custom_text),
                             text_budget,
@@ -2596,11 +2776,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     let submit_index = other_index + 1;
                     let on_cursor = submit_index == panel.cursor;
                     let marker = if on_cursor {
-                        if unicode { "\u{276f} " } else { "> " }
+                        if unicode {
+                            "\u{276f} "
+                        } else {
+                            "> "
+                        }
                     } else {
                         "  "
                     };
-                    let submit_label = if unicode { "\u{2714} \u{63d0}\u{4ea4}" } else { "+ Submit" };
+                    let submit_label = if unicode {
+                        "\u{2714} \u{63d0}\u{4ea4}"
+                    } else {
+                        "+ Submit"
+                    };
                     let label_style = if on_cursor {
                         self.style_bold(Role::Plan)
                     } else {
@@ -2612,10 +2800,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         self.style_for(Role::Secondary)
                     };
                     let budget = rule_width.saturating_sub(crate::width::display_width(marker));
-                    let lbl = crate::width::truncate_with_ellipsis(
-                        &scrub_controls(submit_label),
-                        budget,
-                    );
+                    let lbl =
+                        crate::width::truncate_with_ellipsis(&scrub_controls(submit_label), budget);
                     let mut row = Vec::new();
                     push_str_cells(&mut row, marker, &chrome_style);
                     push_str_cells(&mut row, &lbl, &label_style);
@@ -2628,10 +2814,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 blank_row(&mut out);
                 push_line(&mut out, &panel.question, &self.style_bold(Role::Secondary));
                 blank_row(&mut out);
-                let style = CellStyle { reverse: true, ..CellStyle::default() };
+                let style = CellStyle {
+                    reverse: true,
+                    ..CellStyle::default()
+                };
                 let mut row = Vec::new();
                 let budget = rule_width.saturating_sub(2);
-                let buf = crate::width::truncate_with_ellipsis(&scrub_controls(&panel.text), budget);
+                let buf =
+                    crate::width::truncate_with_ellipsis(&scrub_controls(&panel.text), budget);
                 push_str_cells(&mut row, "> ", &style);
                 push_str_cells(&mut row, &buf, &style);
                 let current_width: usize = row.iter().map(|c| c.width as usize).sum();
@@ -2723,35 +2913,60 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         // Paginate menu using the kind-specific cap.
         let max_menu = self.max_menu_rows(h, 4);
-        let menu_kind = self
-            .menu
-            .as_ref()
-            .map(|m| m.kind)
-            .unwrap_or_default();
+        let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
         let (menu_items, selected_in_view, actual_offset) = if let Some(m) = self.menu.as_ref() {
             let len = m.items.len();
             if len == 0 {
                 (Vec::<(String, String)>::new(), None, 0)
-            } else if matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo) {
-                let header_h = if menu_kind == super::MenuKind::Plugin { 4 } else { 2 };
+            } else if matches!(
+                menu_kind,
+                super::MenuKind::Plugin
+                    | super::MenuKind::Marketplace
+                    | super::MenuKind::PluginInfo
+            ) {
+                let header_h = if menu_kind == super::MenuKind::Plugin {
+                    4
+                } else {
+                    2
+                };
                 if len < header_h {
-                    let sel = if m.selected < len { Some(m.selected) } else { None };
+                    let sel = if m.selected < len {
+                        Some(m.selected)
+                    } else {
+                        None
+                    };
                     (m.items.clone(), sel, 0)
                 } else {
-                    let has_hint = len > header_h && m.items[len - 1].0.starts_with('—') && m.items[len - 1].0.ends_with('—');
+                    let has_hint = len > header_h
+                        && m.items[len - 1].0.starts_with('—')
+                        && m.items[len - 1].0.ends_with('—');
                     let hint_h = if has_hint { 1 } else { 0 };
-                    let header_row_h = if menu_kind == super::MenuKind::Plugin { 6 } else { header_h };
+                    let header_row_h = if menu_kind == super::MenuKind::Plugin {
+                        6
+                    } else {
+                        header_h
+                    };
                     let budget = max_menu.saturating_sub(header_row_h + hint_h);
                     let mut offset = header_h;
                     let mut end = offset;
                     let mut height_sum = 0;
                     while end < len - hint_h {
-                        let item_h = if menu_kind == super::MenuKind::Plugin && end >= 4 && end < len - hint_h {
+                        let item_h = if menu_kind == super::MenuKind::Plugin
+                            && end >= 4
+                            && end < len - hint_h
+                        {
                             self.plugin_item_height(&m.items[end].1, rule_width)
-                        } else if menu_kind == super::MenuKind::Marketplace && end >= 2 && end < len - hint_h {
+                        } else if menu_kind == super::MenuKind::Marketplace
+                            && end >= 2
+                            && end < len - hint_h
+                        {
                             let orig_idx = end;
                             if orig_idx >= 3 && orig_idx < len - hint_h {
-                                if orig_idx % 2 == 0 { 3 } else { 1 }
+                                if orig_idx % 2 == 0 {
+                                    3
+                                } else {
+                                    1
+                                }
                             } else {
                                 1
                             }
@@ -2771,12 +2986,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             let mut h_sum = 0;
                             end = offset;
                             while end < len - hint_h {
-                                let item_h = if menu_kind == super::MenuKind::Plugin && end >= 4 && end < len - hint_h {
+                                let item_h = if menu_kind == super::MenuKind::Plugin
+                                    && end >= 4
+                                    && end < len - hint_h
+                                {
                                     self.plugin_item_height(&m.items[end].1, rule_width)
-                                } else if menu_kind == super::MenuKind::Marketplace && end >= 2 && end < len - hint_h {
+                                } else if menu_kind == super::MenuKind::Marketplace
+                                    && end >= 2
+                                    && end < len - hint_h
+                                {
                                     let orig_idx = end;
                                     if orig_idx >= 3 && orig_idx < len - hint_h {
-                                        if orig_idx % 2 == 0 { 3 } else { 1 }
+                                        if orig_idx % 2 == 0 {
+                                            3
+                                        } else {
+                                            1
+                                        }
                                     } else {
                                         1
                                     }
@@ -2813,7 +3038,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let mut height_sum = 0;
                 let mut end = 0;
                 while end < len {
-                    let item_h = if menu_kind == super::MenuKind::Plugin && end >= 2 && end < len.saturating_sub(1) {
+                    let item_h = if menu_kind == super::MenuKind::Plugin
+                        && end >= 2
+                        && end < len.saturating_sub(1)
+                    {
                         2
                     } else {
                         1
@@ -2831,7 +3059,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         let mut h_sum = 0;
                         end = offset;
                         while end < len {
-                            let item_h = if menu_kind == super::MenuKind::Plugin && end >= 2 && end < len.saturating_sub(1) {
+                            let item_h = if menu_kind == super::MenuKind::Plugin
+                                && end >= 2
+                                && end < len.saturating_sub(1)
+                            {
                                 2
                             } else {
                                 1
@@ -2860,38 +3091,61 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Spinner moved to body as a live paragraph row — footer no
         // longer reserves a spinner slot. Footer layout:
         //   top_rule / middle... / bot_rule / menu... / status
-        let has_hint_at_end = menu_items.last().map(|(n, _)| n.starts_with('—') && n.ends_with('—')).unwrap_or(false);
+        let has_hint_at_end = menu_items
+            .last()
+            .map(|(n, _)| n.starts_with('—') && n.ends_with('—'))
+            .unwrap_or(false);
         let menu_rows = if let Some(m) = self.menu.as_ref() {
-            let is_sticky = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
-            let mut sum = menu_items.iter().enumerate().map(|(i, _)| {
-                let orig_idx = if is_sticky {
-                    let header_h = if menu_kind == super::MenuKind::Plugin { 4 } else { 2 };
-                    if i < header_h {
-                        i
-                    } else if has_hint_at_end && i == menu_items.len() - 1 {
-                        m.items.len() - 1
+            let is_sticky = matches!(
+                menu_kind,
+                super::MenuKind::Plugin
+                    | super::MenuKind::Marketplace
+                    | super::MenuKind::PluginInfo
+            );
+            let mut sum = menu_items
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let orig_idx = if is_sticky {
+                        let header_h = if menu_kind == super::MenuKind::Plugin {
+                            4
+                        } else {
+                            2
+                        };
+                        if i < header_h {
+                            i
+                        } else if has_hint_at_end && i == menu_items.len() - 1 {
+                            m.items.len() - 1
+                        } else {
+                            actual_offset + (i - header_h)
+                        }
                     } else {
-                        actual_offset + (i - header_h)
-                    }
-                } else {
-                    actual_offset + i
-                };
-                if menu_kind == super::MenuKind::Marketplace && orig_idx >= 3 && orig_idx < m.items.len().saturating_sub(1) {
-                    if orig_idx % 2 == 0 {
+                        actual_offset + i
+                    };
+                    if menu_kind == super::MenuKind::Marketplace
+                        && orig_idx >= 3
+                        && orig_idx < m.items.len().saturating_sub(1)
+                    {
+                        if orig_idx % 2 == 0 {
+                            3
+                        } else {
+                            1
+                        }
+                    } else if menu_kind == super::MenuKind::Plugin && orig_idx == 2 {
                         3
+                    } else if menu_kind == super::MenuKind::Plugin
+                        && orig_idx >= 4
+                        && orig_idx < m.items.len().saturating_sub(1)
+                    {
+                        self.plugin_item_height(&m.items[orig_idx].1, rule_width)
                     } else {
                         1
                     }
-                } else if menu_kind == super::MenuKind::Plugin && orig_idx == 2 {
-                    3
-                } else if menu_kind == super::MenuKind::Plugin && orig_idx >= 4 && orig_idx < m.items.len().saturating_sub(1) {
-                    self.plugin_item_height(&m.items[orig_idx].1, rule_width)
-                } else {
-                    1
-                }
-            }).sum::<usize>();
+                })
+                .sum::<usize>();
             if has_hint_at_end {
-                let prev_is_empty = menu_items.len() > 1 && menu_items[menu_items.len() - 2].0.is_empty();
+                let prev_is_empty =
+                    menu_items.len() > 1 && menu_items[menu_items.len() - 2].0.is_empty();
                 if !prev_is_empty {
                     sum += 1;
                 }
@@ -2936,8 +3190,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // this is the backstop for the rest (unfolded single-line pastes,
         // sub-threshold pastes, typed text). The goal/loop + todo rows are folded
         // into the status-rows reservation so the input box height accounts for them.
-        let max_input_rows =
-            Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows + todo_rows + approval_rows);
+        let max_input_rows = Self::max_input_rows(
+            h,
+            attachment_rows,
+            menu_rows,
+            status_rows + goal_rows + todo_rows + approval_rows,
+        );
         let input_view_start = if lines.len() > max_input_rows {
             cursor_row_in_middle
                 .saturating_sub(max_input_rows.saturating_sub(1))
@@ -2950,10 +3208,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // When an approval panel is active, we replace the input box with the
         // approval panel (saves 2+ rows) and hide the status row.
         let approval_active = self.approval_active();
-        let hide_input_box = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
+        let hide_input_box = matches!(
+            menu_kind,
+            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+        );
         let is_add_url = hide_input_box
             && menu_kind == super::MenuKind::Marketplace
-            && self.menu.as_ref()
+            && self
+                .menu
+                .as_ref()
                 .and_then(|m| m.items.get(2))
                 .map(|(name, _)| name == "Add Marketplace")
                 .unwrap_or(false);
@@ -3027,17 +3290,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             Vec::new()
         };
-        let menu_kind = self
-            .menu
-            .as_ref()
-            .map(|m| m.kind)
-            .unwrap_or_default();
+        let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
         let mut menu_cells: Vec<Vec<Cell>> = Vec::new();
         let final_len = self.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
-        let is_sticky = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
+        let is_sticky = matches!(
+            menu_kind,
+            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+        );
         for (i, (name, desc)) in menu_items.iter().enumerate() {
             let orig_idx = if is_sticky {
-                let header_h = if menu_kind == super::MenuKind::Plugin { 4 } else { 2 };
+                let header_h = if menu_kind == super::MenuKind::Plugin {
+                    4
+                } else {
+                    2
+                };
                 if i < header_h {
                     i
                 } else if has_hint_at_end && i == menu_items.len() - 1 {
@@ -3058,9 +3324,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
             }
 
-            if menu_kind == super::MenuKind::Marketplace && !is_add_url && orig_idx >= 3 && orig_idx < final_len.saturating_sub(1) {
+            if menu_kind == super::MenuKind::Marketplace
+                && !is_add_url
+                && orig_idx >= 3
+                && orig_idx < final_len.saturating_sub(1)
+            {
                 if orig_idx % 2 == 0 {
-                    menu_cells.extend(self.build_marketplace_menu_rows(name, desc, selected, rule_width));
+                    menu_cells
+                        .extend(self.build_marketplace_menu_rows(name, desc, selected, rule_width));
                 } else {
                     menu_cells.push(Vec::new());
                 }
@@ -3166,7 +3437,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     });
                 }
                 menu_cells.push(bot_border);
-            } else if menu_kind == super::MenuKind::Plugin && orig_idx >= 4 && orig_idx < final_len.saturating_sub(1) {
+            } else if menu_kind == super::MenuKind::Plugin
+                && orig_idx >= 4
+                && orig_idx < final_len.saturating_sub(1)
+            {
                 menu_cells.extend(self.build_plugin_menu_rows(name, desc, selected, rule_width));
             } else {
                 let row = self.build_menu_row(name, desc, selected, rule_width, menu_kind);
@@ -3372,12 +3646,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         let menu_top = attach_top + attachment_rows;
         let is_search_box_focused = menu_kind == super::MenuKind::Plugin
-            && self.menu.as_ref().map(|m| m.selected == 2 && m.items.len() >= 3).unwrap_or(false);
+            && self
+                .menu
+                .as_ref()
+                .map(|m| m.selected == 2 && m.items.len() >= 3)
+                .unwrap_or(false);
         if is_add_url {
-            let input_row_idx = menu_cells.iter().position(|row| {
-                let text: String = row.iter().map(|c| c.ch).collect();
-                text.contains("❯ ")
-            }).unwrap_or(11);
+            let input_row_idx = menu_cells
+                .iter()
+                .position(|row| {
+                    let text: String = row.iter().map(|c| c.ch).collect();
+                    text.contains("❯ ")
+                })
+                .unwrap_or(11);
             let cursor_abs_row = (menu_top + input_row_idx + 1) as u16;
             let prefix = if self.input_buf.is_char_boundary(self.input_cursor_byte) {
                 &self.input_buf[..self.input_cursor_byte]
@@ -3389,7 +3670,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
         } else if is_search_box_focused {
             let cursor_abs_row = (menu_top + 3 + 1) as u16;
-            let query = self.menu.as_ref()
+            let query = self
+                .menu
+                .as_ref()
                 .and_then(|m| m.items.get(2))
                 .map(|(name, _)| name.clone())
                 .unwrap_or_default();
@@ -3496,11 +3779,31 @@ impl<W: Write + Send> RetainedRenderer<W> {
         hide_input_box: bool,
     ) -> usize {
         let approval_active = approval > 0;
-        let eff_middle   = if approval_active || hide_input_box { 0 } else { middle };
-        let eff_bot_rule = if approval_active || hide_input_box { 0 } else { 1 };
-        let eff_status   = if approval_active || hide_input_box { 0 } else { status };
+        let eff_middle = if approval_active || hide_input_box {
+            0
+        } else {
+            middle
+        };
+        let eff_bot_rule = if approval_active || hide_input_box {
+            0
+        } else {
+            1
+        };
+        let eff_status = if approval_active || hide_input_box {
+            0
+        } else {
+            status
+        };
         let eff_top_rule = 1;
-        eff_top_rule + eff_middle + eff_bot_rule + attachment + menu + goal + todo + approval + eff_status
+        eff_top_rule
+            + eff_middle
+            + eff_bot_rule
+            + attachment
+            + menu
+            + goal
+            + todo
+            + approval
+            + eff_status
     }
 
     /// Footer total height — mirrors the computation inside
@@ -3552,7 +3855,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // a live paragraph — see `push_or_update_live_spinner`.)
         // Delegates to footer_total_rows so both functions share one formula.
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
-        let hide_input_box = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
+        let hide_input_box = matches!(
+            menu_kind,
+            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+        );
         self.footer_total_rows(
             capped_middle,
             attachment_rows,
@@ -3570,7 +3876,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// and at least one body row — so the footer never exceeds the screen no
     /// matter how long the input is. Also capped to `MAX_INPUT_ROWS` so a huge
     /// paste can't take the whole screen on tall terminals.
-    fn max_input_rows(h: usize, attachment_rows: usize, menu_rows: usize, status_rows: usize) -> usize {
+    fn max_input_rows(
+        h: usize,
+        attachment_rows: usize,
+        menu_rows: usize,
+        status_rows: usize,
+    ) -> usize {
         // top rule + bot rule + chrome, plus one reserved body row.
         let reserved = 2 + attachment_rows + menu_rows + status_rows + 1;
         h.saturating_sub(reserved).min(MAX_INPUT_ROWS).max(1)
@@ -3579,7 +3890,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Bottom rule of the input box. When `hidden_rows > 0` (the input is
     /// scrolled), embed a muted `+N more lines` hint at the right so the user
     /// sees the content is hidden (still in `input_buf`), not lost.
-    fn build_input_bot_rule(&self, rule_width: usize, hidden_rows: usize, shell: bool) -> Vec<Cell> {
+    fn build_input_bot_rule(
+        &self,
+        rule_width: usize,
+        hidden_rows: usize,
+        shell: bool,
+    ) -> Vec<Cell> {
         let mut row = self.build_rule_row(rule_width, shell);
         if hidden_rows == 0 {
             return row;
@@ -3592,7 +3908,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let muted = self.style_for(Role::Muted);
         let start = rule_width - hint_chars.len();
         for (i, ch) in hint_chars.into_iter().enumerate() {
-            row[start + i] = Cell { ch, style: muted.clone(), width: 1 };
+            row[start + i] = Cell {
+                ch,
+                style: muted.clone(),
+                width: 1,
+            };
         }
         row
     }
@@ -3611,7 +3931,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // the combined frame. When modal_overlay is None this is a no-op.
         if let Some(ref overlay) = self.modal_overlay {
             for (dy, row) in overlay.cells.iter().enumerate() {
-                self.screen.draw_row(overlay.y as usize + dy, overlay.x as usize, row);
+                self.screen
+                    .draw_row(overlay.y as usize + dy, overlay.x as usize, row);
             }
         }
     }
@@ -3645,14 +3966,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Helper to build a full-width row padded with spaces.
         let build_row = |content: Vec<Cell>| -> Vec<Cell> {
             let mut row = Vec::with_capacity(win_w as usize);
-            row.push(Cell { ch: '│', style: border_style.clone(), width: 1 });
+            row.push(Cell {
+                ch: '│',
+                style: border_style.clone(),
+                width: 1,
+            });
             row.extend(content);
             let filled: usize = row.iter().map(|c| c.width as usize).sum();
             let pad = (win_w as usize).saturating_sub(filled).saturating_sub(1); // -1 for right border
             for _ in 0..pad {
                 row.push(Cell::blank());
             }
-            row.push(Cell { ch: '│', style: border_style.clone(), width: 1 });
+            row.push(Cell {
+                ch: '│',
+                style: border_style.clone(),
+                width: 1,
+            });
             row
         };
 
@@ -3679,7 +4008,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     '\t' => {
                         let n = crate::render::cell::SOFT_TAB_WIDTH.min(max_inner - used);
                         for _ in 0..n {
-                            out.push(Cell { ch: ' ', style: style.clone(), width: 1 });
+                            out.push(Cell {
+                                ch: ' ',
+                                style: style.clone(),
+                                width: 1,
+                            });
                         }
                         used += n;
                     }
@@ -3691,7 +4024,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         if used + w > max_inner {
                             break;
                         }
-                        out.push(Cell { ch, style: style.clone(), width: w as u8 });
+                        out.push(Cell {
+                            ch,
+                            style: style.clone(),
+                            width: w as u8,
+                        });
                         used += w;
                         for _ in 1..w {
                             out.push(Cell::continuation());
@@ -3705,11 +4042,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Top border: ┌─────┐
         {
             let mut row = Vec::with_capacity(win_w as usize);
-            row.push(Cell { ch: '┌', style: border_style.clone(), width: 1 });
+            row.push(Cell {
+                ch: '┌',
+                style: border_style.clone(),
+                width: 1,
+            });
             for _ in 0..(win_w as usize).saturating_sub(2) {
-                row.push(Cell { ch: '─', style: border_style.clone(), width: 1 });
+                row.push(Cell {
+                    ch: '─',
+                    style: border_style.clone(),
+                    width: 1,
+                });
             }
-            row.push(Cell { ch: '┐', style: border_style.clone(), width: 1 });
+            row.push(Cell {
+                ch: '┐',
+                style: border_style.clone(),
+                width: 1,
+            });
             cells.push(row);
         }
 
@@ -3725,11 +4074,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Separator line
         {
             let mut row = Vec::with_capacity(win_w as usize);
-            row.push(Cell { ch: '├', style: border_style.clone(), width: 1 });
+            row.push(Cell {
+                ch: '├',
+                style: border_style.clone(),
+                width: 1,
+            });
             for _ in 0..(win_w as usize).saturating_sub(2) {
-                row.push(Cell { ch: '─', style: border_style.clone(), width: 1 });
+                row.push(Cell {
+                    ch: '─',
+                    style: border_style.clone(),
+                    width: 1,
+                });
             }
-            row.push(Cell { ch: '┤', style: border_style.clone(), width: 1 });
+            row.push(Cell {
+                ch: '┤',
+                style: border_style.clone(),
+                width: 1,
+            });
             cells.push(row);
         }
 
@@ -3760,11 +4121,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Bottom border: └─────┘
         {
             let mut row = Vec::with_capacity(win_w as usize);
-            row.push(Cell { ch: '└', style: border_style.clone(), width: 1 });
+            row.push(Cell {
+                ch: '└',
+                style: border_style.clone(),
+                width: 1,
+            });
             for _ in 0..(win_w as usize).saturating_sub(2) {
-                row.push(Cell { ch: '─', style: border_style.clone(), width: 1 });
+                row.push(Cell {
+                    ch: '─',
+                    style: border_style.clone(),
+                    width: 1,
+                });
             }
-            row.push(Cell { ch: '┘', style: border_style.clone(), width: 1 });
+            row.push(Cell {
+                ch: '┘',
+                style: border_style.clone(),
+                width: 1,
+            });
             cells.push(row);
         }
 
@@ -3788,7 +4161,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let total = self.body_lines.len();
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
-        let hide_input_box = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
+        let hide_input_box = matches!(
+            menu_kind,
+            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+        );
         let has_trailing_empty = total > 0 && self.body_lines[total - 1].is_empty();
         let display_total = if hide_input_box && has_trailing_empty {
             total - 1
@@ -4230,10 +4606,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Called before any push in the render arm that starts a new message.
     fn mark_message(&mut self, kind: crate::render::MarkKind) {
         let line_idx = self.body_lines.len();
-        self.message_marks.push(crate::render::MessageMark {
-            line_idx,
-            kind,
-        });
+        self.message_marks
+            .push(crate::render::MessageMark { line_idx, kind });
     }
 
     /// Push or update the live spinner body row. On the first call of a
@@ -4368,10 +4742,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let name_style = self.style_bold(Role::ToolName);
                 let detail_style = self.style_for(Role::Secondary);
                 let rows = self.build_mixed_style_rows(
-                    "\u{25cf} ", &prefix_style,
-                    &safe_name, &name_style,
-                    &detail_str, &detail_style,
-                    "", &name_style,
+                    "\u{25cf} ",
+                    &prefix_style,
+                    &safe_name,
+                    &name_style,
+                    &detail_str,
+                    &detail_style,
+                    "",
+                    &name_style,
                     &body_str,
                 );
                 for row in rows {
@@ -4525,8 +4903,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body: &str,
         body_style: &CellStyle,
     ) {
-        let rows =
-            self.build_prefixed_rows(prefix, prefix_style, body, body_style, Some((cont_prefix, cont_style)));
+        let rows = self.build_prefixed_rows(
+            prefix,
+            prefix_style,
+            body,
+            body_style,
+            Some((cont_prefix, cont_style)),
+        );
         for row in rows {
             self.push_body_row(row);
         }
@@ -4711,10 +5094,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Write through `self.out` so the escape sequence stays ordered
         // with buffered body-content writes — avoids raw-stdout interleave
         // with the retained renderer's BufWriter.
-        let ok = crate::event_loop::commands::copy_text_to_clipboard_osc52_via(
-            &mut self.out,
-            &source,
-        );
+        let ok =
+            crate::event_loop::commands::copy_text_to_clipboard_osc52_via(&mut self.out, &source);
         // Only show the hint when the clipboard write actually succeeded
         // — a misleading "Copied" is worse than no hint (issue #699 P2).
         if !ok {
@@ -5014,7 +5395,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         // ---- Compose: two columns if wide enough, else stacked ----
         let gap = 4usize;
-        let left_w = if show_mascot { PAD_COL + mascot_w } else { PAD_COL };
+        let left_w = if show_mascot {
+            PAD_COL + mascot_w
+        } else {
+            PAD_COL
+        };
         let tips_col = left_w + gap;
         // Right-column width = the WIDEST tip row (cmd + padding + desc), not a
         // fixed guess. The tip rows aren't truncated, so two-column mode must
@@ -5237,7 +5622,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let safe = scrub_controls(&downgr);
         build_one_row(&safe, muted, screen_w, unicode)
     }
-
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -5442,7 +5826,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
 
             // ── body: tools & diffs ──
-            UiLine::ToolCallInFlight { id, name, detail, hint } => {
+            UiLine::ToolCallInFlight {
+                id,
+                name,
+                detail,
+                hint,
+            } => {
                 // Capture BEFORE the mark mutates the flag (mirrors the static
                 // ToolCall arm) so we can add one blank row of breathing room
                 // between assistant text and this tool.
@@ -5557,7 +5946,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     self.style_faint(Role::Muted)
                 };
                 let screen_w = self.screen.width();
-                let header_row = build_one_row(&header, &header_style, screen_w, self.caps.unicode_symbols);
+                let header_row =
+                    build_one_row(&header, &header_style, screen_w, self.caps.unicode_symbols);
                 self.push_body_row(header_row);
                 let header_idx = self.body_lines.len() - 1;
 
@@ -5664,7 +6054,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // bug as the header (see header_style comment above for
                 // the full rationale and screenshot).
                 let style = self.style_for(Role::Secondary);
-                let row = build_one_row(&text, &style, self.screen.width(), self.caps.unicode_symbols);
+                let row = build_one_row(
+                    &text,
+                    &style,
+                    self.screen.width(),
+                    self.caps.unicode_symbols,
+                );
                 self.push_body_row(row);
             }
             UiLine::ToolCall { name, detail } => {
@@ -5718,19 +6113,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     // header (also ●), matching Claude Code's single-glyph
                     // model for tool-call entries.
                     if safe_detail.is_empty() {
-                        self.push_body_prefixed(
-                            "● ",
-                            &bullet_style,
-                            &body_str,
-                            &tool_name_style,
-                        );
+                        self.push_body_prefixed("● ", &bullet_style, &body_str, &tool_name_style);
                     } else {
                         let detail_str = format!("({})", safe_detail);
                         let rows = self.build_mixed_style_rows(
-                            "● ", &bullet_style,
-                            &safe_name, &tool_name_style,
-                            &detail_str, &detail_style,
-                            "", &tool_name_style,
+                            "● ",
+                            &bullet_style,
+                            &safe_name,
+                            &tool_name_style,
+                            &detail_str,
+                            &detail_style,
+                            "",
+                            &tool_name_style,
                             &body_str,
                         );
                         for row in rows {
@@ -5811,8 +6205,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 };
                 // This handler builds cells directly (bypassing push_body_text), so
                 // downgrade the `✗` prefix + any glyphs in the summary here.
-                let body_str =
-                    crate::glyph::downgrade_glyphs(&body_str, self.caps.unicode_symbols).into_owned();
+                let body_str = crate::glyph::downgrade_glyphs(&body_str, self.caps.unicode_symbols)
+                    .into_owned();
                 // Align the `└` glyph with the `B` of the `Bash` (or
                 // any tool name) in the row above: the tool-call row is
                 // `● Bash(...)` with `●` at col 0 and the tool name at
@@ -5839,7 +6233,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // text stays aligned under the head text.
                 let mut first_visual = true;
                 // `└` leaf marker, gated for non-unicode terminals (→ ASCII backtick).
-                let leaf = if self.caps.unicode_symbols { "  \u{2514} " } else { "  ` " };
+                let leaf = if self.caps.unicode_symbols {
+                    "  \u{2514} "
+                } else {
+                    "  ` "
+                };
                 for (line_idx, phys) in body_str.split('\n').enumerate() {
                     // First physical line of a failure body is the
                     // header. Wrapped continuation chunks of that same
@@ -5906,8 +6304,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // this caps only the scrollback render. Separator/summary rows
                 // don't count toward the cap.
                 const MAX_DIFF_DISPLAY: usize = 25;
-                let content_total =
-                    entries.iter().filter(|e| e.kind != DiffKind::Separator).count();
+                let content_total = entries
+                    .iter()
+                    .filter(|e| e.kind != DiffKind::Separator)
+                    .count();
                 let ellipsis = if unicode { "\u{2026}" } else { "..." };
                 let mut shown = 0usize;
                 for entry in &entries {
@@ -5922,10 +6322,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     }
                     if shown >= MAX_DIFF_DISPLAY {
                         let more = content_total - shown;
-                        self.push_body_text(
-                            &format!("  {ellipsis} +{more} more lines"),
-                            &muted,
-                        );
+                        self.push_body_text(&format!("  {ellipsis} +{more} more lines"), &muted);
                         break;
                     }
                     let style = match entry.kind {
@@ -6001,7 +6398,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             UiLine::CommandOutput(text) => {
                 // If it's a subordinate command output (starts with "  ⎿" or "  └" or "  `" or "  \\"),
                 // pop the empty blank separator so it sits flush under the command!
-                let is_subordinate = text.starts_with("  ⎿") || text.starts_with("  └") || text.starts_with("  `") || text.starts_with("  \\");
+                let is_subordinate = text.starts_with("  ⎿")
+                    || text.starts_with("  └")
+                    || text.starts_with("  `")
+                    || text.starts_with("  \\");
                 if is_subordinate && self.body_lines.last().map_or(false, |r| r.is_empty()) {
                     crate::tuix_trace!(
                         "BPOP",
@@ -6015,8 +6415,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                         let seq = format!("\x1b[{};1H\x1b[K", bottom);
                         let _ = self.out.write_all(seq.as_bytes());
                     }
-                    self.skip_body_scroll_count =
-                        self.skip_body_scroll_count.saturating_add(1);
+                    self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
                 }
 
                 // CommandOutput is trusted internal text — let SGR
@@ -6064,8 +6463,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                         let seq = format!("\x1b[{};1H\x1b[K", bottom);
                         let _ = self.out.write_all(seq.as_bytes());
                     }
-                    self.skip_body_scroll_count =
-                        self.skip_body_scroll_count.saturating_add(1);
+                    self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
                 }
                 let body = format!("└ [Image #{}]", n);
                 self.push_body_text(&body, &self.style_for(Role::Muted));
@@ -6098,14 +6496,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 win_width,
                 win_height,
             } => {
-                self.modal_overlay = Some(self.build_modal_overlay(
-                    &title,
-                    &lines,
-                    scroll,
-                    total,
-                    win_width,
-                    win_height,
-                ));
+                self.modal_overlay = Some(
+                    self.build_modal_overlay(&title, &lines, scroll, total, win_width, win_height),
+                );
             }
             UiLine::ModalOverlayClear => {
                 self.modal_overlay = None;
@@ -6194,7 +6587,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     fn shutdown(&mut self) {
         // Disable mouse capture (button-event + SGR coordinates) so the
         // terminal returns to default mouse behavior when atomcode exits.
-        let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");        let _ = self.out.flush();
+        let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
+        let _ = self.out.flush();
         // Drain any pending frame before exit so the user sees the
         // latest widget state (typically a final prompt or an error
         // line) rather than a frame that dirty-flagged too late.
@@ -6268,8 +6662,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         seq.push_str("\x1b[H");
         let _ = self.out.write_all(seq.as_bytes());
-        self.screen =
-            Screen::new(self.screen.width(), self.screen.height()).with_jediterm(self.caps.jediterm);
+        self.screen = Screen::new(self.screen.width(), self.screen.height())
+            .with_jediterm(self.caps.jediterm);
         // Rebuilding `screen` dropped any suppression flag — re-apply it so a
         // `reset()` issued INSIDE a `begin_sync()` batch (the `/resume` replay)
         // keeps the next render_diff from emitting a nested DECSET 2026 envelope.
@@ -6368,22 +6762,22 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // SGR first, then button-event. Mouse mode must be off before
         // raw_mode is disabled, so the child process sees the terminal with
         // mouse disabled.
-        let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");        // Position cursor at the top of where the footer (input box +
-        // status + menu) used to be, then clear from there to end of
-        // screen. Without this, cursor stays wherever the last paint
-        // left it — usually inside the footer area — and the child's
-        // first stdout write lands ON TOP of footer rows, with later
-        // writes scrolling existing body content up through the
-        // overlap. Symptom: `/login`'s OAuth URL printed at row 1
-        // overlapping prior scrollback ("Press ESC to cancelh lines?"
-        // — our line glued onto an old conversation row).
-        //
-        // Sequence: release DECSTBM, CUP to (body_bottom+1, col 1),
-        // ED 0 (cursor → end of screen), enable autowrap. After this
-        // the child writes into a clean rectangle below the body,
-        // and as it produces more lines the terminal scrolls naturally
-        // (no scroll region active, autowrap on) — which is exactly
-        // the cooked-mode shell experience users expect.
+        let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l"); // Position cursor at the top of where the footer (input box +
+                                                               // status + menu) used to be, then clear from there to end of
+                                                               // screen. Without this, cursor stays wherever the last paint
+                                                               // left it — usually inside the footer area — and the child's
+                                                               // first stdout write lands ON TOP of footer rows, with later
+                                                               // writes scrolling existing body content up through the
+                                                               // overlap. Symptom: `/login`'s OAuth URL printed at row 1
+                                                               // overlapping prior scrollback ("Press ESC to cancelh lines?"
+                                                               // — our line glued onto an old conversation row).
+                                                               //
+                                                               // Sequence: release DECSTBM, CUP to (body_bottom+1, col 1),
+                                                               // ED 0 (cursor → end of screen), enable autowrap. After this
+                                                               // the child writes into a clean rectangle below the body,
+                                                               // and as it produces more lines the terminal scrolls naturally
+                                                               // (no scroll region active, autowrap on) — which is exactly
+                                                               // the cooked-mode shell experience users expect.
         let body_bottom = self.body_bottom_row();
         let position_row = body_bottom.saturating_add(1);
         let seq = format!("\x1b[r\x1b[{};1H\x1b[J\x1b[?7h", position_row);
@@ -6739,7 +7133,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         crate::tuix_trace!(
             "RSZ",
             "scrollback cleared (3J){}",
-            if self.body_log_truncated { " [log truncated: pre-eviction prefix dropped]" } else { "" }
+            if self.body_log_truncated {
+                " [log truncated: pre-eviction prefix dropped]"
+            } else {
+                ""
+            }
         );
         self.screen.resize(cols, rows);
         // `screen.resize` rebuilds the Screen (resetting `sync_suppressed`) —
@@ -6811,7 +7209,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.last_painted_footer_rows = self.current_footer_rows();
         self.dirty = false;
     }
-
 }
 
 impl<W: Write + Send> Drop for RetainedRenderer<W> {
@@ -6844,7 +7241,8 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
         // pushed is a harmless no-op (empty kitty stack).
         let _ = self
             .out
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");        let _ = self.out.flush();
+            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");
+        let _ = self.out.flush();
     }
 }
 
@@ -6950,7 +7348,10 @@ mod tests {
         let row = format_goal_row("重构 auth 模块直到测试全过", 3, 133, 80, true);
         assert!(row.starts_with("◎ "), "geometric marker present: {row}");
         assert!(!row.contains('🎯'), "must NOT use an emoji marker: {row}");
-        assert!(row.contains("重构 auth 模块直到测试全过"), "full condition kept: {row}");
+        assert!(
+            row.contains("重构 auth 模块直到测试全过"),
+            "full condition kept: {row}"
+        );
         assert!(row.contains("· round 3 ·"), "round shown: {row}");
         assert!(row.contains("2m13s"), "elapsed mm/ss: {row}");
     }
@@ -6961,8 +7362,14 @@ mod tests {
         // no emoji — a plain ASCII `*` marker, same gate as the spinner.
         let row = format_goal_row("ship it", 4, 7, 80, false);
         assert!(row.starts_with("* "), "ascii marker: {row}");
-        assert!(!row.contains('◎') && !row.contains('🎯'), "no non-ASCII glyph: {row}");
-        assert!(row.contains("· round 4 · 7s"), "round/elapsed intact: {row}");
+        assert!(
+            !row.contains('◎') && !row.contains('🎯'),
+            "no non-ASCII glyph: {row}"
+        );
+        assert!(
+            row.contains("· round 4 · 7s"),
+            "round/elapsed intact: {row}"
+        );
     }
 
     #[test]
@@ -6988,17 +7395,32 @@ mod tests {
     fn goal_row_truncates_long_condition_but_keeps_round_and_elapsed() {
         let cond = "a".repeat(200);
         let row = format_goal_row(&cond, 7, 5, 40, true);
-        assert!(crate::width::display_width(&row) <= 40, "row fits width: {row}");
-        assert!(row.contains("· round 7 · 5s"), "round/elapsed survive: {row}");
-        assert!(row.contains('…'), "condition truncated with ellipsis: {row}");
+        assert!(
+            crate::width::display_width(&row) <= 40,
+            "row fits width: {row}"
+        );
+        assert!(
+            row.contains("· round 7 · 5s"),
+            "round/elapsed survive: {row}"
+        );
+        assert!(
+            row.contains('…'),
+            "condition truncated with ellipsis: {row}"
+        );
     }
 
     #[test]
     fn goal_row_degrades_to_round_elapsed_when_too_narrow() {
         // No room for any condition → drop it, keep marker + round/elapsed.
         let row = format_goal_row("some long condition", 2, 9, 14, true);
-        assert!(crate::width::display_width(&row) <= 14, "row fits narrow width: {row}");
-        assert!(row.contains("round 2"), "round survives even when condition dropped: {row}");
+        assert!(
+            crate::width::display_width(&row) <= 14,
+            "row fits narrow width: {row}"
+        );
+        assert!(
+            row.contains("round 2"),
+            "round survives even when condition dropped: {row}"
+        );
     }
 
     #[test]
@@ -7007,7 +7429,10 @@ mod tests {
 
         assert!(row.starts_with("⚡ "), "lightning marker present: {row}");
         assert!(row.contains("检查构建状态"), "full label kept: {row}");
-        assert!(row.contains("· round 3 · 2m13s"), "round/elapsed shown: {row}");
+        assert!(
+            row.contains("· round 3 · 2m13s"),
+            "round/elapsed shown: {row}"
+        );
     }
 
     #[test]
@@ -7022,7 +7447,10 @@ mod tests {
     fn loop_row_truncates_label_without_dropping_metadata() {
         let row = format_loop_row(&"x".repeat(200), 7, 5, 40, true);
 
-        assert!(crate::width::display_width(&row) <= 40, "row fits width: {row}");
+        assert!(
+            crate::width::display_width(&row) <= 40,
+            "row fits width: {row}"
+        );
         assert!(row.contains("· round 7 · 5s"), "metadata survives: {row}");
         assert!(row.contains('…'), "label uses an ellipsis: {row}");
     }
@@ -7204,7 +7632,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/project/atomcode".into(),
             ctx_used: 0,
-                ctx_window: 0,
+            ctx_window: 0,
             hint: None,
             mode_indicator: None,
             bypass_indicator: None,
@@ -7227,9 +7655,10 @@ mod tests {
             assert_eq!(row.len(), crate::render::mascot::MASCOT_WIDTH);
         }
         // At least one orange half-block cell exists.
-        let has_orange = rows.iter().flatten().any(|c| {
-            c.ch == '▀' && c.style.fg == Some(crossterm::style::Color::AnsiValue(202))
-        });
+        let has_orange = rows
+            .iter()
+            .flatten()
+            .any(|c| c.ch == '▀' && c.style.fg == Some(crossterm::style::Color::AnsiValue(202)));
         assert!(has_orange, "mascot must contain orange ▀ cells");
     }
 
@@ -7246,7 +7675,10 @@ mod tests {
         md_theme::set_theme_mode(false); // dark → deterministic Role::Shell
         let shell_fg = role(r.caps, Role::Shell);
         let border_fg = role(r.caps, Role::Border);
-        assert_ne!(shell_fg, border_fg, "precondition: shell purple differs from border");
+        assert_ne!(
+            shell_fg, border_fg,
+            "precondition: shell purple differs from border"
+        );
 
         // Rule rows: purple in shell mode, border otherwise.
         let shell_rule = r.build_rule_row(40, true);
@@ -7266,18 +7698,31 @@ mod tests {
         let bang = mid.iter().find(|c| c.ch == '!').expect("leading ! present");
         assert_eq!(bang.style.fg, shell_fg, "leading ! painted shell purple");
         // The rest of the command keeps the default fg (not purple).
-        let s_cell = mid.iter().find(|c| c.ch == 's').expect("command char present");
-        assert_ne!(s_cell.style.fg, shell_fg, "only the ! is tinted, not the whole command");
+        let s_cell = mid
+            .iter()
+            .find(|c| c.ch == 's')
+            .expect("command char present");
+        assert_ne!(
+            s_cell.style.fg, shell_fg,
+            "only the ! is tinted, not the whole command"
+        );
 
         // Leading whitespace before the `!` (buffer `  !ls`) still tints the `!`
         // — `input_shell_mode` trims, so the box is purple; the `!` must match.
         let ws = r.build_middle_row("  !ls", true, true);
         let ws_bang = ws.iter().find(|c| c.ch == '!').expect("leading ! present");
-        assert_eq!(ws_bang.style.fg, shell_fg, "! after leading spaces still painted purple");
+        assert_eq!(
+            ws_bang.style.fg, shell_fg,
+            "! after leading spaces still painted purple"
+        );
 
         // Non-shell first row: chevron stays accent, no purple leak.
         let plain = r.build_middle_row("ls", true, false);
-        assert_eq!(plain[0].style.fg, role(r.caps, Role::Accent), "normal chevron stays accent");
+        assert_eq!(
+            plain[0].style.fg,
+            role(r.caps, Role::Accent),
+            "normal chevron stays accent"
+        );
         md_theme::set_theme_mode(false); // restore
     }
 
@@ -7296,7 +7741,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             ctx_used: 0,
-                ctx_window: 0,
+            ctx_window: 0,
             hint: None,
             mode_indicator: Some(ModeBadge {
                 label: "PLAN".into(),
@@ -7373,8 +7818,14 @@ mod tests {
             visible
         );
         // Badge cells are brand-purple, not the plan periwinkle / border cyan.
-        let first_glyph = row.iter().find(|c| c.ch != ' ').expect("badge glyph present");
-        assert_eq!(first_glyph.style.fg, shell_fg, "shell badge painted brand purple");
+        let first_glyph = row
+            .iter()
+            .find(|c| c.ch != ' ')
+            .expect("badge glyph present");
+        assert_eq!(
+            first_glyph.style.fg, shell_fg,
+            "shell badge painted brand purple"
+        );
         md_theme::set_theme_mode(false); // restore
     }
 
@@ -7478,7 +7929,10 @@ mod tests {
                 .iter()
                 .all(|c| c.style.fg == Some(crossterm::style::Color::AnsiValue(104))),
             "PLAN mode badge must use the mode purple AnsiValue(104); got: {:?}",
-            row[idx..idx + 4].iter().map(|c| c.style.fg).collect::<Vec<_>>()
+            row[idx..idx + 4]
+                .iter()
+                .map(|c| c.style.fg)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -7743,7 +8197,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
-                    kind: crate::render::MenuKind::SlashCommand,
+                kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
             attachments: Vec::new(),
@@ -7769,7 +8223,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
-                    kind: crate::render::MenuKind::SlashCommand,
+                kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
             attachments: Vec::new(),
@@ -8090,7 +8544,10 @@ mod tests {
     #[test]
     fn long_input_does_not_overflow_footer() {
         let (mut r, _c) = new_counting(80, 24);
-        let big = (0..60).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        let big = (0..60)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         r.input_buf = big.clone();
         r.input_cursor_byte = big.len();
         let footer = r.current_footer_rows();
@@ -8106,7 +8563,10 @@ mod tests {
         // A short input is unaffected.
         r.input_buf = "hi".into();
         r.input_cursor_byte = 2;
-        assert!(r.current_footer_rows() < footer, "short input should be smaller");
+        assert!(
+            r.current_footer_rows() < footer,
+            "short input should be smaller"
+        );
     }
 
     /// Regression: after a `/skills` menu containing CJK skill names/descs
@@ -8318,19 +8778,32 @@ mod tests {
 
         for i in 0..6 {
             r.push_body_text(&format!("start explore{i}"), &CellStyle::default());
-            assert_eq!(r.inflight_tool_rows, 0, "a body push must LIFT the live strip");
+            assert_eq!(
+                r.inflight_tool_rows, 0,
+                "a body push must LIFT the live strip"
+            );
             // Next spinner tick re-emits the strip at the new tail.
             r.render_inflight_tool("●", "Task", "5 subtasks", "");
         }
 
-        let strip_rows = r.body_lines.iter().filter(|row| text(row).contains("Task")).count();
-        assert_eq!(strip_rows, 1, "exactly ONE live Task strip — no trail; got {strip_rows}");
+        let strip_rows = r
+            .body_lines
+            .iter()
+            .filter(|row| text(row).contains("Task"))
+            .count();
+        assert_eq!(
+            strip_rows, 1,
+            "exactly ONE live Task strip — no trail; got {strip_rows}"
+        );
         let streamed = r
             .body_lines
             .iter()
             .filter(|row| text(row).contains("start explore"))
             .count();
-        assert_eq!(streamed, 6, "all six streamed lines present above the strip");
+        assert_eq!(
+            streamed, 6,
+            "all six streamed lines present above the strip"
+        );
     }
 
     #[test]
@@ -8344,7 +8817,10 @@ mod tests {
         r.push_body_text("real line A", &CellStyle::default());
         r.push_body_text("real line B", &CellStyle::default());
         assert_eq!(
-            r.body_lines.iter().filter(|row| text(row).contains("real line")).count(),
+            r.body_lines
+                .iter()
+                .filter(|row| text(row).contains("real line"))
+                .count(),
             2
         );
 
@@ -8358,11 +8834,18 @@ mod tests {
         // so use a multi-segment command rather than one long unbreakable token.
         let long = "cd /tmp && echo one && echo two && echo three && echo four";
         r.render_inflight_tool("\u{25cf}", "Bash", long, "");
-        assert!(r.inflight_tool_rows > 2, "wrapped strip should grow past 2 rows: {}", r.inflight_tool_rows);
+        assert!(
+            r.inflight_tool_rows > 2,
+            "wrapped strip should grow past 2 rows: {}",
+            r.inflight_tool_rows
+        );
 
         // Both real lines must survive — the fallback re-push must not have popped them.
         assert_eq!(
-            r.body_lines.iter().filter(|row| text(row).contains("real line")).count(),
+            r.body_lines
+                .iter()
+                .filter(|row| text(row).contains("real line"))
+                .count(),
             2,
             "fallback re-push popped real content via a stale inflight_tool_rows"
         );
@@ -8398,10 +8881,7 @@ mod tests {
         // First render: pushes scroll-style (prev_rows=0 → fallback path).
         r.render_inflight_tool("⠋", "bash", detail, "");
         let bytes_after_first = buf.lock().unwrap().len();
-        assert!(
-            bytes_after_first > 0,
-            "first render must emit some bytes"
-        );
+        assert!(bytes_after_first > 0, "first render must emit some bytes");
 
         // Drain so subsequent measurements are tick-only.
         buf.lock().unwrap().clear();
@@ -8761,7 +9241,10 @@ mod tests {
             detail: "cargo test".into(),
             hint: None,
         });
-        r.render(UiLine::Spinner { frame: "⠙".into(), label: "Running Bash".into() });
+        r.render(UiLine::Spinner {
+            frame: "⠙".into(),
+            label: "Running Bash".into(),
+        });
         r.flush_deferred();
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         drain_into_vterm(&buf, &mut vterm);
@@ -8795,7 +9278,10 @@ mod tests {
             detail: "cd /Users/theo/Documents/workspace/atomcode && cargo test -p atomcode-tuix --lib -- --nocapture 2>&1 | tail -200".into(),
             hint: None,
         });
-        r.render(UiLine::Spinner { frame: "⠙".into(), label: "Running Bash".into() });
+        r.render(UiLine::Spinner {
+            frame: "⠙".into(),
+            label: "Running Bash".into(),
+        });
         r.flush_deferred();
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         drain_into_vterm(&buf, &mut vterm);
@@ -8820,7 +9306,10 @@ mod tests {
         // model is corrupted). The double-remove truncates the sentinel out of
         // `body_lines`; a correct commit removes only the strip rows.
         let body_has_sentinel = r.body_lines.iter().any(|row| {
-            row.iter().map(|c| c.ch).collect::<String>().contains("SENTINEL_KEEP_ME")
+            row.iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .contains("SENTINEL_KEEP_ME")
         });
         assert!(
             body_has_sentinel,
@@ -9042,12 +9531,7 @@ mod tests {
         let bot_rule_row = (0..24usize)
             .rev()
             .find(|&r| (0..40usize).all(|c| vterm.cell_at(r, c).ch == '─'))
-            .unwrap_or_else(|| {
-                panic!(
-                    "no full-width rule row found; dump:\n{}",
-                    vterm.dump()
-                )
-            });
+            .unwrap_or_else(|| panic!("no full-width rule row found; dump:\n{}", vterm.dump()));
         for col in 0..40usize {
             let cell = vterm.cell_at(bot_rule_row, col);
             assert_eq!(
@@ -9149,7 +9633,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
-                    kind: crate::render::MenuKind::SlashCommand,
+                kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
             attachments: Vec::new(),
@@ -9358,7 +9842,8 @@ mod tests {
             vterm.dump()
         );
         assert_ne!(
-            alpha_row, omega_row,
+            alpha_row,
+            omega_row,
             "tokens landed on the same row at width 40 — line did not wrap, \
              so this test no longer exercises reflow\ndump:\n{}",
             vterm.dump()
@@ -9700,8 +10185,11 @@ mod tests {
         // Header row: `● bash(ls -la)` — command inline in parens, matching
         // other tools (`● Read(arg)`).
         assert!(
-            vterm.any_row(|row| row.contains("●") && row.contains("bash(") && row.contains("ls -la")),
-            "bash header row missing\ndump:\n{}", vterm.dump()
+            vterm.any_row(|row| row.contains("●")
+                && row.contains("bash(")
+                && row.contains("ls -la")),
+            "bash header row missing\ndump:\n{}",
+            vterm.dump()
         );
     }
 
@@ -9761,8 +10249,14 @@ mod tests {
         });
         let committed_row = inflight_r.body_lines.last().expect("committed tool row");
 
-        let static_bullet = static_row.iter().find(|c| c.ch == '●').expect("static bullet");
-        let committed_bullet = committed_row.iter().find(|c| c.ch == '●').expect("committed bullet");
+        let static_bullet = static_row
+            .iter()
+            .find(|c| c.ch == '●')
+            .expect("static bullet");
+        let committed_bullet = committed_row
+            .iter()
+            .find(|c| c.ch == '●')
+            .expect("committed bullet");
         assert_eq!(
             committed_bullet.style, static_bullet.style,
             "committed inflight bullet must match static ToolCall bullet style"
@@ -9799,29 +10293,52 @@ mod tests {
         let mut vterm = crate::test_term::VirtualTerminal::new(60, 24);
         r.render(UiLine::ToolCall {
             name: "Bash".into(),
-            detail: "cd /tmp && sed -i '' \\ -e 's/mb-2.5/mb-[10px]/g' \\ -e 's/mb-3.5/mb-[14px]/g'".into(),
+            detail:
+                "cd /tmp && sed -i '' \\ -e 's/mb-2.5/mb-[10px]/g' \\ -e 's/mb-3.5/mb-[14px]/g'"
+                    .into(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
         // Header row carries `● Bash(` plus the first command segment inline.
-        assert!(vterm.any_row(|row| row.contains("● Bash(") && row.contains("cd /tmp")),
-            "header is `● Bash(cd /tmp …` with inline paren command\ndump:\n{}", vterm.dump());
-        assert!(vterm.any_row(|row| row.contains("-e 's/mb-2.5/mb-[10px]/g'")),
-            "the -e segment stays intact on one row\ndump:\n{}", vterm.dump());
+        assert!(
+            vterm.any_row(|row| row.contains("● Bash(") && row.contains("cd /tmp")),
+            "header is `● Bash(cd /tmp …` with inline paren command\ndump:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("-e 's/mb-2.5/mb-[10px]/g'")),
+            "the -e segment stays intact on one row\ndump:\n{}",
+            vterm.dump()
+        );
         // Wrapping still breaks at `&&` (the second segment lands on its own row).
-        assert!(vterm.any_row(|row| row.trim_start().starts_with("&& sed")),
-            "shell boundary wrap at `&&` preserved\ndump:\n{}", vterm.dump());
+        assert!(
+            vterm.any_row(|row| row.trim_start().starts_with("&& sed")),
+            "shell boundary wrap at `&&` preserved\ndump:\n{}",
+            vterm.dump()
+        );
         // Closing paren terminates the command block.
-        assert!(vterm.any_row(|row| row.trim_end().ends_with(')')),
-            "command block closed with `)`\ndump:\n{}", vterm.dump());
-        assert!(!vterm.any_row(|row| row.contains("truncated")),
-            "no truncation\ndump:\n{}", vterm.dump());
+        assert!(
+            vterm.any_row(|row| row.trim_end().ends_with(')')),
+            "command block closed with `)`\ndump:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            !vterm.any_row(|row| row.contains("truncated")),
+            "no truncation\ndump:\n{}",
+            vterm.dump()
+        );
         // No NBSP sentinel should appear anywhere.
-        assert!(!vterm.any_row(|row| row.contains('\u{00A0}')),
-            "no NBSP sentinel expected in new layout\ndump:\n{}", vterm.dump());
+        assert!(
+            !vterm.any_row(|row| row.contains('\u{00A0}')),
+            "no NBSP sentinel expected in new layout\ndump:\n{}",
+            vterm.dump()
+        );
         // The command follows `● Bash(`, never flush at col 0.
-        assert!(!vterm.any_row(|row| row.starts_with("cd /tmp")),
-            "command must sit after the `● Bash(` prefix (not col 0)\ndump:\n{}", vterm.dump());
+        assert!(
+            !vterm.any_row(|row| row.starts_with("cd /tmp")),
+            "command must sit after the `● Bash(` prefix (not col 0)\ndump:\n{}",
+            vterm.dump()
+        );
     }
 
     /// Live bash committed via ToolCallInFlight → ToolCallCommit must produce
@@ -9840,18 +10357,37 @@ mod tests {
         });
         r.flush_deferred();
         // Commit (as ToolCallCommit would):
-        r.render(UiLine::ToolCallCommit { call_id: Some("call-1".into()) });
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-1".into()),
+        });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
         // Committed form is `● Bash(cmd)` inline, matching the static arm:
-        assert!(vterm.any_row(|row| row.contains("● Bash(") && row.contains("cd /tmp")),
-            "committed header is `● Bash(cd /tmp …`\ndump:\n{}", vterm.dump());
-        assert!(vterm.any_row(|row| row.contains("-e 's/cc/dd/g'")),
-            "wrapped segment survives\ndump:\n{}", vterm.dump());
-        assert!(!vterm.any_row(|row| row.contains("truncated")), "no (truncated)\ndump:\n{}", vterm.dump());
+        assert!(
+            vterm.any_row(|row| row.contains("● Bash(") && row.contains("cd /tmp")),
+            "committed header is `● Bash(cd /tmp …`\ndump:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("-e 's/cc/dd/g'")),
+            "wrapped segment survives\ndump:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            !vterm.any_row(|row| row.contains("truncated")),
+            "no (truncated)\ndump:\n{}",
+            vterm.dump()
+        );
         // No ghost/duplicate strip row lingering:
-        let bash_headers = (0..vterm.height() as usize).filter(|&i| vterm.row_text(i).contains("● Bash(")).count();
-        assert_eq!(bash_headers, 1, "exactly one ● Bash( header (no ghost)\ndump:\n{}", vterm.dump());
+        let bash_headers = (0..vterm.height() as usize)
+            .filter(|&i| vterm.row_text(i).contains("● Bash("))
+            .count();
+        assert_eq!(
+            bash_headers,
+            1,
+            "exactly one ● Bash( header (no ghost)\ndump:\n{}",
+            vterm.dump()
+        );
     }
 
     /// ToolResult success: `⎿ summary` + blank spacer; failure
@@ -9964,7 +10500,11 @@ mod tests {
         );
         let name_col = vterm.row_text(hdr_idx).find("ListDirectory").unwrap();
         let name_cell = vterm.cell_at(hdr_idx, name_col);
-        assert!(name_cell.bold, "tool name must be bold, got {:?}", name_cell);
+        assert!(
+            name_cell.bold,
+            "tool name must be bold, got {:?}",
+            name_cell
+        );
         assert!(
             !name_cell.faint,
             "tool name must NOT be faint, got {:?}",
@@ -10069,16 +10609,20 @@ mod tests {
             drain_into_vterm(&buf, &mut vterm);
 
             let tool_row = (0..vterm.height() as usize)
-                .find(|&i| {
-                    vterm.row_text(i).contains("●") && vterm.row_text(i).contains(tool_name)
-                })
+                .find(|&i| vterm.row_text(i).contains("●") && vterm.row_text(i).contains(tool_name))
                 .unwrap_or_else(|| {
-                    panic!("[{tool_name}] tool call row missing\ndump:\n{}", vterm.dump())
+                    panic!(
+                        "[{tool_name}] tool call row missing\ndump:\n{}",
+                        vterm.dump()
+                    )
                 });
             let result_row = (0..vterm.height() as usize)
                 .find(|&i| vterm.row_text(i).contains("└"))
                 .unwrap_or_else(|| {
-                    panic!("[{tool_name}] tool result row missing\ndump:\n{}", vterm.dump())
+                    panic!(
+                        "[{tool_name}] tool result row missing\ndump:\n{}",
+                        vterm.dump()
+                    )
                 });
 
             let first_char = tool_name.chars().next().unwrap();
@@ -10099,7 +10643,8 @@ mod tests {
                     )
                 });
             assert_eq!(
-                arrow_col, name_col,
+                arrow_col,
+                name_col,
                 "[{tool_name}] result '└' col {} must match tool name {:?} col {} \
                  (tool row: {:?}, result row: {:?})",
                 arrow_col,
@@ -10186,8 +10731,7 @@ mod tests {
         let (mut r, buf) = new_capturing(40, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(40, 24);
         let status = status_basic();
-        let long_summary =
-            "Created new file /tmp/atomcode-smoke-temp-check.txt (15 bytes, 1 line)";
+        let long_summary = "Created new file /tmp/atomcode-smoke-temp-check.txt (15 bytes, 1 line)";
         r.render(UiLine::ToolResult {
             success: true,
             summary: long_summary.into(),
@@ -10286,19 +10830,49 @@ mod tests {
         r.caps.colors = true;
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         r.render(UiLine::DiffBlock(vec![
-            DiffEntry { kind: DiffKind::Context, old_lineno: Some(9), new_lineno: Some(9), text: "keep".into() },
-            DiffEntry { kind: DiffKind::Del, old_lineno: Some(10), new_lineno: None, text: "old line".into() },
-            DiffEntry { kind: DiffKind::Add, old_lineno: None, new_lineno: Some(10), text: "new line".into() },
+            DiffEntry {
+                kind: DiffKind::Context,
+                old_lineno: Some(9),
+                new_lineno: Some(9),
+                text: "keep".into(),
+            },
+            DiffEntry {
+                kind: DiffKind::Del,
+                old_lineno: Some(10),
+                new_lineno: None,
+                text: "old line".into(),
+            },
+            DiffEntry {
+                kind: DiffKind::Add,
+                old_lineno: None,
+                new_lineno: Some(10),
+                text: "new line".into(),
+            },
         ]));
         r.render(UiLine::InputPrompt {
-            buf: String::new(), cursor_byte: 0, menu: None,
-            status: status_basic(), attachments: Vec::new(),
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        assert!(vterm.any_row(|row| row.contains("10 - old line")), "removed row w/ gutter\n{}", vterm.dump());
-        assert!(vterm.any_row(|row| row.contains("10 + new line")), "added row w/ gutter\n{}", vterm.dump());
-        assert!(vterm.any_row(|row| row.contains("9   keep")), "context row w/ gutter\n{}", vterm.dump());
+        assert!(
+            vterm.any_row(|row| row.contains("10 - old line")),
+            "removed row w/ gutter\n{}",
+            vterm.dump()
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("10 + new line")),
+            "added row w/ gutter\n{}",
+            vterm.dump()
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("9   keep")),
+            "context row w/ gutter\n{}",
+            vterm.dump()
+        );
     }
 
     /// TurnSeparator: blank + `──── Label ────` + blank. The rule
@@ -10475,7 +11049,9 @@ mod tests {
     fn retained_command_output_internal_newlines_split_into_rows() {
         let (mut r, _buf) = new_capturing(80, 24);
         let before = r.body_lines.len();
-        r.render(UiLine::CommandOutput("line one\nline two\nline three".into()));
+        r.render(UiLine::CommandOutput(
+            "line one\nline two\nline three".into(),
+        ));
         let pushed = r.body_lines.len() - before;
         assert_eq!(
             pushed, 3,
@@ -10702,7 +11278,10 @@ mod tests {
             .iter()
             .map(|row| row.iter().map(|c| c.ch).collect::<String>())
             .collect();
-        let write_rows = row_texts.iter().filter(|t| t.contains("WriteFile(test.txt)")).count();
+        let write_rows = row_texts
+            .iter()
+            .filter(|t| t.contains("WriteFile(test.txt)"))
+            .count();
 
         assert_eq!(
             write_rows, 1,
@@ -10746,7 +11325,10 @@ mod tests {
             .iter()
             .map(|row| row.iter().map(|c| c.ch).collect::<String>())
             .collect();
-        let write_rows = row_texts.iter().filter(|t| t.contains("WriteFile(test.txt)")).count();
+        let write_rows = row_texts
+            .iter()
+            .filter(|t| t.contains("WriteFile(test.txt)"))
+            .count();
 
         assert_eq!(
             write_rows, 1,
@@ -11537,7 +12119,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
-                    kind: crate::render::MenuKind::SlashCommand,
+                kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
             attachments: Vec::new(),
@@ -11566,7 +12148,8 @@ mod tests {
             .filter(|r| vterm.row_text(*r).contains("AtomCode"))
             .count();
         assert_eq!(
-            brand_rows, 1,
+            brand_rows,
+            1,
             "menu-close: welcome brand should appear exactly once \
              (got {}):\n{}",
             brand_rows,
@@ -11578,7 +12161,8 @@ mod tests {
             .filter(|r| vterm.row_text(*r).contains("∙ ~/project"))
             .count();
         assert_eq!(
-            cwd_rows, 1,
+            cwd_rows,
+            1,
             "menu-close: welcome cwd should appear exactly once \
              (got {}):\n{}",
             cwd_rows,
@@ -12065,7 +12649,11 @@ mod tests {
             "bash child must show `Bash cd /tmp`\ndump:\n{}",
             dump
         );
-        assert!(!dump.contains('$'), "no `$` prefix expected\ndump:\n{}", dump);
+        assert!(
+            !dump.contains('$'),
+            "no `$` prefix expected\ndump:\n{}",
+            dump
+        );
         assert!(
             !dump.contains("Bash("),
             "bash child must NOT wrap in Bash(...):\n{}",
@@ -12128,26 +12716,49 @@ mod tests {
         status.approval = Some(crate::render::ApprovalPanelView {
             tool: "Bash".into(),
             detail: "rm -rf build/".into(),
-            options: vec!["Allow once".into(), "Always allow Bash".into(), "Deny".into()],
+            options: vec![
+                "Allow once".into(),
+                "Always allow Bash".into(),
+                "Deny".into(),
+            ],
             selected: 0,
         });
         r.render(UiLine::InputPrompt {
-            buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
         let dump = vterm.dump();
         // Compact panel: only the selectable options (no header/detail/hint row).
-        assert!(vterm.any_row(|r| r.contains("Allow once")), "allow once row\n{dump}");
-        assert!(vterm.any_row(|r| r.contains("Always allow Bash")), "always row (carries tool name)\n{dump}");
+        assert!(
+            vterm.any_row(|r| r.contains("Allow once")),
+            "allow once row\n{dump}"
+        );
+        assert!(
+            vterm.any_row(|r| r.contains("Always allow Bash")),
+            "always row (carries tool name)\n{dump}"
+        );
         assert!(vterm.any_row(|r| r.contains("Deny")), "deny row\n{dump}");
-        assert!(vterm.any_row(|r| r.contains("▸") && r.contains("Allow once")), "selected marker on option 0\n{dump}");
+        assert!(
+            vterm.any_row(|r| r.contains("▸") && r.contains("Allow once")),
+            "selected marker on option 0\n{dump}"
+        );
         // The command detail IS now displayed in the panel header.
-        assert!(vterm.any_row(|r| r.contains("rm -rf build/")), "detail must be in the panel header\n{dump}");
+        assert!(
+            vterm.any_row(|r| r.contains("rm -rf build/")),
+            "detail must be in the panel header\n{dump}"
+        );
         // Panel renders BELOW the input box (chevron ❯).
         let h = vterm.height() as usize;
         let row_of = |n: &str| (0..h).find(|&i| vterm.row_text(i).contains(n));
-        assert!(row_of("Allow once") > row_of("❯"), "panel below input\n{dump}");
+        assert!(
+            row_of("Allow once") > row_of("❯"),
+            "panel below input\n{dump}"
+        );
     }
 
     // request_user_input panel: the question header + a mode-specific body
@@ -12187,22 +12798,56 @@ mod tests {
             );
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
-                buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
+                buf: String::new(),
+                cursor_byte: 0,
+                menu: None,
+                status,
+                attachments: Vec::new(),
             });
             r.flush_deferred();
             drain_into_vterm(&buf, &mut vterm);
             let dump = vterm.dump();
-            assert!(vterm.any_row(|r| r.contains("Library")), "header chip\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("Which library?")), "question\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("1. date-fns")), "numbered option 1\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("Tree-shakeable")), "description line rendered\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("2. Day.js")), "numbered option 2\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("\u{276f}") && r.contains("date-fns")), "cursor marker on option 1\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("3.") && r.contains("输")), "custom-answer row: number + faint placeholder (输入自己的答案…)\n{dump}");
-            assert!(!vterm.any_row(|r| r.contains("Other") || r.contains("Type a custom answer")), "no redundant 'Other' label/subtitle\n{dump}");
+            assert!(
+                vterm.any_row(|r| r.contains("Library")),
+                "header chip\n{dump}"
+            );
+            assert!(
+                vterm.any_row(|r| r.contains("Which library?")),
+                "question\n{dump}"
+            );
+            assert!(
+                vterm.any_row(|r| r.contains("1. date-fns")),
+                "numbered option 1\n{dump}"
+            );
+            assert!(
+                vterm.any_row(|r| r.contains("Tree-shakeable")),
+                "description line rendered\n{dump}"
+            );
+            assert!(
+                vterm.any_row(|r| r.contains("2. Day.js")),
+                "numbered option 2\n{dump}"
+            );
+            assert!(
+                vterm.any_row(|r| r.contains("\u{276f}") && r.contains("date-fns")),
+                "cursor marker on option 1\n{dump}"
+            );
+            assert!(
+                vterm.any_row(|r| r.contains("3.") && r.contains("输")),
+                "custom-answer row: number + faint placeholder (输入自己的答案…)\n{dump}"
+            );
+            assert!(
+                !vterm.any_row(|r| r.contains("Other") || r.contains("Type a custom answer")),
+                "no redundant 'Other' label/subtitle\n{dump}"
+            );
             // Single mode must NOT render a checkbox.
-            assert!(!vterm.any_row(|r| r.contains("[x]") || r.contains("[ ]")), "single must NOT render checkboxes\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("1-3 select")), "single hint\n{dump}");
+            assert!(
+                !vterm.any_row(|r| r.contains("[x]") || r.contains("[ ]")),
+                "single must NOT render checkboxes\n{dump}"
+            );
+            assert!(
+                vterm.any_row(|r| r.contains("1-3 select")),
+                "single hint\n{dump}"
+            );
         }
 
         // Multiple: checkbox prefixes reflect the `checked` flags; "Other" row
@@ -12233,23 +12878,45 @@ mod tests {
             );
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
-                buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
+                buf: String::new(),
+                cursor_byte: 0,
+                menu: None,
+                status,
+                attachments: Vec::new(),
             });
             r.flush_deferred();
             drain_into_vterm(&buf, &mut vterm);
             let dump = vterm.dump();
-            assert!(vterm.any_row(|r| r.contains("[x] 1. Streaming")), "Streaming checked\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("Token-by-token")), "description rendered\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("[ ] 2. Tool use")), "Tool use unchecked\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("[x] 3. Zig")), "custom-answer row: checkbox + number + typed text (no 'Other' word)\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("Zig")), "custom text shown\n{dump}");
+            assert!(
+                vterm.any_row(|r| r.contains("[x] 1. Streaming")),
+                "Streaming checked\n{dump}"
+            );
+            assert!(
+                vterm.any_row(|r| r.contains("Token-by-token")),
+                "description rendered\n{dump}"
+            );
+            assert!(
+                vterm.any_row(|r| r.contains("[ ] 2. Tool use")),
+                "Tool use unchecked\n{dump}"
+            );
+            assert!(
+                vterm.any_row(|r| r.contains("[x] 3. Zig")),
+                "custom-answer row: checkbox + number + typed text (no 'Other' word)\n{dump}"
+            );
+            assert!(
+                vterm.any_row(|r| r.contains("Zig")),
+                "custom text shown\n{dump}"
+            );
             // Multiple: Submit row after Other (unicode ✔ 提交).
             assert!(
                 vterm.any_row(|r| r.contains("\u{2714}") || r.contains("Submit")),
                 "Submit row must be rendered\n{dump}"
             );
             // Multiple hint no longer says "1-N toggle … Enter confirm" — it says Submit row confirms.
-            assert!(vterm.any_row(|r| r.contains("Space toggle")), "multiple hint Space toggle\n{dump}");
+            assert!(
+                vterm.any_row(|r| r.contains("Space toggle")),
+                "multiple hint Space toggle\n{dump}"
+            );
         }
 
         // Text: a `> {buffer}` input row shows the typed answer.
@@ -12277,13 +12944,23 @@ mod tests {
             );
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
-                buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
+                buf: String::new(),
+                cursor_byte: 0,
+                menu: None,
+                status,
+                attachments: Vec::new(),
             });
             r.flush_deferred();
             drain_into_vterm(&buf, &mut vterm);
             let dump = vterm.dump();
-            assert!(vterm.any_row(|r| r.contains("Project name?")), "question header\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("> atomcode")), "text input row\n{dump}");
+            assert!(
+                vterm.any_row(|r| r.contains("Project name?")),
+                "question header\n{dump}"
+            );
+            assert!(
+                vterm.any_row(|r| r.contains("> atomcode")),
+                "text input row\n{dump}"
+            );
         }
     }
 
@@ -12306,26 +12983,46 @@ mod tests {
         let panel = crate::render::ApprovalPanelView {
             tool: "Bash".into(),
             detail: "echo hi".into(),
-            options: vec!["Allow once".into(), "Always allow Bash".into(), "Deny".into()],
+            options: vec![
+                "Allow once".into(),
+                "Always allow Bash".into(),
+                "Deny".into(),
+            ],
             selected: 0,
         };
         status.approval = Some(panel.clone());
         r.render(UiLine::InputPrompt {
-            buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
         let dump = vterm.dump();
 
         // 1. Numbered prefixes appear.
-        assert!(vterm.any_row(|r| r.contains("1. ")), "option 0 prefix '1. '\n{dump}");
-        assert!(vterm.any_row(|r| r.contains("2. ")), "option 1 prefix '2. '\n{dump}");
-        assert!(vterm.any_row(|r| r.contains("3. ")), "option 2 prefix '3. '\n{dump}");
+        assert!(
+            vterm.any_row(|r| r.contains("1. ")),
+            "option 0 prefix '1. '\n{dump}"
+        );
+        assert!(
+            vterm.any_row(|r| r.contains("2. ")),
+            "option 1 prefix '2. '\n{dump}"
+        );
+        assert!(
+            vterm.any_row(|r| r.contains("3. ")),
+            "option 2 prefix '3. '\n{dump}"
+        );
 
         // 2. Selected row (option 0 / Allow once) spans full terminal width with
         //    reverse highlight. Find the row, then check every cell is reverse.
         let h = vterm.height() as usize;
-        let selected_row = (0..h).find(|&i| vterm.row_text(i).contains("1. ") && vterm.row_text(i).contains("Allow once"))
+        let selected_row = (0..h)
+            .find(|&i| {
+                vterm.row_text(i).contains("1. ") && vterm.row_text(i).contains("Allow once")
+            })
             .expect("selected row with '1. Allow once' not found");
         for col in 0..W as usize {
             let cell = vterm.cell_at(selected_row, col);
@@ -12337,8 +13034,12 @@ mod tests {
 
         // 3. Hint row present somewhere below the options.
         // The hint contains "select" (en locale) or "选择" (zh) or ASCII-downgraded equivalent.
-        let hint_present = vterm.any_row(|r| r.contains("select") || r.contains("选择") || r.contains("Enter"));
-        assert!(hint_present, "hint row with keyboard hint text not found\n{dump}");
+        let hint_present =
+            vterm.any_row(|r| r.contains("select") || r.contains("选择") || r.contains("Enter"));
+        assert!(
+            hint_present,
+            "hint row with keyboard hint text not found\n{dump}"
+        );
 
         // 4. Header row names what is being approved.
         assert!(
@@ -12365,26 +13066,70 @@ mod tests {
             tool: "bash".into(),
             detail: "cmd".into(),
             options: vec![
-                ApprovalOption { label: "Allow once".into(), kind: ApprovalKind::AllowOnce, accel: 'y' },
-                ApprovalOption { label: "Always allow bash".into(), kind: ApprovalKind::AlwaysAllow, accel: 'a' },
-                ApprovalOption { label: "Deny".into(), kind: ApprovalKind::Deny, accel: 'n' },
+                ApprovalOption {
+                    label: "Allow once".into(),
+                    kind: ApprovalKind::AllowOnce,
+                    accel: 'y',
+                },
+                ApprovalOption {
+                    label: "Always allow bash".into(),
+                    kind: ApprovalKind::AlwaysAllow,
+                    accel: 'a',
+                },
+                ApprovalOption {
+                    label: "Deny".into(),
+                    kind: ApprovalKind::Deny,
+                    accel: 'n',
+                },
             ],
             selected: 0,
             cache_key: String::new(),
         };
         // Digit routing: index = (c as usize) - ('1' as usize).
         // '1' → idx 0 → AllowOnce
-        assert_eq!(p.options.get(('1' as usize) - ('1' as usize)).map(|o| o.kind), Some(ApprovalKind::AllowOnce));
+        assert_eq!(
+            p.options
+                .get(('1' as usize) - ('1' as usize))
+                .map(|o| o.kind),
+            Some(ApprovalKind::AllowOnce)
+        );
         // '2' → idx 1 → AlwaysAllow
-        assert_eq!(p.options.get(('2' as usize) - ('1' as usize)).map(|o| o.kind), Some(ApprovalKind::AlwaysAllow));
+        assert_eq!(
+            p.options
+                .get(('2' as usize) - ('1' as usize))
+                .map(|o| o.kind),
+            Some(ApprovalKind::AlwaysAllow)
+        );
         // '3' → idx 2 → Deny
-        assert_eq!(p.options.get(('3' as usize) - ('1' as usize)).map(|o| o.kind), Some(ApprovalKind::Deny));
+        assert_eq!(
+            p.options
+                .get(('3' as usize) - ('1' as usize))
+                .map(|o| o.kind),
+            Some(ApprovalKind::Deny)
+        );
         // '9' → idx 8 → out of bounds → None (no panic)
-        assert_eq!(p.options.get(('9' as usize) - ('1' as usize)).map(|o| o.kind), None);
+        assert_eq!(
+            p.options
+                .get(('9' as usize) - ('1' as usize))
+                .map(|o| o.kind),
+            None
+        );
         // Letter accelerator still works (y/a/n).
-        assert_eq!(p.accel_index('y').and_then(|i| p.options.get(i).map(|o| o.kind)), Some(ApprovalKind::AllowOnce));
-        assert_eq!(p.accel_index('a').and_then(|i| p.options.get(i).map(|o| o.kind)), Some(ApprovalKind::AlwaysAllow));
-        assert_eq!(p.accel_index('n').and_then(|i| p.options.get(i).map(|o| o.kind)), Some(ApprovalKind::Deny));
+        assert_eq!(
+            p.accel_index('y')
+                .and_then(|i| p.options.get(i).map(|o| o.kind)),
+            Some(ApprovalKind::AllowOnce)
+        );
+        assert_eq!(
+            p.accel_index('a')
+                .and_then(|i| p.options.get(i).map(|o| o.kind)),
+            Some(ApprovalKind::AlwaysAllow)
+        );
+        assert_eq!(
+            p.accel_index('n')
+                .and_then(|i| p.options.get(i).map(|o| o.kind)),
+            Some(ApprovalKind::Deny)
+        );
     }
 
     /// `attachments` from `UiLine::InputPrompt` paints a `└ [Image #N]`
@@ -12550,7 +13295,8 @@ mod tests {
                         cell.style.fg,
                         Some(Color::DarkRed),
                         "cell '{}' in locked row must carry DarkRed fg, got {:?}",
-                        cell.ch, cell.style.fg,
+                        cell.ch,
+                        cell.style.fg,
                     );
                 }
                 found_red = true;
@@ -12644,7 +13390,10 @@ mod tests {
                 );
             }
         }
-        assert!(saw_chevron && saw_bar, "expected a chevron row and a bar continuation row");
+        assert!(
+            saw_chevron && saw_bar,
+            "expected a chevron row and a bar continuation row"
+        );
     }
 
     /// Windows / no-unicode-font terminals: the continuation bar falls back to an
@@ -12662,7 +13411,11 @@ mod tests {
             if text.contains("second line") {
                 saw_bar = true;
                 let bar = row.first().expect("continuation row must not be empty");
-                assert_eq!(bar.ch, '|', "ascii fallback bar must be '|', got {:?}", bar.ch);
+                assert_eq!(
+                    bar.ch, '|',
+                    "ascii fallback bar must be '|', got {:?}",
+                    bar.ch
+                );
             }
         }
         assert!(saw_bar, "expected a continuation row");
@@ -12719,7 +13472,9 @@ mod tests {
 
         // Check body_lines: there should be exactly one row with "● Bash"
         // and NO row with a spinner glyph (⠙ or similar Braille pattern).
-        let bash_rows: Vec<_> = r.body_lines.iter()
+        let bash_rows: Vec<_> = r
+            .body_lines
+            .iter()
             .enumerate()
             .filter(|(_, row)| {
                 let text: String = row.iter().map(|c| c.ch).collect();
@@ -12732,7 +13487,10 @@ mod tests {
             1,
             "there should be exactly 1 Bash row in body_lines, found {}:\n{:?}",
             bash_rows.len(),
-            bash_rows.iter().map(|(i, row)| (i, row.iter().map(|c| c.ch).collect::<String>())).collect::<Vec<_>>(),
+            bash_rows
+                .iter()
+                .map(|(i, row)| (i, row.iter().map(|c| c.ch).collect::<String>()))
+                .collect::<Vec<_>>(),
         );
 
         // The committed row should start with ● (U+25CF), not a spinner glyph.
@@ -12826,10 +13584,14 @@ mod tests {
         let plain = CellStyle::default();
         let detail = "(mod.rs, publish_service.rs, publish_service.rs, PublishSkill.tsx, skill.ts)";
         let rows = r.build_mixed_style_rows(
-            "◑ ", &plain,
-            "ParallelEditFiles", &plain,
-            detail, &plain,
-            " · 93.7s", &plain,
+            "◑ ",
+            &plain,
+            "ParallelEditFiles",
+            &plain,
+            detail,
+            &plain,
+            " · 93.7s",
+            &plain,
             &format!("ParallelEditFiles{detail}"),
         );
         let avail = 40usize - PAD_COL;
@@ -12837,7 +13599,10 @@ mod tests {
             let w: usize = row.iter().map(|c| c.width as usize).sum();
             assert!(w <= avail, "row width {w} exceeds avail {avail}: {row:?}");
         }
-        let all: String = rows.iter().flat_map(|row| row.iter().map(|c| c.ch)).collect();
+        let all: String = rows
+            .iter()
+            .flat_map(|row| row.iter().map(|c| c.ch))
+            .collect();
         assert!(
             all.contains("93.7s"),
             "duration must survive wrapping, got: {all:?}",
@@ -12878,7 +13643,11 @@ mod tests {
         // bright white (Color::White / SGR 97).
         let mut style = CellStyle::default();
         apply_sgr("37", &mut style);
-        assert_eq!(style.fg, Some(Color::Grey), "SGR 37 must map to Color::Grey");
+        assert_eq!(
+            style.fg,
+            Some(Color::Grey),
+            "SGR 37 must map to Color::Grey"
+        );
     }
 
     #[test]
@@ -12900,7 +13669,11 @@ mod tests {
         // spans stay coloured on white; the old parser dropped it → black.
         let mut style = CellStyle::default();
         apply_sgr("35", &mut style);
-        assert_eq!(style.fg, Some(Color::DarkMagenta), "SGR 35 must map to magenta");
+        assert_eq!(
+            style.fg,
+            Some(Color::DarkMagenta),
+            "SGR 35 must map to magenta"
+        );
     }
 
     #[test]
@@ -12924,7 +13697,12 @@ mod tests {
         for i in 0..5050 {
             r.render(UiLine::User(format!("line {}", i)));
         }
-        assert_eq!(r.body_lines.len(), 5000, "body_lines should cap at 5000, got {}", r.body_lines.len());
+        assert_eq!(
+            r.body_lines.len(),
+            5000,
+            "body_lines should cap at 5000, got {}",
+            r.body_lines.len()
+        );
     }
 
     #[test]
@@ -12947,7 +13725,10 @@ mod tests {
         }
         // 5010 / 2 = 2505 marks dropped; 5005 - 2505 = 2500 survive.
         assert_eq!(r.message_marks.len(), 2500);
-        assert_eq!(r.message_marks[0].line_idx, 0, "first surviving mark should point at body_lines[0] after drain");
+        assert_eq!(
+            r.message_marks[0].line_idx, 0,
+            "first surviving mark should point at body_lines[0] after drain"
+        );
     }
 
     #[test]
@@ -13001,8 +13782,16 @@ mod tests {
         r.suspend_for_external();
         let bytes = buf.lock().unwrap().clone();
         let s = String::from_utf8_lossy(&bytes);
-        assert!(s.contains("\x1b[?1006l"), "suspend must disable SGR: {:?}", s);
-        assert!(s.contains("\x1b[?1002l"), "suspend must disable button-event: {:?}", s);
+        assert!(
+            s.contains("\x1b[?1006l"),
+            "suspend must disable SGR: {:?}",
+            s
+        );
+        assert!(
+            s.contains("\x1b[?1002l"),
+            "suspend must disable button-event: {:?}",
+            s
+        );
     }
 
     #[test]
@@ -13060,8 +13849,16 @@ mod tests {
         r.shutdown();
         let bytes = buf.lock().unwrap().clone();
         let s = String::from_utf8_lossy(&bytes);
-        assert!(s.contains("\x1b[?1002l"), "shutdown must disable button-event: {:?}", s);
-        assert!(s.contains("\x1b[?1006l"), "shutdown must disable SGR coords: {:?}", s);
+        assert!(
+            s.contains("\x1b[?1002l"),
+            "shutdown must disable button-event: {:?}",
+            s
+        );
+        assert!(
+            s.contains("\x1b[?1006l"),
+            "shutdown must disable SGR coords: {:?}",
+            s
+        );
     }
 
     /// Pins the Issue-1 contract: when a mouse-wheel tick reaches
@@ -13101,7 +13898,8 @@ mod tests {
         r.scroll_body(1);
         let after = buf.lock().unwrap().len();
         assert_eq!(
-            before, after,
+            before,
+            after,
             "scroll_body must NOT write any bytes — wheel scroll belongs to the \
              terminal's native scrollback via Shift+wheel / Cmd+↑. Emitted {} \
              unexpected bytes.",
@@ -13299,10 +14097,7 @@ mod tests {
         let probe = "BULLET-FIRST-ZZZ";
         r.render(UiLine::AssistantText(format!("{}\n", probe)));
         for i in 0..(cap_small + 5) {
-            r.render(UiLine::AssistantText(format!(
-                "filler-bullet-{:03}\n",
-                i
-            )));
+            r.render(UiLine::AssistantText(format!("filler-bullet-{:03}\n", i)));
         }
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -13403,10 +14198,7 @@ mod tests {
         });
         // Push past the small cap to trigger several overflow LFs.
         for i in 0..(cap_small + 10) {
-            r.render(UiLine::AssistantText(format!(
-                "filler-bullet-{:03}\n",
-                i
-            )));
+            r.render(UiLine::AssistantText(format!("filler-bullet-{:03}\n", i)));
             if i % 3 == 0 {
                 r.render(UiLine::Spinner {
                     frame: "⠹".into(),
@@ -13771,9 +14563,18 @@ mod tests {
         //   "副本编辑成功、读回一致、删除 - PASS。\n\n步骤 7 - `search_replace`\n"
         // followed by a function-calling tool_call (no XML in text).
         let chunks = [
-            "副本", "编辑", "成功", "、读回", "一致",
-            "、删除 - ", "PASS", "。\n\n",
-            "步骤 7", " - ", "`search_replace`", "\n",
+            "副本",
+            "编辑",
+            "成功",
+            "、读回",
+            "一致",
+            "、删除 - ",
+            "PASS",
+            "。\n\n",
+            "步骤 7",
+            " - ",
+            "`search_replace`",
+            "\n",
         ];
         for (i, chunk) in chunks.iter().enumerate() {
             r.render(UiLine::AssistantText((*chunk).into()));
@@ -13821,7 +14622,9 @@ mod tests {
         r.render(UiLine::ToolCallCommit {
             call_id: Some("call-7".into()),
         });
-        r.render(UiLine::CommandOutput("wrote atomcode_smoke_replace.txt".into()));
+        r.render(UiLine::CommandOutput(
+            "wrote atomcode_smoke_replace.txt".into(),
+        ));
         r.flush_deferred();
 
         // Assert no two adjacent rows have identical non-blank content.
@@ -13880,10 +14683,14 @@ mod tests {
         r.flush_deferred();
 
         // Count rows before result (should be 1: the spinner)
-        let before = r.body_lines.iter().filter(|row| {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains("EditFile")
-        }).count();
+        let before = r
+            .body_lines
+            .iter()
+            .filter(|row| {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                text.contains("EditFile")
+            })
+            .count();
         eprintln!("EditFile rows before ToolCallResult: {}", before);
         assert_eq!(before, 1, "spinner row must exist before result");
 
@@ -13899,10 +14706,14 @@ mod tests {
         r.flush_deferred();
 
         // Count ● EditFile rows after result
-        let after = r.body_lines.iter().filter(|row| {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains("EditFile") && text.contains("●")
-        }).count();
+        let after = r
+            .body_lines
+            .iter()
+            .filter(|row| {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                text.contains("EditFile") && text.contains("●")
+            })
+            .count();
 
         eprintln!("Body lines after ToolCallResult:");
         for (i, row) in r.body_lines.iter().enumerate() {
@@ -13921,16 +14732,25 @@ mod tests {
         );
 
         // Verify the └ result row is immediately after the ● row
-        let tool_idx = r.body_lines.iter().rposition(|row| {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains("EditFile") && text.contains("●")
-        }).unwrap();
-        let result_idx = r.body_lines.iter().position(|row| {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains("Edited") && text.contains("replacement")
-        }).unwrap();
+        let tool_idx = r
+            .body_lines
+            .iter()
+            .rposition(|row| {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                text.contains("EditFile") && text.contains("●")
+            })
+            .unwrap();
+        let result_idx = r
+            .body_lines
+            .iter()
+            .position(|row| {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                text.contains("Edited") && text.contains("replacement")
+            })
+            .unwrap();
         assert_eq!(
-            result_idx, tool_idx + 1,
+            result_idx,
+            tool_idx + 1,
             "result row must be immediately after tool row, gap of {} rows",
             result_idx - tool_idx - 1
         );
@@ -13972,12 +14792,19 @@ mod tests {
         r.flush_deferred();
 
         // Count ● rows AFTER first commit (should be 1)
-        let mid = r.body_lines.iter().filter(|row| {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains("EditFile") && text.contains("●")
-        }).count();
+        let mid = r
+            .body_lines
+            .iter()
+            .filter(|row| {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                text.contains("EditFile") && text.contains("●")
+            })
+            .count();
         eprintln!("● EditFile rows after first ToolCallCommit: {}", mid);
-        assert_eq!(mid, 1, "First ToolCallCommit must produce exactly ONE ● EditFile row");
+        assert_eq!(
+            mid, 1,
+            "First ToolCallCommit must produce exactly ONE ● EditFile row"
+        );
 
         // Phase 3: ToolCallResult arrives
         // EXACT sequence from event loop: AssistantLineBreak + ToolCallCommit + ToolResult
@@ -14000,16 +14827,24 @@ mod tests {
         }
 
         // Count ● EditFile rows after ToolCallResult (must still be 1)
-        let after = r.body_lines.iter().filter(|row| {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains("EditFile") && text.contains("●")
-        }).count();
+        let after = r
+            .body_lines
+            .iter()
+            .filter(|row| {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                text.contains("EditFile") && text.contains("●")
+            })
+            .count();
 
         assert_eq!(
-            after, 1,
+            after,
+            1,
             "Full flow must produce exactly ONE ● EditFile row, got {}.\n{:?}",
             after,
-            r.body_lines.iter().map(|row| row.iter().map(|c| c.ch).collect::<String>()).collect::<Vec<_>>()
+            r.body_lines
+                .iter()
+                .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -14185,8 +15020,7 @@ mod tests {
         // side; pick a payload that lands a unique trailing marker near
         // the right edge so we can spot it later).
         let long_marker = "ENDMARKER";
-        let long_payload =
-            format!("write_file(/long/path/to/file.md) {}", long_marker);
+        let long_payload = format!("write_file(/long/path/to/file.md) {}", long_marker);
         // Sanity: ensure the payload fits in a single body row so we
         // don't accidentally land the marker on a wrapped second row.
         assert!(
@@ -14352,7 +15186,8 @@ mod tests {
         );
         let right_edge = vterm.cell_at(long_screen_row, (w - 5) as usize);
         assert_eq!(
-            right_edge.ch, ' ',
+            right_edge.ch,
+            ' ',
             "right-edge cell at row {} col {} should be blank, got {:?}\ndump:\n{}",
             long_screen_row,
             w - 5,
@@ -14448,7 +15283,8 @@ mod tests {
         // Also: cells past the short row's content should be SPACE.
         let cell_at_right_edge = vterm.cell_at(long_screen_row, (w - 5) as usize);
         assert_eq!(
-            cell_at_right_edge.ch, ' ',
+            cell_at_right_edge.ch,
+            ' ',
             "right-edge cell at row {} col {} should be blank, got {:?}\ndump:\n{}",
             long_screen_row,
             w - 5,
@@ -14657,8 +15493,7 @@ mod tests {
         let row = &lines[0];
 
         // Find the Number-token cells (chars '4' and '2').
-        let number_cells: Vec<&Cell> =
-            row.iter().filter(|c| c.ch == '4' || c.ch == '2').collect();
+        let number_cells: Vec<&Cell> = row.iter().filter(|c| c.ch == '4' || c.ch == '2').collect();
         assert_eq!(
             number_cells.len(),
             2,
@@ -14769,7 +15604,8 @@ mod tests {
         let occ_para = count("ENDPARA_UNIQUE");
         let occ_label = count("DONE_LABEL_UNIQUE");
         assert_eq!(
-            occ_para, 1,
+            occ_para,
+            1,
             "ENDPARA_UNIQUE must appear EXACTLY once after end-of-turn \
              overflow burst (found {}). Pre-fix this was 2 — the \
              overflow direct-write landed at row cap+1 (one below the \
@@ -14780,7 +15616,8 @@ mod tests {
             vterm.dump()
         );
         assert_eq!(
-            occ_label, 1,
+            occ_label,
+            1,
             "DONE_LABEL_UNIQUE must appear EXACTLY once after end-of-turn \
              overflow burst (found {}). See ENDPARA_UNIQUE assertion \
              above for the mechanism.\ndump:\n{}",
@@ -15244,9 +16081,10 @@ mod tests {
         // Bonus check: the row that actually contains the reasoning
         // text should mark its content cells with `faint = true` so
         // the visual dim style still renders.
-        let has_faint_text = r.body_lines.iter().any(|row| {
-            row.iter().any(|c| c.style.faint && c.ch != ' ')
-        });
+        let has_faint_text = r
+            .body_lines
+            .iter()
+            .any(|row| row.iter().any(|c| c.style.faint && c.ch != ' '));
         assert!(
             has_faint_text,
             "no faint reasoning cells found — the dim style was lost \
@@ -15262,18 +16100,30 @@ mod tests {
 
         // 1. Send text without a newline, it should be buffered and not render as a row yet.
         r.render(UiLine::ReasoningText("Step 1: thinking".into()));
-        assert_eq!(r.body_lines.len(), 0, "should buffer reasoning without newline");
+        assert_eq!(
+            r.body_lines.len(),
+            0,
+            "should buffer reasoning without newline"
+        );
 
         // 2. Send a newline, it should flush the complete line.
         r.render(UiLine::ReasoningText("\n".into()));
-        assert_eq!(r.body_lines.len(), 1, "should flush complete line on newline");
+        assert_eq!(
+            r.body_lines.len(),
+            1,
+            "should flush complete line on newline"
+        );
         assert!(r.body_lines[0].iter().any(|c| c.style.faint && c.ch == 'S'));
 
         // 3. Send more text, and then a TurnComplete. The remainder should flush.
         r.render(UiLine::ReasoningText("Step 2: almost done".into()));
         assert_eq!(r.body_lines.len(), 1, "remainder should stay buffered");
         r.render(UiLine::TurnComplete);
-        assert_eq!(r.body_lines.len(), 2, "remainder should flush on TurnComplete");
+        assert_eq!(
+            r.body_lines.len(),
+            2,
+            "remainder should flush on TurnComplete"
+        );
     }
 
     #[test]
@@ -15286,7 +16136,11 @@ mod tests {
         r.render(UiLine::CommandOutput("world\n".into()));
 
         // check body log
-        assert_eq!(r.body_log.len(), 1, "consecutive command outputs must be coalesced");
+        assert_eq!(
+            r.body_log.len(),
+            1,
+            "consecutive command outputs must be coalesced"
+        );
         if let UiLine::CommandOutput(text) = &r.body_log[0] {
             assert_eq!(text, "hello world\n");
         } else {
@@ -15501,7 +16355,8 @@ mod tests {
             let total = scrollback_count + visible_count;
             // Two /whoami invocations × 1 occurrence per line = 2.
             assert_eq!(
-                total, 2,
+                total,
+                2,
                 "line {:?} should appear exactly once after /whoami \
                  (visible={}, scrollback={})\n\nvisible grid:\n{}\n\n\
                  scrollback tail:\n{}",
@@ -15530,7 +16385,10 @@ mod tests {
         let mut vterm = crate::test_term::VirtualTerminal::new(60, 24);
         r.render(UiLine::AssistantText("refine spacing further now".into()));
         r.render(UiLine::AssistantLineBreak);
-        r.render(UiLine::ToolCall { name: "Bash".into(), detail: "ls".into() });
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: "ls".into(),
+        });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
         let rows: Vec<String> = (0..vterm.height() as usize)
@@ -15539,7 +16397,12 @@ mod tests {
         let text_idx = rows
             .iter()
             .position(|r| r.contains("refine spacing further"))
-            .unwrap_or_else(|| panic!("assistant text row not found\nvterm dump:\n{}", vterm.dump()));
+            .unwrap_or_else(|| {
+                panic!(
+                    "assistant text row not found\nvterm dump:\n{}",
+                    vterm.dump()
+                )
+            });
         let bash_idx = rows
             .iter()
             .position(|r| r.contains("● Bash"))
@@ -15550,7 +16413,9 @@ mod tests {
             vterm.dump()
         );
         assert!(
-            rows[text_idx + 1..bash_idx].iter().any(|r| r.trim().is_empty()),
+            rows[text_idx + 1..bash_idx]
+                .iter()
+                .any(|r| r.trim().is_empty()),
             "a blank row exists between them\n{}",
             vterm.dump()
         );
@@ -15563,10 +16428,19 @@ mod tests {
         let (mut r, buf) = new_capturing(60, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(60, 24);
         // First tool call + result (no assistant text in between)
-        r.render(UiLine::ToolCall { name: "Bash".into(), detail: "ls".into() });
-        r.render(UiLine::ToolResult { success: true, summary: "file.txt".into() });
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: "ls".into(),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "file.txt".into(),
+        });
         // Second tool call — previous mark was a ToolResult, NOT assistant text
-        r.render(UiLine::ToolCall { name: "Bash".into(), detail: "pwd".into() });
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: "pwd".into(),
+        });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
         let rows: Vec<String> = (0..vterm.height() as usize)
@@ -15579,7 +16453,12 @@ mod tests {
             .filter(|(_, r)| r.contains("● Bash"))
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(bash_positions.len(), 2, "expected two ● Bash rows\n{}", vterm.dump());
+        assert_eq!(
+            bash_positions.len(),
+            2,
+            "expected two ● Bash rows\n{}",
+            vterm.dump()
+        );
         let first_bash = bash_positions[0];
         let second_bash = bash_positions[1];
         // The rows between first_bash and second_bash (exclusive) should have
@@ -15616,7 +16495,11 @@ mod tests {
         status.approval = Some(crate::render::ApprovalPanelView {
             tool: "Bash".into(),
             detail: "rm -rf /tmp/x".into(),
-            options: vec!["Allow once".into(), "Always allow Bash (this session)".into(), "Deny".into()],
+            options: vec![
+                "Allow once".into(),
+                "Always allow Bash (this session)".into(),
+                "Deny".into(),
+            ],
             selected: 0,
         });
 
@@ -15636,22 +16519,47 @@ mod tests {
         // The input middle row contains "> " or "❯ " followed by input text.
         // We look for the typed text in the middle row specifically.
         let input_text_visible = vterm.any_row(|row| row.contains("some typed text"));
-        assert!(!input_text_visible, "input box middle row must be hidden during approval\n{dump}");
+        assert!(
+            !input_text_visible,
+            "input box middle row must be hidden during approval\n{dump}"
+        );
 
         // Status row (model name) must NOT appear.
         let status_visible = vterm.any_row(|row| row.contains("glm-5"));
-        assert!(!status_visible, "status row (model name 'glm-5') must be hidden during approval\n{dump}");
+        assert!(
+            !status_visible,
+            "status row (model name 'glm-5') must be hidden during approval\n{dump}"
+        );
 
         // Approval options MUST appear.
-        assert!(vterm.any_row(|row| row.contains("1. ")), "option 1 prefix must be on screen\n{dump}");
-        assert!(vterm.any_row(|row| row.contains("2. ")), "option 2 prefix must be on screen\n{dump}");
-        assert!(vterm.any_row(|row| row.contains("3. ")), "option 3 prefix must be on screen\n{dump}");
-        assert!(vterm.any_row(|row| row.contains("Allow once")), "Allow once must be on screen\n{dump}");
-        assert!(vterm.any_row(|row| row.contains("Deny")), "Deny must be on screen\n{dump}");
+        assert!(
+            vterm.any_row(|row| row.contains("1. ")),
+            "option 1 prefix must be on screen\n{dump}"
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("2. ")),
+            "option 2 prefix must be on screen\n{dump}"
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("3. ")),
+            "option 3 prefix must be on screen\n{dump}"
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("Allow once")),
+            "Allow once must be on screen\n{dump}"
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("Deny")),
+            "Deny must be on screen\n{dump}"
+        );
 
         // Hint row MUST appear.
-        let hint_visible = vterm.any_row(|row| row.contains("select") || row.contains("选择") || row.contains("Enter"));
-        assert!(hint_visible, "hint row with keyboard hint text must appear\n{dump}");
+        let hint_visible = vterm
+            .any_row(|row| row.contains("select") || row.contains("选择") || row.contains("Enter"));
+        assert!(
+            hint_visible,
+            "hint row with keyboard hint text must appear\n{dump}"
+        );
 
         // Exactly ONE horizontal rule above the first option row.
         // A rule row is a row where every non-space char is the rule char (─ or -).
@@ -15660,16 +16568,25 @@ mod tests {
         };
         let option1_row = row_of("1. ").expect("option 1 row must exist");
         // There should be a rule row at option1_row - 2 (since row - 1 is the header).
-        let row_above_header = option1_row.checked_sub(2).expect("option 1 must not be at row 0/1");
+        let row_above_header = option1_row
+            .checked_sub(2)
+            .expect("option 1 must not be at row 0/1");
         let rule_text = vterm.row_text(row_above_header);
-        let is_rule = !rule_text.trim().is_empty() && rule_text.chars().all(|c| c == '─' || c == '-' || c == ' ');
-        assert!(is_rule, "row above header must be a horizontal rule; got: {:?}\n{dump}", rule_text);
+        let is_rule = !rule_text.trim().is_empty()
+            && rule_text.chars().all(|c| c == '─' || c == '-' || c == ' ');
+        assert!(
+            is_rule,
+            "row above header must be a horizontal rule; got: {:?}\n{dump}",
+            rule_text
+        );
 
         // No second rule immediately above the rule row (no bot_rule).
         if let Some(two_above) = row_above_header.checked_sub(1) {
             let two_above_text = vterm.row_text(two_above);
             let is_also_rule = !two_above_text.trim().is_empty()
-                && two_above_text.chars().all(|c| c == '─' || c == '-' || c == ' ');
+                && two_above_text
+                    .chars()
+                    .all(|c| c == '─' || c == '-' || c == ' ');
             // two_above should NOT be a rule (would mean bot_rule still drawn)
             assert!(!is_also_rule,
                 "bot_rule must not appear during approval; row {} looks like a second rule: {:?}\n{dump}",
@@ -15701,13 +16618,22 @@ mod tests {
         let dump = vterm.dump();
 
         // Input box must be visible (the text we typed).
-        assert!(vterm.any_row(|row| row.contains("hello world")), "input text must appear without approval\n{dump}");
+        assert!(
+            vterm.any_row(|row| row.contains("hello world")),
+            "input text must appear without approval\n{dump}"
+        );
 
         // Status row (model name) must be visible.
-        assert!(vterm.any_row(|row| row.contains("glm-5")), "status row (model='glm-5') must appear without approval\n{dump}");
+        assert!(
+            vterm.any_row(|row| row.contains("glm-5")),
+            "status row (model='glm-5') must appear without approval\n{dump}"
+        );
 
         // No approval options.
-        assert!(!vterm.any_row(|row| row.contains("1. ")), "no option prefix without approval\n{dump}");
+        assert!(
+            !vterm.any_row(|row| row.contains("1. ")),
+            "no option prefix without approval\n{dump}"
+        );
     }
 
     /// The footer height reported by `current_footer_rows()` must equal the
@@ -15778,24 +16704,37 @@ mod tests {
         // Row 0 = top rule (─────…).
         let top_rule_row_text = vterm.row_text(0);
         let is_rule = !top_rule_row_text.trim().is_empty()
-            && top_rule_row_text.chars().all(|c| c == '─' || c == '-' || c == ' ');
-        assert!(is_rule,
+            && top_rule_row_text
+                .chars()
+                .all(|c| c == '─' || c == '-' || c == ' ');
+        assert!(
+            is_rule,
             "row 0 must be a top rule; got: {:?}",
-            top_rule_row_text);
+            top_rule_row_text
+        );
         // Row 1 = header row.
         let header_row = vterm.row_text(1);
-        assert!(header_row.contains("Allow"),
-            "row 1 must be the header row; got: {:?}", header_row);
+        assert!(
+            header_row.contains("Allow"),
+            "row 1 must be the header row; got: {:?}",
+            header_row
+        );
         // Row 2 = first approval option.
         let option_row = vterm.row_text(2);
-        assert!(option_row.contains("1. "),
-            "row 2 must be the first approval option; got: {:?}", option_row);
+        assert!(
+            option_row.contains("1. "),
+            "row 2 must be the first approval option; got: {:?}",
+            option_row
+        );
         // Rows 4..H-1 should be blank (no status, no input, no second rule).
         // Verify row expected_footer_rows (5) is blank — nothing leaked beyond the 5 footer rows.
         let row_after_footer = vterm.row_text(expected_footer_rows);
-        assert!(row_after_footer.trim().is_empty(),
+        assert!(
+            row_after_footer.trim().is_empty(),
             "row {} (just below footer) must be blank; got: {:?}",
-            expected_footer_rows, row_after_footer);
+            expected_footer_rows,
+            row_after_footer
+        );
     }
 
     // helper: collect body_lines chars, skipping wide-glyph continuation cells
@@ -15857,7 +16796,10 @@ mod tests {
         r.caps.jediterm = false;
         r.push_welcome("GLM-5.2", "~/proj");
         let text = body_text(&r);
-        assert!(!text.contains('▀'), "no mascot on a non-modern emulator (FinalShell-like)");
+        assert!(
+            !text.contains('▀'),
+            "no mascot on a non-modern emulator (FinalShell-like)"
+        );
         assert!(text.contains("/login"), "tips still present");
     }
 
@@ -15895,7 +16837,10 @@ mod tests {
             let rows = r.build_welcome_rows("GLM-5.2", "~/some/project/path", &[0, 1, 2, 3]);
             for (i, row) in rows.iter().enumerate() {
                 let rw: usize = row.iter().map(|c| c.width as usize).sum();
-                assert!(rw <= w, "width {w}: welcome row {i} is {rw} cols (> {w}) — would wrap");
+                assert!(
+                    rw <= w,
+                    "width {w}: welcome row {i} is {rw} cols (> {w}) — would wrap"
+                );
             }
         }
     }
@@ -15925,8 +16870,14 @@ mod tests {
         let before = tip_cmds(&r);
         r.reflow_body_to_current_width();
         let after = tip_cmds(&r);
-        assert_eq!(before, after, "resize (body_log replay) must not re-roll tips");
-        assert!(before.iter().any(|c| c == "/login"), "pinned /login present");
+        assert_eq!(
+            before, after,
+            "resize (body_log replay) must not re-roll tips"
+        );
+        assert!(
+            before.iter().any(|c| c == "/login"),
+            "pinned /login present"
+        );
     }
 
     /// A cell whose TOP pixel is transparent but bottom is coloured must use the
@@ -15942,8 +16893,14 @@ mod tests {
         // pixel MUST render as lower-half `▄` (colour on fg), never `▀` with a
         // None fg (which paints the top half in the default fg — the dark-bar bug).
         let c = mascot_cell(None, orange);
-        assert_eq!(c.ch, '\u{2584}', "transparent-top pixel must render as lower-half '▄'");
-        assert!(c.style.fg.is_some(), "'▄' carries the bottom colour on its fg");
+        assert_eq!(
+            c.ch, '\u{2584}',
+            "transparent-top pixel must render as lower-half '▄'"
+        );
+        assert!(
+            c.style.fg.is_some(),
+            "'▄' carries the bottom colour on its fg"
+        );
         assert_eq!(mascot_cell(orange, None).ch, '\u{2580}'); // top-only → '▀'
         assert_eq!(mascot_cell(orange, orange).ch, '\u{2580}'); // both → '▀' + bg
         assert_eq!(mascot_cell(None, None), Cell::blank()); // both transparent → blank
@@ -15969,9 +16926,15 @@ mod tests {
         r.caps.unicode_symbols = false;
         r.push_welcome("GLM-5.2", "~/proj");
         let text = body_text(&r);
-        assert!(!text.contains('#'), "mascot must be omitted, not '#'-downgraded");
+        assert!(
+            !text.contains('#'),
+            "mascot must be omitted, not '#'-downgraded"
+        );
         assert!(!text.contains('\u{2580}') && !text.contains('\u{2584}'));
-        assert!(text.contains("/login"), "tips still present without a mascot");
+        assert!(
+            text.contains("/login"),
+            "tips still present without a mascot"
+        );
     }
 
     /// When the tips column is TALLER than the mascot (e.g. the 4-row mascot vs
@@ -15989,7 +16952,12 @@ mod tests {
         let cwd_row: String = r
             .body_lines
             .iter()
-            .find(|row| row.iter().map(|c| c.ch).collect::<String>().contains("proj"))
+            .find(|row| {
+                row.iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .contains("proj")
+            })
             .expect("cwd row present")
             .iter()
             .map(|c| c.ch)
@@ -16040,10 +17008,23 @@ mod todo_panel_rows_tests {
         // real status (no fold): [Spacer, Header, Completed, InProgress, Pending] = 5 rows.
         assert_eq!(rows.len(), 5);
         assert!(matches!(rows[0], TodoPanelRow::Spacer));
-        assert!(matches!(rows[1], TodoPanelRow::Header { completed: 1, in_progress: 1, total: 3 }));
-        assert!(matches!(&rows[2], TodoPanelRow::Item { index: 0, status: TodoStatus::Completed, content, .. } if content == "a"));
-        assert!(matches!(&rows[3], TodoPanelRow::Item { index: 1, status: TodoStatus::InProgress, content, .. } if content == "b"));
-        assert!(matches!(&rows[4], TodoPanelRow::Item { index: 2, status: TodoStatus::Pending, content, .. } if content == "c"));
+        assert!(matches!(
+            rows[1],
+            TodoPanelRow::Header {
+                completed: 1,
+                in_progress: 1,
+                total: 3
+            }
+        ));
+        assert!(
+            matches!(&rows[2], TodoPanelRow::Item { index: 0, status: TodoStatus::Completed, content, .. } if content == "a")
+        );
+        assert!(
+            matches!(&rows[3], TodoPanelRow::Item { index: 1, status: TodoStatus::InProgress, content, .. } if content == "b")
+        );
+        assert!(
+            matches!(&rows[4], TodoPanelRow::Item { index: 2, status: TodoStatus::Pending, content, .. } if content == "c")
+        );
     }
 
     #[test]
@@ -16051,8 +17032,20 @@ mod todo_panel_rows_tests {
         let it = items(&[(TodoStatus::InProgress, "b"), (TodoStatus::Pending, "c")]);
         let rows = todo_panel_rows(&it, 0, 1, 2, MAX_TODO_PANEL_ROWS);
         // Both items fit → shown individually (in-progress + pending), no More.
-        assert!(rows.iter().any(|r| matches!(r, TodoPanelRow::Item { status: TodoStatus::InProgress, .. })));
-        assert!(rows.iter().any(|r| matches!(r, TodoPanelRow::Item { status: TodoStatus::Pending, .. })));
+        assert!(rows.iter().any(|r| matches!(
+            r,
+            TodoPanelRow::Item {
+                status: TodoStatus::InProgress,
+                ..
+            }
+        )));
+        assert!(rows.iter().any(|r| matches!(
+            r,
+            TodoPanelRow::Item {
+                status: TodoStatus::Pending,
+                ..
+            }
+        )));
         assert!(!rows.iter().any(|r| matches!(r, TodoPanelRow::More { .. })));
     }
 
@@ -16070,25 +17063,39 @@ mod todo_panel_rows_tests {
         let rows = todo_panel_rows(&it, 0, 1, 5, 4);
         assert_eq!(rows.len(), 4);
         assert!(matches!(rows[0], TodoPanelRow::Spacer));
-        assert!(matches!(rows.last().unwrap(), TodoPanelRow::More { hidden: 4 }));
+        assert!(matches!(
+            rows.last().unwrap(),
+            TodoPanelRow::More { hidden: 4 }
+        ));
     }
 
     #[test]
     fn in_progress_survives_tight_budget() {
         // body_budget = max_rows - 2 (Spacer + Header). With max_rows=3: budget=1.
         // in-progress wins the single body slot over the completed fold.
-        let it = items(&[(TodoStatus::Completed, "done"), (TodoStatus::InProgress, "ip")]);
+        let it = items(&[
+            (TodoStatus::Completed, "done"),
+            (TodoStatus::InProgress, "ip"),
+        ]);
         let rows = todo_panel_rows(&it, 1, 1, 2, 3);
         assert_eq!(rows.len(), 3);
         assert!(matches!(rows[0], TodoPanelRow::Spacer));
         assert!(matches!(rows[1], TodoPanelRow::Header { .. }));
-        assert!(matches!(&rows[2], TodoPanelRow::Item { status: TodoStatus::InProgress, .. }));
+        assert!(matches!(
+            &rows[2],
+            TodoPanelRow::Item {
+                status: TodoStatus::InProgress,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn never_exceeds_max_rows() {
         let mut it = items(&[(TodoStatus::InProgress, "ip"), (TodoStatus::Completed, "c")]);
-        for i in 0..20 { it.push((TodoStatus::Pending, format!("p{i}"))); }
+        for i in 0..20 {
+            it.push((TodoStatus::Pending, format!("p{i}")));
+        }
         let rows = todo_panel_rows(&it, 1, 1, 22, MAX_TODO_PANEL_ROWS);
         assert!(rows.len() <= MAX_TODO_PANEL_ROWS);
     }
@@ -16098,15 +17105,28 @@ mod todo_panel_rows_tests {
         // 11 completed + 1 open. The frontier (the open task) is the last item, so the
         // window is the last `body_budget` (5) items — recent completed shown INDIVIDUALLY
         // plus the open one. No fold, no `+N more` (nothing hidden after the frontier).
-        let mut it: Vec<(TodoStatus, String)> =
-            (1..=11).map(|i| (TodoStatus::Completed, format!("s{i}"))).collect();
+        let mut it: Vec<(TodoStatus, String)> = (1..=11)
+            .map(|i| (TodoStatus::Completed, format!("s{i}")))
+            .collect();
         it.push((TodoStatus::Pending, "final".into()));
         let rows = todo_panel_rows(&it, 11, 0, 12, MAX_TODO_PANEL_ROWS); // MAX_TODO_PANEL_ROWS = 7
         assert_eq!(rows.len(), 7, "Spacer + Header + 5 items");
-        assert!(!rows.iter().any(|r| matches!(r, TodoPanelRow::More { .. })), "frontier at end → no More");
+        assert!(
+            !rows.iter().any(|r| matches!(r, TodoPanelRow::More { .. })),
+            "frontier at end → no More"
+        );
         // Window is items[7..12] = #8..#12, each shown with its real index + status.
-        assert!(matches!(&rows[2], TodoPanelRow::Item { index: 7, status: TodoStatus::Completed, .. }));
-        assert!(matches!(&rows[6], TodoPanelRow::Item { index: 11, status: TodoStatus::Pending, content, .. } if content == "final"));
+        assert!(matches!(
+            &rows[2],
+            TodoPanelRow::Item {
+                index: 7,
+                status: TodoStatus::Completed,
+                ..
+            }
+        ));
+        assert!(
+            matches!(&rows[6], TodoPanelRow::Item { index: 11, status: TodoStatus::Pending, content, .. } if content == "final")
+        );
     }
 
     #[test]
@@ -16127,8 +17147,8 @@ mod todo_panel_rows_tests {
 
     #[test]
     fn build_todo_rows_header_and_inprogress() {
-        use atomcode_capabilities::tools::todo::TodoStatus;
         use crate::terminal::{EnvView, TerminalCaps};
+        use atomcode_capabilities::tools::todo::TodoStatus;
         let caps = TerminalCaps::from_env(EnvView {
             is_stdout_tty: true,
             term: Some("xterm-256color".into()),
@@ -16169,13 +17189,20 @@ mod todo_panel_rows_tests {
         );
         // the in-progress row: filled checkbox glyph is bold + Brand (pink),
         // the body text is bold default fg. Both are bold; only the glyph is pink.
-        let ip = rows.iter().find(|row| text(row).contains("wire it")).unwrap();
+        let ip = rows
+            .iter()
+            .find(|row| text(row).contains("wire it"))
+            .unwrap();
         assert!(ip.iter().any(|c| c.style.bold), "in-progress task is bold");
         assert!(
             ip.iter().any(|c| c.style.fg == Some(Palette::BRAND)),
             "in-progress checkbox glyph must be Brand-coloured (filled square stands out)"
         );
         // Tasks-panel style: every item carries a `#N` positional number.
-        assert!(text(ip).contains('#'), "item must show a #N number, got: {:?}", text(ip));
+        assert!(
+            text(ip).contains('#'),
+            "item must show a #N number, got: {:?}",
+            text(ip)
+        );
     }
 }

@@ -171,7 +171,10 @@ mod tests {
         let reg = Arc::new(McpRegistry::new());
         let adapter = McpToolAdapter::new(reg, info("docs", "query"));
         assert_eq!(adapter.risk("{}"), RiskLevel::Risky);
-        assert!(!adapter.read_only_hint(), "unannotated tool is not read-only");
+        assert!(
+            !adapter.read_only_hint(),
+            "unannotated tool is not read-only"
+        );
     }
 
     #[test]
@@ -190,16 +193,25 @@ mod tests {
     fn auto_approved_tool_is_safe_but_only_that_tool() {
         let reg = Arc::new(McpRegistry::new());
         reg.mark_tool_auto_approved("mcp__docs__query");
-        assert_eq!(McpToolAdapter::new(reg.clone(), info("docs", "query")).risk("{}"), RiskLevel::Safe);
+        assert_eq!(
+            McpToolAdapter::new(reg.clone(), info("docs", "query")).risk("{}"),
+            RiskLevel::Safe
+        );
         // A different tool from the same server is NOT covered.
-        assert_eq!(McpToolAdapter::new(reg, info("docs", "search")).risk("{}"), RiskLevel::Risky);
+        assert_eq!(
+            McpToolAdapter::new(reg, info("docs", "search")).risk("{}"),
+            RiskLevel::Risky
+        );
     }
 
     #[test]
     fn always_grant_scope_is_tool_wide_not_per_args() {
         let adapter = McpToolAdapter::new(Arc::new(McpRegistry::new()), info("docs", "query"));
         // Same scope regardless of args → "Always" persists across differing calls.
-        assert_eq!(adapter.always_grant_scope(r#"{"q":"a"}"#), adapter.always_grant_scope(r#"{"q":"b"}"#));
+        assert_eq!(
+            adapter.always_grant_scope(r#"{"q":"a"}"#),
+            adapter.always_grant_scope(r#"{"q":"b"}"#)
+        );
         assert_eq!(adapter.always_grant_scope("{}"), "");
     }
 }

@@ -49,7 +49,12 @@ use super::resolve_path;
 use super::sensitive_path::{path_is_sensitive, references_sensitive_path};
 
 /// The file-mutation tools this gate owns. Anything else falls through to the normal flow.
-const WRITE_TOOLS: &[&str] = &["edit_file", "write_file", "search_replace", "parallel_edit_files"];
+const WRITE_TOOLS: &[&str] = &[
+    "edit_file",
+    "write_file",
+    "search_replace",
+    "parallel_edit_files",
+];
 
 fn is_write_tool(name: &str) -> bool {
     WRITE_TOOLS.contains(&name)
@@ -66,7 +71,10 @@ fn write_targets(tool: &str, args: &str) -> Vec<String> {
             struct P {
                 file_path: String,
             }
-            serde_json::from_str::<P>(args).ok().map(|p| vec![p.file_path]).unwrap_or_default()
+            serde_json::from_str::<P>(args)
+                .ok()
+                .map(|p| vec![p.file_path])
+                .unwrap_or_default()
         }
         "search_replace" => {
             #[derive(Deserialize)]
@@ -157,7 +165,10 @@ pub(crate) fn canonical_dir_key(raw: &str, cwd: &Path) -> String {
     // created does not — so canonicalizing it gives a stable key across the
     // create-then-edit sequence. Fall back to the resolved path if there is no parent.
     let dir = resolved.parent().map(Path::to_path_buf).unwrap_or(resolved);
-    std::fs::canonicalize(&dir).unwrap_or(dir).to_string_lossy().into_owned()
+    std::fs::canonicalize(&dir)
+        .unwrap_or(dir)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Grant key for an out-of-workspace write. Free fn (no `self`) so it can run inside
@@ -227,7 +238,12 @@ impl WriteApprovalGate {
 
     /// Round-trip the driver for an approval decision (same wire shape as [`ApprovalMiddleware`],
     /// so the existing prompt UI renders it unchanged).
-    async fn prompt(&self, call: &ToolCall, tool: &Arc<dyn Tool>, rt: &RequestCtx) -> PermissionDecision {
+    async fn prompt(
+        &self,
+        call: &ToolCall,
+        tool: &Arc<dyn Tool>,
+        rt: &RequestCtx,
+    ) -> PermissionDecision {
         let payload = serde_json::to_value(ApprovalRequest {
             call_id: call.id.clone(),
             tool: tool.name().to_string(),
@@ -247,7 +263,9 @@ impl WriteApprovalGate {
     ) -> BeforeOutcome {
         match self.prompt(call, tool, rt).await {
             PermissionDecision::AllowOnce | PermissionDecision::AllowAlways => {
-                BeforeOutcome::Allow { reason: Some("sensitive write approved (not remembered)".into()) }
+                BeforeOutcome::Allow {
+                    reason: Some("sensitive write approved (not remembered)".into()),
+                }
             }
             PermissionDecision::Deny => BeforeOutcome::deny(format!(
                 "writing a sensitive path needs approval and was denied: {}",
@@ -259,7 +277,12 @@ impl WriteApprovalGate {
 
 #[async_trait]
 impl ToolMiddleware for WriteApprovalGate {
-    async fn before(&self, call: &mut ToolCall, tool: &Arc<dyn Tool>, rt: &RequestCtx) -> BeforeOutcome {
+    async fn before(
+        &self,
+        call: &mut ToolCall,
+        tool: &Arc<dyn Tool>,
+        rt: &RequestCtx,
+    ) -> BeforeOutcome {
         let name = tool.name();
         if !is_write_tool(name) {
             return BeforeOutcome::Proceed; // not ours — defer to the normal flow
@@ -290,8 +313,10 @@ impl ToolMiddleware for WriteApprovalGate {
         // Classify on the RESOLVED path (catches RELATIVE `.ssh/...` / Windows `..\.ssh\..` /
         // system-protected prefixes that the raw substring form misses). Checked BEFORE the
         // workspace shortcut so an in-workspace `.env` / `id_rsa` still prompts.
-        let sensitive =
-            raw_sensitive || targets.iter().any(|t| path_is_sensitive(&resolve_path(t, &cwd)));
+        let sensitive = raw_sensitive
+            || targets
+                .iter()
+                .any(|t| path_is_sensitive(&resolve_path(t, &cwd)));
         if sensitive {
             return self.prompt_unremembered(call, tool, rt).await;
         }
@@ -301,7 +326,9 @@ impl ToolMiddleware for WriteApprovalGate {
         // tools this gate owns — bash still flows to ApprovalMiddleware and prompts.
         // Enforced here in middleware, before the runtime approval seam.
         if self.accept_edits.load(std::sync::atomic::Ordering::Relaxed) {
-            return BeforeOutcome::Allow { reason: Some("accept-edits mode".into()) };
+            return BeforeOutcome::Allow {
+                reason: Some("accept-edits mode".into()),
+            };
         }
 
         // (2)+(3) classification CANONICALIZES paths (touches the filesystem). Run it OFF the
@@ -328,19 +355,27 @@ impl ToolMiddleware for WriteApprovalGate {
         // (2) Entirely in-workspace, non-sensitive → AUTO-APPROVE, no prompt (v1 parity). The
         // `!is_empty` + non-blank guards keep an unparseable / empty-path call from vacuously passing.
         if in_workspace {
-            return BeforeOutcome::Allow { reason: Some("in-workspace write".into()) };
+            return BeforeOutcome::Allow {
+                reason: Some("in-workspace write".into()),
+            };
         }
 
         // (3) Out-of-workspace (or unparseable) non-sensitive → prompt; "Always" remembers per
         // canonical path (edit/write) or per tool (bulk/multi-file).
         if self.store.is_granted(&key) {
-            return BeforeOutcome::Allow { reason: Some("previously granted this session".into()) };
+            return BeforeOutcome::Allow {
+                reason: Some("previously granted this session".into()),
+            };
         }
         match self.prompt(call, tool, rt).await {
-            PermissionDecision::AllowOnce => BeforeOutcome::Allow { reason: Some("approved once".into()) },
+            PermissionDecision::AllowOnce => BeforeOutcome::Allow {
+                reason: Some("approved once".into()),
+            },
             PermissionDecision::AllowAlways => {
                 self.store.grant(&key);
-                BeforeOutcome::Allow { reason: Some("approved always (this folder)".into()) }
+                BeforeOutcome::Allow {
+                    reason: Some("approved always (this folder)".into()),
+                }
             }
             PermissionDecision::Deny => {
                 BeforeOutcome::deny(format!("denied by approval policy: {name}"))
@@ -390,9 +425,15 @@ mod tests {
     async fn non_write_tool_is_not_ours() {
         let gate = WriteApprovalGate::pinned(std::env::temp_dir());
         let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool::default());
-        let mut call =
-            ToolCall { id: "1".into(), name: "read_file".into(), arguments: r#"{"file_path":"a"}"#.into() };
-        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"file_path":"a"}"#.into(),
+        };
+        assert_eq!(
+            gate.before(&mut call, &tool, &silent_rt()).await,
+            BeforeOutcome::Proceed
+        );
     }
 
     #[tokio::test]
@@ -404,7 +445,10 @@ mod tests {
         // Relative path inside the workspace → Allow, and the silent driver is never consulted.
         let mut call = edit_call("a.rs");
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(matches!(out, BeforeOutcome::Allow { .. }), "in-workspace edit must auto-approve, got {out:?}");
+        assert!(
+            matches!(out, BeforeOutcome::Allow { .. }),
+            "in-workspace edit must auto-approve, got {out:?}"
+        );
     }
 
     #[tokio::test]
@@ -416,7 +460,10 @@ mod tests {
         let tool = write_tool();
         let mut call = write_call("brand/new/file.txt");
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(matches!(out, BeforeOutcome::Allow { .. }), "new in-workspace file must auto-approve, got {out:?}");
+        assert!(
+            matches!(out, BeforeOutcome::Allow { .. }),
+            "new in-workspace file must auto-approve, got {out:?}"
+        );
     }
 
     #[tokio::test]
@@ -430,7 +477,10 @@ mod tests {
         let mut call = edit_call(target.to_str().unwrap());
         // Reaches the prompt → silent driver → fails closed.
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "out-of-workspace edit must prompt (fail closed when silent), got {out:?}");
+        assert!(
+            out.is_deny(),
+            "out-of-workspace edit must prompt (fail closed when silent), got {out:?}"
+        );
     }
 
     #[tokio::test]
@@ -442,7 +492,10 @@ mod tests {
         let tool = write_tool();
         let mut call = write_call(ws.path().join(".env").to_str().unwrap());
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "sensitive in-workspace write must prompt (fail closed), got {out:?}");
+        assert!(
+            out.is_deny(),
+            "sensitive in-workspace write must prompt (fail closed), got {out:?}"
+        );
         assert!(out.deny_reason().unwrap().contains("sensitive"));
     }
 
@@ -462,7 +515,10 @@ mod tests {
 
         let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
         // Grant is keyed by the folder, from the `granted` file's target.
-        store.grant(&format!("writedir::{}", canonical_dir_key(granted.to_str().unwrap(), ws.path())));
+        store.grant(&format!(
+            "writedir::{}",
+            canonical_dir_key(granted.to_str().unwrap(), ws.path())
+        ));
         let gate =
             WriteApprovalGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
 
@@ -470,14 +526,20 @@ mod tests {
         let edit = edit_tool();
         let mut s = edit_call(sibling.to_str().unwrap());
         assert!(
-            matches!(gate.before(&mut s, &edit, &silent_rt()).await, BeforeOutcome::Allow { .. }),
+            matches!(
+                gate.before(&mut s, &edit, &silent_rt()).await,
+                BeforeOutcome::Allow { .. }
+            ),
             "a sibling in the granted folder must auto-approve (edit_file)"
         );
         // ...and via write_file (proves the grant is cross-tool, not per-tool).
         let write = write_tool();
         let mut w = write_call(dir_a.join("fresh.rs").to_str().unwrap());
         assert!(
-            matches!(gate.before(&mut w, &write, &silent_rt()).await, BeforeOutcome::Allow { .. }),
+            matches!(
+                gate.before(&mut w, &write, &silent_rt()).await,
+                BeforeOutcome::Allow { .. }
+            ),
             "a new file in the granted folder must auto-approve (write_file)"
         );
         // A file in a DIFFERENT folder still prompts.
@@ -503,7 +565,10 @@ mod tests {
         let ordinary = std::path::PathBuf::from("/atomcode-test-outside-accept-edits/report.md");
         let mut c = write_call(ordinary.to_str().unwrap());
         assert!(
-            matches!(gate.before(&mut c, &tool, &silent_rt()).await, BeforeOutcome::Allow { .. }),
+            matches!(
+                gate.before(&mut c, &tool, &silent_rt()).await,
+                BeforeOutcome::Allow { .. }
+            ),
             "accept-edits must auto-approve a non-sensitive edit"
         );
 
@@ -535,7 +600,10 @@ mod tests {
         let home_var = std::env::var_os("USERPROFILE");
         #[cfg(not(windows))]
         let home_var = std::env::var_os("HOME");
-        let Some(home) = home_var.map(PathBuf::from).filter(|p| !p.as_os_str().is_empty()) else {
+        let Some(home) = home_var
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+        else {
             return;
         };
         // Workspace == home dir; relative ".ssh/authorized_keys" resolves to ~/.ssh/authorized_keys.
@@ -543,7 +611,10 @@ mod tests {
         let tool = write_tool();
         let mut call = write_call(".ssh/authorized_keys");
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "relative ~/.ssh write must prompt (fail closed), got {out:?}");
+        assert!(
+            out.is_deny(),
+            "relative ~/.ssh write must prompt (fail closed), got {out:?}"
+        );
         assert!(out.deny_reason().unwrap().contains("sensitive"));
     }
 
@@ -559,7 +630,10 @@ mod tests {
         let target = r"C:\Windows\System32\drivers\etc\hosts";
         let mut call = write_call(target);
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "system-protected write must prompt (fail closed), got {out:?}");
+        assert!(
+            out.is_deny(),
+            "system-protected write must prompt (fail closed), got {out:?}"
+        );
     }
 
     #[tokio::test]
@@ -570,7 +644,10 @@ mod tests {
         let tool = write_tool();
         let mut call = write_call("");
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "blank path must prompt (fail closed), not auto-approve, got {out:?}");
+        assert!(
+            out.is_deny(),
+            "blank path must prompt (fail closed), not auto-approve, got {out:?}"
+        );
     }
 
     #[test]
@@ -587,8 +664,14 @@ mod tests {
         {
             assert!(path_is_sensitive(Path::new("/etc/hosts")));
             assert!(path_is_sensitive(Path::new("/usr/lib/x")));
-            assert!(!path_is_sensitive(Path::new("/usr/local/bin/x")), "exception");
-            assert!(!path_is_sensitive(Path::new("/var/folders/ab/x")), "tmp exception");
+            assert!(
+                !path_is_sensitive(Path::new("/usr/local/bin/x")),
+                "exception"
+            );
+            assert!(
+                !path_is_sensitive(Path::new("/var/folders/ab/x")),
+                "tmp exception"
+            );
         }
         // ordinary project files are not sensitive
         assert!(!path_is_sensitive(Path::new("/proj/src/main.rs")));
@@ -604,13 +687,19 @@ mod tests {
         let secret = outside.path().join("id_rsa");
         std::fs::write(&secret, "k").unwrap();
         let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
-        store.grant(&format!("writedir::{}", canonical_dir_key(secret.to_str().unwrap(), ws.path())));
+        store.grant(&format!(
+            "writedir::{}",
+            canonical_dir_key(secret.to_str().unwrap(), ws.path())
+        ));
         let gate =
             WriteApprovalGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
         let tool = edit_tool();
         let mut call = edit_call(secret.to_str().unwrap());
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(out.is_deny(), "sensitive write must ignore the cache and prompt (fail closed), got {out:?}");
+        assert!(
+            out.is_deny(),
+            "sensitive write must ignore the cache and prompt (fail closed), got {out:?}"
+        );
     }
 
     #[test]
@@ -626,20 +715,35 @@ mod tests {
         // `..` escape and an absolute outside path
         assert!(!path_in_workspace("../escape.rs", root));
         let outside = tempfile::tempdir().unwrap();
-        assert!(!path_in_workspace(outside.path().join("x.rs").to_str().unwrap(), root));
+        assert!(!path_in_workspace(
+            outside.path().join("x.rs").to_str().unwrap(),
+            root
+        ));
     }
 
     #[test]
     fn write_targets_extracts_per_tool() {
         assert_eq!(
-            write_targets("edit_file", r#"{"file_path":"a.rs","old_string":"x","new_string":"y"}"#),
+            write_targets(
+                "edit_file",
+                r#"{"file_path":"a.rs","old_string":"x","new_string":"y"}"#
+            ),
             vec!["a.rs".to_string()]
         );
-        assert_eq!(write_targets("write_file", r#"{"file_path":"b.rs","content":"x"}"#), vec!["b.rs".to_string()]);
-        // search_replace default root = "."
-        assert_eq!(write_targets("search_replace", r#"{"search":"a","replace":"b"}"#), vec![".".to_string()]);
         assert_eq!(
-            write_targets("parallel_edit_files", r#"{"files":[{"path":"x","instruction":"i"},{"path":"y","instruction":"j"}]}"#),
+            write_targets("write_file", r#"{"file_path":"b.rs","content":"x"}"#),
+            vec!["b.rs".to_string()]
+        );
+        // search_replace default root = "."
+        assert_eq!(
+            write_targets("search_replace", r#"{"search":"a","replace":"b"}"#),
+            vec![".".to_string()]
+        );
+        assert_eq!(
+            write_targets(
+                "parallel_edit_files",
+                r#"{"files":[{"path":"x","instruction":"i"},{"path":"y","instruction":"j"}]}"#
+            ),
             vec!["x".to_string(), "y".to_string()]
         );
         assert!(write_targets("edit_file", "not json").is_empty());

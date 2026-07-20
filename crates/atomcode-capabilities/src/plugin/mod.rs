@@ -4,8 +4,8 @@
 // Public API surface (per spec §10): the high-level entry points used by
 // the TUI dispatcher and downstream registries.
 pub mod bootstrap;
-pub mod installer;
 pub mod hook_trust;
+pub mod installer;
 pub mod loader;
 pub mod marketplace;
 
@@ -18,10 +18,13 @@ pub(crate) mod state;
 pub(crate) mod url;
 
 // Re-export types needed by downstream crates (TUI, CLI).
-pub use state::InstallScope;
-pub use manifest::{load_marketplace_manifest, load_plugin_manifest, MarketplaceManifest, PluginEntry, PluginManifest, PluginSource};
-pub use paths::{marketplaces_root, plugins_root, project_plugins_root};
 pub use loader::{installed_plugin_cc_hooks, installed_plugin_hook_trust_status, PluginHookTrust};
+pub use manifest::{
+    load_marketplace_manifest, load_plugin_manifest, MarketplaceManifest, PluginEntry,
+    PluginManifest, PluginSource,
+};
+pub use paths::{marketplaces_root, plugins_root, project_plugins_root};
+pub use state::InstallScope;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -38,10 +41,15 @@ pub enum PluginJobEvent {
     PluginUpdated(installer::InstalledPluginInfo),
     /// The plugin is already installed; carries the canonical id so the
     /// renderer can show a friendly reinstall hint with the right commands.
-    PluginAlreadyInstalled { id: String },
+    PluginAlreadyInstalled {
+        id: String,
+    },
     /// Generic failure: `op` is one of "add" / "update" / "install" so the
     /// renderer can produce the same human message as the prior sync path.
-    Failed { op: String, msg: String },
+    Failed {
+        op: String,
+        msg: String,
+    },
     /// Git is not installed or not on PATH. This is a pre-check failure,
     /// not an operational error — the renderer should show a friendly hint
     /// (not an error) to guide the user to install git.

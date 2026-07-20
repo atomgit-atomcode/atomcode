@@ -20,10 +20,10 @@ impl WorktreeManager {
 
     pub fn from_dir(dir: PathBuf) -> Result<Self> {
         let mut cmd = Command::new("git");
-        cmd.args(["rev-parse", "--show-toplevel"])
-            .current_dir(&dir);
+        cmd.args(["rev-parse", "--show-toplevel"]).current_dir(&dir);
         atomcode_capabilities::process_utils::suppress_console_window_sync(&mut cmd);
-        let output = cmd.output()
+        let output = cmd
+            .output()
             .context("Failed to resolve git repository root")?;
         if !output.status.success() {
             anyhow::bail!(
@@ -56,8 +56,7 @@ impl WorktreeManager {
                 .arg(base)
                 .current_dir(&self.repo_root);
             atomcode_capabilities::process_utils::suppress_console_window_sync(&mut cmd);
-            cmd.output()
-                .context("Failed to run git worktree add")?
+            cmd.output().context("Failed to run git worktree add")?
         };
         if !output.status.success() {
             anyhow::bail!(
@@ -78,8 +77,7 @@ impl WorktreeManager {
         cmd.args(["worktree", "list", "--porcelain"])
             .current_dir(&self.repo_root);
         atomcode_capabilities::process_utils::suppress_console_window_sync(&mut cmd);
-        let output = cmd.output()
-            .context("Failed to run git worktree list")?;
+        let output = cmd.output().context("Failed to run git worktree list")?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut result = Vec::new();
         let mut current_path: Option<PathBuf> = None;
@@ -120,8 +118,7 @@ impl WorktreeManager {
                 .arg(&worktree_path)
                 .current_dir(&self.repo_root);
             atomcode_capabilities::process_utils::suppress_console_window_sync(&mut cmd);
-            cmd.output()
-                .context("Failed to run git worktree remove")?
+            cmd.output().context("Failed to run git worktree remove")?
         };
         if !output.status.success() {
             anyhow::bail!(
@@ -137,9 +134,7 @@ impl WorktreeManager {
         cmd.args(["status", "--porcelain"])
             .current_dir(worktree_path);
         atomcode_capabilities::process_utils::suppress_console_window_sync(&mut cmd);
-        cmd.output()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false)
+        cmd.output().map(|o| !o.stdout.is_empty()).unwrap_or(false)
     }
 
     fn worktree_base_dir(&self) -> PathBuf {

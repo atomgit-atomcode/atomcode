@@ -568,13 +568,17 @@ mod tests {
         let (name, entry) = raw.mcp_servers.into_iter().next().unwrap();
         let cfg = server_entry_to_config(&name, entry).unwrap();
         assert!(cfg.trust, "trust:true must be parsed");
-        assert_eq!(cfg.auto_approve, vec!["query".to_string(), "search".to_string()]);
+        assert_eq!(
+            cfg.auto_approve,
+            vec!["query".to_string(), "search".to_string()]
+        );
     }
 
     #[test]
     fn trust_and_auto_approve_default_off_when_absent() {
         let raw: McpConfigFile =
-            serde_json::from_str(r#"{"mcpServers":{"s":{"url":"http://127.0.0.1:8080/mcp"}}}"#).unwrap();
+            serde_json::from_str(r#"{"mcpServers":{"s":{"url":"http://127.0.0.1:8080/mcp"}}}"#)
+                .unwrap();
         let (name, entry) = raw.mcp_servers.into_iter().next().unwrap();
         let cfg = server_entry_to_config(&name, entry).unwrap();
         assert!(!cfg.trust);

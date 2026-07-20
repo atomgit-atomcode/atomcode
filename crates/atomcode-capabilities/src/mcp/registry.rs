@@ -26,10 +26,11 @@ pub enum McpConnectEvent {
     BlockedUntrusted { name: String },
 }
 
-/// Canonical trust-store key for a project dir — mirrors `atomcode_core::session::hash_path`.
+/// Canonical trust-store key for a project dir. Its ordinary-path hash stays
+/// compatible with the retired core session bucket algorithm.
 /// Exposed so tests (and any same-store reader) use ONE implementation.
 ///
-/// The algorithm (must stay in sync with `atomcode_core::session::hash_path`):
+/// The algorithm is pinned by the golden test below:
 /// 1. `strip_verbatim_prefix` on the raw string (BEFORE backslash replacement —
 ///    the prefix contains backslashes that must still be intact).
 /// 2. Replace `\\` → `/`.
@@ -38,9 +39,8 @@ pub enum McpConnectEvent {
 /// 5. Hash as `PathBuf` via `DefaultHasher` (component-prefix hashing — NOT `str::hash`).
 /// 6. Format as `{:016x}`.
 ///
-/// The cross-engine golden test in this module pins the exact output for a fixed
-/// path; the matching test in `atomcode-core` pins the same literal so any drift
-/// between the two implementations fails CI immediately.
+/// The shared config helper pins the same ordinary-path literal used by session
+/// buckets; this function additionally strips Windows verbatim prefixes.
 pub fn project_trust_key(project_dir: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -167,13 +167,19 @@ impl McpRegistry {
 
     /// Whether `server` is configured `trust: true` (auto-approve all its tools).
     pub fn is_server_trusted(&self, server: &str) -> bool {
-        self.trusted_servers.read().map(|s| s.contains(server)).unwrap_or(false)
+        self.trusted_servers
+            .read()
+            .map(|s| s.contains(server))
+            .unwrap_or(false)
     }
 
     /// Whether the full tool name (`mcp__{server}__{tool}`) is auto-approved — on a
     /// server's `autoApprove` allowlist, or granted "Always" at runtime.
     pub fn is_tool_auto_approved(&self, full_name: &str) -> bool {
-        self.auto_approved_tools.read().map(|s| s.contains(full_name)).unwrap_or(false)
+        self.auto_approved_tools
+            .read()
+            .map(|s| s.contains(full_name))
+            .unwrap_or(false)
     }
 
     /// Mark a server trusted at runtime (idempotent).
@@ -263,7 +269,9 @@ impl McpRegistry {
                 // Nothing will ever connect — mark done + store the ready permit so
                 // a later `wait_for_initial_connections` returns immediately instead
                 // of burning its whole timeout (same as the no-server path below).
-                registry.initial_done.store(true, std::sync::atomic::Ordering::Release);
+                registry
+                    .initial_done
+                    .store(true, std::sync::atomic::Ordering::Release);
                 registry.initial_ready.notify_one();
                 return registry;
             }
@@ -273,7 +281,9 @@ impl McpRegistry {
         let (configs, blocked) = Self::partition_by_trust(configs, project_dir);
         for b in &blocked {
             if let Some(tx) = &combined_tx {
-                let _ = tx.send(McpConnectEvent::BlockedUntrusted { name: b.name.clone() });
+                let _ = tx.send(McpConnectEvent::BlockedUntrusted {
+                    name: b.name.clone(),
+                });
             }
         }
 
@@ -376,7 +386,9 @@ impl McpRegistry {
             });
         } else {
             // No servers configured — signal immediately (permit-storing, see above).
-            registry.initial_done.store(true, std::sync::atomic::Ordering::Release);
+            registry
+                .initial_done
+                .store(true, std::sync::atomic::Ordering::Release);
             registry.initial_ready.notify_one();
         }
 
@@ -689,10 +701,10 @@ mod tests {
         .unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let reg =
-            McpRegistry::from_config_background_with_events(proj.path(), Some(tx));
+        let reg = McpRegistry::from_config_background_with_events(proj.path(), Some(tx));
         // Give the background task a chance to run (it must NOT spawn).
-        reg.wait_for_initial_connections(std::time::Duration::from_millis(500)).await;
+        reg.wait_for_initial_connections(std::time::Duration::from_millis(500))
+            .await;
 
         // No server connected.
         assert!(
@@ -731,10 +743,19 @@ mod tests {
             auto_approve: vec!["query".to_string(), "mcp__docs__search".to_string()],
         };
         reg.apply_trust_from_config(&cfg);
-        assert!(reg.is_tool_auto_approved("mcp__docs__query"), "bare name should normalize");
-        assert!(reg.is_tool_auto_approved("mcp__docs__search"), "already-qualified should match");
+        assert!(
+            reg.is_tool_auto_approved("mcp__docs__query"),
+            "bare name should normalize"
+        );
+        assert!(
+            reg.is_tool_auto_approved("mcp__docs__search"),
+            "already-qualified should match"
+        );
         assert!(!reg.is_tool_auto_approved("mcp__docs__other"));
-        assert!(!reg.is_server_trusted("docs"), "trust:false must not trust the server");
+        assert!(
+            !reg.is_server_trusted("docs"),
+            "trust:false must not trust the server"
+        );
     }
 
     /// `project_trust_key` must produce the same key for a verbatim-prefixed path
@@ -762,15 +783,11 @@ mod tests {
     /// for a fixed Unix path so any change to the base algorithm (hasher / format /
     /// PathBuf component hashing) fails CI in this crate.
     ///
-    /// The SAME literal is pinned in `atomcode-core`'s `mcp::trust` tests via
-    /// `core::session::hash_path` — both must equal `8b6a67e0b2c06dae` or the
-    /// two engines have drifted and will disagree on trust state at runtime.
+    /// The same literal is pinned by the shared session-bucket helper.
     #[cfg(unix)]
     #[test]
     fn trust_key_golden_matches_core_algorithm() {
         use std::path::Path;
-        // Must equal atomcode_core::session::hash_path(Path::new("/tmp/atomcode-trust-golden")).
-        // If this literal changes, core and capabilities have drifted — fix BOTH crates.
         assert_eq!(
             project_trust_key(Path::new("/tmp/atomcode-trust-golden")),
             "8b6a67e0b2c06dae"

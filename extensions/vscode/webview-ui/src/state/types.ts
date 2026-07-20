@@ -22,6 +22,7 @@ export interface UserInfo {
 
 export interface AuthStatus {
   logged_in: boolean;
+  expired?: boolean;
   auth_path: string;
   user: UserInfo | null;
 }

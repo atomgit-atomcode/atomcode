@@ -257,10 +257,7 @@ impl LiveSession {
     /// Running. It must be non-blocking; callers use it to abort their old event
     /// forwarder. The returned lease blocks new turns until it is committed or
     /// consumed for rollback; its receiver resumes forwarding from this boundary.
-    pub async fn begin_idle_handoff<F>(
-        &self,
-        at_boundary: F,
-    ) -> Option<IdleHandoff>
+    pub async fn begin_idle_handoff<F>(&self, at_boundary: F) -> Option<IdleHandoff>
     where
         F: FnOnce(),
     {
@@ -816,10 +813,7 @@ mod tests {
             .await
             .expect("captured receiver should see the turn after rollback");
 
-        assert!(matches!(
-            event,
-            LiveEvent::StateChanged(TurnState::Running)
-        ));
+        assert!(matches!(event, LiveEvent::StateChanged(TurnState::Running)));
     }
 
     /// 中途加入（手机退后台回来重连）：join_with_replay 必须能补回当前回合
