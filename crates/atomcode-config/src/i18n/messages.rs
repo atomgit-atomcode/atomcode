@@ -118,6 +118,7 @@ pub enum Msg<'a> {
 
     // ── Status bar (build_status) ──
     StatusNoProvider,
+    StatusRuntimeUnavailable,
     /// Open-source build with an AtomGit-gateway provider configured.
     /// Sending any chat will fail with `CpOfficialBuildRequired`; this
     /// hint surfaces the same diagnosis up-front so the user doesn't

@@ -111,6 +111,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 状态栏 ──
         Msg::StatusNoProvider =>
             "未配置 Provider · 使用 /provider 配置".into(),
+        Msg::StatusRuntimeUnavailable =>
+            "Runtime 不可用 · 请重启或查看上方错误".into(),
         Msg::StatusOfficialBuildRequired =>
             "CodingPlan 需要官方构建".into(),
         Msg::StatusUpgradeHint { version } =>

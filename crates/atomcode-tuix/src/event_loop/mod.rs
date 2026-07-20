@@ -40,7 +40,7 @@ use atomcode_config::config::Config;
 use ui_event::{UiAgentPhase as AgentPhase, UiEvent as AgentEvent};
 use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use atomcode_core::conversation::message::ImagePart;
 use base64::Engine;
@@ -805,7 +805,54 @@ pub struct RuntimeEndpoint {
 #[derive(Clone)]
 pub enum RuntimeControl {
     Ready(ReadyRuntimeControl),
-    Starting(mpsc::UnboundedSender<atomcode_coding::DriverCommand>),
+    Deferred(DeferredRuntimeControl),
+}
+
+#[derive(Clone)]
+pub struct DeferredRuntimeControl {
+    command_tx: mpsc::UnboundedSender<atomcode_coding::DriverCommand>,
+    state: watch::Receiver<atomcode_coding::DeferredRuntimeState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeUiAvailability {
+    Starting,
+    Available,
+    AwaitingProvider,
+    Failed,
+    Stopped,
+}
+
+fn runtime_ui_availability(phase: atomcode_coding::RuntimePhase) -> RuntimeUiAvailability {
+    match phase {
+        atomcode_coding::RuntimePhase::AwaitingProvider => {
+            RuntimeUiAvailability::AwaitingProvider
+        }
+        atomcode_coding::RuntimePhase::Failed => RuntimeUiAvailability::Failed,
+        atomcode_coding::RuntimePhase::ShuttingDown | atomcode_coding::RuntimePhase::Stopped => {
+            RuntimeUiAvailability::Stopped
+        }
+        atomcode_coding::RuntimePhase::Ready
+        | atomcode_coding::RuntimePhase::InTurn
+        | atomcode_coding::RuntimePhase::WaitingApproval
+        | atomcode_coding::RuntimePhase::Reconfiguring => RuntimeUiAvailability::Available,
+    }
+}
+
+fn command_allowed_while_starting(command: &atomcode_coding::DriverCommand) -> bool {
+    use atomcode_coding::DriverCommand;
+    matches!(
+        command,
+        DriverCommand::Cancel
+            | DriverCommand::SetMode(_)
+            | DriverCommand::QueueLocalContext(_)
+            | DriverCommand::ReloadProvider(_)
+            | DriverCommand::DeactivateProvider(_)
+            | DriverCommand::ReloadCapabilities
+            | DriverCommand::StopGoal
+            | DriverCommand::StopLoop
+            | DriverCommand::Shutdown
+    )
 }
 
 #[derive(Clone)]
@@ -899,22 +946,28 @@ impl ReadyRuntimeControl {
             return Err(atomcode_coding::RuntimeUnavailable);
         }
         let phase = self.handle.status().phase;
-        let provider_available = matches!(
-            phase,
-            atomcode_coding::RuntimePhase::Ready
-                | atomcode_coding::RuntimePhase::InTurn
-                | atomcode_coding::RuntimePhase::WaitingApproval
-        );
-        if !provider_available
-            && !matches!(
-                &request,
-                ReadyRuntimeRequest::ReloadProvider { .. }
-                    | ReadyRuntimeRequest::DeactivateProvider { .. }
-                    | ReadyRuntimeRequest::Dispatch(
-                        atomcode_coding::DriverCommand::Shutdown
-                    )
-            )
-        {
+        let allowed = match &request {
+            ReadyRuntimeRequest::ReloadProvider { .. }
+            | ReadyRuntimeRequest::DeactivateProvider { .. } => matches!(
+                phase,
+                atomcode_coding::RuntimePhase::Ready
+                    | atomcode_coding::RuntimePhase::InTurn
+                    | atomcode_coding::RuntimePhase::WaitingApproval
+                    | atomcode_coding::RuntimePhase::AwaitingProvider
+                    | atomcode_coding::RuntimePhase::Failed
+            ),
+            ReadyRuntimeRequest::Dispatch(command) => self.handle.accepts(command),
+            ReadyRuntimeRequest::Compact(_)
+            | ReadyRuntimeRequest::Undo { .. }
+            | ReadyRuntimeRequest::ContextStats { .. }
+            | ReadyRuntimeRequest::RestoreSnapshot { .. } => matches!(
+                phase,
+                atomcode_coding::RuntimePhase::Ready
+                    | atomcode_coding::RuntimePhase::InTurn
+                    | atomcode_coding::RuntimePhase::WaitingApproval
+            ),
+        };
+        if !allowed {
             return Err(atomcode_coding::RuntimeUnavailable);
         }
         let should_spawn = {
@@ -1029,6 +1082,69 @@ impl ReadyRuntimeControl {
     }
 }
 
+impl DeferredRuntimeControl {
+    fn ui_availability(&self) -> RuntimeUiAvailability {
+        match &*self.state.borrow() {
+            atomcode_coding::DeferredRuntimeState::Starting => RuntimeUiAvailability::Starting,
+            atomcode_coding::DeferredRuntimeState::Ready(handle) => {
+                runtime_ui_availability(handle.status().phase)
+            }
+            atomcode_coding::DeferredRuntimeState::Failed(_) => RuntimeUiAvailability::Failed,
+        }
+    }
+
+    fn normal_operation_allowed(&self) -> bool {
+        match &*self.state.borrow() {
+            atomcode_coding::DeferredRuntimeState::Ready(handle) => matches!(
+                handle.status().phase,
+                atomcode_coding::RuntimePhase::Ready
+                    | atomcode_coding::RuntimePhase::InTurn
+                    | atomcode_coding::RuntimePhase::WaitingApproval
+            ),
+            atomcode_coding::DeferredRuntimeState::Starting
+            | atomcode_coding::DeferredRuntimeState::Failed(_) => false,
+        }
+    }
+
+    fn provider_operation_allowed(&self) -> bool {
+        match &*self.state.borrow() {
+            atomcode_coding::DeferredRuntimeState::Starting => true,
+            atomcode_coding::DeferredRuntimeState::Ready(handle) => matches!(
+                handle.status().phase,
+                atomcode_coding::RuntimePhase::Ready
+                    | atomcode_coding::RuntimePhase::InTurn
+                    | atomcode_coding::RuntimePhase::WaitingApproval
+                    | atomcode_coding::RuntimePhase::AwaitingProvider
+                    | atomcode_coding::RuntimePhase::Failed
+            ),
+            atomcode_coding::DeferredRuntimeState::Failed(_) => false,
+        }
+    }
+
+    fn dispatch_allowed(&self, command: &atomcode_coding::DriverCommand) -> bool {
+        match &*self.state.borrow() {
+            atomcode_coding::DeferredRuntimeState::Starting => {
+                command_allowed_while_starting(command)
+            }
+            atomcode_coding::DeferredRuntimeState::Ready(handle) => {
+                handle.accepts(command)
+            }
+            atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                matches!(command, atomcode_coding::DriverCommand::Shutdown)
+            }
+        }
+    }
+
+    fn send(
+        &self,
+        command: atomcode_coding::DriverCommand,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        self.command_tx
+            .send(command)
+            .map_err(|_| atomcode_coding::RuntimeUnavailable)
+    }
+}
+
 impl RuntimeControl {
     pub fn detach_delivery_event_tx(&self) {
         if let Self::Ready(ready) = self {
@@ -1047,25 +1163,27 @@ impl RuntimeControl {
         Self::Ready(ReadyRuntimeControl::with_event_tx(handle, event_tx))
     }
 
+    pub fn deferred(
+        command_tx: mpsc::UnboundedSender<atomcode_coding::DriverCommand>,
+        state: watch::Receiver<atomcode_coding::DeferredRuntimeState>,
+    ) -> Self {
+        Self::Deferred(DeferredRuntimeControl { command_tx, state })
+    }
+
     pub fn is_closed(&self) -> bool {
         match self {
             Self::Ready(ready) => ready.handle.is_stopped(),
-            Self::Starting(sender) => sender.is_closed(),
+            Self::Deferred(deferred) => {
+                deferred.command_tx.is_closed()
+                    || matches!(deferred.ui_availability(), RuntimeUiAvailability::Stopped)
+            }
         }
     }
 
-    fn provider_is_unavailable(&self) -> bool {
+    fn ui_availability(&self) -> RuntimeUiAvailability {
         match self {
-            Self::Ready(ready) => matches!(
-                ready.handle.status().phase,
-                atomcode_coding::RuntimePhase::AwaitingProvider
-                    | atomcode_coding::RuntimePhase::Failed
-                    | atomcode_coding::RuntimePhase::Stopped
-            ),
-            // No status snapshot exists until asynchronous preparation installs
-            // the ready handle. Preserve the config/auth fallback during that
-            // short startup window.
-            Self::Starting(_) => false,
+            Self::Ready(ready) => runtime_ui_availability(ready.handle.status().phase),
+            Self::Deferred(deferred) => deferred.ui_availability(),
         }
     }
 
@@ -1086,9 +1204,10 @@ impl RuntimeControl {
     ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
         match self {
             Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::Compact(focus)),
-            Self::Starting(sender) => sender
-                .send(atomcode_coding::DriverCommand::Compact(focus))
-                .map_err(|_| atomcode_coding::RuntimeUnavailable),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::Compact(focus))
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
     }
 
@@ -1098,9 +1217,33 @@ impl RuntimeControl {
     ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
         match self {
             Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::Dispatch(command)),
-            Self::Starting(sender) => sender
-                .send(command)
-                .map_err(|_| atomcode_coding::RuntimeUnavailable),
+            Self::Deferred(deferred) if deferred.dispatch_allowed(&command) => {
+                deferred.send(command)
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    /// Queue a command that intentionally belongs to a runtime still preparing.
+    /// Foreground input must use `dispatch`, which rejects Submit until the
+    /// authoritative handle is ready; background startup uses this explicit path
+    /// for its initial prompt and does not enter the foreground streaming UI.
+    pub(crate) fn dispatch_when_ready(
+        &self,
+        command: atomcode_coding::DriverCommand,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(_) => self.dispatch(command),
+            Self::Deferred(deferred) => match &*deferred.state.borrow() {
+                atomcode_coding::DeferredRuntimeState::Starting => deferred.send(command),
+                atomcode_coding::DeferredRuntimeState::Ready(handle) if handle.accepts(&command) => {
+                    deferred.send(command)
+                }
+                atomcode_coding::DeferredRuntimeState::Ready(_)
+                | atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                    Err(atomcode_coding::RuntimeUnavailable)
+                }
+            },
         }
     }
 
@@ -1116,9 +1259,10 @@ impl RuntimeControl {
                 runtime_id,
                 event_tx,
             }),
-            Self::Starting(sender) => sender
-                .send(atomcode_coding::DriverCommand::UndoToPrompt(nth))
-                .map_err(|_| atomcode_coding::RuntimeUnavailable),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::UndoToPrompt(nth))
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
     }
 
@@ -1132,9 +1276,10 @@ impl RuntimeControl {
                 runtime_id,
                 event_tx,
             }),
-            Self::Starting(sender) => sender
-                .send(atomcode_coding::DriverCommand::RefreshContextStats)
-                .map_err(|_| atomcode_coding::RuntimeUnavailable),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::RefreshContextStats)
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
     }
 
@@ -1152,12 +1297,13 @@ impl RuntimeControl {
                 runtime_id,
                 event_tx,
             }),
-            Self::Starting(sender) => sender
-                .send(atomcode_coding::DriverCommand::RestoreSnapshotCorrelated {
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => deferred.send(
+                atomcode_coding::DriverCommand::RestoreSnapshotCorrelated {
                     snapshot,
                     correlation_id,
-                })
-                .map_err(|_| atomcode_coding::RuntimeUnavailable),
+                },
+            ),
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
     }
 
@@ -1173,9 +1319,10 @@ impl RuntimeControl {
                 runtime_id,
                 event_tx,
             }),
-            Self::Starting(sender) => sender
-                .send(atomcode_coding::DriverCommand::ReloadProvider(next))
-                .map_err(|_| atomcode_coding::RuntimeUnavailable),
+            Self::Deferred(deferred) if deferred.provider_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::ReloadProvider(next))
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
     }
 
@@ -1191,9 +1338,10 @@ impl RuntimeControl {
                 runtime_id,
                 event_tx,
             }),
-            Self::Starting(sender) => sender
-                .send(atomcode_coding::DriverCommand::DeactivateProvider(reason))
-                .map_err(|_| atomcode_coding::RuntimeUnavailable),
+            Self::Deferred(deferred) if deferred.provider_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::DeactivateProvider(reason))
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
     }
 }
@@ -1266,14 +1414,19 @@ fn local_restore_scope_matches(
 
 #[cfg(test)]
 mod local_restore_scope_tests {
-    use super::{bg_runtime, bg_runtime::RuntimeId, local_restore_scope_matches, RuntimeControl};
+    use super::{
+        bg_runtime, bg_runtime::RuntimeId, local_restore_scope_matches, RuntimeControl,
+        RuntimeUiAvailability,
+    };
     use atomcode_coding::runtime::{
         coding_runtime_control_channel, noop_agent_handle, spawn_runtime_owner,
         CodingRuntimeControl,
     };
-    use atomcode_coding::{DriverCommand, ProviderUnavailableReason, UserInput};
+    use atomcode_coding::{
+        DeferredRuntimeState, DriverCommand, ProviderUnavailableReason, UserInput,
+    };
     use atomcode_core::session::SessionId;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
 
     #[test]
     fn acknowledgement_requires_restore_runtime_and_session_identity() {
@@ -1391,7 +1544,10 @@ mod local_restore_scope_tests {
             .unwrap();
         let runtime = RuntimeControl::from(handle);
 
-        assert!(runtime.provider_is_unavailable());
+        assert_eq!(
+            runtime.ui_availability(),
+            RuntimeUiAvailability::AwaitingProvider
+        );
         assert!(runtime
             .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
             .is_err());
@@ -1411,6 +1567,63 @@ mod local_restore_scope_tests {
         let runtime = RuntimeControl::from(handle);
 
         assert!(runtime.dispatch(DriverCommand::Shutdown).is_ok());
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_runtime_projects_awaiting_provider_and_rejects_submit() {
+        let (handle, owner) = coding_runtime_control_channel();
+        let (runtime_tx, _runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner(noop_agent_handle(), owner, runtime_tx, true);
+        handle
+            .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+            .await
+            .unwrap();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (_state_tx, state_rx) = watch::channel(DeferredRuntimeState::Ready(handle));
+        let runtime = RuntimeControl::deferred(command_tx, state_rx);
+
+        assert_eq!(
+            runtime.ui_availability(),
+            RuntimeUiAvailability::AwaitingProvider
+        );
+        assert!(runtime
+            .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
+            .is_err());
+        assert!(runtime.dispatch(DriverCommand::Shutdown).is_ok());
+        assert!(matches!(command_rx.recv().await, Some(DriverCommand::Shutdown)));
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_starting_rejects_foreground_submit_but_can_queue_background_startup() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (_state_tx, state_rx) = watch::channel(DeferredRuntimeState::Starting);
+        let runtime = RuntimeControl::deferred(command_tx, state_rx);
+        let prompt = DriverCommand::Submit(UserInput::from("background task"));
+
+        assert_eq!(
+            runtime.ui_availability(),
+            RuntimeUiAvailability::Starting
+        );
+        assert!(runtime.dispatch(prompt.clone()).is_err());
+        assert!(runtime.dispatch_when_ready(prompt).is_ok());
+        assert!(matches!(
+            command_rx.recv().await,
+            Some(DriverCommand::Submit(input)) if input.text == "background task"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_is_not_reported_as_missing_provider() {
+        let (handle, owner) = coding_runtime_control_channel();
+        let (runtime_tx, _runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner(noop_agent_handle(), owner, runtime_tx, false);
+        let runtime = RuntimeControl::from(handle);
+
+        assert_eq!(runtime.ui_availability(), RuntimeUiAvailability::Failed);
 
         adapter.shutdown().await.unwrap();
     }
@@ -13745,8 +13958,13 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     //      why before they're told to upgrade.
     //   2. Upgrade-available hint (existing behavior).
     //   3. None.
-    let no_provider = ctx.runtime.provider_is_unavailable()
+    let runtime_availability = ctx.runtime.ui_availability();
+    let no_provider = matches!(
+        runtime_availability,
+        RuntimeUiAvailability::AwaitingProvider
+    )
         || (ctx.config.providers.is_empty() && atomcode_auth::get_stored_auth().is_none());
+    let runtime_failed = matches!(runtime_availability, RuntimeUiAvailability::Failed);
     // Open-source build pointed at an AtomGit gateway: any chat will
     // fail-fast with `CpOfficialBuildRequired`. Surface that diagnosis
     // up front (red, beats every other hint) so the user doesn't have
@@ -13774,6 +13992,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else if no_provider {
         Some((
             crate::i18n::t(crate::i18n::Msg::StatusNoProvider).into_owned(),
+            crate::render::HintSeverity::Warning,
+        ))
+    } else if runtime_failed {
+        Some((
+            crate::i18n::t(crate::i18n::Msg::StatusRuntimeUnavailable).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
     } else if let Some(warning) = monitor::is_codingplan_provider(&ctx.config.default_provider)

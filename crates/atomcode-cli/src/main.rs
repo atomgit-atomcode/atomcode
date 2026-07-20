@@ -1744,13 +1744,13 @@ fn spawn_deferred_tui_runtime(
     let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
         &session.to_conversation_snapshot(),
     );
-    let (native_control, mut events) =
+    let (native_control, mut events, runtime_state) =
         atomcode_daemon::spawn_native_runtime_for_session_deferred(
             cfg,
             session_id.clone(),
             snapshot,
         );
-    let control = atomcode_tuix::RuntimeControl::Starting(native_control);
+    let control = atomcode_tuix::RuntimeControl::deferred(native_control, runtime_state);
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {

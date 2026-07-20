@@ -119,6 +119,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── Status bar ──
         Msg::StatusNoProvider =>
             "no provider · /provider to configure".into(),
+        Msg::StatusRuntimeUnavailable =>
+            "runtime unavailable · restart or inspect the error above".into(),
         Msg::StatusOfficialBuildRequired =>
             "CodingPlan needs the official build".into(),
         Msg::StatusUpgradeHint { version } =>

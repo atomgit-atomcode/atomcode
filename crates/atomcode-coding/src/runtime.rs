@@ -707,6 +707,16 @@ pub struct CodingRuntimeHandle {
     terminal: watch::Receiver<Option<RuntimeExit>>,
 }
 
+/// Readiness of a runtime whose asynchronous preparation is owned by a driver adapter.
+/// Once ready, consumers read the authoritative phase from the stable runtime handle
+/// instead of maintaining a second lifecycle state mirror.
+#[derive(Clone, Debug)]
+pub enum DeferredRuntimeState {
+    Starting,
+    Ready(CodingRuntimeHandle),
+    Failed(String),
+}
+
 impl CodingRuntimeHandle {
     pub fn is_stopped(&self) -> bool {
         self.terminal.borrow().is_some() || self.tx.is_closed()
@@ -715,6 +725,13 @@ impl CodingRuntimeHandle {
     /// Current actor-owned lifecycle state projected for fast driver checks.
     pub fn status(&self) -> RuntimeStatus {
         runtime_status(self.state.load(Ordering::Acquire))
+    }
+
+    /// Whether a fire-and-forget driver command can be accepted in the current
+    /// authoritative runtime phase. Drivers use this before entering UI states
+    /// that assume the command reached the runtime owner.
+    pub fn accepts(&self, command: &DriverCommand) -> bool {
+        !self.is_stopped() && runtime_phase_accepts_command(self.status().phase, command)
     }
 
     /// Request manual conversation compaction from the current kernel agent.
@@ -733,13 +750,8 @@ impl CodingRuntimeHandle {
 
     pub fn dispatch(&self, command: DriverCommand) -> Result<(), RuntimeUnavailable> {
         let state = self.state.load(Ordering::Acquire);
-        if !runtime_state_available(state)
-            && !matches!(
-                command,
-                DriverCommand::ReloadProvider(_)
-                    | DriverCommand::DeactivateProvider(_)
-                    | DriverCommand::Shutdown
-            )
+        if self.is_stopped()
+            || !runtime_phase_accepts_command(runtime_status(state).phase, &command)
         {
             return Err(RuntimeUnavailable);
         }
@@ -1599,6 +1611,22 @@ fn runtime_state_available(state: u64) -> bool {
         runtime_status(state).phase,
         RuntimePhase::Ready | RuntimePhase::InTurn | RuntimePhase::WaitingApproval
     )
+}
+
+fn runtime_phase_accepts_command(phase: RuntimePhase, command: &DriverCommand) -> bool {
+    match phase {
+        RuntimePhase::Ready | RuntimePhase::InTurn | RuntimePhase::WaitingApproval => true,
+        RuntimePhase::AwaitingProvider | RuntimePhase::Failed => matches!(
+            command,
+            DriverCommand::ReloadProvider(_)
+                | DriverCommand::DeactivateProvider(_)
+                | DriverCommand::Shutdown
+        ),
+        RuntimePhase::Reconfiguring | RuntimePhase::ShuttingDown => {
+            matches!(command, DriverCommand::Shutdown)
+        }
+        RuntimePhase::Stopped => false,
+    }
 }
 
 /// Internal kernel-facing owner adapter wrapped by [`CodingRuntime`].
@@ -5022,6 +5050,16 @@ mod tests {
         let adapter = spawn_runtime_owner(agent, controls, runtime_tx, false);
 
         assert_eq!(handle.compact(None), Err(RuntimeUnavailable));
+        assert!(!handle.accepts(&DriverCommand::Submit(UserInput::from("blocked"))));
+        assert!(
+            handle.accepts(&DriverCommand::ReloadProvider(CodingAgentConfig::new(
+                "key",
+                "https://example.test/v1",
+                "model",
+                ".",
+            )))
+        );
+        assert!(handle.accepts(&DriverCommand::Shutdown));
         assert!(runtime_rx.try_recv().is_err());
 
         adapter.shutdown().await.unwrap();

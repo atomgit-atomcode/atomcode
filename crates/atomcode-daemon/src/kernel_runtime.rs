@@ -4,7 +4,7 @@ use atomcode_coding::config::CodingAgentConfig;
 use atomcode_coding::parts::{PrepareOptions, SessionMode};
 use atomcode_coding::runtime::CodingRuntimeEvent;
 use atomcode_coding::CodingRuntimeConfig;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// Convert the shared runtime configuration into the native coding-agent config.
 pub fn coding_config_from_runtime(cfg: &CodingRuntimeConfig) -> CodingAgentConfig {
@@ -70,9 +70,11 @@ pub fn spawn_native_runtime_for_session_deferred(
 ) -> (
     mpsc::UnboundedSender<atomcode_coding::DriverCommand>,
     mpsc::UnboundedReceiver<CodingRuntimeEvent>,
+    watch::Receiver<atomcode_coding::DeferredRuntimeState>,
 ) {
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (state_tx, state_rx) = watch::channel(atomcode_coding::DeferredRuntimeState::Starting);
     tokio::spawn(async move {
         let bootstrap = if cfg.model.is_empty() {
             atomcode_coding::ProviderBootstrap::Unavailable(
@@ -91,6 +93,9 @@ pub fn spawn_native_runtime_for_session_deferred(
             Ok(runtime) => runtime,
             Err(error) => {
                 let message = error.to_string();
+                state_tx.send_replace(atomcode_coding::DeferredRuntimeState::Failed(
+                    message.clone(),
+                ));
                 let _ = event_tx.send(CodingRuntimeEvent::Agent(
                     atomcode_kernel::event::AgentEvent::Error {
                         message: message.clone(),
@@ -119,6 +124,7 @@ pub fn spawn_native_runtime_for_session_deferred(
             task,
             ..
         } = runtime;
+        state_tx.send_replace(atomcode_coding::DeferredRuntimeState::Ready(handle.clone()));
         loop {
             tokio::select! {
                 control = control_rx.recv() => {
@@ -187,5 +193,113 @@ pub fn spawn_native_runtime_for_session_deferred(
         }
         let _ = task.await;
     });
-    (control_tx, event_rx)
+    (control_tx, event_rx, state_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn deferred_runtime_publishes_authoritative_awaiting_provider_handle() {
+        let working_dir = tempfile::tempdir().unwrap();
+        let config = atomcode_config::config::Config::default();
+        let cfg = CodingRuntimeConfig::from_config(
+            &config,
+            working_dir.path(),
+            None,
+            None,
+            false,
+            true,
+        );
+        let (control_tx, _event_rx, mut state_rx) =
+            spawn_native_runtime_for_session_deferred(
+                cfg,
+                "deferred-test".into(),
+                atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
+            );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), state_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let state = state_rx.borrow().clone();
+        let atomcode_coding::DeferredRuntimeState::Ready(handle) = state else {
+            panic!("deferred runtime did not publish a ready handle");
+        };
+        assert_eq!(
+            handle.status().phase,
+            atomcode_coding::RuntimePhase::AwaitingProvider
+        );
+
+        control_tx
+            .send(atomcode_coding::DriverCommand::Shutdown)
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), control_tx.closed())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn deferred_runtime_reports_same_session_conflict() {
+        let home = tempfile::tempdir().unwrap();
+        let working_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let config = atomcode_config::config::Config::default();
+        let cfg = || {
+            CodingRuntimeConfig::from_config(
+                &config,
+                working_dir.path(),
+                None,
+                None,
+                false,
+                true,
+            )
+        };
+        let snapshot = || atomcode_kernel::message::SessionSnapshot::new(Vec::new());
+        let (first_tx, _first_events, mut first_state) =
+            spawn_native_runtime_for_session_deferred(
+                cfg(),
+                "same-deferred-session".into(),
+                snapshot(),
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(5), first_state.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            *first_state.borrow(),
+            atomcode_coding::DeferredRuntimeState::Ready(_)
+        ));
+
+        let (second_tx, _second_events, mut second_state) =
+            spawn_native_runtime_for_session_deferred(
+                cfg(),
+                "same-deferred-session".into(),
+                snapshot(),
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(5), second_state.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &*second_state.borrow(),
+            atomcode_coding::DeferredRuntimeState::Failed(message)
+                if message.contains("already in use")
+        ));
+
+        first_tx
+            .send(atomcode_coding::DriverCommand::Shutdown)
+            .unwrap();
+        second_tx
+            .send(atomcode_coding::DriverCommand::Shutdown)
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), first_tx.closed())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), second_tx.closed())
+            .await
+            .unwrap();
+    }
 }

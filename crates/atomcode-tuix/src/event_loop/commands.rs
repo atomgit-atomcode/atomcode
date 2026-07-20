@@ -2477,7 +2477,9 @@ fn execute_slash_command_impl(
             };
             endpoint
                 .native
-                .dispatch(atomcode_coding::DriverCommand::Submit(task.to_string().into()))
+                .dispatch_when_ready(atomcode_coding::DriverCommand::Submit(
+                    task.to_string().into(),
+                ))
                 .ok();
             renderer.render(UiLine::CommandOutput(
                 t(Msg::BgTaskStarted {
