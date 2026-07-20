@@ -4,9 +4,11 @@
 //! The hooks (snapshot / transcript) and the recall tool call into this; the manager
 //! itself does only file IO, so it is fully unit-testable with a temp root.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Arc, Barrier, Mutex};
 
 use atomcode_kernel::message::SessionSnapshot;
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,10 @@ pub struct SessionMeta {
     pub name: String,
     #[serde(default)]
     pub user_renamed: bool,
+    /// True once the AI session namer has assigned `name`. Kept separate from
+    /// `user_renamed` so a resumed session does not run the one-shot namer again.
+    #[serde(default)]
+    pub ai_named: bool,
     pub working_dir: String,
     /// epoch MILLISECONDS, UTC.
     pub created_at: i64,
@@ -54,6 +60,7 @@ impl SessionMeta {
             name: format!("session-{id}"),
             id,
             user_renamed: false,
+            ai_named: false,
             working_dir: working_dir.into(),
             created_at: now_ms,
             updated_at: now_ms,
@@ -69,16 +76,47 @@ impl SessionMeta {
 pub struct TurnStat {
     /// The divider renders AFTER this many messages of the snapshot.
     pub after_message: usize,
+    /// LLM round-trips within this completed user turn. Named `round_count` to avoid
+    /// confusing it with [`SessionMeta::turn_count`] (completed user turns).
+    #[serde(default)]
+    pub round_count: u32,
     pub tool_call_count: u32,
     pub duration_ms: u64,
+    /// Prompt + completion tokens from the final model request in this turn — the
+    /// same value the live turn divider displays.
     pub total_tokens: u32,
     #[serde(default)]
     pub errored: bool,
+    /// Prompt/context occupancy reported by the final model request.
+    #[serde(default)]
+    pub used_tokens: u32,
+    /// Model context-window size paired with `used_tokens`.
+    #[serde(default)]
+    pub ctx_window: u32,
 }
 
 /// The per-project session store at `$ATOMCODE_HOME/sessions/<project_hash>/`.
 pub struct SessionManager {
     root: PathBuf,
+    #[cfg(test)]
+    meta_read_pause: Mutex<Option<Arc<MetaReadPause>>>,
+}
+
+#[cfg(test)]
+pub(crate) struct MetaReadPause {
+    entered: Barrier,
+    resume: Barrier,
+}
+
+#[cfg(test)]
+impl MetaReadPause {
+    pub(crate) fn wait_until_read(&self) {
+        self.entered.wait();
+    }
+
+    pub(crate) fn resume(&self) {
+        self.resume.wait();
+    }
 }
 
 impl SessionManager {
@@ -89,12 +127,20 @@ impl SessionManager {
         let root = super::config_dir()
             .join("sessions")
             .join(Self::project_hash(working_dir));
-        Self { root }
+        Self {
+            root,
+            #[cfg(test)]
+            meta_read_pause: Mutex::new(None),
+        }
     }
 
     /// Point the store at an explicit directory (tests / custom layouts).
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            #[cfg(test)]
+            meta_read_pause: Mutex::new(None),
+        }
     }
 
     /// The store's root directory.
@@ -133,6 +179,9 @@ impl SessionManager {
     pub fn meta_path(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.meta"))
     }
+    fn meta_lock_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.meta.lock"))
+    }
     /// The append-only transcript path the [`TranscriptHook`](super::TranscriptHook)
     /// writes (and the recall tool reads).
     pub fn jsonl_path(&self, id: &str) -> PathBuf {
@@ -151,8 +200,55 @@ impl SessionManager {
     }
 
     pub fn write_meta(&self, meta: &SessionMeta) -> io::Result<()> {
+        self.with_meta_lock(&meta.id, || self.write_meta_unlocked(meta))
+    }
+
+    fn write_meta_unlocked(&self, meta: &SessionMeta) -> io::Result<()> {
         let bytes = serde_json::to_vec_pretty(meta).map_err(invalid_data)?;
         atomic_write(&self.meta_path(&meta.id), &bytes)
+    }
+
+    /// Atomically mutate an existing meta across threads and processes. The advisory
+    /// lock covers the whole read-modify-write sequence; `write_meta` alone only
+    /// serializes complete replacements and must not be used with a stale prior read.
+    pub fn update_meta(&self, id: &str, update: impl FnOnce(&mut SessionMeta)) -> io::Result<()> {
+        self.with_meta_lock(id, || {
+            let mut meta = self.read_meta(id)?;
+            update(&mut meta);
+            self.write_meta_unlocked(&meta)
+        })
+    }
+
+    pub(crate) fn update_meta_or_insert(
+        &self,
+        id: &str,
+        new_meta: SessionMeta,
+        update: impl FnOnce(&mut SessionMeta),
+    ) -> io::Result<()> {
+        self.with_meta_lock(id, || {
+            let mut meta = match self.read_meta(id) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => new_meta,
+                Err(error) => return Err(error),
+            };
+            update(&mut meta);
+            self.write_meta_unlocked(&meta)
+        })
+    }
+
+    fn with_meta_lock<T>(
+        &self,
+        id: &str,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        fs::create_dir_all(&self.root)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(self.meta_lock_path(id))?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        operation()
     }
 
     pub fn read_meta(&self, id: &str) -> io::Result<SessionMeta> {
@@ -167,7 +263,22 @@ impl SessionManager {
                 format!("meta schema v{} > supported v{META_VERSION}", meta.v),
             ));
         }
+        #[cfg(test)]
+        if let Some(pause) = self.meta_read_pause.lock().unwrap().take() {
+            pause.entered.wait();
+            pause.resume.wait();
+        }
         Ok(meta)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_meta_read(&self) -> Arc<MetaReadPause> {
+        let pause = Arc::new(MetaReadPause {
+            entered: Barrier::new(2),
+            resume: Barrier::new(2),
+        });
+        *self.meta_read_pause.lock().unwrap() = Some(pause.clone());
+        pause
     }
 
     /// List all sessions in this project bucket, NEWEST FIRST. Reads ONLY `*.meta`
@@ -204,10 +315,10 @@ impl SessionManager {
 
     /// Rename a session (sets `name` + `user_renamed`). Errors if no meta exists.
     pub fn rename(&self, id: &str, name: &str) -> io::Result<()> {
-        let mut meta = self.read_meta(id)?;
-        meta.name = name.to_string();
-        meta.user_renamed = true;
-        self.write_meta(&meta)
+        self.update_meta(id, |meta| {
+            meta.name = name.to_string();
+            meta.user_renamed = true;
+        })
     }
 
     /// Remove a session's three files. A missing file is not an error (idempotent).
@@ -304,6 +415,77 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].id, "new", "newest updated_at first");
         assert_eq!(mgr.latest().unwrap().id, "new");
+    }
+
+    #[test]
+    fn legacy_meta_rewrites_with_s1a_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let legacy = serde_json::json!({
+            "v": 1,
+            "id": "legacy",
+            "name": "Legacy",
+            "user_renamed": false,
+            "working_dir": "/p",
+            "created_at": 1,
+            "updated_at": 2,
+            "turn_count": 1,
+            "message_count": 2,
+            "turn_stats": [{
+                "after_message": 2,
+                "tool_call_count": 1,
+                "duration_ms": 10,
+                "total_tokens": 7,
+                "errored": false
+            }]
+        });
+        std::fs::write(
+            mgr.meta_path("legacy"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let meta = mgr.read_meta("legacy").unwrap();
+        mgr.write_meta(&meta).unwrap();
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(mgr.meta_path("legacy")).unwrap()).unwrap();
+
+        assert_eq!(rewritten["ai_named"], false);
+        assert_eq!(rewritten["turn_stats"][0]["round_count"], 0);
+        assert_eq!(rewritten["turn_stats"][0]["used_tokens"], 0);
+        assert_eq!(rewritten["turn_stats"][0]["ctx_window"], 0);
+    }
+
+    #[test]
+    fn rename_preserves_ai_named_from_native_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let native = serde_json::json!({
+            "v": 1,
+            "id": "named",
+            "name": "AI title",
+            "user_renamed": false,
+            "ai_named": true,
+            "working_dir": "/p",
+            "created_at": 1,
+            "updated_at": 2,
+            "turn_count": 1,
+            "message_count": 2,
+            "turn_stats": []
+        });
+        std::fs::write(
+            mgr.meta_path("named"),
+            serde_json::to_vec_pretty(&native).unwrap(),
+        )
+        .unwrap();
+
+        mgr.rename("named", "User title").unwrap();
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(mgr.meta_path("named")).unwrap()).unwrap();
+
+        assert_eq!(rewritten["name"], "User title");
+        assert_eq!(rewritten["user_renamed"], true);
+        assert_eq!(rewritten["ai_named"], true);
     }
 
     #[test]

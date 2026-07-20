@@ -9,7 +9,6 @@
 //! Per-turn wall-clock `duration_ms` (and the `errored` flag) live HERE in L1 — the
 //! kernel is clock-free — feeding the `turn_stats` a resume uses to re-render dividers.
 
-use std::io;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -20,13 +19,16 @@ use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
 
 use super::{now_ms, SessionManager, SessionMeta, TurnStat};
 
-/// Per-turn accumulation (reset each turn): start time for duration, and the turn's
-/// tool-call count / token total gathered across rounds.
+/// Per-turn accumulation (reset each turn): duration, round/tool counts, and the final
+/// model request's token/context figures.
 #[derive(Default)]
 struct TurnAccum {
     started_ms: i64,
+    round_count: u32,
     tool_calls: u32,
     total_tokens: u32,
+    used_tokens: u32,
+    ctx_window: u32,
 }
 
 /// Saves `<id>.snapshot` (the compacted working set) + updates `<id>.meta` each turn.
@@ -69,18 +71,27 @@ impl LifecycleHooks for SnapshotHook {
     /// Mark the turn's wall-clock start (for `duration_ms`) and reset per-turn counters.
     async fn user_prompt_submit(&self, _text: &mut String) -> Result<(), String> {
         let mut a = self.lock();
-        *a = TurnAccum { started_ms: now_ms(), tool_calls: 0, total_tokens: 0 };
+        *a = TurnAccum {
+            started_ms: now_ms(),
+            ..Default::default()
+        };
         Ok(())
     }
 
-    /// Accumulate this round's tool-call count + the cumulative context-token count.
+    /// Count this model round and retain the final request's usage/context figures.
     async fn on_model_response(&self, response: &mut Message) {
         let mut a = self.lock();
-        a.tool_calls = a.tool_calls.saturating_add(response.tool_calls.len() as u32);
+        a.round_count = a.round_count.saturating_add(1);
+        a.tool_calls = a
+            .tool_calls
+            .saturating_add(response.tool_calls.len() as u32);
         if let Some(meta) = &response.meta {
-            // `used_tokens` is the round's cumulative context size; the last round's is
-            // the turn's footprint — what a `✓ … tokens` divider shows.
-            a.total_tokens = meta.used_tokens;
+            // Match the live runtime projection: the turn divider shows prompt +
+            // completion from the FINAL request, while context restore needs the
+            // distinct used/window pair. Do not conflate these three values.
+            a.total_tokens = meta.tokens.prompt.saturating_add(meta.tokens.completion);
+            a.used_tokens = meta.used_tokens;
+            a.ctx_window = meta.ctx_window;
         }
     }
 
@@ -100,43 +111,43 @@ impl LifecycleHooks for SnapshotHook {
         }
 
         let now = now_ms();
-        let (duration_ms, tool_call_count, total_tokens) = {
+        let (duration_ms, round_count, tool_call_count, total_tokens, used_tokens, ctx_window) = {
             let a = self.lock();
             (
                 (now - a.started_ms).max(0) as u64,
+                a.round_count,
                 a.tool_calls,
                 a.total_tokens,
+                a.used_tokens,
+                a.ctx_window,
             )
         };
 
-        // Read-modify-write so accumulated turn_stats (persisted on disk) survive, and a
-        // user `/rename` is preserved. ONLY a genuinely-absent meta (NotFound) starts
-        // fresh; any OTHER read error (a transient IO failure, or a corrupt/partially
-        // written file) must NOT clobber the on-disk meta — skip this turn's update and
-        // leave the existing data intact (the snapshot above already persisted).
-        let mut meta = match self.mgr.read_meta(&self.session_id) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                SessionMeta::new(&self.session_id, &self.working_dir, now)
-            }
-            Err(_) => return,
-        };
         let msg_count = convo.messages.len();
-        meta.updated_at = now;
-        meta.turn_count = meta.turn_count.saturating_add(1);
-        meta.message_count = msg_count as u32;
-        // Drop turn_stats whose divider position no longer exists in the (possibly
-        // compacted, hence shorter) snapshot, so the stats stay consistent with what a
-        // resume will load — mirrors production's `retain(|s| s.after_message <= new_len)`.
-        meta.turn_stats.retain(|s| s.after_message <= msg_count);
-        meta.turn_stats.push(TurnStat {
-            after_message: msg_count,
-            tool_call_count,
-            duration_ms,
-            total_tokens,
-            errored: *reason != StopReason::Stopped,
-        });
-        let _ = self.mgr.write_meta(&meta);
+        let fresh = SessionMeta::new(&self.session_id, &self.working_dir, now);
+        if let Err(error) = self
+            .mgr
+            .update_meta_or_insert(&self.session_id, fresh, |meta| {
+                meta.updated_at = now;
+                meta.turn_count = meta.turn_count.saturating_add(1);
+                meta.message_count = msg_count as u32;
+                // Drop turn_stats whose divider position no longer exists in the
+                // (possibly compacted, hence shorter) snapshot.
+                meta.turn_stats.retain(|s| s.after_message <= msg_count);
+                meta.turn_stats.push(TurnStat {
+                    after_message: msg_count,
+                    round_count,
+                    tool_call_count,
+                    duration_ms,
+                    total_tokens,
+                    errored: *reason != StopReason::Stopped,
+                    used_tokens,
+                    ctx_window,
+                });
+            })
+        {
+            eprintln!("[SnapshotHook] update_meta failed: {error}");
+        }
     }
 }
 
@@ -171,6 +182,16 @@ mod tests {
     }
 
     fn resp(tool_calls: usize, used: u32) -> Message {
+        resp_with_usage(tool_calls, used, 5, used, 0)
+    }
+
+    fn resp_with_usage(
+        tool_calls: usize,
+        prompt: u32,
+        completion: u32,
+        used: u32,
+        ctx_window: u32,
+    ) -> Message {
         let calls = (0..tool_calls)
             .map(|i| atomcode_kernel::tool::ToolCall {
                 id: format!("c{i}"),
@@ -181,7 +202,12 @@ mod tests {
         let mut m = Message::assistant("ok", calls);
         m.meta = Some(MessageMeta {
             used_tokens: used,
-            tokens: TokenUsage { prompt: used, completion: 5, cached: 0 },
+            ctx_window,
+            tokens: TokenUsage {
+                prompt,
+                completion,
+                cached: 0,
+            },
             ..Default::default()
         });
         m
@@ -206,9 +232,33 @@ mod tests {
         assert_eq!(meta.turn_stats.len(), 1);
         let st = &meta.turn_stats[0];
         assert_eq!(st.tool_call_count, 2);
-        assert_eq!(st.total_tokens, 1234);
+        assert_eq!(st.total_tokens, 1239);
+        assert_eq!(st.round_count, 1);
+        assert_eq!(st.used_tokens, 1234);
+        assert_eq!(st.ctx_window, 0);
         assert_eq!(st.after_message, 3);
         assert!(!st.errored);
+    }
+
+    #[tokio::test]
+    async fn records_round_count_and_distinct_token_semantics() {
+        let (h, mgr, _d) = hook("s1a-stats");
+        h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
+        h.on_model_response(&mut resp_with_usage(1, 100, 10, 800, 1_000))
+            .await;
+        h.on_model_response(&mut resp_with_usage(2, 200, 20, 900, 1_000))
+            .await;
+        h.turn_complete(&convo_with(3), &StopReason::Stopped, &TurnCtx::default())
+            .await;
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(mgr.meta_path("s1a-stats")).unwrap()).unwrap();
+        let stat = &raw["turn_stats"][0];
+        assert_eq!(stat["round_count"], 2);
+        assert_eq!(stat["tool_call_count"], 3);
+        assert_eq!(stat["total_tokens"], 220);
+        assert_eq!(stat["used_tokens"], 900);
+        assert_eq!(stat["ctx_window"], 1_000);
     }
 
     #[tokio::test]
@@ -246,7 +296,7 @@ mod tests {
         let meta = mgr.read_meta("s1").unwrap();
         assert_eq!(meta.turn_count, 3);
         assert_eq!(meta.turn_stats.len(), 3);
-        assert_eq!(meta.turn_stats[2].total_tokens, 300);
+        assert_eq!(meta.turn_stats[2].total_tokens, 305);
     }
 
     #[tokio::test]
@@ -304,5 +354,48 @@ mod tests {
         assert_eq!(meta.name, "My Work");
         assert!(meta.user_renamed);
         assert_eq!(meta.turn_count, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_rename_and_turn_complete_preserve_both_updates() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (hook, mgr, _d) = hook("concurrent-meta");
+        mgr.write_meta(&SessionMeta::new("concurrent-meta", "/proj", 1))
+            .unwrap();
+        hook.user_prompt_submit(&mut "go".to_string()).await.unwrap();
+
+        // Pause turn-complete after it has read the old title. Without a lock, rename
+        // completes next and the stale turn write then silently restores the old title.
+        let pause = mgr.pause_next_meta_read();
+        let turn = tokio::spawn(async move {
+            hook.turn_complete(
+                &convo_with(2),
+                &StopReason::Stopped,
+                &TurnCtx::default(),
+            )
+            .await;
+        });
+        pause.wait_until_read();
+
+        let rename_mgr = mgr.clone();
+        let (renamed_tx, renamed_rx) = mpsc::channel();
+        let rename = std::thread::spawn(move || {
+            let result = rename_mgr.rename("concurrent-meta", "User title");
+            let _ = renamed_tx.send(());
+            result
+        });
+        let rename_waited = renamed_rx.recv_timeout(Duration::from_secs(1)).is_err();
+        pause.resume();
+
+        turn.await.unwrap();
+        rename.join().unwrap().unwrap();
+        assert!(rename_waited, "rename must wait for the turn meta update lock");
+        let meta = mgr.read_meta("concurrent-meta").unwrap();
+        assert_eq!(meta.name, "User title");
+        assert!(meta.user_renamed);
+        assert_eq!(meta.turn_count, 1);
+        assert_eq!(meta.turn_stats.len(), 1);
     }
 }

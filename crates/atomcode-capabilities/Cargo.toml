@@ -93,11 +93,11 @@ uuid = { version = "1", features = ["v4"], optional = true }
 dirs = { version = "6", optional = true }
 toml = { version = "0.8", optional = true }
 # `session` capability deps: chrono for epoch↔ISO + local-time date math (transcript
-# timestamps, current-date injection, recall date filtering). dirs (already optional)
-# resolves $ATOMCODE_HOME/sessions. Matches production's chrono pin.
+# timestamps, current-date injection, recall date filtering). dirs resolves
+# $ATOMCODE_HOME/sessions; fs2 serializes per-session meta read-modify-write.
 chrono = { version = "0.4", optional = true }
-# `setup` capability deps: file-lock (fs2) for the install lock + typed setup errors
-# (thiserror). anyhow/sha2/chrono/serde/serde_json/tempfile are shared with other
+# `setup` also uses fs2 for its install lock; thiserror provides typed setup errors.
+# anyhow/sha2/chrono/serde/serde_json/tempfile are shared with other
 # capabilities (or already non-optional). Optional so a non-setup embedder skips them.
 fs2 = { version = "0.4", optional = true }
 thiserror = { version = "1", optional = true }
@@ -175,7 +175,7 @@ mcp = [
 # coexist) — a per-turn compacted <id>.snapshot for RESUME + an append-only,
 # never-compacted <id>.jsonl transcript for RECALL — plus the SnapshotHook /
 # TranscriptHook / recall tool / current-date hook that drive it. Opt-in (NOT default).
-session = ["dep:dirs", "dep:chrono"]
+session = ["dep:dirs", "dep:chrono", "dep:fs2"]
 # User-driven persistent memory: the production memory.md store (global
 # $ATOMCODE_HOME/memory.md + per-project <root>/.atomcode/memory.md, same files so
 # old/new coexist) + a MemoryHook that injects the merged entries at session_start.
