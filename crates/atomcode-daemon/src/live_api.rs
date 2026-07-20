@@ -2848,9 +2848,10 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
             let new_registry =
                 Arc::new(McpRegistry::from_config_background(&working_dir));
             *state.mcp_registry.write().await = new_registry;
-            // Invalidate the per-project live MCP cache so the next /live turn rebuilds a
-            // fresh registry that now allows the just-trusted project servers (the cached
-            // entry was built while untrusted, with project servers withheld).
+            // Invalidate the per-project cache used by build_turn_parts consumers
+            // (/context, /compact); the live agent turn itself reconnects via the
+            // ReloadHooks command below (the /live turn path takes the cache as
+            // `_mcp_cache` and does not consult it for the actual agent connection).
             live_mcp_cache().write().await.remove(&working_dir);
             // Re-prepare the persistent native runtime so it mounts the newly
             // trusted project servers immediately. Best-effort: before the first

@@ -3495,21 +3495,31 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
 
     let statuses = registry.server_statuses().await;
 
+    let all_cfgs = atomcode_core::mcp::load_mcp_config(&working_dir).unwrap_or_default();
+
+    // Trust / blocked enrichment: compute blocked FIRST so we can exclude them from the
+    // "connecting" synthetic entries below. Blocked (untrusted-project) servers are withheld
+    // — they never connect — so they must NOT appear as "connecting" in the status list while
+    // simultaneously appearing in `blocked[]` (a contradiction the webui rendered).
+    let trusted = atomcode_core::mcp::trust::is_project_trusted(&working_dir);
+    let blocked: Vec<String> =
+        atomcode_core::mcp::trust::partition_by_trust(all_cfgs.clone(), &working_dir)
+            .blocked
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+
     // Surface configured-but-not-yet-connected servers as `connecting` so a slow
     // handshake (especially remote HTTP) renders as "connecting", not an empty
     // panel. Names come from the same user + project mcp.json the registry loads.
-    let all_cfgs = atomcode_core::mcp::load_mcp_config(&working_dir).unwrap_or_default();
-    let configured_names: Vec<String> = all_cfgs.iter().map(|c| c.name.clone()).collect();
-    let statuses = merge_configured_mcp_statuses(statuses, &configured_names);
-
-    // Trust / blocked enrichment: re-partition the configs to derive which
-    // project-source servers are withheld from this session (read-only, cheap).
-    let trusted = atomcode_core::mcp::trust::is_project_trusted(&working_dir);
-    let blocked: Vec<String> = atomcode_core::mcp::trust::partition_by_trust(all_cfgs, &working_dir)
-        .blocked
-        .into_iter()
-        .map(|c| c.name)
+    // Blocked servers are excluded: they aren't "connecting", they're withheld, and they
+    // already appear in the `blocked[]` list above.
+    let configured_names: Vec<String> = all_cfgs
+        .iter()
+        .map(|c| c.name.clone())
+        .filter(|n| !blocked.contains(n))
         .collect();
+    let statuses = merge_configured_mcp_statuses(statuses, &configured_names);
 
     // Fetch the tool list once (was previously re-fetched per connected server).
     let tools = registry.list_all_tools().await;
