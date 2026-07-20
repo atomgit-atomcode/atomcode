@@ -1370,7 +1370,7 @@ pub struct LoopCtx {
     /// the right-aligned usage hint when usage_percent ≥ 80% and the
     /// current model is on a CodingPlan provider.
     pub usage_slot:
-        std::sync::Arc<std::sync::Mutex<Option<atomcode_core::coding_plan::types::UsageInfo>>>,
+        std::sync::Arc<std::sync::Mutex<Option<atomcode_codingplan::types::UsageInfo>>>,
     /// Last time `usage_monitor::spawn_check` was invoked. Used to
     /// enforce `usage_monitor::USAGE_COOLDOWN` on TurnComplete-triggered
     /// refreshes. `None` = no check has run yet this session.
@@ -5942,7 +5942,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 /// + serde parse. Idempotent — when no other process has synced, the
 /// early return skips all work.
 fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
-    let current = atomcode_core::coding_plan::read_last_sync();
+    let current = atomcode_codingplan::read_last_sync();
     let advanced = match (current, ctx.monitor_last_sync_seen) {
         (Some(new), Some(old)) => new > old,
         (Some(_), None) => true, // marker just appeared

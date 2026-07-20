@@ -4014,7 +4014,7 @@ fn render_login_line_from_stored_auth() -> String {
 /// fetch-failure line). `from_stored_auth` returns `AuthExpired` for a dead token but a
 /// PLAIN error when never logged in, so the two stay distinguishable.
 fn render_cp_auth_error(e: &anyhow::Error, fallback: impl FnOnce() -> String) -> String {
-    if atomcode_core::coding_plan::is_auth_expired(e) {
+    if atomcode_codingplan::is_auth_expired(e) {
         t(Msg::StatusCpAuthExpired).into_owned()
     } else {
         fallback()
@@ -4029,7 +4029,7 @@ fn render_cp_auth_error(e: &anyhow::Error, fallback: impl FnOnce() -> String) ->
 /// quick-glance command, so any fetch problem degrades into a visible
 /// note instead of aborting the whole command.
 fn render_codingplan_status_for_status_cmd() -> String {
-    use atomcode_core::coding_plan::client::Client;
+    use atomcode_codingplan::client::Client;
 
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
@@ -4066,7 +4066,7 @@ fn render_codingplan_status_for_status_cmd() -> String {
     // Prefer the per-window `rate_limit_windows` schema when present, mirroring
     // `/login` (setup.rs). Iterate visible short windows (show_enable=1) normally.
     if !status.rate_limit_windows.is_empty() {
-        use atomcode_core::coding_plan::setup::format_duration_secs;
+        use atomcode_codingplan::setup::format_duration_secs;
         for w in status
             .rate_limit_windows
             .iter()
@@ -4094,7 +4094,7 @@ fn render_codingplan_status_for_status_cmd() -> String {
         out.push_str(&t(Msg::StatusCpUsage {
             usage: &u.display_desc(),
             reset_at: &u.reset_at_display,
-            duration: &atomcode_core::coding_plan::setup::format_duration_secs(
+            duration: &atomcode_codingplan::setup::format_duration_secs(
                 u.seconds_until_reset,
             ),
         }));
@@ -4363,7 +4363,7 @@ fn open_usage(
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
 ) {
-    let client = match atomcode_core::coding_plan::client::Client::from_stored_auth() {
+    let client = match atomcode_codingplan::client::Client::from_stored_auth() {
         Ok(c) => c,
         Err(_) => {
             renderer.render(UiLine::CommandOutput(
@@ -4389,7 +4389,7 @@ fn open_usage(
     };
     let overview = usage
         .as_ref()
-        .map(atomcode_core::coding_plan::usage::compute_overview);
+        .map(atomcode_codingplan::usage::compute_overview);
     *active_modal = Some(Box::new(UsageModal::new(UsageData {
         window,
         plan,
@@ -5254,7 +5254,7 @@ mod status_login_tests {
 
     #[test]
     fn cp_auth_error_expired_ignores_fallback_and_prompts_relogin() {
-        use atomcode_core::coding_plan::AuthExpired;
+        use atomcode_codingplan::AuthExpired;
         let err = anyhow::Error::new(AuthExpired { status: 401 });
         let line = render_cp_auth_error(&err, || "FALLBACK".to_string());
         assert!(line.contains("/login"), "auth-expired must prompt /login: {line:?}");
@@ -5621,7 +5621,7 @@ fn run_oauth_with_renderer(
 fn run_coding_plan_blocking(
     config: &atomcode_config::config::Config,
     tel: &std::sync::Arc<atomcode_telemetry::Telemetry>,
-) -> Result<(atomcode_config::config::Config, atomcode_core::coding_plan::SetupReport)> {
+) -> Result<(atomcode_config::config::Config, atomcode_codingplan::SetupReport)> {
     let mut cfg = config.clone();
     let tel = tel.clone();
     // Run on a dedicated OS thread so `reqwest::blocking::Client`'s
@@ -5631,7 +5631,7 @@ fn run_coding_plan_blocking(
     // (`run_login_flow` isn't async) and avoids the need to
     // `Handle::block_on`.
     std::thread::spawn(move || {
-        let report = atomcode_core::coding_plan::run(&mut cfg, Some(&tel));
+        let report = atomcode_codingplan::run(&mut cfg, Some(&tel));
         (cfg, report)
     })
     .join()
@@ -5745,11 +5745,11 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         // Stamp the drift-monitor sync marker alongside the config
         // write. Failures are non-fatal: at worst the 24h staleness
         // hint mis-fires once.
-        let _ = atomcode_core::coding_plan::write_last_sync_now();
+        let _ = atomcode_codingplan::write_last_sync_now();
         // Also bump our own last-seen timestamp so the cross-process
         // sync-check on the next keystroke doesn't redundantly
         // reload the config we just saved ourselves.
-        ctx.monitor_last_sync_seen = atomcode_core::coding_plan::read_last_sync();
+        ctx.monitor_last_sync_seen = atomcode_codingplan::read_last_sync();
         // Update `ctx.model_name` to reflect the new default provider from
         // the just-completed login/setup. This ensures the status line shows
         // the current model immediately rather than the pre-login value.

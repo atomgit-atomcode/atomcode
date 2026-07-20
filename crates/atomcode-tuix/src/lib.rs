@@ -743,7 +743,7 @@ pub async fn run(
         // Seed with whatever's on disk now — any NEWER mtime observed
         // later means another atomcode process resynced and our drift
         // warning (if any) is stale.
-        monitor_last_sync_seen: atomcode_core::coding_plan::read_last_sync(),
+        monitor_last_sync_seen: atomcode_codingplan::read_last_sync(),
         wake_rx,
         wake_tx: wake_tx.clone(),
         oauth_event_rx,

@@ -3,8 +3,8 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use atomcode_core::coding_plan::types::{PlanInfo, RateLimitWindow};
-use atomcode_core::coding_plan::usage::{compute_overview, humanize_tokens, OverviewStats, UsageResponse};
+use atomcode_codingplan::types::{PlanInfo, RateLimitWindow};
+use atomcode_codingplan::usage::{compute_overview, humanize_tokens, OverviewStats, UsageResponse};
 
 use super::{Modal, ModalAction};
 use crate::event_loop::{build_status, Buffer, LoopCtx};
@@ -828,7 +828,7 @@ fn align_stat_lines(pairs: &[(String, String)], muted: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::coding_plan::usage::{compute_overview, parse_usage};
+    use atomcode_codingplan::usage::{compute_overview, parse_usage};
 
     // Small inline sample — matches the shape from usage.rs core tests
     const SAMPLE: &str = r#"{
@@ -1076,7 +1076,7 @@ mod tests {
 
     #[test]
     fn current_rows_shows_plan_info_when_present() {
-        use atomcode_core::coding_plan::types::PlanInfo;
+        use atomcode_codingplan::types::PlanInfo;
         let plan = PlanInfo {
             plan_name: "CodingPlan Pro".into(),
             status: 1,
