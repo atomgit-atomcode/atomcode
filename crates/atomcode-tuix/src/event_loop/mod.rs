@@ -12464,6 +12464,16 @@ fn handle_agent_event(
             handle_undo_failure(requested, available, renderer);
         }
         AgentEvent::Error { error, snapshot } => {
+            // A `reasoning_effort` rejection (openai_compat's
+            // `effort_unsupported_error`) auto-disables the field at the provider
+            // for the rest of the session. Clear the footer indicator so it stops
+            // showing e.g. `[max]` for a value that is no longer being sent. The
+            // config value is untouched (a fresh session re-syncs it and re-heals).
+            // Coupled to the token in that error message; must be checked BEFORE
+            // `error` is moved into the render below.
+            if error.contains("reasoning_effort") {
+                ctx.reasoning_effort = None;
+            }
             // Seal the reply buffer (any text streamed before the error stays
             // copyable via `/copy`).
             state.response_finalized = true;
