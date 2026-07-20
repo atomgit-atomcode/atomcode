@@ -2710,6 +2710,10 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
             let new_registry =
                 Arc::new(McpRegistry::from_config_background(&working_dir));
             *state.mcp_registry.write().await = new_registry;
+            // Invalidate the per-project live MCP cache so the next /live turn rebuilds a
+            // fresh registry that now allows the just-trusted project servers (the cached
+            // entry was built while untrusted, with project servers withheld).
+            live_mcp_cache().write().await.remove(&working_dir);
             Json(serde_json::json!({ "ok": true, "trusted": true })).into_response()
         }
         Err(e) => (
