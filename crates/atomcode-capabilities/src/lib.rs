@@ -82,6 +82,12 @@ pub(crate) mod proxy;
 /// [`pathutil`]. Free of any feature `cfg` because `codeintel` is independent of `tools`.
 pub(crate) mod pathutil;
 
+/// Cross-platform atomic file write (tempfile → fsync → persist → parent-dir fsync).
+/// Ported from `atomcode-core`'s `fs_atomic` for the `plugin` feature (trust store).
+/// Opt-in behind `feature = "plugin"`.
+#[cfg(feature = "plugin")]
+pub mod fs;
+
 #[cfg(feature = "provider")]
 pub mod provider;
 
