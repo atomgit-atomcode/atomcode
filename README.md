@@ -454,42 +454,35 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 
 ## Architecture
 
-AtomCode is a Rust workspace with four crates:
+AtomCode is a layered Rust workspace:
 
 ```
 atomcode/
   crates/
-    atomcode-core/     # Headless library — no TUI dependency
-      agent/           # AgentLoop: autonomous tool-use loop
-      turn/            # TurnRunner, datalog, permission decider
-      config/          # Config loading, provider configs
-      conversation/    # Message types, windowed context
-      provider/        # LlmProvider trait + OpenAI/Claude/Ollama
-      tool/            # Tool trait + built-in tool implementations
-      session/         # Persistent sessions
-      skill.rs         # User-defined skills
-
-    atomcode-tuix/     # Terminal UI — retained-mode renderer (CC-style normal mode)
-      event_loop/      # App state machine, command dispatch
-      render/          # Cell-based renderer, diff, retained-mode frame loop
-      modals/          # Picker UIs (dir, model, session, provider, issue)
-
-    atomcode-cli/      # Binary entry point (TUI + headless -p mode)
-      main.rs          # CLI args, first-run wizard, launch
-      auth/            # AtomGit OAuth client
-
-    atomcode-daemon/   # HTTP/SSE API server over atomcode-core
+    atomcode-kernel/        # Neutral agent loop and runtime traits
+    atomcode-capabilities/  # Providers, tools, MCP, skills, sessions, memory
+    atomcode-coding/        # Coding specialization and CodingRuntime lifecycle
+    atomcode-review/        # Review specialization
+    atomcode-tuix/          # Terminal UI
+    atomcode-cli/           # TUI and headless entry point
+    atomcode-daemon/        # HTTP/SSE/WebSocket transport
+    atomcode-core/          # Transitional session/plugin/live compatibility code
 ```
+
+The coding path is `CLI/TUI/daemon → CodingRuntime → kernel`. The retired core
+agent protocol and `atomcode-bridge` are no longer part of the runtime path.
 
 ### Design Principles
 
 1. **Tech-stack agnostic** — never hardcodes language-specific logic. Detects project type dynamically from descriptor files (`package.json`, `Cargo.toml`, `pyproject.toml`, `pom.xml`, etc.).
 
-2. **Decoupled agent** — `AgentLoop` runs as an independent async task, communicating with the TUI via channels (`AgentCommand` / `AgentEvent`). The core library has zero TUI dependencies, which is also what makes the daemon possible.
+2. **Single runtime owner** — `CodingRuntime` owns the live coding agent, provider/session lifecycle, pending requests, snapshots, and controllers. Drivers handle input, presentation, and transport without rebuilding a second agent runtime.
 
 3. **Tool safety** — all destructive operations require explicit user approval. Tool failures become LLM observations, never panics.
 
 4. **Context-aware** — token-budget-aware conversation windowing, project file-tree injection, and per-turn system reminders keep the model focused without exceeding context limits.
+
+5. **Directed dependencies** — kernel stays neutral; capabilities and coding stay free of `atomcode-core`; legacy session data is handled at an explicit compatibility boundary rather than as a runtime fallback.
 
 ## Project Instruction File
 

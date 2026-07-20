@@ -449,42 +449,35 @@ atomcode --prompt-file task.md
 
 ## 架构
 
-AtomCode 是一个 Rust workspace，由四个 crate 组成：
+AtomCode 是一个分层的 Rust workspace：
 
 ```
 atomcode/
   crates/
-    atomcode-core/     # 无头核心库，不依赖 TUI
-      agent/           # AgentLoop：自主工具调用循环
-      turn/            # TurnRunner、datalog、权限决策器
-      config/          # 配置加载、provider 配置
-      conversation/    # 消息类型、窗口化上下文
-      provider/        # LlmProvider trait + OpenAI/Claude/Ollama
-      tool/            # Tool trait + 内置工具实现
-      session/         # 持久化会话
-      skill.rs         # 用户自定义 skill
-
-    atomcode-tuix/     # 终端 UI — retained-mode 渲染器（CC 风格 normal mode）
-      event_loop/      # App 状态机、命令分发
-      render/          # cell-level 渲染器、diff、retained-mode 帧循环
-      modals/          # 各种 picker（dir、model、session、provider、issue）
-
-    atomcode-cli/      # 可执行入口（TUI + headless -p 模式）
-      main.rs          # CLI 参数、首次运行向导、启动
-      auth/            # AtomGit OAuth 客户端
-
-    atomcode-daemon/   # 基于 atomcode-core 的 HTTP/SSE API 服务
+    atomcode-kernel/        # 中立 agent 循环与运行时 trait
+    atomcode-capabilities/  # provider、tools、MCP、skills、session、memory
+    atomcode-coding/        # coding 专业化与 CodingRuntime 生命周期
+    atomcode-review/        # 代码评审专业化
+    atomcode-tuix/          # 终端 UI
+    atomcode-cli/           # TUI 与 headless 入口
+    atomcode-daemon/        # HTTP/SSE/WebSocket 传输层
+    atomcode-core/          # 过渡期 session/plugin/live 兼容代码
 ```
+
+coding 主调用链是 `CLI/TUI/daemon → CodingRuntime → kernel`。已经退役的 core agent
+协议和 `atomcode-bridge` 不再位于运行时路径中。
 
 ### 设计原则
 
 1. **技术栈无关** —— 核心引擎不硬编码任何特定语言的逻辑，通过 `package.json`、`Cargo.toml`、`pyproject.toml`、`pom.xml` 等描述文件动态探测项目类型。
 
-2. **Agent 解耦** —— `AgentLoop` 作为独立的异步任务运行，通过 channel（`AgentCommand` / `AgentEvent`）与 TUI 通信。核心库完全不依赖 TUI，这也是 daemon 得以存在的基础。
+2. **单一运行时所有者** —— `CodingRuntime` 统一拥有 live coding agent、provider/session 生命周期、pending request、snapshot 和 controller。driver 只负责输入、展示和传输，不重建第二套 agent runtime。
 
 3. **工具安全** —— 所有破坏性操作必须经用户显式确认。工具失败会作为 observation 返回给模型，绝不 panic。
 
 4. **上下文感知** —— token 预算感知的会话窗口、项目文件树注入、每轮系统提醒，在不超出上下文限制的同时让模型保持专注。
+
+5. **依赖单向** —— kernel 保持中立；capabilities 和 coding 保持 core-free；历史 session 数据只在显式兼容边界处理，不作为 runtime fallback。
 
 ## 项目指令文件
 
