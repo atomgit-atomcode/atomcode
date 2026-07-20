@@ -12370,6 +12370,7 @@ mod tests {
                 ApprovalOption { label: "Deny".into(), kind: ApprovalKind::Deny, accel: 'n' },
             ],
             selected: 0,
+            cache_key: String::new(),
         };
         // Digit routing: index = (c as usize) - ('1' as usize).
         // '1' → idx 0 → AllowOnce

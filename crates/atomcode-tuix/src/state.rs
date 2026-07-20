@@ -39,6 +39,7 @@ pub struct ApprovalPanel {
     pub detail: String,
     pub options: Vec<ApprovalOption>,
     pub selected: usize,
+    pub cache_key: String,
 }
 
 impl ApprovalPanel {
@@ -2143,6 +2144,7 @@ mod tests {
                 ApprovalOption { label: "Deny".into(), kind: ApprovalKind::Deny, accel: 'n' },
             ],
             selected: 0,
+            cache_key: String::new(),
         };
         p.move_up();
         assert_eq!(p.selected, 2, "up from 0 wraps to last");

@@ -2363,6 +2363,7 @@ fn execute_slash_command_impl(
                             selected: 0,
                             tool: tool_name,
                             detail,
+                            cache_key: String::new(),
                         });
                         state.on_approval_needed("");
                     }

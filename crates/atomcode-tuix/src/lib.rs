@@ -719,6 +719,7 @@ pub async fn run(
         model_name,
         runtime,
         pending_runtime_request_id: None,
+        allowed_always: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         native_tools: std::collections::HashMap::new(),
         shutdown_deadline: None,
         runtime_spawn_override,

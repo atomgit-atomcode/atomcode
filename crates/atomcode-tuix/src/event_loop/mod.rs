@@ -1306,9 +1306,9 @@ pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
     pub runtime: RuntimeControl,
-    /// Native runtime request currently represented by the local approval panel.
-    /// Sync-mode approvals are owned by `LiveSession` and do not use this slot.
     pub pending_runtime_request_id: Option<atomcode_kernel::event::RequestId>,
+    /// Cache of "Always Allow" tool/command decisions for the active TUI session.
+    pub allowed_always: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub native_tools:
         std::collections::HashMap<String, (String, std::time::Instant)>,
     /// Force-exit watchdog deadline. Armed by [`arm_shutdown_watchdog`] when the
@@ -8980,6 +8980,20 @@ fn approval_choice_to_decision(choice: ApprovalChoice) -> atomcode_core::tool::P
     }
 }
 
+fn get_approval_cache_key(tool: &str, args: &str) -> String {
+    if tool == "bash" {
+        let command = if let Ok(val) = serde_json::from_str::<serde_json::Value>(args) {
+            val.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        } else {
+            args.to_string()
+        };
+        let normalized = atomcode_capabilities::tools::normalize_command_for_grant(&command);
+        format!("bash::{normalized}")
+    } else {
+        format!("{tool}::")
+    }
+}
+
 /// The three approval options for `tool`, in display order (Allow once is the
 /// default selection). The "Always allow" label carries the tool name because
 /// `AgentEvent::ApprovalNeeded` does not carry the grant scope — except for the
@@ -9587,6 +9601,14 @@ fn handle_approval_key(
         return Ok(());
     };
     let choice = approval_kind_to_choice(kind);
+    if choice == ApprovalChoice::AllowAlways {
+        if let Some(p) = &app.state.approval_panel {
+            if !p.cache_key.is_empty() {
+                let mut guard = ctx.allowed_always.lock().unwrap();
+                guard.insert(p.cache_key.clone());
+            }
+        }
+    }
     deliver_approval(ctx, choice);
     app.state.on_approval_resolved(); // clears approval_panel + phase → Streaming
                                       // Repaint the footer NOW so the approval panel disappears immediately, the
@@ -12077,6 +12099,15 @@ fn handle_agent_event(
             snapshot,
             ..
         } => {
+            let cache_key = get_approval_cache_key(&tool_name, &call.arguments);
+            let already_allowed = {
+                let guard = ctx.allowed_always.lock().unwrap();
+                guard.contains(&cache_key)
+            };
+            if already_allowed {
+                deliver_approval(ctx, ApprovalChoice::AllowAlways);
+                return;
+            }
             // BYPASS mode (`--dangerously-skip-permissions`): auto-approve and
             // skip the prompt entirely. In LOCAL mode the core decider already
             // short-circuits, so this event never fires there. But in SYNC mode
@@ -12148,6 +12179,7 @@ fn handle_agent_event(
                 detail: detail.clone(),
                 options: build_approval_options(&display),
                 selected: 0,
+                cache_key,
             });
             renderer.flush();
             atomcode_capabilities::notify::notify(
