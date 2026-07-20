@@ -655,6 +655,7 @@ version = "5.0.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "atomcode-auth",
  "atomcode-capabilities",
  "atomcode-coding",
  "atomcode-codingplan",

@@ -586,7 +586,7 @@ pub async fn run(
     // Mirror channel for /plugin add|update|install so git latency never
     // stalls the input loop. See LoopCtx::plugin_job_tx for the rationale.
     let (plugin_job_tx, plugin_job_rx) =
-        tokio::sync::mpsc::unbounded_channel::<atomcode_core::plugin::PluginJobEvent>();
+        tokio::sync::mpsc::unbounded_channel::<atomcode_capabilities::plugin::PluginJobEvent>();
 
     // Seed the recent-project-dirs ring from disk and guarantee the
     // current working dir sits at index 0 so the `/cd` picker always
@@ -635,7 +635,7 @@ pub async fn run(
         let job_tx = plugin_job_tx.clone();
         tokio::spawn(async move {
             let events = tokio::task::spawn_blocking(move || {
-                let events = atomcode_core::plugin::bootstrap::run_startup_hooks(&cfg);
+                let events = atomcode_capabilities::plugin::bootstrap::run_startup_hooks(&cfg);
                 // Refresh the shared SkillRegistry from disk so the
                 // freshly-installed skills are visible to the slash
                 // menu + agent loop without a restart.

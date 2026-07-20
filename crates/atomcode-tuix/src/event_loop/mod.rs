@@ -1421,8 +1421,8 @@ pub struct LoopCtx {
     /// clone/pull and pushes a `PluginJobEvent` here when done. Mirrors the
     /// `upgrade_tx`/`rx` layout so the event loop only has to add a single
     /// `select!` arm. Unbounded — events are tiny terminal results.
-    pub plugin_job_tx: mpsc::UnboundedSender<atomcode_core::plugin::PluginJobEvent>,
-    pub plugin_job_rx: mpsc::UnboundedReceiver<atomcode_core::plugin::PluginJobEvent>,
+    pub plugin_job_tx: mpsc::UnboundedSender<atomcode_capabilities::plugin::PluginJobEvent>,
+    pub plugin_job_rx: mpsc::UnboundedReceiver<atomcode_capabilities::plugin::PluginJobEvent>,
     /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
     /// option 0 (Set up CodingPlan). The event loop drains this on
     /// modal close and runs the full `/login` flow (OAuth if needed →
@@ -4715,8 +4715,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     {
         // Run migration first so pre-existing plugins are grandfathered before
         // we query trust status — prevents the banner from wrongly listing them.
-        atomcode_core::plugin::hook_trust::ensure_migrated();
-        let untrusted: Vec<_> = atomcode_core::plugin::installed_plugin_hook_trust_status()
+        atomcode_capabilities::plugin::hook_trust::ensure_migrated();
+        let untrusted: Vec<_> = atomcode_capabilities::plugin::installed_plugin_hook_trust_status()
             .into_iter()
             .filter(|s| !s.trusted)
             .collect();
@@ -8169,7 +8169,7 @@ pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
     if ctx.is_plain_renderer {
         return false;
     }
-    ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none()
+    ctx.config.providers.is_empty() && atomcode_auth::get_stored_auth().is_none()
 }
 
 /// Extract current + latest version from the `ALREADY_LATEST` error
@@ -9830,12 +9830,12 @@ fn handle_user_input_key(
 /// emitted by the previous synchronous path in `handle_plugin` so users see
 /// the same wording — only the timing changes.
 pub(super) fn handle_plugin_job_event(
-    ev: atomcode_core::plugin::PluginJobEvent,
+    ev: atomcode_capabilities::plugin::PluginJobEvent,
     ctx: &mut LoopCtx,
     state: &mut crate::state::UiState,
     renderer: &mut dyn Renderer,
 ) {
-    use atomcode_core::plugin::PluginJobEvent;
+    use atomcode_capabilities::plugin::PluginJobEvent;
     match ev {
         PluginJobEvent::MarketplaceAdded(info) => {
             // Marketplace add by itself doesn't load any skills (those come
@@ -13637,7 +13637,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     //   2. Upgrade-available hint (existing behavior).
     //   3. None.
     let no_provider =
-        ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none();
+        ctx.config.providers.is_empty() && atomcode_auth::get_stored_auth().is_none();
     // Open-source build pointed at an AtomGit gateway: any chat will
     // fail-fast with `CpOfficialBuildRequired`. Surface that diagnosis
     // up front (red, beats every other hint) so the user doesn't have

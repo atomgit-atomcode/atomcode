@@ -64,7 +64,7 @@ impl CustomCommandRegistry {
         Self::load_from_dir(&config_dir.join("commands"), None, &mut commands);
         Self::load_from_dir(&project_root.join(".atomcode/commands"), None, &mut commands);
         // Plugin layer
-        for assets in atomcode_core::plugin::loader::iter_installed_plugin_assets() {
+        for assets in atomcode_capabilities::plugin::loader::iter_installed_plugin_assets() {
             Self::load_from_dir(&assets.commands_dir(), Some(&assets.plugin), &mut commands);
         }
         Self { commands }

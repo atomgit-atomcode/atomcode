@@ -18,10 +18,10 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use atomcode_core::plugin::installer::InstalledPluginInfo;
-use atomcode_core::plugin::marketplace::MarketplaceInfo;
-use atomcode_core::plugin::InstallScope;
-use atomcode_core::plugin::PluginJobEvent;
+use atomcode_capabilities::plugin::installer::InstalledPluginInfo;
+use atomcode_capabilities::plugin::marketplace::MarketplaceInfo;
+use atomcode_capabilities::plugin::InstallScope;
+use atomcode_capabilities::plugin::PluginJobEvent;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
@@ -124,13 +124,13 @@ impl PluginManager {
 
     fn all_browse_plugins(&self) -> Vec<BrowsePluginItem> {
         let mut items = Vec::new();
-        let root_opt = atomcode_core::plugin::marketplaces_root();
+        let root_opt = atomcode_capabilities::plugin::marketplaces_root();
 
         for m in &self.marketplaces {
             let mut descriptions = std::collections::HashMap::new();
             if let Some(ref root) = root_opt {
                 let mp_dir = root.join(&m.name);
-                if let Ok(Some(manifest)) = atomcode_core::plugin::load_marketplace_manifest(&mp_dir) {
+                if let Ok(Some(manifest)) = atomcode_capabilities::plugin::load_marketplace_manifest(&mp_dir) {
                     for p in manifest.plugins {
                         if let Some(desc) = p.description {
                             descriptions.insert(p.name, desc);
@@ -227,8 +227,8 @@ impl PluginManager {
 
     fn reload(&mut self) {
         self.marketplaces =
-            atomcode_core::plugin::marketplace::list_marketplaces().unwrap_or_default();
-        self.installed = atomcode_core::plugin::installer::list_installed().unwrap_or_default();
+            atomcode_capabilities::plugin::marketplace::list_marketplaces().unwrap_or_default();
+        self.installed = atomcode_capabilities::plugin::installer::list_installed().unwrap_or_default();
         let n = self.current_len();
         if n == 0 {
             self.selected = 0;
@@ -274,24 +274,24 @@ impl PluginManager {
         let mut version = None;
         let mut description = None;
 
-        if let Some(root) = atomcode_core::plugin::marketplaces_root() {
+        if let Some(root) = atomcode_capabilities::plugin::marketplaces_root() {
             let mp_dir = root.join(mp);
 
             // 1. Try to get details from the marketplace manifest first (as it contains details for both inline and external plugins)
-            if let Ok(Some(mp_manifest)) = atomcode_core::plugin::load_marketplace_manifest(&mp_dir) {
+            if let Ok(Some(mp_manifest)) = atomcode_capabilities::plugin::load_marketplace_manifest(&mp_dir) {
                 if let Some(p) = mp_manifest.plugins.iter().find(|p| p.name == plugin || sanitize(&p.name) == plugin) {
                     version = p.version.clone();
                     description = p.description.clone();
 
                     // If it is an inline plugin, we can try to read its actual plugin.json for more accurate / updated details
-                    if let atomcode_core::plugin::PluginSource::Inline(ref path) = p.source {
+                    if let atomcode_capabilities::plugin::PluginSource::Inline(ref path) = p.source {
                         let normalized = path.trim_start_matches("./");
                         let dir = if normalized.is_empty() {
                             mp_dir.clone()
                         } else {
                             mp_dir.join(normalized)
                         };
-                        if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&dir) {
+                        if let Ok(manifest) = atomcode_capabilities::plugin::load_plugin_manifest(&dir) {
                             if manifest.version.is_some() {
                                 version = manifest.version;
                             }
@@ -306,14 +306,14 @@ impl PluginManager {
             // 2. Fall back to loading from mp_dir/plugin (or mp_dir itself) if not found in marketplace manifest
             if version.is_none() && description.is_none() {
                 let plugin_dir = mp_dir.join(plugin);
-                if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&plugin_dir) {
+                if let Ok(manifest) = atomcode_capabilities::plugin::load_plugin_manifest(&plugin_dir) {
                     if manifest.version.is_some() || manifest.description.is_some() {
                         version = manifest.version;
                         description = manifest.description;
                     }
                 }
                 if version.is_none() && description.is_none() {
-                    if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&mp_dir) {
+                    if let Ok(manifest) = atomcode_capabilities::plugin::load_plugin_manifest(&mp_dir) {
                         version = manifest.version;
                         description = manifest.description;
                     }
@@ -324,13 +324,13 @@ impl PluginManager {
     }
 
     fn get_installed_plugin_details(&self, plugin: &str, mp: &str, scope: &InstallScope) -> (Option<String>, Option<String>) {
-        let root_opt = atomcode_core::plugin::plugins_root();
+        let root_opt = atomcode_capabilities::plugin::plugins_root();
         let cwd = std::env::current_dir().ok();
         let dir_opt = match scope {
             InstallScope::User => root_opt,
             InstallScope::Project | InstallScope::Local => {
                 if let Some(ref wd) = cwd {
-                    atomcode_core::plugin::project_plugins_root(wd, scope)
+                    atomcode_capabilities::plugin::project_plugins_root(wd, scope)
                 } else {
                     None
                 }
@@ -339,7 +339,7 @@ impl PluginManager {
         if let Some(root) = dir_opt {
             if let Some(info) = self.installed.iter().find(|i| i.plugin == plugin && i.marketplace == mp && i.scope == *scope) {
                 let plugin_dir = root.join(&info.plugin_dir);
-                if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&plugin_dir) {
+                if let Ok(manifest) = atomcode_capabilities::plugin::load_plugin_manifest(&plugin_dir) {
                     let version = manifest.version;
                     let description = manifest.description;
                     if version.is_some() || description.is_some() {
@@ -369,8 +369,8 @@ impl PluginManager {
             self.pending = Some(t(Msg::PluginMgrInstalling { plugin: &plugin }).into_owned());
         }
         tokio::task::spawn_blocking(move || {
-            let _ = atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope.clone());
-            let ev = match atomcode_core::plugin::installer::install(&plugin, &mp, scope) {
+            let _ = atomcode_capabilities::plugin::installer::uninstall(&plugin, &mp, scope.clone());
+            let ev = match atomcode_capabilities::plugin::installer::install(&plugin, &mp, scope) {
                 Ok(info) => {
                     if is_update {
                         PluginJobEvent::PluginUpdated(info)
@@ -380,7 +380,7 @@ impl PluginManager {
                 }
                 Err(e) => {
                     if let Some(aie) = e
-                        .downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>(
+                        .downcast_ref::<atomcode_capabilities::plugin::installer::AlreadyInstalledError>(
                     ) {
                         PluginJobEvent::PluginAlreadyInstalled { id: aie.id.clone() }
                     } else {
@@ -396,7 +396,7 @@ impl PluginManager {
         let tx = ctx.plugin_job_tx.clone();
         self.pending = Some(t(Msg::PluginMgrCloning).into_owned());
         tokio::task::spawn_blocking(move || {
-            let ev = match atomcode_core::plugin::marketplace::add_marketplace(&url) {
+            let ev = match atomcode_capabilities::plugin::marketplace::add_marketplace(&url) {
                 Ok(info) => PluginJobEvent::MarketplaceAdded(info),
                 Err(e) => PluginJobEvent::Failed { op: "add".into(), msg: format!("{:#}", e) },
             };
@@ -477,7 +477,7 @@ impl PluginManager {
             .cloned()
             .collect();
         for i in installed_from_mp {
-            if let Err(e) = atomcode_core::plugin::installer::uninstall(&i.plugin, &i.marketplace, i.scope) {
+            if let Err(e) = atomcode_capabilities::plugin::installer::uninstall(&i.plugin, &i.marketplace, i.scope) {
                 renderer.render(crate::render::UiLine::Error(format!(
                     "Failed to auto-uninstall plugin '{}': {:#}",
                     i.plugin, e
@@ -485,7 +485,7 @@ impl PluginManager {
             }
         }
 
-        match atomcode_core::plugin::marketplace::remove_marketplace(&name) {
+        match atomcode_capabilities::plugin::marketplace::remove_marketplace(&name) {
             Ok(()) => {
                 reload_plugins(ctx);
                 renderer.render(UiLine::CommandOutput(
@@ -503,7 +503,7 @@ impl PluginManager {
         let tx = ctx.plugin_job_tx.clone();
         self.pending = Some(format!("Updating marketplace '{}'...", name));
         tokio::task::spawn_blocking(move || {
-            let ev = match atomcode_core::plugin::marketplace::update_marketplace(&name) {
+            let ev = match atomcode_capabilities::plugin::marketplace::update_marketplace(&name) {
                 Ok(info) => PluginJobEvent::MarketplaceUpdated(info),
                 Err(e) => PluginJobEvent::Failed { op: "update".into(), msg: format!("{:#}", e) },
             };
@@ -561,7 +561,7 @@ impl PluginManager {
         let plugins = self.filtered_browse_plugins();
         let Some(item) = plugins.get(self.selected - 1) else { return };
         let name = item.marketplace.clone();
-        match atomcode_core::plugin::marketplace::remove_marketplace(&name) {
+        match atomcode_capabilities::plugin::marketplace::remove_marketplace(&name) {
             Ok(()) => {
                 reload_plugins(ctx);
                 renderer.render(UiLine::CommandOutput(
@@ -594,7 +594,7 @@ impl PluginManager {
         match self.selected {
             0 => {
                 // Uninstall
-                match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
+                match atomcode_capabilities::plugin::installer::uninstall(&plugin, &mp, scope) {
                     Ok(()) => {
                         reload_plugins(ctx);
                         renderer.render(UiLine::CommandOutput(
@@ -673,9 +673,9 @@ impl PluginManager {
                     return (Vec::new(), hint);
                 }
 
-                let root_opt = atomcode_core::plugin::plugins_root();
+                let root_opt = atomcode_capabilities::plugin::plugins_root();
                 let cwd = std::env::current_dir().ok();
-                let mp_root_opt = atomcode_core::plugin::marketplaces_root();
+                let mp_root_opt = atomcode_capabilities::plugin::marketplaces_root();
                 let mut descriptions = std::collections::HashMap::new();
                 for i in &inst {
                     let mut found_desc = None;
@@ -683,7 +683,7 @@ impl PluginManager {
                         InstallScope::User => root_opt.clone(),
                         InstallScope::Project | InstallScope::Local => {
                             if let Some(ref wd) = cwd {
-                                atomcode_core::plugin::project_plugins_root(wd, &i.scope)
+                                atomcode_capabilities::plugin::project_plugins_root(wd, &i.scope)
                             } else {
                                 None
                             }
@@ -691,7 +691,7 @@ impl PluginManager {
                     };
                     if let Some(root) = dir_opt {
                         let plugin_dir = root.join(&i.plugin_dir);
-                        if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&plugin_dir) {
+                        if let Ok(manifest) = atomcode_capabilities::plugin::load_plugin_manifest(&plugin_dir) {
                             if let Some(desc) = manifest.description {
                                 if !desc.trim().is_empty() {
                                     found_desc = Some(desc);
@@ -702,7 +702,7 @@ impl PluginManager {
                     if found_desc.is_none() {
                         if let Some(ref mp_root) = mp_root_opt {
                             let mp_dir = mp_root.join(&i.marketplace);
-                            if let Ok(Some(mp_manifest)) = atomcode_core::plugin::load_marketplace_manifest(&mp_dir) {
+                            if let Ok(Some(mp_manifest)) = atomcode_capabilities::plugin::load_marketplace_manifest(&mp_dir) {
                                 if let Some(p) = mp_manifest.plugins.iter().find(|p| p.name == i.plugin || sanitize(&p.name) == i.plugin) {
                                     if let Some(desc) = &p.description {
                                         if !desc.trim().is_empty() {
@@ -1321,7 +1321,7 @@ impl Modal for PluginManager {
                 // Best-effort rollback — if this fails the stale dir
                 // cleanup logic in install_external will handle it on
                 // the next install attempt.
-                let _ = atomcode_core::plugin::installer::uninstall(
+                let _ = atomcode_capabilities::plugin::installer::uninstall(
                     &info.plugin,
                     &info.marketplace,
                     info.scope.clone(),
@@ -1350,7 +1350,7 @@ impl Modal for PluginManager {
 }
 
 fn get_directory_modified_date(name: &str) -> String {
-    if let Some(root) = atomcode_core::plugin::marketplaces_root() {
+    if let Some(root) = atomcode_capabilities::plugin::marketplaces_root() {
         let dir = root.join(name);
         let target = if dir.join(".atomcode-plugin/marketplace.json").exists() {
             dir.join(".atomcode-plugin/marketplace.json")

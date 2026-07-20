@@ -324,7 +324,7 @@ pub struct OnboardingWizard {
     /// no manual Enter required. `None` after a take, after an Esc,
     /// or when `start_login()` itself errored at construction.
     pub(super) pending_session:
-        Option<atomcode_core::auth::oauth::LoginSession>,
+        Option<atomcode_auth::oauth::LoginSession>,
 }
 
 impl OnboardingWizard {
@@ -367,7 +367,7 @@ impl OnboardingWizard {
     /// / `$LANG` (i18n step gone); user can switch later via
     /// `/language`.
     ///
-    /// Synchronously calls [`atomcode_core::auth::oauth::start_login`]
+    /// Synchronously calls [`atomcode_auth::oauth::start_login`]
     /// up front so the QR is paintable the moment the modal opens.
     /// On network failure the error is stashed on the wizard and
     /// rendered in place of the QR — Esc bails, Enter retries via
@@ -380,7 +380,7 @@ impl OnboardingWizard {
     /// loop.
     pub fn new_qr_fast_path() -> Self {
         let (qr_login_url, qr_login_error, pending_session) =
-            match atomcode_core::auth::oauth::start_login() {
+            match atomcode_auth::oauth::start_login() {
                 Ok(session) => (Some(session.url().to_string()), None, Some(session)),
                 Err(e) => (None, Some(format!("{e:#}")), None),
             };
@@ -404,7 +404,7 @@ impl OnboardingWizard {
     /// return None and are harmless.
     pub fn take_pending_session(
         &mut self,
-    ) -> Option<atomcode_core::auth::oauth::LoginSession> {
+    ) -> Option<atomcode_auth::oauth::LoginSession> {
         self.pending_session.take()
     }
 
@@ -958,7 +958,7 @@ impl crate::modals::Modal for OnboardingWizard {
                 // panel content is unchanged; the browser launch is
                 // a pure side effect.
                 if let Some(url) = &self.qr_login_url {
-                    let _ = atomcode_core::auth::oauth::open_browser(url);
+                    let _ = atomcode_auth::oauth::open_browser(url);
                 }
                 Ok(ModalAction::Continue)
             }
@@ -969,7 +969,7 @@ impl crate::modals::Modal for OnboardingWizard {
                 // round-trip, store either url or error, AND on success
                 // spawn a fresh background poll thread so the new
                 // session auto-completes the way the original did.
-                match atomcode_core::auth::oauth::start_login() {
+                match atomcode_auth::oauth::start_login() {
                     Ok(session) => {
                         self.qr_login_url = Some(session.url().to_string());
                         self.qr_login_error = None;

@@ -795,7 +795,7 @@ struct RelayBinaryEntry {
 
 /// 获取 relay-client 远端版本清单。
 async fn fetch_relay_manifest() -> Result<RelayManifest, String> {
-    let token = atomcode_core::auth::oauth::get_valid_token()
+    let token = atomcode_auth::oauth::get_valid_token()
         .map_err(|_| "未登录 GitCode。请先在 atomcode 中执行 /login 登录账号".to_string())?;
 
     let client = reqwest::Client::builder()
@@ -1074,7 +1074,7 @@ async fn download_relay_client(
     }
 
     // 获取 GitCode OAuth token（用户需先 /login）
-    let token = atomcode_core::auth::oauth::get_valid_token()
+    let token = atomcode_auth::oauth::get_valid_token()
         .map_err(|_| "未登录 GitCode。请先在 atomcode 中执行 /login 登录账号".to_string())?;
 
     // 构建 HTTP 客户端 + 添加鉴权头
@@ -1329,23 +1329,23 @@ fn execute_slash_command_impl(
                     renderer.flush();
 
                     tokio::task::spawn_blocking(move || {
-                        let ev = match atomcode_core::plugin::installer::ensure_plugin_installed(
+                        let ev = match atomcode_capabilities::plugin::installer::ensure_plugin_installed(
                             "atomcode",
                             "atomcode-skills",
                             "https://atomgit.com/atomgit_atomcode/atomcode-skills.git",
                         ) {
                             Ok(info) => {
-                                atomcode_core::plugin::PluginJobEvent::PluginInstalled(info)
+                                atomcode_capabilities::plugin::PluginJobEvent::PluginInstalled(info)
                             }
                             Err(e) => {
                                 if let Some(_aie) = e.downcast_ref::<
-                                    atomcode_core::plugin::installer::AlreadyInstalledError,
+                                    atomcode_capabilities::plugin::installer::AlreadyInstalledError,
                                 >() {
-                                    atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                    atomcode_capabilities::plugin::PluginJobEvent::PluginAlreadyInstalled {
                                         id: _aie.id.clone(),
                                     }
                                 } else {
-                                    atomcode_core::plugin::PluginJobEvent::Failed {
+                                    atomcode_capabilities::plugin::PluginJobEvent::Failed {
                                         op: "install".into(),
                                         msg: format!("{:#}", e),
                                     }
@@ -1962,7 +1962,7 @@ fn execute_slash_command_impl(
                             initial,
                         );
                         // 1.5) 检查登录态：未登录不允许开启远程访问。
-                        if atomcode_core::auth::oauth::get_stored_auth().is_none() {
+                        if atomcode_auth::oauth::get_stored_auth().is_none() {
                             renderer.render(UiLine::CommandOutput(
                                 "远程访问需要先登录。输入 /login 完成登录后，再执行 /app。".to_string(),
                             ));
@@ -1976,7 +1976,7 @@ fn execute_slash_command_impl(
                         atomcode_daemon::stop_app_server();
                         //    传入当前登录 user_id 启用双向校验。
                         let app_user_id =
-                            atomcode_core::auth::oauth::get_stored_auth().map(|a| a.user.id);
+                            atomcode_auth::oauth::get_stored_auth().map(|a| a.user.id);
                         let started = tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(
                                 atomcode_daemon::ensure_app_server(
@@ -1991,7 +1991,7 @@ fn execute_slash_command_impl(
                             Ok((_h, port)) => {
                                 // 3) route token（中继路由 key + 凭证）+ 中继 URL。
                                 // token = user_id.随机hex，App 端扫码后校验 user_id 是否一致。
-                                let token = match atomcode_core::auth::oauth::get_stored_auth() {
+                                let token = match atomcode_auth::oauth::get_stored_auth() {
                                     Some(auth) => format!(
                                         "{}.{}",
                                         auth.user.id,
@@ -2115,7 +2115,7 @@ fn execute_slash_command_impl(
                 let _ = ctx.app_relay_child.take();
             }
             atomcode_daemon::stop_app_server();
-            match atomcode_core::auth::logout() {
+            match atomcode_auth::logout() {
                 Ok(()) => {
                     ctx.telemetry.set_account_id(None);
                     let _ = reload_runtime_provider(ctx);
@@ -3379,11 +3379,11 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         t(Msg::PluginMarketplaceCloning { url: &url }).into_owned(),
                     );
                     tokio::task::spawn_blocking(move || {
-                        let ev = match atomcode_core::plugin::marketplace::add_marketplace(&url) {
+                        let ev = match atomcode_capabilities::plugin::marketplace::add_marketplace(&url) {
                             Ok(info) => {
-                                atomcode_core::plugin::PluginJobEvent::MarketplaceAdded(info)
+                                atomcode_capabilities::plugin::PluginJobEvent::MarketplaceAdded(info)
                             }
-                            Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
+                            Err(e) => atomcode_capabilities::plugin::PluginJobEvent::Failed {
                                 op: "add marketplace".into(),
                                 msg: format!("{:#}", e),
                             },
@@ -3391,7 +3391,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         let _ = tx.send(ev);
                     });
                 }
-                "remove" => match atomcode_core::plugin::marketplace::remove_marketplace(arg) {
+                "remove" => match atomcode_capabilities::plugin::marketplace::remove_marketplace(arg) {
                     Ok(()) => {
                         super::reload_plugins(ctx);
                         ok(
@@ -3415,12 +3415,12 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         t(Msg::PluginMarketplaceUpdating { name: &name }).into_owned(),
                     );
                     tokio::task::spawn_blocking(move || {
-                        let ev = match atomcode_core::plugin::marketplace::update_marketplace(&name)
+                        let ev = match atomcode_capabilities::plugin::marketplace::update_marketplace(&name)
                         {
                             Ok(info) => {
-                                atomcode_core::plugin::PluginJobEvent::MarketplaceUpdated(info)
+                                atomcode_capabilities::plugin::PluginJobEvent::MarketplaceUpdated(info)
                             }
-                            Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
+                            Err(e) => atomcode_capabilities::plugin::PluginJobEvent::Failed {
                                 op: "update marketplace".into(),
                                 msg: format!("{:#}", e),
                             },
@@ -3428,7 +3428,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         let _ = tx.send(ev);
                     });
                 }
-                "list" => match atomcode_core::plugin::marketplace::list_marketplaces() {
+                "list" => match atomcode_capabilities::plugin::marketplace::list_marketplaces() {
                     Ok(items) if items.is_empty() => {
                         ok(renderer, t(Msg::PluginNoMarketplaces).into_owned());
                     }
@@ -3479,15 +3479,15 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         .into_owned(),
                     );
                     tokio::task::spawn_blocking(move || {
-                        let ev = match atomcode_core::plugin::installer::install(&plugin, &mp, scope) {
-                            Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
+                        let ev = match atomcode_capabilities::plugin::installer::install(&plugin, &mp, scope) {
+                            Ok(info) => atomcode_capabilities::plugin::PluginJobEvent::PluginInstalled(info),
                             Err(e) => {
-                                if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
-                                    atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                if let Some(_aie) = e.downcast_ref::<atomcode_capabilities::plugin::installer::AlreadyInstalledError>() {
+                                    atomcode_capabilities::plugin::PluginJobEvent::PluginAlreadyInstalled {
                                         id: _aie.id.clone(),
                                     }
                                 } else {
-                                    atomcode_core::plugin::PluginJobEvent::Failed {
+                                    atomcode_capabilities::plugin::PluginJobEvent::Failed {
                                         op: "install".into(),
                                         msg: format!("{:#}", e),
                                     }
@@ -3499,7 +3499,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 }
                 Some(PluginArg::Bare { plugin }) => {
                     // Bare plugin name — resolve across all marketplaces.
-                    match atomcode_core::plugin::installer::resolve_plugin_marketplace(&plugin) {
+                    match atomcode_capabilities::plugin::installer::resolve_plugin_marketplace(&plugin) {
                         Ok(matches) if matches.len() == 1 => {
                             let m = &matches[0];
                             let mp = m.marketplace.clone();
@@ -3510,15 +3510,15 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                                 t(Msg::PluginInstallingByName { plugin: &plugin }).into_owned(),
                             );
                             tokio::task::spawn_blocking(move || {
-                                let ev = match atomcode_core::plugin::installer::install(&resolved_plugin, &mp, scope) {
-                                    Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
+                                let ev = match atomcode_capabilities::plugin::installer::install(&resolved_plugin, &mp, scope) {
+                                    Ok(info) => atomcode_capabilities::plugin::PluginJobEvent::PluginInstalled(info),
                                     Err(e) => {
-                                        if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
-                                            atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                        if let Some(_aie) = e.downcast_ref::<atomcode_capabilities::plugin::installer::AlreadyInstalledError>() {
+                                            atomcode_capabilities::plugin::PluginJobEvent::PluginAlreadyInstalled {
                                                 id: _aie.id.clone(),
                                             }
                                         } else {
-                                            atomcode_core::plugin::PluginJobEvent::Failed {
+                                            atomcode_capabilities::plugin::PluginJobEvent::Failed {
                                                 op: "install".into(),
                                                 msg: format!("{:#}", e),
                                             }
@@ -3557,10 +3557,10 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 plugin,
                 marketplace: mp,
             }) => {
-                match atomcode_core::plugin::installer::uninstall(
+                match atomcode_capabilities::plugin::installer::uninstall(
                     &plugin,
                     &mp,
-                    atomcode_core::plugin::InstallScope::User,
+                    atomcode_capabilities::plugin::InstallScope::User,
                 ) {
                     Ok(()) => {
                         super::reload_plugins(ctx);
@@ -3585,13 +3585,13 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             Some(PluginArg::Bare { plugin }) => {
                 // Look up which installed plugins match this name.
                 let installed =
-                    atomcode_core::plugin::installer::list_installed().unwrap_or_default();
+                    atomcode_capabilities::plugin::installer::list_installed().unwrap_or_default();
                 let matches: Vec<_> = installed
                     .into_iter()
                     .filter(|p| {
                         p.plugin == plugin
                             || p.plugin
-                                == atomcode_core::plugin::marketplace::sanitize_name(&plugin)
+                                == atomcode_capabilities::plugin::marketplace::sanitize_name(&plugin)
                     })
                     .collect();
                 match matches.len() {
@@ -3603,7 +3603,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         let p = &matches[0];
                         let (plug, mp, scope) =
                             (p.plugin.clone(), p.marketplace.clone(), p.scope.clone());
-                        match atomcode_core::plugin::installer::uninstall(&plug, &mp, scope) {
+                        match atomcode_capabilities::plugin::installer::uninstall(&plug, &mp, scope) {
                             Ok(()) => {
                                 super::reload_plugins(ctx);
                                 ok(
@@ -3639,7 +3639,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             }
             None => err(renderer, t(Msg::PluginUninstallUsage).into_owned()),
         },
-        "list" => match atomcode_core::plugin::installer::list_installed() {
+        "list" => match atomcode_capabilities::plugin::installer::list_installed() {
             Ok(items) if items.is_empty() => {
                 ok(renderer, t(Msg::PluginNoInstalled).into_owned());
             }
@@ -3713,13 +3713,13 @@ fn parse_plugin_arg(s: &str) -> Option<PluginArg> {
 
 /// Parse a `--scope user|project|local` argument.
 /// Defaults to `User` if missing or unrecognized.
-fn parse_scope_arg(s: &str) -> atomcode_core::plugin::InstallScope {
+fn parse_scope_arg(s: &str) -> atomcode_capabilities::plugin::InstallScope {
     // Accept both `--scope user` and bare `user`.
     let val = s.strip_prefix("--scope=").unwrap_or(s).trim();
     match val.to_lowercase().as_str() {
-        "project" => atomcode_core::plugin::InstallScope::Project,
-        "local" => atomcode_core::plugin::InstallScope::Local,
-        _ => atomcode_core::plugin::InstallScope::User,
+        "project" => atomcode_capabilities::plugin::InstallScope::Project,
+        "local" => atomcode_capabilities::plugin::InstallScope::Local,
+        _ => atomcode_capabilities::plugin::InstallScope::User,
     }
 }
 
@@ -4013,7 +4013,7 @@ fn format_login_identity(name: Option<&str>, username: &str) -> String {
 /// name. Shared by both `/status` renderers so the interactive and remote
 /// outputs can't drift.
 fn render_login_line_from_stored_auth() -> String {
-    match atomcode_core::auth::get_stored_auth() {
+    match atomcode_auth::get_stored_auth() {
         Some(a) => {
             let identity = format_login_identity(a.user.name.as_deref(), &a.user.username);
             render_login_line(Some(&identity))
@@ -4334,7 +4334,7 @@ pub(super) fn build_status_text(ctx: &LoopCtx, proxy: Option<&str>) -> String {
 
 /// `/whoami` 的账号信息文本。TUI arm 与手机远程执行共用。
 pub(super) fn build_whoami_text() -> String {
-    if let Some(auth) = atomcode_core::auth::get_stored_auth() {
+    if let Some(auth) = atomcode_auth::get_stored_auth() {
         let email = auth.user.email.as_deref().unwrap_or("—");
         let name = auth.user.name.as_deref().unwrap_or(&auth.user.username);
         format!(
@@ -4342,7 +4342,7 @@ pub(super) fn build_whoami_text() -> String {
             name,
             auth.user.username,
             email,
-            atomcode_core::auth::auth_file_path().display(),
+            atomcode_auth::auth_file_path().display(),
         )
     } else {
         t(Msg::CmdWhoamiNotSignedIn).into_owned()
@@ -5565,12 +5565,12 @@ mod compose_login_chrome_tests {
 fn run_oauth_with_renderer(
     renderer: &mut dyn Renderer,
     ctx: &mut LoopCtx,
-) -> Result<atomcode_core::auth::AuthInfo> {
+) -> Result<atomcode_auth::AuthInfo> {
     use crossterm::event::KeyCode;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc::error::TryRecvError;
 
-    let session = atomcode_core::auth::start_login()?;
+    let session = atomcode_auth::start_login()?;
 
     // QR + URL + ESC affordance go through the body via UiLine::CommandOutput
     // so they sit in scrollback above the input box exactly like any other
@@ -5593,8 +5593,8 @@ fn run_oauth_with_renderer(
     // we return.
     loop {
         match session.poll_once()? {
-            atomcode_core::auth::PollOutcome::Authorized => break,
-            atomcode_core::auth::PollOutcome::Pending => {}
+            atomcode_auth::PollOutcome::Authorized => break,
+            atomcode_auth::PollOutcome::Pending => {}
         }
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -5673,9 +5673,9 @@ fn run_coding_plan_blocking(
 /// path — that path prints to stdout and is reserved for CLI callers.
 pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
     // Phase 1: pre-flight login if needed.
-    if !atomcode_core::auth::is_logged_in() {
+    if !atomcode_auth::is_logged_in() {
         if let Err(e) = run_oauth_with_renderer(renderer, ctx)
-            .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
+            .and_then(|auth| atomcode_auth::save_auth(&auth).map(|_| auth))
         {
             // Login failed/cancelled. Surface as a top-level error;
             // skip the rest of setup since claim/models/status all
@@ -5724,7 +5724,7 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         renderer.render(UiLine::CommandOutput(t(Msg::CpReauthAfter401).into_owned()));
         renderer.flush();
         match run_oauth_with_renderer(renderer, ctx)
-            .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
+            .and_then(|auth| atomcode_auth::save_auth(&auth).map(|_| auth))
         {
             Ok(_) => {
                 let (cfg_after2, r2) = match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
