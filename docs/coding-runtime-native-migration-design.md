@@ -57,10 +57,10 @@ background、ACP 和 clix 均由 `CodingRuntime` 持有 kernel agent 生命周�
 - CLI、TUI、daemon、background 对 bridge/core legacy 类型的发送、消费和依赖；
 - TUI 双 endpoint，改为 runtime control + TUI-local `UiEvent` 投影。
 
-保留的 core `TurnEvent`、conversation/session/tool 类型属于 live transport 和持久化领域模型，不是
-旧 engine driver 协议；`permission_bridge` 只负责 HTTP 审批协作，也不是已删除的 engine bridge。
-daemon 的 `legacy_convert.rs` 与 TUI 的 `runtime_convert.rs` 仅处理历史 session/snapshot 数据兼容，
-不能投递旧 engine 命令。
+本阶段当时保留的 core live/session surface 已在后续
+[`session-convergence-plan.md`](session-convergence-plan.md) 与
+[`live-transport-convergence-plan.md`](live-transport-convergence-plan.md) 中完成退役。daemon 的
+`legacy_convert.rs` 只处理历史 session/snapshot 数据兼容，不能投递旧 engine 命令。
 
 ### 0.4 daemon `/chat` 图片 parity 修复
 

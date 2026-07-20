@@ -137,13 +137,27 @@ pub fn spawn_native_runtime_for_session_deferred(
     snapshot: atomcode_kernel::message::SessionSnapshot,
 ) -> (
     mpsc::UnboundedSender<atomcode_coding::DriverCommand>,
-    mpsc::UnboundedReceiver<CodingRuntimeEvent>,
+    mpsc::UnboundedReceiver<atomcode_coding::SequencedRuntimeEvent>,
     watch::Receiver<atomcode_coding::DeferredRuntimeState>,
 ) {
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (state_tx, state_rx) = watch::channel(atomcode_coding::DeferredRuntimeState::Starting);
     tokio::spawn(async move {
+        let mut output_sequence = 0u64;
+        let send_event =
+            |event_tx: &mpsc::UnboundedSender<atomcode_coding::SequencedRuntimeEvent>,
+             output_sequence: &mut u64,
+             generation: u64,
+             event: CodingRuntimeEvent| {
+                let result = event_tx.send(atomcode_coding::SequencedRuntimeEvent {
+                    generation,
+                    sequence: *output_sequence,
+                    event,
+                });
+                *output_sequence = output_sequence.wrapping_add(1);
+                result
+            };
         let bootstrap = if cfg.model.is_empty() {
             atomcode_coding::ProviderBootstrap::Unavailable(
                 atomcode_coding::ProviderUnavailableReason::NotConfigured,
@@ -164,24 +178,30 @@ pub fn spawn_native_runtime_for_session_deferred(
                 state_tx.send_replace(atomcode_coding::DeferredRuntimeState::Failed(
                     message.clone(),
                 ));
-                let _ = event_tx.send(CodingRuntimeEvent::Agent(
-                    atomcode_kernel::event::AgentEvent::Error {
+                let _ = send_event(
+                    &event_tx,
+                    &mut output_sequence,
+                    0,
+                    CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Error {
                         message: message.clone(),
                         http_status: None,
                         code: None,
-                    },
-                ));
+                    }),
+                );
                 while let Some(control) = control_rx.recv().await {
                     if matches!(control, atomcode_coding::DriverCommand::Shutdown) {
                         break;
                     }
-                    let _ = event_tx.send(CodingRuntimeEvent::Agent(
-                        atomcode_kernel::event::AgentEvent::Error {
+                    let _ = send_event(
+                        &event_tx,
+                        &mut output_sequence,
+                        0,
+                        CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Error {
                             message: format!("runtime unavailable: {message}"),
                             http_status: None,
                             code: None,
-                        },
-                    ));
+                        }),
+                    );
                 }
                 return;
             }
@@ -233,24 +253,37 @@ pub fn spawn_native_runtime_for_session_deferred(
                         ),
                         control => {
                             if let Err(error) = handle.dispatch(control) {
-                                let _ = event_tx.send(CodingRuntimeEvent::Agent(
-                                    atomcode_kernel::event::AgentEvent::Error {
+                                let _ = send_event(
+                                    &event_tx,
+                                    &mut output_sequence,
+                                    handle.status().generation,
+                                    CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Error {
                                         message: error.to_string(),
                                         http_status: None,
                                         code: None,
-                                    },
-                                ));
+                                    }),
+                                );
                             }
                             None
                         }
                     };
                     if let Some(event) = event {
-                        let _ = event_tx.send(event);
+                        let _ = send_event(
+                            &event_tx,
+                            &mut output_sequence,
+                            handle.status().generation,
+                            event,
+                        );
                     }
                 }
                 event = events.recv() => match event {
                     Some(event) => {
-                        if event_tx.send(event.event).is_err() {
+                        if send_event(
+                            &event_tx,
+                            &mut output_sequence,
+                            event.generation,
+                            event.event,
+                        ).is_err() {
                             let _ = handle.shutdown().await;
                             break;
                         }
@@ -268,17 +301,50 @@ pub fn spawn_native_runtime_for_session_deferred(
 mod tests {
     use super::*;
 
+    struct ScopedHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl ScopedHome {
+        fn new() -> Self {
+            let lock = crate::atomcode_home_test_lock()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let previous = std::env::var_os("ATOMCODE_HOME");
+            let dir = tempfile::tempdir().unwrap();
+            std::env::set_var("ATOMCODE_HOME", dir.path());
+            Self {
+                _lock: lock,
+                previous,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for ScopedHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("ATOMCODE_HOME", value),
+                None => std::env::remove_var("ATOMCODE_HOME"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn deferred_runtime_publishes_authoritative_awaiting_provider_handle() {
+        let _home = ScopedHome::new();
         let working_dir = tempfile::tempdir().unwrap();
         let config = atomcode_config::config::Config::default();
         let cfg =
             CodingRuntimeConfig::from_config(&config, working_dir.path(), None, None, false, true);
-        let (control_tx, _event_rx, mut state_rx) = spawn_native_runtime_for_session_deferred(
+        let (control_tx, mut event_rx, mut state_rx) = spawn_native_runtime_for_session_deferred(
             cfg,
             "deferred-test".into(),
             atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         );
+        let _: &mut mpsc::UnboundedReceiver<atomcode_coding::SequencedRuntimeEvent> = &mut event_rx;
 
         tokio::time::timeout(std::time::Duration::from_secs(5), state_rx.changed())
             .await
@@ -302,11 +368,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(atomcode_home)]
     async fn deferred_runtime_reports_same_session_conflict() {
-        let home = tempfile::tempdir().unwrap();
+        let _home = ScopedHome::new();
         let working_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", home.path());
         let config = atomcode_config::config::Config::default();
         let cfg = || {
             CodingRuntimeConfig::from_config(&config, working_dir.path(), None, None, false, true)

@@ -35,6 +35,12 @@ pub fn register_embedded_runtime(
     snapshot: SessionSnapshot,
     control: Arc<dyn LiveRuntimeControl>,
 ) -> Result<LiveBinding, HubError> {
+    let headless_owner = headless()
+        .try_lock()
+        .map_err(|_| HubError::RuntimeUnavailable)?;
+    if headless_owner.is_some() {
+        return Err(HubError::RuntimeUnavailable);
+    }
     let binding = hub().bind(session_id, working_dir, snapshot, control)?;
     *EMBEDDED_BINDING
         .lock()
@@ -100,8 +106,18 @@ pub fn join() -> Result<LiveJoin, HubError> {
     hub().join()
 }
 
+pub fn binding() -> Result<LiveBinding, HubError> {
+    hub().binding()
+}
+
 pub fn submit(input: UserInput) -> Result<(), HubError> {
     hub().submit(input)
+}
+
+pub async fn submit_confirmed(
+    input: UserInput,
+) -> Result<atomcode_coding::SubmitReceipt, HubError> {
+    hub().submit_confirmed(input).await
 }
 
 pub fn accept_local_input(input: UserInput) -> Result<(), HubError> {
@@ -119,12 +135,56 @@ pub fn respond_pending_kind(kind: &str, value: serde_json::Value) -> Result<u64,
     hub().respond_pending_kind(kind, value)
 }
 
+pub async fn respond_confirmed(
+    id: atomcode_kernel::event::RequestId,
+    value: serde_json::Value,
+) -> Result<(), HubError> {
+    hub().respond_confirmed(id, value).await
+}
+
+pub async fn respond_pending_kind_confirmed(
+    kind: &str,
+    value: serde_json::Value,
+) -> Result<u64, HubError> {
+    hub().respond_pending_kind_confirmed(kind, value).await
+}
+
 pub fn cancel() -> Result<(), HubError> {
     hub().cancel()
 }
 
+pub async fn cancel_confirmed() -> Result<(), HubError> {
+    hub().cancel_confirmed().await
+}
+
 pub fn dispatch(command: DriverCommand) -> Result<(), HubError> {
     hub().dispatch(command)
+}
+
+pub async fn set_mode(mode: RuntimeMode) -> Result<(), HubError> {
+    hub().set_mode(mode).await
+}
+
+pub async fn reload_provider(
+    next: atomcode_coding::CodingAgentConfig,
+) -> Result<atomcode_coding::RuntimeGeneration, HubError> {
+    hub().reload_provider(next).await
+}
+
+pub async fn resume_session(
+    session_id: String,
+) -> Result<atomcode_coding::SessionChanged, HubError> {
+    hub().resume_session(session_id).await
+}
+
+pub async fn change_directory(
+    working_dir: PathBuf,
+) -> Result<atomcode_coding::SessionChanged, HubError> {
+    hub().change_directory(working_dir).await
+}
+
+pub async fn reload_capabilities() -> Result<atomcode_coding::SessionChanged, HubError> {
+    hub().reload_capabilities().await
 }
 
 pub fn publish_command_output(text: String) -> Result<(), HubError> {

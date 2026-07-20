@@ -543,11 +543,15 @@ pub(super) fn execute_slash_command(
     let result =
         execute_slash_command_impl(cmd, arg, state, ctx, &mut cap, active_modal, setup_pending);
     if !cap.captured.is_empty() {
-        let _ = atomcode_daemon::native_live::publish_command_output(format!(
+        if let Err(error) = atomcode_daemon::native_live::publish_command_output(format!(
             "/{}\n{}",
             cmd.trim_start_matches('/'),
             cap.captured
-        ));
+        )) {
+            cap.inner
+                .render(UiLine::Error(format!("斜杠命令输出同步失败：{error:?}")));
+            cap.inner.flush();
+        }
     }
     result
 }

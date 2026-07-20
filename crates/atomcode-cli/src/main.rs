@@ -1753,7 +1753,7 @@ fn spawn_deferred_tui_runtime(
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             if event_tx
-                .send(atomcode_tuix::RuntimeEventPayload::Native(event))
+                .send(atomcode_tuix::RuntimeEventPayload::SequencedNative(event))
                 .is_err()
             {
                 break;

@@ -677,6 +677,8 @@ export async function postLiveStop(): Promise<void> {
     headers: authHeaders(),
   });
   if (!resp.ok) throw new Error(`stop live chat failed: ${resp.status}`);
+  const body = await resp.json() as { accepted?: boolean };
+  if (!body.accepted) throw new Error('live runtime rejected the stop request');
 }
 
 /** Ask the bound native runtime to resume an existing session. */
@@ -748,6 +750,7 @@ export async function postLiveMode(mode: ApprovalMode): Promise<ApprovalMode> {
   });
   if (!resp.ok) throw new Error(`switch mode failed: ${resp.status}`);
   const body = (await resp.json()) as ApprovalModeResponse;
+  if (!body.ok) throw new Error('live runtime rejected the mode switch');
   return body.mode;
 }
 
@@ -787,6 +790,7 @@ export async function postLivePermission(
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ decision, tool_name: toolName }),
   });
+  if (!resp.ok) throw new Error(`answer live permission failed: ${resp.status}`);
   return resp.json();
 }
 
@@ -810,5 +814,6 @@ export async function postLiveUserInput(body: {
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
   });
+  if (!resp.ok) throw new Error(`answer live user input failed: ${resp.status}`);
   return resp.json();
 }

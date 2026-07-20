@@ -39,10 +39,14 @@ test('live control APIs reject protocol-level failures', async () => {
   )) as typeof fetch;
 
   try {
-    const { postLiveSwitchSession } = await import('./api.ts');
+    const { postLiveMode, postLiveSwitchSession } = await import('./api.ts');
     await assert.rejects(
       () => postLiveSwitchSession('session-2'),
       /runtime is busy/,
+    );
+    await assert.rejects(
+      () => postLiveMode('plan'),
+      /rejected the mode switch/,
     );
   } finally {
     globalThis.fetch = originalFetch;

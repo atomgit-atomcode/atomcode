@@ -1,13 +1,12 @@
 # Session / Conversation 收口方案
 
-> 状态：S0～S5 已完成；core session **持久化接口面**达到状态④。core live transport 单独规划。
+> 状态：S0～S5 已完成；core session **持久化接口面**达到状态④；后续 live transport 收口也已完成。
 >
 > 核对基线：`release/v5.0.1@c212245d8916ff02b776122401bf633cb1ef4339`
 >
 > 当前四态：CLI、TUI、daemon 的生产持久化与磁盘读取均已切到 native；core session 模块、JSON writer、
-> manager、磁盘读取投影和直接依赖已删除。legacy JSON 仅由 daemon 私有 DTO 只读导入。core
-> `LiveSession/TurnExecutor` 的内存协议仍使用 core
-> `Conversation/TurnEvent/provider/tool`，属于独立的 live transport 收口，不再混入本方案的完成门槛。
+> manager、磁盘读取投影和直接依赖已删除。legacy JSON 仅由 daemon 私有 DTO 只读导入。后续
+> live transport 的实施结果见 [`live-transport-convergence-plan.md`](live-transport-convergence-plan.md)。
 
 ## 1. 结论
 
@@ -764,5 +763,5 @@ catalog 文件健康诊断被显式报告；24 个结构损坏会话被 fail-clo
 S1 按行为切片先写失败测试，再实现 native schema parity。S0 的 characterization tests 保持绿色，
 不把未来行为提前写成永久失败测试。
 
-唯一下一步：单独评审 core live transport 收口方案，先定义 `LiveSession/TurnExecutor` 的 owner、
-kernel-neutral 事件 DTO、审批和多视图回放边界；不得把它继续塞进已经完成的 session 持久化迁移。
+后续任务已在 [`live-transport-convergence-plan.md`](live-transport-convergence-plan.md) 完成：
+Coding Runtime 成为唯一 owner，core live/turn legacy 接口面已删除。

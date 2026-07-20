@@ -1597,16 +1597,49 @@ async fn change_dir(
         // When a native live runtime is attached, it is the working-directory
         // owner. Reject the HTTP mutation if the runtime cannot accept the same
         // transition; otherwise the UI state and the executing runtime diverge.
-        if crate::native_live::join().is_ok() {
-            if let Err(error) = crate::native_live::dispatch(
-                atomcode_coding::DriverCommand::ChangeDirectory(new_path.clone()),
-            ) {
+        if let Ok(previous_binding) = crate::native_live::binding() {
+            if let Err(error) = crate::native_live::change_directory(new_path.clone()).await {
                 return Json(ChangeDirResponse {
                     success: false,
                     message: format!("Runtime rejected directory change: {error:?}"),
                     current_dir: project.working_dir.clone(),
                     project_hash: hash_path(&project.working_dir),
                 });
+            }
+            if let Some(session_id) = req
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|session_id| !session_id.is_empty())
+            {
+                if let Err(error) =
+                    crate::live_api::live_switch_session(session_id.to_string()).await
+                {
+                    let rollback_error = match crate::native_live::change_directory(
+                        previous_binding.working_dir.clone(),
+                    )
+                    .await
+                    {
+                        Ok(_) => crate::live_api::live_switch_session(
+                            previous_binding.session_id.clone(),
+                        )
+                        .await
+                        .err()
+                        .map(|error| format!("session restore failed: {error:?}")),
+                        Err(error) => Some(format!("directory restore failed: {error:?}")),
+                    };
+                    return Json(ChangeDirResponse {
+                        success: false,
+                        message: match rollback_error {
+                            Some(rollback) => format!(
+                                "Runtime rejected session switch: {error:?}; rollback failed: {rollback}"
+                            ),
+                            None => format!("Runtime rejected session switch: {error:?}"),
+                        },
+                        current_dir: project.working_dir.clone(),
+                        project_hash: hash_path(&project.working_dir),
+                    });
+                }
             }
         }
 
@@ -1649,17 +1682,6 @@ async fn change_dir(
 
         // 同步 daemon 项目视图；已绑定 runtime 已在上方接受原生目录切换。
         crate::live_api::live_set_working_dir(new_path.clone());
-        // 手机点开历史对话时带 session_id：再用官方的会话切换原语广播切到该会话，
-        // 配合 App 侧 /live?session_id= 重连，两端落到同一会话。空则只切目录。
-        if let Some(sid) = req
-            .session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            crate::live_api::live_switch_session(sid.to_string());
-        }
-
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
 
         Json(ChangeDirResponse {
@@ -1923,7 +1945,10 @@ async fn create_session(
     // so they follow: create new session with the same ID. Only when the caller has
     // sync enabled — sync-off webui新建对话不应牵连 TUI 新建（issue #850）。
     if req.sync {
-        crate::live_api::live_switch_session(id);
+        if let Err(error) = crate::live_api::live_switch_session(id).await {
+            let message = format!("Session created, but live switch failed: {error:?}");
+            return (StatusCode::CONFLICT, Json(message)).into_response();
+        }
     }
 
     (StatusCode::CREATED, Json(response)).into_response()

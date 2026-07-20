@@ -1393,6 +1393,17 @@ impl atomcode_daemon::live_hub::LiveRuntimeControl for RuntimeControl {
     ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
         RuntimeControl::dispatch(self, command)
     }
+
+    fn handle(&self) -> Option<CodingRuntimeHandle> {
+        match self {
+            Self::Ready(ready) => Some(ready.handle.clone()),
+            Self::Deferred(deferred) => match &*deferred.state.borrow() {
+                atomcode_coding::DeferredRuntimeState::Ready(handle) => Some(handle.clone()),
+                atomcode_coding::DeferredRuntimeState::Starting
+                | atomcode_coding::DeferredRuntimeState::Failed(_) => None,
+            },
+        }
+    }
 }
 
 /// A newly spawned runtime endpoint and its single-consumer ordered event stream.
@@ -5588,7 +5599,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
-                    publish_live_runtime_event(&ctx, &runtime_event.event);
+                    if let Err(error) = publish_live_runtime_event(&ctx, &runtime_event.event) {
+                        renderer.render(UiLine::Error(error));
+                        renderer.flush();
+                    }
                     let pre_phase = app.state.phase;
                     handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
@@ -6003,7 +6017,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
-                    publish_live_runtime_event(&ctx, &runtime_event.event);
+                    if let Err(error) = publish_live_runtime_event(&ctx, &runtime_event.event) {
+                        renderer.render(UiLine::Error(error));
+                        renderer.flush();
+                    }
                     let pre_phase = app.state.phase;
                     handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
@@ -8966,11 +8983,16 @@ fn deliver_approval(ctx: &mut LoopCtx, choice: ApprovalChoice) {
         };
         let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
         if ctx.live_binding.is_some() {
-            let _ = atomcode_daemon::native_live::respond(id, value);
+            if let Err(error) = atomcode_daemon::native_live::respond(id, value) {
+                crate::tuix_trace!("LIVE", "approval response failed: {error:?}");
+            }
         } else {
-            ctx.runtime
+            if let Err(error) = ctx
+                .runtime
                 .dispatch(atomcode_coding::DriverCommand::Respond { id, value })
-                .ok();
+            {
+                crate::tuix_trace!("LIVE", "approval response failed: {error:?}");
+            }
         }
     }
 }
@@ -8986,11 +9008,16 @@ fn deliver_user_input(
         ctx.pending_runtime_request_id = None;
     }
     if ctx.live_binding.is_some() {
-        let _ = atomcode_daemon::native_live::respond(id, value);
+        if let Err(error) = atomcode_daemon::native_live::respond(id, value) {
+            crate::tuix_trace!("LIVE", "user-input response failed: {error:?}");
+        }
     } else {
-        ctx.runtime
+        if let Err(error) = ctx
+            .runtime
             .dispatch(atomcode_coding::DriverCommand::Respond { id, value })
-            .ok();
+        {
+            crate::tuix_trace!("LIVE", "user-input response failed: {error:?}");
+        }
     }
 }
 
@@ -9001,14 +9028,19 @@ fn deliver_user_input_null(ctx: &mut LoopCtx, id: u64) {
         ctx.pending_runtime_request_id = None;
     }
     if ctx.live_binding.is_some() {
-        let _ = atomcode_daemon::native_live::respond(id, serde_json::Value::Null);
+        if let Err(error) = atomcode_daemon::native_live::respond(id, serde_json::Value::Null) {
+            crate::tuix_trace!("LIVE", "null user-input response failed: {error:?}");
+        }
     } else {
-        ctx.runtime
+        if let Err(error) = ctx
+            .runtime
             .dispatch(atomcode_coding::DriverCommand::Respond {
                 id,
                 value: serde_json::Value::Null,
             })
-            .ok();
+        {
+            crate::tuix_trace!("LIVE", "null user-input response failed: {error:?}");
+        }
     }
 }
 
@@ -11112,18 +11144,25 @@ fn handle_runtime_event(
     }
 }
 
-fn publish_live_runtime_event(ctx: &LoopCtx, event: &bg_runtime::RuntimeEventPayload) {
+fn publish_live_runtime_event(
+    ctx: &LoopCtx,
+    event: &bg_runtime::RuntimeEventPayload,
+) -> Result<(), String> {
     let Some(binding) = &ctx.live_binding else {
-        return;
+        return Ok(());
     };
-    match event {
+    let result = match event {
         bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => {
-            let _ = atomcode_daemon::native_live::publish(binding, envelope.clone());
+            atomcode_daemon::native_live::publish(binding, envelope.clone())
         }
         bg_runtime::RuntimeEventPayload::Native(event) => {
-            let _ = atomcode_daemon::native_live::publish_unsequenced(binding, event.clone());
+            atomcode_daemon::native_live::publish_unsequenced(binding, event.clone())
         }
-        _ => {}
+        _ => return Ok(()),
+    };
+    match result {
+        Ok(()) | Err(atomcode_daemon::live_hub::HubError::StaleEvent) => Ok(()),
+        Err(error) => Err(format!("Live event synchronization failed: {error:?}")),
     }
 }
 
@@ -12666,7 +12705,7 @@ fn handle_agent_event(
         }
         AgentEvent::ProjectSwitched(new_dir) => {
             // A webui /cd switched the project directory (delivered via the
-            // live-sync forwarder in sync mode). Follow it: change cwd like
+            // bound native runtime in sync mode). Follow it: change cwd like
             // `/cd` (updates working_dir + @-file index + recent dirs +
             // tells the running agent), THEN open a fresh session in the new
             // dir like `/session`. Distinct from WorkingDirChanged (agent's own
@@ -12687,15 +12726,27 @@ fn handle_agent_event(
                     renderer.render(UiLine::CommandOutput(format!("（手机端执行 {display}）")));
                     renderer.render(UiLine::CommandOutput(txt.clone()));
                     renderer.flush();
-                    let _ = atomcode_daemon::native_live::publish_command_output(format!(
-                        "{display}\n{txt}"
-                    ));
+                    if let Err(error) = atomcode_daemon::native_live::publish_command_output(
+                        format!("{display}\n{txt}"),
+                    ) {
+                        renderer.render(UiLine::Error(format!(
+                            "Remote command output synchronization failed: {error:?}"
+                        )));
+                        renderer.flush();
+                    }
                 }
                 None => {
-                    let _ = atomcode_daemon::native_live::publish_command_output(format!(
-                        "{display}\n  该命令需要在桌面端执行（手机端仅支持 \
-                         /status /cost /whoami /diff）"
-                    ));
+                    if let Err(error) =
+                        atomcode_daemon::native_live::publish_command_output(format!(
+                            "{display}\n  该命令需要在桌面端执行（手机端仅支持 \
+                             /status /cost /whoami /diff）"
+                        ))
+                    {
+                        renderer.render(UiLine::Error(format!(
+                            "Remote command rejection synchronization failed: {error:?}"
+                        )));
+                        renderer.flush();
+                    }
                 }
             }
         }

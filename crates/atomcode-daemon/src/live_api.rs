@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
@@ -25,6 +25,9 @@ use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+use std::sync::OnceLock;
 
 pub(crate) use crate::approval_mode::ApprovalMode;
 use crate::CachedMcpRegistry;
@@ -70,20 +73,13 @@ fn live_current_mode_wire() -> String {
 
 /// Coding Runtime 是工作目录的唯一运行时所有者；未绑定时使用 daemon 项目状态。
 fn live_current_working_dir(fallback: &Path) -> std::path::PathBuf {
-    crate::native_live::join()
-        .map(|join| join.binding.working_dir)
+    crate::native_live::binding()
+        .map(|binding| binding.working_dir)
         .unwrap_or_else(|_| fallback.to_path_buf())
 }
 
 struct AuthoritativeTerminal {
     snapshot: ConversationSnapshot,
-}
-
-/// 设置 live 视图选中的 provider（None 时不覆盖）。
-fn set_live_provider(provider: Option<String>) {
-    if let Some(p) = provider {
-        live_set_provider(p);
-    }
 }
 
 /// 设置进程级选中 provider 并把切换广播给所有视图（TUI live 转发器 / 其他 webui tab）。
@@ -171,8 +167,10 @@ pub fn live_set_working_dir(dir: std::path::PathBuf) {
 }
 
 /// 请求当前 Coding Runtime 恢复指定会话。
-pub fn live_switch_session(session_id: String) {
-    let _ = crate::native_live::dispatch(atomcode_coding::DriverCommand::ResumeSession(session_id));
+pub async fn live_switch_session(
+    session_id: String,
+) -> Result<atomcode_coding::SessionChanged, crate::live_hub::HubError> {
+    crate::native_live::resume_session(session_id).await
 }
 
 /// 当前生效的 provider 名：优先进程级选择（LIVE_PROVIDER），回退 config 默认。
@@ -1040,6 +1038,27 @@ impl NativeLiveWireProjector {
             }) => LiveWireEvent::Error {
                 message: reason.to_string(),
             },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderReloadFinished(Err(
+                error,
+            ))) => LiveWireEvent::Error {
+                message: format!("provider reload failed: {error}"),
+            },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderDeactivationFinished(
+                Err(error),
+            )) => LiveWireEvent::Error {
+                message: format!("provider deactivation failed: {error}"),
+            },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::SnapshotRestoreFinished {
+                result: Err(error),
+                ..
+            }) => LiveWireEvent::Error {
+                message: format!("snapshot restore failed: {error}"),
+            },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::UndoFinished(Err(error))) => {
+                LiveWireEvent::Error {
+                    message: format!("undo failed: {error}"),
+                }
+            }
             crate::live_hub::LiveViewEvent::Runtime(_) => return None,
         })
     }
@@ -1157,13 +1176,17 @@ pub(crate) async fn live_stream(
     });
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|w| {
-        let json = match serde_json::to_string(&w) {
-            Ok(s) => s,
-            Err(e) => {
-                atomcode_core::ctrace!("LIVE", "live_stream: serde_json serialization failed: {e}");
-                return Ok::<_, std::convert::Infallible>(Event::default().data(""));
-            }
-        };
+        let json = serde_json::to_string(&w).unwrap_or_else(|error| {
+            atomcode_core::ctrace!(
+                "LIVE",
+                "live_stream: serde_json serialization failed: {error}"
+            );
+            serde_json::json!({
+                "type": "error",
+                "message": format!("live event serialization failed: {error}"),
+            })
+            .to_string()
+        });
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
     Sse::new(stream)
@@ -1261,8 +1284,10 @@ pub(crate) async fn live_message(
 ) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
     let sid = parse_session_id(req.session_id);
-    set_live_provider(req.provider.clone());
-    let provider_name = live_current_provider();
+    let requested_provider = req.provider.clone();
+    let provider_name = requested_provider
+        .clone()
+        .unwrap_or_else(live_current_provider);
     let join = match crate::native_live::ensure_headless_runtime(
         live_current_working_dir(&working_dir),
         state.telemetry.clone(),
@@ -1277,7 +1302,7 @@ pub(crate) async fn live_message(
             return Json(serde_json::json!({ "accepted": false, "error": error }));
         }
     };
-    if req.provider.is_some() {
+    if let Some(requested_provider) = requested_provider {
         let config = match Config::load(&Config::default_path()) {
             Ok(config) => config,
             Err(error) => {
@@ -1287,6 +1312,12 @@ pub(crate) async fn live_message(
                 }));
             }
         };
+        if !config.providers.contains_key(&requested_provider) {
+            return Json(serde_json::json!({
+                "accepted": false,
+                "error": format!("provider {requested_provider:?} not found"),
+            }));
+        }
         let runtime_config = chat_runtime_config(
             &config,
             &provider_name,
@@ -1294,14 +1325,13 @@ pub(crate) async fn live_message(
             state.telemetry.clone(),
         );
         let next = crate::kernel_runtime::coding_config_from_runtime(&runtime_config);
-        if let Err(error) =
-            crate::native_live::dispatch(atomcode_coding::DriverCommand::ReloadProvider(next))
-        {
+        if let Err(error) = crate::native_live::reload_provider(next).await {
             return Json(serde_json::json!({
                 "accepted": false,
                 "error": format!("provider reload rejected: {error:?}"),
             }));
         }
+        live_set_provider(requested_provider);
     }
     let original_images: Vec<ImagePart> = req
         .images
@@ -1329,8 +1359,8 @@ pub(crate) async fn live_message(
             })
             .collect()
     };
-    match crate::native_live::submit(atomcode_coding::UserInput { text, images }) {
-        Ok(()) => Json(serde_json::json!({ "accepted": true })),
+    match crate::native_live::submit_confirmed(atomcode_coding::UserInput { text, images }).await {
+        Ok(_) => Json(serde_json::json!({ "accepted": true })),
         Err(error) => Json(serde_json::json!({
             "accepted": false,
             "error": format!("live submit rejected: {error:?}"),
@@ -1340,7 +1370,7 @@ pub(crate) async fn live_message(
 
 /// POST /live/stop — cancel the turn shared by the TUI and synchronized webui tabs.
 pub(crate) async fn live_stop() -> impl IntoResponse {
-    let accepted = crate::native_live::cancel().is_ok();
+    let accepted = crate::native_live::cancel_confirmed().await.is_ok();
     Json(serde_json::json!({ "accepted": accepted }))
 }
 
@@ -1358,10 +1388,8 @@ pub(crate) struct LiveSwitchSessionReq {
 pub(crate) async fn live_switch_session_endpoint(
     Json(req): Json<LiveSwitchSessionReq>,
 ) -> impl IntoResponse {
-    match crate::native_live::dispatch(atomcode_coding::DriverCommand::ResumeSession(
-        req.session_id,
-    )) {
-        Ok(()) => Json(serde_json::json!({ "ok": true })),
+    match crate::native_live::resume_session(req.session_id).await {
+        Ok(_) => Json(serde_json::json!({ "ok": true })),
         Err(error) => Json(serde_json::json!({
             "ok": false,
             "error": format!("session switch rejected: {error:?}"),
@@ -1401,9 +1429,13 @@ pub(crate) async fn live_provider(
             "error": format!("provider {:?} not found", req.provider),
         }));
     }
-    if config.default_provider != req.provider {
+    let config_path = Config::default_path();
+    let previous_provider = config.default_provider.clone();
+    let previous_selected_provider = live_current_provider();
+    let default_changed = previous_provider != req.provider;
+    if default_changed {
         config.default_provider = req.provider.clone();
-        if let Err(error) = config.save(&Config::default_path()) {
+        if let Err(error) = config.save(&config_path) {
             return Json(serde_json::json!({
                 "ok": false,
                 "error": format!("save provider config failed: {error}"),
@@ -1421,7 +1453,27 @@ pub(crate) async fn live_provider(
     .await
     {
         Ok(join) => join,
-        Err(error) => return Json(serde_json::json!({ "ok": false, "error": error })),
+        Err(error) => {
+            live_set_provider(previous_selected_provider.clone());
+            let rollback_error = if default_changed {
+                config.default_provider = previous_provider.clone();
+                config
+                    .save(&config_path)
+                    .err()
+                    .map(|error| error.to_string())
+            } else {
+                None
+            };
+            return Json(serde_json::json!({
+                "ok": false,
+                "error": match rollback_error {
+                    Some(rollback) => format!(
+                        "{error}; config rollback failed: {rollback}"
+                    ),
+                    None => error,
+                },
+            }));
+        }
     };
     let runtime_config = chat_runtime_config(
         &config,
@@ -1429,14 +1481,33 @@ pub(crate) async fn live_provider(
         &join.binding.working_dir,
         state.telemetry.clone(),
     );
-    match crate::native_live::dispatch(atomcode_coding::DriverCommand::ReloadProvider(
-        crate::kernel_runtime::coding_config_from_runtime(&runtime_config),
-    )) {
-        Ok(()) => Json(serde_json::json!({ "ok": true })),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": format!("provider reload rejected: {error:?}"),
-        })),
+    match crate::native_live::reload_provider(crate::kernel_runtime::coding_config_from_runtime(
+        &runtime_config,
+    ))
+    .await
+    {
+        Ok(_) => Json(serde_json::json!({ "ok": true })),
+        Err(error) => {
+            live_set_provider(previous_selected_provider.clone());
+            let rollback_error = if default_changed {
+                config.default_provider = previous_provider.clone();
+                config
+                    .save(&config_path)
+                    .err()
+                    .map(|error| error.to_string())
+            } else {
+                None
+            };
+            Json(serde_json::json!({
+                "ok": false,
+                "error": match rollback_error {
+                    Some(rollback) => format!(
+                        "provider reload rejected: {error:?}; config rollback failed: {rollback}"
+                    ),
+                    None => format!("provider reload rejected: {error:?}"),
+                },
+            }))
+        }
     }
 }
 
@@ -1459,16 +1530,25 @@ pub(crate) async fn approval_mode_get() -> impl IntoResponse {
     })
 }
 
-pub(crate) async fn approval_mode_set(Json(req): Json<LiveModeReq>) -> impl IntoResponse {
-    live_set_mode(req.mode);
-    let ok = match crate::native_live::join() {
-        Ok(_) => crate::native_live::dispatch(atomcode_coding::DriverCommand::SetMode(
-            native_runtime_mode(req.mode),
-        ))
-        .is_ok(),
+async fn apply_live_mode(mode: ApprovalMode) -> bool {
+    let accepted = match crate::native_live::binding() {
+        Ok(_) => crate::native_live::set_mode(native_runtime_mode(mode))
+            .await
+            .is_ok(),
         Err(_) => true,
     };
-    Json(ApprovalModeResp { ok, mode: req.mode })
+    if accepted {
+        live_set_mode(mode);
+    }
+    accepted
+}
+
+pub(crate) async fn approval_mode_set(Json(req): Json<LiveModeReq>) -> impl IntoResponse {
+    let ok = apply_live_mode(req.mode).await;
+    Json(ApprovalModeResp {
+        ok,
+        mode: live_current_approval_mode(),
+    })
 }
 
 /// POST /live/mode — webui 底栏「模式」pill 切换审批模式（build / plan / bypass）。
@@ -1479,15 +1559,11 @@ pub(crate) async fn approval_mode_set(Json(req): Json<LiveModeReq>) -> impl Into
 /// 模式是运行时会话状态，不写入 config（与 provider 持久化为默认不同）——避免
 /// 「免审批」这种危险态被静默持久化。
 pub(crate) async fn live_mode(Json(req): Json<LiveModeReq>) -> impl IntoResponse {
-    live_set_mode(req.mode);
-    let ok = match crate::native_live::join() {
-        Ok(_) => crate::native_live::dispatch(atomcode_coding::DriverCommand::SetMode(
-            native_runtime_mode(req.mode),
-        ))
-        .is_ok(),
-        Err(_) => true,
-    };
-    Json(ApprovalModeResp { ok, mode: req.mode })
+    let ok = apply_live_mode(req.mode).await;
+    Json(ApprovalModeResp {
+        ok,
+        mode: live_current_approval_mode(),
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -1553,6 +1629,7 @@ pub(crate) async fn live_reasoning_effort(
         )
             .into_response();
     };
+    let previous_effort = provider.reasoning_effort.clone();
     provider.reasoning_effort = effort;
     if let Err(error) = config.save(&config_path) {
         return (
@@ -1565,21 +1642,33 @@ pub(crate) async fn live_reasoning_effort(
             .into_response();
     }
 
-    if let Ok(join) = crate::native_live::join() {
+    if let Ok(binding) = crate::native_live::binding() {
         let runtime_config = chat_runtime_config(
             &config,
             &target,
-            &join.binding.working_dir,
+            &binding.working_dir,
             state.telemetry.clone(),
         );
-        if let Err(error) =
-            crate::native_live::dispatch(atomcode_coding::DriverCommand::ReloadProvider(
-                crate::kernel_runtime::coding_config_from_runtime(&runtime_config),
-            ))
+        if let Err(error) = crate::native_live::reload_provider(
+            crate::kernel_runtime::coding_config_from_runtime(&runtime_config),
+        )
+        .await
         {
+            if let Some(provider) = config.providers.get_mut(&target) {
+                provider.reasoning_effort = previous_effort;
+            }
+            let rollback_error = config
+                .save(&config_path)
+                .err()
+                .map(|error| error.to_string());
             return Json(serde_json::json!({
                 "ok": false,
-                "error": format!("provider reload rejected: {error:?}"),
+                "error": match rollback_error {
+                    Some(rollback) => format!(
+                        "provider reload rejected: {error:?}; config rollback failed: {rollback}"
+                    ),
+                    None => format!("provider reload rejected: {error:?}"),
+                },
             }))
             .into_response();
         }
@@ -1633,10 +1722,11 @@ pub(crate) async fn live_permission(
         _ => atomcode_capabilities::tools::ApprovalResponse::deny(),
     };
     let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
-    let ok = crate::native_live::respond_pending_kind(
+    let ok = crate::native_live::respond_pending_kind_confirmed(
         atomcode_capabilities::tools::APPROVAL_KIND,
         value,
     )
+    .await
     .is_ok();
     Json(serde_json::json!({ "accepted": ok }))
 }
@@ -1666,7 +1756,9 @@ pub(crate) async fn live_user_input(
         "selected": req.selected,
         "text": req.text,
     });
-    let ok = crate::native_live::respond(req.request_id, value).is_ok();
+    let ok = crate::native_live::respond_confirmed(req.request_id, value)
+        .await
+        .is_ok();
     axum::Json(serde_json::json!({ "accepted": ok }))
 }
 
@@ -1693,7 +1785,7 @@ pub(crate) async fn live_command(
 /// 任一视图(手机 App「停止」/ webui / TUI)都可调用,先到先停。
 /// 返回 `{"cancelled": bool}`:false 表示当前没有运行中的 turn。
 pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResponse {
-    let cancelled = crate::native_live::cancel().is_ok();
+    let cancelled = crate::native_live::cancel_confirmed().await.is_ok();
     Json(serde_json::json!({ "cancelled": cancelled }))
 }
 
@@ -1714,11 +1806,8 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
             // trusted project servers immediately. Best-effort: before the first
             // turn there is no runtime yet, and its first prepare reads trust
             // from disk directly.
-            let reloaded = match crate::native_live::join() {
-                Ok(_) => {
-                    crate::native_live::dispatch(atomcode_coding::DriverCommand::ReloadCapabilities)
-                        .is_ok()
-                }
+            let reloaded = match crate::native_live::binding() {
+                Ok(_) => crate::native_live::reload_capabilities().await.is_ok(),
                 Err(_) => true,
             };
             Json(serde_json::json!({
@@ -1918,10 +2007,9 @@ mod tests {
         }
     }
 
-    // 回归：webui sync/live 模式切换模型——/live/message 必须解析 provider 字段，
-    // 且 set_live_provider 把选择写入 LIVE_PROVIDER（None 不覆盖既有选择）。
+    // 回归：/live/message 必须解析显式 provider，但不接受 per-message mode 覆盖。
     #[test]
-    fn live_message_parses_provider_and_updates_override() {
+    fn live_message_parses_optional_provider() {
         // 带 provider 的请求体被解析。
         // `approval_mode` is deliberately ignored here: live approval mode is
         // global runtime state changed only through /approval_mode or /live/mode,
@@ -1931,15 +2019,9 @@ mod tests {
                 .unwrap();
         assert_eq!(req.provider.as_deref(), Some("openai"));
 
-        // set_live_provider(Some) 写入覆盖。
-        set_live_provider(req.provider);
-        assert_eq!(LIVE_PROVIDER.lock().unwrap().as_deref(), Some("openai"));
-
-        // 不带 provider 的请求体默认 None，且 set_live_provider(None) 不覆盖既有选择。
+        // 不带 provider 的请求体默认 None。
         let req2: LiveMessageReq = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
         assert_eq!(req2.provider, None);
-        set_live_provider(req2.provider);
-        assert_eq!(LIVE_PROVIDER.lock().unwrap().as_deref(), Some("openai"));
     }
 
     #[test]

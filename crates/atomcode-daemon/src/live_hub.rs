@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use atomcode_coding::{
     CodingRuntimeEvent, CodingRuntimeHandle, DriverCommand, RuntimePhase, RuntimeStatus,
-    RuntimeUnavailable, SequencedRuntimeEvent, TurnCompletion, UserInput,
+    RuntimeUnavailable, SequencedRuntimeEvent, SubmitReceipt, TurnCompletion, UserInput,
 };
 use atomcode_kernel::event::{AgentEvent, RequestId};
 use atomcode_kernel::message::SessionSnapshot;
@@ -15,6 +15,7 @@ const BROADCAST_CAPACITY: usize = 1024;
 pub trait LiveRuntimeControl: Send + Sync {
     fn status(&self) -> RuntimeStatus;
     fn dispatch(&self, command: DriverCommand) -> Result<(), RuntimeUnavailable>;
+    fn handle(&self) -> Option<CodingRuntimeHandle>;
 }
 
 impl LiveRuntimeControl for CodingRuntimeHandle {
@@ -24,6 +25,10 @@ impl LiveRuntimeControl for CodingRuntimeHandle {
 
     fn dispatch(&self, command: DriverCommand) -> Result<(), RuntimeUnavailable> {
         CodingRuntimeHandle::dispatch(self, command)
+    }
+
+    fn handle(&self) -> Option<CodingRuntimeHandle> {
+        Some(self.clone())
     }
 }
 
@@ -68,6 +73,7 @@ pub enum HubError {
     ActiveTurn,
     NoActiveTurn,
     SnapshotUnavailable(String),
+    RuntimeRejected(String),
 }
 
 struct BoundRuntime {
@@ -170,6 +176,16 @@ impl LiveViewHub {
         })
     }
 
+    pub fn binding(&self) -> Result<LiveBinding, HubError> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .binding
+            .as_ref()
+            .map(|bound| bound.identity.clone())
+            .ok_or(HubError::Unbound)
+    }
+
     pub fn unbind(&self, binding: &LiveBinding) -> Result<(), HubError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
@@ -252,11 +268,41 @@ impl LiveViewHub {
         Self::dispatch_locked(&state, DriverCommand::Submit(input.clone()))?;
         if !state.turn_active {
             state.replay.clear();
+            state.pending_requests.clear();
         }
         state.turn_active = true;
-        state.pending_requests.clear();
         self.publish_view_locked(&mut state, LiveViewEvent::InputAccepted(input), true);
         Ok(())
+    }
+
+    pub async fn submit_confirmed(&self, input: UserInput) -> Result<SubmitReceipt, HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        let receipt = handle
+            .submit(input.clone())
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+        let receipt_generation = match receipt {
+            SubmitReceipt::Started { generation, .. }
+            | SubmitReceipt::Steered { generation, .. } => generation,
+        };
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
+        if current.identity.id != binding.id {
+            return Err(HubError::StaleBinding);
+        }
+        if current.identity.generation != receipt_generation {
+            return Err(HubError::RuntimeGenerationChanged {
+                expected: receipt_generation,
+                actual: current.identity.generation,
+            });
+        }
+        if matches!(receipt, SubmitReceipt::Started { .. }) {
+            state.replay.clear();
+            state.pending_requests.clear();
+        }
+        state.turn_active = true;
+        self.publish_view_locked(&mut state, LiveViewEvent::InputAccepted(input), true);
+        Ok(receipt)
     }
 
     /// Record an input already accepted through the bound runtime's local driver.
@@ -286,6 +332,61 @@ impl LiveViewHub {
         Self::dispatch_locked(&state, command)
     }
 
+    pub async fn set_mode(&self, mode: atomcode_coding::RuntimeMode) -> Result<(), HubError> {
+        self.bound_handle()?
+            .1
+            .set_mode(mode)
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+    }
+
+    pub async fn reload_provider(
+        &self,
+        next: atomcode_coding::CodingAgentConfig,
+    ) -> Result<atomcode_coding::RuntimeGeneration, HubError> {
+        self.bound_handle()?
+            .1
+            .reassemble_provider(next)
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+    }
+
+    pub async fn resume_session(
+        &self,
+        session_id: String,
+    ) -> Result<atomcode_coding::SessionChanged, HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        let changed = handle
+            .resume_session(session_id)
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+        self.commit_changed_snapshot(&binding, &handle, &changed)
+            .await?;
+        Ok(changed)
+    }
+
+    pub async fn change_directory(
+        &self,
+        working_dir: PathBuf,
+    ) -> Result<atomcode_coding::SessionChanged, HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        let changed = handle
+            .change_directory(working_dir)
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+        self.commit_changed_snapshot(&binding, &handle, &changed)
+            .await?;
+        Ok(changed)
+    }
+
+    pub async fn reload_capabilities(&self) -> Result<atomcode_coding::SessionChanged, HubError> {
+        self.bound_handle()?
+            .1
+            .reload_capabilities()
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+    }
+
     pub fn publish_command_output(&self, text: String) -> Result<(), HubError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.binding.is_none() {
@@ -305,6 +406,33 @@ impl LiveViewHub {
         Ok(())
     }
 
+    pub async fn respond_confirmed(
+        &self,
+        id: RequestId,
+        value: serde_json::Value,
+    ) -> Result<(), HubError> {
+        {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if !state.pending_requests.contains_key(&id) {
+                return Err(HubError::UnknownRequest(id));
+            }
+        }
+        let (binding, handle) = self.bound_handle()?;
+        handle
+            .respond(id, value)
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
+        if current.identity.id != binding.id {
+            return Err(HubError::StaleBinding);
+        }
+        if current.identity.generation == binding.generation {
+            state.pending_requests.remove(&id);
+        }
+        Ok(())
+    }
+
     pub fn respond_pending_kind(
         &self,
         kind: &str,
@@ -321,12 +449,43 @@ impl LiveViewHub {
         Ok(id)
     }
 
+    pub async fn respond_pending_kind_confirmed(
+        &self,
+        kind: &str,
+        value: serde_json::Value,
+    ) -> Result<RequestId, HubError> {
+        let id = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state
+                .pending_requests
+                .iter()
+                .find_map(|(id, pending_kind)| (pending_kind == kind).then_some(*id))
+                .ok_or(HubError::UnknownRequest(0))?
+        };
+        self.respond_confirmed(id, value).await?;
+        Ok(id)
+    }
+
     pub fn cancel(&self) -> Result<(), HubError> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if !state.turn_active {
             return Err(HubError::NoActiveTurn);
         }
         Self::dispatch_locked(&state, DriverCommand::Cancel)
+    }
+
+    pub async fn cancel_confirmed(&self) -> Result<(), HubError> {
+        {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if !state.turn_active {
+                return Err(HubError::NoActiveTurn);
+            }
+        }
+        self.bound_handle()?
+            .1
+            .cancel()
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
     }
 
     pub fn publish(
@@ -396,17 +555,24 @@ impl LiveViewHub {
             }
             CodingRuntimeEvent::SessionChanged(changed) => {
                 let current = state.binding.as_mut().expect("binding checked above");
+                let identity_changed = changed
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|session_id| session_id != &current.identity.session_id)
+                    || changed.working_dir != current.identity.working_dir;
                 if let Some(session_id) = &changed.session_id {
                     current.identity.session_id = session_id.clone();
                 }
                 current.identity.working_dir = changed.working_dir.clone();
-                // The identity changes before the owner can asynchronously fetch
-                // the replacement snapshot. Never pair it with the previous
-                // session's snapshot during that window.
-                state.snapshot_error = Some("session snapshot pending".into());
-                state.replay.clear();
-                state.pending_requests.clear();
-                state.turn_active = false;
+                if identity_changed {
+                    // The identity changes before the owner can asynchronously fetch
+                    // the replacement snapshot. Never pair it with the previous
+                    // session's snapshot during that window.
+                    state.snapshot_error = Some("session snapshot pending".into());
+                    state.replay.clear();
+                    state.pending_requests.clear();
+                    state.turn_active = false;
+                }
             }
             CodingRuntimeEvent::WorkingDirectoryChanged(working_dir) => {
                 let current = state.binding.as_mut().expect("binding checked above");
@@ -453,6 +619,49 @@ impl LiveViewHub {
             .control
             .dispatch(command)
             .map_err(|_| HubError::RuntimeUnavailable)
+    }
+
+    fn bound_handle(&self) -> Result<(LiveBinding, CodingRuntimeHandle), HubError> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(error) = &state.snapshot_error {
+            return Err(HubError::SnapshotUnavailable(error.clone()));
+        }
+        let binding = state.binding.as_ref().ok_or(HubError::Unbound)?;
+        let status = binding.control.status();
+        if status.generation != binding.identity.generation {
+            return Err(HubError::RuntimeGenerationChanged {
+                expected: binding.identity.generation,
+                actual: status.generation,
+            });
+        }
+        let handle = binding
+            .control
+            .handle()
+            .ok_or(HubError::RuntimeUnavailable)?;
+        Ok((binding.identity.clone(), handle))
+    }
+
+    async fn commit_changed_snapshot(
+        &self,
+        binding: &LiveBinding,
+        handle: &CodingRuntimeHandle,
+        changed: &atomcode_coding::SessionChanged,
+    ) -> Result<(), HubError> {
+        let snapshot = handle
+            .snapshot()
+            .await
+            .map_err(|error| HubError::SnapshotUnavailable(error.to_string()))?;
+        let session_id = changed
+            .session_id
+            .clone()
+            .ok_or_else(|| HubError::SnapshotUnavailable("runtime has no session id".into()))?;
+        self.commit_runtime_snapshot(
+            binding,
+            session_id,
+            changed.working_dir.clone(),
+            snapshot.as_ref().clone(),
+        )?;
+        Ok(())
     }
 
     fn publish_view_locked(&self, state: &mut HubState, event: LiveViewEvent, replay: bool) {
@@ -502,6 +711,10 @@ mod tests {
             self.commands.lock().unwrap().push(command);
             Ok(())
         }
+
+        fn handle(&self) -> Option<atomcode_coding::CodingRuntimeHandle> {
+            None
+        }
     }
 
     fn control() -> (Arc<FakeControl>, Arc<Mutex<Vec<DriverCommand>>>) {
@@ -532,6 +745,23 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error, HubError::Unbound);
+    }
+
+    #[tokio::test]
+    async fn confirmed_submit_requires_an_authoritative_runtime_handle() {
+        let hub = LiveViewHub::new();
+        let (control, commands) = control();
+        hub.bind("session-1", PathBuf::from("/one"), snapshot("one"), control)
+            .unwrap();
+
+        let error = hub
+            .submit_confirmed(UserInput::from("hello"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, HubError::RuntimeUnavailable);
+        assert!(commands.lock().unwrap().is_empty());
+        assert!(hub.join().unwrap().replay.is_empty());
     }
 
     #[test]
@@ -934,6 +1164,40 @@ mod tests {
         assert_eq!(join.binding.working_dir, PathBuf::from("/two"));
         assert_eq!(join.binding.generation, 1);
         assert_eq!(join.snapshot.messages[0].text, "new");
+    }
+
+    #[test]
+    fn reconfigure_event_for_same_session_keeps_committed_snapshot_available() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind(
+                "session-1",
+                PathBuf::from("/one"),
+                snapshot("committed"),
+                control,
+            )
+            .unwrap();
+
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 2,
+                sequence: 1,
+                event: CodingRuntimeEvent::SessionChanged(atomcode_coding::SessionChanged {
+                    generation: atomcode_coding::RuntimeGeneration(2),
+                    session_id: Some("session-1".into()),
+                    working_dir: PathBuf::from("/one"),
+                }),
+            },
+        )
+        .unwrap();
+
+        let join = hub
+            .join()
+            .expect("same-session reconfigure keeps snapshot valid");
+        assert_eq!(join.binding.generation, 2);
+        assert_eq!(join.snapshot.messages[0].text, "committed");
     }
 
     #[test]

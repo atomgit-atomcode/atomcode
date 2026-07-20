@@ -1,8 +1,11 @@
 # Live Transport 收口方案
 
-> 状态：方案已按 `release/v5.0.1@97a21adb42ba69457cb6b7157f3681283e03a367` 复核，进入 LT1。
+> 状态：LT0～LT5 已实施；live transport legacy 接口面达到状态④。
 >
-> 当前四态：core live transport 的逻辑已实现且 TUI/daemon 生产消费者仍在使用，旧接口面处于状态③；尚未退役。
+> 实施基线：`release/v5.0.1@97a21adb42ba69457cb6b7157f3681283e03a367`。
+>
+> 当前四态：CLI、TUI、daemon 已使用 Coding Runtime 原生命令、事件和 snapshot；core `live`、
+> `TurnEvent`、daemon 第二 runtime 和 TUI snapshot handoff 已删除，达到状态④。
 
 ## 1. 结论
 
@@ -33,27 +36,26 @@ Live View: TUI / WebUI / mobile
   runtime，不得再创建 `KernelTurnExecutor` runtime；
 - 不创建新的大而全协议 crate。优先复用 kernel `AgentEvent/ToolBatchCall/SessionSnapshot` 和 coding
   `CodingRuntimeEvent/RuntimeRequest/DriverCommand`，Web SSE DTO 留在 daemon 边界；
-- 完成标准是删除 core `LiveSession/TurnExecutor/TurnEvent` 及其生产依赖、重复转换和 TUI snapshot
-  handoff fallback，不以“新 hub 已可用”冒充退役。
+- 完成标准已兑现：删除 core `LiveSession/TurnExecutor/TurnEvent` 及其生产依赖、重复转换和 TUI
+  snapshot handoff fallback，不以“新 hub 已可用”冒充退役。
 
-## 2. 当前事实
+## 2. 实施结果
 
-| 范围 | 当前 owner / 路径 | 问题 |
+| 范围 | 当前 owner / 路径 | 结果 |
 |---|---|---|
-| core `LiveSession` | core `Conversation` + coordinator | 第二份 conversation 和 turn guard |
-| daemon `KernelTurnExecutor` | 私有持久 `CodingRuntime` | live 层自行创建、reload、reprepare runtime |
-| TUI foreground | `RuntimeControl` + `CodingRuntime` | `/webui` 后与 live runtime 并存 |
-| 审批 / user input | core 全局 sender 槽 | 响应只靠当前槽，generation/session 约束不显式 |
-| 多视图回放 | core snapshot + turn buffer | snapshot 是 core projection，不是 native runtime 权威类型 |
-| provider/mode/cd | 多个 daemon 进程级静态变量 | 状态与 runtime binding 分离，替换时容易串会话 |
-| `/chat` | native runtime → core `TurnEvent` → wire | 非 live 路径仍借用 legacy 展示 DTO |
+| core live | 已删除 `core/src/live` 和 `turn/event.rs` | 第二 conversation、turn guard 和孤儿 progress sender 已删除 |
+| headless daemon | daemon driver 创建一个 `CodingRuntime` 并绑定 hub | 不再创建 `KernelTurnExecutor` 或 core conversation |
+| TUI embedded | hub 绑定 foreground `RuntimeControl` | `/webui`、`/sync` 不再创建第二 runtime |
+| 审批 / user input | hub 按 native request id 关联 | 错误 id、重复回答、generation 替换均 fail-closed |
+| 多视图回放 | native committed snapshot + generation replay | session snapshot 未提交期间 join fail-closed |
+| provider/mode/cd | 原生 reconfigure 命令 | UI 选择状态不再充当 runtime shadow owner |
+| `/chat` | `CodingRuntimeEvent` → daemon projector → wire | 已删除 core `TurnEvent` 中间投影 |
 
 当前生产消费者：
 
 - daemon `/live` SSE、message、cancel、permission、user-input、provider、mode、cd、session switch；
 - daemon `/chat` 的 `TurnEvent` 中间投影；
 - TUI `/webui`、`/sync`、session switch、输入、cancel、审批、remote slash command 和 live forwarder；
-- core bash/tool 的历史 `TurnEvent` progress sender；
 - Web/mobile 的 `LiveWireEvent` 外部兼容面。
 
 ## 3. 不变量与失败语义
@@ -73,7 +75,7 @@ Live View: TUI / WebUI / mobile
 
 ## 4. 实施切片
 
-### LT0：基线与 characterization
+### LT0：基线与 characterization（完成）
 
 - 固定当前 `/live` wire shape、join/replay、busy、cancel、审批多请求、错误 request id、session switch 和
   lag 行为；
@@ -82,7 +84,7 @@ Live View: TUI / WebUI / mobile
 
 完成门槛：每个后续切片都能指出保护它的现有或新增失败测试。
 
-### LT1：中立事件类型去重
+### LT1：中立事件类型去重（完成）
 
 - TUI/daemon 的 tool-batch 展示统一使用 kernel `ToolBatchCall`，删除非 live 消费者对 core duplicate 的依赖；
 - `/chat` 不再把 core `TurnEvent` 当成公共协议，逐步改为 daemon projector 或直接消费 native runtime event；
@@ -91,7 +93,7 @@ Live View: TUI / WebUI / mobile
 预计删除：TUI/daemon 的 core `ToolBatchCall` 引用、kernel → core tool-batch 复制；为 LT2 缩小
 `TurnEvent` 的真实消费者。
 
-### LT2：建立无执行权的 Live View Hub
+### LT2：建立无执行权的 Live View Hub（完成）
 
 - 在 daemon 内实现 hub：native committed snapshot、generation-scoped replay、broadcast、runtime control
   binding 和 pending request 索引；
@@ -101,7 +103,7 @@ Live View: TUI / WebUI / mobile
 预计删除：core coordinator 的第二 conversation、turn guard、审批/回答 sender 槽和 cancellation token 语义；
 在消费者切换前 core 实现仍保留，状态仍是③。
 
-### LT3：headless daemon 切换
+### LT3：headless daemon 切换（完成）
 
 - daemon 创建的 `CodingRuntime` 直接绑定 hub；runtime 事件单一消费方同时更新 hub 与 daemon API；
 - `/live` message/permission/user-input/cancel/provider/mode/cd 全部路由到 binding；
@@ -110,7 +112,7 @@ Live View: TUI / WebUI / mobile
 
 预计删除：daemon `TurnExecutor` 实现、live runtime 二次 snapshot 写回和 core conversation 投影。
 
-### LT4：TUI foreground runtime 复用
+### LT4：TUI foreground runtime 复用（完成）
 
 - TUI runtime event forwarder增加 hub tee，`/webui` / `/sync` 将当前 `RuntimeControl` 与当前 generation/session
   绑定到 hub；
@@ -120,7 +122,7 @@ Live View: TUI / WebUI / mobile
 
 预计删除：TUI 第二 runtime、sync 专用 input/approval/cancel 分支和 snapshot handoff。
 
-### LT5：core legacy 接口面退役
+### LT5：core legacy 接口面退役（完成）
 
 - 切换所有生产消费者与测试；
 - 删除 core `live` 模块、`TurnExecutor`、`TurnEvent`、相关 `ToolContext.event_tx` 和无消费者依赖；
@@ -138,7 +140,24 @@ Live View: TUI / WebUI / mobile
 | LT4 | TUI sync：同 runtime、switch、detach、late event | TUI 全 crate + CLI all-targets |
 | LT5 | 全仓符号/依赖搜索 | core、daemon、TUI、CLI 相关 workspace 检查 |
 
+最终自动验证（2026-07-21）：
+
+| 范围 | 结果 |
+|---|---|
+| core | 1236 passed，1 ignored |
+| daemon | 132 passed |
+| TUI | 1406 passed；plugin target 1 passed |
+| CLI | 81 passed |
+| WebUI | 59 passed；TypeScript typecheck 通过 |
+| workspace | `cargo check --workspace --all-targets` 通过；仅保留既有 kernel liveness 测试 unused import 警告 |
+| legacy 搜索 | 生产代码中无 `LiveSession/TurnExecutor/TurnEvent/core::live/live_sync` 引用 |
+
+实际删除：core `live` 与 `turn/event` 模块、孤儿 `ToolContext.event_tx/current_call_id`、daemon
+`KernelTurnExecutor/NativeRuntimeState/LIVE_EXECUTOR`、TUI `live_sync` 与 snapshot handoff 状态。
+deferred runtime 事件保留 generation/sequence；Web 的 submit/respond/cancel/provider/mode/session/cd/reload
+接口等待 Coding Runtime 真实终态，配置失败会回滚或显式报告。
+
 ## 6. 当前唯一下一步
 
-执行 LT1 的第一个闭环：先写一个使用 kernel `ToolBatchCall` 的失败测试，再把 TUI native UI 事件和 daemon
-`ChatEvent` 的 batch payload 切到 kernel 类型，删除这些路径上的 core duplicate 转换；不触碰 wire 字段。
+完成一次人工多端验收：TUI 启动 `/webui`，浏览器加入同一会话，分别验证双向输入、审批、cancel、
+session resume、`/cd` 和 provider reload。该步骤验证真实浏览器/终端交互，不再新增迁移代码。
