@@ -11,6 +11,10 @@ atomcode-config = { path = "../atomcode-config" }
 # `auth` (OAuth login + secure token file) extracted to this leaf; core re-exports it as
 # `atomcode_core::auth` during the transition.
 atomcode-auth = { path = "../atomcode-auth" }
+# TEMP: for the `pub use atomcode_codingplan as coding_plan` shim during extraction.
+# Removed in the final task once all consumers switch to atomcode_codingplan directly
+# (core itself no longer uses coding_plan — provider signs via atomcode_auth::gateway_crypto).
+atomcode-codingplan = { path = "../atomcode-codingplan" }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

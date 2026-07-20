@@ -14,16 +14,16 @@
 // API gateway sees a consistent `atomcode/<ver>` identifier.
 
 pub mod client;
-pub mod crypto;
 pub mod setup;
 pub mod sync_marker;
 pub mod types;
 pub mod usage;
 
+// Gateway request-signing (is_atomgit_gateway / RequestSigner / SignInput / …) lives in
+// `atomcode_auth::gateway_crypto` now — this crate is the CodingPlan REST/usage/setup business
+// layer only. Consumers that need signing import from `atomcode_auth::gateway_crypto` directly.
+
 pub use client::{api_base_url, is_auth_expired, AuthExpired, Client};
-pub use crypto::{
-    is_atomgit_gateway, signer, signer_available, RequestSigner, SignError, SignInput, SignOutput,
-};
 pub use setup::{run, SetupReport, StepResult};
 pub use sync_marker::{read_last_sync, write_last_sync_now};
 pub use types::{ClaimResponse, ModelEntry, PlanInfo, PlanType, StatusResponse, UsageInfo};

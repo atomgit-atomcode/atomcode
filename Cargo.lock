@@ -476,6 +476,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomcode-codingplan"
+version = "5.0.0"
+dependencies = [
+ "anyhow",
+ "atomcode-auth",
+ "atomcode-config",
+ "atomcode-telemetry",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
 name = "atomcode-codingplan-crypto"
 version = "0.1.0"
 
@@ -500,6 +516,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "atomcode-auth",
+ "atomcode-codingplan",
  "atomcode-config",
  "atomcode-kernel",
  "atomcode-telemetry",

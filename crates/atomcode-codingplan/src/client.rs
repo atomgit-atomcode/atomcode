@@ -1,7 +1,7 @@
 // crates/atomcode-core/src/coding_plan/client.rs
 //
 // Blocking HTTP client for the three CodingPlan REST endpoints. Reuses the
-// OAuth token already on disk (from `crate::auth`) — the token authenticates
+// OAuth token already on disk (from `atomcode_auth`) — the token authenticates
 // both `atomgit.com` and `api.gitcode.com` (same backend, different front
 // domains). Every request carries `ATOMCODE_USER_AGENT` so AtomGit's
 // API gateway sees a consistent identifier.
@@ -13,7 +13,24 @@
 use anyhow::{anyhow, Context, Result};
 
 use super::types::{ClaimResponse, ModelEntry, PlanType, StatusResponse};
-use crate::auth;
+use atomcode_auth as auth;
+
+/// Apply the process proxy policy to a blocking reqwest client builder, inlined here so the
+/// leaf needs no `atomcode-core` (core's `proxy::apply_blocking_proxy_policy` lived there
+/// because it needs reqwest, which the config leaf can't carry). Honors NoProxy mode; leaves
+/// reqwest's env-based proxy detection intact otherwise. Fail-open (any non-NoProxy → builder).
+fn apply_blocking_proxy_policy(
+    builder: reqwest::blocking::ClientBuilder,
+) -> reqwest::blocking::ClientBuilder {
+    atomcode_config::proxy::ensure_runtime_initialized();
+    if std::env::var(atomcode_config::proxy::MODE_ENV).ok().as_deref()
+        == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
+    {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
 
 /// Default CodingPlan REST API base URL.
 /// Override with the `ATOMCODE_CODINGPLAN_API_BASE` environment variable.
@@ -122,10 +139,10 @@ impl Client {
         // error. `builder().build()` returns the same failure as a catchable
         // `Err`, so propagate it and let the orchestrator render a clean
         // "status fetch failed" line.
-        let http = crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
+        let http = apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
-            .user_agent(crate::ATOMCODE_USER_AGENT)
+            .user_agent(atomcode_auth::ATOMCODE_USER_AGENT)
             .build()
             .context("failed to build CodingPlan HTTP client")?;
         Ok(Self { http, token })
@@ -239,7 +256,7 @@ impl Client {
     /// GET the 60-day CodingPlan usage (no date params — server defaults to
     /// 60 days). Mirrors `status_v2`'s blocking client + bearer auth +
     /// timeout + retry + auth-error promotion.
-    pub fn usage(&self) -> Result<crate::coding_plan::usage::UsageResponse> {
+    pub fn usage(&self) -> Result<crate::usage::UsageResponse> {
         let url = format!("{}/coding-plan/usage", api_base_url());
         let resp = with_retries(&CODING_PLAN_RETRY_BACKOFFS, is_transient_send_error, || {
             self.http.get(&url).bearer_auth(&self.token).send()
@@ -256,7 +273,7 @@ impl Client {
         if !status.is_success() {
             return Err(anyhow!("{}", format_api_error("usage", status, &body)));
         }
-        crate::coding_plan::usage::parse_usage(&body).with_context(|| {
+        crate::usage::parse_usage(&body).with_context(|| {
             format!(
                 "parse usage response (body: {})",
                 truncate_for_error(&body, 200)

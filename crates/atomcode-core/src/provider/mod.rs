@@ -419,7 +419,7 @@ pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> 
         // platform credential to an attacker-controlled base_url would
         // leak the user's AtomGit identity.
         let base_url = config.base_url.as_deref().unwrap_or("");
-        if !crate::coding_plan::crypto::is_atomgit_gateway(base_url) {
+        if !atomcode_auth::gateway_crypto::is_atomgit_gateway(base_url) {
             anyhow::bail!(
                 "Provider '{}' has no api_key and base_url '{base_url}' is not \
                  a trusted AtomGit gateway.\n\

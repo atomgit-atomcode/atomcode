@@ -36,7 +36,7 @@ use super::client::{is_auth_expired, Client};
 use super::types::{ModelEntry, PlanType, StatusResponse};
 #[cfg(test)]
 use super::types::RateLimitWindow;
-use crate::auth;
+use atomcode_auth as auth;
 use atomcode_config::config::provider::ProviderConfig;
 use atomcode_config::config::Config;
 
@@ -142,7 +142,7 @@ impl SetupReport {
     /// Shared by the CLI subcommand and the `/codingplan` slash command
     /// so the visual contract stays consistent.
     pub fn render(&self) -> String {
-        use crate::i18n::{t, Msg};
+        use atomcode_config::i18n::{t, Msg};
 
         let mut out = String::new();
         out.push_str(&t(Msg::CpSetupHeader));
@@ -933,7 +933,7 @@ fn step_models_and_register(
     //     or clear to None when the new list has no VL candidate.
     let vl_idx = names
         .iter()
-        .position(|n| crate::provider::model_name_suggests_vision(n));
+        .position(|n| atomcode_config::util::model_name_suggests_vision(n));
     let new_vl_key = vl_idx.map(|i| provider_names[i].clone());
 
     let vision_preprocessor = {
@@ -1420,8 +1420,8 @@ mod tests {
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
                 all_models: vec![],
             }),
-            status: StepResult::Ok(crate::coding_plan::types::StatusResponse {
-                codingplan_free: Some(crate::coding_plan::types::PlanInfo {
+            status: StepResult::Ok(crate::types::StatusResponse {
+                codingplan_free: Some(crate::types::PlanInfo {
                     plan_name: "CodingPlan Free".into(),
                     status: 1,
                     claimed_at: "2026-04-22".into(),
@@ -1430,7 +1430,7 @@ mod tests {
                     total_days: 30,
                     apply_id: 1,
                 }),
-                current_usage: Some(crate::coding_plan::types::UsageInfo {
+                current_usage: Some(crate::types::UsageInfo {
                     placeholder: false,
                     window_token_limit: 50000,
                     window_tokens_used: 0,
@@ -1515,8 +1515,8 @@ mod tests {
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
                 all_models: vec![],
             }),
-            status: StepResult::Ok(crate::coding_plan::types::StatusResponse {
-                codingplan_free: Some(crate::coding_plan::types::PlanInfo {
+            status: StepResult::Ok(crate::types::StatusResponse {
+                codingplan_free: Some(crate::types::PlanInfo {
                     plan_name: "CodingPlan Free".into(),
                     status: 0,
                     claimed_at: String::new(),
@@ -2186,7 +2186,7 @@ mod tests {
 
         let vl_idx = names
             .iter()
-            .position(|n| crate::provider::model_name_suggests_vision(n));
+            .position(|n| atomcode_config::util::model_name_suggests_vision(n));
         let new_vl_key = vl_idx.map(|i| provider_names[i].clone());
         let vision_preprocessor = {
             let current = config.vision_preprocessor_provider.clone();
@@ -2417,8 +2417,8 @@ mod tests {
 
     // ── rate_limit_windows rendering tests ─────────────────────────────
 
-    fn blank_status_response() -> crate::coding_plan::types::StatusResponse {
-        crate::coding_plan::types::StatusResponse {
+    fn blank_status_response() -> crate::types::StatusResponse {
+        crate::types::StatusResponse {
             codingplan_free: None,
             current_usage: None,
             audit_status: 0,
@@ -2430,7 +2430,7 @@ mod tests {
     }
 
     fn status_only_report(
-        s: crate::coding_plan::types::StatusResponse,
+        s: crate::types::StatusResponse,
     ) -> SetupReport {
         SetupReport {
             login: StepResult::Skipped("already logged in".into()),
@@ -2445,7 +2445,7 @@ mod tests {
     #[test]
     fn render_uses_rate_limit_windows_when_present() {
         // rate_limit_windows populated → prefers new field over current_usage.
-        let s = crate::coding_plan::types::StatusResponse {
+        let s = crate::types::StatusResponse {
             rate_limit_windows: vec![
                 RateLimitWindow {
                     rule_index: 0,
@@ -2473,8 +2473,8 @@ mod tests {
     #[test]
     fn render_falls_back_to_current_usage_when_windows_empty() {
         // rate_limit_windows empty → backward-compat path using current_usage.
-        let s = crate::coding_plan::types::StatusResponse {
-            current_usage: Some(crate::coding_plan::types::UsageInfo {
+        let s = crate::types::StatusResponse {
+            current_usage: Some(crate::types::UsageInfo {
                 placeholder: false,
                 window_token_limit: 0,
                 window_tokens_used: 0,
@@ -2497,7 +2497,7 @@ mod tests {
     #[test]
     fn render_rate_limit_window_hidden_when_show_enable_zero() {
         // show_enable=0 windows must be skipped; only show_enable=1 rendered.
-        let s = crate::coding_plan::types::StatusResponse {
+        let s = crate::types::StatusResponse {
             rate_limit_windows: vec![
                 RateLimitWindow {
                     rule_index: 0,

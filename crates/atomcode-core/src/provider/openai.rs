@@ -14,7 +14,7 @@ use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
 
 use crate::auth::oauth::{get_stored_auth, refresh_access_token};
-use crate::coding_plan::crypto::{self, SignError, SignInput};
+use atomcode_auth::gateway_crypto::{self as crypto, SignError, SignInput};
 use crate::i18n::{t, Msg};
 
 use super::{LlmProvider, ReasoningPolicy};
