@@ -686,6 +686,9 @@ async fn bash_execute_background(
         crate::process_utils::apply_utf8_locale_env(&mut cmd);
         unsafe {
             cmd.pre_exec(|| {
+                // SAFETY(pre_exec): runs in the forked child before exec —
+                // async-signal-safe libc ONLY. No allocation, locks, panics, or
+                // non-reentrant calls, or the child can deadlock. setsid() is safe.
                 extern "C" {
                     fn setsid() -> i32;
                 }
@@ -811,6 +814,10 @@ pub async fn run_shell(
         // like the [PASSED] box from AtomGit push hooks.
         unsafe {
             cmd.pre_exec(|| {
+                // SAFETY(pre_exec): runs in the forked child before exec —
+                // async-signal-safe libc ONLY. No allocation, locks, panics, or
+                // non-reentrant calls, or the child can deadlock.
+                // setsid()/open()/close()/ioctl() below are async-signal-safe.
                 extern "C" {
                     fn setsid() -> i32;
                     fn open(path: *const i8, oflag: i32, ...) -> i32;
@@ -3917,6 +3924,9 @@ mod pgroup_child_tests {
             .kill_on_drop(true);
         unsafe {
             cmd.pre_exec(|| {
+                // SAFETY(pre_exec): runs in the forked child before exec —
+                // async-signal-safe libc ONLY. No allocation, locks, panics, or
+                // non-reentrant calls, or the child can deadlock. setsid() is safe.
                 extern "C" {
                     fn setsid() -> i32;
                 }

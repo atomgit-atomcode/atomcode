@@ -542,6 +542,9 @@ fn spawn_detached_upgrade_prep() {
         use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {
+                // SAFETY(pre_exec): runs in the forked child before exec —
+                // async-signal-safe libc ONLY. No allocation, locks, panics, or
+                // non-reentrant calls, or the child can deadlock. libc::setsid() is safe.
                 // Detach from parent's controlling terminal / process group.
                 // Return value ignored — setsid only fails when caller is
                 // already a process group leader (not our case post-fork).
