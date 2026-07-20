@@ -758,6 +758,8 @@ pub async fn run(
         mcp_registry,
         mcp_connect_rx,
         mcp_reload: None,
+        mcp_blocked_untrusted: Vec::new(),
+        mcp_blocked_notice_emitted: false,
         lsp_connect_rx,
         telemetry,
         worktree_original_dir: None,

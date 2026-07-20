@@ -53,6 +53,11 @@ pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecisi
 /// 进程内单一活动 LiveSession（TUI 与进程内 webui 共享）。
 static LIVE: StdMutex<Option<Arc<atomcode_core::live::LiveSession>>> = StdMutex::new(None);
 
+/// 当前 LiveSession 的具体执行器。与 `LIVE` 同步写入（`ensure_live_session_global`），
+/// 用于从 `/live/mcp/trust` 等副作用端点通知已建好的 native runtime 重载能力集，
+/// 而无需通过不暴露 runtime handle 的 `LiveSession`。
+static LIVE_EXECUTOR: StdMutex<Option<Arc<KernelTurnExecutor>>> = StdMutex::new(None);
+
 /// 当前 LiveSession 的稳定 session_id（字符串），供 /live SSE 端点在 Snapshot 中暴露。
 static LIVE_SESSION_ID: StdMutex<Option<String>> = StdMutex::new(None);
 
@@ -377,13 +382,17 @@ pub(crate) fn ensure_live_session_global(
     // 复用既有会话的分支已在上方提前 return，不会走到这里。
     *LIVE_WORKING_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(working_dir.clone());
     atomcode_core::ctrace!("LIVE", "daemon live turns on the kernel stack");
-    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(KernelTurnExecutor::new(
+    let kernel_executor = Arc::new(KernelTurnExecutor::new(
         working_dir,
         None,
         false,
         session_id,
         telemetry,
     ));
+    // Store a handle to the concrete executor so side-effect endpoints can
+    // re-prepare the native runtime without going through LiveSession.
+    *LIVE_EXECUTOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(kernel_executor.clone());
+    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = kernel_executor;
     // 历史在锁内、确认要建会话后才求值——既省掉无谓读盘，也避免「锁外判定、锁内已被
     // 别的请求替换」的 TOCTOU：是否新建与用什么历史新建是同一临界区里的决定。
     let (initial_messages, cold_summaries) = initial_session();
@@ -720,6 +729,17 @@ impl KernelTurnExecutor {
             loop_max_rounds: config.loop_config.max_rounds,
             subagent_config: Some(Arc::new(config.clone())),
         })
+    }
+
+    /// Reload the persistent native runtime's capabilities when it has already
+    /// been built. A fresh session has nothing to reload; its first prepare
+    /// reads the persisted trust store directly.
+    pub(crate) async fn reload_capabilities(&self) -> bool {
+        let guard = self.runtime.lock().await;
+        let Some(state) = guard.as_ref() else {
+            return false;
+        };
+        state.handle.reload_capabilities().await.is_ok()
     }
 }
 
@@ -2814,10 +2834,102 @@ pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResp
     Json(serde_json::json!({ "cancelled": cancelled }))
 }
 
+/// POST /live/mcp/trust — Trust the current project so its `.mcp.json` servers
+/// are allowed to connect on the next turn. Rebuilds the serving MCP registry
+/// so newly-allowed servers start connecting immediately.
+///
+/// Response on success: `{"ok": true, "trusted": true}`
+/// Response on failure: HTTP 500 + `{"ok": false, "error": "..."}`
+pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoResponse {
+    let fallback = { state.project.read().await.working_dir.clone() };
+    let working_dir = live_current_working_dir(&fallback);
+    match atomcode_core::mcp::trust::trust_project(&working_dir) {
+        Ok(()) => {
+            let new_registry =
+                Arc::new(McpRegistry::from_config_background(&working_dir));
+            *state.mcp_registry.write().await = new_registry;
+            // Invalidate the per-project live MCP cache so the next /live turn rebuilds a
+            // fresh registry that now allows the just-trusted project servers (the cached
+            // entry was built while untrusted, with project servers withheld).
+            live_mcp_cache().write().await.remove(&working_dir);
+            // Re-prepare the persistent native runtime so it mounts the newly
+            // trusted project servers immediately. Best-effort: before the first
+            // turn there is no runtime yet, and its first prepare reads trust
+            // from disk directly.
+            let executor = LIVE_EXECUTOR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(exec) = executor {
+                let _ = exec.reload_capabilities().await;
+            }
+            Json(serde_json::json!({ "ok": true, "trusted": true })).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use atomcode_core::conversation::message::Message;
+
+    /// Trust round-trip at the daemon layer: trust_project → is_project_trusted → partition_by_trust
+    /// clears blocked list.  Uses ATOMCODE_MCP_TRUST_STORE as the test seam so we never touch the
+    /// developer's real trust store.
+    #[test]
+    #[serial_test::serial]
+    fn mcp_trust_round_trip_clears_blocked() {
+        use atomcode_core::mcp::config::{McpConfigSource, McpServerConfig, McpTransportConfig};
+        use atomcode_core::mcp::trust::{is_project_trusted, partition_by_trust, trust_project};
+
+        let store_dir = tempfile::tempdir().unwrap();
+        // SAFETY: test seam; serial attribute prevents concurrent mutation.
+        unsafe {
+            std::env::set_var(
+                "ATOMCODE_MCP_TRUST_STORE",
+                store_dir.path().join("mcp_trust_daemon_test.json"),
+            );
+        }
+
+        let proj = store_dir.path().join("fake-project");
+
+        // Before trust: project-source server appears in blocked.
+        let project_cfg = McpServerConfig {
+            name: "untrusted-server".to_string(),
+            disabled: false,
+            config: McpTransportConfig::Stdio {
+                command: "true".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout_ms: None,
+            },
+            source: McpConfigSource::Project,
+            trust: false,
+            auto_approve: vec![],
+        };
+        let part_before =
+            partition_by_trust(vec![project_cfg.clone()], &proj);
+        assert_eq!(part_before.blocked.len(), 1, "untrusted project: server should be blocked");
+        assert!(part_before.allowed.is_empty());
+        assert!(!is_project_trusted(&proj), "fresh store: project must be untrusted");
+
+        // Trust the project.
+        trust_project(&proj).expect("trust_project must not fail");
+        assert!(is_project_trusted(&proj), "after trust_project: project must be trusted");
+
+        // After trust: same config yields empty blocked.
+        let part_after = partition_by_trust(vec![project_cfg], &proj);
+        assert!(part_after.blocked.is_empty(), "trusted project: blocked must be empty");
+        assert_eq!(part_after.allowed.len(), 1);
+
+        // Cleanup env so other serial tests see a clean state.
+        unsafe { std::env::remove_var("ATOMCODE_MCP_TRUST_STORE") };
+    }
 
     #[test]
     fn real_empty_terminal_snapshot_clears_the_conversation() {

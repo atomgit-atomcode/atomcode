@@ -113,10 +113,25 @@ async fn adapter_passes_kernel_tool_conformance() {
     report.assert_conformant();
 }
 
+/// Write a trust store file that marks `project_dir` as trusted.
+/// Mirrors the format written by `atomcode_core::mcp::trust::trust_project`.
+fn write_trusted_store(store_path: &std::path::Path, project_dir: &std::path::Path) {
+    let key = atomcode_capabilities::mcp::registry::project_trust_key(project_dir);
+    let store = serde_json::json!({
+        "version": 1,
+        "projects": {
+            key: { "path": project_dir.display().to_string() }
+        }
+    });
+    std::fs::write(store_path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+}
+
 /// The high-level integration entry: `connect_and_adapt` loads a project `.mcp.json`,
 /// connects, and returns ready-to-mount adapters. Isolates `$ATOMCODE_HOME` to an
-/// empty temp dir so only the project config is read (hermetic).
+/// empty temp dir so only the project config is read (hermetic). The project is
+/// pre-trusted so the security gate allows its servers through.
 #[tokio::test]
+#[serial_test::serial]
 async fn connect_and_adapt_reads_project_mcp_json() {
     let home = tempfile::tempdir().unwrap();
     // SAFETY: edition 2021; this is the only test that reads global MCP config, and
@@ -125,6 +140,17 @@ async fn connect_and_adapt_reads_project_mcp_json() {
     std::env::set_var("ATOMCODE_HOME", home.path());
 
     let project = tempfile::tempdir().unwrap();
+
+    // Pre-trust the project so the security gate allows its servers through.
+    // Point ATOMCODE_MCP_TRUST_STORE at a store inside our isolated home dir.
+    let trust_store = home.path().join("mcp_trust.json");
+    // SAFETY: test-only env mutation; #[serial] prevents concurrent tests from
+    // racing on this variable.
+    unsafe {
+        std::env::set_var("ATOMCODE_MCP_TRUST_STORE", &trust_store);
+    }
+    write_trusted_store(&trust_store, project.path());
+
     let server = env!("CARGO_BIN_EXE_mcp-test-server");
     let mcp_json = serde_json::json!({
         "mcpServers": { "proj": { "command": server, "args": [], "timeout_ms": 5000 } }
