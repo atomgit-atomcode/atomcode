@@ -302,10 +302,15 @@ where
     Err(last_err.expect("send_with_retry_resign: loop terminated without error or response"))
 }
 
-/// Blocking variant for sync code paths (e.g. OAuth token refresh in `create_provider`).
+/// Blocking variant for crate-internal sync code paths.
+///
+/// This helper uses `reqwest::blocking` and `std::thread::sleep` between
+/// attempts. Callers in async contexts must run it through
+/// `tokio::task::spawn_blocking` or a dedicated thread.
+///
 /// Same contract as `send_with_retry`: builder-chain errors are surfaced
 /// as `reqwest::Error` rather than panics.
-pub fn send_with_retry_blocking(
+pub(crate) fn send_with_retry_blocking(
     builder: reqwest::blocking::RequestBuilder,
     policy: &RetryPolicy,
 ) -> Result<reqwest::blocking::Response, reqwest::Error> {

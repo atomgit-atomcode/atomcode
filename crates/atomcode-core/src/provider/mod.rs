@@ -410,8 +410,10 @@ mod format_http_error_tests {
 }
 
 /// Factory: create the right provider from config.
-/// If `api_key` is `None`, automatically loads from `$ATOMCODE_HOME/auth.toml`
-/// (with token refresh if expired).
+///
+/// This may perform blocking auth I/O when the config relies on AtomGit OAuth
+/// credentials instead of a static API key. Async callers must run provider
+/// construction through `tokio::task::spawn_blocking` or a dedicated thread.
 pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> {
     let mut config = if config.api_key.is_none() && config.provider_type != "ollama" {
         // Security: only fall back to the OAuth access_token when the
