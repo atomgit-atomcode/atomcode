@@ -79,10 +79,23 @@ impl AtomgitClient {
     }
 
     /// Read the repo's `project_labels`.
-    pub async fn repo_labels(&self, owner: &str, repo: &str) -> Result<Vec<String>, String> {
-        let r: crate::atomgit::models::Repo =
+    ///
+    /// `Ok(None)` means the GET response carried **no `project_labels` key at
+    /// all** — the caller must NOT treat that as "no labels": the field may live
+    /// under a name we don't read, and a full-replace PATCH would then wipe the
+    /// real labels. `Ok(Some(vec![]))` means the key was present and genuinely
+    /// empty (safe to add to). We inspect the raw JSON here rather than the
+    /// [`Repo`](crate::atomgit::models::Repo) struct, whose tolerant deserializer
+    /// collapses "absent" and "empty" into the same `Vec`.
+    pub async fn repo_labels(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Option<Vec<String>>, String> {
+        let v: serde_json::Value =
             self.get_json(&format!("/repos/{owner}/{repo}"), &[]).await?;
-        Ok(r.project_labels)
+        Ok(v.get("project_labels")
+            .map(crate::atomgit::models::project_labels_from_json))
     }
 
     /// Replace the repo's `project_labels` wholesale.
@@ -96,7 +109,15 @@ impl AtomgitClient {
     /// Ensure `label` is present. Returns `true` if it was added, `false` if it
     /// was already there. Idempotent (GET then PATCH-if-missing).
     pub async fn repo_ensure_label(&self, owner: &str, repo: &str, label: &str) -> Result<bool, String> {
-        let mut labels = self.repo_labels(owner, repo).await?;
+        // Guard: if the GET response has no `project_labels` field, we cannot
+        // confirm the current labels. Refuse to PATCH — a full-replace with just
+        // our label would clobber labels stored under a field we don't read.
+        let mut labels = self.repo_labels(owner, repo).await?.ok_or_else(|| {
+            format!(
+                "{owner}/{repo}: repo response has no `project_labels` field; \
+                 skipping label update to avoid clobbering existing labels"
+            )
+        })?;
         if labels.iter().any(|l| l == label) {
             return Ok(false);
         }
@@ -260,6 +281,46 @@ mod label_tests {
         let c = client(&server);
         let added = c.repo_ensure_label("acme", "widget", "atomcode").await.unwrap();
         assert!(added, "should have added the label");
+    }
+
+    #[tokio::test]
+    async fn ensure_label_skips_patch_when_field_absent() {
+        let server = MockServer::start().await;
+        // GET response omits `project_labels` entirely — we can't confirm state.
+        Mock::given(method("GET")).and(path("/api/v5/repos/acme/widget"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name":"widget"})))
+            .mount(&server).await;
+        // A PATCH here would clobber labels stored under an unread field: forbid it.
+        Mock::given(method("PATCH")).and(path("/api/v5/repos/acme/widget"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name":"widget"})))
+            .expect(0)
+            .mount(&server).await;
+
+        let c = client(&server);
+        let res = c.repo_ensure_label("acme", "widget", "atomcode").await;
+        assert!(res.is_err(), "must refuse to PATCH when project_labels is absent");
+        // MockServer's Drop verifies the PATCH .expect(0).
+    }
+
+    #[tokio::test]
+    async fn ensure_label_adds_when_present_but_empty() {
+        let server = MockServer::start().await;
+        // Field present and genuinely empty ([] or null) → confirmed empty, safe to add.
+        Mock::given(method("GET")).and(path("/api/v5/repos/acme/widget"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name":"widget","project_labels":[]})))
+            .mount(&server).await;
+        Mock::given(method("PATCH")).and(path("/api/v5/repos/acme/widget"))
+            .and(body_json(serde_json::json!({"project_labels":["atomcode"]})))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name":"widget"})))
+            .mount(&server).await;
+
+        let c = client(&server);
+        let added = c.repo_ensure_label("acme", "widget", "atomcode").await.unwrap();
+        assert!(added, "present-but-empty labels should still get atomcode added");
     }
 
     #[tokio::test]

@@ -23,31 +23,39 @@ where
     }
 }
 
-/// Tolerant deserializer for `project_labels`: accepts absent, null, an array of
-/// strings, or an array of `{ "name": "..." }` objects (the AtomGit/GitCode wire
-/// shape is unconfirmed — E2E is blocked). Any of them → `Vec<String>`.
+/// Coerce a JSON value into a label list, tolerating every shape AtomGit/GitCode
+/// might send (the wire shape is unconfirmed — E2E is blocked): an array of
+/// strings, an array of `{ "name": "..." }` objects, `null`, or anything else.
+/// A non-array (or absent, via serde `default`) collapses to an empty list.
+///
+/// Presence of the *field* is a separate question from its contents — callers
+/// that must not clobber labels (see [`AtomgitClient::repo_labels`]) inspect the
+/// raw key themselves rather than relying on this lossy conversion.
+pub(crate) fn project_labels_from_json(v: &serde_json::Value) -> Vec<String> {
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|e| match e {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(o) => {
+                o.get("name").and_then(|n| n.as_str()).map(str::to_string)
+            }
+            _ => None,
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Tolerant deserializer for `project_labels`. Delegates to
+/// [`project_labels_from_json`] so the model path and the read-back path share
+/// one coercion. Absent (via serde `default`) → empty.
 fn de_project_labels<'de, D>(d: D) -> Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Entry {
-        Str(String),
-        Obj {
-            #[serde(default)]
-            name: String,
-        },
-    }
-    let entries = Option::<Vec<Entry>>::deserialize(d)?.unwrap_or_default();
-    Ok(entries
-        .into_iter()
-        .map(|e| match e {
-            Entry::Str(s) => s,
-            Entry::Obj { name } => name,
-        })
-        .filter(|s| !s.is_empty())
-        .collect())
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(project_labels_from_json(&v))
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

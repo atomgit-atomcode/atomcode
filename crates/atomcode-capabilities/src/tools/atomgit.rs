@@ -221,8 +221,9 @@ impl Tool for AtomgitRepoTool {
             },
             "labels" => match (a.owner, a.repo) {
                 (Some(o), Some(r)) => match self.client.repo_labels(&o, &r).await {
-                    Ok(labels) if labels.is_empty() => ok("(no labels)".to_string()),
-                    Ok(labels) => ok(labels.join(", ")),
+                    Ok(None) => ok("(project_labels not reported by this repo)".to_string()),
+                    Ok(Some(labels)) if labels.is_empty() => ok("(no labels)".to_string()),
+                    Ok(Some(labels)) => ok(labels.join(", ")),
                     Err(e) => err(e),
                 },
                 _ => err("atomgit_repo labels: owner and repo are required".to_string()),
