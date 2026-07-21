@@ -314,7 +314,16 @@ fn empty_exhaustion_message(
 fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
     let output_reserve = max_tokens.unwrap_or(16_384);
     let margin = (window / 8).clamp(16_000, 128_000);
-    window.saturating_sub(output_reserve).saturating_sub(margin)
+    let reserve = output_reserve.saturating_add(margin);
+    // If the reserve can't fit inside the window (unrealistically small windows,
+    // e.g. test fixtures), don't reserve — fall back to the raw window so the guard
+    // keeps its old `est >= window` behavior. Real model windows (>= 128K) always
+    // leave room, so this only affects tiny windows.
+    if reserve >= window {
+        window
+    } else {
+        window - reserve
+    }
 }
 
 /// The pre-send over-window advisory. Fires when the estimate reaches `trigger_limit`
@@ -3873,8 +3882,10 @@ mod effective_input_limit_tests {
     }
 
     #[test]
-    fn tiny_window_saturates_to_zero_never_panics() {
-        // window smaller than the reserve → saturating_sub → 0.
-        assert_eq!(effective_input_limit(1_000, Some(16_384)), 0);
+    fn tiny_window_falls_back_to_raw_window() {
+        // reserve (~32_384) exceeds a tiny window → no reservation possible, so it
+        // falls back to the raw window (old `est >= window` behavior). Never panics.
+        assert_eq!(effective_input_limit(1_000, Some(16_384)), 1_000);
+        assert_eq!(effective_input_limit(100, Some(16_384)), 100);
     }
 }
