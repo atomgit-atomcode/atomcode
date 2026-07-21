@@ -77,7 +77,7 @@ pub use provider_factory::{
 pub use rate_limit::{RateLimitWindow, RateLimitWindowSource};
 pub use runtime::{
     CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
-    CodingRuntimeStart, DeferredRuntimeState, DriverCommand, ImagePreprocessor, LocalContextInput,
+    CodingRuntimeStart, DeferredRuntimeState, DriverCommand, ImagePreprocessor, VisionNotice, LocalContextInput,
     ProviderBootstrap, ProviderUnavailableReason, ReconfigureKind, ReprepareInput,
     RuntimeContextStats, RuntimeError, RuntimeExit, RuntimeExitReason, RuntimeGeneration,
     RuntimeMode, RuntimePhase, RuntimeRequest, RuntimeSessionInfo, RuntimeSnapshotError,

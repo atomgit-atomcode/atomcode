@@ -1265,6 +1265,12 @@ pub enum Msg<'a> {
         char_count: usize,
     },
 
+    /// VL preprocessing failed — shown as a warning. `reason` is the underlying
+    /// error; the driver restores the images so the user can retry.
+    VisionPreprocessFailed {
+        reason: &'a str,
+    },
+
     /// TurnComplete separator summary, e.g.
     ///   `✓ Shipped · 3 rounds · 2 tools · 6.8s · 285 tokens`
     /// `done` is a playful English verb from `DONE_LABELS` — kept

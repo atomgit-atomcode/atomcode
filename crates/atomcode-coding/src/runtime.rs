@@ -41,6 +41,13 @@ use crate::{assemble, CodingAgentConfig, CodingProviderFactory, PluginHookSource
 pub enum CodingRuntimeEvent {
     /// A kernel observation that is not owned as a runtime terminal/request.
     Agent(AgentEvent),
+    /// Vision (VL) preprocessing recognised the turn's image(s) — the driver
+    /// renders a "✓ VL recognised image, returned N chars" status line.
+    VisionPreprocessSuccess { vl_key: String, char_count: usize },
+    /// Vision (VL) preprocessing failed — the driver surfaces a warning and
+    /// re-attaches the images it remembers from submit so the user can retry
+    /// without re-pasting from the clipboard.
+    VisionPreprocessFailed { reason: String },
     /// A potentially slow compaction strategy has started.
     CompactionStarted {
         trigger: CompactTrigger,
@@ -451,13 +458,32 @@ pub trait ImagePreprocessor: Send + Sync {
     /// authoritative, unlike re-reading a config default. `session_id` is the
     /// active conversation's id, forwarded onto any auxiliary (VL) call so a
     /// gateway pins it to the same upstream account.
+    ///
+    /// Returns the rewritten input plus an optional [`VisionNotice`] the
+    /// runtime turns into a user-visible status line (the "✓ VL recognised
+    /// image …" toast / a failure warning). `None` = nothing to surface
+    /// (vision-capable model or no images).
     async fn preprocess(
         &self,
         text: String,
         images: Vec<ImageContent>,
         active_model: String,
         session_id: Option<String>,
-    ) -> UserInput;
+    ) -> (UserInput, Option<VisionNotice>);
+}
+
+/// Result of a vision preprocessing pass, surfaced to the user as a status
+/// line by the runtime (the driver deliberately can't render directly — it
+/// runs on the owner task, not the UI loop).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VisionNotice {
+    /// VL converted the image(s) to text — show the "recognised" toast.
+    Recognised { vl_key: String, char_count: usize },
+    /// VL failed (images were cleared from the model request + a failure
+    /// marker folded into the text) — the driver surfaces a warning and
+    /// re-attaches the images it remembers from submit (the runtime doesn't
+    /// carry them, so image↔marker pairing stays authoritative on the driver).
+    Failed { reason: String },
 }
 
 pub struct CodingRuntimeStart {
@@ -2377,7 +2403,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     .as_ref()
                                     .and_then(|r| r.parts.session.as_ref())
                                     .map(|b| b.id.clone());
-                                input = pp
+                                let (new_input, notice) = pp
                                     .preprocess(
                                         std::mem::take(&mut input.text),
                                         std::mem::take(&mut input.images),
@@ -2385,6 +2411,26 @@ fn spawn_runtime_owner_with_optional_agent(
                                         session_id,
                                     )
                                     .await;
+                                input = new_input;
+                                // Surface the outcome as a status line, emitted
+                                // BEFORE SendMessage so it renders right under the
+                                // user message, ahead of the assistant response.
+                                match notice {
+                                    Some(VisionNotice::Recognised { vl_key, char_count }) => {
+                                        let _ = runtime_event_tx.send(
+                                            CodingRuntimeEvent::VisionPreprocessSuccess {
+                                                vl_key,
+                                                char_count,
+                                            },
+                                        );
+                                    }
+                                    Some(VisionNotice::Failed { reason }) => {
+                                        let _ = runtime_event_tx.send(
+                                            CodingRuntimeEvent::VisionPreprocessFailed { reason },
+                                        );
+                                    }
+                                    None => {}
+                                }
                             }
                         }
                         if send_agent_command(
@@ -5666,6 +5712,30 @@ mod tests {
         assert_eq!(handle.status().phase, RuntimePhase::Failed);
     }
 
+    // An `ImagePreprocessor` that fails: clears images from the model request
+    // and returns a Failed notice (as the real CLI adapter does on VL failure).
+    struct FailingPreprocessor;
+    #[async_trait::async_trait]
+    impl ImagePreprocessor for FailingPreprocessor {
+        async fn preprocess(
+            &self,
+            text: String,
+            _images: Vec<ImageContent>,
+            _active_model: String,
+            _session_id: Option<String>,
+        ) -> (UserInput, Option<VisionNotice>) {
+            (
+                UserInput {
+                    text: format!("{text}\n\n[图片识别失败]"),
+                    images: Vec::new(),
+                },
+                Some(VisionNotice::Failed {
+                    reason: "boom".into(),
+                }),
+            )
+        }
+    }
+
     // A recording `ImagePreprocessor` that folds images into text (mimicking a
     // VL description) and clears them, flagging whether it was ever called.
     struct RecordingPreprocessor {
@@ -5679,12 +5749,18 @@ mod tests {
             _images: Vec<ImageContent>,
             _active_model: String,
             _session_id: Option<String>,
-        ) -> UserInput {
+        ) -> (UserInput, Option<VisionNotice>) {
             self.called.store(true, Ordering::Release);
-            UserInput {
-                text: format!("VL[{text}]"),
-                images: Vec::new(),
-            }
+            (
+                UserInput {
+                    text: format!("VL[{text}]"),
+                    images: Vec::new(),
+                },
+                Some(VisionNotice::Recognised {
+                    vl_key: "vl".into(),
+                    char_count: 3,
+                }),
+            )
         }
     }
 
@@ -5693,11 +5769,12 @@ mod tests {
     ) -> (
         CodingRuntimeHandle,
         mpsc::UnboundedReceiver<AgentCommand>,
+        mpsc::UnboundedReceiver<CodingRuntimeEvent>,
         KernelRuntimeAdapter,
     ) {
         let (agent, kernel_commands, _kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
-        let (runtime_tx, _runtime_events) = mpsc::unbounded_channel();
+        let (runtime_tx, runtime_events) = mpsc::unbounded_channel();
         let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
         let CodingRuntimeStart {
             agent: config,
@@ -5723,7 +5800,7 @@ mod tests {
         let adapter = spawn_runtime_owner_with_protocol(
             agent, controls, runtime_tx, true, true, None, Some(resources), Some(wakeup_rx),
         );
-        (handle, kernel_commands, adapter)
+        (handle, kernel_commands, runtime_events, adapter)
     }
 
     // The installed preprocessor runs on an image-carrying submit, and its
@@ -5732,7 +5809,7 @@ mod tests {
     #[tokio::test]
     async fn image_submit_runs_installed_preprocessor_before_kernel() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (handle, mut kernel_commands, _adapter) =
+        let (handle, mut kernel_commands, mut runtime_events, _adapter) =
             spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor { called: called.clone() }))).await;
 
         handle
@@ -5754,6 +5831,17 @@ mod tests {
             other => panic!("expected SendMessage, got {other:?}"),
         }
         assert!(called.load(Ordering::Acquire), "preprocessor must have run");
+
+        // The recognition notice must be emitted so the driver can render the
+        // "✓ VL recognised image, returned N chars" status line.
+        let mut saw_success = false;
+        while let Ok(ev) = runtime_events.try_recv() {
+            if let CodingRuntimeEvent::VisionPreprocessSuccess { char_count, .. } = ev {
+                assert_eq!(char_count, 3);
+                saw_success = true;
+            }
+        }
+        assert!(saw_success, "runtime must emit VisionPreprocessSuccess for the toast");
     }
 
     // Guard: a text-only submit skips the preprocessor entirely (no images),
@@ -5761,7 +5849,7 @@ mod tests {
     #[tokio::test]
     async fn text_only_submit_skips_preprocessor() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (handle, mut kernel_commands, _adapter) =
+        let (handle, mut kernel_commands, _runtime_events, _adapter) =
             spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor { called: called.clone() }))).await;
 
         handle.submit(UserInput::from("no images here")).await.unwrap();
@@ -5773,6 +5861,43 @@ mod tests {
             other => panic!("expected SendMessage, got {other:?}"),
         }
         assert!(!called.load(Ordering::Acquire), "preprocessor must NOT run without images");
+    }
+
+    // On VL failure the runtime emits VisionPreprocessFailed (the driver
+    // re-attaches its remembered images) and the kernel still gets a
+    // text-only turn.
+    #[tokio::test]
+    async fn image_submit_failure_emits_failed_event_and_text_only_turn() {
+        let (handle, mut kernel_commands, mut runtime_events, _adapter) =
+            spawn_with_preprocessor(Some(Arc::new(FailingPreprocessor))).await;
+
+        handle
+            .submit(UserInput {
+                text: "look".into(),
+                images: vec![ImageContent {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                }],
+            })
+            .await
+            .unwrap();
+
+        // Kernel receives text-only (images cleared for the non-vision model).
+        match kernel_commands.recv().await {
+            Some(AgentCommand::SendMessage { images, .. }) => {
+                assert!(images.is_empty(), "failed VL must clear images for the model");
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+
+        let mut saw_failed = false;
+        while let Ok(ev) = runtime_events.try_recv() {
+            if let CodingRuntimeEvent::VisionPreprocessFailed { reason } = ev {
+                assert_eq!(reason, "boom");
+                saw_failed = true;
+            }
+        }
+        assert!(saw_failed, "runtime must emit VisionPreprocessFailed");
     }
 
     #[tokio::test]

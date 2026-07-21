@@ -539,6 +539,15 @@ pub struct UiState {
     /// can be edited + resent without re-typing. `None` between
     /// turns and after any successful completion.
     pub last_submitted_message: Option<String>,
+    /// Authoritative pasted `(images, markers)` of the last submitted turn,
+    /// captured at submit BEFORE typed-path attachment so the image↔marker
+    /// pairing stays exact (never re-derived from text, which can misorder).
+    /// Re-attached on `VisionPreprocessFailed` so the user can retry without
+    /// re-pasting. Overwritten each image-carrying submit; only read on
+    /// failure. Parallel vecs (aligned by index).
+    pub last_submitted_pasted_images:
+        Vec<atomcode_core::conversation::message::ImagePart>,
+    pub last_submitted_pasted_markers: Vec<usize>,
     /// `/context` dispatched a `RefreshContextStats` command and is
     /// waiting for the resulting rich ContextStats event to render the
     /// report. `Some(show_prompt)` until the next rich emission lands;
@@ -774,6 +783,8 @@ impl UiState {
             last_context: None,
             post_compaction_used_tokens: None,
             last_submitted_message: None,
+            last_submitted_pasted_images: Vec::new(),
+            last_submitted_pasted_markers: Vec::new(),
             pending_context_render: None,
             pending_images: Vec::new(),
             pending_image_hashes: Vec::new(),

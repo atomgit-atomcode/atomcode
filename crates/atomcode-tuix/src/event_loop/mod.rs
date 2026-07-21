@@ -7871,6 +7871,15 @@ fn handle_idle_key(
                         kept_markers.push(n);
                     }
                 }
+                // Remember the authoritative pasted (image, marker) pairing —
+                // captured HERE, before typed-path attachment — so a VL
+                // preprocessing failure can re-attach the images with their
+                // exact markers rather than re-deriving from text (which can
+                // misorder when images are pasted out of cursor order). Typed
+                // paths are intentionally excluded: their retry rides the file
+                // path restored into the buffer via `last_submitted_message`.
+                app.state.last_submitted_pasted_images = images.clone();
+                app.state.last_submitted_pasted_markers = kept_markers.clone();
                 // Recognize bare image paths that were typed / pasted as
                 // keystrokes (notably Windows conhost paste) and never went
                 // through the `InputEvent::Paste` image detection. Mutates
@@ -11043,6 +11052,54 @@ fn handle_runtime_event(
                 CodingRuntimeEvent::ControllerWarning(message) => {
                     renderer.render(UiLine::Warning(message));
                     renderer.flush();
+                    return;
+                }
+                CodingRuntimeEvent::VisionPreprocessSuccess { vl_key, char_count } => {
+                    // Reuse the existing UiEvent handler so the "✓ VL recognised
+                    // image, returned N chars · <model>" toast renders identically
+                    // to the pre-bridge-retirement behavior.
+                    handle_agent_event(
+                        AgentEvent::VisionPreprocessSuccess { vl_key, char_count },
+                        state,
+                        think,
+                        renderer,
+                        pending_tools,
+                        ctx,
+                        setup_pending,
+                        reasoning_buffer,
+                        buf,
+                    );
+                    return;
+                }
+                CodingRuntimeEvent::VisionPreprocessFailed { reason } => {
+                    renderer.render(UiLine::Warning(
+                        crate::i18n::t(crate::i18n::Msg::VisionPreprocessFailed {
+                            reason: &reason,
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+                    // Re-attach the images so the user can retry without
+                    // re-pasting (parity with the old bridge). Uses the
+                    // AUTHORITATIVE (image, marker) pairing stashed at submit —
+                    // not re-derived from text — so `└ [Image #N]` echoes match.
+                    // The RestorePendingImages handler also restores the caption
+                    // from `last_submitted_message`.
+                    let images = std::mem::take(&mut state.last_submitted_pasted_images);
+                    let markers = std::mem::take(&mut state.last_submitted_pasted_markers);
+                    if !images.is_empty() {
+                        handle_agent_event(
+                            AgentEvent::RestorePendingImages { images, markers },
+                            state,
+                            think,
+                            renderer,
+                            pending_tools,
+                            ctx,
+                            setup_pending,
+                            reasoning_buffer,
+                            buf,
+                        );
+                    }
                     return;
                 }
                 CodingRuntimeEvent::UndoFinished(result) => {
