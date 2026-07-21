@@ -12,6 +12,7 @@ pub struct SystemProxy {
 
 /// Normalize a proxy authority to a URL reqwest accepts: prepend `http://`
 /// unless a scheme is already present. Empty/blank → `None`.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn normalize_proxy(value: &str) -> Option<String> {
     let v = value.trim();
     if v.is_empty() {
@@ -27,6 +28,7 @@ fn normalize_proxy(value: &str) -> Option<String> {
 /// Parse a Windows `ProxyServer` value into `(http, https)` proxy URLs.
 /// Two forms: a bare `host:port` (applies to all schemes) or a
 /// `scheme=host:port;…` list. Only `http`/`https` schemes are surfaced.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn parse_win_proxy_server(raw: &str) -> (Option<String>, Option<String>) {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -52,6 +54,7 @@ pub(crate) fn parse_win_proxy_server(raw: &str) -> (Option<String>, Option<Strin
 
 /// Parse a Windows `ProxyOverride` (`;`-separated) into a `NO_PROXY` value
 /// (`,`-separated). The `<local>` token is expanded to the loopback names.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn parse_win_bypass(raw: &str) -> Option<String> {
     let mut out: Vec<String> = Vec::new();
     for tok in raw.split(';') {
