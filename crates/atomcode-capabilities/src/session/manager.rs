@@ -14,7 +14,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Barrier, Mutex};
 
-use atomcode_kernel::message::{SessionSnapshot, SNAPSHOT_VERSION};
+use atomcode_kernel::message::{Message, Role, SessionSnapshot, SNAPSHOT_VERSION};
 use serde::{de::IgnoredAny, Deserialize, Serialize};
 
 use super::presentation::{PresentationEntry, PresentationFile, MAX_PRESENTATION_BYTES};
@@ -352,6 +352,72 @@ impl SessionMeta {
             message_count: 0,
             turn_stats: Vec::new(),
         }
+    }
+
+    /// Whether a stored title is an untouched/generated placeholder that may be
+    /// replaced by a deterministic first-prompt fallback.
+    pub fn name_needs_fallback(name: &str, session_id: &str) -> bool {
+        let name = name.trim_start();
+        let generated_session_name = name.strip_prefix("session-").is_some_and(|suffix| {
+            suffix == session_id
+                || (suffix.len() >= 10 && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        });
+        name == "default" || generated_session_name || strip_leading_image_markers(name) != name
+    }
+
+    /// Replace an untouched placeholder with the first real user prompt.
+    /// This is the durable fallback when optional AI title generation is
+    /// disabled or fails; it deliberately leaves `ai_named` false so a later
+    /// generated title may still refine the name.
+    pub fn auto_name_from_messages(&mut self, messages: &[Message]) {
+        if self.user_renamed || self.ai_named || !Self::name_needs_fallback(&self.name, &self.id) {
+            return;
+        }
+        let Some(text) = messages
+            .iter()
+            .filter(|message| message.role == Role::User && !message.synthetic)
+            .map(|message| strip_leading_image_markers(message.text.trim()))
+            .find(|text| !text.is_empty())
+        else {
+            return;
+        };
+        let name: String = text
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .take(40)
+            .collect();
+        let name = name.trim();
+        if !name.is_empty() {
+            self.name = name.to_string();
+        }
+    }
+}
+
+/// Remove only TUI-generated image attachment markers from the beginning of a
+/// prompt. Other bracketed user text (`[workspace]`, Markdown, tags) is content.
+fn strip_leading_image_markers(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim_start();
+        let Some(marker) = trimmed.strip_prefix("[Image #") else {
+            return trimmed;
+        };
+        let Some(close) = marker.find(']') else {
+            return trimmed;
+        };
+        let number = &marker[..close];
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            return trimmed;
+        }
+        text = &marker[close + 1..];
     }
 }
 
@@ -2050,6 +2116,37 @@ mod tests {
 
     fn snap(texts: &[&str]) -> SessionSnapshot {
         SessionSnapshot::new(texts.iter().map(|t| Message::user(*t)).collect())
+    }
+
+    #[test]
+    fn fallback_name_uses_text_after_image_marker_in_first_user_message() {
+        let mut meta = SessionMeta::new("image-session", "/project", 1);
+
+        meta.auto_name_from_messages(&[Message::user("[Image #1]识别图片内容")]);
+
+        assert_eq!(meta.name, "识别图片内容");
+    }
+
+    #[test]
+    fn fallback_name_preserves_real_bracketed_first_user_message() {
+        let mut meta = SessionMeta::new("bracket-session", "/project", 1);
+
+        meta.auto_name_from_messages(&[
+            Message::user("[workspace] 修复登录"),
+            Message::user("好的"),
+        ]);
+
+        assert_eq!(meta.name, "[workspace] 修复登录");
+    }
+
+    #[test]
+    fn fallback_name_does_not_replace_meaningful_session_prefixed_name() {
+        let mut meta = SessionMeta::new("id", "/project", 1);
+        meta.name = "session-notes".into();
+
+        meta.auto_name_from_messages(&[Message::user("不应覆盖")]);
+
+        assert_eq!(meta.name, "session-notes");
     }
 
     /// project_hash must match production's `hash_path` BYTE-FOR-BYTE: hash the

@@ -195,6 +195,7 @@ impl LifecycleHooks for SnapshotHook {
 
         let msg_count = convo.messages.len();
         let update_meta = |meta: &mut SessionMeta| {
+            meta.auto_name_from_messages(&convo.messages);
             meta.updated_at = now;
             meta.turn_count = meta.turn_count.saturating_add(1);
             meta.message_count = msg_count as u32;
@@ -419,6 +420,23 @@ mod tests {
         assert_eq!(st.after_message, 3);
         assert_eq!(st.turn_id, 7);
         assert!(!st.errored);
+    }
+
+    #[tokio::test]
+    async fn turn_complete_auto_names_default_meta_from_first_real_user_message() {
+        let (h, mgr, _d) = hook("auto-name");
+        let mut convo = Conversation::new();
+        convo.push(Message::synthetic_user("[System meta] ignore"));
+        convo.push(Message::user("修复恢复会话名称\n补测试"));
+        convo.push(Message::assistant("done", Vec::new()));
+
+        h.turn_complete(&convo, &StopReason::Stopped, &TurnCtx::default())
+            .await;
+
+        let meta = mgr.read_meta("auto-name").unwrap();
+        assert_eq!(meta.name, "修复恢复会话名称");
+        assert!(!meta.user_renamed);
+        assert!(!meta.ai_named);
     }
 
     #[tokio::test]

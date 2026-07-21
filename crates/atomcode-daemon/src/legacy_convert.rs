@@ -366,7 +366,7 @@ fn convert_legacy_session(session: &LegacySession) -> anyhow::Result<ConvertedLe
         .turn_counter
         .max(boundaries.last().map_or(0, |boundary| boundary.turn_id));
 
-    let meta = SessionMeta {
+    let mut meta = SessionMeta {
         v: META_VERSION,
         id,
         name: session.name.clone(),
@@ -381,6 +381,7 @@ fn convert_legacy_session(session: &LegacySession) -> anyhow::Result<ConvertedLe
         message_count: checked_u32(session.messages.len(), "messages")?,
         turn_stats,
     };
+    meta.auto_name_from_messages(&snapshot.messages);
 
     Ok(ConvertedLegacySession {
         snapshot,
@@ -431,6 +432,7 @@ pub fn converge_session(
     let Some(legacy_bytes) = legacy_bytes else {
         return match (existing_meta, existing_snapshot) {
             (Some(mut meta), Some(snapshot)) if meta.owner == StorageOwner::Unconfirmed => {
+                meta.auto_name_from_messages(&snapshot.messages);
                 meta.owner = StorageOwner::Native;
                 meta.import_info = None;
                 let write_presentation = existing_presentation.is_none();
@@ -487,6 +489,7 @@ pub fn converge_session(
     } else {
         converted.meta.clone()
     };
+    meta.auto_name_from_messages(&snapshot.messages);
     if preserve_native_snapshot
         && (meta.turn_stats.is_empty() || meta.turn_stats.iter().any(|stat| stat.turn_id == 0))
     {
@@ -541,14 +544,35 @@ pub fn converge_session(
 pub fn catalog_for_project(
     working_dir: &std::path::Path,
 ) -> anyhow::Result<Vec<atomcode_capabilities::session::CatalogEntry>> {
+    catalog_for_project_in_root(&SessionManager::sessions_root(), working_dir)
+}
+
+fn catalog_for_project_in_root(
+    sessions_root: &std::path::Path,
+    working_dir: &std::path::Path,
+) -> anyhow::Result<Vec<atomcode_capabilities::session::CatalogEntry>> {
     let bucket = SessionManager::project_hash(working_dir);
-    let scan = SessionManager::scan_all();
+    let scan = SessionManager::scan_catalog(sessions_root);
     report_catalog_diagnostics(&scan.diagnostics);
-    Ok(scan
+    let mut entries: Vec<_> = scan
         .entries
         .into_iter()
         .filter(|entry| entry.project_bucket == bucket)
-        .collect())
+        .collect();
+    for entry in &mut entries {
+        if !SessionMeta::name_needs_fallback(&entry.name, &entry.id) {
+            continue;
+        }
+        match load_catalog_session_view_in_root(sessions_root, entry) {
+            Ok(view) => entry.name = view.meta.name,
+            Err(error) => tracing::warn!(
+                session_id = %entry.id,
+                error = %error,
+                "session placeholder name repair failed; keeping catalog entry"
+            ),
+        }
+    }
+    Ok(entries)
 }
 
 pub fn find_catalog_session_view(query: &str) -> anyhow::Result<Option<CatalogSessionView>> {
@@ -610,7 +634,18 @@ fn load_catalog_session_view_in_root(
     let manager = SessionManager::with_root(sessions_root.join(&entry.project_bucket));
     let meta = optional_store(manager.read_meta(&entry.id))?;
     if meta.as_ref().map(|meta| &meta.owner) == Some(&StorageOwner::Native) {
-        return Ok(manager.load_native_session(&entry.id)?.into());
+        let mut loaded = manager.load_native_session(&entry.id)?;
+        let old_name = loaded.meta.name.clone();
+        loaded
+            .meta
+            .auto_name_from_messages(&loaded.snapshot.messages);
+        if loaded.meta.name != old_name {
+            manager.update_meta(&entry.id, |meta| {
+                meta.auto_name_from_messages(&loaded.snapshot.messages);
+            })?;
+            loaded.meta = manager.read_meta(&entry.id)?;
+        }
+        return Ok(loaded.into());
     }
 
     if entry.presence == CatalogPresence::NativeOnly {
@@ -623,10 +658,16 @@ fn load_catalog_session_view_in_root(
                 meta.owner
             )
         }
+        // Pre-owner native sessions have a valid meta + snapshot but no
+        // presentation sidecar. Resolve that historical state through the same
+        // lease-protected convergence seam used by runtime startup, so readers
+        // only ever receive a complete owner=native aggregate.
+        let lease = manager.acquire_lease(&entry.id)?;
+        let adopted = converge_session(&manager, &lease)?;
         return Ok(CatalogSessionView {
-            snapshot: manager.load_snapshot(&entry.id)?,
-            presentation: manager.read_presentation(&entry.id)?,
-            meta,
+            snapshot: adopted.snapshot,
+            presentation: adopted.presentation,
+            meta: adopted.meta,
         });
     }
 
@@ -1217,6 +1258,31 @@ mod tests {
     }
 
     #[test]
+    fn legacy_cutover_repairs_placeholder_name_before_native_commit() {
+        use atomcode_capabilities::session::{SessionManager, StorageOwner};
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let mut session = full_legacy_session();
+        session.name = format!("session-{}", session.id);
+        session.user_renamed = false;
+        session.ai_named = false;
+        let id = session.id.clone();
+        std::fs::write(
+            manager.legacy_path(&id).unwrap(),
+            serde_json::to_vec(&session).unwrap(),
+        )
+        .unwrap();
+        let lease = manager.acquire_lease(&id).unwrap();
+
+        let imported = converge_session(&manager, &lease).unwrap();
+
+        assert_eq!(imported.meta.owner, StorageOwner::Native);
+        assert_eq!(imported.meta.name, "inspect this image");
+        assert_eq!(manager.read_meta(&id).unwrap().name, "inspect this image");
+    }
+
+    #[test]
     fn valid_native_snapshot_is_never_overwritten_by_legacy() {
         use atomcode_capabilities::session::{SessionManager, SessionMeta};
 
@@ -1390,6 +1456,7 @@ mod tests {
             atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user("native")]);
         let presentation = PresentationFile::default();
         let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.name = "named native session".into();
         meta.owner = StorageOwner::Native;
         manager
             .commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
@@ -1413,6 +1480,162 @@ mod tests {
 
         std::fs::remove_file(manager.presentation_path(id).unwrap()).unwrap();
         assert!(load_catalog_session_view_in_root(dir.path(), &entry).is_err());
+    }
+
+    #[test]
+    fn catalog_session_view_repairs_complete_native_placeholder_name() {
+        use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
+
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = "0123456789abcdef";
+        let id = "native-placeholder";
+        let manager = SessionManager::with_root(dir.path().join(bucket));
+        let lease = manager.acquire_lease(id).unwrap();
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
+            "恢复自动命名",
+        )]);
+        let presentation = PresentationFile::default();
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+            .unwrap();
+        drop(lease);
+        let entry = CatalogEntry {
+            id: id.into(),
+            name: meta.name,
+            project_bucket: bucket.into(),
+            working_dir: "/project".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            message_count: 1,
+            turn_count: 0,
+            presence: CatalogPresence::NativeOnly,
+        };
+
+        let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
+
+        assert_eq!(loaded.meta.name, "恢复自动命名");
+        assert_eq!(manager.read_meta(id).unwrap().name, "恢复自动命名");
+    }
+
+    #[test]
+    fn project_catalog_repairs_placeholder_before_first_resume_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let working_dir = std::path::Path::new("/project");
+        let bucket = SessionManager::project_hash(working_dir);
+        let id = "catalog-placeholder";
+        let manager = SessionManager::with_root(dir.path().join(&bucket));
+        let lease = manager.acquire_lease(id).unwrap();
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
+            "首次展示名称",
+        )]);
+        let mut meta = SessionMeta::new(id, working_dir.to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+
+        let entries = catalog_for_project_in_root(dir.path(), working_dir).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "首次展示名称");
+        assert_eq!(manager.read_meta(id).unwrap().name, "首次展示名称");
+    }
+
+    #[test]
+    fn project_catalog_name_repair_failure_does_not_hide_healthy_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let working_dir = std::path::Path::new("/project");
+        let bucket = SessionManager::project_hash(working_dir);
+        let manager = SessionManager::with_root(dir.path().join(&bucket));
+
+        let healthy_id = "healthy-placeholder";
+        let healthy_lease = manager.acquire_lease(healthy_id).unwrap();
+        let healthy_snapshot =
+            atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user("健康会话")]);
+        let mut healthy_meta = SessionMeta::new(healthy_id, working_dir.to_string_lossy(), 2);
+        healthy_meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &healthy_lease,
+                Some(&healthy_snapshot),
+                Some(&PresentationFile::default()),
+                &healthy_meta,
+            )
+            .unwrap();
+        drop(healthy_lease);
+
+        let damaged_id = "damaged-placeholder";
+        let damaged_snapshot =
+            atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user("损坏会话")]);
+        manager
+            .save_snapshot(damaged_id, &damaged_snapshot)
+            .unwrap();
+        let mut damaged_meta = SessionMeta::new(damaged_id, working_dir.to_string_lossy(), 1);
+        damaged_meta.owner = StorageOwner::Native;
+        manager.write_meta(&damaged_meta).unwrap();
+
+        let entries = catalog_for_project_in_root(dir.path(), working_dir).unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == healthy_id)
+                .map(|entry| entry.name.as_str()),
+            Some("健康会话")
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == damaged_id)
+                .map(|entry| entry.name.as_str()),
+            Some("session-damaged-placeholder")
+        );
+    }
+
+    #[test]
+    fn catalog_session_view_adopts_pre_owner_native_without_presentation() {
+        use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
+
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = "0123456789abcdef";
+        let id = "pre-owner-native";
+        let manager = SessionManager::with_root(dir.path().join(bucket));
+        let snapshot =
+            atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user("native")]);
+        let meta = SessionMeta::new(id, "/project", 1);
+        manager.save_snapshot(id, &snapshot).unwrap();
+        manager.write_meta(&meta).unwrap();
+        let entry = CatalogEntry {
+            id: id.into(),
+            name: meta.name.clone(),
+            project_bucket: bucket.into(),
+            working_dir: "/project".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            message_count: 1,
+            turn_count: 0,
+            presence: CatalogPresence::NativeOnly,
+        };
+
+        let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
+
+        assert_eq!(loaded.meta.owner, StorageOwner::Native);
+        assert_eq!(loaded.meta.name, "native");
+        assert_eq!(loaded.snapshot, snapshot);
+        assert_eq!(loaded.presentation, PresentationFile::default());
+        assert_eq!(manager.read_meta(id).unwrap().owner, StorageOwner::Native);
+        assert_eq!(
+            manager.read_presentation(id).unwrap(),
+            PresentationFile::default()
+        );
     }
 
     #[test]
