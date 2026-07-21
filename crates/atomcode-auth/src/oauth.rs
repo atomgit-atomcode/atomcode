@@ -110,6 +110,21 @@ fn network_connect_hint(err: &reqwest::Error) -> Option<std::borrow::Cow<'static
     }
 }
 
+/// Wrap a login HTTP `send()` result with a failure context, appending the
+/// network hint as INNER context (below `ctx`) when the error is
+/// connect/timeout — so the display leads with `ctx` and supplements with
+/// proxy guidance. Shared by the login GET/exchange calls.
+fn with_login_context<T>(result: reqwest::Result<T>, ctx: &'static str) -> Result<T> {
+    result.map_err(|e| {
+        let hint = network_connect_hint(&e);
+        let mut err = anyhow::Error::new(e);
+        if let Some(h) = hint {
+            err = err.context(h.into_owned());
+        }
+        err.context(ctx)
+    })
+}
+
 fn blocking_client() -> Result<reqwest::blocking::Client> {
     // Hard timeouts here too — the `get_valid_token` path calls
     // `refresh_access_token` synchronously whenever a stored token
@@ -399,12 +414,13 @@ impl LoginSession {
     /// `Authorized`. Errors only on transport/parse failures; a
     /// "not yet" answer is `Ok(Pending)`, never `Err`.
     pub fn poll_once(&self) -> Result<PollOutcome> {
-        let resp = self
-            .client
-            .get(platform_check_url())
-            .query(&[("state", &self.state)])
-            .send()
-            .context("Failed to call /auth/check")?;
+        let resp = with_login_context(
+            self.client
+                .get(platform_check_url())
+                .query(&[("state", &self.state)])
+                .send(),
+            "Failed to call /auth/check",
+        )?;
         if resp.status().is_success() {
             if let Ok(check) = resp.json::<PlatformCheckResponse>() {
                 if check.valid {
@@ -419,12 +435,14 @@ impl LoginSession {
     /// Consumes the session — only call after `poll_once` returned
     /// `Authorized`.
     pub fn finish(self, tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
-        let token_resp: PlatformTokenResponse = self
-            .client
-            .get(platform_token_url())
-            .query(&[("state", &self.state)])
-            .send()
-            .context("Failed to call /auth/token")?
+        let resp = with_login_context(
+            self.client
+                .get(platform_token_url())
+                .query(&[("state", &self.state)])
+                .send(),
+            "Failed to call /auth/token",
+        )?;
+        let token_resp: PlatformTokenResponse = resp
             .json()
             .context("Failed to parse /auth/token response")?;
 
@@ -492,20 +510,7 @@ pub fn start_login() -> Result<LoginSession> {
         .get(platform_login_url())
         .query(&[("provider", "atomgit")])
         .send();
-    let resp = match sent {
-        Ok(r) => r,
-        Err(e) => {
-            // Failure identity as the OUTERMOST context so `{e:#}` leads with
-            // "Failed to call /auth/login: …os error…"; the hint is inner
-            // (supplemental) rather than burying the concrete error.
-            let hint = network_connect_hint(&e);
-            let mut err = anyhow::Error::new(e);
-            if let Some(h) = hint {
-                err = err.context(h.into_owned());
-            }
-            return Err(err.context("Failed to call /auth/login"));
-        }
-    };
+    let resp = with_login_context(sent, "Failed to call /auth/login")?;
     let resp: PlatformLoginResponse = resp
         .json()
         .context("Failed to parse /auth/login response")?;
@@ -1500,5 +1505,20 @@ mod tests {
             .build()
             .expect_err("bad url builds an error");
         assert!(super::network_connect_hint(&err).is_none(), "got: {err:?}");
+    }
+
+    #[test]
+    fn with_login_context_leads_with_ctx_and_adds_hint_on_connect_error() {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(1))
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap();
+        // TEST-NET-3 (RFC 5737) — unroutable, fails at connect/timeout.
+        let res = client.get("http://203.0.113.1:81/").send();
+        let err = super::with_login_context(res, "Failed to call /auth/test").unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.starts_with("Failed to call /auth/test"), "ctx must lead: {chain}");
+        assert!(chain.contains("/proxy") || chain.contains("HTTPS_PROXY"), "hint present: {chain}");
     }
 }

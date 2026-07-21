@@ -107,11 +107,20 @@ pub(crate) fn parse_scutil_proxy(raw: &str) -> SystemProxy {
         }
     }
     let enabled = |key: &str| kv.get(key).map(|v| v == "1").unwrap_or(false);
+    // Bracket a bare IPv6 host so the proxy URL is well-formed (`http://[::1]:8080`).
+    fn bracket_host(h: &str) -> std::borrow::Cow<'_, str> {
+        if h.contains(':') && !h.starts_with('[') {
+            std::borrow::Cow::Owned(format!("[{h}]"))
+        } else {
+            std::borrow::Cow::Borrowed(h)
+        }
+    }
     let endpoint = |host_key: &str, port_key: &str| -> Option<String> {
         let host = kv.get(host_key)?.trim();
         if host.is_empty() {
             return None;
         }
+        let host = bracket_host(host);
         match kv.get(port_key) {
             Some(port) if !port.is_empty() => Some(format!("http://{host}:{port}")),
             _ => Some(format!("http://{host}")),
@@ -231,6 +240,13 @@ mod tests {
     fn scutil_disabled_yields_empty() {
         let raw = "<dictionary> {\n  HTTPEnable : 0\n  HTTPSEnable : 0\n}";
         assert_eq!(parse_scutil_proxy(raw), SystemProxy::default());
+    }
+
+    #[test]
+    fn scutil_ipv6_host_is_bracketed() {
+        let raw = "<dictionary> {\n  HTTPEnable : 1\n  HTTPProxy : ::1\n  HTTPPort : 8080\n  HTTPSEnable : 0\n}";
+        let sp = parse_scutil_proxy(raw);
+        assert_eq!(sp.http.as_deref(), Some("http://[::1]:8080"));
     }
 
     #[test]
