@@ -6431,13 +6431,15 @@ fn handle_input(
                     other => deferred.push(other),
                 }
             }
+            if app.active_modal.is_some() {
+                renderer.clear_screen();
+            }
             renderer.on_resize(cols, rows);
             // A resize invalidates any open modal's cached overlay
             // geometry (it was built for the old size). Rebuild it now so
             // the window re-centres at the new dimensions instead of
             // lingering stale / mispositioned until the next keypress.
             if let Some(m) = app.active_modal.as_ref() {
-                renderer.clear_screen();
                 m.draw(&app.buf, &app.state, ctx, renderer);
             }
             for ev in deferred {
