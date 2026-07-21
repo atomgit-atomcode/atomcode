@@ -67,7 +67,7 @@ impl ProviderError {
         // 2. HTTP 400 + message signature (Anthropic "prompt is too long", others).
         if self.http_status == Some(400) {
             let m = self.message.to_ascii_lowercase();
-            const NEEDLES: [&str; 11] = [
+            const NEEDLES: [&str; 10] = [
                 "context length",
                 "context window",
                 "maximum context",
@@ -75,8 +75,7 @@ impl ProviderError {
                 "reduce the length",
                 "too many tokens",
                 "range of input length", // Bailian / Tencent gateway
-                "input length",          // "input length exceeds context length" variants
-                "exceeds the maximum",   // generic upstream phrasing
+                "input length exceeds",  // "input length exceeds context length" variants
                 "maximum prompt length", // Anthropic-style variant
                 "too large for model",   // variant
             ];
@@ -258,12 +257,13 @@ mod overflow_tests {
             "<400> InvalidParameter: Range of input length should be [1, 1000000]."
         )
         .is_context_overflow());
-        // Other variants.
-        assert!(err(Some(400), None, "input length exceeds context length").is_context_overflow());
-        assert!(err(Some(400), None, "This exceeds the maximum for this model").is_context_overflow());
+        // Narrowed input-length needle (no other needle is present in this message).
+        assert!(err(Some(400), None, "input length exceeds the model limit").is_context_overflow());
         assert!(err(Some(400), None, "maximum prompt length is 200000").is_context_overflow());
         assert!(err(Some(400), None, "too large for model with 8192 maximum").is_context_overflow());
-        // Unrelated 400 stays false.
+        // Unrelated 400s stay false — including a validation error that merely mentions
+        // "input length" in a non-overflow sense (guards against the over-broad needle).
         assert!(!err(Some(400), Some("model_not_found"), "no such model").is_context_overflow());
+        assert!(!err(Some(400), None, "input length must be positive").is_context_overflow());
     }
 }
