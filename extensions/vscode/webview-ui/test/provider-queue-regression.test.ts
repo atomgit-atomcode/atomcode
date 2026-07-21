@@ -6,12 +6,34 @@ declare const require: {
 };
 
 const originalLoad = (Module as unknown as { _load: typeof Module['_load'] })._load;
+type WatcherRecord = {
+  pattern: { base: string; pattern: string };
+  create?: () => void;
+  change?: () => void;
+  delete?: () => void;
+  disposed: boolean;
+};
+const fileWatchers: WatcherRecord[] = [];
+class RelativePatternMock {
+  constructor(public base: string, public pattern: string) {}
+}
 const vscodeMock = {
   Uri: { joinPath: (...parts: Array<{ fsPath?: string } | string>) => ({ fsPath: parts.map((p) => typeof p === 'string' ? p : p.fsPath || '').join('/') }) },
+  RelativePattern: RelativePatternMock,
   workspace: {
     workspaceFolders: [] as Array<{ uri: { fsPath: string } }>,
     onDidChangeConfiguration: (_listener: unknown) => ({ dispose() {} }),
     getConfiguration: () => ({ get: (_key: string) => undefined }),
+    createFileSystemWatcher: (pattern: { base: string; pattern: string }) => {
+      const record: WatcherRecord = { pattern, disposed: false };
+      fileWatchers.push(record);
+      return {
+        onDidCreate: (listener: () => void) => { record.create = listener; },
+        onDidChange: (listener: () => void) => { record.change = listener; },
+        onDidDelete: (listener: () => void) => { record.delete = listener; },
+        dispose: () => { record.disposed = true; },
+      };
+    },
   },
   window: {},
   env: { language: 'en' },
@@ -29,6 +51,84 @@ const vscodeMock = {
 const { ChatViewProvider, mergeSessionsForDisplay } = require('../../src/chat/provider');
 
 (Module as unknown as { _load: typeof Module['_load'] })._load = originalLoad;
+
+async function testAuthFileWatcherRefreshesSetupState() {
+  fileWatchers.length = 0;
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {} as never);
+  const unsafeProvider = provider as unknown as {
+    _watchAtomCodeAuth: (path: string) => void;
+    _sendSetupState: () => Promise<void>;
+  };
+  let refreshes = 0;
+  unsafeProvider._sendSetupState = async () => { refreshes += 1; };
+
+  unsafeProvider._watchAtomCodeAuth('/tmp/atomcode/auth.toml');
+
+  assert.equal(fileWatchers.length, 1);
+  assert.equal(fileWatchers[0].pattern.base, '/tmp/atomcode');
+  assert.equal(fileWatchers[0].pattern.pattern, 'auth.toml');
+  fileWatchers[0].delete?.();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(refreshes, 1);
+
+  provider.dispose();
+  assert.equal(fileWatchers[0].disposed, true);
+}
+
+async function testStaleSetupRefreshCannotOverwriteNewerAuthState() {
+  let resolveFirstAuth!: (value: unknown) => void;
+  const firstAuth = new Promise((resolve) => { resolveFirstAuth = resolve; });
+  let authCalls = 0;
+  const client = {
+    authStatus: () => {
+      authCalls += 1;
+      if (authCalls === 1) return firstAuth;
+      return Promise.resolve({
+        logged_in: true,
+        expired: false,
+        auth_path: '/tmp/atomcode/auth.toml',
+        user: { id: 'new-user' },
+      });
+    },
+    listProviders: () => Promise.resolve({
+      default_provider: 'main',
+      providers: [{
+        name: 'main', type: 'openai', model: 'new-model', has_api_key: false,
+        requires_login: true, is_default: true, context_window: 128_000,
+        skip_tls_verify: false,
+      }],
+    }),
+    getConfig: () => Promise.resolve({
+      path: '/tmp/atomcode/config.toml', default_provider: 'main', provider_count: 1,
+      providers: [], network: {}, telemetry: {},
+    }),
+    listModels: () => Promise.resolve([]),
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const unsafeProvider = provider as unknown as {
+    _sendSetupState: () => Promise<void>;
+    _broadcastMessage: (message: unknown) => void;
+  };
+  const messages: Array<{ type?: string; auth?: { logged_in?: boolean } }> = [];
+  unsafeProvider._broadcastMessage = (message) => {
+    messages.push(message as { type?: string; auth?: { logged_in?: boolean } });
+  };
+
+  const staleRefresh = unsafeProvider._sendSetupState();
+  await unsafeProvider._sendSetupState();
+  resolveFirstAuth({
+    logged_in: false,
+    expired: false,
+    auth_path: '/tmp/atomcode/auth.toml',
+    user: null,
+  });
+  await staleRefresh;
+
+  const authMessages = messages.filter((message) => message.type === 'authStatus');
+  assert.equal(authMessages.at(-1)?.auth?.logged_in, true);
+  assert.equal(authMessages.some((message) => message.auth?.logged_in === false), false);
+  provider.dispose();
+}
 
 async function testQueuedMessageDrainsForCompletedSessionWithoutFocusedPanel() {
   const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {} as never);
@@ -438,6 +538,8 @@ function testMergeSessionsForDisplayShowsOnlyCurrentProjectSessionsWhenProjectIs
 }
 
 Promise.resolve()
+  .then(testAuthFileWatcherRefreshesSetupState)
+  .then(testStaleSetupRefreshCannotOverwriteNewerAuthState)
   .then(testQueuedMessageDrainsForCompletedSessionWithoutFocusedPanel)
   .then(testQueuedMessageDoesNotDrainWhileApprovalModeIsPending)
   .then(testInitialStateDoesNotClearPendingApprovalModeSwitch)

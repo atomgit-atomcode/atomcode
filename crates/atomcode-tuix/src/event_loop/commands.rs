@@ -22,7 +22,8 @@
 use std::path::PathBuf;
 
 use super::{
-    bg_runtime, deactivate_runtime_provider, reload_runtime_provider, save_and_reload, LoopCtx,
+    apply_persisted_config, bg_runtime, deactivate_runtime_provider_after_logout,
+    reload_runtime_provider, save_and_reload, LoopCtx,
 };
 use crate::i18n::{t, Msg};
 use crate::modals::usage::{UsageData, UsageModal};
@@ -1383,10 +1384,14 @@ fn execute_slash_command_impl(
                     Ok(locale) => {
                         crate::i18n::set_locale(locale);
                         ctx.config.language = Some(locale);
-                        let config_path = atomcode_config::config::Config::default_path();
-                        if let Err(e) = ctx.config.save(&config_path) {
-                            // TODO: surface via renderer once a non-modal error display is available
-                            eprintln!("[language] failed to save config: {e}");
+                        match ctx.config_store.update(|config| {
+                            config.language = Some(locale);
+                            Ok(())
+                        }) {
+                            Ok(commit) => {
+                                ctx.observed_config_revision = Some(commit.snapshot.revision)
+                            }
+                            Err(e) => eprintln!("[language] failed to save config: {e}"),
                         }
                         // Display label matches the picker's option list
                         // so /language en and /language zh both echo a
@@ -1971,14 +1976,21 @@ fn execute_slash_command_impl(
             atomcode_daemon::stop_app_server();
             match atomcode_auth::logout() {
                 Ok(()) => {
-                    ctx.telemetry.set_account_id(None);
-                    if let Err(error) = deactivate_runtime_provider(ctx) {
-                        let message = format!(
-                            "credentials removed, but provider deactivation failed: {error}"
-                        );
-                        renderer.render(UiLine::Error(
-                            t(Msg::CmdLogoutFailed { error: &message }).into_owned(),
-                        ));
+                    match deactivate_runtime_provider_after_logout(ctx) {
+                        Ok(true) => {
+                            // Runtime owner emits the completion only after the
+                            // active AtomGit provider has been torn down.
+                        }
+                        Ok(false) => renderer
+                            .render(UiLine::CommandOutput(t(Msg::CmdLogoutDone).into_owned())),
+                        Err(error) => {
+                            let message = format!(
+                                "credentials removed, but provider deactivation failed: {error}"
+                            );
+                            renderer.render(UiLine::Error(
+                                t(Msg::CmdLogoutFailed { error: &message }).into_owned(),
+                            ));
+                        }
                     }
                 }
                 Err(e) => {
@@ -2724,26 +2736,24 @@ fn execute_slash_command_impl(
                     } else if sub == "on" {
                         p.thinking_enabled = Some(true);
                         let budget = p.thinking_budget.unwrap_or(10_000);
-                        save_and_reload(ctx, renderer);
-                        renderer.render(UiLine::CommandOutput(
+                        save_and_reload(
+                            ctx,
+                            renderer,
                             t(Msg::ThinkEnabled { budget }).into_owned(),
-                        ));
-                        renderer.flush();
+                        );
                     } else if sub == "off" {
                         p.thinking_enabled = Some(false);
-                        save_and_reload(ctx, renderer);
-                        renderer.render(UiLine::CommandOutput(t(Msg::ThinkDisabled).into_owned()));
-                        renderer.flush();
+                        save_and_reload(ctx, renderer, t(Msg::ThinkDisabled).into_owned());
                     } else if let Some(rest) = sub.strip_prefix("budget") {
                         let num_str = rest.trim();
                         match num_str.parse::<u32>() {
                             Ok(n) if n >= 1024 => {
                                 p.thinking_budget = Some(n);
-                                save_and_reload(ctx, renderer);
-                                renderer.render(UiLine::CommandOutput(
+                                save_and_reload(
+                                    ctx,
+                                    renderer,
                                     t(Msg::ThinkBudgetSet { n }).into_owned(),
-                                ));
-                                renderer.flush();
+                                );
                             }
                             Ok(n) => {
                                 renderer.render(UiLine::Error(
@@ -2793,19 +2803,19 @@ fn execute_slash_command_impl(
                     } else if sub == "high" || sub == "max" {
                         p.reasoning_effort = Some(sub.to_string());
                         ctx.reasoning_effort = Some(sub.to_string());
-                        crate::event_loop::save_and_reload(ctx, renderer);
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  ○ Reasoning effort set to: {sub}\n"
-                        )));
-                        renderer.flush();
+                        crate::event_loop::save_and_reload(
+                            ctx,
+                            renderer,
+                            format!("  ○ Reasoning effort set to: {sub}\n"),
+                        );
                     } else if sub == "off" {
                         p.reasoning_effort = None;
                         ctx.reasoning_effort = None;
-                        crate::event_loop::save_and_reload(ctx, renderer);
-                        renderer.render(UiLine::CommandOutput(
+                        crate::event_loop::save_and_reload(
+                            ctx,
+                            renderer,
                             "  ○ Reasoning effort: default (API auto)\n".to_string(),
-                        ));
-                        renderer.flush();
+                        );
                     } else {
                         renderer.render(UiLine::CommandOutput(
                             "  Usage: /effort high | max | off\n  Shortcut: Ctrl+T\n".into(),
@@ -5694,15 +5704,15 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     // this the user sees "✓ already logged in as X" followed by
     // "✗ claim failed — run `atomcode login` again" and has to do
     // manually what `/codingplan` could do itself.
-    let (cfg_after, mut report) = match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
-        Ok((cfg, r)) => (cfg, r),
-        Err(e) => {
-            renderer.render(UiLine::Error(format!("internal error: {e:#}")));
-            renderer.flush();
-            return Ok(());
-        }
-    };
-    ctx.config = cfg_after;
+    let (mut prepared_config, mut report) =
+        match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
+            Ok((cfg, r)) => (cfg, r),
+            Err(e) => {
+                renderer.render(UiLine::Error(format!("internal error: {e:#}")));
+                renderer.flush();
+                return Ok(());
+            }
+        };
     if report.auth_expired {
         renderer.render(UiLine::CommandOutput(t(Msg::CpReauthAfter401).into_owned()));
         renderer.flush();
@@ -5710,15 +5720,16 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
             .and_then(|auth| atomcode_auth::save_auth(&auth).map(|_| auth))
         {
             Ok(_) => {
-                let (cfg_after2, r2) = match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
-                    Ok((cfg, r)) => (cfg, r),
-                    Err(e) => {
-                        renderer.render(UiLine::Error(format!("internal error: {e:#}")));
-                        renderer.flush();
-                        return Ok(());
-                    }
-                };
-                ctx.config = cfg_after2;
+                let (cfg_after2, r2) =
+                    match run_coding_plan_blocking(&prepared_config, &ctx.telemetry) {
+                        Ok((cfg, r)) => (cfg, r),
+                        Err(e) => {
+                            renderer.render(UiLine::Error(format!("internal error: {e:#}")));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                    };
+                prepared_config = cfg_after2;
                 report = r2;
             }
             Err(e) => {
@@ -5742,7 +5753,26 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     if report.should_persist_config() {
         // Config mutation only persists when critical steps passed —
         // don't write a half-set-up config if login or models failed.
-        save_and_reload(ctx, renderer);
+        match ctx.config_store.update(|latest| {
+            atomcode_codingplan::merge_successful_config(latest, &prepared_config, &report)
+        }) {
+            Ok(commit) => apply_persisted_config(
+                ctx,
+                commit.snapshot.config,
+                commit.snapshot.revision,
+                renderer,
+            ),
+            Err(error) => {
+                renderer.render(UiLine::Error(
+                    t(Msg::ConfigSaveFailed {
+                        error: &error.to_string(),
+                    })
+                    .into_owned(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+        }
         // Stamp the drift-monitor sync marker alongside the config
         // write. Failures are non-fatal: at worst the 24h staleness
         // hint mis-fires once.
@@ -5751,21 +5781,6 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         // sync-check on the next keystroke doesn't redundantly
         // reload the config we just saved ourselves.
         ctx.monitor_last_sync_seen = atomcode_codingplan::read_last_sync();
-        // Update `ctx.model_name` to reflect the new default provider from
-        // the just-completed login/setup. This ensures the status line shows
-        // the current model immediately rather than the pre-login value.
-        // Runtime reassembly is asynchronous (started by `save_and_reload`
-        // above) — if it fails to switch (e.g. gateway signer
-        // unavailable), the user will see the error on their next chat turn
-        // and can fall back to `/model`. This matches `/model`'s approach
-        // which also updates `ctx.model_name` optimistically.
-        if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
-            ctx.model_name = p.model.clone();
-        }
-        // NOTE: the footer context window is NOT refreshed here — `run_login_flow`
-        // has no `UiState` handle. The post-login window self-corrects on the
-        // first turn's ContextStats; threading state through just for this rare
-        // path isn't worth it. The /model picker + reload paths do refresh it.
         // Clear any stale drift warning now that we've just
         // re-synced. Also reset the cooldown so the next
         // pre-turn trigger (if conditions change) can fire

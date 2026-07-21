@@ -798,16 +798,22 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
-        let mut config: Config = toml::from_str(&content)
+        Self::parse_disk_content(&content, path)
+    }
+
+    pub(crate) fn parse_disk_content(content: &str, path: &Path) -> Result<Self> {
+        let mut config: Config = toml::from_str(content)
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         migrate_legacy_lsp_default(&mut config);
         Ok(config)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        crate::store::ConfigStore::new(path).replace(self)?;
+        Ok(())
+    }
+
+    pub(crate) fn serialize_for_disk(&self, disk: Option<&Config>) -> Result<String> {
         // Filter out ephemeral providers (e.g. OAuth /login) — they live in memory only.
         let mut persistent = self.clone();
         persistent.providers.retain(|_, v| !v.ephemeral);
@@ -819,8 +825,8 @@ impl Config {
             .unwrap_or(true)
         {
             // Restore original default from disk if possible
-            if let Ok(disk) = Config::load(path) {
-                persistent.default_provider = disk.default_provider;
+            if let Some(disk) = disk {
+                persistent.default_provider = disk.default_provider.clone();
             }
         }
         let mut content = toml::to_string_pretty(&persistent)?;
@@ -830,8 +836,7 @@ impl Config {
         content.push_str(&render_telemetry_section(&self.telemetry));
         content.push_str(&render_instructions_section());
         content.push_str(&render_hooks_json_section());
-        std::fs::write(path, content)?;
-        Ok(())
+        Ok(content)
     }
 
     pub fn active_provider(&self, override_name: Option<&str>) -> Result<&ProviderConfig> {

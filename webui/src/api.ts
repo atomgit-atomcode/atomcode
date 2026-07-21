@@ -17,6 +17,7 @@ export function getToken(): string {
 }
 
 export type SSEEvent =
+  | { type: 'runtime_info'; provider: string; model: string }
   | { type: 'text'; content: string }
   | { type: 'reasoning'; content: string }
   | { type: 'tool_start'; id: string; name: string; arguments: unknown }
@@ -335,6 +336,7 @@ export interface ProviderInfo {
   model: string;
   base_url?: string;
   has_api_key: boolean;
+  requires_login?: boolean;
   is_default: boolean;
   context_window?: number;
 }

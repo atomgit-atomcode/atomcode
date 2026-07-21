@@ -35,6 +35,7 @@ use anyhow::Result;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCompletion};
 use atomcode_coding::CodingRuntimeHandle;
 use atomcode_config::config::Config;
+use atomcode_config::{ConfigRevision, ConfigStore};
 use atomcode_daemon::legacy_convert::snapshot_to_core;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::{mpsc, watch};
@@ -81,8 +82,15 @@ fn submit_foreground_runtime(ctx: &LoopCtx, input: atomcode_coding::UserInput) -
 }
 
 fn reload_runtime_provider(ctx: &LoopCtx) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+    reload_runtime_provider_from(ctx, &ctx.config)
+}
+
+fn reload_runtime_provider_from(
+    ctx: &LoopCtx,
+    source: &Config,
+) -> Result<(), atomcode_coding::RuntimeUnavailable> {
     let config = atomcode_coding::CodingRuntimeConfig::from_config(
-        &ctx.config,
+        source,
         &ctx.working_dir,
         None,
         Some(ctx.telemetry.clone()),
@@ -103,6 +111,33 @@ fn deactivate_runtime_provider(ctx: &LoopCtx) -> Result<(), atomcode_coding::Run
         ctx.foreground_runtime_id,
         ctx.runtime_event_tx.clone(),
     )
+}
+
+pub(crate) fn deactivate_runtime_provider_after_logout(
+    ctx: &mut LoopCtx,
+) -> Result<bool, atomcode_coding::RuntimeUnavailable> {
+    let auth = AuthObservation::read();
+    ctx.telemetry.set_account_id(auth.user_id.clone());
+    let availability = ctx.runtime.ui_availability();
+    if availability == RuntimeUiAvailability::Starting
+        && provider_requires_atomgit_auth(&ctx.config)
+    {
+        // Reconcile again once startup settles; the provider may have been
+        // assembled from credentials that disappeared during construction.
+        ctx.observed_auth = None;
+        return Ok(false);
+    }
+    if !should_deactivate_for_missing_auth(&ctx.config, availability) {
+        commit_auth_observation(&mut ctx.observed_auth, auth, true);
+        return Ok(false);
+    }
+    if let Err(error) = deactivate_runtime_provider(ctx) {
+        commit_auth_observation(&mut ctx.observed_auth, auth, false);
+        return Err(error);
+    }
+    commit_auth_observation(&mut ctx.observed_auth, auth, true);
+    ctx.pending_provider_deactivation = true;
+    Ok(true)
 }
 
 /// Encode raw RGBA pixel data as a PNG image in memory.
@@ -1593,9 +1628,41 @@ mod local_restore_scope_tests {
 }
 
 /// Bag of handles passed into the loop.
+pub(crate) struct PendingProviderReload {
+    desired_config: Config,
+    persisted_revision: Option<ConfigRevision>,
+    rollback_persisted_config: Option<Config>,
+    rollback_runtime_config: Option<Config>,
+    previous_model_name: Option<String>,
+    announce: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AuthObservation {
+    user_id: Option<String>,
+}
+
+impl AuthObservation {
+    fn read() -> Self {
+        Self {
+            user_id: atomcode_auth::get_stored_auth().map(|auth| auth.user.id),
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        self.user_id.is_some()
+    }
+}
+
 pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
+    pub(crate) provider_selection_mode: crate::ProviderSelectionMode,
+    pub(crate) config_store: ConfigStore,
+    pub(crate) observed_config_revision: Option<ConfigRevision>,
+    pub(crate) pending_provider_reload: Option<PendingProviderReload>,
+    pub(crate) observed_auth: Option<AuthObservation>,
+    pub(crate) pending_provider_deactivation: bool,
     pub runtime: RuntimeControl,
     pub pending_runtime_request_id: Option<atomcode_kernel::event::RequestId>,
     /// Cache of "Always Allow" tool/command decisions for the active TUI session.
@@ -5247,6 +5314,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     deferred_render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     deferred_render_tick.tick().await; // consume the immediate fire
 
+    // Cross-process config observer. Provider/model changes are prepared only
+    // while idle, so an in-flight turn and its approvals keep one generation.
+    let mut config_poll_tick = tokio::time::interval(Duration::from_millis(500));
+    config_poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    config_poll_tick.tick().await;
+
     // Last emitted integer percent for the /upgrade download line.
     // Gate on change so we don't spam the renderer with a progress
     // line for every chunk (a 10 MB binary at 64 KiB chunks would be
@@ -5323,6 +5396,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // when nothing is pending.
             _ = deferred_render_tick.tick() => {
                 renderer.flush_deferred();
+            }
+
+            _ = config_poll_tick.tick() => {
+                let idle_boundary = matches!(app.state.phase, UiPhase::Idle)
+                    && app.active_modal.is_none();
+                let config_changed = idle_boundary && poll_external_config(&mut ctx);
+                let auth_changed = poll_external_auth(&mut ctx);
+                if idle_boundary && (config_changed || auth_changed) {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                }
             }
 
             // ── Spinner tick (from background task) ──
@@ -5599,6 +5682,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let provider_reload_failed = matches!(
+                        &runtime_event.event,
+                        bg_runtime::RuntimeEventPayload::Native(
+                            CodingRuntimeEvent::ProviderReloadFinished(Err(_))
+                        )
+                    );
                     if let Err(error) = publish_live_runtime_event(&ctx, &runtime_event.event) {
                         renderer.render(UiLine::Error(error));
                         renderer.flush();
@@ -5617,12 +5706,20 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
                     if matches!(app.state.phase, UiPhase::Idle) {
+                        // The end of a turn is the first safe provider reload
+                        // boundary. Reconcile before draining type-ahead so the
+                        // next queued message cannot start on the stale model.
+                        let config_redraw = poll_shared_state(&mut ctx);
                         // Turn just ended — drain the type-ahead queue.
                         // Pop the oldest queued message, echo as a User
                         // line, dispatch to the agent, and transition
                         // back to Streaming. Remaining queue entries
                         // fire in order on subsequent completions.
-                        if let Some(queued) = app.message_queue.pop_front() {
+                        if provider_transition_pending(&ctx) || provider_reload_failed {
+                            if config_redraw || provider_reload_failed {
+                                redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                            }
+                        } else if let Some(queued) = app.message_queue.pop_front() {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                             if submit_foreground_runtime(
                                 &ctx,
@@ -5718,6 +5815,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         #[cfg(windows)]
         tokio::select! {
             biased;
+
+            _ = config_poll_tick.tick() => {
+                let idle_boundary = matches!(app.state.phase, UiPhase::Idle)
+                    && app.active_modal.is_none();
+                let config_changed = idle_boundary && poll_external_config(&mut ctx);
+                let auth_changed = poll_external_auth(&mut ctx);
+                if idle_boundary && (config_changed || auth_changed) {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                }
+            }
 
             // ── Windows OS-level Ctrl+C ──
             // Fallback for conhost configurations where the keystroke
@@ -6017,6 +6124,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let provider_reload_failed = matches!(
+                        &runtime_event.event,
+                        bg_runtime::RuntimeEventPayload::Native(
+                            CodingRuntimeEvent::ProviderReloadFinished(Err(_))
+                        )
+                    );
                     if let Err(error) = publish_live_runtime_event(&ctx, &runtime_event.event) {
                         renderer.render(UiLine::Error(error));
                         renderer.flush();
@@ -6035,7 +6148,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
                     if matches!(app.state.phase, UiPhase::Idle) {
-                        if let Some(queued) = app.message_queue.pop_front() {
+                        let config_redraw = poll_shared_state(&mut ctx);
+                        if provider_transition_pending(&ctx) || provider_reload_failed {
+                            if config_redraw || provider_reload_failed {
+                                redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                            }
+                        } else if let Some(queued) = app.message_queue.pop_front() {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                             if submit_foreground_runtime(
                                 &ctx,
@@ -6130,12 +6248,409 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     }
 }
 
-/// If another atomcode process just ran `/codingplan` (i.e. the shared
-/// sync marker file advanced since we last looked), pull the fresh
-/// config from disk, clear our stale drift warning, and hand the new
-/// config to the agent. Cheap on every keystroke: a single file-read
-/// + serde parse. Idempotent — when no other process has synced, the
-/// early return skips all work.
+fn resolved_provider_fingerprint(config: &Config) -> Option<Vec<u8>> {
+    let requested = config.default_provider.as_str();
+    let name = if config.providers.contains_key(requested) {
+        requested
+    } else {
+        config.providers.keys().min()?.as_str()
+    };
+    serde_json::to_vec(&(name, config.providers.get(name)?)).ok()
+}
+
+fn provider_requires_atomgit_auth(config: &Config) -> bool {
+    config
+        .active_provider(None)
+        .ok()
+        .and_then(|provider| provider.base_url.as_deref())
+        .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway)
+}
+
+fn should_reload_provider(
+    mode: crate::ProviderSelectionMode,
+    current: &Config,
+    desired: &Config,
+    runtime_availability: RuntimeUiAvailability,
+    auth_available: bool,
+) -> bool {
+    let requires_atomgit_auth = provider_requires_atomgit_auth(desired);
+    if requires_atomgit_auth && !auth_available {
+        return false;
+    }
+    let recovering_atomgit_auth =
+        requires_atomgit_auth && runtime_availability == RuntimeUiAvailability::AwaitingProvider;
+    recovering_atomgit_auth
+        || (mode == crate::ProviderSelectionMode::FollowGlobalDefault
+            && !current
+                .providers
+                .get(&current.default_provider)
+                .is_some_and(|provider| provider.ephemeral)
+            && resolved_provider_fingerprint(current) != resolved_provider_fingerprint(desired))
+}
+
+fn should_deactivate_for_missing_auth(
+    config: &Config,
+    runtime_availability: RuntimeUiAvailability,
+) -> bool {
+    provider_requires_atomgit_auth(config)
+        && runtime_availability == RuntimeUiAvailability::Available
+}
+
+fn merge_persisted_config_preserving_active(current: &Config, mut persisted: Config) -> Config {
+    let active_name = current.default_provider.clone();
+    for (name, provider) in &current.providers {
+        if provider.ephemeral || name == &active_name {
+            persisted.providers.insert(name.clone(), provider.clone());
+        }
+    }
+    persisted.default_provider = active_name;
+    persisted
+}
+
+#[cfg(test)]
+mod external_config_tests {
+    use super::*;
+    use atomcode_config::ProviderConfig;
+
+    fn config(model: &str, ephemeral: bool) -> Config {
+        config_with_url(model, ephemeral, "https://example.test/v1")
+    }
+
+    fn config_with_url(model: &str, ephemeral: bool, base_url: &str) -> Config {
+        let mut config = Config::with_default_provider("main");
+        config.providers.insert(
+            "main".into(),
+            ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: None,
+                model: model.into(),
+                base_url: Some(base_url.into()),
+                system_prompt: None,
+                user_agent: None,
+                context_window: 128_000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                skip_tls_verify: false,
+                ephemeral,
+                capable_model: None,
+            },
+        );
+        config
+    }
+
+    fn atomgit_config(model: &str) -> Config {
+        config_with_url(model, false, "https://llm-api.atomgit.com/v1")
+    }
+
+    #[test]
+    fn follow_global_detects_model_change_inside_same_provider() {
+        assert!(should_reload_provider(
+            crate::ProviderSelectionMode::FollowGlobalDefault,
+            &config("model-a", false),
+            &config("model-b", false),
+            RuntimeUiAvailability::Available,
+            true,
+        ));
+    }
+
+    #[test]
+    fn explicit_selection_does_not_follow_external_default() {
+        assert!(!should_reload_provider(
+            crate::ProviderSelectionMode::Pinned,
+            &config("model-a", false),
+            &config("model-b", false),
+            RuntimeUiAvailability::Available,
+            true,
+        ));
+    }
+
+    #[test]
+    fn active_ephemeral_provider_is_not_replaced_from_disk() {
+        assert!(!should_reload_provider(
+            crate::ProviderSelectionMode::FollowGlobalDefault,
+            &config("oauth-model", true),
+            &config("disk-model", false),
+            RuntimeUiAvailability::Available,
+            true,
+        ));
+    }
+
+    #[test]
+    fn pinned_selection_keeps_active_provider_but_accepts_other_persisted_fields() {
+        let mut current = config("pinned-model", false);
+        current.language = Some(atomcode_config::locale::Locale::En);
+        let mut persisted = config("global-model", false);
+        persisted.language = Some(atomcode_config::locale::Locale::ZhCn);
+        persisted
+            .providers
+            .insert("new-provider".into(), persisted.providers["main"].clone());
+
+        let merged = merge_persisted_config_preserving_active(&current, persisted);
+
+        assert_eq!(merged.default_provider, "main");
+        assert_eq!(merged.providers["main"].model, "pinned-model");
+        assert!(merged.providers.contains_key("new-provider"));
+        assert_eq!(merged.language, Some(atomcode_config::locale::Locale::ZhCn));
+    }
+
+    #[test]
+    fn atomgit_auth_dependency_uses_gateway_not_provider_name() {
+        let mut renamed = atomgit_config("model-a");
+        let provider = renamed.providers.remove("main").unwrap();
+        renamed
+            .providers
+            .insert("renamed-provider".into(), provider);
+        renamed.default_provider = "renamed-provider".into();
+
+        assert!(provider_requires_atomgit_auth(&renamed));
+        assert!(!provider_requires_atomgit_auth(&config("model-a", false)));
+    }
+
+    #[test]
+    fn awaiting_atomgit_runtime_recovers_even_when_config_is_unchanged() {
+        let current = atomgit_config("model-a");
+
+        assert!(should_reload_provider(
+            crate::ProviderSelectionMode::FollowGlobalDefault,
+            &current,
+            &current,
+            RuntimeUiAvailability::AwaitingProvider,
+            true,
+        ));
+        assert!(should_reload_provider(
+            crate::ProviderSelectionMode::Pinned,
+            &current,
+            &current,
+            RuntimeUiAvailability::AwaitingProvider,
+            true,
+        ));
+    }
+
+    #[test]
+    fn ready_runtime_does_not_reload_for_unchanged_config() {
+        let current = atomgit_config("model-a");
+
+        assert!(!should_reload_provider(
+            crate::ProviderSelectionMode::FollowGlobalDefault,
+            &current,
+            &current,
+            RuntimeUiAvailability::Available,
+            true,
+        ));
+    }
+
+    #[test]
+    fn missing_atomgit_auth_defers_config_reload_until_login() {
+        assert!(!should_reload_provider(
+            crate::ProviderSelectionMode::FollowGlobalDefault,
+            &atomgit_config("model-a"),
+            &atomgit_config("model-b"),
+            RuntimeUiAvailability::Available,
+            false,
+        ));
+    }
+
+    #[test]
+    fn atomgit_logout_deactivates_only_atomgit_provider() {
+        assert!(should_deactivate_for_missing_auth(
+            &atomgit_config("model-a"),
+            RuntimeUiAvailability::Available,
+        ));
+        assert!(!should_deactivate_for_missing_auth(
+            &config("model-a", false),
+            RuntimeUiAvailability::Available,
+        ));
+    }
+
+    #[test]
+    fn failed_auth_transition_keeps_the_previous_observation_for_retry() {
+        let previous = AuthObservation {
+            user_id: Some("user-a".into()),
+        };
+        let missing = AuthObservation { user_id: None };
+        let mut observed = Some(previous.clone());
+
+        commit_auth_observation(&mut observed, missing.clone(), false);
+        assert_eq!(observed, Some(previous));
+
+        commit_auth_observation(&mut observed, missing.clone(), true);
+        assert_eq!(observed, Some(missing));
+    }
+}
+
+/// Observe the shared config at an idle boundary. Explicit CLI overrides stay
+/// pinned; ordinary interactive sessions follow global provider/model changes.
+/// The visible config is committed only after the runtime emits ProviderChanged.
+fn poll_external_config(ctx: &mut LoopCtx) -> bool {
+    if provider_transition_pending(ctx) {
+        return false;
+    }
+    let mut snapshot = match ctx.config_store.read() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            crate::tuix_trace!("CONFIG", "external config poll failed: {error:#}");
+            return false;
+        }
+    };
+    if ctx.observed_config_revision.as_ref() == Some(&snapshot.revision) {
+        return false;
+    }
+    let active_is_ephemeral = ctx
+        .config
+        .providers
+        .get(&ctx.config.default_provider)
+        .is_some_and(|provider| provider.ephemeral);
+    for (name, provider) in &ctx.config.providers {
+        if provider.ephemeral {
+            snapshot
+                .config
+                .providers
+                .entry(name.clone())
+                .or_insert_with(|| provider.clone());
+        }
+    }
+    let desired = if ctx.provider_selection_mode == crate::ProviderSelectionMode::Pinned
+        || active_is_ephemeral
+    {
+        merge_persisted_config_preserving_active(&ctx.config, snapshot.config)
+    } else {
+        snapshot.config
+    };
+    let auth_available = AuthObservation::read().is_available();
+
+    if !should_reload_provider(
+        ctx.provider_selection_mode,
+        &ctx.config,
+        &desired,
+        ctx.runtime.ui_availability(),
+        auth_available,
+    ) {
+        ctx.config = desired;
+        atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        ctx.observed_config_revision = Some(snapshot.revision);
+        // The active provider may have changed from a custom endpoint to an
+        // AtomGit gateway while logged out. Force the auth observer to
+        // reconcile that new dependency even when auth.toml itself did not
+        // change.
+        ctx.observed_auth = None;
+        return true;
+    }
+
+    atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+    if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+        atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        crate::tuix_trace!(
+            "CONFIG",
+            "external provider reload could not be queued: {error}"
+        );
+        return false;
+    }
+    ctx.observed_config_revision = Some(snapshot.revision.clone());
+    ctx.pending_provider_reload = Some(PendingProviderReload {
+        desired_config: desired,
+        persisted_revision: Some(snapshot.revision),
+        rollback_persisted_config: None,
+        rollback_runtime_config: None,
+        previous_model_name: None,
+        announce: None,
+    });
+    false
+}
+
+fn provider_transition_pending(ctx: &LoopCtx) -> bool {
+    ctx.pending_provider_reload.is_some() || ctx.pending_provider_deactivation
+}
+
+fn commit_auth_observation(
+    observed: &mut Option<AuthObservation>,
+    current: AuthObservation,
+    reconciled: bool,
+) {
+    if reconciled {
+        *observed = Some(current);
+    }
+}
+
+/// Reconcile the shared AtomGit credential file independently from config.toml.
+/// Only availability/identity is observed; tokens never enter UI state, logs, or
+/// the cross-process protocol. Token refreshes for the same account therefore do
+/// not cause provider reassembly, while logout/login transitions do.
+fn poll_external_auth(ctx: &mut LoopCtx) -> bool {
+    let current = AuthObservation::read();
+    let changed = ctx.observed_auth.as_ref() != Some(&current);
+    if !changed || provider_transition_pending(ctx) {
+        return false;
+    }
+
+    ctx.telemetry.set_account_id(current.user_id.clone());
+    let availability = ctx.runtime.ui_availability();
+    if availability == RuntimeUiAvailability::Starting {
+        // Runtime construction and auth.toml may race. Leave this observation
+        // uncommitted so the first stable runtime phase is reconciled.
+        return true;
+    }
+
+    let mut reconciled = true;
+    if current.is_available()
+        && provider_requires_atomgit_auth(&ctx.config)
+        && availability == RuntimeUiAvailability::AwaitingProvider
+    {
+        atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        match reload_runtime_provider(ctx) {
+            Ok(()) => {
+                ctx.pending_provider_reload = Some(PendingProviderReload {
+                    desired_config: ctx.config.clone(),
+                    persisted_revision: None,
+                    rollback_persisted_config: None,
+                    rollback_runtime_config: None,
+                    previous_model_name: None,
+                    announce: None,
+                });
+            }
+            Err(error) => {
+                reconciled = false;
+                crate::tuix_trace!(
+                    "AUTH",
+                    "provider recovery after external login could not be queued: {error}"
+                );
+            }
+        }
+    } else if !current.is_available()
+        && should_deactivate_for_missing_auth(&ctx.config, availability)
+    {
+        match deactivate_runtime_provider(ctx) {
+            Ok(()) => ctx.pending_provider_deactivation = true,
+            Err(error) => {
+                reconciled = false;
+                crate::tuix_trace!(
+                    "AUTH",
+                    "provider deactivation after external logout could not be queued: {error}"
+                );
+            }
+        }
+    }
+
+    // Commit the observation after the transition was queued (or proven
+    // irrelevant). A later opposite transition remains visible while an async
+    // provider operation is pending because the early return above does not
+    // overwrite this value.
+    commit_auth_observation(&mut ctx.observed_auth, current, reconciled);
+    true
+}
+
+fn poll_shared_state(ctx: &mut LoopCtx) -> bool {
+    let config_changed = poll_external_config(ctx);
+    let auth_changed = poll_external_auth(ctx);
+    config_changed || auth_changed
+}
+
+/// If another atomcode process just ran `/codingplan`, clear stale plan hints.
+/// Provider/model reconciliation is handled generically by `poll_external_config`.
 fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
     let current = atomcode_codingplan::read_last_sync();
     let advanced = match (current, ctx.monitor_last_sync_seen) {
@@ -6147,18 +6662,6 @@ fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
         return;
     }
     ctx.monitor_last_sync_seen = current;
-
-    // Hot-reload the config file. Fail silently: if the other process
-    // wrote a malformed config (shouldn't happen — it would have
-    // rejected its own reload), leave our in-memory snapshot alone.
-    let path = atomcode_config::config::Config::default_path();
-    if let Ok(fresh) = atomcode_config::config::Config::load(&path) {
-        ctx.config = fresh;
-        if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
-            ctx.model_name = p.model.clone();
-        }
-        let _ = reload_runtime_provider(ctx);
-    }
 
     // Sync marker = another process just reconciled config with
     // server, so any drift warning we're still showing is stale by
@@ -6370,9 +6873,13 @@ fn handle_input(
 ) -> Result<()> {
     use crate::modals::ModalAction;
 
-    // Pick up any cross-process `/codingplan` that ran since the last
-    // input — hot-reloads config + clears stale drift hint before we
-    // act on the current keystroke.
+    if matches!(app.state.phase, UiPhase::Idle)
+        && app.active_modal.is_none()
+        && poll_shared_state(ctx)
+    {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    }
+    // `/codingplan` has extra warning/quota caches beyond the generic config.
     refresh_after_cross_process_codingplan_sync(ctx);
 
     crate::tuix_trace!(
@@ -6389,6 +6896,16 @@ fn handle_input(
             InputEvent::MouseScroll(d) => format!("mouse_scroll({})", d),
         }
     );
+
+    if provider_transition_pending(ctx)
+        && matches!(&ev, InputEvent::Key(key) if key.code == KeyCode::Enter)
+    {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+        ));
+        renderer.flush();
+        return Ok(());
+    }
 
     match ev {
         InputEvent::MouseScroll(delta) => {
@@ -8440,14 +8957,141 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
     (loaded, warnings)
 }
 
-pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
-    let path = Config::default_path();
-    match ctx.config.save(&path) {
-        Ok(()) => {
-            atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
-            let _ = reload_runtime_provider(ctx);
+fn rollback_pending_provider_reload(
+    ctx: &mut LoopCtx,
+    pending: PendingProviderReload,
+) -> Option<String> {
+    let PendingProviderReload {
+        persisted_revision,
+        rollback_persisted_config,
+        rollback_runtime_config,
+        previous_model_name,
+        ..
+    } = pending;
+    let rollback_error = match (persisted_revision, rollback_persisted_config) {
+        (Some(revision), Some(previous)) => {
+            match ctx.config_store.update_if_revision(&revision, |config| {
+                *config = previous;
+                Ok(())
+            }) {
+                Ok(Some(commit)) => {
+                    ctx.observed_config_revision = Some(commit.snapshot.revision);
+                    None
+                }
+                Ok(None) => None,
+                Err(error) => Some(error.to_string()),
+            }
+        }
+        _ => None,
+    };
+    if let Some(previous) = rollback_runtime_config {
+        ctx.config = previous;
+    }
+    if let Some(model) = previous_model_name {
+        ctx.model_name = model;
+    }
+    atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+    rollback_error
+}
+
+pub(crate) fn save_and_reload(
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    success_message: String,
+) -> bool {
+    if provider_transition_pending(ctx) {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+        ));
+        renderer.flush();
+        return false;
+    }
+    let store = ctx.config_store.clone();
+    let desired = ctx.config.clone();
+    let previous_model_name = ctx.model_name.clone();
+    let mut previous_persisted = None;
+    let commit = match ctx.observed_config_revision.as_ref() {
+        Some(revision) => store
+            .update_if_revision(revision, |config| {
+                previous_persisted = Some(config.clone());
+                *config = desired.clone();
+                Ok(())
+            })
+            .and_then(|commit| {
+                commit.ok_or_else(|| anyhow::anyhow!("config changed in another process; retry"))
+            }),
+        None => store.update(|config| {
+            previous_persisted = Some(config.clone());
+            *config = desired.clone();
+            Ok(())
+        }),
+    };
+    match commit {
+        Ok(commit) => {
+            let rollback_persisted_config = previous_persisted;
+            let rollback_runtime_config = rollback_persisted_config.as_ref().map(|previous| {
+                let active_is_ephemeral = desired
+                    .providers
+                    .get(&desired.default_provider)
+                    .is_some_and(|provider| provider.ephemeral);
+                if ctx.provider_selection_mode == crate::ProviderSelectionMode::Pinned
+                    || active_is_ephemeral
+                {
+                    merge_persisted_config_preserving_active(&desired, previous.clone())
+                } else {
+                    previous.clone()
+                }
+            });
+            atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+            if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+                let rollback_error = rollback_pending_provider_reload(
+                    ctx,
+                    PendingProviderReload {
+                        desired_config: desired,
+                        persisted_revision: Some(commit.snapshot.revision),
+                        rollback_persisted_config,
+                        rollback_runtime_config,
+                        previous_model_name: Some(previous_model_name),
+                        announce: None,
+                    },
+                );
+                let suffix = rollback_error
+                    .map(|error| format!("; config rollback failed: {error}"))
+                    .unwrap_or_default();
+                renderer.render(UiLine::Error(format!(
+                    "provider reload could not be started: {error}{suffix}"
+                )));
+                renderer.flush();
+                return false;
+            }
+            ctx.observed_config_revision = Some(commit.snapshot.revision.clone());
+            ctx.pending_provider_reload = Some(PendingProviderReload {
+                desired_config: desired,
+                persisted_revision: Some(commit.snapshot.revision),
+                rollback_persisted_config,
+                rollback_runtime_config,
+                previous_model_name: Some(previous_model_name),
+                announce: Some(success_message),
+            });
+            true
         }
         Err(e) => {
+            ctx.model_name = previous_model_name;
+            if let Ok(snapshot) = store.read() {
+                let active_is_ephemeral = desired
+                    .providers
+                    .get(&desired.default_provider)
+                    .is_some_and(|provider| provider.ephemeral);
+                ctx.config = if ctx.provider_selection_mode == crate::ProviderSelectionMode::Pinned
+                    || active_is_ephemeral
+                {
+                    merge_persisted_config_preserving_active(&desired, snapshot.config)
+                } else {
+                    snapshot.config
+                };
+                ctx.observed_config_revision = Some(snapshot.revision);
+                atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+            }
             renderer.render(UiLine::Error(
                 crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
                     error: &format!("{}", e),
@@ -8455,8 +9099,170 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                 .into_owned(),
             ));
             renderer.flush();
+            false
         }
     }
+}
+
+pub(crate) fn select_provider_and_reload(
+    ctx: &mut LoopCtx,
+    provider_name: &str,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    if provider_transition_pending(ctx) {
+        return false;
+    }
+    let Some(selected) = ctx.config.providers.get(provider_name) else {
+        renderer.render(UiLine::Error(format!(
+            "provider {provider_name:?} is no longer available"
+        )));
+        renderer.flush();
+        return false;
+    };
+    let selected_model = selected.model.clone();
+    let selected_ephemeral = selected.ephemeral;
+
+    if selected_ephemeral {
+        let mut desired = ctx.config.clone();
+        desired.default_provider = provider_name.to_string();
+        atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+        if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+            atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+            renderer.render(UiLine::Error(format!(
+                "provider reload could not be started: {error}"
+            )));
+            renderer.flush();
+            return false;
+        }
+        ctx.pending_provider_reload = Some(PendingProviderReload {
+            desired_config: desired,
+            persisted_revision: None,
+            rollback_persisted_config: None,
+            rollback_runtime_config: None,
+            previous_model_name: None,
+            announce: Some(
+                crate::i18n::t(crate::i18n::Msg::ModelSwitched {
+                    provider: provider_name,
+                    model: &selected_model,
+                })
+                .into_owned(),
+            ),
+        });
+        return true;
+    }
+
+    let store = ctx.config_store.clone();
+    let mut previous_persisted = None;
+    let commit = match store.update(|config| {
+        if !config.providers.contains_key(provider_name) {
+            anyhow::bail!("provider {provider_name:?} is no longer available");
+        }
+        previous_persisted = Some(config.clone());
+        config.default_provider = provider_name.to_string();
+        Ok(())
+    }) {
+        Ok(commit) => commit,
+        Err(error) => {
+            renderer.render(UiLine::Error(
+                crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
+                    error: &error.to_string(),
+                })
+                .into_owned(),
+            ));
+            renderer.flush();
+            return false;
+        }
+    };
+
+    let mut desired = commit.snapshot.config.clone();
+    for (name, provider) in &ctx.config.providers {
+        if provider.ephemeral {
+            desired
+                .providers
+                .entry(name.clone())
+                .or_insert_with(|| provider.clone());
+        }
+    }
+    atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+    if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+        let rollback_error = rollback_pending_provider_reload(
+            ctx,
+            PendingProviderReload {
+                desired_config: desired,
+                persisted_revision: Some(commit.snapshot.revision),
+                rollback_persisted_config: previous_persisted,
+                rollback_runtime_config: Some(ctx.config.clone()),
+                previous_model_name: Some(ctx.model_name.clone()),
+                announce: None,
+            },
+        );
+        let suffix = rollback_error
+            .map(|error| format!("; config rollback failed: {error}"))
+            .unwrap_or_default();
+        renderer.render(UiLine::Error(format!(
+            "provider reload could not be started: {error}{suffix}"
+        )));
+        renderer.flush();
+        return false;
+    }
+
+    ctx.observed_config_revision = Some(commit.snapshot.revision.clone());
+    ctx.pending_provider_reload = Some(PendingProviderReload {
+        desired_config: desired,
+        persisted_revision: Some(commit.snapshot.revision),
+        rollback_persisted_config: previous_persisted,
+        rollback_runtime_config: Some(ctx.config.clone()),
+        previous_model_name: Some(ctx.model_name.clone()),
+        announce: Some(
+            crate::i18n::t(crate::i18n::Msg::ModelSwitched {
+                provider: provider_name,
+                model: &selected_model,
+            })
+            .into_owned(),
+        ),
+    });
+    true
+}
+
+pub(crate) fn apply_persisted_config(
+    ctx: &mut LoopCtx,
+    config: Config,
+    revision: ConfigRevision,
+    renderer: &mut dyn Renderer,
+) {
+    atomcode_config::proxy::apply_process_proxy_config(&config.network.proxy);
+    let desired = if ctx.provider_selection_mode == crate::ProviderSelectionMode::Pinned {
+        merge_persisted_config_preserving_active(&ctx.config, config)
+    } else {
+        config
+    };
+    if !should_reload_provider(
+        ctx.provider_selection_mode,
+        &ctx.config,
+        &desired,
+        ctx.runtime.ui_availability(),
+        AuthObservation::read().is_available(),
+    ) {
+        ctx.config = desired;
+        ctx.observed_config_revision = Some(revision);
+        ctx.observed_auth = None;
+        return;
+    }
+    if reload_runtime_provider_from(ctx, &desired).is_err() {
+        atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        renderer.render(UiLine::Error("provider runtime is unavailable".into()));
+        renderer.flush();
+        return;
+    }
+    ctx.observed_config_revision = Some(revision.clone());
+    ctx.pending_provider_reload = Some(PendingProviderReload {
+        desired_config: desired,
+        persisted_revision: Some(revision),
+        rollback_persisted_config: None,
+        rollback_runtime_config: None,
+        previous_model_name: None,
+        announce: None,
+    });
 }
 
 /// On Ctrl+C / Esc during streaming, pull the running message back
@@ -11159,13 +11965,61 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::SnapshotRestoreFinished { .. } => return,
+                CodingRuntimeEvent::ProviderChanged { provider, model } => {
+                    let announcement = if let Some(pending) = ctx.pending_provider_reload.take() {
+                        ctx.config = pending.desired_config;
+                        pending.announce
+                    } else {
+                        None
+                    };
+                    ctx.model_name = model;
+                    atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+                    state.on_model_window_changed(ctx.config.default_context_window());
+                    sync_reasoning_effort_from_provider(ctx);
+                    atomcode_daemon::live_set_provider(provider.clone());
+                    if let Ok(mut warning) = ctx.monitor_warning.lock() {
+                        *warning = None;
+                    }
+                    if let Ok(mut usage) = ctx.usage_slot.lock() {
+                        *usage = None;
+                    }
+                    if monitor::is_codingplan_provider(&provider) {
+                        ctx.monitor_last_check_at = Some(std::time::Instant::now());
+                        monitor::spawn_check(
+                            ctx.config.clone(),
+                            ctx.model_name.clone(),
+                            ctx.monitor_warning.clone(),
+                            ctx.wake_tx.clone(),
+                        );
+                        ctx.usage_last_check_at = Some(std::time::Instant::now());
+                        usage_monitor::spawn_check(ctx.usage_slot.clone(), ctx.wake_tx.clone());
+                    }
+                    let dir_display =
+                        crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+                    renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
+                    if let Some(announcement) = announcement {
+                        renderer.render(UiLine::CommandOutput(announcement));
+                    }
+                    renderer.flush();
+                    return;
+                }
                 CodingRuntimeEvent::ProviderReloadFinished(Err(error)) => {
-                    renderer.render(UiLine::Error(format!("provider reload failed: {error}")));
+                    let mut message = format!("provider reload failed: {error}");
+                    if let Some(pending) = ctx.pending_provider_reload.take() {
+                        if let Some(rollback_error) = rollback_pending_provider_reload(ctx, pending)
+                        {
+                            message
+                                .push_str(&format!("; config rollback failed: {rollback_error}"));
+                        }
+                    }
+                    atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+                    renderer.render(UiLine::Error(message));
                     renderer.flush();
                     return;
                 }
                 CodingRuntimeEvent::ProviderReloadFinished(Ok(_)) => return,
                 CodingRuntimeEvent::ProviderDeactivationFinished(Ok(_)) => {
+                    ctx.pending_provider_deactivation = false;
                     renderer.render(UiLine::CommandOutput(
                         crate::i18n::t(crate::i18n::Msg::CmdLogoutDone).into_owned(),
                     ));
@@ -11173,6 +12027,12 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::ProviderDeactivationFinished(Err(error)) => {
+                    ctx.pending_provider_deactivation = false;
+                    // Credentials are already gone. Keep the missing-auth
+                    // transition observable so the next poll retries the
+                    // fail-closed deactivation instead of leaving a live
+                    // AtomGit provider behind after a transient runtime race.
+                    ctx.observed_auth = None;
                     let message =
                         format!("credentials removed, but provider deactivation failed: {error}");
                     renderer.render(UiLine::Error(
@@ -15094,13 +15954,21 @@ fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
 
 /// Persist the current reasoning_effort to config.toml
 fn persist_reasoning_effort(ctx: &mut LoopCtx) {
-    let path = Config::default_path();
     let default_provider = ctx.config.default_provider.clone();
     if let Some(p) = ctx.config.providers.get_mut(&default_provider) {
         p.reasoning_effort = ctx.reasoning_effort.clone();
     }
-    if let Err(e) = ctx.config.save(&path) {
-        eprintln!("[reasoning_effort] failed to save config: {e}");
+    let effort = ctx.reasoning_effort.clone();
+    match ctx.config_store.update(|config| {
+        let provider = config
+            .providers
+            .get_mut(&default_provider)
+            .ok_or_else(|| anyhow::anyhow!("provider {default_provider:?} not found"))?;
+        provider.reasoning_effort = effort;
+        Ok(())
+    }) {
+        Ok(commit) => ctx.observed_config_revision = Some(commit.snapshot.revision),
+        Err(e) => eprintln!("[reasoning_effort] failed to save config: {e}"),
     }
 }
 

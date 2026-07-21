@@ -1,7 +1,9 @@
 package com.atomcode.jetbrains.services
 
 import com.atomcode.jetbrains.daemon.ApprovalMode
+import com.atomcode.jetbrains.daemon.AuthStatusResponse
 import com.atomcode.jetbrains.daemon.HealthResponse
+import com.atomcode.jetbrains.daemon.ProviderInfo
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -10,6 +12,35 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNull
 
 class AtomCodeProjectServiceTest {
+    private fun provider(name: String, requiresLogin: Boolean?): ProviderInfo =
+        ProviderInfo(
+            name = name,
+            type = "openai",
+            model = "model",
+            isDefault = true,
+            hasApiKey = false,
+            requiresLogin = requiresLogin,
+            thinkingEnabled = false,
+            thinkingBudget = null,
+            thinkingType = null,
+            thinkingKeep = null,
+        )
+
+    private val signedOut = AuthStatusResponse(
+        loggedIn = false,
+        expired = false,
+        authPath = "/tmp/auth.toml",
+        userName = null,
+    )
+
+    @Test
+    fun `setup is required only when the selected provider depends on login`() {
+        assertEquals(false, providerSetupRequired(listOf(provider("custom", false)), "custom", signedOut))
+        assertEquals(true, providerSetupRequired(listOf(provider("gateway", true)), "gateway", signedOut))
+        assertEquals(true, providerSetupRequired(listOf(provider("legacy", null)), "legacy", signedOut))
+        assertEquals(true, providerSetupRequired(emptyList(), "", signedOut))
+    }
+
     @Test
     fun `approval mode runtime state keeps confirmed mode while switch is pending`() {
         val state = ApprovalModeRuntimeState()

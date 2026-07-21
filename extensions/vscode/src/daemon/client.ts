@@ -503,6 +503,9 @@ export class DaemonClient {
     }
 
     switch (event.type) {
+      case 'runtime_info':
+        callbacks.onRuntimeInfo?.(event.provider, event.model);
+        break;
       case 'text':
         callbacks.onText(event.content);
         break;

@@ -50,10 +50,11 @@ export function useAuth() {
   const pollTimer = useRef<number | null>(null);
   const loginGeneration = useRef(0);
 
-  async function refresh() {
+  async function refresh(shouldApply: () => boolean = () => true) {
     try {
       const r = await fetch('/auth/status', { headers: authHeaders() });
       const s = await r.json();
+      if (!shouldApply()) return;
       setLoggedIn(!!s.logged_in);
       setExpired(!!s.expired);
       setUser(s.user ?? null);
@@ -63,8 +64,20 @@ export function useAuth() {
   }
 
   useEffect(() => {
-    refresh();
+    let active = true;
+    const refreshWhileMounted = () => {
+      if (active) void refresh(() => active);
+    };
+    refreshWhileMounted();
+    const interval = window.setInterval(refreshWhileMounted, 2_000);
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') refreshWhileMounted();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
     return () => {
+      active = false;
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisibility);
       loginGeneration.current += 1;
       if (pollTimer.current !== null) clearTimeout(pollTimer.current);
     };

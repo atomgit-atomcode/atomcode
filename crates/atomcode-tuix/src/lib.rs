@@ -63,6 +63,14 @@ use crate::render::{
 };
 use crate::terminal::TerminalCaps;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderSelectionMode {
+    /// Follow changes to the shared default provider in `config.toml`.
+    FollowGlobalDefault,
+    /// Keep an explicit launch-time `--provider` / `--model` selection.
+    Pinned,
+}
+
 /// RAII guard: enables raw mode + bracketed paste on construction,
 /// unconditionally restores both on drop (even during panic).
 struct TerminalGuard {
@@ -285,6 +293,8 @@ pub fn panic_restore_terminal() {
 pub async fn run(
     config: Config,
     model_name: String,
+    provider_selection_mode: ProviderSelectionMode,
+    config_store: atomcode_config::ConfigStore,
     spawned_runtime: SpawnedRuntime,
     runtime_spawn_override: RuntimeSpawnOverride,
     working_dir: std::path::PathBuf,
@@ -713,6 +723,18 @@ pub async fn run(
     let ctx = LoopCtx {
         config,
         model_name,
+        provider_selection_mode,
+        config_store,
+        // Reconcile once inside the event loop instead of marking a fresh disk
+        // revision as observed here. The config passed into `run` was loaded
+        // earlier, so another process may have committed between those reads.
+        observed_config_revision: None,
+        pending_provider_reload: None,
+        // Reconcile authentication against the runtime after startup. Keeping
+        // this unobserved closes the race where auth.toml changes while the
+        // runtime is still being assembled.
+        observed_auth: None,
+        pending_provider_deactivation: false,
         runtime,
         pending_runtime_request_id: None,
         allowed_always: std::sync::Arc::new(

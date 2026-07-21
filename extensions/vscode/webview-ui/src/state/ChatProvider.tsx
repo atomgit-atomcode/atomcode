@@ -221,6 +221,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         case 'providers':
           dispatch({ type: 'SET_PROVIDERS', providers: msg.providers, defaultProvider: msg.defaultProvider });
           break;
+        case 'runtimeInfo':
+          dispatch({ type: 'SET_CURRENT_PROVIDER', provider: msg.provider, model: msg.model });
+          break;
         case 'authStatus':
           dispatch({ type: 'SET_AUTH', auth: msg.auth });
           break;

@@ -1690,9 +1690,16 @@ async fn run() -> Result<i32> {
             // Same as the headless arm: don't `?` — a TUI run that ends in an
             // error must still reach the shutdown/flush below. Ok(()) → exit 0;
             // the error propagates only after telemetry is drained.
+            let provider_selection_mode = if cli.provider.is_some() || cli.model.is_some() {
+                atomcode_tuix::ProviderSelectionMode::Pinned
+            } else {
+                atomcode_tuix::ProviderSelectionMode::FollowGlobalDefault
+            };
             match atomcode_tuix::run(
                 config,
                 model_name,
+                provider_selection_mode,
+                atomcode_config::ConfigStore::new(config_path.clone()),
                 tui_runtime,
                 runtime_spawn_override,
                 working_dir,
@@ -3411,20 +3418,25 @@ fn run_codingplan_core(
     }
 
     if report.should_persist_config() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = config.save(&path) {
-            eprintln!("  ⚠ Failed to save config to {}: {:#}", path.display(), e);
-        }
+        let persisted = match atomcode_config::ConfigStore::new(&path)
+            .update(|latest| atomcode_codingplan::merge_successful_config(latest, &config, &report))
+        {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("  ⚠ Failed to save config to {}: {:#}", path.display(), e);
+                false
+            }
+        };
         // Stamp the sync marker alongside the config write. The drift
         // monitor on the TUI side reads this to decide whether to warn
         // about stale provider lists (> 24h + server drift). A failed
         // marker write is non-fatal — the config already landed; only
         // the 24h hint would be miscounted, which self-corrects on the
         // next successful run.
-        if let Err(e) = atomcode_codingplan::write_last_sync_now() {
-            eprintln!("  ⚠ Failed to write codingplan sync marker: {:#}", e);
+        if persisted {
+            if let Err(e) = atomcode_codingplan::write_last_sync_now() {
+                eprintln!("  ⚠ Failed to write codingplan sync marker: {:#}", e);
+            }
         }
     }
 

@@ -3,6 +3,7 @@ package com.atomcode.jetbrains.services
 import com.atomcode.jetbrains.daemon.AtomCodeDaemonClient
 import com.atomcode.jetbrains.daemon.AtomCodeDaemonProcess
 import com.atomcode.jetbrains.daemon.ApprovalMode
+import com.atomcode.jetbrains.daemon.AuthStatusResponse
 import com.atomcode.jetbrains.daemon.ChatEvent
 import com.atomcode.jetbrains.daemon.ChatRequest
 import com.atomcode.jetbrains.daemon.ChatStreamListener
@@ -16,6 +17,7 @@ import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.daemon.ModelInfo
 import com.atomcode.jetbrains.daemon.PatchProviderRequest
 import com.atomcode.jetbrains.daemon.PatchThinkingRequest
+import com.atomcode.jetbrains.daemon.ProviderInfo
 import com.atomcode.jetbrains.daemon.SessionDetail
 import com.atomcode.jetbrains.daemon.SessionMeta
 import com.atomcode.jetbrains.daemon.SetupSnapshot
@@ -44,6 +46,20 @@ private const val DAEMON_STARTUP_WAIT_SECONDS = 15L
 private const val DAEMON_STARTUP_RETRY_DELAY_MS = 150L
 private const val BACKGROUND_HEALTH_INITIAL_DELAY_SECONDS = 5L
 private const val BACKGROUND_HEALTH_INTERVAL_SECONDS = 30L
+
+internal fun providerSetupRequired(
+    providers: List<ProviderInfo>,
+    defaultProvider: String,
+    auth: AuthStatusResponse?,
+): Boolean {
+    if (providers.isEmpty()) return true
+    val selected = providers.firstOrNull { it.name == defaultProvider }
+        ?: providers.firstOrNull { it.isDefault }
+    val authUnavailable = auth?.loggedIn != true || auth.expired
+    // Older daemons do not expose requires_login. Keep the previous
+    // fail-closed behaviour until both sides speak the new protocol.
+    return selected?.requiresLogin?.let { it && authUnavailable } ?: authUnavailable
+}
 
 internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode.Build) {
     @Volatile
@@ -539,7 +555,11 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                         models = models,
                         defaultProvider = defaultProvider,
                         currentModel = currentModel,
-                        setupRequired = auth?.loggedIn != true || auth.expired || providers?.providers.isNullOrEmpty(),
+                        setupRequired = providerSetupRequired(
+                            providers = providers?.providers.orEmpty(),
+                            defaultProvider = defaultProvider,
+                            auth = auth,
+                        ),
                     )
                 }
             }

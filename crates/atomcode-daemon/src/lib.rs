@@ -126,6 +126,7 @@ pub(crate) struct ProviderInfo {
     pub model: String,
     pub base_url: Option<String>,
     pub has_api_key: bool,
+    pub requires_login: bool,
     pub is_default: bool,
     pub context_window: usize,
     pub max_tokens: Option<usize>,
@@ -1666,11 +1667,10 @@ async fn change_dir(
         // state above is always updated (so a webui switch survives refresh);
         // rewriting the configured default is gated behind `set_default`.
         if req.set_default {
-            let config_path = Config::default_path();
-            if let Ok(mut config) = Config::load(&config_path) {
+            let _ = atomcode_config::ConfigStore::default_store().update(|config| {
                 config.default_workdir = Some(new_path.to_string_lossy().to_string());
-                let _ = config.save(&config_path);
-            }
+                Ok(())
+            });
         }
 
         let hash = hash_path(&new_path);
@@ -2224,6 +2224,12 @@ pub struct ImageInput {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum ChatEvent {
+    /// Exact provider/model resolved for this request.
+    #[serde(rename = "runtime_info")]
+    RuntimeInfo {
+        provider: String,
+        model: String,
+    },
     /// Tool batch started (all tools in this assistant turn)
     #[serde(rename = "tool_batch")]
     ToolBatchStarted {
@@ -2326,6 +2332,20 @@ pub enum ChatEvent {
 #[cfg(test)]
 mod chat_event_type_tests {
     use super::{ChatEvent, ChatRuntimeProjector};
+
+    #[test]
+    fn runtime_info_serializes_the_exact_resolved_selection() {
+        let json = serde_json::to_value(ChatEvent::RuntimeInfo {
+            provider: "main".into(),
+            model: "model-x".into(),
+        })
+        .unwrap();
+
+        assert_eq!(json["type"], "runtime_info");
+        assert_eq!(json["provider"], "main");
+        assert_eq!(json["model"], "model-x");
+        assert!(json.get("config_revision").is_none());
+    }
 
     #[test]
     fn tool_batch_payload_is_kernel_native() {
@@ -3094,8 +3114,7 @@ async fn process_chat_request(
 ) -> anyhow::Result<()> {
     let approval_mode = effective_chat_approval_mode(req.approval_mode);
     // Load config
-    let config_path = Config::default_path();
-    let config = Config::load(&config_path)?;
+    let config = atomcode_config::ConfigStore::default_store().read()?.config;
     atomcode_config::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // Determine provider
@@ -3106,7 +3125,6 @@ async fn process_chat_request(
         .providers
         .get(&provider_name)
         .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_name))?;
-
     // Pre-flight: validate the selected provider config up front so a bad
     // provider surfaces a clean error here rather than deep in the runtime. The
     // runtime builds its own provider for the actual turn.
@@ -3118,6 +3136,10 @@ async fn process_chat_request(
             .await
             .map_err(|e| anyhow::anyhow!("provider construction task panicked: {e}"))??
     };
+    let _ = event_tx.send(ChatEvent::RuntimeInfo {
+        provider: provider_name.clone(),
+        model: provider_config.model.clone(),
+    });
 
     // Get working directory
     let working_dir = req

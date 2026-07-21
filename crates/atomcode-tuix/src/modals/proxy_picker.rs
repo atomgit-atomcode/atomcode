@@ -63,12 +63,8 @@ impl Modal for ProxyPicker {
                     }
                 }
                 proxy::apply_process_proxy_config(&ctx.config.network.proxy);
-                save_and_reload(ctx, renderer);
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  Proxy mode: {}\n",
-                    ctx.config.network.proxy.summary()
-                )));
-                renderer.flush();
+                let success = format!("  Proxy mode: {}\n", ctx.config.network.proxy.summary());
+                save_and_reload(ctx, renderer, success);
                 Ok(ModalAction::Close)
             }
             KeyCode::Esc => Ok(ModalAction::Close),

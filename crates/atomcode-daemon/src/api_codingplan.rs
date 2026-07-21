@@ -7,7 +7,7 @@ use atomcode_telemetry::{CodingplanErrorKind, CodingplanResult, Event};
 
 use crate::{
     api_auth::{pending_invite_for_login, poll_login_session, LoginPollStep},
-    api_config::{config_response, load_config, save_config},
+    api_config::{config_response, load_config, update_config},
     daemon_scope, json_error, AppState,
 };
 
@@ -184,7 +184,7 @@ pub(crate) async fn codingplan_setup(
         })
         .await;
 
-        let (config, report) = match setup_result {
+        let (mut config, report) = match setup_result {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 state.telemetry.track(Event::TakeCodingplan {
@@ -227,17 +227,22 @@ pub(crate) async fn codingplan_setup(
 
         // Persist config if setup succeeded
         if report.should_persist_config() {
-            if let Err(e) = save_config(&config) {
-                state.telemetry.track(Event::TakeCodingplan {
-                    type_: result_type,
-                    error_kind: Some(CodingplanErrorKind::ExecutionFailed),
-                    error_data: Some(serde_json::json!({
-                        "step": "config_save",
-                        "message": e,
-                    }).to_string()),
-                });
-                return json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-            }
+            config = match update_config(|latest| {
+                coding_plan::merge_successful_config(latest, &config, &report)
+            }) {
+                Ok(config) => config,
+                Err(e) => {
+                    state.telemetry.track(Event::TakeCodingplan {
+                        type_: result_type,
+                        error_kind: Some(CodingplanErrorKind::ExecutionFailed),
+                        error_data: Some(serde_json::json!({
+                            "step": "config_save",
+                            "message": e,
+                        }).to_string()),
+                    });
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+                }
+            };
             if let Err(e) = coding_plan::write_last_sync_now() {
                 state.telemetry.track(Event::TakeCodingplan {
                     type_: result_type,

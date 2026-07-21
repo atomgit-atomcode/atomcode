@@ -1422,34 +1422,35 @@ pub(crate) async fn live_provider(
     Json(req): Json<LiveProviderReq>,
 ) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
-    let mut config = match Config::load(&Config::default_path()) {
-        Ok(config) => config,
-        Err(error) => {
+    let store = atomcode_config::ConfigStore::default_store();
+    let mut provider_missing = false;
+    let mut previous_provider = String::new();
+    let commit = match store.update(|config| {
+        if !config.providers.contains_key(&req.provider) {
+            provider_missing = true;
+            anyhow::bail!("provider {:?} not found", req.provider);
+        }
+        previous_provider = config.default_provider.clone();
+        config.default_provider = req.provider.clone();
+        Ok(())
+    }) {
+        Ok(commit) => commit,
+        Err(_) if provider_missing => {
             return Json(serde_json::json!({
                 "ok": false,
-                "error": format!("load provider config failed: {error}"),
+                "error": format!("provider {:?} not found", req.provider),
             }));
         }
-    };
-    if !config.providers.contains_key(&req.provider) {
-        return Json(serde_json::json!({
-            "ok": false,
-            "error": format!("provider {:?} not found", req.provider),
-        }));
-    }
-    let config_path = Config::default_path();
-    let previous_provider = config.default_provider.clone();
-    let previous_selected_provider = live_current_provider();
-    let default_changed = previous_provider != req.provider;
-    if default_changed {
-        config.default_provider = req.provider.clone();
-        if let Err(error) = config.save(&config_path) {
+        Err(error) => {
             return Json(serde_json::json!({
                 "ok": false,
                 "error": format!("save provider config failed: {error}"),
             }));
         }
-    }
+    };
+    let config = commit.snapshot.config.clone();
+    let previous_selected_provider = live_current_provider();
+    let default_changed = previous_provider != req.provider;
     live_set_provider(req.provider.clone());
     let join = match crate::native_live::ensure_headless_runtime(
         live_current_working_dir(&working_dir),
@@ -1464,11 +1465,13 @@ pub(crate) async fn live_provider(
         Err(error) => {
             live_set_provider(previous_selected_provider.clone());
             let rollback_error = if default_changed {
-                config.default_provider = previous_provider.clone();
-                config
-                    .save(&config_path)
-                    .err()
-                    .map(|error| error.to_string())
+                match store.update_if_revision(&commit.snapshot.revision, |config| {
+                    config.default_provider = previous_provider.clone();
+                    Ok(())
+                }) {
+                    Ok(Some(_)) | Ok(None) => None,
+                    Err(error) => Some(error.to_string()),
+                }
             } else {
                 None
             };
@@ -1498,11 +1501,13 @@ pub(crate) async fn live_provider(
         Err(error) => {
             live_set_provider(previous_selected_provider.clone());
             let rollback_error = if default_changed {
-                config.default_provider = previous_provider.clone();
-                config
-                    .save(&config_path)
-                    .err()
-                    .map(|error| error.to_string())
+                match store.update_if_revision(&commit.snapshot.revision, |config| {
+                    config.default_provider = previous_provider.clone();
+                    Ok(())
+                }) {
+                    Ok(Some(_)) | Ok(None) => None,
+                    Err(error) => Some(error.to_string()),
+                }
             } else {
                 None
             };
@@ -1610,45 +1615,46 @@ pub(crate) async fn live_reasoning_effort(
                 .into_response();
         }
     };
-    let config_path = Config::default_path();
-    let mut config = match Config::load(&config_path) {
-        Ok(config) => config,
+    let store = atomcode_config::ConfigStore::default_store();
+    let requested = req.provider;
+    let mut target = String::new();
+    let mut previous_effort = None;
+    let mut provider_missing = false;
+    let commit = match store.update(|config| {
+        target = requested
+            .clone()
+            .unwrap_or_else(|| config.default_provider.clone());
+        let Some(provider) = config.providers.get_mut(&target) else {
+            provider_missing = true;
+            anyhow::bail!("provider {target:?} not found");
+        };
+        previous_effort = provider.reasoning_effort.clone();
+        provider.reasoning_effort = effort;
+        Ok(())
+    }) {
+        Ok(commit) => commit,
+        Err(_) if provider_missing => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("provider {target:?} not found"),
+                })),
+            )
+                .into_response();
+        }
         Err(error) => {
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "ok": false,
-                    "error": format!("load provider config failed: {error}"),
+                    "error": format!("save provider config failed: {error}"),
                 })),
             )
                 .into_response();
         }
     };
-    let target = req
-        .provider
-        .unwrap_or_else(|| config.default_provider.clone());
-    let Some(provider) = config.providers.get_mut(&target) else {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": format!("provider {target:?} not found"),
-            })),
-        )
-            .into_response();
-    };
-    let previous_effort = provider.reasoning_effort.clone();
-    provider.reasoning_effort = effort;
-    if let Err(error) = config.save(&config_path) {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": format!("save provider config failed: {error}"),
-            })),
-        )
-            .into_response();
-    }
+    let config = commit.snapshot.config.clone();
 
     if let Ok(binding) = crate::native_live::binding() {
         let runtime_config = chat_runtime_config(
@@ -1662,13 +1668,16 @@ pub(crate) async fn live_reasoning_effort(
         )
         .await
         {
-            if let Some(provider) = config.providers.get_mut(&target) {
-                provider.reasoning_effort = previous_effort;
-            }
-            let rollback_error = config
-                .save(&config_path)
-                .err()
-                .map(|error| error.to_string());
+            let rollback_error =
+                match store.update_if_revision(&commit.snapshot.revision, |config| {
+                    if let Some(provider) = config.providers.get_mut(&target) {
+                        provider.reasoning_effort = previous_effort;
+                    }
+                    Ok(())
+                }) {
+                    Ok(Some(_)) | Ok(None) => None,
+                    Err(error) => Some(error.to_string()),
+                };
             return Json(serde_json::json!({
                 "ok": false,
                 "error": match rollback_error {

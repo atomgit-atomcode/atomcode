@@ -713,6 +713,7 @@ impl OnboardingWizard {
     pub(super) fn apply_language(
         &self,
         config: &mut atomcode_config::config::Config,
+        store: &atomcode_config::ConfigStore,
     ) -> anyhow::Result<atomcode_config::locale::Locale> {
         use atomcode_config::locale::Locale;
         let new_locale = match self.language_idx {
@@ -732,7 +733,10 @@ impl OnboardingWizard {
             _ => unreachable!("language_idx is bounded 0..=2"),
         };
         crate::i18n::set_locale(new_locale);
-        config.save(&atomcode_config::config::Config::default_path())?;
+        store.update(|latest| {
+            latest.language = config.language;
+            Ok(())
+        })?;
         Ok(new_locale)
     }
 
@@ -949,7 +953,7 @@ impl crate::modals::Modal for OnboardingWizard {
                 Ok(ModalAction::Continue)
             }
             PureOutcome::ApplyLanguageThenAdvance => {
-                if let Err(e) = self.apply_language(&mut ctx.config) {
+                if let Err(e) = self.apply_language(&mut ctx.config, &ctx.config_store) {
                     let msg = crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
                         error: &e.to_string(),
                     });
@@ -1524,7 +1528,7 @@ mod tests {
         let _g = crate::i18n::test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         // ATOMCODE_HOME drives Config::config_dir() ahead of $HOME, so
-        // the test's config.save lands in `<tmp>/config.toml` and not
+        // the test's config transaction lands in `<tmp>/config.toml` and not
         // the real home dir. Saved+restored around the test to keep
         // parallel tests from racing on the global env.
         let prev_atomcode_home = std::env::var("ATOMCODE_HOME").ok();
@@ -1533,7 +1537,9 @@ mod tests {
         let mut cfg = blank_config_for_test();
         let mut w = OnboardingWizard::new();
         w.language_idx = 2;
-        let applied = w.apply_language(&mut cfg).unwrap();
+        let applied = w
+            .apply_language(&mut cfg, &atomcode_config::ConfigStore::default_store())
+            .unwrap();
         assert_eq!(applied, Locale::ZhCn);
         assert_eq!(cfg.language, Some(Locale::ZhCn));
         assert_eq!(crate::i18n::current_locale(), Locale::ZhCn);
@@ -1562,7 +1568,8 @@ mod tests {
         cfg.language = Some(Locale::En); // start with non-None
         let mut w = OnboardingWizard::new();
         w.language_idx = 0;
-        w.apply_language(&mut cfg).unwrap();
+        w.apply_language(&mut cfg, &atomcode_config::ConfigStore::default_store())
+            .unwrap();
         assert_eq!(cfg.language, None);
 
         match prev {

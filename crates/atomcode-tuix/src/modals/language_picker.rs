@@ -70,10 +70,12 @@ impl Modal for LanguagePicker {
                 // back in English on a zh_CN selection.
                 i18n::set_locale(locale);
                 ctx.config.language = Some(locale);
-                let config_path = atomcode_config::config::Config::default_path();
-                if let Err(e) = ctx.config.save(&config_path) {
-                    // TODO: surface via renderer once a non-modal error display is available
-                    eprintln!("[language] failed to save config: {e}");
+                match ctx.config_store.update(|config| {
+                    config.language = Some(locale);
+                    Ok(())
+                }) {
+                    Ok(commit) => ctx.observed_config_revision = Some(commit.snapshot.revision),
+                    Err(e) => eprintln!("[language] failed to save config: {e}"),
                 }
                 renderer.render(UiLine::CommandOutput(
                     crate::i18n::t(crate::i18n::Msg::LanguageSwitched {

@@ -48,10 +48,16 @@ export function ModelSelector({ placement = 'down', onOpen }: ModelSelectorProps
     setEffortOpen(false);
   }
 
+  const currentProvider = state.providers.find((p) => p.name === state.currentProvider);
   const currentLabel =
-    state.providers.find((p) => p.name === state.currentProvider)?.model
+    currentProvider?.model
     ?? state.models.find((m) => m.provider === state.currentProvider)?.model
     ?? state.currentModel;
+  const loginRequired = currentProvider?.requires_login === true
+    && (!state.auth?.logged_in || state.auth.expired === true);
+  const currentDisplayLabel = loginRequired
+    ? `${currentLabel} · ${t('model.loginRequired')}`
+    : currentLabel;
 
   const currentEffortModel = state.models.find((m) => m.provider === state.currentProvider);
   const showEffort = !!currentEffortModel?.effort_applicable;
@@ -103,7 +109,7 @@ export function ModelSelector({ placement = 'down', onOpen }: ModelSelectorProps
           onClick={handleTriggerClick}
           title={t('model.selectModel')}
         >
-          <span className="model-selector-label">{currentLabel}</span>
+          <span className="model-selector-label">{currentDisplayLabel}</span>
           <span className="model-selector-chevron">{open ? '▴' : '▾'}</span>
         </button>
         {open && (

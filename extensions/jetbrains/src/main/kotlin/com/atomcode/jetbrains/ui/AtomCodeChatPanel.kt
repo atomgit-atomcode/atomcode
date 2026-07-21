@@ -229,6 +229,12 @@ class AtomCodeChatPanel(
     private var currentSession: SessionRefView? = null
     private var welcomeLanguage: String = defaultWelcomeLanguage()
     private var loggedIn = false
+    private val setupRefreshTimer = Timer(2_000) {
+        if (isShowing && !disposed) refreshSetupSnapshot(silent = true)
+    }.apply {
+        isRepeats = true
+        initialDelay = 2_000
+    }
     private val streamHandler = StreamEventHandler(messageView)
     private val pendingContext = mutableListOf<ChatContextItem>()
     private val pendingImages = mutableListOf<PendingImageAttachment>()
@@ -272,6 +278,7 @@ class AtomCodeChatPanel(
         installInputKeyBindings()
 
         service.addConnectionListener(connectionListener)
+        setupRefreshTimer.start()
         renderConnectionState(service.connectionState)
         applyChatSettings()
         showWelcomePage()
@@ -302,6 +309,7 @@ class AtomCodeChatPanel(
         pendingContext.clear()
         pendingImages.clear()
         service.removeConnectionListener(connectionListener)
+        setupRefreshTimer.stop()
         messageView.dispose()
     }
 
@@ -393,14 +401,16 @@ class AtomCodeChatPanel(
         }
     }
 
-    private fun refreshSetupSnapshot() {
+    private fun refreshSetupSnapshot(silent: Boolean = false) {
         service.loadSetupSnapshot().whenComplete { snapshot, error ->
             SwingUtilities.invokeLater {
                 if (error != null) {
-                    addErrorMessage(error.cause?.message ?: error.message ?: "failed to load setup")
+                    if (!silent) {
+                        addErrorMessage(error.cause?.message ?: error.message ?: "failed to load setup")
+                    }
                     return@invokeLater
                 }
-                renderSetupSnapshot(snapshot)
+                if (snapshot != setupSnapshot) renderSetupSnapshot(snapshot)
             }
         }
     }
@@ -1072,6 +1082,10 @@ class AtomCodeChatPanel(
 
     private fun renderChatEvent(event: ChatEvent) {
         when (event) {
+            is ChatEvent.RuntimeInfo -> {
+                inputPanel.setModelName(event.model)
+                refreshSetupSnapshot(silent = true)
+            }
             is ChatEvent.Text -> streamHandler.onText(event.content)
             is ChatEvent.Reasoning -> streamHandler.onReasoning(event.content)
             is ChatEvent.ToolBatch -> streamHandler.onToolBatch()

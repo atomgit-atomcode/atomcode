@@ -9,6 +9,8 @@ import type {
   PermissionRequestData,
   StatusData,
   SearchState,
+  AuthStatus,
+  ProviderInfo,
 } from './types';
 import { blocksFromLegacyMessage } from './blocks';
 import { buildSearchMatches } from '../utils/search';
@@ -16,6 +18,22 @@ import { buildSearchMatches } from '../utils/search';
 let _msgCounter = 0;
 function nextId(): string {
   return `msg-${Date.now()}-${++_msgCounter}`;
+}
+
+function providerSetupRequired(
+  providers: ProviderInfo[],
+  currentProvider: string,
+  auth?: AuthStatus,
+): boolean {
+  if (providers.length === 0) return true;
+  const current = providers.find((provider) => provider.name === currentProvider)
+    ?? providers.find((provider) => provider.is_default);
+  const authUnavailable = !auth?.logged_in || auth.expired === true;
+  // Older daemons did not expose requires_login. Preserve their previous
+  // conservative behaviour until the daemon is upgraded.
+  return current?.requires_login === undefined
+    ? authUnavailable
+    : current.requires_login && authUnavailable;
 }
 
 function lastAssistantIndex(messages: ChatMessage[]): number {
@@ -797,7 +815,11 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
         providers: action.providers,
         currentProvider: current?.name ?? state.currentProvider,
         currentModel: current?.model ?? state.currentModel,
-        setupRequired: state.auth?.logged_in === false || state.auth?.expired === true || action.providers.length === 0,
+        setupRequired: providerSetupRequired(
+          action.providers,
+          current?.name ?? state.currentProvider,
+          state.auth,
+        ),
       };
     }
 
@@ -805,7 +827,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         auth: action.auth,
-        setupRequired: !action.auth.logged_in || action.auth.expired === true || state.providers.length === 0,
+        setupRequired: providerSetupRequired(state.providers, state.currentProvider, action.auth),
       };
 
     case 'SET_SETUP_STATE': {
@@ -840,6 +862,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
         ...state,
         currentProvider: action.provider,
         currentModel: action.model ?? provider?.model ?? state.currentModel,
+        setupRequired: providerSetupRequired(state.providers, action.provider, state.auth),
       };
     }
 

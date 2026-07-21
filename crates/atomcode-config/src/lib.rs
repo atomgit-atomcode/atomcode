@@ -29,8 +29,12 @@ pub mod lsp_registry;
 /// load/save/paths. `atomcode_core::config` re-exports this during the transition.
 pub mod config;
 
+/// Transactional, cross-process-safe access to `config.toml`.
+pub mod store;
+
 /// Pure parsers for OS system-proxy descriptions: Windows ProxyServer/ProxyOverride
 /// and macOS `scutil --proxy` output → normalized HTTP(S)_PROXY / NO_PROXY values.
 pub mod system_proxy;
 
 pub use config::{provider::ProviderConfig, Config};
+pub use store::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};

@@ -6,6 +6,15 @@ import kotlin.test.assertTrue
 
 class SseParserTest {
     @Test
+    fun parsesRuntimeInfoEvent() {
+        val parser = SseParser()
+        val events = parser.feed(
+            """data: {"type":"runtime_info","provider":"main","model":"model-x"}${"\n\n"}""",
+        )
+        assertEquals(ChatEvent.RuntimeInfo("main", "model-x"), events.single())
+    }
+
+    @Test
     fun parsesTextEvent() {
         val parser = SseParser()
         val events = parser.feed("""data: {"type":"text","content":"hello"}${"\n\n"}""")

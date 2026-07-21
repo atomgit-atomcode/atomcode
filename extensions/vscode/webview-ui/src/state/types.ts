@@ -33,6 +33,7 @@ export interface ProviderInfo {
   model: string;
   base_url?: string;
   has_api_key: boolean;
+  requires_login?: boolean;
   is_default: boolean;
   context_window: number;
   max_tokens?: number;

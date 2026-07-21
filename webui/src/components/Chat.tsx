@@ -26,7 +26,7 @@
 // 我们愿意根据再审意见继续优化。
 
 import { VNode } from 'preact';
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, type CommandResult, UserInputRequestEvent } from '../api';
 import {
   parseSlashCommand,
@@ -423,6 +423,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 正在拉取某会话历史：用于抑制落地页，避免切到「有内容的会话」时先闪一下落地页。
   const [loading, setLoading] = useState(false);
   const [provider, setProvider] = useState<string | null>(null);
+  const providerPinnedRef = useRef(false);
+  const followDefaultProvider = useCallback((name: string) => {
+    if (!providerPinnedRef.current) setProvider(name);
+  }, []);
   // 审批模式（build / plan / bypass）。进程级 runtime 状态，由 /live snapshot +
   // 'mode' 事件同步，切换调 postLiveMode（下一轮生效）。confirmedMode 是 daemon 已确认值。
   const [modeState, setModeState] = useState(() => initModeState('build' as ApprovalMode));
@@ -599,14 +603,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, activeSession?.project_hash]);
-
-  // Initialize provider from default model
-  useEffect(() => {
-    getModels().then((ms) => {
-      const def = ms.find((m) => m.is_default) ?? ms[0];
-      if (def) setProvider((p) => p ?? def.provider);
-    }).catch(() => {});
-  }, []);
 
   // How close to the bottom (px) still counts as "at the bottom" — a small slack so
   // sub-pixel rounding / layout jitter during streaming doesn't wrongly release follow.
@@ -936,7 +932,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
-      if (e.provider) setProvider(e.provider);
+      if (e.provider) {
+        providerPinnedRef.current = false;
+        setProvider(e.provider);
+      }
       // 同步当前审批模式，让新 tab 显示正确的模式 pill（含别的 tab 切成的 Bypass/Plan）。
       if (e.mode) setModeState(initModeState(e.mode));
       // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
@@ -951,6 +950,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }
     // 模型切换是进程级（全局），与正在查看哪个会话无关 → 不门控，始终更新下拉框。
     if (e.type === 'provider') {
+      providerPinnedRef.current = false;
       setProvider(e.provider);
       return;
     }
@@ -1161,6 +1161,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   /** Switch the active provider and notify the backend when in sync mode. */
   function switchProvider(name: string) {
     if (!sync) {
+      providerPinnedRef.current = true;
       setProvider(name);
       return;
     }
@@ -1390,6 +1391,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   function handleEvent(event: SSEEvent) {
     switch (event.type) {
+      case 'runtime_info':
+        setProvider(event.provider);
+        break;
       case 'command_output':
         pushCommandNotice(event.text);
         break;
@@ -2188,6 +2192,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         <ModelSelector
           value={provider}
           onChange={(p) => switchProvider(p)}
+          onDefaultChange={followDefaultProvider}
         />
         {busy ? (
           <>

@@ -137,7 +137,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _approvalModeState: ApprovalModeState = initApprovalModeState('build');
   public onModelSelected?: (model: string) => void;
 
-  private _configWatcher?: vscode.Disposable;
+  private _settingsWatcher?: vscode.Disposable;
+  private _atomCodeConfigWatcher?: vscode.FileSystemWatcher;
+  private _atomCodeAuthWatcher?: vscode.FileSystemWatcher;
+  private _watchedConfigPath?: string;
+  private _watchedAuthPath?: string;
+  private _setupRefreshTimer?: NodeJS.Timeout;
+  private _setupStateGeneration = 0;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -146,7 +152,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Apply a chat-font config change LIVE (set the CSS var in the DOM) instead of rebuilding
     // the webview HTML — a rebuild would reset the active chat. Initial load is handled by the
     // `{{fontStyle}}` injection in `_getHtml`.
-    this._configWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
+    this._settingsWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
       if (
         e.affectsConfiguration('atomcode.chat.fontFamily') ||
         e.affectsConfiguration('chatEditor.fontFamily')
@@ -187,11 +193,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   public dispose() {
+    this._setupStateGeneration += 1;
     this._loginGeneration += 1;
     const loginId = this._loginId;
     this._loginId = undefined;
     if (loginId) void this._client.cancelLogin(loginId).catch(() => undefined);
-    this._configWatcher?.dispose();
+    this._settingsWatcher?.dispose();
+    this._atomCodeConfigWatcher?.dispose();
+    this._atomCodeAuthWatcher?.dispose();
+    if (this._setupRefreshTimer) clearTimeout(this._setupRefreshTimer);
   }
 
   private _findAtomCodeTabGroup(): vscode.ViewColumn | undefined {
@@ -247,6 +257,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // When user switches to this tab in VS Code, sync sidebar selection
     panel.onDidChangeViewState((e) => {
       if (e.webviewPanel.active) {
+        void this._sendSetupState(panel.webview);
         const activeSid = this._findSessionIdByPanel(panel);
         if (activeSid) {
           this._focusedPanelId = activeSid;
@@ -343,6 +354,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // When user switches to this tab in VS Code, sync sidebar selection
     panel.onDidChangeViewState((e) => {
       if (e.webviewPanel.active) {
+        void this._sendSetupState(panel.webview);
         const activeSid = this._findSessionIdByPanel(panel);
         if (activeSid) {
           this._focusedPanelId = activeSid;
@@ -379,6 +391,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.onDidChangeVisibility(() => {
       vscode.commands.executeCommand('setContext', 'atomcode.chatFocused', webviewView.visible);
+      if (webviewView.visible) void this._sendSetupState(webviewView.webview);
     });
   }
 
@@ -910,6 +923,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const streamSessionId = sid;
 
     rt.abortController = this._client.streamChat(request, {
+      onRuntimeInfo: (provider, model) => {
+        this.onModelSelected?.(model);
+        this._broadcastMessage({ type: 'runtimeInfo', provider, model });
+      },
       onText: (content) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
@@ -1258,49 +1275,113 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _sendSetupState(webview?: vscode.Webview) {
+    const generation = ++this._setupStateGeneration;
+    const isCurrent = () => generation === this._setupStateGeneration;
     let auth: AuthStatusResponse | undefined;
     let providers: ProvidersResponse | undefined;
     let config: ConfigResponse | undefined;
     let models: ModelInfo[] | undefined;
-    const post = (msg: unknown) => webview
-      ? this._postMessage(msg, webview)
-      : this._broadcastMessage(msg);
+    const post = (msg: unknown) => {
+      if (!isCurrent()) return;
+      // Setup state is process-global. Broadcasting the newest snapshot keeps
+      // every open view coherent when a panel-focused refresh supersedes an
+      // older watcher refresh. A not-yet-registered webview still receives its
+      // direct initialization copy.
+      this._broadcastMessage(msg);
+      const tracked = webview && (
+        this._view?.webview === webview
+        || Array.from(this._panels.values()).some((panel) => panel.webview === webview)
+      );
+      if (webview && !tracked) this._postMessage(msg, webview);
+    };
 
     try {
       auth = await this._client.authStatus();
+      if (!isCurrent()) return;
       post({ type: 'authStatus', auth });
+      this._watchAtomCodeAuth(auth.auth_path);
     } catch (e) {
+      if (!isCurrent()) return;
       post({ type: 'setupError', message: this._messageFromError(e) });
     }
 
     try {
       providers = await this._client.listProviders();
+      if (!isCurrent()) return;
       post({ type: 'providers', providers: providers.providers, defaultProvider: providers.default_provider });
     } catch (e) {
+      if (!isCurrent()) return;
       post({ type: 'setupError', message: this._messageFromError(e) });
     }
 
     try {
       config = await this._client.getConfig();
+      if (!isCurrent()) return;
       post({ type: 'config', config });
+      this._watchAtomCodeConfig(config.path);
     } catch {
+      if (!isCurrent()) return;
       // Older daemons may not have P0 APIs; provider fetch error already surfaces enough.
     }
 
     try {
       models = await this._client.listModels();
+      if (!isCurrent()) return;
       post({ type: 'models', models });
-    } catch {}
+    } catch {
+      if (!isCurrent()) return;
+    }
 
     const defaultProvider = providers?.providers.find((p) => p.is_default);
+    const authUnavailable = !auth?.logged_in || auth.expired === true;
+    const selectedRequiresLogin = defaultProvider?.requires_login;
     post({
       type: 'setupState',
       auth,
       providers: providers?.providers ?? [],
       defaultProvider: providers?.default_provider ?? config?.default_provider ?? '',
       currentModel: defaultProvider?.model || models?.find((m) => m.is_default)?.model || '',
-      setupRequired: !auth?.logged_in || auth.expired || (providers?.providers.length ?? 0) === 0,
+      setupRequired: (providers?.providers.length ?? 0) === 0
+        || (selectedRequiresLogin === undefined
+          ? authUnavailable
+          : selectedRequiresLogin && authUnavailable),
     });
+  }
+
+  private _watchAtomCodeConfig(configPath: string) {
+    if (!configPath || this._watchedConfigPath === configPath) return;
+    this._atomCodeConfigWatcher?.dispose();
+    this._watchedConfigPath = configPath;
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(path.dirname(configPath), path.basename(configPath)),
+    );
+    const scheduleRefresh = () => this._scheduleSetupStateRefresh();
+    watcher.onDidCreate(scheduleRefresh);
+    watcher.onDidChange(scheduleRefresh);
+    watcher.onDidDelete(scheduleRefresh);
+    this._atomCodeConfigWatcher = watcher;
+  }
+
+  private _watchAtomCodeAuth(authPath: string) {
+    if (!authPath || this._watchedAuthPath === authPath) return;
+    this._atomCodeAuthWatcher?.dispose();
+    this._watchedAuthPath = authPath;
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(path.dirname(authPath), path.basename(authPath)),
+    );
+    const scheduleRefresh = () => this._scheduleSetupStateRefresh();
+    watcher.onDidCreate(scheduleRefresh);
+    watcher.onDidChange(scheduleRefresh);
+    watcher.onDidDelete(scheduleRefresh);
+    this._atomCodeAuthWatcher = watcher;
+  }
+
+  private _scheduleSetupStateRefresh() {
+    if (this._setupRefreshTimer) clearTimeout(this._setupRefreshTimer);
+    this._setupRefreshTimer = setTimeout(() => {
+      this._setupRefreshTimer = undefined;
+      void this._sendSetupState();
+    }, 100);
   }
 
   private async _startLogin() {
@@ -1499,6 +1580,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._sendSetupState();
     } catch (e) {
       this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
+      await this._sendSetupState();
     }
   }
 
@@ -1508,6 +1590,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._sendSetupState();
     } catch (e) {
       this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
+      // The webview updates optimistically; re-read daemon truth on failure.
+      await this._sendSetupState();
     }
   }
 
@@ -1520,6 +1604,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._sendSetupState();
     } catch (e) {
       this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
+      // The webview updates optimistically; re-read daemon truth on failure.
+      await this._sendSetupState();
     }
   }
 

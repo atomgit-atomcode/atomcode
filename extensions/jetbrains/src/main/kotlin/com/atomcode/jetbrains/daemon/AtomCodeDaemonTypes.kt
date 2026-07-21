@@ -54,6 +54,7 @@ data class ProviderInfo(
     val model: String,
     val isDefault: Boolean,
     val hasApiKey: Boolean,
+    val requiresLogin: Boolean? = null,
     val thinkingEnabled: Boolean,
     val thinkingBudget: Int?,
     val thinkingType: String?,
@@ -215,6 +216,7 @@ interface ChatStreamListener {
 }
 
 sealed interface ChatEvent {
+    data class RuntimeInfo(val provider: String, val model: String) : ChatEvent
     data class Text(val content: String) : ChatEvent
     data class Reasoning(val content: String) : ChatEvent
     data class ToolBatch(val callsJson: String) : ChatEvent

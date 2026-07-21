@@ -503,6 +503,7 @@ private fun String.toProviderInfo(): ProviderInfo =
         model = jsonString("model").orEmpty(),
         isDefault = jsonBoolean("is_default") ?: false,
         hasApiKey = jsonBoolean("has_api_key") ?: false,
+        requiresLogin = jsonBoolean("requires_login"),
         thinkingEnabled = jsonBoolean("thinking_enabled") ?: false,
         thinkingBudget = jsonInt("thinking_budget"),
         thinkingType = jsonString("thinking_type"),

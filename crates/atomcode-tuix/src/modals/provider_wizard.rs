@@ -13,7 +13,9 @@ use atomcode_config::config::provider::ProviderConfig;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{build_status, save_and_reload, Buffer, LoopCtx};
+use crate::event_loop::{
+    build_status, save_and_reload, select_provider_and_reload, Buffer, LoopCtx,
+};
 use crate::input::key_action::classify;
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
@@ -356,15 +358,7 @@ fn handle_key(
                 }
                 KeyCode::Enter => {
                     let chosen = providers[selected].clone();
-                    ctx.config.default_provider = chosen.clone();
-                    if let Some(p) = ctx.config.providers.get(&chosen) {
-                        ctx.model_name = p.model.clone();
-                    }
-                    save_and_reload(ctx, renderer);
-                    push(
-                        renderer,
-                        &crate::i18n::t(crate::i18n::Msg::ProviderDefaultSet { name: &chosen }),
-                    );
+                    select_provider_and_reload(ctx, &chosen, renderer);
                     return Ok(ModalAction::Close);
                 }
                 _ => {}
@@ -392,10 +386,11 @@ fn handle_key(
                             .cloned()
                             .unwrap_or_default();
                     }
-                    save_and_reload(ctx, renderer);
-                    push(
+                    save_and_reload(
+                        ctx,
                         renderer,
-                        &crate::i18n::t(crate::i18n::Msg::ProviderDeleted { name: &target }),
+                        crate::i18n::t(crate::i18n::Msg::ProviderDeleted { name: &target })
+                            .into_owned(),
                     );
                 }
                 _ => {
@@ -566,14 +561,14 @@ fn handle_key(
                             let cfg = draft.into_config();
                             ctx.config.providers.insert(name.clone(), cfg);
                             ctx.config.default_provider = name.clone();
-                            ctx.model_name = model.clone();
-                            save_and_reload(ctx, renderer);
-                            push(
+                            save_and_reload(
+                                ctx,
                                 renderer,
-                                &crate::i18n::t(crate::i18n::Msg::ProviderAdded {
+                                crate::i18n::t(crate::i18n::Msg::ProviderAdded {
                                     name: &name,
                                     model: &model,
-                                }),
+                                })
+                                .into_owned(),
                             );
                             return Ok(ModalAction::Close);
                         }
@@ -647,10 +642,11 @@ fn handle_key(
                         if let Some(existing) = ctx.config.providers.get_mut(&target) {
                             draft.apply_onto(existing);
                         }
-                        save_and_reload(ctx, renderer);
-                        push(
+                        save_and_reload(
+                            ctx,
                             renderer,
-                            &crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &target }),
+                            crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &target })
+                                .into_owned(),
                         );
                         return Ok(ModalAction::Close);
                     }

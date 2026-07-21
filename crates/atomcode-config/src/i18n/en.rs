@@ -475,6 +475,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "No active provider configured. Use /provider to add one.".into(),
         Msg::CmdProviderUnavailable =>
             "Provider is unavailable. Use /login to sign in or /provider to configure one.".into(),
+        Msg::CmdProviderReloading =>
+            "Provider/model is switching. Send after the switch completes.".into(),
 
         // ── Approval prompt ──
         Msg::ApprovalPromptAlt { tool, detail } =>

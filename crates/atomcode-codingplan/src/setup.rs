@@ -27,7 +27,9 @@
 //   - Multiple models → one provider per model, named
 //     `AtomGit-{display_model_name}` with `/` → `-` (keeps config.toml
 //     section names clean — `[providers.AtomGit-moonshotai-Kimi-K2]`).
-//   - `default_provider` is set to the first model in the API order.
+//   - A valid non-CodingPlan default is preserved. A CodingPlan selection is
+//     preserved by model identity when still available; otherwise use the first
+//     available model in API order.
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -547,7 +549,7 @@ pub struct ModelsInfo {
     pub display_names: Vec<String>,
     /// Provider keys actually inserted into Config (available only).
     pub provider_names: Vec<String>,
-    /// Which of `provider_names` was set as `default_provider`.
+    /// Effective `default_provider` after refresh (may be a preserved custom provider).
     pub default_provider: String,
     /// Outcome of vision_preprocessor_provider auto-config. Drives the
     /// "Vision preprocessor → ..." line in the rendered report.
@@ -911,6 +913,12 @@ fn step_models_and_register(
         );
     }
 
+    let previous_default = config.default_provider.clone();
+    let previous_model = config
+        .providers
+        .get(&previous_default)
+        .map(|provider| provider.model.clone());
+
     // Wipe any stale AtomGit* entries so we don't accumulate old names.
     let stale: Vec<String> = config
         .providers
@@ -927,15 +935,17 @@ fn step_models_and_register(
         .map(|m| m.display_model_name.clone())
         .collect();
     let provider_names = provider_names_for(&names);
-    let default_provider = provider_names
-        .first()
-        .cloned()
-        .unwrap_or_else(|| PROVIDER_PREFIX.to_string());
-
     for (pname, m) in provider_names.iter().zip(available.iter()) {
         let pc = build_codingplan_provider(m);
         config.providers.insert(pname.clone(), pc);
     }
+    let default_provider = refreshed_default_provider(
+        config,
+        &previous_default,
+        previous_model.as_deref(),
+        &names,
+        &provider_names,
+    );
     config.default_provider = default_provider.clone();
 
     // Auto-detect a vision_preprocessor candidate from the freshly
@@ -986,6 +996,80 @@ fn step_models_and_register(
         }),
         false,
     )
+}
+
+fn refreshed_default_provider(
+    config: &Config,
+    previous_default: &str,
+    previous_model: Option<&str>,
+    model_names: &[String],
+    provider_names: &[String],
+) -> String {
+    if !is_codingplan_provider_name(previous_default)
+        && config.providers.contains_key(previous_default)
+    {
+        return previous_default.to_string();
+    }
+    if is_codingplan_provider_name(previous_default) {
+        if let Some(index) = previous_model
+            .and_then(|model| model_names.iter().position(|candidate| candidate == model))
+        {
+            return provider_names[index].clone();
+        }
+        if config.providers.contains_key(previous_default) {
+            return previous_default.to_string();
+        }
+    }
+    provider_names
+        .first()
+        .cloned()
+        .unwrap_or_else(|| PROVIDER_PREFIX.to_string())
+}
+
+/// Merge a successful catalog refresh into the latest disk snapshot.
+///
+/// The network request runs without holding the config lock. Callers invoke
+/// this inside `ConfigStore::update` so unrelated concurrent edits survive.
+pub fn merge_successful_config(
+    latest: &mut Config,
+    prepared: &Config,
+    report: &SetupReport,
+) -> Result<()> {
+    let StepResult::Ok(models) = &report.models else {
+        anyhow::bail!("CodingPlan model refresh did not complete");
+    };
+    let previous_default = latest.default_provider.clone();
+    let previous_model = latest
+        .providers
+        .get(&previous_default)
+        .map(|provider| provider.model.clone());
+
+    latest
+        .providers
+        .retain(|name, _| !is_codingplan_provider_name(name));
+    for name in &models.provider_names {
+        let provider = prepared
+            .providers
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("prepared provider {name:?} is missing"))?;
+        latest.providers.insert(name.clone(), provider.clone());
+    }
+    latest.default_provider = refreshed_default_provider(
+        latest,
+        &previous_default,
+        previous_model.as_deref(),
+        &models.display_names,
+        &models.provider_names,
+    );
+
+    let custom_vision = latest
+        .vision_preprocessor_provider
+        .as_deref()
+        .is_some_and(|name| !name.is_empty() && !is_codingplan_provider_name(name));
+    if !custom_vision {
+        latest.vision_preprocessor_provider = prepared.vision_preprocessor_provider.clone();
+    }
+    Ok(())
 }
 
 fn step_status() -> (StepResult<StatusResponse>, bool) {
@@ -2212,6 +2296,11 @@ mod tests {
         config: &mut Config,
         models: Vec<super::super::types::ModelEntry>,
     ) -> ModelsInfo {
+        let previous_default = config.default_provider.clone();
+        let previous_model = config
+            .providers
+            .get(&previous_default)
+            .map(|provider| provider.model.clone());
         let stale: Vec<String> = config
             .providers
             .keys()
@@ -2226,15 +2315,18 @@ mod tests {
             .map(|m| m.display_model_name.clone())
             .collect();
         let provider_names = provider_names_for(&names);
-        let default_provider = provider_names
-            .first()
-            .cloned()
-            .unwrap_or_else(|| PROVIDER_PREFIX.to_string());
         for (pname, m) in provider_names.iter().zip(models.iter()) {
             config
                 .providers
                 .insert(pname.clone(), build_codingplan_provider(m));
         }
+        let default_provider = refreshed_default_provider(
+            config,
+            &previous_default,
+            previous_model.as_deref(),
+            &names,
+            &provider_names,
+        );
         config.default_provider = default_provider.clone();
 
         let vl_idx = names
@@ -2277,6 +2369,71 @@ mod tests {
             // shape stays consistent if any future assertion peeks.
             all_models: models,
         }
+    }
+
+    #[test]
+    fn catalog_refresh_preserves_valid_non_codingplan_default() {
+        let mut config = blank_config();
+        config.providers.insert(
+            "custom".into(),
+            build_codingplan_provider(&vl_model_entry("custom-model")),
+        );
+        config.default_provider = "custom".into();
+
+        let report = run_register(&mut config, vec![vl_model_entry("new-plan-model")]);
+
+        assert_eq!(config.default_provider, "custom");
+        assert_eq!(report.default_provider, "custom");
+    }
+
+    #[test]
+    fn catalog_refresh_preserves_selected_codingplan_model_when_still_available() {
+        let mut config = blank_config();
+        config.providers.insert(
+            "AtomGit-old-key".into(),
+            build_codingplan_provider(&vl_model_entry("selected-model")),
+        );
+        config.default_provider = "AtomGit-old-key".into();
+
+        let report = run_register(
+            &mut config,
+            vec![
+                vl_model_entry("first-model"),
+                vl_model_entry("selected-model"),
+            ],
+        );
+
+        assert_eq!(
+            config.default_provider, "AtomGit-selected-model",
+            "refresh should keep the selected model even if provider keys are rebuilt"
+        );
+        assert_eq!(report.default_provider, "AtomGit-selected-model");
+    }
+
+    #[test]
+    fn successful_refresh_merges_into_latest_snapshot_without_losing_concurrent_default() {
+        let mut prepared = blank_config();
+        let models = run_register(&mut prepared, vec![vl_model_entry("plan-model")]);
+        let report = SetupReport {
+            login: StepResult::Skipped("test".into()),
+            claim: StepResult::Skipped("test".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Ok(models),
+            status: StepResult::Skipped("test".into()),
+            auth_expired: false,
+        };
+        let mut latest = blank_config();
+        latest.providers.insert(
+            "custom".into(),
+            build_codingplan_provider(&vl_model_entry("custom-model")),
+        );
+        latest.default_provider = "custom".into();
+
+        merge_successful_config(&mut latest, &prepared, &report).unwrap();
+
+        assert_eq!(latest.default_provider, "custom");
+        assert!(latest.providers.contains_key("custom"));
+        assert!(latest.providers.contains_key("AtomGit"));
     }
 
     #[test]
