@@ -56,7 +56,6 @@ export interface HealthResponse {
   version: string;
   service: string;
   instance_id?: string;
-  capabilities?: string[];
 }
 
 // Project
@@ -116,7 +115,6 @@ export interface LoginStartResponse {
   url: string;
   expires_in_seconds: number;
   daemon_instance_id?: string;
-  protocol_version: number;
 }
 
 export interface LoginPollResponse {

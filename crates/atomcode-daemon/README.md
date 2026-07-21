@@ -526,13 +526,11 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 
 ```json
 {
-  "open_browser": true,
-  "protocol_version": 2
+  "open_browser": true
 }
 ```
 
 - `open_browser`：是否自动打开浏览器（默认 `true`）
-- `protocol_version`：传 `2` 启用带类型终态和结构化错误的登录协议；省略时保持旧客户端兼容语义
 
 **响应示例：**
 
@@ -541,8 +539,7 @@ curl -N -X POST http://127.0.0.1:13456/chat \
   "login_id": "uuid-of-login-session",
   "url": "https://auth.example.com/login?code=xxx",
   "expires_in_seconds": 600,
-  "daemon_instance_id": "uuid-of-daemon-process",
-  "protocol_version": 2
+  "daemon_instance_id": "uuid-of-daemon-process"
 }
 ```
 
@@ -560,7 +557,7 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 }
 ```
 
-协议 v2 还会以 HTTP 200 返回 `expired`、`cancelled`、`failed` 终态，并附带稳定的
+登录协议以 HTTP 200 返回 `expired`、`cancelled`、`failed` 终态，并附带稳定的
 `code`/`message`；可重试的临时错误使用 HTTP 503 和 `retryable: true`。登录会话只属于
 创建它的 daemon 实例，实例重启后客户端必须重新发起登录，不能重放旧 `login_id`。
 

@@ -25,19 +25,19 @@ fn auth_info() -> atomcode_auth::AuthInfo {
 fn login_expires_at_the_server_ttl_boundary() {
     let started = Instant::now();
 
-    let mut before = LoginRecord::new((), 2, started);
+    let mut before = LoginRecord::new((), started);
     assert!(matches!(
         before.begin_poll(started + Duration::from_secs(599)),
         BeginPoll::Poll { .. }
     ));
 
-    let mut at_boundary = LoginRecord::new((), 2, started);
+    let mut at_boundary = LoginRecord::new((), started);
     assert!(matches!(
         at_boundary.begin_poll(started + Duration::from_secs(600)),
         BeginPoll::Current(LoginStateSnapshot::Expired)
     ));
 
-    let mut after = LoginRecord::new((), 2, started);
+    let mut after = LoginRecord::new((), started);
     assert!(matches!(
         after.begin_poll(started + Duration::from_secs(601)),
         BeginPoll::Current(LoginStateSnapshot::Expired)
@@ -47,7 +47,7 @@ fn login_expires_at_the_server_ttl_boundary() {
 #[test]
 fn concurrent_poll_observes_pending_instead_of_missing_record() {
     let started = Instant::now();
-    let mut record = LoginRecord::new((), 2, started);
+    let mut record = LoginRecord::new((), started);
 
     let generation = match record.begin_poll(started) {
         BeginPoll::Poll { generation, .. } => generation,
@@ -68,7 +68,7 @@ fn concurrent_poll_observes_pending_instead_of_missing_record() {
 #[test]
 fn cancellation_wins_over_a_late_poll_result() {
     let started = Instant::now();
-    let mut record = LoginRecord::new((), 2, started);
+    let mut record = LoginRecord::new((), started);
 
     let generation = match record.begin_poll(started) {
         BeginPoll::Poll { generation, .. } => generation,
@@ -89,7 +89,7 @@ fn cancellation_wins_over_a_late_poll_result() {
 #[test]
 fn expiry_wins_over_a_late_poll_result() {
     let started = Instant::now();
-    let mut record = LoginRecord::new((), 2, started);
+    let mut record = LoginRecord::new((), started);
 
     let generation = match record.begin_poll(started) {
         BeginPoll::Poll { generation, .. } => generation,
@@ -109,7 +109,7 @@ fn expiry_wins_over_a_late_poll_result() {
 #[test]
 fn credential_persistence_can_retry_without_repeating_token_exchange() {
     let started = Instant::now();
-    let mut record = LoginRecord::new((), 2, started);
+    let mut record = LoginRecord::new((), started);
     let generation = match record.begin_poll(started) {
         BeginPoll::Poll { generation, .. } => generation,
         other => panic!("poll should own work, got {other:?}"),
@@ -148,7 +148,7 @@ fn credential_persistence_can_retry_without_repeating_token_exchange() {
 #[test]
 fn persistence_commit_is_the_cancellation_linearization_boundary() {
     let started = Instant::now();
-    let mut record = LoginRecord::new((), 2, started);
+    let mut record = LoginRecord::new((), started);
     let poll_generation = match record.begin_poll(started) {
         BeginPoll::Poll { generation, .. } => generation,
         other => panic!("poll should own work, got {other:?}"),
@@ -182,7 +182,7 @@ fn persistence_commit_is_the_cancellation_linearization_boundary() {
 #[test]
 fn authorized_result_remains_readable_when_the_http_response_is_retried() {
     let started = Instant::now();
-    let mut record = LoginRecord::new((), 2, started);
+    let mut record = LoginRecord::new((), started);
     let poll_generation = match record.begin_poll(started) {
         BeginPoll::Poll { generation, .. } => generation,
         other => panic!("poll should own work, got {other:?}"),
@@ -211,7 +211,7 @@ fn authorized_result_remains_readable_when_the_http_response_is_retried() {
 #[test]
 fn terminal_result_is_retained_for_client_retry_then_removed() {
     let started = Instant::now();
-    let mut record = LoginRecord::new((), 2, started);
+    let mut record = LoginRecord::new((), started);
     record.cancel(started);
 
     assert!(!record.removable_at(started + TERMINAL_RETENTION - Duration::from_millis(1)));

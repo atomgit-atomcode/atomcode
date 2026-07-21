@@ -74,5 +74,4 @@ private fun startResponse() = LoginStartResponse(
     url = "https://example.invalid/login",
     expiresInSeconds = 600,
     daemonInstanceId = "daemon-instance",
-    protocolVersion = 2,
 )

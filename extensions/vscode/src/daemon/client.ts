@@ -306,7 +306,6 @@ export class DaemonClient {
   startLogin(openBrowser = true): Promise<LoginStartResponse> {
     return this.post<LoginStartResponse>('/auth/login/start', {
       open_browser: openBrowser,
-      protocol_version: 2,
     });
   }
 

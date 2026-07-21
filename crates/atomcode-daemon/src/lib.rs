@@ -1387,7 +1387,6 @@ pub struct HealthResponse {
     pub service: &'static str,
     pub binary_hash: &'static str,
     pub instance_id: String,
-    pub capabilities: &'static [&'static str],
 }
 
 fn executable_sha256() -> &'static str {
@@ -1410,7 +1409,6 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         service: "atomcode-daemon",
         binary_hash: executable_sha256(),
         instance_id: state.daemon_instance_id.to_string(),
-        capabilities: &["auth.login.v2"],
     })
 }
 

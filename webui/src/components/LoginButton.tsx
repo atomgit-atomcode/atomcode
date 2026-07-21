@@ -79,7 +79,7 @@ export function useAuth() {
       const r = await fetch('/auth/login/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ open_browser: false, protocol_version: 2 }),
+        body: JSON.stringify({ open_browser: false }),
       });
       if (!r.ok) throw new Error(`Login start failed: ${r.status}`);
       const start = await r.json();
@@ -128,7 +128,7 @@ export function useAuth() {
             stopPolling();
             return;
           }
-          // expired / cancelled / failed are terminal in protocol v2.
+          // expired / cancelled / failed are terminal login states.
           stopPolling();
         } catch {
           if (Date.now() < deadline) schedule(2000); else stopPolling();

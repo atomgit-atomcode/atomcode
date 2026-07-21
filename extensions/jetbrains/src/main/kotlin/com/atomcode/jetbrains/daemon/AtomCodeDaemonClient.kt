@@ -78,13 +78,12 @@ class AtomCodeDaemonClient(
         }
 
     fun startLogin(openBrowser: Boolean = true): CompletableFuture<LoginStartResponse> =
-        send("POST", "/auth/login/start", """{"open_browser":$openBrowser,"protocol_version":2}""").thenApply { raw ->
+        send("POST", "/auth/login/start", """{"open_browser":$openBrowser}""").thenApply { raw ->
             LoginStartResponse(
                 loginId = raw.jsonString("login_id").orEmpty(),
                 url = raw.jsonString("url").orEmpty(),
                 expiresInSeconds = raw.jsonInt("expires_in_seconds") ?: 600,
                 daemonInstanceId = raw.jsonString("daemon_instance_id"),
-                protocolVersion = raw.jsonInt("protocol_version") ?: 1,
             )
         }
 

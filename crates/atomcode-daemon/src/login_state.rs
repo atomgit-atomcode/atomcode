@@ -4,7 +4,6 @@ use atomcode_auth::{AuthInfo, UserInfo};
 
 pub(crate) const LOGIN_TTL: Duration = Duration::from_secs(600);
 pub(crate) const TERMINAL_RETENTION: Duration = Duration::from_secs(60);
-pub(crate) const LOGIN_PROTOCOL_V2: u8 = 2;
 pub(crate) const LOGIN_RETRY_AFTER_MS: u64 = 2_000;
 
 #[derive(Debug, Clone)]
@@ -73,29 +72,19 @@ pub(crate) struct LoginRecord<S = atomcode_auth::LoginSession> {
     created_at: Instant,
     terminal_at: Option<Instant>,
     generation: u64,
-    protocol_version: u8,
     state: LoginRecordState,
 }
 
 impl<S> LoginRecord<S> {
-    pub(crate) fn new(session: S, requested_protocol: u8, now: Instant) -> Self {
+    pub(crate) fn new(session: S, now: Instant) -> Self {
         Self {
             session: Some(session),
             pending_auth: None,
             created_at: now,
             terminal_at: None,
             generation: 0,
-            protocol_version: if requested_protocol == LOGIN_PROTOCOL_V2 {
-                LOGIN_PROTOCOL_V2
-            } else {
-                1
-            },
             state: LoginRecordState::Pending,
         }
-    }
-
-    pub(crate) fn protocol_version(&self) -> u8 {
-        self.protocol_version
     }
 
     pub(crate) fn snapshot(&self) -> LoginStateSnapshot {

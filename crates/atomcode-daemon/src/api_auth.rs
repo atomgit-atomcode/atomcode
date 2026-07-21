@@ -14,7 +14,7 @@ use atomcode_telemetry::Event;
 use crate::{
     coded_json_error, json_error,
     login_state::{
-        ApplyPoll, BeginPoll, LoginRecord, LoginStateSnapshot, PollCompletion, LOGIN_PROTOCOL_V2,
+        ApplyPoll, BeginPoll, LoginRecord, LoginStateSnapshot, PollCompletion,
         LOGIN_RETRY_AFTER_MS, LOGIN_TTL,
     },
     AppState, LoginSessionsStore,
@@ -42,7 +42,6 @@ pub(crate) enum LoginPollStep {
 
 pub(crate) struct LoginPollResult {
     pub step: LoginPollStep,
-    pub protocol_version: u8,
 }
 
 pub(crate) struct LoginPollError {
@@ -100,7 +99,6 @@ struct LoginStartResponse {
     url: String,
     expires_in_seconds: u64,
     daemon_instance_id: String,
-    protocol_version: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,8 +117,6 @@ struct LoginPollResponse {
 pub(crate) struct LoginStartRequest {
     #[serde(default = "default_true")]
     open_browser: bool,
-    #[serde(default)]
-    protocol_version: Option<u8>,
 }
 
 fn default_true() -> bool {
@@ -193,11 +189,6 @@ pub(crate) async fn auth_login_start(
         .into_response();
     }
 
-    let protocol_version = if req.protocol_version == Some(LOGIN_PROTOCOL_V2) {
-        LOGIN_PROTOCOL_V2
-    } else {
-        1
-    };
     let open_browser = req.open_browser;
 
     let start_result =
@@ -238,7 +229,6 @@ pub(crate) async fn auth_login_start(
     let login_id = uuid::Uuid::new_v4().to_string();
     let entry = Arc::new(tokio::sync::Mutex::new(LoginRecord::new(
         session,
-        protocol_version,
         Instant::now(),
     )));
     let mut sessions = state.login_sessions.write().await;
@@ -250,7 +240,6 @@ pub(crate) async fn auth_login_start(
         url,
         expires_in_seconds: LOGIN_TTL.as_secs(),
         daemon_instance_id: state.daemon_instance_id.to_string(),
-        protocol_version,
     })
     .into_response()
 }
@@ -385,9 +374,9 @@ pub(crate) async fn poll_login_session(
             retryable: false,
         })?;
 
-    let (protocol_version, work) = {
+    let work = {
         let mut record = record.lock().await;
-        (record.protocol_version(), record.begin_poll(Instant::now()))
+        record.begin_poll(Instant::now())
     };
 
     let (step, newly_authorized) = match work {
@@ -461,7 +450,6 @@ pub(crate) async fn poll_login_session(
             },
             other => other,
         },
-        protocol_version,
     })
 }
 
@@ -529,49 +517,30 @@ fn login_poll_response(result: LoginPollResult) -> axum::response::Response {
             coded_json_error(StatusCode::SERVICE_UNAVAILABLE, code, message, true).into_response()
         }
         LoginPollStep::Expired => terminal_login_response(
-            result.protocol_version,
-            StatusCode::GONE,
             "expired",
             "login_session_expired",
             "Login session expired; start a new login",
         ),
         LoginPollStep::Cancelled => terminal_login_response(
-            result.protocol_version,
-            StatusCode::GONE,
             "cancelled",
             "login_session_cancelled",
             "Login session was cancelled",
         ),
         LoginPollStep::Failed { code, message } => {
-            if result.protocol_version == LOGIN_PROTOCOL_V2 {
-                response("failed", None, Some(code), Some(message), None)
-            } else {
-                coded_json_error(StatusCode::INTERNAL_SERVER_ERROR, code, message, false)
-                    .into_response()
-            }
+            response("failed", None, Some(code), Some(message), None)
         }
     }
 }
 
-fn terminal_login_response(
-    protocol_version: u8,
-    legacy_status: StatusCode,
-    status: &str,
-    code: &str,
-    message: &str,
-) -> axum::response::Response {
-    if protocol_version == LOGIN_PROTOCOL_V2 {
-        Json(LoginPollResponse {
-            status: status.to_string(),
-            user: None,
-            code: Some(code.to_string()),
-            message: Some(message.to_string()),
-            retry_after_ms: None,
-        })
-        .into_response()
-    } else {
-        coded_json_error(legacy_status, code, message, false).into_response()
-    }
+fn terminal_login_response(status: &str, code: &str, message: &str) -> axum::response::Response {
+    Json(LoginPollResponse {
+        status: status.to_string(),
+        user: None,
+        code: Some(code.to_string()),
+        message: Some(message.to_string()),
+        retry_after_ms: None,
+    })
+    .into_response()
 }
 
 pub(crate) async fn cleanup_login_sessions(login_sessions: &LoginSessionsStore) {
@@ -633,27 +602,47 @@ mod tests {
         assert_eq!(classify_auth_status(true, false), (true, true));
     }
 
-    #[tokio::test]
-    async fn protocol_v2_returns_a_typed_expired_terminal_response() {
-        let response = login_poll_response(LoginPollResult {
-            step: LoginPollStep::Expired,
-            protocol_version: LOGIN_PROTOCOL_V2,
-        });
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "expired");
-        assert_eq!(json["code"], "login_session_expired");
+    #[test]
+    fn login_start_response_has_no_runtime_protocol_selector() {
+        let response = LoginStartResponse {
+            login_id: "login-id".to_string(),
+            url: "https://example.invalid/login".to_string(),
+            expires_in_seconds: 600,
+            daemon_instance_id: "daemon-instance".to_string(),
+        };
+
+        let json = serde_json::to_value(response).unwrap();
+        assert!(json.get("protocol_version").is_none());
     }
 
-    #[test]
-    fn legacy_protocol_does_not_turn_terminal_state_into_http_200() {
-        let response = login_poll_response(LoginPollResult {
-            step: LoginPollStep::Expired,
-            protocol_version: 1,
-        });
-        assert_eq!(response.status(), StatusCode::GONE);
+    #[tokio::test]
+    async fn terminal_states_return_typed_responses() {
+        let cases = [
+            (LoginPollStep::Expired, "expired", "login_session_expired"),
+            (
+                LoginPollStep::Cancelled,
+                "cancelled",
+                "login_session_cancelled",
+            ),
+            (
+                LoginPollStep::Failed {
+                    code: "login_exchange_failed".to_string(),
+                    message: "Login authorization exchange failed".to_string(),
+                },
+                "failed",
+                "login_exchange_failed",
+            ),
+        ];
+
+        for (step, expected_status, expected_code) in cases {
+            let response = login_poll_response(LoginPollResult { step });
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["status"], expected_status);
+            assert_eq!(json["code"], expected_code);
+        }
     }
 }

@@ -38,7 +38,6 @@ data class LoginStartResponse(
     val url: String,
     val expiresInSeconds: Int,
     val daemonInstanceId: String? = null,
-    val protocolVersion: Int = 1,
 )
 
 data class LoginPollResponse(
