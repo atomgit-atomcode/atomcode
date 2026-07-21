@@ -393,7 +393,15 @@ pub enum PollOutcome {
 pub struct LoginSession {
     state: String,
     login_url: String,
-    client: reqwest::blocking::Client,
+    client: Option<reqwest::blocking::Client>,
+}
+
+impl Drop for LoginSession {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            let _ = std::thread::spawn(move || drop(client));
+        }
+    }
 }
 
 impl LoginSession {
@@ -414,86 +422,106 @@ impl LoginSession {
     /// `Authorized`. Errors only on transport/parse failures; a
     /// "not yet" answer is `Ok(Pending)`, never `Err`.
     pub fn poll_once(&self) -> Result<PollOutcome> {
-        let resp = with_login_context(
-            self.client
-                .get(platform_check_url())
-                .query(&[("state", &self.state)])
-                .send(),
-            "Failed to call /auth/check",
-        )?;
-        if resp.status().is_success() {
-            if let Ok(check) = resp.json::<PlatformCheckResponse>() {
-                if check.valid {
-                    return Ok(PollOutcome::Authorized);
+        let client = match &self.client {
+            Some(c) => c.clone(),
+            None => return Ok(PollOutcome::Pending),
+        };
+        let state = self.state.clone();
+        std::thread::spawn(move || {
+            let resp = with_login_context(
+                client
+                    .get(platform_check_url())
+                    .query(&[("state", &state)])
+                    .send(),
+                "Failed to call /auth/check",
+            )?;
+            if resp.status().is_success() {
+                if let Ok(check) = resp.json::<PlatformCheckResponse>() {
+                    if check.valid {
+                        return Ok(PollOutcome::Authorized);
+                    }
                 }
             }
-        }
-        Ok(PollOutcome::Pending)
+            Ok(PollOutcome::Pending)
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("poll_once thread panicked"))?
     }
 
     /// Final step: `/auth/token` exchange + `LoginSuccess` telemetry.
     /// Consumes the session — only call after `poll_once` returned
     /// `Authorized`.
-    pub fn finish(self, tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
-        let resp = with_login_context(
-            self.client
-                .get(platform_token_url())
-                .query(&[("state", &self.state)])
-                .send(),
-            "Failed to call /auth/token",
-        )?;
-        let token_resp: PlatformTokenResponse = resp
-            .json()
-            .context("Failed to parse /auth/token response")?;
-
-        // `duration_since(UNIX_EPOCH)` only fails when the wall clock
-        // is before 1970 — a misconfigured VM clock at boot is the
-        // realistic trigger. Treat that as `created_at = 0`: the
-        // expiry check downstream will see the token as immediately
-        // stale and force a refresh / re-login rather than panicking
-        // out of the OAuth callback (#45).
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        let auth_info = AuthInfo {
-            access_token: token_resp.access_token,
-            refresh_token: token_resp.refresh_token,
-            token_type: token_resp.token_type,
-            expires_in: token_resp.expires_in,
-            created_at,
-            user: UserInfo {
-                id: token_resp.user.id,
-                username: token_resp.user.username,
-                name: token_resp.user.name,
-                email: token_resp.user.email,
-                avatar_url: token_resp.user.avatar_url,
-            },
-        };
-
-        if let Some(t) = tel {
-            // Push account_id onto the telemetry handle BEFORE emitting
-            // login_success so the event itself — and every subsequent event in
-            // this process — carries the id. The handle-level setter outlives
-            // any task-local scope, so events emitted outside the main scope
-            // (e.g. before scope is entered, or from spawned tasks) inherit it.
-            t.set_account_id(Some(auth_info.user.id.to_string()));
-            let (invite_code, install_uuid) = pending_invite_for_login();
-            let event = Event::LoginSuccess {
-                invite_code,
-                install_uuid,
+    pub fn finish(mut self, tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
+        let client = self.client.take();
+        let state = self.state.clone();
+        let tel = tel.cloned();
+        std::thread::spawn(move || {
+            let client = match client {
+                Some(c) => c,
+                None => blocking_client()?,
             };
-            if let Err(e) = t.track_durable_sync(event.clone()) {
-                tracing::warn!(
-                    ?e,
-                    "login_success durable enqueue failed; falling back to async telemetry"
-                );
-                t.track(event);
-            }
-        }
+            let resp = with_login_context(
+                client
+                    .get(platform_token_url())
+                    .query(&[("state", &state)])
+                    .send(),
+                "Failed to call /auth/token",
+            )?;
+            let token_resp: PlatformTokenResponse = resp
+                .json()
+                .context("Failed to parse /auth/token response")?;
 
-        Ok(auth_info)
+            // `duration_since(UNIX_EPOCH)` only fails when the wall clock
+            // is before 1970 — a misconfigured VM clock at boot is the
+            // realistic trigger. Treat that as `created_at = 0`: the
+            // expiry check downstream will see the token as immediately
+            // stale and force a refresh / re-login rather than panicking
+            // out of the OAuth callback (#45).
+            let created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            let auth_info = AuthInfo {
+                access_token: token_resp.access_token,
+                refresh_token: token_resp.refresh_token,
+                token_type: token_resp.token_type,
+                expires_in: token_resp.expires_in,
+                created_at,
+                user: UserInfo {
+                    id: token_resp.user.id,
+                    username: token_resp.user.username,
+                    name: token_resp.user.name,
+                    email: token_resp.user.email,
+                    avatar_url: token_resp.user.avatar_url,
+                },
+            };
+
+            if let Some(t) = tel.as_ref() {
+                // Push account_id onto the telemetry handle BEFORE emitting
+                // login_success so the event itself — and every subsequent event in
+                // this process — carries the id. The handle-level setter outlives
+                // any task-local scope, so events emitted outside the main scope
+                // (e.g. before scope is entered, or from spawned tasks) inherit it.
+                t.set_account_id(Some(auth_info.user.id.to_string()));
+                let (invite_code, install_uuid) = pending_invite_for_login();
+                let event = Event::LoginSuccess {
+                    invite_code,
+                    install_uuid,
+                };
+                if let Err(e) = t.track_durable_sync(event.clone()) {
+                    tracing::warn!(
+                        ?e,
+                        "login_success durable enqueue failed; falling back to async telemetry"
+                    );
+                    t.track(event);
+                }
+            }
+
+            Ok(auth_info)
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("finish thread panicked"))?
     }
 }
 
@@ -502,23 +530,27 @@ impl LoginSession {
 /// user action — separated from polling so callers can render the URL
 /// before yielding control to the wait loop.
 pub fn start_login() -> Result<LoginSession> {
-    // `Client::new()` panics on TLS/resolver init failure; with `panic =
-    // "abort"` that aborts the process before the QR can even render.
-    // Build fallibly and surface a recoverable error instead.
-    let client = blocking_client()?;
-    let sent = client
-        .get(platform_login_url())
-        .query(&[("provider", "atomgit")])
-        .send();
-    let resp = with_login_context(sent, "Failed to call /auth/login")?;
-    let resp: PlatformLoginResponse = resp
-        .json()
-        .context("Failed to parse /auth/login response")?;
-    Ok(LoginSession {
-        state: resp.state,
-        login_url: strip_force_login(&resp.login_url),
-        client,
+    std::thread::spawn(move || {
+        // `Client::new()` panics on TLS/resolver init failure; with `panic =
+        // "abort"` that aborts the process before the QR can even render.
+        // Build fallibly and surface a recoverable error instead.
+        let client = blocking_client()?;
+        let sent = client
+            .get(platform_login_url())
+            .query(&[("provider", "atomgit")])
+            .send();
+        let resp = with_login_context(sent, "Failed to call /auth/login")?;
+        let resp: PlatformLoginResponse = resp
+            .json()
+            .context("Failed to parse /auth/login response")?;
+        Ok(LoginSession {
+            state: resp.state,
+            login_url: strip_force_login(&resp.login_url),
+            client: Some(client),
+        })
     })
+    .join()
+    .map_err(|_| anyhow::anyhow!("start_login thread panicked"))?
 }
 
 /// Drop `force_login=true` from the broker-supplied OAuth URL. The
@@ -1002,73 +1034,78 @@ fn urlencoding_decode(s: &str) -> String {
 /// Refresh the access token using the stored refresh_token via Platform Broker.
 /// Returns updated AuthInfo with new tokens, and saves it to disk.
 pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
-    let refresh_token = auth
-        .refresh_token
-        .as_deref()
-        .context("No refresh_token available — please /login again")?;
-
-    let client = blocking_client()?;
-
-    // Call Platform Broker API for refresh
-    let response = client
-        .post(platform_refresh_url())
-        .json(&serde_json::json!({ "refresh_token": refresh_token }))
-        .send()
-        .context("Failed to send refresh token request to broker")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        anyhow::bail!(
-            "Token refresh failed ({}): {} — please /login again",
-            status,
-            body
-        );
-    }
-
-    #[derive(Deserialize)]
-    struct BrokerResponse {
-        access_token: String,
-        token_type: Option<String>,
-        expires_in: Option<i64>,
-        refresh_token: Option<String>,
-        user: Option<PlatformUserInfo>,
-    }
-
-    let broker_resp: BrokerResponse = response.json().context("Failed to parse broker response")?;
-
-    // Pre-1970 wall clock would otherwise panic on `unwrap` and lose
-    // the refresh result. Falling back to 0 forces the next token
-    // check to refresh again — safer than crashing the broker path.
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    let new_auth = AuthInfo {
-        access_token: broker_resp.access_token,
-        refresh_token: broker_resp
+    let auth = auth.clone();
+    std::thread::spawn(move || {
+        let refresh_token = auth
             .refresh_token
-            .or_else(|| auth.refresh_token.clone()),
-        token_type: broker_resp
-            .token_type
-            .unwrap_or_else(|| auth.token_type.clone()),
-        expires_in: broker_resp.expires_in.or(auth.expires_in),
-        created_at,
-        user: broker_resp
-            .user
-            .map(|u| UserInfo {
-                id: u.id,
-                username: u.username,
-                name: u.name,
-                email: u.email,
-                avatar_url: u.avatar_url,
-            })
-            .unwrap_or_else(|| auth.user.clone()),
-    };
+            .as_deref()
+            .context("No refresh_token available — please /login again")?;
 
-    save_auth(&new_auth)?;
-    Ok(new_auth)
+        let client = blocking_client()?;
+
+        // Call Platform Broker API for refresh
+        let response = client
+            .post(platform_refresh_url())
+            .json(&serde_json::json!({ "refresh_token": refresh_token }))
+            .send()
+            .context("Failed to send refresh token request to broker")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            anyhow::bail!(
+                "Token refresh failed ({}): {} — please /login again",
+                status,
+                body
+            );
+        }
+
+        #[derive(Deserialize)]
+        struct BrokerResponse {
+            access_token: String,
+            token_type: Option<String>,
+            expires_in: Option<i64>,
+            refresh_token: Option<String>,
+            user: Option<PlatformUserInfo>,
+        }
+
+        let broker_resp: BrokerResponse = response.json().context("Failed to parse broker response")?;
+
+        // Pre-1970 wall clock would otherwise panic on `unwrap` and lose
+        // the refresh result. Falling back to 0 forces the next token
+        // check to refresh again — safer than crashing the broker path.
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let new_auth = AuthInfo {
+            access_token: broker_resp.access_token,
+            refresh_token: broker_resp
+                .refresh_token
+                .or_else(|| auth.refresh_token.clone()),
+            token_type: broker_resp
+                .token_type
+                .unwrap_or_else(|| auth.token_type.clone()),
+            expires_in: broker_resp.expires_in.or(auth.expires_in),
+            created_at,
+            user: broker_resp
+                .user
+                .map(|u| UserInfo {
+                    id: u.id,
+                    username: u.username,
+                    name: u.name,
+                    email: u.email,
+                    avatar_url: u.avatar_url,
+                })
+                .unwrap_or_else(|| auth.user.clone()),
+        };
+
+        save_auth(&new_auth)?;
+        Ok(new_auth)
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("refresh_access_token thread panicked"))?
 }
 
 fn get_valid_auth_info() -> Result<AuthInfo> {
