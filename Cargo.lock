@@ -509,6 +509,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml 0.8.23",
+ "winreg",
 ]
 
 [[package]]

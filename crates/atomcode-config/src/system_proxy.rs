@@ -125,6 +125,55 @@ pub(crate) fn parse_scutil_proxy(raw: &str) -> SystemProxy {
     }
 }
 
+/// Best-effort read of the OS static system proxy. Fail-open: any error or an
+/// unsupported OS yields an empty `SystemProxy` (callers then fall back to
+/// direct / env-var behavior).
+pub fn resolve() -> SystemProxy {
+    #[cfg(windows)]
+    {
+        resolve_windows().unwrap_or_default()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        resolve_macos()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        SystemProxy::default()
+    }
+}
+
+#[cfg(windows)]
+fn resolve_windows() -> Option<SystemProxy> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let settings = hkcu
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        .ok()?;
+    let enabled: u32 = settings.get_value("ProxyEnable").unwrap_or(0);
+    if enabled == 0 {
+        return Some(SystemProxy::default());
+    }
+    let server: String = settings.get_value("ProxyServer").unwrap_or_default();
+    let (http, https) = parse_win_proxy_server(&server);
+    let no_proxy = settings
+        .get_value::<String, _>("ProxyOverride")
+        .ok()
+        .and_then(|o| parse_win_bypass(&o));
+    Some(SystemProxy { http, https, no_proxy })
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos() -> SystemProxy {
+    match std::process::Command::new("scutil").arg("--proxy").output() {
+        Ok(out) if out.status.success() => {
+            parse_scutil_proxy(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => SystemProxy::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

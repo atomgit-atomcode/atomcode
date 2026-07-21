@@ -18,6 +18,10 @@ dirs = "6"
 # `getpwnam_r` for the sudo-aware home lookup in util::real_home_dir.
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# Read HKCU Internet Settings (the per-user static proxy the system browser uses).
+winreg = "0.55"
+
 [features]
 test-util = []
 
