@@ -125,10 +125,25 @@ fn mount_coding_tools(vision: bool) -> MountedTools {
     let mut registry = ToolRegistry::new();
     register_coding_tools_with_vision(&mut registry, vision);
     register_codeintel_tools(&mut registry);
-    let names: Vec<&str> = coding_tool_names()
+    let mut names: Vec<&str> = coding_tool_names()
         .iter()
         .chain(codeintel_tool_names().iter())
         .copied()
         .collect();
+    #[cfg(feature = "atomgit")]
+    {
+        use atomcode_capabilities::tools::{
+            atomgit_tool_names, register_atomgit_tools, AtomgitClient, AtomgitConfig,
+            LiveTokenProvider,
+        };
+        if let Ok(client) = AtomgitClient::new(AtomgitConfig {
+            base_url: "https://api.atomgit.com/api/v5".to_string(),
+            user_agent: format!("atomcode/{}", env!("CARGO_PKG_VERSION")),
+            token: std::sync::Arc::new(LiveTokenProvider),
+        }) {
+            register_atomgit_tools(&mut registry, std::sync::Arc::new(client));
+            names.extend_from_slice(atomgit_tool_names());
+        }
+    }
     registry.mount(&names)
 }

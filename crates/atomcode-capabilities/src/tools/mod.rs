@@ -72,6 +72,8 @@ pub use ast_grep::AstGrepTool;
 pub use atomgit::{
     atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, AtomgitPrTool, AtomgitRepoTool,
 };
+#[cfg(feature = "atomgit")]
+pub use crate::atomgit::{AtomgitClient, AtomgitConfig, LiveTokenProvider, StaticTokenProvider, TokenProvider};
 pub use bash::{normalize_command_for_grant, run_shell, BashTool, ShellExit, ShellOutcome};
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;
