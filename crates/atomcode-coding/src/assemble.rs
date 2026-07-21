@@ -116,6 +116,12 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
     if todo_enabled {
         builder = builder.hook(Arc::new(crate::todo::TodoHook));
     }
+    #[cfg(feature = "atomgit")]
+    {
+        builder = builder.middleware(Arc::new(
+            atomcode_capabilities::tools::GitPushLabelMiddleware::new(cfg.working_dir.clone()),
+        ));
+    }
     builder.build()
 }
 
