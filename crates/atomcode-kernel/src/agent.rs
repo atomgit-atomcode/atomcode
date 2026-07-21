@@ -317,15 +317,12 @@ fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
     window.saturating_sub(output_reserve).saturating_sub(margin)
 }
 
-/// Pre-send advisory: the estimated OUTGOING request still meets/exceeds the
-/// model window AFTER the pre-send emergency compaction already tried (or had
-/// nothing to drain). At this point the cause is a single oversized input that
-/// compaction cannot shrink, so the ONLY actionable advice is to trim it or use a
-/// larger-window model — `/compact` is no longer suggested (we just ran it). Kept
-/// to a single concise line, matching codex/opencode's terse overflow messaging.
-/// Returns `None` within the window or when the window is unknown (`ctx_window == 0`).
-fn over_window_advisory(est_prompt_tokens: u32, ctx_window: u32) -> Option<String> {
-    if ctx_window == 0 || (est_prompt_tokens as u64) < (ctx_window as u64) {
+/// The pre-send over-window advisory. Fires when the estimate reaches `trigger_limit`
+/// (the effective input budget — window minus output reserve minus margin), so it
+/// warns BEFORE the real request crosses the model's usable limit. The user-facing
+/// text still references the full `ctx_window` — the reserve is internal.
+fn over_window_advisory(est_prompt_tokens: u32, ctx_window: u32, trigger_limit: u32) -> Option<String> {
+    if ctx_window == 0 || (est_prompt_tokens as u64) < (trigger_limit as u64) {
         return None;
     }
     Some(format!(
@@ -1400,6 +1397,7 @@ impl RunningAgent {
             // floor — unrecoverable, so fall through to the advisory).
             {
                 let window = self.provider.context_window();
+                let limit = effective_input_limit(window, self.chat_options.max_tokens);
                 let est = |msgs: &[Message]| -> u64 {
                     msgs.iter().map(|m| m.estimate_tokens() as u64).sum()
                 };
@@ -1413,7 +1411,7 @@ impl RunningAgent {
                 let mut attempts: u8 = 0;
                 while has_drainable
                     && window > 0
-                    && est(&messages) >= window as u64
+                    && est(&messages) >= limit as u64
                     && attempts < MAX_OVERFLOW_ATTEMPTS
                 {
                     let before = est(&convo.messages);
@@ -1435,7 +1433,9 @@ impl RunningAgent {
             // actionable advice instead of a silent doomed request.
             if !over_window_warned {
                 let est: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
-                if let Some(advisory) = over_window_advisory(est, self.provider.context_window()) {
+                let window = self.provider.context_window();
+                let limit = effective_input_limit(window, self.chat_options.max_tokens);
+                if let Some(advisory) = over_window_advisory(est, window, limit) {
                     over_window_warned = true;
                     self.rt.emit(AgentEvent::Warning(advisory));
                 }
@@ -3193,28 +3193,28 @@ mod over_window_advisory_tests {
     #[test]
     fn fires_at_or_over_window() {
         assert!(
-            over_window_advisory(200_000, 200_000).is_some(),
+            over_window_advisory(200_000, 200_000, 200_000).is_some(),
             "exactly at window must warn"
         );
         assert!(
-            over_window_advisory(339_000, 200_000).is_some(),
+            over_window_advisory(339_000, 200_000, 200_000).is_some(),
             "over window must warn"
         );
     }
 
     #[test]
     fn silent_within_window() {
-        assert!(over_window_advisory(150_000, 200_000).is_none());
+        assert!(over_window_advisory(150_000, 200_000, 200_000).is_none());
     }
 
     #[test]
     fn silent_when_window_unknown() {
-        assert!(over_window_advisory(999_999, 0).is_none());
+        assert!(over_window_advisory(999_999, 0, 0).is_none());
     }
 
     #[test]
     fn advisory_is_actionable_and_one_line() {
-        let m = over_window_advisory(339_000, 200_000).expect("over-window must warn");
+        let m = over_window_advisory(339_000, 200_000, 200_000).expect("over-window must warn");
         assert!(!m.contains('\n'), "must be a single line: {m}");
         assert!(m.contains("窗口"), "must name the window: {m}");
         assert!(
@@ -3225,6 +3225,16 @@ mod over_window_advisory_tests {
             !m.contains("/compact"),
             "must NOT suggest /compact (already ran): {m}"
         );
+    }
+
+    #[test]
+    fn fires_at_effective_limit_below_window() {
+        // window 1_000_000, effective limit 858_616 (16_384 output + 125_000 margin).
+        // An estimate of 900_000 is UNDER the window but OVER the effective limit —
+        // the old `est >= window` gate would stay silent; the reserve makes it warn.
+        assert!(super::over_window_advisory(900_000, 1_000_000, 858_616).is_some());
+        // Just under the effective limit → still silent.
+        assert!(super::over_window_advisory(800_000, 1_000_000, 858_616).is_none());
     }
 }
 
