@@ -187,16 +187,33 @@ pub fn ensure_runtime_initialized() {
     }
 }
 
+/// Resolve the effective `FollowSystem` env values: an explicit env-var proxy
+/// always wins; the OS system proxy only fills a field the env left empty.
+fn follow_system_env(
+    snapshot: &ProxyEnvSnapshot,
+    sys: &crate::system_proxy::SystemProxy,
+) -> ProxyEnvSnapshot {
+    ProxyEnvSnapshot {
+        http: snapshot.http.clone().or_else(|| sys.http.clone()),
+        https: snapshot.https.clone().or_else(|| sys.https.clone()),
+        all: snapshot.all.clone(),
+        no_proxy: snapshot.no_proxy.clone().or_else(|| sys.no_proxy.clone()),
+    }
+}
+
 pub fn apply_process_proxy_config(cfg: &ProxyConfig) {
     let _ = startup_env();
     env::set_var(MODE_ENV, cfg.mode.as_str());
     match cfg.mode {
         ProxyMode::FollowSystem => {
             let snapshot = startup_env();
-            set_env_keys(ENV_HTTP_PROXY, &snapshot.http);
-            set_env_keys(ENV_HTTPS_PROXY, &snapshot.https);
-            set_env_keys(ENV_ALL_PROXY, &snapshot.all);
-            set_env_keys(ENV_NO_PROXY, &snapshot.no_proxy);
+            // Explicit env proxy wins; the OS system proxy fills any gap so a
+            // browser-configured (system) proxy is honored out of the box.
+            let resolved = follow_system_env(snapshot, &crate::system_proxy::resolve());
+            set_env_keys(ENV_HTTP_PROXY, &resolved.http);
+            set_env_keys(ENV_HTTPS_PROXY, &resolved.https);
+            set_env_keys(ENV_ALL_PROXY, &resolved.all);
+            set_env_keys(ENV_NO_PROXY, &resolved.no_proxy);
         }
         ProxyMode::DefaultProxy => {
             set_env_keys(ENV_HTTP_PROXY, &cfg.http);
@@ -216,6 +233,35 @@ pub fn apply_process_proxy_config(cfg: &ProxyConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_system_env_prefers_env_then_system() {
+        use crate::system_proxy::SystemProxy;
+        // Env has HTTPS only; system supplies HTTP + bypass.
+        let snap = ProxyEnvSnapshot {
+            http: None,
+            https: Some("http://env-https:9".into()),
+            all: None,
+            no_proxy: None,
+        };
+        let sys = SystemProxy {
+            http: Some("http://sys-http:8".into()),
+            https: Some("http://sys-https:8".into()),
+            no_proxy: Some("*.corp".into()),
+        };
+        let out = follow_system_env(&snap, &sys);
+        // env https wins; system http fills the gap; system no_proxy fills the gap.
+        assert_eq!(out.https.as_deref(), Some("http://env-https:9"));
+        assert_eq!(out.http.as_deref(), Some("http://sys-http:8"));
+        assert_eq!(out.no_proxy.as_deref(), Some("*.corp"));
+    }
+
+    #[test]
+    fn follow_system_env_all_empty_stays_empty() {
+        use crate::system_proxy::SystemProxy;
+        let out = follow_system_env(&ProxyEnvSnapshot::default(), &SystemProxy::default());
+        assert!(out.http.is_none() && out.https.is_none() && out.no_proxy.is_none());
+    }
 
     #[test]
     fn proxy_mode_default_is_follow_system() {
