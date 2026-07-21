@@ -20,6 +20,7 @@ pub mod client;
 pub mod issue;
 pub mod models;
 pub mod pr;
+pub mod remote;
 pub mod repo;
 
 pub use client::AtomgitClient;
