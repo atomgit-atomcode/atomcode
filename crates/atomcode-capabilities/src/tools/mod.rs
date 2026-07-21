@@ -74,6 +74,8 @@ pub use atomgit::{
 };
 #[cfg(feature = "atomgit")]
 pub use crate::atomgit::{AtomgitClient, AtomgitConfig, LiveTokenProvider, StaticTokenProvider, TokenProvider};
+#[cfg(feature = "atomgit")]
+pub use crate::atomgit::push_label_mw::GitPushLabelMiddleware;
 pub use bash::{normalize_command_for_grant, run_shell, BashTool, ShellExit, ShellOutcome};
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;

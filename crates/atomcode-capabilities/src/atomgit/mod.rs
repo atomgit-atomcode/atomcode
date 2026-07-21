@@ -20,6 +20,7 @@ pub mod client;
 pub mod issue;
 pub mod models;
 pub mod pr;
+pub mod push_label_mw;
 pub mod remote;
 pub mod repo;
 
