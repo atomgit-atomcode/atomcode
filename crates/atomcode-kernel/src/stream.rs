@@ -67,7 +67,7 @@ impl ProviderError {
         // 2. HTTP 400 + message signature (Anthropic "prompt is too long", others).
         if self.http_status == Some(400) {
             let m = self.message.to_ascii_lowercase();
-            const NEEDLES: [&str; 10] = [
+            const NEEDLES: [&str; 9] = [
                 "context length",
                 "context window",
                 "maximum context",
@@ -75,9 +75,8 @@ impl ProviderError {
                 "reduce the length",
                 "too many tokens",
                 "range of input length", // Bailian / Tencent gateway
-                "input length exceeds",  // "input length exceeds context length" variants
                 "maximum prompt length", // Anthropic-style variant
-                "too large for model with", // variant
+                "too large for model with ", // trailing space: don't match "...without..."
             ];
             if NEEDLES.iter().any(|n| m.contains(n)) {
                 return true;
@@ -257,13 +256,16 @@ mod overflow_tests {
             "<400> InvalidParameter: Range of input length should be [1, 1000000]."
         )
         .is_context_overflow());
-        // Narrowed input-length needle (no other needle is present in this message).
-        assert!(err(Some(400), None, "input length exceeds the model limit").is_context_overflow());
         assert!(err(Some(400), None, "maximum prompt length is 200000").is_context_overflow());
-        assert!(err(Some(400), None, "too large for model with 8192 maximum").is_context_overflow());
-        // Unrelated 400s stay false — including a validation error that merely mentions
-        // "input length" in a non-overflow sense (guards against the over-broad needle).
+        assert!(err(
+            Some(400),
+            None,
+            "too large for model with 8192 maximum context length"
+        )
+        .is_context_overflow());
+        // Unrelated 400s stay false — including near-miss substrings of the tightened needles.
         assert!(!err(Some(400), Some("model_not_found"), "no such model").is_context_overflow());
         assert!(!err(Some(400), None, "input length must be positive").is_context_overflow());
+        assert!(!err(Some(400), None, "payload too large for model without streaming").is_context_overflow());
     }
 }
