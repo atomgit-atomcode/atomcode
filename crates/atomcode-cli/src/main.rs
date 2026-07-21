@@ -1512,7 +1512,6 @@ async fn run() -> Result<i32> {
     } else {
         atomcode_coding::ProviderBootstrap::RecoverAuthentication
     };
-    eprintln!("[engine] active (model {})", runtime_cfg.model);
     let (native_runtime, native_coding_cfg) =
         spawn_native_cli_runtime(&runtime_cfg, resume_session_id.clone(), provider_bootstrap)
             .await?;
