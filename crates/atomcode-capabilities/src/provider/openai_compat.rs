@@ -206,6 +206,12 @@ fn build_http_client(
         // (parity with core's `build_http_client`). Driver injects the real
         // `atomcode/<version>`; bare fallback when unset.
         .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+    // TLS trust (issue #514): webpki base roots are always present so `.build()`
+    // never hard-fails on certs; layer the OS native store (corporate MITM CAs)
+    // and SSL_CERT_FILE on top, additively and best-effort. This is the DEFAULT
+    // v2 provider path. Mirrors `core::provider::add_trusted_roots` — kept
+    // crate-local because capabilities does not depend on core.
+    builder = add_trusted_roots(builder);
     if skip_tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
     }
@@ -214,6 +220,55 @@ fn build_http_client(
         message: format!("http client build failed: {e}"),
         ..Default::default()
     })
+}
+
+/// Add the OS native root store and `SSL_CERT_FILE` (if set) to the builder's
+/// trusted roots, ON TOP of the built-in webpki roots. Best-effort: unparseable
+/// certs, an unreadable/malformed `SSL_CERT_FILE`, or native-store load errors
+/// are warned and skipped — NEVER fatal (the webpki base guarantees a working
+/// client). Mirrors `core::provider::add_trusted_roots`; codex-style graceful
+/// `load_native_certs`. See issue #514.
+fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    // 1) OS native roots (corporate MITM CAs live here).
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        tracing::warn!(
+            "loaded OS native roots with {} error(s); using the {} that parsed (issue #514)",
+            native.errors.len(),
+            native.certs.len()
+        );
+    }
+    for der in native.certs {
+        if let Ok(cert) = reqwest::Certificate::from_der(der.as_ref()) {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    // 2) SSL_CERT_FILE override/extra (empty string = unset). Loaded explicitly
+    //    for cross-platform certainty. reqwest's `Certificate` is validated only
+    //    at `.build()`, so a MALFORMED SSL_CERT_FILE surfaces there as a clear
+    //    `ProviderError` (never a panic, and only for this opt-in builder — every
+    //    other client build uses the webpki base and is unaffected). See #514.
+    let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|p| !p.is_empty()) else {
+        return builder;
+    };
+    let Ok(pem) = std::fs::read(&path) else {
+        tracing::warn!("SSL_CERT_FILE={path:?} could not be read; ignoring (issue #514)");
+        return builder;
+    };
+    match reqwest::Certificate::from_pem_bundle(&pem) {
+        Ok(certs) => {
+            let count = certs.len();
+            for c in certs {
+                builder = builder.add_root_certificate(c);
+            }
+            tracing::info!("Loaded {count} TLS root(s) from SSL_CERT_FILE={path:?} (issue #514)");
+        }
+        Err(e) => {
+            tracing::warn!("SSL_CERT_FILE={path:?} is not a valid PEM bundle: {e}; ignoring (issue #514)");
+        }
+    }
+    builder
 }
 
 /// An HTTP client held behind a rebuild seam. `get()` hands out the current client
@@ -2842,5 +2897,38 @@ mod tests {
             "2nd request must have effort stripped after the 400: {}",
             bodies[1]
         );
+    }
+
+    // ---- TLS root trust (issue #514) ----
+
+    #[test]
+    #[serial_test::serial(ssl_cert_file_env)]
+    fn build_http_client_builds_with_webpki_base_no_ssl_cert_file() {
+        std::env::remove_var("SSL_CERT_FILE");
+        // Plain build must succeed on the webpki base roots.
+        assert!(build_http_client(std::time::Duration::from_secs(5), false, None).is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial(ssl_cert_file_env)]
+    fn build_http_client_reports_malformed_ssl_cert_file_as_error_not_panic() {
+        // A malformed SSL_CERT_FILE surfaces as a clear `ProviderError` at
+        // `.build()` — NEVER a panic, and only for this opt-in builder. The
+        // webpki base leaves every other client build unaffected. See #514.
+        let tmp = tempfile::tempdir().unwrap();
+        let cert_path = tmp.path().join("roots.pem");
+        std::fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n").unwrap();
+        std::env::set_var("SSL_CERT_FILE", &cert_path);
+        let built = build_http_client(std::time::Duration::from_secs(5), false, None);
+        std::env::remove_var("SSL_CERT_FILE");
+        assert!(built.is_err(), "a malformed SSL_CERT_FILE must surface as Err, not panic");
+    }
+
+    #[test]
+    #[serial_test::serial(ssl_cert_file_env)]
+    fn build_http_client_skip_tls_verify_still_builds() {
+        std::env::remove_var("SSL_CERT_FILE");
+        // Root loading happens before the danger_accept path.
+        assert!(build_http_client(std::time::Duration::from_secs(5), true, None).is_ok());
     }
 }

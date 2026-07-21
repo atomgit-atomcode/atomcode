@@ -190,7 +190,7 @@ impl OpenAiProvider {
             },
         };
         Ok(Self {
-            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify),
+            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify)?,
             api_key: std::sync::Arc::new(tokio::sync::RwLock::new(api_key)),
             model: config.model.clone(),
             base_url: config

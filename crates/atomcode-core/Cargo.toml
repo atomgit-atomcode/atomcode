@@ -16,7 +16,17 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 http = "1"
-reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls-native-roots", "blocking"], default-features = false }
+# `rustls-tls` (webpki base roots) — an INFALLIBLE base so `.build()` never
+# hard-fails on certs. OS native roots + SSL_CERT_FILE are layered on TOP,
+# gracefully, in `build_http_client` (see `add_trusted_roots`). We deliberately
+# do NOT use `rustls-tls-native-roots`: reqwest reads native roots / SSL_CERT_FILE
+# STRICTLY there and fails the build ("zero valid certificates …") on a bad
+# SSL_CERT_FILE or empty store — which cascades into panics at every `.build()`
+# call site. Graceful, additive loading (codex-style) avoids that. See #514.
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "blocking"], default-features = false }
+# OS native root store loader (Windows cert manager / macOS keychain / Linux
+# /etc/ssl/certs) for corporate MITM-proxy CAs. Loaded best-effort. See #514.
+rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "sync", "time", "net"] }

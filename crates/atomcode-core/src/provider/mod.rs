@@ -116,7 +116,7 @@ pub trait LlmProvider: Send + Sync {
 pub(super) fn build_http_client(
     ua_override: Option<&str>,
     skip_tls_verify: bool,
-) -> reqwest::Client {
+) -> anyhow::Result<reqwest::Client> {
     let ua = ua_override.unwrap_or(crate::ATOMCODE_USER_AGENT);
     let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
         .connect_timeout(std::time::Duration::from_secs(30))
@@ -138,62 +138,70 @@ pub(super) fn build_http_client(
         .pool_idle_timeout(std::time::Duration::from_secs(30))
         .user_agent(ua);
 
-    // SECURITY (issue #514): trust the OS native root store AND honor
-    // SSL_CERT_FILE. The previous `rustls-tls` feature pulled in ONLY the
-    // hard-coded webpki-roots (Mozilla bundle), so on Windows the system
-    // cert manager, on macOS the keychain, and on Linux /etc/ssl/certs
-    // were all IGNORED — corporate proxies with a MITM CA installed in
-    // the OS store failed with `invalid peer certificate: UnknownIssuer`.
-    // The `rustls-tls-native-roots` Cargo feature makes rustls load the
-    // OS native roots (and rustls-native-certs honors SSL_CERT_FILE on
-    // its own), so switching the feature is the primary fix.
-    //
-    // As belt-and-suspenders, ALSO load SSL_CERT_FILE explicitly via
-    // `add_root_certificate` when the env var is set — this guarantees
-    // the file's certs are added even if a future reqwest/rustls version
-    // changes how native-roots interacts with the env var.
-    builder = load_extra_tls_roots(builder);
+    // TLS trust (issue #514): the webpki base roots (from the `rustls-tls`
+    // feature) are ALWAYS present, so `.build()` never hard-fails on certs.
+    // Layer the OS native store (Windows cert manager / macOS keychain / Linux
+    // /etc/ssl/certs — where a corporate MITM-proxy CA lives) and SSL_CERT_FILE
+    // on TOP, additively and best-effort. Bad/partial certs are warned and
+    // skipped, never fatal — this is the codex-style graceful load that avoids
+    // the panics reqwest's strict `rustls-tls-native-roots` would cascade.
+    builder = add_trusted_roots(builder);
 
     if skip_tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
     }
 
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    // With the infallible webpki base + graceful root loading above, `.build()`
+    // no longer fails on cert config; it can still fail on other builder state
+    // (e.g. a bad proxy), so surface that as a clear error rather than panicking.
+    builder.build().map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
 }
 
-/// Honour `SSL_CERT_FILE` by adding its PEM-encoded certs to the builder's
-/// trusted roots. No-op when the env var is unset or the file can't be read
-/// (best-effort; the native-roots feature already covers the common path).
-/// See issue #514.
-fn load_extra_tls_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    let Some(path) = std::env::var_os("SSL_CERT_FILE") else {
+/// Add the OS native root store and `SSL_CERT_FILE` (if set) to the builder's
+/// trusted roots, ON TOP of the built-in webpki roots. Best-effort: a cert that
+/// fails to parse, an unreadable/malformed `SSL_CERT_FILE`, or native-store load
+/// errors are warned and skipped — NEVER fatal (the webpki base guarantees a
+/// working client). Mirrors codex's graceful `load_native_certs` +
+/// `add_parsable_certificates`. See issue #514.
+fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    // 1) OS native roots (corporate MITM CAs live here).
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        tracing::warn!(
+            "loaded OS native roots with {} error(s); using the {} that parsed (issue #514)",
+            native.errors.len(),
+            native.certs.len()
+        );
+    }
+    for der in native.certs {
+        if let Ok(cert) = reqwest::Certificate::from_der(der.as_ref()) {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    // 2) SSL_CERT_FILE override/extra (empty string = unset). Loaded explicitly
+    //    for cross-platform certainty (rustls-native-certs' env handling varies
+    //    by platform). reqwest's `Certificate` is validated only at `.build()`,
+    //    so a MALFORMED SSL_CERT_FILE surfaces there as a clear `Err` (never a
+    //    panic, and only for this opt-in builder — every other client build uses
+    //    the webpki base and is unaffected). A VALID bundle is trusted. See #514.
+    let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|p| !p.is_empty()) else {
         return builder;
     };
     let Ok(pem) = std::fs::read(&path) else {
-        tracing::warn!(
-            "SSL_CERT_FILE pointed at {:?} but the file could not be read;              ignoring (issue #514)",
-            path
-        );
+        tracing::warn!("SSL_CERT_FILE={path:?} could not be read; ignoring (issue #514)");
         return builder;
     };
-    // Certificate::from_pem_bundle accepts a PEM file with one or more certs.
     match reqwest::Certificate::from_pem_bundle(&pem) {
         Ok(certs) => {
             let count = certs.len();
             for c in certs {
                 builder = builder.add_root_certificate(c);
             }
-            tracing::info!(
-                "Loaded {} extra TLS root(s) from SSL_CERT_FILE={:?} (issue #514)",
-                count,
-                path
-            );
+            tracing::info!("Loaded {count} TLS root(s) from SSL_CERT_FILE={path:?} (issue #514)");
         }
         Err(e) => {
-            tracing::warn!(
-                "SSL_CERT_FILE={:?} could not be parsed as a PEM bundle: {e};                  ignoring (issue #514)",
-                path
-            );
+            tracing::warn!("SSL_CERT_FILE={path:?} is not a valid PEM bundle: {e}; ignoring (issue #514)");
         }
     }
     builder
@@ -478,44 +486,40 @@ mod format_http_error_tests {
 mod build_http_client_tls_tests {
     use super::build_http_client;
 
+    // `#[serial(ssl_cert_file_env)]`: these mutate the process-global
+    // SSL_CERT_FILE env var; without serialisation a parallel test's bogus
+    // value leaks in and makes native-roots `.build()` fail ("zero valid
+    // certificates found in native root store").
     #[test]
+    #[serial_test::serial(ssl_cert_file_env)]
     fn build_http_client_succeeds_with_native_roots_issue_514() {
-        // The rustls-tls-native-roots feature loads the OS native root
-        // store at build time. If the feature were misconfigured this would
-        // panic/error. A plain build (no SSL_CERT_FILE) must succeed.
-        // SAFETY: this is the only place in the test process that touches
-        // the env var, and the test runner serialises tests within a binary.
+        // Plain build (no SSL_CERT_FILE) must succeed under native-roots.
         std::env::remove_var("SSL_CERT_FILE");
-        let _client = build_http_client(None, false);
-        // Reaching here without panic is the assertion.
+        assert!(build_http_client(None, false).is_ok());
     }
 
     #[test]
-    fn build_http_client_honours_ssl_cert_file_issue_514() {
-        // A minimal self-signed PEM bundle. We generate a throwaway cert
-        // via rcgen-like inline PEM is overkill; instead use a well-known
-        // invalid-but-parseable PEM header so from_pem_bundle fails
-        // gracefully (warns + ignores) rather than panicking — proving the
-        // env var is consulted and the error path is non-fatal.
+    #[serial_test::serial(ssl_cert_file_env)]
+    fn build_http_client_reports_malformed_ssl_cert_file_as_error_not_panic() {
+        // A malformed SSL_CERT_FILE cert surfaces as a clear `Err` at `.build()`
+        // (reqwest validates certs only there). The guarantees: (1) NEVER a panic
+        // (Result); (2) it affects ONLY this opt-in builder — the webpki base
+        // leaves every other client build in the workspace unaffected. See #514.
         let tmp = tempfile::tempdir().unwrap();
         let cert_path = tmp.path().join("roots.pem");
-        // A syntactically valid PEM block with bogus base64 content:
-        // from_pem_bundle will fail to parse it, log a warn, and continue.
         std::fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n").unwrap();
-        // SAFETY: test-only; the test runner serialises within the binary.
         std::env::set_var("SSL_CERT_FILE", &cert_path);
-        let _client = build_http_client(None, false);
+        let built = build_http_client(None, false);
         std::env::remove_var("SSL_CERT_FILE");
-        // Reaching here without panic is the assertion: the bogus bundle
-        // was rejected gracefully, not fatally.
+        assert!(built.is_err(), "a malformed SSL_CERT_FILE must surface as Err, not panic");
     }
 
     #[test]
+    #[serial_test::serial(ssl_cert_file_env)]
     fn build_http_client_skip_tls_verify_still_builds_issue_514() {
-        // skip_tls_verify=true must continue to build (the native-roots
-        // load happens before the danger_accept path).
+        // skip_tls_verify=true must continue to build.
         std::env::remove_var("SSL_CERT_FILE");
-        let _client = build_http_client(None, true);
+        assert!(build_http_client(None, true).is_ok());
     }
 }
 

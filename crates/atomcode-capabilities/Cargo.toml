@@ -37,7 +37,16 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 tokio-util = { version = "0.7", optional = true }
 # `provider` capability deps (HTTP + SSE). Optional so a downstream embedder that
 # only wants other capabilities does not pull in the TLS/HTTP stack.
+# `rustls-tls` (webpki base) — an INFALLIBLE base so `.build()` never hard-fails
+# on certs. OS native roots + SSL_CERT_FILE are layered on TOP, gracefully, in
+# `build_http_client` (`add_trusted_roots`). NOT `rustls-tls-native-roots`:
+# reqwest reads native roots / SSL_CERT_FILE STRICTLY there and fails the build
+# ("zero valid certificates …") on a bad SSL_CERT_FILE or empty store, which
+# cascades into panics at every `.build()` site. This is the DEFAULT v2 provider
+# path; the whole-workspace feature must stay `rustls-tls`. See issue #514.
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false, optional = true }
+# OS native root store loader for corporate MITM-proxy CAs. Best-effort. #514.
+rustls-native-certs = { version = "0.8", optional = true }
 # RFC 7231 HTTP-date parsing for `Retry-After` headers that use the date form (e.g. some
 # Anthropic 429s) instead of delta-seconds. Already in the tree via reqwest. provider-only.
 httpdate = { version = "1", optional = true }
@@ -117,7 +126,7 @@ tar = { version = "0.4", optional = true }
 default = ["provider", "tools"]
 # Real LlmProvider adapters (OpenAI-compatible: GLM / DeepSeek / …). `dirs` resolves the
 # wire-dump output dir (config_dir()/wire-dump) for the byte-level ATOMCODE_WIRE_DUMP.
-provider = ["dep:reqwest", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:getrandom", "dep:tracing"]
+provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:getrandom", "dep:tracing"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
 tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "tokio/fs", "tokio/process", "tokio/io-util"]
