@@ -77,7 +77,7 @@ impl ProviderError {
                 "range of input length", // Bailian / Tencent gateway
                 "input length exceeds",  // "input length exceeds context length" variants
                 "maximum prompt length", // Anthropic-style variant
-                "too large for model",   // variant
+                "too large for model with", // variant
             ];
             if NEEDLES.iter().any(|n| m.contains(n)) {
                 return true;

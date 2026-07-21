@@ -326,7 +326,7 @@ fn over_window_advisory(est_prompt_tokens: u32, ctx_window: u32, trigger_limit: 
         return None;
     }
     Some(format!(
-        "请求约 {}K tokens 超出当前模型窗口（约 {}K）：单条输入过大，请精简输入或换用更大窗口的模型。",
+        "请求约 {}K tokens 接近当前模型可用上限（窗口约 {}K，需为回复预留空间）：请精简输入或换用更大窗口的模型。",
         est_prompt_tokens / 1000,
         ctx_window / 1000,
     ))
