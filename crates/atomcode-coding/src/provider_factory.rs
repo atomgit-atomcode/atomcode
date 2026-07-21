@@ -179,8 +179,8 @@ pub fn derive_tier_config(
     if let Some(base_url) = &provider.base_url {
         tier.base_url = base_url.clone();
     }
-    if let Some(api_key) = &provider.api_key {
-        tier.api_key = api_key.clone();
+    if let Some(api_key) = provider.resolved_api_key() {
+        tier.api_key = api_key;
     }
     tier.provider_type = provider.provider_type.clone();
     tier.context_window = provider.context_window as u32;

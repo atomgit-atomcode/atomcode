@@ -54,7 +54,7 @@ pub(crate) fn provider_info(
         provider_type: p.provider_type.clone(),
         model: p.model.clone(),
         base_url: p.base_url.clone(),
-        has_api_key: p.api_key.is_some(),
+        has_api_key: p.resolved_api_key().is_some(),
         is_default: name == default_provider,
         context_window: p.context_window,
         max_tokens: p.max_tokens,

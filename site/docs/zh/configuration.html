@@ -116,7 +116,7 @@ context_window = 64000</code></pre>
         </thead>
         <tbody>
           <tr><td><code>type</code></td><td>string</td><td>是</td><td>provider 协议类型,目前支持 <code>openai</code>、<code>claude</code>、<code>ollama</code></td></tr>
-          <tr><td><code>api_key</code></td><td>string?</td><td>视情况</td><td>API Key。<code>ollama</code> 可不填。OAuth 登录的 provider 不含此字段,token 从 <code>~/.atomcode/auth.toml</code> 自动读取</td></tr>
+          <tr><td><code>api_key</code></td><td>string?</td><td>视情况</td><td>API Key。支持明文密钥、环境变量语法（如 <code>$MY_KEY</code> 或 <code>${MY_KEY:-default}</code>）、环境变量名（如 <code>MY_KEY</code>），或留空自动回退标准环境变量（如 <code>OPENAI_API_KEY</code> / <code>ANTHROPIC_API_KEY</code>）。<code>ollama</code> 可不填。OAuth 登录的 provider 不含此字段，token 从 <code>~/.atomcode/auth.toml</code> 自动读取</td></tr>
           <tr><td><code>model</code></td><td>string</td><td>是</td><td>模型名,比如 <code>deepseek-chat</code>、<code>gpt-4o</code>、<code>claude-sonnet-4-6</code></td></tr>
           <tr><td><code>base_url</code></td><td>string</td><td>是</td><td>API 基地址,需指向实际接口。例:<code>https://api.deepseek.com/v1</code>、<code>http://localhost:11434</code></td></tr>
           <tr><td><code>context_window</code></td><td>integer</td><td>否</td><td>模型上下文窗口(tokens),默认 64000。<code>ollama</code> 默认 8000</td></tr>
@@ -125,6 +125,34 @@ context_window = 64000</code></pre>
           <tr><td><code>user_agent</code></td><td>string?</td><td>否</td><td>覆盖 HTTP 请求的 User-Agent,当上游接口屏蔽通用 UA 时使用</td></tr>
         </tbody>
       </table>
+
+      <h2>环境变量与 API Key 动态解析</h2>
+      <p>为避免在配置文件中明文保存敏感密钥，并方便与其他开发工具共用环境变量，AtomCode 支持在 <code>config.toml</code> 中灵活使用环境变量：</p>
+      <ul>
+        <li><strong>环境变量语法展开 (<code>$VAR</code> / <code>${VAR}</code>)</strong>：
+          <pre><code>[providers.my_openai]
+type = "openai"
+model = "gpt-4o"
+api_key = "$MY_OPENAI_KEY" # 或 "${MY_OPENAI_KEY}"
+base_url = "https://api.openai.com/v1"</code></pre>
+          支持带默认值的表达式（例：<code>api_key = "${MY_KEY:-sk-fallback}"</code>）。
+        </li>
+        <li><strong>直接填写环境变量名</strong>：
+          <pre><code>[providers.my_claude]
+type = "claude"
+model = "claude-sonnet-4-6"
+api_key = "ANTHROPIC_API_KEY" # 自动从环境变量 ANTHROPIC_API_KEY 中读取</code></pre>
+        </li>
+        <li><strong>留空自动回退标准环境变量</strong>：当未配置或留空 <code>api_key</code> 时，系统会自动寻找对应 <code>type</code> 的标准环境变量：
+          <ul>
+            <li><code>openai</code> / <code>openai-compat</code>：读取 <code>OPENAI_API_KEY</code></li>
+            <li><code>claude</code> / <code>anthropic</code>：读取 <code>ANTHROPIC_API_KEY</code></li>
+            <li><code>ollama</code>：读取 <code>OLLAMA_API_KEY</code></li>
+            <li>通用后备：读取 <code>ATOMCODE_API_KEY</code></li>
+          </ul>
+        </li>
+      </ul>
+      <p>注：配置文件中的 <code>$VAR</code> 语法由 AtomCode 程序内部解析，在 Windows、macOS 和 Linux 上保持统一写法。</p>
 
       <div class="callout callout-info">
         <strong>为什么默认 64K 而不是 128K?</strong>

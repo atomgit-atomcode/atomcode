@@ -116,7 +116,7 @@ context_window = 64000</code></pre>
         </thead>
         <tbody>
           <tr><td><code>type</code></td><td>string</td><td>yes</td><td>Provider protocol — currently <code>openai</code>, <code>claude</code>, or <code>ollama</code></td></tr>
-          <tr><td><code>api_key</code></td><td>string?</td><td>conditional</td><td>API key. Optional for <code>ollama</code>. OAuth providers omit this — the token is read from <code>~/.atomcode/auth.toml</code> automatically</td></tr>
+          <tr><td><code>api_key</code></td><td>string?</td><td>conditional</td><td>API key. Supports literal keys, env var expansion (e.g. <code>$MY_KEY</code> or <code>${MY_KEY:-default}</code>), direct env var names (e.g. <code>MY_KEY</code>), or omitted/blank fallback to standard env vars (e.g. <code>OPENAI_API_KEY</code> / <code>ANTHROPIC_API_KEY</code>). Optional for <code>ollama</code>. OAuth providers omit this — token read from <code>~/.atomcode/auth.toml</code> automatically</td></tr>
           <tr><td><code>model</code></td><td>string</td><td>yes</td><td>Model name, e.g. <code>deepseek-chat</code>, <code>gpt-4o</code>, <code>claude-sonnet-4-6</code></td></tr>
           <tr><td><code>base_url</code></td><td>string</td><td>yes</td><td>API base URL, pointing at the actual endpoint. e.g. <code>https://api.deepseek.com/v1</code>, <code>http://localhost:11434</code></td></tr>
           <tr><td><code>context_window</code></td><td>integer</td><td>no</td><td>Model context window (tokens), default 64000. Default 8000 for <code>ollama</code></td></tr>
@@ -125,6 +125,34 @@ context_window = 64000</code></pre>
           <tr><td><code>user_agent</code></td><td>string?</td><td>no</td><td>Override the HTTP User-Agent — useful when the upstream blocks the default UA</td></tr>
         </tbody>
       </table>
+
+      <h2>Environment Variables & Dynamic API Key Resolution</h2>
+      <p>To avoid storing sensitive credentials in plain text and to share environment variables with other tools, AtomCode supports flexible environment variable syntax in <code>config.toml</code>:</p>
+      <ul>
+        <li><strong>Environment Variable Expansion (<code>$VAR</code> / <code>${VAR}</code>)</strong>:
+          <pre><code>[providers.my_openai]
+type = "openai"
+model = "gpt-4o"
+api_key = "$MY_OPENAI_KEY" # or "${MY_OPENAI_KEY}"
+base_url = "https://api.openai.com/v1"</code></pre>
+          Supports fallback expressions with default values (e.g., <code>api_key = "${MY_KEY:-sk-fallback}"</code>).
+        </li>
+        <li><strong>Direct Environment Variable Name</strong>:
+          <pre><code>[providers.my_claude]
+type = "claude"
+model = "claude-sonnet-4-6"
+api_key = "ANTHROPIC_API_KEY" # Automatically read from environment variable ANTHROPIC_API_KEY</code></pre>
+        </li>
+        <li><strong>Automatic Standard Environment Variable Fallback</strong>: When <code>api_key</code> is omitted or blank, AtomCode automatically checks standard environment variables matching the provider <code>type</code>:
+          <ul>
+            <li><code>openai</code> / <code>openai-compat</code>: reads <code>OPENAI_API_KEY</code></li>
+            <li><code>claude</code> / <code>anthropic</code>: reads <code>ANTHROPIC_API_KEY</code></li>
+            <li><code>ollama</code>: reads <code>OLLAMA_API_KEY</code></li>
+            <li>Global fallback: reads <code>ATOMCODE_API_KEY</code></li>
+          </ul>
+        </li>
+      </ul>
+      <p>Note: The <code>$VAR</code> syntax in <code>config.toml</code> is parsed internally by AtomCode, providing consistent behavior across Windows, macOS, and Linux.</p>
 
       <div class="callout callout-info">
         <strong>Why default to 64K instead of 128K?</strong>

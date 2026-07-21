@@ -162,7 +162,7 @@ impl CodingRuntimeConfig {
         let provider = config.providers.get(&provider_name);
         Self {
             api_key: provider
-                .and_then(|provider| provider.api_key.clone())
+                .and_then(|provider| provider.resolved_api_key())
                 .unwrap_or_default(),
             base_url: provider
                 .and_then(|provider| provider.base_url.clone())
@@ -240,8 +240,8 @@ pub fn apply_provider_config(
     if let Some(base_url) = &provider.base_url {
         config.base_url = base_url.clone();
     }
-    if let Some(api_key) = &provider.api_key {
-        config.api_key = api_key.clone();
+    if let Some(api_key) = provider.resolved_api_key() {
+        config.api_key = api_key;
     }
     config.context_window = provider.context_window as u32;
     config.chat_options.max_tokens = provider.max_tokens.map(|value| value as u32);
