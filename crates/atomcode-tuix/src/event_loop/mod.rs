@@ -6437,6 +6437,7 @@ fn handle_input(
             // the window re-centres at the new dimensions instead of
             // lingering stale / mispositioned until the next keypress.
             if let Some(m) = app.active_modal.as_ref() {
+                renderer.clear_screen();
                 m.draw(&app.buf, &app.state, ctx, renderer);
             }
             for ev in deferred {
