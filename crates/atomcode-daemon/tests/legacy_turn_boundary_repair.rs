@@ -86,7 +86,7 @@ fn presentation_anchors_at_start_when_all_legacy_boundaries_are_invalid() {
 }
 
 #[test]
-fn out_of_range_legacy_turn_boundary_remains_an_error() {
+fn out_of_range_legacy_turn_boundary_is_repaired_during_cutover() {
     let mut legacy = legacy_fixture();
     let message_count = legacy["messages"].as_array().unwrap().len();
     legacy["turn_stats"][0]["after_message"] = (message_count + 1).into();
@@ -94,15 +94,16 @@ fn out_of_range_legacy_turn_boundary_remains_an_error() {
     let (_dir, manager, id) = write_legacy(&legacy);
     let lease = manager.acquire_lease(&id).unwrap();
 
-    let error = converge_session(&manager, &lease).unwrap_err();
+    let outcome = converge_session(&manager, &lease).unwrap();
 
-    assert!(
-        error
-            .to_string()
-            .contains("legacy turn boundary is outside the message history"),
-        "{error:#}"
+    assert_eq!(outcome.status, ImportStatus::ImportedFull);
+    assert_eq!(
+        outcome.diagnostic,
+        Some(ImportDiagnostic::RepairedLegacyTurnBoundaries {
+            dropped_turn_stats: 1,
+        })
     );
-    assert!(manager.read_meta(&id).is_err());
+    assert_eq!(outcome.meta, manager.read_meta(&id).unwrap());
 }
 
 #[test]

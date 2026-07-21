@@ -306,10 +306,10 @@ fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedL
     let mut dropped_turn_stats = 0usize;
 
     for stat in &session.turn_stats {
-        if stat.after_message > session.messages.len() {
-            anyhow::bail!("legacy turn boundary is outside the message history")
-        }
-        if stat.after_message == 0 || stat.after_message <= previous_after {
+        if stat.after_message > session.messages.len()
+            || stat.after_message == 0
+            || stat.after_message <= previous_after
+        {
             dropped_turn_stats += 1;
             continue;
         }
