@@ -517,30 +517,27 @@ fn login_poll_response(result: LoginPollResult) -> axum::response::Response {
             coded_json_error(StatusCode::SERVICE_UNAVAILABLE, code, message, true).into_response()
         }
         LoginPollStep::Expired => terminal_login_response(
-            "expired",
+            StatusCode::GONE,
             "login_session_expired",
             "Login session expired; start a new login",
         ),
         LoginPollStep::Cancelled => terminal_login_response(
-            "cancelled",
+            StatusCode::GONE,
             "login_session_cancelled",
             "Login session was cancelled",
         ),
         LoginPollStep::Failed { code, message } => {
-            response("failed", None, Some(code), Some(message), None)
+            terminal_login_response(StatusCode::INTERNAL_SERVER_ERROR, code, message)
         }
     }
 }
 
-fn terminal_login_response(status: &str, code: &str, message: &str) -> axum::response::Response {
-    Json(LoginPollResponse {
-        status: status.to_string(),
-        user: None,
-        code: Some(code.to_string()),
-        message: Some(message.to_string()),
-        retry_after_ms: None,
-    })
-    .into_response()
+fn terminal_login_response(
+    status: StatusCode,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> axum::response::Response {
+    coded_json_error(status, code, message, false).into_response()
 }
 
 pub(crate) async fn cleanup_login_sessions(login_sessions: &LoginSessionsStore) {
@@ -616,12 +613,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_states_return_typed_responses() {
+    async fn login_terminal_states_are_non_success_and_non_retryable() {
         let cases = [
-            (LoginPollStep::Expired, "expired", "login_session_expired"),
+            (
+                LoginPollStep::Expired,
+                StatusCode::GONE,
+                "login_session_expired",
+            ),
             (
                 LoginPollStep::Cancelled,
-                "cancelled",
+                StatusCode::GONE,
                 "login_session_cancelled",
             ),
             (
@@ -629,20 +630,59 @@ mod tests {
                     code: "login_exchange_failed".to_string(),
                     message: "Login authorization exchange failed".to_string(),
                 },
-                "failed",
+                StatusCode::INTERNAL_SERVER_ERROR,
                 "login_exchange_failed",
             ),
         ];
 
-        for (step, expected_status, expected_code) in cases {
+        for (step, expected_http_status, expected_code) in cases {
             let response = login_poll_response(LoginPollResult { step });
-            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), expected_http_status);
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(json["status"], expected_status);
             assert_eq!(json["code"], expected_code);
+            assert_eq!(json["retryable"], false);
         }
+    }
+
+    #[test]
+    fn login_pending_and_authorized_states_remain_successful() {
+        let pending = login_poll_response(LoginPollResult {
+            step: LoginPollStep::Pending,
+        });
+        assert_eq!(pending.status(), StatusCode::OK);
+
+        let authorized = login_poll_response(LoginPollResult {
+            step: LoginPollStep::Authorized {
+                user: auth::UserInfo {
+                    id: "user-id".to_string(),
+                    username: "tester".to_string(),
+                    name: None,
+                    email: None,
+                    avatar_url: None,
+                },
+                newly_authorized: false,
+            },
+        });
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn login_retryable_failure_remains_service_unavailable() {
+        let response = login_poll_response(LoginPollResult {
+            step: LoginPollStep::Retryable {
+                code: "login_poll_unavailable".to_string(),
+                message: "Login service is temporarily unavailable".to_string(),
+            },
+        });
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "login_poll_unavailable");
+        assert_eq!(json["retryable"], true);
     }
 }

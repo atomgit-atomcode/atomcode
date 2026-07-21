@@ -337,13 +337,19 @@ mod tests {
             _images: Vec<atomcode_coding::ImageContent>,
             _active_model: String,
             _session_id: Option<String>,
-        ) -> atomcode_coding::UserInput {
+        ) -> (
+            atomcode_coding::UserInput,
+            Option<atomcode_coding::VisionNotice>,
+        ) {
             self.called
                 .store(true, std::sync::atomic::Ordering::Release);
-            atomcode_coding::UserInput {
-                text: format!("recognized: {text}"),
-                images: Vec::new(),
-            }
+            (
+                atomcode_coding::UserInput {
+                    text: format!("recognized: {text}"),
+                    images: Vec::new(),
+                },
+                None,
+            )
         }
     }
 

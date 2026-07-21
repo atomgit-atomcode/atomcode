@@ -557,9 +557,10 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 }
 ```
 
-登录协议以 HTTP 200 返回 `expired`、`cancelled`、`failed` 终态，并附带稳定的
-`code`/`message`；可重试的临时错误使用 HTTP 503 和 `retryable: true`。登录会话只属于
-创建它的 daemon 实例，实例重启后客户端必须重新发起登录，不能重放旧 `login_id`。
+`pending`、`authorized` 使用 HTTP 200。`expired`、`cancelled` 使用 HTTP 410，
+`failed` 使用 HTTP 500；这些终态附带稳定的 `code`/`error` 和 `retryable: false`。
+可重试的临时错误使用 HTTP 503 和 `retryable: true`。登录会话只属于创建它的 daemon
+实例，实例重启后客户端必须重新发起登录，不能重放旧 `login_id`。
 
 **响应示例（已授权）：**
 

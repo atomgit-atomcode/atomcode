@@ -6,9 +6,9 @@ import com.atomcode.jetbrains.daemon.LoginPollResponse
 import com.atomcode.jetbrains.daemon.LoginStartResponse
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
+import com.intellij.openapi.diagnostic.Logger
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionException
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 private const val DEFAULT_LOGIN_POLL_DELAY_MS = 2_000L
@@ -16,9 +16,9 @@ private const val DEFAULT_LOGIN_POLL_DELAY_MS = 2_000L
 /** Application-wide single-flight owner for daemon OAuth attempts. */
 @Service(Service.Level.APP)
 class AtomCodeLoginCoordinator {
-    private val attempts = ConcurrentHashMap<String, CompletableFuture<Unit>>()
+    private val attempts = mutableMapOf<String, LoginAttempt>()
+    private val logger = Logger.getInstance(AtomCodeLoginCoordinator::class.java)
 
-    @Synchronized
     fun login(
         client: AtomCodeDaemonClient,
         onStatus: (String) -> Unit,
@@ -32,29 +32,61 @@ class AtomCodeLoginCoordinator {
         onStatus,
     )
 
-    @Synchronized
     internal fun login(
         transport: LoginTransport,
         onStatus: (String) -> Unit,
     ): CompletableFuture<Unit> {
         val key = transport.key
-        attempts[key]?.takeUnless { it.isDone }?.let { return it }
-
-        val shared = CompletableFuture<Unit>()
-        attempts[key] = shared
+        val (attempt, startsAttempt) = synchronized(attempts) {
+            attempts[key]?.takeUnless { it.future.isDone }?.let { return@synchronized it to false }
+            LoginAttempt(CompletableFuture()).also { attempts[key] = it } to true
+        }
+        attempt.addListener(onStatus)
+        if (!startsAttempt) return attempt.future
 
         transport.start()
             .thenCompose { start ->
-                onStatus("Opened browser for AtomGit sign-in.")
+                attempt.publish("Opened browser for AtomGit sign-in.")
                 val deadline = System.nanoTime() +
                     TimeUnit.SECONDS.toNanos(start.expiresInSeconds.coerceAtLeast(1).toLong())
-                poll(transport, start.loginId, deadline, onStatus)
+                poll(transport, start.loginId, deadline, attempt::publish)
             }
             .whenComplete { _, error ->
-                if (error == null) shared.complete(Unit) else shared.completeExceptionally(unwrap(error))
-                attempts.remove(key, shared)
+                if (error == null) attempt.future.complete(Unit) else attempt.future.completeExceptionally(unwrap(error))
+                synchronized(attempts) {
+                    if (attempts[key] === attempt) attempts.remove(key)
+                }
             }
-        return shared
+        return attempt.future
+    }
+
+    private inner class LoginAttempt(
+        val future: CompletableFuture<Unit>,
+    ) {
+        private val listeners = mutableListOf<(String) -> Unit>()
+        private var latestStatus: String? = null
+
+        fun addListener(listener: (String) -> Unit) {
+            synchronized(this) {
+                listeners += listener
+                latestStatus?.let { notifyListener(listener, it) }
+            }
+        }
+
+        fun publish(status: String) {
+            synchronized(this) {
+                latestStatus = status
+                listeners.forEach { notifyListener(it, status) }
+            }
+        }
+
+        private fun notifyListener(listener: (String) -> Unit, status: String) {
+            try {
+                listener(status)
+            } catch (error: Exception) {
+                logger.warn("AtomCode login status listener failed", error)
+            }
+        }
     }
 
     private fun poll(

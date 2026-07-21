@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import { classifyAuthDisplayState } from '../auth/status';
 import { DaemonClient, DaemonHttpError } from '../daemon/client';
 import {
   AuthStatusResponse,
@@ -1929,7 +1930,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case '/whoami':
         try {
           const auth = await this._client.authStatus();
-          if (auth.logged_in && auth.user) {
+          const authState = classifyAuthDisplayState(auth);
+          if (authState === 'expired') {
+            this._postSlashInfo(vscode.l10n.t('AtomGit session expired. Sign in again.'), sessionId, text);
+          } else if (authState === 'signed_in' && auth.user) {
             const name = auth.user.name || auth.user.username || auth.user.email || auth.user.id;
             const lines = [
               `${name} (${auth.user.username || auth.user.id})`,
@@ -1961,9 +1965,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this._client.listProviders().catch(() => undefined),
           ]);
           const provider = providers?.providers.find((p) => p.name === providers.default_provider || p.is_default);
+          const authState = classifyAuthDisplayState(auth);
+          const authLabel = authState === 'expired'
+            ? vscode.l10n.t('expired')
+            : authState === 'signed_in'
+              ? vscode.l10n.t('signed in')
+              : vscode.l10n.t('not signed in');
           this._postSlashInfo([
             `Daemon: ${health.service} ${health.version}`,
-            `Auth: ${auth?.logged_in ? vscode.l10n.t('signed in') : vscode.l10n.t('not signed in')}`,
+            `Auth: ${authLabel}`,
             `Provider: ${provider ? `${provider.name} (${provider.model})` : vscode.l10n.t('not configured')}`,
           ].join('\n'), sessionId, text);
         } catch (e) {
