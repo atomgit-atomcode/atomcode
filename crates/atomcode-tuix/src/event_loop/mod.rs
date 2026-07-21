@@ -846,6 +846,55 @@ pub struct McpReloadProgress {
     pub started_at: std::time::Instant,
 }
 
+pub(crate) struct PendingSessionResume {
+    pub project_bucket: String,
+    pub session: Session,
+    pub working_dir: PathBuf,
+}
+
+fn session_resume_matches(
+    pending: &PendingSessionResume,
+    changed: &atomcode_coding::SessionChanged,
+) -> bool {
+    changed.session_id.as_deref() == Some(pending.session.id.as_str())
+        && changed.working_dir == pending.working_dir
+        && atomcode_capabilities::session::SessionManager::project_hash(&changed.working_dir)
+            == pending.project_bucket
+}
+
+#[cfg(test)]
+mod session_resume_tests {
+    use super::{session_resume_matches, PendingSessionResume};
+    use crate::session::Session;
+    use std::path::PathBuf;
+
+    #[test]
+    fn terminal_must_match_id_directory_and_project_bucket() {
+        let working_dir = PathBuf::from("/project");
+        let mut session = Session::default_session(working_dir.clone());
+        session.id = "target-session".into();
+        let pending = PendingSessionResume {
+            project_bucket:
+                atomcode_capabilities::session::SessionManager::project_hash(&working_dir),
+            session,
+            working_dir: working_dir.clone(),
+        };
+        let exact = atomcode_coding::SessionChanged {
+            generation: atomcode_coding::RuntimeGeneration(1),
+            session_id: Some("target-session".into()),
+            working_dir: working_dir.clone(),
+        };
+
+        assert!(session_resume_matches(&pending, &exact));
+
+        let wrong_directory = atomcode_coding::SessionChanged {
+            working_dir: PathBuf::from("/other-project"),
+            ..exact
+        };
+        assert!(!session_resume_matches(&pending, &wrong_directory));
+    }
+}
+
 /// The native runtime control plane transferred when the TUI switches sessions.
 #[derive(Clone)]
 pub struct RuntimeEndpoint {
@@ -938,6 +987,13 @@ enum ReadyRuntimeRequest {
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
+    ResumeSession {
+        id: String,
+        working_dir: PathBuf,
+        lease: atomcode_capabilities::session::SessionLease,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
     ReloadProvider {
         next: atomcode_coding::CodingAgentConfig,
         runtime_id: bg_runtime::RuntimeId,
@@ -1010,7 +1066,8 @@ impl ReadyRuntimeControl {
             ReadyRuntimeRequest::Compact(_)
             | ReadyRuntimeRequest::Undo { .. }
             | ReadyRuntimeRequest::ContextStats { .. }
-            | ReadyRuntimeRequest::RestoreSnapshot { .. } => matches!(
+            | ReadyRuntimeRequest::RestoreSnapshot { .. }
+            | ReadyRuntimeRequest::ResumeSession { .. } => matches!(
                 phase,
                 atomcode_coding::RuntimePhase::Ready
                     | atomcode_coding::RuntimePhase::InTurn
@@ -1101,6 +1158,23 @@ impl ReadyRuntimeControl {
                             correlation_id,
                             result,
                         },
+                    );
+                }
+                ReadyRuntimeRequest::ResumeSession {
+                    id,
+                    working_dir,
+                    lease,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self
+                        .handle
+                        .resume_session_with_lease(id, working_dir, lease)
+                        .await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::SessionResumeFinished(result),
                     );
                 }
                 ReadyRuntimeRequest::ReloadProvider {
@@ -1352,6 +1426,46 @@ impl RuntimeControl {
                     snapshot,
                     correlation_id,
                 })
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn resume_session(
+        &self,
+        id: String,
+        working_dir: PathBuf,
+        lease: atomcode_capabilities::session::SessionLease,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ResumeSession {
+                id,
+                working_dir,
+                lease,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                let handle = match &*deferred.state.borrow() {
+                    atomcode_coding::DeferredRuntimeState::Ready(handle) => handle.clone(),
+                    atomcode_coding::DeferredRuntimeState::Starting
+                    | atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                        return Err(atomcode_coding::RuntimeUnavailable);
+                    }
+                };
+                tokio::spawn(async move {
+                    let result = handle
+                        .resume_session_with_lease(id, working_dir, lease)
+                        .await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::SessionResumeFinished(result),
+                    );
+                });
+                Ok(())
             }
             Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
@@ -1840,6 +1954,9 @@ pub struct LoopCtx {
     /// Active session id once `/resume` has loaded one. Required by the
     /// `/rename` slash command to know which session file to update.
     pub current_session_id: Option<SessionId>,
+    /// Exact picker selection waiting for CodingRuntime's resume terminal.
+    /// UI/session projections are committed only after this operation succeeds.
+    pub(crate) pending_session_resume: Option<PendingSessionResume>,
     /// Cached "clipboard currently holds an image" flag, with a short TTL
     /// so the right-aligned `Image in clipboard · ctrl+v to paste` hint
     /// stays current without thrashing the system clipboard on every
@@ -11794,6 +11911,14 @@ fn handle_runtime_event(
                 }
                 CodingRuntimeEvent::SessionChanged(changed) => {
                     if let Some(session_id) = changed.session_id {
+                        if ctx.pending_session_resume.as_ref().is_some_and(|pending| {
+                            pending.session.id == session_id
+                                && pending.working_dir == changed.working_dir
+                        }) {
+                            // Runtime committed, but the correlated terminal still owns
+                            // the exact catalog projection used by the picker.
+                            return;
+                        }
                         apply_native_session_changed(
                             session_id,
                             changed.working_dir,
@@ -11965,6 +12090,53 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::SnapshotRestoreFinished { .. } => return,
+                CodingRuntimeEvent::SessionResumeFinished(result) => {
+                    match result {
+                        Err(error) => {
+                            ctx.pending_session_resume = None;
+                            let message = error.to_string();
+                            renderer.render(UiLine::Error(
+                                crate::i18n::t(crate::i18n::Msg::SessionLoadFailed {
+                                    error: &message,
+                                })
+                                .into_owned(),
+                            ));
+                            renderer.flush();
+                        }
+                        Ok(changed) => {
+                            let pending = ctx.pending_session_resume.take();
+                            let matches = pending
+                                .as_ref()
+                                .is_some_and(|pending| session_resume_matches(pending, &changed));
+                            if matches {
+                                let pending = pending.expect("checked above");
+                                commit_native_session_changed(
+                                    pending.session,
+                                    changed.working_dir,
+                                    state,
+                                    renderer,
+                                    ctx,
+                                );
+                            } else {
+                                renderer.render(UiLine::Error(
+                                    "session resume returned an unexpected identity; following the runtime owner"
+                                        .into(),
+                                ));
+                                renderer.flush();
+                                if let Some(session_id) = changed.session_id {
+                                    apply_native_session_changed(
+                                        session_id,
+                                        changed.working_dir,
+                                        state,
+                                        renderer,
+                                        ctx,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 CodingRuntimeEvent::ProviderChanged { provider, model } => {
                     let announcement = if let Some(pending) = ctx.pending_provider_reload.take() {
                         ctx.config = pending.desired_config;
@@ -12075,6 +12247,12 @@ fn publish_live_runtime_event(
         bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => {
             atomcode_daemon::native_live::publish(binding, envelope.clone())
         }
+        // Driver-correlated completion is consumed only by this TUI. Publishing
+        // it as an unsequenced live event would advance the hub sequence outside
+        // CodingRuntime's authoritative event stream.
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::SessionResumeFinished(_)) => {
+            return Ok(());
+        }
         bg_runtime::RuntimeEventPayload::Native(event) => {
             atomcode_daemon::native_live::publish_unsequenced(binding, event.clone())
         }
@@ -12096,7 +12274,11 @@ fn apply_native_session_changed(
     if ctx.current_session.id == session_id {
         return;
     }
-    let session = match atomcode_daemon::legacy_convert::find_catalog_session_view(&session_id) {
+    let project_bucket = atomcode_capabilities::session::SessionManager::project_hash(&working_dir);
+    let session = match atomcode_daemon::legacy_convert::load_catalog_session_view_in_project(
+        &project_bucket,
+        &session_id,
+    ) {
         Ok(Some(session)) => match Session::from_catalog_view(session) {
             Ok(session) => session,
             Err(error) => {
@@ -12123,6 +12305,17 @@ fn apply_native_session_changed(
         }
     };
 
+    commit_native_session_changed(session, working_dir, state, renderer, ctx);
+}
+
+fn commit_native_session_changed(
+    session: Session,
+    working_dir: PathBuf,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+) {
+    let session_id = session.id.clone();
     if ctx.working_dir != working_dir {
         ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, working_dir.clone()));
         ctx.file_index.reset(working_dir.clone());
@@ -14178,134 +14371,6 @@ fn handle_agent_event(
                 mode.label()
             )));
             renderer.flush();
-        }
-        AgentEvent::SessionSwitched(session_id) => {
-            // 另一端（webui 新建对话 / webui 侧栏切到已存在会话）切换了会话，
-            // 同步模式的 TUI 跟随。按 session_id 跨项目定位会话文件：
-            //  - webui「新建」：文件已落盘但为空 → 回放空历史 = 干净空白会话；
-            //  - webui 切到「已存在」会话：把该会话的历史一并加载、回放进 TUI。
-            // 二者统一走 load_any，省掉「新建/切换」分支。找不到文件（罕见）才退回
-            // 到「按指定 id 建空白会话」的旧行为。
-            crate::tuix_trace!(
-                "TUI",
-                "SessionSwitched: session_id={}, live_binding={}",
-                session_id,
-                ctx.live_binding.is_some()
-            );
-            let sid = session_id;
-            // 自回声守卫：TUI 自己发起的切换（/new、/resume 等，见 sync_local_session_switch）
-            // 会经 live_switch_session 广播、再经转发器回流到这里。此时本地切换已完成、
-            // ctx.current_session.id 已是目标 id，无需重复清场/回放/重挂——直接忽略，避免
-            // 双重渲染。仅「另一端发起」的切换（id 与当前不同）才走下面的完整跟随逻辑。
-            // 与 ProviderChanged 臂同款的自回声去重。
-            if ctx.current_session.id == sid {
-                crate::tuix_trace!(
-                    "TUI",
-                    "SessionSwitched: self-echo for current session, ignoring"
-                );
-                return;
-            }
-            let loaded = match atomcode_daemon::legacy_convert::find_catalog_session_view(&sid) {
-                Ok(session) => session.map(Session::from_catalog_view).transpose(),
-                Err(error) => {
-                    renderer.render(UiLine::Error(format!(
-                        "Failed to resolve session {}: {error}",
-                        sid.as_str()
-                    )));
-                    renderer.flush();
-                    return;
-                }
-            };
-            let loaded = match loaded {
-                Ok(session) => session,
-                Err(error) => {
-                    renderer.render(UiLine::Error(format!(
-                        "Failed to decode session {}: {error}",
-                        sid
-                    )));
-                    renderer.flush();
-                    return;
-                }
-            };
-
-            // 重置对话与计数（无论加载成功与否都先清场）。
-            ctx.runtime
-                .dispatch(atomcode_coding::DriverCommand::FreshSession)
-                .ok();
-            state.total_tokens = 0;
-            state.prompt_tokens = 0;
-            state.completion_tokens = 0;
-            state.cached_tokens = 0;
-            state.last_context = None;
-            state.pending_context_render = None;
-            state.thinking_idx = 0;
-            state.on_turn_complete();
-            state.active_todos = None;
-            sync_todo_titles(state); // drop prior session's titles
-            state.approval_panel = None;
-
-            // 目标会话所属目录：已存在会话用其自身 working_dir；建不出来时沿用当前目录。
-            let target_session = match loaded {
-                Some(session) => {
-                    // 该会话属于另一个项目 → 先像 /cd 一样切目录（与 webui handleSelectSession
-                    // 的 setCwd 对齐），保证后续回合在正确项目里执行、@-索引/会话列表也跟随。
-                    if ctx.working_dir != session.working_dir {
-                        commands::apply_cd(ctx, session.working_dir.clone());
-                    }
-                    ctx.current_session_id = Some(sid.clone());
-                    session
-                }
-                None => {
-                    // 罕见：磁盘上找不到该会话（如 webui 刚新建、广播早于落盘）。
-                    // 退回旧行为：用指定 id 建一个空白会话，保证三端落同一文件。
-                    ctx.current_session_id = None;
-                    let mut new_session = Session::default_session(ctx.working_dir.clone());
-                    new_session.id = sid;
-                    new_session
-                }
-            };
-
-            // 切换会话：停掉任何进行中的 /loop，避免其 TUI 侧定时器把旧 payload 打进
-            // 新会话（并清掉残留的 footer）。ClearLoop 在下面 SetConversation 之前送达。
-            commands::stop_active_loop(state, ctx);
-            // 把历史灌进 agent 会话，使后续回合带上下文（空会话则等价于清空）。
-            ctx.runtime
-                .dispatch(atomcode_coding::DriverCommand::RestoreSnapshot(
-                    atomcode_daemon::legacy_convert::snapshot_to_kernel(
-                        &target_session.to_conversation_snapshot(),
-                    ),
-                ))
-                .ok();
-            commands::bind_telemetry_to_session(ctx, &target_session);
-            ctx.current_session = target_session;
-            ctx.bg_manager
-                .set_foreground_session(ctx.current_session.clone());
-
-            // 重绘画布并回放目标会话历史（/resume 同款干净回放，不带「同步快照」分隔）。
-            renderer.begin_sync();
-            renderer.reset();
-            if ctx.current_session.messages.is_empty() {
-                let dir_display =
-                    crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-                renderer.render(UiLine::Welcome {
-                    model: ctx.model_name.clone(),
-                    working_dir: dir_display,
-                });
-                renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::CmdNewSession).into_owned(),
-                ));
-            } else {
-                crate::modals::session_picker::replay_session(
-                    renderer,
-                    state,
-                    &ctx.current_session,
-                    true,
-                );
-            }
-            renderer.flush();
-            renderer.end_sync();
-
-            commands::sync_local_session_switch(ctx, renderer);
         }
         AgentEvent::SessionRenamed { name } => {
             // AI session-namer renamed the active session (fire-and-forget after

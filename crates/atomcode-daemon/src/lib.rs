@@ -3147,8 +3147,16 @@ async fn process_chat_request(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
     let (session_id, initial_snapshot) = if let Some(ref session_id_str) = req.session_id {
-        let session = crate::legacy_convert::find_catalog_session_view(session_id_str)?
-            .ok_or_else(|| anyhow::anyhow!("session {session_id_str:?} not found"))?;
+        let project_bucket = NativeSessionManager::project_hash(&working_dir);
+        let session = crate::legacy_convert::load_catalog_session_view_in_project(
+            &project_bucket,
+            session_id_str,
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "session {session_id_str:?} not found in project bucket {project_bucket}"
+            )
+        })?;
         (
             session.meta.id,
             crate::legacy_convert::snapshot_to_core(&session.snapshot),

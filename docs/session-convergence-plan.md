@@ -628,6 +628,38 @@ undo、compact/checkpoint、rename、AI naming、UI-only append 均只写 native
 background/live 的 core JSON save 与 live mirror writer 已删除。当前可以声明 core JSON writer 子接口面
 已退役，但 core 读取投影、反向转换与 importer DTO 仍可达，整体仍是状态③。
 
+#### S4b 补充审计：TUI `/resume` 精确定位与事务提交
+
+2026-07-21 复核发现，上述“resume 通过同一 lease 建立或导入 native session”的完成声明对启动时
+`--continue` 成立，但 TUI `/resume` 仍有两个缺口：picker 从当前项目 catalog 得到条目后丢弃
+`project_bucket`，Enter 又按 id 全局查询；加载后使用 `RestoreSnapshot` 替换旧 binding 的 snapshot，
+而不是让 runtime 切换 `SessionBinding`。因此同一 id 跨 bucket 时会误报歧义，即使加载成功也可能让
+UI session 与 runtime 持久化 owner 不一致。S4b 在以下补充项完成前不得视为 TUI 入口已完成：
+
+1. picker 的选择值保留 `(project_bucket, id)`；load、rename、delete 使用同一位置，global find 继续
+   fail-closed，不用时间戳或目录顺序消歧；
+2. Enter 在目标 bucket 下获取 lease 并执行 legacy/unconfirmed → native 收敛，导入结果和同一 lease
+   一起交给 `CodingRuntime` 的 resume reprepare；禁止导入后释放 lease 再重新竞争；
+3. runtime 在旧 agent 仍可用时预构建目标 session candidate；成功后才发布新 generation 和
+   `SessionChanged`，失败时保持旧 binding、cwd、snapshot、provider、grant 和 UI 不变；
+4. TUI 等待一个显式 resume terminal；成功后才提交 `current_session`、telemetry、todo/context 投影和
+   replay，失败只显示错误。禁止 `.ok()` 吞掉 delivery/runtime 错误；
+5. `RestoreSnapshot` 仅保留给同一 session 内的 undo/局部历史替换，不再承担 session switch；
+6. 通用 `SessionChanged` 消费方按事件携带的 working directory 计算 project bucket 并精确读取，避免
+   runtime 已成功切换后又走一次全局 ambiguous 查询；WebUI/live resume 也必须使用
+   当前 live binding 的 bucket 和同一 lease，`/chat` 携带 session id 时也按请求 working directory
+   精确读取；TUI 中另起 `FreshSession + RestoreSnapshot` 的无生产方旧分支直接退役；
+7. 回归测试覆盖：同 id 跨 bucket 精确选择、legacy 越界 boundary 导入、目标 lease 冲突、candidate
+   构建失败回滚、成功后只写目标 session、旧 generation 迟到事件不污染 UI。
+
+2026-07-21 上述补充项已完成：TUI picker、live 切换和 `/chat` 的定位路径已改为
+project-scoped，picker/live 的 cutover lease 会直接转移给 runtime；TUI 的旧二次恢复分支及其
+UI event surface 已删除。该子切片已达到退役态，但整体 session 收口仍保留 core 读取投影、
+反向转换与 legacy importer，仍是整体状态③。
+
+边界：重复 session 的数据清理不是恢复事务的一部分；没有显式选择和内容比对时不得自动删除或合并。
+MCP 启动失败也属于独立 capability 配置问题，不与 session 恢复补丁混做。
+
 ### S5：Core session 持久化 surface 退役
 
 前置：生产写路径已经 native-only；接下来的工作只退役磁盘读取投影、兼容 DTO 和 core session

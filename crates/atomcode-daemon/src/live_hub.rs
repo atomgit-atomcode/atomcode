@@ -353,13 +353,21 @@ impl LiveViewHub {
         Ok(generation)
     }
 
-    pub async fn resume_session(
+    pub async fn resume_session_with_lease(
         &self,
         session_id: String,
+        working_dir: PathBuf,
+        lease: atomcode_capabilities::session::SessionLease,
     ) -> Result<atomcode_coding::SessionChanged, HubError> {
         let (binding, handle) = self.bound_handle()?;
+        if binding.working_dir != working_dir {
+            return Err(HubError::RuntimeRejected(format!(
+                "prepared session directory {:?} does not match live binding {:?}",
+                working_dir, binding.working_dir
+            )));
+        }
         let changed = handle
-            .resume_session(session_id)
+            .resume_session_with_lease(session_id, working_dir, lease)
             .await
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
         self.commit_changed_snapshot(&binding, &handle, &changed)

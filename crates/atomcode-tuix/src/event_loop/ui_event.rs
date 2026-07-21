@@ -159,7 +159,6 @@ pub enum UiEvent {
         plan: bool,
         bypass: bool,
     },
-    SessionSwitched(String),
     SessionRenamed {
         name: String,
     },

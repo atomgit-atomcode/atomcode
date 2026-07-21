@@ -2176,7 +2176,7 @@ mod tests {
     #[test]
     fn active_todos_persist_across_cancel_and_error() {
         // The todo panel is PER-SESSION state (see reset_to_new_session /
-        // SessionSwitched, which drop it), NOT per-turn — it already survives
+        // native SessionChanged, which drop it), NOT per-turn — it already survives
         // turn COMPLETE (active_todos_persists_across_turn_end). Cancel and
         // error are just turn terminations too, so they must preserve it as
         // well. Regression: clearing on cancel/error nuked the plan, and since

@@ -34,6 +34,16 @@ pub struct CatalogSessionView {
     pub presentation: PresentationFile,
 }
 
+/// Exact catalog selection prepared for a runtime resume. The importer and the
+/// replacement runtime share `lease`; dropping this value before handing the
+/// guard to `CodingRuntime` intentionally abandons the switch.
+#[derive(Debug)]
+pub struct PreparedCatalogSessionResume {
+    pub project_bucket: String,
+    pub view: CatalogSessionView,
+    pub lease: SessionLease,
+}
+
 impl From<ConvertedLegacySession> for CatalogSessionView {
     fn from(value: ConvertedLegacySession) -> Self {
         Self {
@@ -671,6 +681,55 @@ pub fn load_catalog_session_view_in_project(
     load_catalog_session_view_in_project_root(&SessionManager::sessions_root(), project_bucket, id)
 }
 
+/// Resolve one exact catalog location, converge it to native ownership under an
+/// exclusive lease, and return that same guard for transfer into CodingRuntime.
+pub fn prepare_catalog_session_resume_in_project(
+    project_bucket: &str,
+    id: &str,
+) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
+    prepare_catalog_session_resume_in_project_root(
+        &SessionManager::sessions_root(),
+        project_bucket,
+        id,
+    )
+}
+
+fn prepare_catalog_session_resume_in_project_root(
+    sessions_root: &std::path::Path,
+    project_bucket: &str,
+    id: &str,
+) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
+    validate_project_bucket(project_bucket)?;
+    let scan = SessionManager::scan_catalog(sessions_root);
+    report_catalog_diagnostics(&scan.diagnostics);
+    let Some(entry) = scan
+        .entries
+        .iter()
+        .find(|entry| entry.project_bucket == project_bucket && entry.id == id)
+    else {
+        let project_diagnostics: Vec<_> = scan
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.project_bucket.as_deref() == Some(project_bucket))
+            .cloned()
+            .collect();
+        reject_matching_catalog_diagnostic(&project_diagnostics, id)?;
+        return Ok(None);
+    };
+    let manager = SessionManager::with_root(sessions_root.join(project_bucket));
+    let lease = manager.acquire_lease(id)?;
+    let outcome = converge_session(&manager, &lease)?;
+    Ok(Some(PreparedCatalogSessionResume {
+        project_bucket: entry.project_bucket.clone(),
+        view: CatalogSessionView {
+            snapshot: outcome.snapshot,
+            meta: outcome.meta,
+            presentation: outcome.presentation,
+        },
+        lease,
+    }))
+}
+
 fn load_catalog_session_view_in_project_root(
     sessions_root: &std::path::Path,
     project_bucket: &str,
@@ -1168,6 +1227,81 @@ mod tests {
             .expect("unrelated valid sessions must remain usable");
         let error = reject_matching_catalog_diagnostic(&[diagnostic], "damaged").unwrap_err();
         assert!(error.to_string().contains("sidecars but no metadata"));
+    }
+
+    #[test]
+    fn prepared_resume_keeps_exact_bucket_and_holds_cutover_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "same-id";
+        let first_bucket = "1111111111111111";
+        let second_bucket = "2222222222222222";
+        for (bucket, text) in [(first_bucket, "first"), (second_bucket, "second")] {
+            let manager = SessionManager::with_root(root.path().join(bucket));
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot =
+                atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(text)]);
+            let mut meta = SessionMeta::new(id, format!("/{text}"), 1);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+        }
+
+        let prepared =
+            prepare_catalog_session_resume_in_project_root(root.path(), first_bucket, id)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(prepared.project_bucket, first_bucket);
+        assert_eq!(prepared.view.snapshot.messages[0].text, "first");
+        let first = SessionManager::with_root(root.path().join(first_bucket));
+        let second = SessionManager::with_root(root.path().join(second_bucket));
+        assert!(matches!(
+            first.acquire_lease(id),
+            Err(atomcode_capabilities::session::SessionStoreError::SessionInUse { .. })
+        ));
+        assert!(second.acquire_lease(id).is_ok());
+
+        drop(prepared);
+        assert!(first.acquire_lease(id).is_ok());
+    }
+
+    #[test]
+    fn prepared_resume_repairs_out_of_range_legacy_boundary_before_lease_transfer() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = "3333333333333333";
+        let mut legacy = full_legacy_session();
+        legacy.turn_stats[0].after_message = legacy.messages.len() + 1;
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        std::fs::create_dir_all(manager.root()).unwrap();
+        std::fs::write(
+            manager.legacy_path(&legacy.id).unwrap(),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let prepared =
+            prepare_catalog_session_resume_in_project_root(root.path(), bucket, &legacy.id)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(prepared.view.meta.owner, StorageOwner::Native);
+        assert!(prepared
+            .view
+            .meta
+            .turn_stats
+            .iter()
+            .all(|stat| stat.after_message <= prepared.view.snapshot.messages.len()));
+        assert!(matches!(
+            manager.acquire_lease(&legacy.id),
+            Err(atomcode_capabilities::session::SessionStoreError::SessionInUse { .. })
+        ));
     }
 
     #[test]

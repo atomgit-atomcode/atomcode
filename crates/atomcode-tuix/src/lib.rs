@@ -788,6 +788,7 @@ pub async fn run(
         replay_on_start: session_to_continue,
         file_index: crate::event_loop::file_index::FileIndex::new(file_index_root),
         current_session_id: None,
+        pending_session_resume: None,
         clipboard_check: std::sync::Arc::new(std::sync::Mutex::new(
             crate::event_loop::ClipboardCheckState::default(),
         )),

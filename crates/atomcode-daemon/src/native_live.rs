@@ -174,7 +174,29 @@ pub async fn reload_provider(
 pub async fn resume_session(
     session_id: String,
 ) -> Result<atomcode_coding::SessionChanged, HubError> {
-    hub().resume_session(session_id).await
+    let binding = hub().binding()?;
+    if binding.session_id == session_id {
+        return Ok(atomcode_coding::SessionChanged {
+            generation: atomcode_coding::RuntimeGeneration(binding.generation),
+            session_id: Some(binding.session_id),
+            working_dir: binding.working_dir,
+        });
+    }
+    let project_bucket =
+        atomcode_capabilities::session::SessionManager::project_hash(&binding.working_dir);
+    let prepared = crate::legacy_convert::prepare_catalog_session_resume_in_project(
+        &project_bucket,
+        &session_id,
+    )
+    .map_err(|error| HubError::RuntimeRejected(error.to_string()))?
+    .ok_or_else(|| {
+        HubError::RuntimeRejected(format!(
+            "session {session_id:?} not found in project bucket {project_bucket}"
+        ))
+    })?;
+    hub()
+        .resume_session_with_lease(session_id, binding.working_dir, prepared.lease)
+        .await
 }
 
 pub async fn change_directory(

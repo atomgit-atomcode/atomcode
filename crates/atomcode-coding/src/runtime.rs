@@ -92,6 +92,7 @@ pub enum CodingRuntimeEvent {
         correlation_id: u64,
         result: Result<Arc<SessionSnapshot>, RuntimeError>,
     },
+    SessionResumeFinished(Result<SessionChanged, RuntimeError>),
     ProviderReloadFinished(Result<RuntimeGeneration, RuntimeError>),
     ProviderDeactivationFinished(Result<RuntimeGeneration, RuntimeError>),
     ControllerWarning(String),
@@ -1127,6 +1128,24 @@ impl CodingRuntimeHandle {
             .await
     }
 
+    /// Resume a session whose catalog cutover lease is already held by the driver.
+    /// The same guard is validated and transferred into the replacement
+    /// [`SessionBinding`], so legacy import and runtime ownership have no unlocked
+    /// window between them.
+    pub async fn resume_session_with_lease(
+        &self,
+        id: impl Into<String>,
+        working_dir: std::path::PathBuf,
+        lease: SessionLease,
+    ) -> Result<SessionChanged, RuntimeError> {
+        self.reprepare_target(ReprepareTarget::ResumeWithLease {
+            id: id.into(),
+            working_dir,
+            lease,
+        })
+        .await
+    }
+
     pub async fn change_directory(
         &self,
         directory: std::path::PathBuf,
@@ -1629,6 +1648,11 @@ pub enum ReprepareTarget {
     Reload,
     Fresh,
     Resume(String),
+    ResumeWithLease {
+        id: String,
+        working_dir: std::path::PathBuf,
+        lease: SessionLease,
+    },
     ChangeDirectory(std::path::PathBuf),
 }
 
@@ -2927,7 +2951,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
-                        let input = match resolve_reprepare_input(&runtime, target) {
+                        let (input, prepared_lease) = match resolve_reprepare_input(&runtime, target) {
                             Ok(input) => input,
                             Err(error) => {
                                 resources = Some(runtime);
@@ -2950,10 +2974,9 @@ fn spawn_runtime_owner_with_optional_agent(
 
                         // Preflight the complete capability graph while the current agent is
                         // still alive. A prepare failure must leave the old runtime untouched.
-                        let reuse_lease = matching_session_lease(
-                            &runtime.parts,
-                            &input.prepare.session,
-                        );
+                        let reuse_lease = prepared_lease.or_else(|| {
+                            matching_session_lease(&runtime.parts, &input.prepare.session)
+                        });
                         let candidate_parts = prepare_with_plugin_hook_source_reusing_lease(
                             &input.config,
                             input.prepare.clone(),
@@ -4006,38 +4029,87 @@ async fn receive_agent_event(agent: &mut Option<AgentHandle>) -> Option<AgentEve
 fn resolve_reprepare_input(
     runtime: &RuntimeResources,
     target: ReprepareTarget,
-) -> Result<ReprepareInput, RuntimeError> {
+) -> Result<(ReprepareInput, Option<SessionLease>), RuntimeError> {
     match target {
-        ReprepareTarget::Exact(input) => Ok(input),
+        ReprepareTarget::Exact(input) => Ok((input, None)),
         ReprepareTarget::Reload => {
             let mut prepare = runtime.prepare.clone();
             prepare.session = match runtime.parts.session.as_ref() {
                 Some(binding) => crate::SessionMode::Resume(binding.id.clone()),
                 None => crate::SessionMode::Disabled,
             };
-            Ok(ReprepareInput {
-                config: runtime.config.clone(),
-                prepare,
-                operation: ReconfigureKind::Reprepare,
-            })
+            Ok((
+                ReprepareInput {
+                    config: runtime.config.clone(),
+                    prepare,
+                    operation: ReconfigureKind::Reprepare,
+                },
+                None,
+            ))
         }
         ReprepareTarget::Fresh => {
             let mut prepare = runtime.prepare.clone();
             prepare.session = crate::SessionMode::Fresh;
-            Ok(ReprepareInput {
-                config: runtime.config.clone(),
-                prepare,
-                operation: ReconfigureKind::FreshSession,
-            })
+            Ok((
+                ReprepareInput {
+                    config: runtime.config.clone(),
+                    prepare,
+                    operation: ReconfigureKind::FreshSession,
+                },
+                None,
+            ))
         }
         ReprepareTarget::Resume(id) => {
             let mut prepare = runtime.prepare.clone();
             prepare.session = crate::SessionMode::Resume(id);
-            Ok(ReprepareInput {
-                config: runtime.config.clone(),
-                prepare,
-                operation: ReconfigureKind::ResumeSession,
-            })
+            Ok((
+                ReprepareInput {
+                    config: runtime.config.clone(),
+                    prepare,
+                    operation: ReconfigureKind::ResumeSession,
+                },
+                None,
+            ))
+        }
+        ReprepareTarget::ResumeWithLease {
+            id,
+            working_dir,
+            lease,
+        } => {
+            if lease.id() != id {
+                return Err(RuntimeError::ReconfigureFailed(format!(
+                    "prepared session lease is for {:?}, not {:?}",
+                    lease.id(),
+                    id
+                )));
+            }
+            if !working_dir.is_absolute() {
+                return Err(RuntimeError::InvalidWorkingDirectory(format!(
+                    "session working directory is not absolute: {}",
+                    working_dir.display()
+                )));
+            }
+            if !working_dir.is_dir() {
+                return Err(RuntimeError::InvalidWorkingDirectory(format!(
+                    "session working directory is not a directory: {}",
+                    working_dir.display()
+                )));
+            }
+            let mut config = runtime.config.clone();
+            // Do not canonicalize here. The persisted project bucket is keyed by
+            // this exact path spelling (`/var` and `/private/var` differ on macOS),
+            // and the transferred lease below is the authority that validates it.
+            config.working_dir = working_dir;
+            let mut prepare = runtime.prepare.clone();
+            prepare.session = crate::SessionMode::Resume(id);
+            Ok((
+                ReprepareInput {
+                    config,
+                    prepare,
+                    operation: ReconfigureKind::ResumeSession,
+                },
+                Some(lease),
+            ))
         }
         ReprepareTarget::ChangeDirectory(directory) => {
             let target = if directory.is_absolute() {
@@ -4062,11 +4134,14 @@ fn resolve_reprepare_input(
             config.working_dir = canonical;
             let mut prepare = runtime.prepare.clone();
             prepare.session = crate::SessionMode::Fresh;
-            Ok(ReprepareInput {
-                config,
-                prepare,
-                operation: ReconfigureKind::ChangeDirectory,
-            })
+            Ok((
+                ReprepareInput {
+                    config,
+                    prepare,
+                    operation: ReconfigureKind::ChangeDirectory,
+                },
+                None,
+            ))
         }
     }
 }
@@ -6668,6 +6743,94 @@ mod tests {
         ));
         runtime.handle.shutdown().await.unwrap();
         manager.acquire_lease(id).unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn prepared_resume_transfers_exact_lease_and_keeps_old_snapshot_unchanged() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        let target_id = "prepared-target";
+        let target_snapshot = SessionSnapshot::new(vec![Message::user("target history")]);
+        let target_lease = manager.acquire_lease(target_id).unwrap();
+        let mut target_meta = SessionMeta::new(target_id, project.path().to_string_lossy(), 1);
+        target_meta.owner = StorageOwner::Native;
+        target_meta.message_count = 1;
+        manager
+            .commit_native_import(
+                &target_lease,
+                Some(&target_snapshot),
+                Some(&PresentationFile::default()),
+                &target_meta,
+            )
+            .unwrap();
+
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let old_id = runtime.session.as_ref().unwrap().id.clone();
+        let old_snapshot = manager.load_snapshot(&old_id).unwrap();
+
+        let changed = runtime
+            .handle
+            .resume_session_with_lease(target_id, project.path().to_path_buf(), target_lease)
+            .await
+            .unwrap();
+
+        assert_eq!(changed.session_id.as_deref(), Some(target_id));
+        let resumed = runtime.handle.snapshot().await.unwrap();
+        assert!(resumed.messages.iter().any(|message| {
+            message.role == atomcode_kernel::message::Role::User && message.text == "target history"
+        }));
+        assert_eq!(manager.load_snapshot(&old_id).unwrap(), old_snapshot);
+        assert!(manager.acquire_lease(&old_id).is_ok());
+        assert!(matches!(
+            manager.acquire_lease(target_id),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn prepared_resume_rejects_a_lease_for_another_session() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        manager
+            .save_snapshot(
+                "target-session",
+                &SessionSnapshot::new(vec![Message::user("target history")]),
+            )
+            .unwrap();
+        let wrong_lease = manager.acquire_lease("other-session").unwrap();
+
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let old_id = runtime.session.as_ref().unwrap().id.clone();
+
+        let result = runtime
+            .handle
+            .resume_session_with_lease("target-session", project.path().to_path_buf(), wrong_lease)
+            .await;
+
+        assert!(matches!(result, Err(RuntimeError::ReconfigureFailed(_))));
+        assert_eq!(runtime.handle.status().generation, 0);
+        assert!(matches!(
+            manager.acquire_lease(&old_id),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        assert!(manager.acquire_lease("target-session").is_ok());
+        assert!(manager.acquire_lease("other-session").is_ok());
+
+        runtime.handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]

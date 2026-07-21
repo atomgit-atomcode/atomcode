@@ -1390,9 +1390,9 @@ pub(crate) struct LiveSwitchSessionReq {
 /// POST /live/switch_session — webui 切到「已存在」的会话时广播会话切换，
 /// 让同进程 sync 模式的 TUI 跟随加载该会话（含历史）。
 ///
-/// 与新建会话（create_session）走同一条广播：仅带 session_id；TUI 侧按 id
-/// 跨项目定位会话文件（SessionManager::load_any），据其 working_dir 切目录、
-/// 回放历史。无绑定 runtime 时明确返回拒绝，不隐式创建另一条执行路径。
+/// 目标会话在当前 live binding 的 project bucket 内精确定位，并在
+/// legacy 收敛后将同一 lease 交给 CodingRuntime。无绑定 runtime 时明确
+/// 返回拒绝，不隐式创建另一条执行路径。
 pub(crate) async fn live_switch_session_endpoint(
     Json(req): Json<LiveSwitchSessionReq>,
 ) -> impl IntoResponse {

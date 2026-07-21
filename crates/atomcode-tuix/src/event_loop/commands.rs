@@ -208,6 +208,7 @@ pub fn validate_session_name(name: &str) -> Option<String> {
 
 /// Rename a session after validation, persist it, and return old/new names.
 pub fn perform_session_rename(
+    project_bucket: &str,
     session_id: &SessionId,
     new_name: &str,
 ) -> Result<(String, String), String> {
@@ -215,14 +216,17 @@ pub fn perform_session_rename(
         return Err(err);
     }
     let new_name = new_name.trim().to_string();
-    let old_name =
-        atomcode_daemon::legacy_convert::rename_catalog_session(session_id.as_str(), &new_name)
-            .map_err(|e| {
-                t(Msg::SessionSaveFailed {
-                    error: &e.to_string(),
-                })
-                .into_owned()
-            })?;
+    let old_name = atomcode_daemon::legacy_convert::rename_catalog_session_in_project(
+        project_bucket,
+        session_id.as_str(),
+        &new_name,
+    )
+    .map_err(|e| {
+        t(Msg::SessionSaveFailed {
+            error: &e.to_string(),
+        })
+        .into_owned()
+    })?;
     Ok((old_name, new_name))
 }
 
@@ -2144,7 +2148,7 @@ fn execute_slash_command_impl(
                     state.on_turn_complete();
                     // The todo panel is per-session and is NOT cleared at turn end;
                     // this fresh foreground session has no todos, so drop the prior
-                    // session's list (mirrors reset_to_new_session / SessionSwitched).
+                    // session's list (mirrors reset_to_new_session / native SessionChanged).
                     state.active_todos = None;
                     crate::event_loop::sync_todo_titles(state); // drop prior session's titles
                     state.approval_panel = None;

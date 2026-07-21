@@ -87,8 +87,12 @@ impl SessionPicker {
     }
 
     pub fn chosen_id(&self) -> Option<String> {
-        let i = *self.filtered.get(self.selected)?;
-        self.sessions.get(i).map(|s| s.id.clone())
+        self.chosen_session().map(|session| session.id.clone())
+    }
+
+    fn chosen_session(&self) -> Option<&SessionMeta> {
+        let index = *self.filtered.get(self.selected)?;
+        self.sessions.get(index)
     }
 
     /// The static key-legend hint advertising the picker's actions
@@ -135,7 +139,11 @@ impl Modal for SessionPicker {
                     if let Some(idx) = self.filtered.get(self.selected).copied() {
                         if let Some(session_meta) = self.sessions.get(idx) {
                             let id = session_meta.id.clone();
-                            match perform_session_rename(&id, &self.rename_buffer) {
+                            match perform_session_rename(
+                                &session_meta.project_bucket,
+                                &id,
+                                &self.rename_buffer,
+                            ) {
                                 Ok((old_name, new_name)) => {
                                     // Update the session name in our local list
                                     if let Some(s) = self.sessions.get_mut(idx) {
@@ -250,12 +258,8 @@ impl Modal for SessionPicker {
                     // Second Ctrl+D: confirm delete
                     if let Some(session) = self.sessions.get(idx) {
                         let id = session.id.clone();
-                        let project_bucket =
-                            atomcode_capabilities::session::SessionManager::project_hash(
-                                &session.working_dir,
-                            );
                         match atomcode_daemon::legacy_convert::delete_catalog_session_in_project(
-                            &project_bucket,
+                            &session.project_bucket,
                             id.as_str(),
                         ) {
                             Ok(()) => {
@@ -304,55 +308,71 @@ impl Modal for SessionPicker {
                 Ok(ModalAction::Continue)
             }
             KeyCode::Enter => {
-                let Some(id) = self.chosen_id() else {
+                let Some(selected) = self.chosen_session().cloned() else {
                     // Filter matched nothing — ignore Enter, stay open.
                     return Ok(ModalAction::Continue);
                 };
-                match atomcode_daemon::legacy_convert::find_catalog_session_view(id.as_str())
-                    .and_then(|view| {
-                        let view = view
-                            .ok_or_else(|| anyhow::anyhow!("session {} not found", id.as_str()))?;
-                        Session::from_catalog_view(view)
-                    }) {
-                    Ok(session) => {
-                        ctx.current_session_id = Some(id);
-                        replay_session(renderer, state, &session, true);
-                        ctx.runtime
-                            .dispatch(atomcode_coding::DriverCommand::RestoreSnapshot(
-                                atomcode_daemon::legacy_convert::snapshot_to_kernel(
-                                    &session.to_conversation_snapshot(),
-                                ),
-                            ))
-                            .ok();
-                        // Continue accumulating into the same session file —
-                        // future TurnComplete saves overwrite it. Bind
-                        // telemetry + agent (header/datalog) to the resumed
-                        // session's persistent id so /resume reuses its
-                        // original id (gateway routes back to the warm upstream).
-                        crate::event_loop::commands::bind_telemetry_to_session(ctx, &session);
-                        ctx.current_session = session;
-                        ctx.bg_manager
-                            .set_foreground_session(ctx.current_session.clone());
-                        state.on_turn_complete();
-                        // 同步模式：把这次「本地切换到历史会话」双向同步到 webui，并把
-                        // 已共享时用新的 committed snapshot 原子更新 live hub。
-                        crate::event_loop::commands::sync_local_session_switch(ctx, renderer);
-                        Ok(ModalAction::Close)
-                    }
-                    Err(e) => {
-                        ctx.current_session_id = None;
-                        state.total_tokens = 0;
-                        state.thinking_idx = 0;
-                        state.on_turn_complete();
-                        let msg = format!("{}", e);
-                        renderer.render(UiLine::Error(
-                            crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &msg })
-                                .into_owned(),
-                        ));
-                        renderer.flush();
-                        Ok(ModalAction::Close)
-                    }
+                if selected.id == ctx.current_session.id {
+                    return Ok(ModalAction::Close);
                 }
+                if ctx.pending_session_resume.is_some() {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::SessionLoadFailed {
+                            error: "another session resume is still in progress",
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+                    return Ok(ModalAction::Close);
+                }
+
+                let result = (|| -> anyhow::Result<()> {
+                    let expected_bucket =
+                        atomcode_capabilities::session::SessionManager::project_hash(
+                            &ctx.working_dir,
+                        );
+                    if selected.project_bucket != expected_bucket {
+                        anyhow::bail!(
+                            "selected session moved from project bucket {} to {}",
+                            selected.project_bucket,
+                            expected_bucket
+                        );
+                    }
+                    let prepared =
+                        atomcode_daemon::legacy_convert::prepare_catalog_session_resume_in_project(
+                            &selected.project_bucket,
+                            &selected.id,
+                        )?
+                        .ok_or_else(|| anyhow::anyhow!("session {} not found", selected.id))?;
+                    let project_bucket = prepared.project_bucket;
+                    let session = Session::from_catalog_view(prepared.view)?;
+                    let working_dir = ctx.working_dir.clone();
+                    ctx.runtime
+                        .resume_session(
+                            session.id.clone(),
+                            working_dir.clone(),
+                            prepared.lease,
+                            ctx.foreground_runtime_id,
+                            ctx.runtime_event_tx.clone(),
+                        )
+                        .map_err(|_| anyhow::anyhow!("coding runtime is unavailable"))?;
+                    ctx.pending_session_resume = Some(crate::event_loop::PendingSessionResume {
+                        project_bucket,
+                        session,
+                        working_dir,
+                    });
+                    Ok(())
+                })();
+
+                if let Err(error) = result {
+                    let message = error.to_string();
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &message })
+                            .into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                Ok(ModalAction::Close)
             }
             KeyCode::Esc => {
                 if self.confirm_delete.is_some() {
@@ -750,6 +770,7 @@ mod tests {
         SessionMeta {
             id: format!("id-{name}"),
             name: name.to_string(),
+            project_bucket: "0123456789abcdef".to_string(),
             working_dir: PathBuf::from("/tmp/x"),
             created_at: 0,
             updated_at: 0,

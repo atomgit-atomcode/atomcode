@@ -46,6 +46,9 @@ pub type Session = TuiSession;
 pub struct SessionMeta {
     pub id: SessionId,
     pub name: String,
+    /// Authoritative on-disk catalog location. Session ids are not sufficient:
+    /// historical migrations may leave the same id in more than one project bucket.
+    pub project_bucket: String,
     pub working_dir: PathBuf,
     pub created_at: i64,
     pub updated_at: i64,
@@ -58,6 +61,7 @@ impl From<atomcode_capabilities::session::CatalogEntry> for SessionMeta {
         Self {
             id: entry.id,
             name: entry.name,
+            project_bucket: entry.project_bucket,
             working_dir: entry.working_dir,
             created_at: entry.created_at_ms,
             updated_at: entry.updated_at_ms,
@@ -175,5 +179,30 @@ impl TuiSession {
 
     pub fn short_id(&self) -> &str {
         self.id.get(..8).unwrap_or(&self.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
+
+    #[test]
+    fn catalog_projection_preserves_exact_project_bucket() {
+        let entry = CatalogEntry {
+            id: "same-id".into(),
+            name: "selected".into(),
+            project_bucket: "0123456789abcdef".into(),
+            working_dir: PathBuf::from("/project"),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            message_count: 3,
+            turn_count: 1,
+            presence: CatalogPresence::NativeOnly,
+        };
+
+        let projected = SessionMeta::from(entry);
+
+        assert_eq!(projected.project_bucket, "0123456789abcdef");
     }
 }
