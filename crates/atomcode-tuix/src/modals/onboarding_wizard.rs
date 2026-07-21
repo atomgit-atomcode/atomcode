@@ -197,13 +197,25 @@ fn pad_to_width(s: &str, target: usize) -> String {
 /// panel must not push into the footer.
 const FOOTER_ROWS: usize = 5;
 
+/// Maximum panel width for the onboarding wizard box. Must not exceed
+/// `screen_width - 4` (76 cols on an 80-col terminal) because
+/// `RetainedRenderer::push_body_text_sgr` automatically prepends
+/// `PAD_COL` (2 spaces) and wraps lines at `screen_width - 4`. A panel
+/// of 80 cols on an 80-col terminal would exceed the 76-col wrap budget
+/// and break into double-lines with wrapped right borders.
+pub(super) const MAX_PANEL_WIDTH: usize = 76;
+
+pub(super) fn calc_panel_width(term_cols: u16) -> usize {
+    (term_cols as usize).saturating_sub(4).min(MAX_PANEL_WIDTH)
+}
+
 /// Wrap `lines` with top + bottom padding blanks and a left
 /// indent so the wizard panel sits at the visual centre of the
 /// visible body area. `panel_width` is the horizontal extent of
-/// the widest line (typically the bordered panel — 80 cols
-/// capped); callers pass this in rather than scanning every line
-/// for SGR width because draw_panel-shaped output already commits
-/// to a known width.
+/// the widest line (typically the bordered panel — capped at
+/// `MAX_PANEL_WIDTH`); callers pass this in rather than scanning
+/// every line for SGR width because draw_panel-shaped output
+/// already commits to a known width.
 ///
 /// RetainedRenderer anchors body content to the body region's BOTTOM:
 /// when total pushed rows < body_height, the auto-empty rows appear
@@ -228,7 +240,8 @@ fn center_lines(
     let free = body_rows.saturating_sub(lines.len());
     let top_blanks = free / 2;
     let bottom_blanks = free - top_blanks;
-    let left_pad = term_cols.saturating_sub(panel_width) / 2;
+    let usable_cols = term_cols.saturating_sub(4);
+    let left_pad = usable_cols.saturating_sub(panel_width) / 2;
     let pad_str = " ".repeat(left_pad);
     let mut out = Vec::with_capacity(lines.len() + free);
     for _ in 0..top_blanks {
@@ -581,6 +594,9 @@ impl OnboardingWizard {
     ) -> Vec<String> {
         use crate::i18n::{t, Msg};
         let compact = term_rows < 22;
+        let panel_width = calc_panel_width(term_cols);
+        let inner_width = panel_width.saturating_sub(4);
+        let cell_w = inner_width.saturating_sub(2);
 
         // Step header (above box)
         let mut out = Vec::new();
@@ -598,19 +614,14 @@ impl OnboardingWizard {
             // ANSI Shadow style) broke in fonts that draw `█` at
             // 100% cell coverage while keeping `╔═` at line weight,
             // leaving the shadow outline floating disjointly from
-            // the letter bodies. Each row is 49 cells; 12-col
-            // leading pad centres the 49-wide logo inside
-            // draw_panel's 74-col content area (12 + 49 + 13 = 74).
-            content
-                .push("             ███  █████  ███  █     █  ████  ███  ████  █████".to_string());
-            content
-                .push("            █   █   █   █   █ ██   ██ █     █   █ █   █ █    ".to_string());
-            content
-                .push("            █████   █   █   █ █ █ █ █ █     █   █ █   █ ████ ".to_string());
-            content
-                .push("            █   █   █   █   █ █  █  █ █     █   █ █   █ █    ".to_string());
-            content
-                .push("            █   █   █    ███  █     █  ████  ███  ████  █████".to_string());
+            // the letter bodies. Each row is 49 cells; logo_pad
+            // centres the 49-wide logo inside draw_panel's content area.
+            let logo_pad = " ".repeat(cell_w.saturating_sub(49) / 2);
+            content.push(format!("{logo_pad}███  █████  ███  █     █  ████  ███  ████  █████"));
+            content.push(format!("{logo_pad}█   █   █   █   █ ██   ██ █     █   █ █   █ █    "));
+            content.push(format!("{logo_pad}█████   █   █   █ █ █ █ █ █     █   █ █   █ ████ "));
+            content.push(format!("{logo_pad}█   █   █   █   █ █  █  █ █     █   █ █   █ █    "));
+            content.push(format!("{logo_pad}█   █   █    ███  █     █  ████  ███  ████  █████"));
             content.push(String::new());
             content.push(
                 t(Msg::OnboardingIntroVersionLine {
@@ -643,7 +654,7 @@ impl OnboardingWizard {
             &t(Msg::OnboardingPanelTitle),
             &content,
             "Step 1/3",
-            (term_cols as usize).min(80),
+            panel_width,
             unicode_symbols,
         ));
         ascii_fallback_step(out, unicode_symbols)
@@ -684,7 +695,7 @@ impl OnboardingWizard {
             &t(Msg::OnboardingPanelTitle),
             &content,
             "Step 2/3",
-            (term_cols as usize).min(80),
+            calc_panel_width(term_cols),
             unicode_symbols,
         ));
         ascii_fallback_step(out, unicode_symbols)
@@ -771,7 +782,7 @@ impl OnboardingWizard {
             &t(Msg::OnboardingPanelTitle),
             &content,
             "Step 3/3",
-            (term_cols as usize).min(80),
+            calc_panel_width(term_cols),
             unicode_symbols,
         ));
         ascii_fallback_step(out, unicode_symbols)
@@ -807,7 +818,7 @@ impl OnboardingWizard {
     /// QR glyphs render as `□` tofu on Windows legacy conhost / `LANG=C`
     /// and a tofu QR is silently unscannable — better to show nothing.
     pub(super) fn draw_qr_login_lines(&self, term_cols: u16, unicode_symbols: bool) -> Vec<String> {
-        let panel_width = (term_cols as usize).min(80);
+        let panel_width = calc_panel_width(term_cols);
         let inner_width = panel_width.saturating_sub(4);
         // Cells available for content inside the panel's `│ <2sp> ... <2sp> │`
         // padding. Centring is leading-space prefix; draw_panel adds the
@@ -1040,12 +1051,12 @@ impl crate::modals::Modal for OnboardingWizard {
         renderer: &mut dyn crate::render::Renderer,
     ) {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        // The wizard panel is capped at 80 cols by draw_panel; use that
-        // as the centering anchor so the bordered box stays at the
+        // The wizard panel is capped at MAX_PANEL_WIDTH cols by calc_panel_width;
+        // use that as the centering anchor so the bordered box stays at the
         // canvas middle in wide terminals. Confirm is deliberately
         // left uncentred — it's an inline scrollback message that
         // shares space with the preserved body context.
-        let panel_width = (cols as usize).min(80);
+        let panel_width = calc_panel_width(cols);
         // Mirror of TerminalCaps::unicode_symbols — false on Windows
         // legacy conhost / LANG=C / TERM=dumb. Threaded into the
         // panel + content rendering so those terminals get an ASCII
@@ -2108,5 +2119,31 @@ mod tests {
         assert!(!blob.contains('▀'));
         assert!(!blob.contains('▄'));
         assert!(!blob.contains('█'));
+    }
+
+    #[test]
+    fn panel_line_widths_fit_within_80_col_budget() {
+        // RetainedRenderer prepends PAD_COL (2 spaces) and wraps body lines
+        // at screen_width - 4. On an 80-col terminal, lines passed via
+        // UiLine::CommandOutput must not exceed 76 visible columns so the
+        // right border does not wrap onto a second line.
+        let wizard = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let steps_lines = vec![
+            wizard.draw_intro_lines(80, 24, true),
+            wizard.draw_language_lines(80, true),
+            wizard.draw_setup_lines(80, true),
+            wizard.draw_qr_login_lines(80, true),
+        ];
+
+        for (idx, raw_lines) in steps_lines.into_iter().enumerate() {
+            let centered = center_lines(raw_lines, calc_panel_width(80), 80, 24);
+            for (line_idx, line) in centered.into_iter().enumerate() {
+                let w = UnicodeWidthStr::width(strip_sgr(&line).as_str());
+                assert!(
+                    w <= 76,
+                    "Step {idx} line {line_idx} width ({w}) exceeds 76-col budget: {line:?}"
+                );
+            }
+        }
     }
 }
