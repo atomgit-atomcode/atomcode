@@ -49,6 +49,8 @@ struct RepoArgs {
     refs: Option<String>,
     #[serde(default)]
     tag_message: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
 }
@@ -110,13 +112,14 @@ impl Tool for AtomgitRepoTool {
          \"delete\" (owner+repo), \"fork\" (owner+repo; optional name, private), \
          \"clone\" (owner+repo; optional branch, dir — runs local `git clone`), \
          \"create_tag\" (owner+repo+tag_name; optional refs=start point (default main), \
-         tag_message)."
+         tag_message), \"labels\" (owner+repo — read project labels), \"ensure_label\" \
+         (owner+repo; optional label, default atomcode)."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["list","view","create","delete","fork","clone","create_tag"] },
+                "action": { "type": "string", "enum": ["list","view","create","delete","fork","clone","create_tag","labels","ensure_label"] },
                 "owner": { "type": "string", "description": "Repo owner (org for create). Omit on create for a personal repo." },
                 "repo": { "type": "string", "description": "Repo name for view/delete/fork/clone." },
                 "name": { "type": "string", "description": "New repo name (create) or fork target name." },
@@ -127,6 +130,7 @@ impl Tool for AtomgitRepoTool {
                 "tag_name": { "type": "string", "description": "New tag name (create_tag)." },
                 "refs": { "type": "string", "description": "Start point for create_tag — branch/commit/tag (default main)." },
                 "tag_message": { "type": "string", "description": "Tag description (create_tag, optional)." },
+                "label": { "type": "string", "description": "Label for ensure_label (default \"atomcode\")." },
                 "limit": { "type": "integer", "description": "Max repos for list (default 30)." }
             },
             "required": ["action"]
@@ -134,7 +138,7 @@ impl Tool for AtomgitRepoTool {
     }
     fn risk(&self, args: &str) -> RiskLevel {
         match action_of(args).as_deref() {
-            Some("list") | Some("view") => RiskLevel::Safe,
+            Some("list") | Some("view") | Some("labels") => RiskLevel::Safe,
             _ => RiskLevel::Risky,
         }
     }
@@ -214,6 +218,25 @@ impl Tool for AtomgitRepoTool {
                 _ => err(
                     "atomgit_repo create_tag: owner, repo and tag_name are required".to_string(),
                 ),
+            },
+            "labels" => match (a.owner, a.repo) {
+                (Some(o), Some(r)) => match self.client.repo_labels(&o, &r).await {
+                    Ok(labels) if labels.is_empty() => ok("(no labels)".to_string()),
+                    Ok(labels) => ok(labels.join(", ")),
+                    Err(e) => err(e),
+                },
+                _ => err("atomgit_repo labels: owner and repo are required".to_string()),
+            },
+            "ensure_label" => match (a.owner, a.repo) {
+                (Some(o), Some(r)) => {
+                    let label = a.label.as_deref().unwrap_or("atomcode");
+                    match self.client.repo_ensure_label(&o, &r, label).await {
+                        Ok(true) => ok(format!("Added label {label:?} to {o}/{r}")),
+                        Ok(false) => ok(format!("Label {label:?} already present on {o}/{r}")),
+                        Err(e) => err(e),
+                    }
+                }
+                _ => err("atomgit_repo ensure_label: owner and repo are required".to_string()),
             },
             other => err(format!("atomgit_repo: unknown action {other:?}")),
         }
@@ -916,5 +939,39 @@ mod tests {
             "{}",
             r.content
         );
+    }
+}
+
+#[cfg(test)]
+mod label_action_tests {
+    use super::*;
+    use atomcode_kernel::tool::RiskLevel;
+    use crate::atomgit::TokenProvider;
+
+    struct FixedTok(String);
+    impl TokenProvider for FixedTok {
+        fn token(&self) -> Result<String, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn tool() -> AtomgitRepoTool {
+        // Build a client whose token/base are irrelevant for risk() (no network).
+        let client = std::sync::Arc::new(
+            crate::atomgit::AtomgitClient::new(crate::atomgit::AtomgitConfig {
+                base_url: "https://api.atomgit.com/api/v5".into(),
+                user_agent: "t".into(),
+                token: std::sync::Arc::new(FixedTok("t".into())),
+            }).unwrap(),
+        );
+        AtomgitRepoTool::new(client)
+    }
+
+    #[test]
+    fn labels_is_safe_ensure_label_and_delete_are_risky() {
+        let t = tool();
+        assert_eq!(t.risk(r#"{"action":"labels"}"#), RiskLevel::Safe);
+        assert_eq!(t.risk(r#"{"action":"ensure_label"}"#), RiskLevel::Risky);
+        assert_eq!(t.risk(r#"{"action":"delete"}"#), RiskLevel::Risky);
     }
 }
