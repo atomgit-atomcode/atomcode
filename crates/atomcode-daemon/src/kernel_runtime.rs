@@ -27,6 +27,7 @@ pub async fn start_native_runtime_with_session(
         cfg,
         session,
         atomcode_coding::ProviderBootstrap::Required,
+        None,
     )
     .await
 }
@@ -35,6 +36,7 @@ async fn start_native_runtime_with_session_bootstrap(
     cfg: CodingRuntimeConfig,
     session: SessionMode,
     bootstrap: atomcode_coding::ProviderBootstrap,
+    image_preprocessor: Option<std::sync::Arc<dyn atomcode_coding::ImagePreprocessor>>,
 ) -> Result<(atomcode_coding::CodingRuntime, CodingAgentConfig), atomcode_coding::RuntimeStartError>
 {
     let coding_cfg = coding_config_from_runtime(&cfg);
@@ -118,10 +120,10 @@ async fn start_native_runtime_with_session_bootstrap(
         prepare,
         provider_factory: crate::coding_provider_factory(),
         plugin_hooks: crate::installed_plugin_hook_source(),
-        // Daemon preprocesses images upstream (live_api / /chat) before the
-        // turn reaches here, so the runtime-level hook is a no-op → None.
-        // (Step 2 will move it here and drop the upstream copies.)
-        image_preprocessor: None,
+        // Daemon callers keep this `None` because live_api preprocesses upstream.
+        // The TUI session-switch path injects the same preprocessor as its initial
+        // runtime, so `/resume` does not silently lose image recognition.
+        image_preprocessor,
     };
     let runtime = match imported_lease {
         Some(lease) => {
@@ -139,6 +141,23 @@ pub fn spawn_native_runtime_for_session_deferred(
     cfg: CodingRuntimeConfig,
     id: String,
     snapshot: atomcode_kernel::message::SessionSnapshot,
+) -> (
+    mpsc::UnboundedSender<atomcode_coding::DriverCommand>,
+    mpsc::UnboundedReceiver<atomcode_coding::SequencedRuntimeEvent>,
+    watch::Receiver<atomcode_coding::DeferredRuntimeState>,
+) {
+    spawn_native_runtime_for_session_deferred_with_preprocessor(cfg, id, snapshot, None)
+}
+
+/// Deferred restored-runtime constructor for drivers that own image preprocessing.
+/// Daemon/live callers use [`spawn_native_runtime_for_session_deferred`]; the local
+/// TUI injects its VL adapter so a session replacement preserves the initial runtime's
+/// image-input behavior.
+pub fn spawn_native_runtime_for_session_deferred_with_preprocessor(
+    cfg: CodingRuntimeConfig,
+    id: String,
+    snapshot: atomcode_kernel::message::SessionSnapshot,
+    image_preprocessor: Option<std::sync::Arc<dyn atomcode_coding::ImagePreprocessor>>,
 ) -> (
     mpsc::UnboundedSender<atomcode_coding::DriverCommand>,
     mpsc::UnboundedReceiver<atomcode_coding::SequencedRuntimeEvent>,
@@ -173,6 +192,7 @@ pub fn spawn_native_runtime_for_session_deferred(
             cfg,
             SessionMode::ExternalSnapshot { id, snapshot },
             bootstrap,
+            image_preprocessor,
         )
         .await;
         let (runtime, _) = match runtime {
@@ -305,6 +325,28 @@ pub fn spawn_native_runtime_for_session_deferred(
 mod tests {
     use super::*;
 
+    struct RecordingImagePreprocessor {
+        called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl atomcode_coding::ImagePreprocessor for RecordingImagePreprocessor {
+        async fn preprocess(
+            &self,
+            text: String,
+            _images: Vec<atomcode_coding::ImageContent>,
+            _active_model: String,
+            _session_id: Option<String>,
+        ) -> atomcode_coding::UserInput {
+            self.called
+                .store(true, std::sync::atomic::Ordering::Release);
+            atomcode_coding::UserInput {
+                text: format!("recognized: {text}"),
+                images: Vec::new(),
+            }
+        }
+    }
+
     struct ScopedHome {
         _lock: std::sync::MutexGuard<'static, ()>,
         previous: Option<std::ffi::OsString>,
@@ -362,6 +404,66 @@ mod tests {
             handle.status().phase,
             atomcode_coding::RuntimePhase::AwaitingProvider
         );
+
+        control_tx
+            .send(atomcode_coding::DriverCommand::Shutdown)
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), control_tx.closed())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_tui_resume_keeps_image_preprocessor() {
+        let _home = ScopedHome::new();
+        let working_dir = tempfile::tempdir().unwrap();
+        let config = atomcode_config::config::Config::default();
+        let mut cfg =
+            CodingRuntimeConfig::from_config(&config, working_dir.path(), None, None, false, true);
+        cfg.provider_name = "main".into();
+        cfg.api_key = "test".into();
+        cfg.base_url = "http://127.0.0.1:9/v1".into();
+        cfg.model = "glm-5.2".into();
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let preprocessor = std::sync::Arc::new(RecordingImagePreprocessor {
+            called: called.clone(),
+        });
+        let (control_tx, _event_rx, mut state_rx) =
+            spawn_native_runtime_for_session_deferred_with_preprocessor(
+                cfg,
+                "deferred-image-test".into(),
+                atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
+                Some(preprocessor),
+            );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), state_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            *state_rx.borrow(),
+            atomcode_coding::DeferredRuntimeState::Ready(_)
+        ));
+
+        control_tx
+            .send(atomcode_coding::DriverCommand::Submit(
+                atomcode_coding::UserInput {
+                    text: "inspect".into(),
+                    images: vec![atomcode_coding::ImageContent {
+                        media_type: "image/png".into(),
+                        data: "AAAA".into(),
+                    }],
+                },
+            ))
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !called.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred resumed runtime dropped the image preprocessor");
 
         control_tx
             .send(atomcode_coding::DriverCommand::Shutdown)

@@ -40,7 +40,8 @@ mod login_state_tests;
 pub mod native_live;
 mod runtime_host;
 pub use kernel_runtime::{
-    spawn_native_runtime_for_session_deferred, start_native_runtime,
+    spawn_native_runtime_for_session_deferred,
+    spawn_native_runtime_for_session_deferred_with_preprocessor, start_native_runtime,
     start_native_runtime_with_session,
 };
 pub use runtime_host::{
