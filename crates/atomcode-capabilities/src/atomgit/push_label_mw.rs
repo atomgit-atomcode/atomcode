@@ -101,7 +101,7 @@ impl ToolMiddleware for GitPushLabelMiddleware {
         _rt: &RequestCtx,
     ) -> BeforeOutcome {
         if tool.name() == "bash" && is_git_push(&call.arguments) {
-            self.pending.lock().unwrap().insert(call.id.clone());
+            self.pending.lock().unwrap_or_else(|p| p.into_inner()).insert(call.id.clone());
         }
         BeforeOutcome::Proceed
     }

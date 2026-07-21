@@ -23,6 +23,33 @@ where
     }
 }
 
+/// Tolerant deserializer for `project_labels`: accepts absent, null, an array of
+/// strings, or an array of `{ "name": "..." }` objects (the AtomGit/GitCode wire
+/// shape is unconfirmed — E2E is blocked). Any of them → `Vec<String>`.
+fn de_project_labels<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Str(String),
+        Obj {
+            #[serde(default)]
+            name: String,
+        },
+    }
+    let entries = Option::<Vec<Entry>>::deserialize(d)?.unwrap_or_default();
+    Ok(entries
+        .into_iter()
+        .map(|e| match e {
+            Entry::Str(s) => s,
+            Entry::Obj { name } => name,
+        })
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct User {
     #[serde(default)]
@@ -45,7 +72,7 @@ pub struct Repo {
     pub default_branch: String,
     #[serde(default)]
     pub owner: User,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_project_labels")]
     pub project_labels: Vec<String>,
 }
 
@@ -119,6 +146,22 @@ pub struct CreatedComment {
     pub id: u64,
     #[serde(default)]
     pub html_url: String,
+}
+
+#[cfg(test)]
+mod label_shape_tests {
+    use super::Repo;
+    #[test]
+    fn project_labels_tolerates_all_wire_shapes() {
+        let strs: Repo = serde_json::from_value(serde_json::json!({"name":"w","project_labels":["a","b"]})).unwrap();
+        assert_eq!(strs.project_labels, vec!["a".to_string(),"b".to_string()]);
+        let objs: Repo = serde_json::from_value(serde_json::json!({"name":"w","project_labels":[{"name":"a"},{"name":"b"}]})).unwrap();
+        assert_eq!(objs.project_labels, vec!["a".to_string(),"b".to_string()]);
+        let nul: Repo = serde_json::from_value(serde_json::json!({"name":"w","project_labels":null})).unwrap();
+        assert!(nul.project_labels.is_empty());
+        let absent: Repo = serde_json::from_value(serde_json::json!({"name":"w"})).unwrap();
+        assert!(absent.project_labels.is_empty());
+    }
 }
 
 #[cfg(test)]

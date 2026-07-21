@@ -131,6 +131,7 @@ fn mount_coding_tools(vision: bool) -> MountedTools {
     let mut registry = ToolRegistry::new();
     register_coding_tools_with_vision(&mut registry, vision);
     register_codeintel_tools(&mut registry);
+    #[cfg_attr(not(feature = "atomgit"), allow(unused_mut))]
     let mut names: Vec<&str> = coding_tool_names()
         .iter()
         .chain(codeintel_tool_names().iter())
