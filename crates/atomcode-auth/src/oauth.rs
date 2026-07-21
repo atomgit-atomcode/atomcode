@@ -98,6 +98,18 @@ fn apply_blocking_proxy_policy(
     }
 }
 
+/// The localized network hint for a login HTTP failure, or `None` when the
+/// error is not connection-level. Connect resets (e.g. Windows os error 10054)
+/// and timeouts mean the endpoint was unreachable on THIS client's path while a
+/// browser may still work — usually a proxy/firewall difference.
+fn network_connect_hint(err: &reqwest::Error) -> Option<std::borrow::Cow<'static, str>> {
+    if err.is_connect() || err.is_timeout() {
+        Some(atomcode_config::i18n::t(atomcode_config::i18n::Msg::NetworkConnectHint))
+    } else {
+        None
+    }
+}
+
 fn blocking_client() -> Result<reqwest::blocking::Client> {
     // Hard timeouts here too — the `get_valid_token` path calls
     // `refresh_access_token` synchronously whenever a stored token
@@ -476,11 +488,22 @@ pub fn start_login() -> Result<LoginSession> {
     // "abort"` that aborts the process before the QR can even render.
     // Build fallibly and surface a recoverable error instead.
     let client = blocking_client()?;
-    let resp: PlatformLoginResponse = client
+    let sent = client
         .get(platform_login_url())
         .query(&[("provider", "atomgit")])
-        .send()
-        .context("Failed to call /auth/login")?
+        .send();
+    let resp = match sent {
+        Ok(r) => r,
+        Err(e) => {
+            let hint = network_connect_hint(&e);
+            let err = anyhow::Error::new(e).context("Failed to call /auth/login");
+            return Err(match hint {
+                Some(h) => err.context(h.into_owned()),
+                None => err,
+            });
+        }
+    };
+    let resp: PlatformLoginResponse = resp
         .json()
         .context("Failed to parse /auth/login response")?;
     Ok(LoginSession {
@@ -1443,5 +1466,36 @@ mod tests {
             sanitize_base_url("127.0.0.1:8765/"),
             "http://127.0.0.1:8765"
         );
+    }
+
+    #[test]
+    fn connect_error_yields_hint_timeout_does_too() {
+        // A builder timeout produces a timeout-class reqwest error.
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(1))
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap();
+        // 203.0.113.0/24 is TEST-NET-3 (RFC 5737) — guaranteed unroutable, so this
+        // fails at connect/timeout without depending on any real host.
+        let err = client
+            .get("http://203.0.113.1:81/")
+            .send()
+            .expect_err("must fail");
+        assert!(
+            super::network_connect_hint(&err).is_some(),
+            "connect/timeout error must yield a hint, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn non_network_error_yields_no_hint() {
+        // A decode error is neither connect nor timeout → no hint.
+        // Build any reqwest::Error that is not connect/timeout by parsing a bad URL.
+        let err = reqwest::blocking::Client::new()
+            .get("http://")
+            .build()
+            .expect_err("bad url builds an error");
+        assert!(super::network_connect_hint(&err).is_none(), "got: {err:?}");
     }
 }
