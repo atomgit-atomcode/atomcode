@@ -179,12 +179,13 @@ fn load_extra_tls_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientB
     // Certificate::from_pem_bundle accepts a PEM file with one or more certs.
     match reqwest::Certificate::from_pem_bundle(&pem) {
         Ok(certs) => {
+            let count = certs.len();
             for c in certs {
                 builder = builder.add_root_certificate(c);
             }
             tracing::info!(
                 "Loaded {} extra TLS root(s) from SSL_CERT_FILE={:?} (issue #514)",
-                certs.len(),
+                count,
                 path
             );
         }
