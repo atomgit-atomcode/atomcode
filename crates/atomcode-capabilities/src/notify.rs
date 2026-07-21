@@ -7,11 +7,9 @@ use std::time::Duration;
 
 use atomcode_config::config::NotificationConfig;
 
-/// Why a turn stopped, decoupled from any engine's stop-reason enum so this
-/// module (L0) needs no dependency on the v1 core `agent::TurnStopReason` (nor
-/// the v2 `kernel::event::StopReason`). Hosts map their engine's reason into
-/// this before calling [`notify`]. Variants mirror `core::agent::TurnStopReason`
-/// one-to-one so the mapping is total and byte-identical.
+/// Why a turn stopped, decoupled from host-specific stop-reason enums so this
+/// module (L0) needs no dependency on kernel or UI event types. Hosts map their
+/// stop reason into this enum before calling [`notify`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifyStopReason {
     Natural,

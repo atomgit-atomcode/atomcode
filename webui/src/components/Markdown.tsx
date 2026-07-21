@@ -16,7 +16,7 @@ renderer.code = function (code: string, infostring?: string) {
   const text = code ?? '';
   if (!text.trim()) return '';
   const lang = (infostring ?? '').split(/\s+/)[0] ?? '';
-  // escape HTML in code (no hljs for v1)
+  // Escape HTML in code; syntax highlighting is intentionally omitted here.
   const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return (
     `<div class="code-block-wrapper">` +

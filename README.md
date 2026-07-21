@@ -194,10 +194,10 @@ brew install --cask atomcode
 
 Run AtomCode as your **normal user**, never with `sudo`. AtomCode keeps its
 config, sessions, and logs under `~/.atomcode`; running once as root leaves
-root-owned files there, so every later non-root start fails at engine init with:
+root-owned files there, so every later non-root start fails at runtime init with:
 
 ```
-engine v2 assemble failed: Permission denied (os error 13)
+coding runtime assemble failed: Permission denied (os error 13)
 ```
 
 (the message may say `prepare` instead of `assemble` — same cause.) If you hit

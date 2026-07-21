@@ -1944,7 +1944,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_fallback_approval_is_closed_for_plan_mode() {
+    fn fallback_approval_is_closed_for_plan_mode() {
         assert!(matches!(
             fallback_approval_decision(ApprovalMode::Plan),
             PermissionDecision::Deny
@@ -2076,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_images_from_turn_base_preserves_v2_history_user_display_payload() {
+    fn restore_images_from_turn_base_preserves_history_user_display_payload() {
         use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
 
         let original_user = Message {

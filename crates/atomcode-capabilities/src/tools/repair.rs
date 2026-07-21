@@ -1478,15 +1478,15 @@ use std::sync::Arc;
 
 /// Repairs a tool call's JSON arguments in place before the call executes.
 ///
-/// After the v1→v2 split, tools deserialize their arguments directly
+/// Kernel tools deserialize their arguments directly
 /// (`serde_json::from_str(&call.arguments)`), so any non-conforming JSON the
 /// model emits — trailing commas, single quotes, unescaped source-code quotes /
 /// newlines, markdown code fences, ambiguous Windows backslash paths — fails the
 /// *entire* tool call. Weaker models trip this constantly when writing files or
 /// editing code, which surfaces to the user as "write failed / nothing happens".
 ///
-/// v1 (the monolithic core) ran `repair_tool_args` over the arguments before
-/// dispatch; the layered kernel has no equivalent. This middleware restores that
+/// The former core dispatch ran `repair_tool_args` over arguments before execution;
+/// the layered kernel has no built-in equivalent. This middleware preserves that
 /// tolerance by rewriting `call.arguments` in [`before`](ToolMiddleware::before).
 ///
 /// **Register it FIRST** (ahead of any approval gate) so the bytes an approval

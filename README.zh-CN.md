@@ -193,10 +193,10 @@ brew install --cask atomcode
 
 请用**普通用户**运行 AtomCode，切勿 `sudo`。AtomCode 把配置、会话、日志都放在
 `~/.atomcode`；一旦用 root 跑过一次，就会在那里留下 root 属主的文件，之后非 root
-启动会在引擎初始化阶段报错：
+启动会在运行时初始化阶段报错：
 
 ```
-engine v2 assemble failed: Permission denied (os error 13)
+coding runtime assemble failed: Permission denied (os error 13)
 ```
 
 （提示里可能是 `prepare` 而非 `assemble`——同一个原因。）遇到这种情况，把属主收回

@@ -578,8 +578,8 @@ mod tests {
 
     #[test]
     fn persona_carries_behavioral_guardrails() {
-        // Three v1 guardrails the initial v2 port dropped, restored for parity with the
-        // legacy engine (peer agents like opencode keep them too).
+        // Three behavioral guardrails retained from the former engine
+        // (peer agents like opencode keep them too).
         let p = coding_persona("m", true, false);
         assert!(
             p.contains("Prioritize technical correctness over agreeing with the user"),

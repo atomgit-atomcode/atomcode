@@ -1,17 +1,15 @@
-//! `WriteApprovalGate` — workspace-aware, per-path approval for the file-MUTATION tools,
-//! restoring the v4.25.1 (v1/core) approval granularity that v2 had flattened to a single
-//! tool-wide "Always".
+//! `WriteApprovalGate` — workspace-aware, per-path approval for file-mutation tools.
 //!
 //! ## Why
 //!
-//! v2's [`ApprovalMiddleware`] made "总是 / Always" on an edit a TOOL-WIDE grant (key
+//! The generic [`ApprovalMiddleware`] made "总是 / Always" on an edit a TOOL-WIDE grant (key
 //! `edit_file::`), so one approval silently covered every later write this session — to ANY
-//! path, including `~/.ssh/authorized_keys` / `.env` / `/etc/...`. v1 instead:
+//! path, including `~/.ssh/authorized_keys` / `.env` / `/etc/...`. The required policy is:
 //! - AUTO-APPROVED in-workspace non-sensitive writes (no prompt at all), and
 //! - scoped "Always" PER CANONICAL DIRECTORY for out-of-workspace writes, while
 //! - treating SENSITIVE writes as un-grantable (prompt every time, never remembered).
 //!
-//! This gate reproduces that, in v2's middleware idiom. It fully OWNS approval for the write
+//! This gate implements that policy in the current middleware. It fully OWNS approval for the write
 //! tools — returning [`Allow`](BeforeOutcome::Allow) / [`Deny`](BeforeOutcome::Deny) for every
 //! write call so the generic [`ApprovalMiddleware`] never double-prompts them — exactly how
 //! [`SensitivePathGate`] owns sensitive-READ approval. **Register it BEFORE
@@ -23,7 +21,7 @@
 //! | target | behavior |
 //! |---|---|
 //! | sensitive path (any location) | prompt EVERY time, never remembered |
-//! | in-workspace, non-sensitive | auto-approve, no prompt (v1 parity) |
+//! | in-workspace, non-sensitive | auto-approve, no prompt |
 //! | out-of-workspace, non-sensitive | prompt; "Always" remembered PER canonical DIRECTORY across `edit_file`/`write_file` (codex `grant_root` style — one approval covers sibling writes in that folder) or PER tool (`search_replace`/`parallel_edit_files`, which have no single target file) |
 //!
 //! Sensitivity is checked FIRST, so an in-workspace `.env` / `id_rsa` still prompts. New files

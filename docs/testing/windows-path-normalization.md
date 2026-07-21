@@ -1,6 +1,6 @@
 # Windows 路径归一化 —— 真机测试清单
 
-对应改动:v2 中心化路径归一化(`atomcode-capabilities/src/pathnorm.rs`),修复
+对应改动:中心化路径归一化(`atomcode-capabilities/src/pathnorm.rs`),修复
 工具结果反斜杠打断 bash、`\\?\` 泄漏、`atomcode review` 在 Windows 全挂等问题。
 
 > ⚠️ 本改动的效果**只在 Windows 上体现**(macOS/Linux 上 `to_display` 是 no-op,
@@ -9,9 +9,8 @@
 
 ## 环境准备
 
-- [ ] Windows + **v2 默认引擎**(**不要**加 `--engine v1` —— 本次是 v2-only,v1 仍显示
-      反斜杠属预期,别误判为 bug)
-- [ ] 已安装 **Git Bash**(v2 在 Windows 默认走它)
+- [ ] Windows 当前版本
+- [ ] 已安装 **Git Bash**(Windows 默认走它)
 - [ ] 工作目录用**非 C: 盘**(如 `E:\cqy-service`)跑一遍
 - [ ] 再用一个**含中文/空格**的目录(如 `C:\用户\我的 项目`)跑一遍
 - [ ] (可选)找一台**没装 Git Bash**(回退 cmd.exe)的机器测 §6
@@ -68,12 +67,11 @@
 - [ ] **不同盘符**(D:\、E:\)
 - [ ] (若适用)**UNC 路径** `\\server\share\...` → 显示成 `//server/share/...`,操作正常
 
-## §6 两种 shell / 两个引擎 [P1]
+## §6 两种 shell [P1]
 
 - [ ] **Git Bash**(默认):§1 全过
 - [ ] **cmd.exe 回退**(没装 Git Bash 的机器):正斜杠 `C:/Users/x/file` 在 cmd 下大多命令
       也接受,但实测 `type` / `cd` / python 等是否 OK(若有问题需单独处理)
-- [ ] **v1 引擎**(`--engine v1`):本次**未改** core 工具,仍显示反斜杠 → **预期**,非 bug
 
 ---
 

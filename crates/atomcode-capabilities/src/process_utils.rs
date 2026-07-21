@@ -2,9 +2,8 @@
 //! construction, UTF-8 locale, admin check) — the shared L1 home now that
 //! `capabilities` must not depend on `core`. Consumed here plus by the CLI/TUI drivers.
 //!
-//! NOTE: `shell_command` + `is_running_as_admin` are byte-identical copies of the same
-//! fns still in `atomcode_core::process_utils` (core keeps its own for the v1 engine).
-//! Keep the two in sync until core is retired, then core's copy dies with it.
+//! `shell_command` + `is_running_as_admin` also exist in `atomcode_core::process_utils`
+//! for core's remaining hook consumers. Consolidate that copy when those consumers migrate.
 //!
 //! On Windows, a GUI / **console-less** parent (the atomcode-daemon behind
 //! clawbot/OpenClaw) that spawns a console program (cmd.exe, git, ast-grep, a

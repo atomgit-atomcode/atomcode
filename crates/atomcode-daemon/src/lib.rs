@@ -5396,7 +5396,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_submitted_user_images_before_save_repairs_text_only_v2_snapshot() {
+    fn restore_submitted_user_images_before_save_repairs_text_only_snapshot() {
         use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
 
         let mut messages = vec![

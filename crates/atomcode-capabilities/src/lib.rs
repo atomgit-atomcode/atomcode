@@ -120,7 +120,7 @@ pub mod askpass;
 /// Desktop / terminal notifications: fires an OS-native or terminal-protocol notification
 /// (kitty OSC 99, OSC 777, iTerm2 OSC 9, `notify-send`, `terminal-notifier`/`osascript`)
 /// when a turn finishes or an approval is pending. A host (TUI/cli) feeds terminal-focus
-/// state via [`notify::set_terminal_focus_state`] and maps its engine's turn-stop reason
+/// state via [`notify::set_terminal_focus_state`] and maps its turn-stop reason
 /// into [`notify::NotifyStopReason`] before calling [`notify::notify`]. Reads
 /// `NotificationConfig` from the config leaf; carries no dependency on any engine crate.
 #[cfg(feature = "notify")]

@@ -1,6 +1,6 @@
 //! `SessionContextHook` — injects the per-session "context block" (environment + project
 //! instructions + git snapshot) as ONE leading `Role::System` message at session start,
-//! the v2 port of v1's runtime-injected prompt sections (`agent/prompt.rs`).
+//! replacing the former core runtime-injected prompt sections.
 //!
 //! Cache-safe: the block is read ONCE at session start and frozen — a SNAPSHOT of where
 //! the session began, not a live view (the git section says so explicitly). The wire

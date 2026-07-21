@@ -2115,11 +2115,11 @@ pub enum ShellExit {
     KilledTimeout,
 }
 
-/// NOTE: transitional DUPLICATE of `atomcode_core::tool::bash::run_shell` — core keeps its
-/// copy while its v1 engine lives; this is the one v2 (bridge `!cmd`) uses. Delete core's copy
-/// when the v1 engine is retired. A behavior fix here must be mirrored there until then. (This
-/// copy reuses capabilities' own `sanitize_terminal_output`, a deliberate SUPERSET of core's —
-/// it additionally strips DCS/SOS/PM/APC + 8-bit C1 introducers, so `!cmd` output is cleaner.)
+/// Capabilities-owned shell runner used by the current coding stack. Core still has a separate
+/// implementation for its remaining tool consumers; consolidate that copy only when those
+/// consumers migrate. This implementation reuses capabilities' own `sanitize_terminal_output`,
+/// a deliberate superset of core's: it additionally strips DCS/SOS/PM/APC + 8-bit C1
+/// introducers, so `!cmd` output is cleaner.
 ///
 /// Spawn `command` in `wd`, stream output via `chunk_cb`, return raw outcome.
 /// No ToolResult framing, no git snapshot, no error-signature tracking —

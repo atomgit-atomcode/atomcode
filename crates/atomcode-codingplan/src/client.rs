@@ -227,9 +227,8 @@ impl Client {
         })
     }
 
-    /// `GET /coding-plan/status-v2` — audit/quota/expiry snapshot. Same
-    /// response envelope as v1; only the path changed under the v2
-    /// rollout, so the parser type stays put.
+    /// `GET /coding-plan/status-v2` — audit/quota/expiry snapshot. The endpoint
+    /// uses the shared [`StatusResponse`] envelope.
     pub fn status_v2(&self) -> Result<StatusResponse> {
         let url = format!("{}/coding-plan/status-v2", api_base_url());
         let resp = with_retries(&CODING_PLAN_RETRY_BACKOFFS, is_transient_send_error, || {
