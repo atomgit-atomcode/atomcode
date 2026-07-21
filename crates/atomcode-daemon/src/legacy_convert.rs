@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use atomcode_capabilities::session::manager::META_VERSION;
 use atomcode_capabilities::session::presentation::PRESENTATION_VERSION;
 use atomcode_capabilities::session::{
-    anchor_from_legacy_position, ImportInfo, ImportKind, LegacyTurnBoundary, PresentationEntry,
-    PresentationFile, PresentationRole, SessionLease, SessionManager, SessionMeta, SessionResult,
-    StorageOwner, TurnStat,
+    anchor_from_legacy_position, DisplayAnchor, ImportInfo, ImportKind, LegacyTurnBoundary,
+    PresentationEntry, PresentationFile, PresentationRole, SessionLease, SessionManager,
+    SessionMeta, SessionResult, StorageOwner, TurnStat,
 };
 
 /// In-memory result of the one legacy → native conversion. S2b owns persistence
@@ -120,6 +120,18 @@ pub enum ImportStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportDiagnostic {
     LegacyChangedAfterCutover,
+    RepairedLegacyTurnBoundaries { dropped_turn_stats: usize },
+}
+
+fn report_import_diagnostic(session_id: &str, diagnostic: Option<ImportDiagnostic>) {
+    if let Some(ImportDiagnostic::RepairedLegacyTurnBoundaries { dropped_turn_stats }) = diagnostic
+    {
+        tracing::warn!(
+            session_id,
+            dropped_turn_stats,
+            "repaired malformed legacy turn boundaries during import"
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -281,9 +293,88 @@ pub fn snapshot_to_kernel(
     atomcode_kernel::message::SessionSnapshot::new(messages)
 }
 
+struct NormalizedLegacyTurns {
+    boundaries: Vec<LegacyTurnBoundary>,
+    turn_stats: Vec<TurnStat>,
+    dropped_turn_stats: usize,
+}
+
+fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedLegacyTurns> {
+    let mut boundaries = Vec::with_capacity(session.turn_stats.len());
+    let mut turn_stats = Vec::with_capacity(session.turn_stats.len());
+    let mut previous_after = 0usize;
+    let mut dropped_turn_stats = 0usize;
+
+    for stat in &session.turn_stats {
+        if stat.after_message > session.messages.len() {
+            anyhow::bail!("legacy turn boundary is outside the message history")
+        }
+        if stat.after_message == 0 || stat.after_message <= previous_after {
+            dropped_turn_stats += 1;
+            continue;
+        }
+
+        let turn_id = u64::try_from(turn_stats.len())?
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("legacy turn id overflow"))?;
+        boundaries.push(LegacyTurnBoundary {
+            after_message: stat.after_message,
+            turn_id,
+        });
+        turn_stats.push(TurnStat {
+            after_message: stat.after_message,
+            turn_id,
+            round_count: checked_u32(stat.turn_count, "turn_count")?,
+            tool_call_count: checked_u32(stat.tool_call_count, "tool_call_count")?,
+            duration_ms: stat.duration_ms,
+            total_tokens: checked_u32(stat.total_tokens, "total_tokens")?,
+            errored: stat.errored,
+            used_tokens: checked_u32(stat.used_tokens, "used_tokens")?,
+            ctx_window: checked_u32(stat.ctx_window, "ctx_window")?,
+        });
+        previous_after = stat.after_message;
+    }
+
+    // Keep the native anchor invariant strict; only the frozen legacy reader is
+    // allowed to repair malformed historical offsets.
+    anchor_from_legacy_position(0, &boundaries)?;
+    Ok(NormalizedLegacyTurns {
+        boundaries,
+        turn_stats,
+        dropped_turn_stats,
+    })
+}
+
+fn anchor_from_normalized_legacy_position(
+    after_message: usize,
+    boundaries: &[LegacyTurnBoundary],
+    repaired_turn_boundaries: bool,
+) -> SessionResult<DisplayAnchor> {
+    if !repaired_turn_boundaries {
+        return anchor_from_legacy_position(after_message, boundaries);
+    }
+    let Some(last) = boundaries.last() else {
+        return Ok(DisplayAnchor::AtStart);
+    };
+    if after_message > last.after_message {
+        return Ok(DisplayAnchor::AfterTurn {
+            turn_id: last.turn_id,
+        });
+    }
+    anchor_from_legacy_position(after_message, boundaries)
+}
+
 /// Convert the complete legacy session DTO without reading or writing files.
 /// Persistence, ownership and importer recovery are deliberately S2b concerns.
 fn convert_legacy_session(session: &LegacySession) -> anyhow::Result<ConvertedLegacySession> {
+    let (converted, diagnostic) = convert_legacy_session_with_diagnostic(session)?;
+    report_import_diagnostic(&session.id, diagnostic);
+    Ok(converted)
+}
+
+fn convert_legacy_session_with_diagnostic(
+    session: &LegacySession,
+) -> anyhow::Result<(ConvertedLegacySession, Option<ImportDiagnostic>)> {
     let id = session.id.clone();
     let working_dir = session
         .working_dir
@@ -293,43 +384,8 @@ fn convert_legacy_session(session: &LegacySession) -> anyhow::Result<ConvertedLe
     let created_at = seconds_to_millis(session.created_at, "created_at")?;
     let updated_at = seconds_to_millis(session.updated_at, "updated_at")?;
 
-    let boundaries: Vec<_> = session
-        .turn_stats
-        .iter()
-        .enumerate()
-        .map(|(index, stat)| LegacyTurnBoundary {
-            after_message: stat.after_message,
-            turn_id: index as u64 + 1,
-        })
-        .collect();
-    // Validate the complete boundary set even when there are no presentation
-    // entries that would otherwise exercise `anchor_from_legacy_position`.
-    anchor_from_legacy_position(0, &boundaries)?;
-    if boundaries
-        .iter()
-        .any(|boundary| boundary.after_message > session.messages.len())
-    {
-        anyhow::bail!("legacy turn boundary is outside the message history")
-    }
-
-    let turn_stats = session
-        .turn_stats
-        .iter()
-        .zip(&boundaries)
-        .map(|(stat, boundary)| {
-            Ok(TurnStat {
-                after_message: stat.after_message,
-                turn_id: boundary.turn_id,
-                round_count: checked_u32(stat.turn_count, "turn_count")?,
-                tool_call_count: checked_u32(stat.tool_call_count, "tool_call_count")?,
-                duration_ms: stat.duration_ms,
-                total_tokens: checked_u32(stat.total_tokens, "total_tokens")?,
-                errored: stat.errored,
-                used_tokens: checked_u32(stat.used_tokens, "used_tokens")?,
-                ctx_window: checked_u32(stat.ctx_window, "ctx_window")?,
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let normalized_turns = normalize_legacy_turns(session)?;
+    let boundaries = &normalized_turns.boundaries;
 
     let presentation = PresentationFile {
         v: PRESENTATION_VERSION,
@@ -337,6 +393,9 @@ fn convert_legacy_session(session: &LegacySession) -> anyhow::Result<ConvertedLe
             .display_messages
             .iter()
             .map(|display| {
+                if display.after_message > session.messages.len() {
+                    anyhow::bail!("legacy presentation position is outside the message history")
+                }
                 let role = match display.message.role {
                     CoreRole::User => PresentationRole::User,
                     CoreRole::Assistant => PresentationRole::Assistant,
@@ -350,7 +409,11 @@ fn convert_legacy_session(session: &LegacySession) -> anyhow::Result<ConvertedLe
                     anyhow::bail!("legacy presentation content is not plain text")
                 };
                 Ok(PresentationEntry {
-                    anchor: anchor_from_legacy_position(display.after_message, &boundaries)?,
+                    anchor: anchor_from_normalized_legacy_position(
+                        display.after_message,
+                        boundaries,
+                        normalized_turns.dropped_turn_stats > 0,
+                    )?,
                     role,
                     text: text.clone(),
                 })
@@ -377,17 +440,26 @@ fn convert_legacy_session(session: &LegacySession) -> anyhow::Result<ConvertedLe
         working_dir,
         created_at,
         updated_at,
-        turn_count: checked_u32(session.turn_stats.len(), "turn_stats")?,
+        turn_count: checked_u32(normalized_turns.turn_stats.len(), "turn_stats")?,
         message_count: checked_u32(session.messages.len(), "messages")?,
-        turn_stats,
+        turn_stats: normalized_turns.turn_stats,
     };
     meta.auto_name_from_messages(&snapshot.messages);
 
-    Ok(ConvertedLegacySession {
-        snapshot,
-        meta,
-        presentation,
-    })
+    let diagnostic = (normalized_turns.dropped_turn_stats > 0).then_some(
+        ImportDiagnostic::RepairedLegacyTurnBoundaries {
+            dropped_turn_stats: normalized_turns.dropped_turn_stats,
+        },
+    );
+
+    Ok((
+        ConvertedLegacySession {
+            snapshot,
+            meta,
+            presentation,
+        },
+        diagnostic,
+    ))
 }
 
 /// Resolve a session's storage state and, when needed, publish native ownership.
@@ -466,7 +538,7 @@ pub fn converge_session(
             legacy.id
         )
     }
-    let mut converted = convert_legacy_session(&legacy)?;
+    let (mut converted, diagnostic) = convert_legacy_session_with_diagnostic(&legacy)?;
     let preserve_native_snapshot = existing_snapshot.is_some() && !force_legacy;
     if preserve_native_snapshot {
         let base = existing_snapshot
@@ -527,6 +599,7 @@ pub fn converge_session(
         (!preserve_presentation).then_some(&presentation),
         &meta,
     )?;
+    report_import_diagnostic(id, diagnostic);
 
     Ok(ImportOutcome {
         status: if preserve_native_snapshot {
@@ -534,7 +607,7 @@ pub fn converge_session(
         } else {
             ImportStatus::ImportedFull
         },
-        diagnostic: None,
+        diagnostic,
         snapshot,
         meta,
         presentation,
