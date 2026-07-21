@@ -188,14 +188,27 @@ pub fn ensure_runtime_initialized() {
 }
 
 /// Resolve the effective `FollowSystem` env values: an explicit env-var proxy
-/// always wins; the OS system proxy only fills a field the env left empty.
+/// always wins; the OS system proxy only fills a field the env left empty. A
+/// user-set `ALL_PROXY` counts as an explicit proxy for every scheme (reqwest
+/// prioritizes scheme-specific vars over `ALL_PROXY`, so the system proxy must
+/// not fill `http`/`https` and override it).
 fn follow_system_env(
     snapshot: &ProxyEnvSnapshot,
     sys: &crate::system_proxy::SystemProxy,
 ) -> ProxyEnvSnapshot {
+    let env_covers_all = snapshot.all.is_some();
+    let fill = |scheme_env: &Option<String>, sys_val: &Option<String>| -> Option<String> {
+        scheme_env.clone().or_else(|| {
+            if env_covers_all {
+                None
+            } else {
+                sys_val.clone()
+            }
+        })
+    };
     ProxyEnvSnapshot {
-        http: snapshot.http.clone().or_else(|| sys.http.clone()),
-        https: snapshot.https.clone().or_else(|| sys.https.clone()),
+        http: fill(&snapshot.http, &sys.http),
+        https: fill(&snapshot.https, &sys.https),
         all: snapshot.all.clone(),
         no_proxy: snapshot.no_proxy.clone().or_else(|| sys.no_proxy.clone()),
     }
@@ -261,6 +274,29 @@ mod tests {
         use crate::system_proxy::SystemProxy;
         let out = follow_system_env(&ProxyEnvSnapshot::default(), &SystemProxy::default());
         assert!(out.http.is_none() && out.https.is_none() && out.no_proxy.is_none());
+    }
+
+    #[test]
+    fn follow_system_env_explicit_all_proxy_beats_system() {
+        use crate::system_proxy::SystemProxy;
+        // User set only ALL_PROXY; the OS also has http/https proxies. ALL_PROXY is
+        // authoritative for every scheme, so the system proxy must NOT fill
+        // http/https (which reqwest would otherwise prioritize over ALL_PROXY).
+        let snap = ProxyEnvSnapshot {
+            http: None,
+            https: None,
+            all: Some("http://env-all:7".into()),
+            no_proxy: None,
+        };
+        let sys = SystemProxy {
+            http: Some("http://sys-http:8".into()),
+            https: Some("http://sys-https:8".into()),
+            no_proxy: None,
+        };
+        let out = follow_system_env(&snap, &sys);
+        assert!(out.http.is_none(), "system must not fill http when ALL_PROXY set: {:?}", out.http);
+        assert!(out.https.is_none(), "system must not fill https when ALL_PROXY set: {:?}", out.https);
+        assert_eq!(out.all.as_deref(), Some("http://env-all:7"));
     }
 
     #[test]

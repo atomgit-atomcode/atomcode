@@ -180,7 +180,6 @@ fn resolve_macos() -> SystemProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::*;
 
     #[test]
     fn win_proxy_server_single_applies_to_both() {
