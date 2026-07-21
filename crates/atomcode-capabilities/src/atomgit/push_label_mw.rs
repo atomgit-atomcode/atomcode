@@ -43,7 +43,7 @@ impl GitPushLabelMiddleware {
 
     async fn ensure(&self, t: PushTarget) {
         let key = format!("{}/{}@{}", t.owner, t.repo, t.base_url);
-        if self.ensured.lock().unwrap().contains(&key) {
+        if self.ensured.lock().unwrap_or_else(|p| p.into_inner()).contains(&key) {
             return;
         }
         // Fetch the token OFF the async runtime (blocking auth I/O).
@@ -81,7 +81,7 @@ impl GitPushLabelMiddleware {
                     t.repo,
                     if added { "added" } else { "already present" }
                 );
-                self.ensured.lock().unwrap().insert(key);
+                self.ensured.lock().unwrap_or_else(|p| p.into_inner()).insert(key);
             }
             Err(e) => tracing::warn!(
                 "atomcode-label: ensure failed for {}/{}: {e}",
@@ -107,7 +107,7 @@ impl ToolMiddleware for GitPushLabelMiddleware {
     }
 
     async fn after(&self, result: &mut ToolResult) -> AfterOutcome {
-        let was_push = self.pending.lock().unwrap().remove(&result.call_id);
+        let was_push = self.pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&result.call_id);
         if was_push && !result.is_error {
             if let Some(target) = detect_push_target(&self.working_dir) {
                 self.ensure(target).await; // best-effort
