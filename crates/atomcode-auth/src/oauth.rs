@@ -495,12 +495,15 @@ pub fn start_login() -> Result<LoginSession> {
     let resp = match sent {
         Ok(r) => r,
         Err(e) => {
+            // Failure identity as the OUTERMOST context so `{e:#}` leads with
+            // "Failed to call /auth/login: …os error…"; the hint is inner
+            // (supplemental) rather than burying the concrete error.
             let hint = network_connect_hint(&e);
-            let err = anyhow::Error::new(e).context("Failed to call /auth/login");
-            return Err(match hint {
-                Some(h) => err.context(h.into_owned()),
-                None => err,
-            });
+            let mut err = anyhow::Error::new(e);
+            if let Some(h) = hint {
+                err = err.context(h.into_owned());
+            }
+            return Err(err.context("Failed to call /auth/login"));
         }
     };
     let resp: PlatformLoginResponse = resp

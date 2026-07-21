@@ -132,6 +132,14 @@ pub(crate) fn parse_scutil_proxy(raw: &str) -> SystemProxy {
 /// unsupported OS yields an empty `SystemProxy` (callers then fall back to
 /// direct / env-var behavior).
 pub fn resolve() -> SystemProxy {
+    // Read the OS proxy once per process (mirrors `STARTUP_ENV` in proxy.rs).
+    // `apply_process_proxy_config` re-runs on every `/proxy` change, so re-spawning
+    // scutil / re-reading the registry each time would be wasted work.
+    static CACHE: std::sync::OnceLock<SystemProxy> = std::sync::OnceLock::new();
+    CACHE.get_or_init(resolve_uncached).clone()
+}
+
+fn resolve_uncached() -> SystemProxy {
     #[cfg(windows)]
     {
         resolve_windows().unwrap_or_default()
