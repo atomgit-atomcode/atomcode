@@ -3155,20 +3155,35 @@ fn execute_slash_command_impl(
             }
         }
         "todo" => {
-            // `/todo` derives + prints the current list. `/todo clear` (first
-            // word "clear", extra words ignored) deterministically wipes it
-            // (reseeds the kernel with an empty `todowrite`) so cancelled/stale
-            // tasks stop reappearing — then the print shows the now-empty "no
-            // list" as confirmation.
-            let want_clear = arg
-                .split_whitespace()
-                .next()
-                .is_some_and(|w| w.eq_ignore_ascii_case("clear"));
-            {
-                // Only reseed when there's actually something to clear, so a
-                // no-op `/todo clear` doesn't pollute the transcript with an
+            // `/todo` derives + prints the current list. Two deterministic
+            // subcommands (first word, case-insensitive) mutate it without
+            // waiting on the model, both via the kernel-reseed path so the next
+            // turn's TodoHook reflects the change:
+            //   `/todo clear`        — wipe the list (stale/cancelled tasks stop reappearing)
+            //   `/todo add <text>`   — append one pending task at the end
+            // Then the list is re-printed as confirmation.
+            let (kw, rest) = match arg.trim().split_once(char::is_whitespace) {
+                Some((k, r)) => (k, r.trim()),
+                None => (arg.trim(), ""),
+            };
+            if kw.eq_ignore_ascii_case("add") {
+                if rest.is_empty() {
+                    renderer.render(UiLine::CommandOutput(t(Msg::TodoAddUsage).into_owned()));
+                    renderer.flush();
+                } else {
+                    add_todo(ctx, state, rest);
+                    let out = format_todo_command(
+                        &ctx.current_session.messages,
+                        ctx.caps.unicode_symbols,
+                    );
+                    renderer.render(UiLine::CommandOutput(out));
+                    renderer.flush();
+                }
+            } else {
+                // Only reseed on clear when there's actually something to clear,
+                // so a no-op `/todo clear` doesn't pollute the transcript with an
                 // empty-todowrite pair.
-                if want_clear && state.active_todos.is_some() {
+                if kw.eq_ignore_ascii_case("clear") && state.active_todos.is_some() {
                     clear_todos(ctx, state);
                 }
                 let out =
@@ -5842,6 +5857,69 @@ fn todo_clear_messages(id: String) -> Vec<atomcode_core::conversation::message::
     ]
 }
 
+/// Synthetic tool-call pair for `/todo add <content>`: an incremental
+/// `{"action":"add","content":…}` call plus its result. Mirrors
+/// [`todo_clear_messages`]; the `content` is JSON-encoded via `serde_json` so
+/// quotes/newlines in the user's text can't break the args. Folds through the
+/// canonical `reduce_todos` as a new pending task appended at the end.
+fn todo_add_messages(
+    id: String,
+    content: &str,
+) -> Vec<atomcode_core::conversation::message::Message> {
+    use atomcode_core::conversation::message::{Message, MessageContent, Role};
+    use atomcode_core::tool::{ToolCall, ToolResult};
+    let args = serde_json::json!({ "action": "add", "content": content }).to_string();
+    vec![
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: id.clone(),
+                    name: "todowrite".to_string(),
+                    arguments: args,
+                }],
+                reasoning_content: None,
+                thinking_blocks: Vec::new(),
+            },
+            synthetic: false,
+            internal_origin: Some("todo_add".to_string()),
+        },
+        Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                call_id: id,
+                output: format!("Added task: {content}"),
+                success: true,
+            }),
+            synthetic: false,
+            internal_origin: Some("todo_add".to_string()),
+        },
+    ]
+}
+
+/// `/todo add <content>` — deterministically append a pending task without
+/// waiting on the model. Same reseed path as [`clear_todos`]: append the
+/// synthetic `add` pair and push it into the kernel conversation, so the next
+/// turn's TodoHook sees the new task and the model can act on it; then refresh
+/// the live panel from the updated transcript and persist.
+fn add_todo(ctx: &mut LoopCtx, state: &mut UiState, content: &str) {
+    let id = format!("todo-add-{}", ctx.current_session.messages.len());
+    let mut snapshot = ctx.current_session.to_conversation_snapshot();
+    snapshot.messages.extend(todo_add_messages(id, content));
+    ctx.runtime
+        .dispatch(atomcode_coding::DriverCommand::RestoreSnapshot(
+            atomcode_daemon::legacy_convert::snapshot_to_kernel(&snapshot),
+        ))
+        .ok();
+    ctx.current_session
+        .update_from_conversation_snapshot(snapshot);
+    ctx.current_session.touch();
+    state.active_todos =
+        crate::event_loop::todo_progress_from_messages(&ctx.current_session.messages);
+    crate::event_loop::sync_todo_titles(state);
+}
+
 /// `/todo clear` — deterministically wipe the task list without waiting on the
 /// model. Appends the synthetic empty-`todowrite` pair and reseeds the kernel
 /// conversation (the proven `/resume` `SetConversation` path), so the next turn's
@@ -6817,6 +6895,50 @@ mod todo_command_tests {
             format_todo_command(&msgs, false).contains(&no_list),
             "after the clear pair, /todo must show the no-list message; got:\n{}",
             format_todo_command(&msgs, false)
+        );
+    }
+
+    #[test]
+    fn todo_add_pair_appends_a_task_keeping_existing() {
+        // A live plan, then the `/todo add` synthetic pair appended, must fold to
+        // the ORIGINAL task plus the new one at the end — existing tasks untouched.
+        let mut msgs = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "1".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"do x","status":"in_progress"}]}"#.into(),
+                }],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+            internal_origin: None,
+        }];
+        msgs.extend(super::todo_add_messages("todo-add-1".to_string(), "ship it"));
+        let out = format_todo_command(&msgs, false);
+        assert!(out.contains("do x"), "existing task must remain:\n{out}");
+        assert!(out.contains("[ ] ship it"), "new pending task appended:\n{out}");
+    }
+
+    #[test]
+    fn todo_add_from_empty_creates_the_list() {
+        // No prior plan: `/todo add` alone should create a one-item list.
+        let msgs = super::todo_add_messages("todo-add-0".to_string(), "first task");
+        let out = format_todo_command(&msgs, false);
+        assert!(out.contains("[ ] first task"), "add-from-empty seeds the list:\n{out}");
+    }
+
+    #[test]
+    fn todo_add_content_with_quotes_is_json_safe() {
+        // serde_json encoding must keep the args valid so the fold sees the task.
+        let msgs = super::todo_add_messages("todo-add-2".to_string(), r#"handle "weird" input"#);
+        let out = format_todo_command(&msgs, false);
+        assert!(
+            out.contains(r#"handle "weird" input"#),
+            "quoted content survives round-trip:\n{out}"
         );
     }
 

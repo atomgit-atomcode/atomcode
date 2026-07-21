@@ -911,7 +911,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescReview => "Code review the current changes (/review · /review staged · /review <base>)".into(),
         Msg::CmdDescGoal => "Set a completion goal (autonomous loop until met)".into(),
         Msg::CmdDescProxy => "Switch outbound proxy mode".into(),
-        Msg::CmdDescTodo => "Reprint the current todo list (derived from session transcript)".into(),
+        Msg::CmdDescTodo => "Show the current todo list; `/todo add <task>` appends one, `/todo clear` wipes it".into(),
         Msg::CmdDescDesktop =>
             "Open the AtomCode desktop app (launch it if installed, else show the download link)".into(),
         Msg::DesktopOpening { name, path } =>
@@ -922,6 +922,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             format!("Found the app but couldn't launch it: {}\n  {}\n", err, path).into(),
         Msg::TodoNoList => "No task list yet (the model hasn't created todos).".into(),
         Msg::TodoListHeader => "Current tasks:".into(),
+        Msg::TodoAddUsage => "Usage: /todo add <task description>".into(),
         Msg::ViewUsage => "Usage: /view <filepath>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode Guide — type /guide <question>".into(),
         Msg::GuideMenuTopics => "Common topics:".into(),

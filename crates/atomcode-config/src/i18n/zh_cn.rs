@@ -896,7 +896,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescReview => "审查当前代码改动（/review · /review staged · /review <基准>）".into(),
         Msg::CmdDescGoal => "设定完成目标（自主循环直到达成）".into(),
         Msg::CmdDescProxy => "切换出站代理模式".into(),
-        Msg::CmdDescTodo => "重新打印当前任务清单（从会话记录中推导）".into(),
+        Msg::CmdDescTodo => "显示当前任务清单；`/todo add <任务>` 追加一条，`/todo clear` 清空".into(),
         Msg::CmdDescDesktop =>
             "打开 AtomCode 桌面端（已安装则启动，否则显示下载地址）".into(),
         Msg::DesktopOpening { name, path } =>
@@ -907,6 +907,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("找到了应用但启动失败：{}\n  {}\n", err, path).into(),
         Msg::TodoNoList => "当前无任务清单（模型尚未创建 todo）。".into(),
         Msg::TodoListHeader => "当前任务清单:".into(),
+        Msg::TodoAddUsage => "用法：/todo add <任务描述>".into(),
         Msg::ViewUsage => "用法：/view <文件路径>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode 使用指南 — 输入 /guide <问题> 提问".into(),
         Msg::GuideMenuTopics => "常用话题：".into(),
