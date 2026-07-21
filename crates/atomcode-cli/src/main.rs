@@ -13,6 +13,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod telemetry_cmd;
+mod vision;
 use atomcode::uninstall;
 
 // Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
@@ -1938,6 +1939,10 @@ async fn spawn_native_cli_runtime(
         prepare,
         provider_factory: atomcode_daemon::coding_provider_factory(),
         plugin_hooks: atomcode_daemon::installed_plugin_hook_source(),
+        // Restore the TUI's VL image recognition (dropped when the legacy
+        // bridge was retired): convert images to text for non-vision models
+        // inside the async turn, so it never blocks the UI. See `vision`.
+        image_preprocessor: Some(std::sync::Arc::new(crate::vision::VlImagePreprocessor)),
     };
     let runtime = match imported_lease {
         Some(lease) => {

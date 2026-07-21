@@ -118,6 +118,10 @@ async fn start_native_runtime_with_session_bootstrap(
         prepare,
         provider_factory: crate::coding_provider_factory(),
         plugin_hooks: crate::installed_plugin_hook_source(),
+        // Daemon preprocesses images upstream (live_api / /chat) before the
+        // turn reaches here, so the runtime-level hook is a no-op → None.
+        // (Step 2 will move it here and drop the upstream copies.)
+        image_preprocessor: None,
     };
     let runtime = match imported_lease {
         Some(lease) => {

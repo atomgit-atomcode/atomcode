@@ -21,6 +21,7 @@ default = []
 distro-pm = ["atomcode-updater/distro-pm", "atomcode-tuix/distro-pm"]
 
 [dependencies]
+async-trait = "0.1"
 atomcode-core = { path = "../atomcode-core" }
 atomcode-codingplan = { path = "../atomcode-codingplan" }
 # Config system (leaf crate, extracted from core) — used directly, not via the

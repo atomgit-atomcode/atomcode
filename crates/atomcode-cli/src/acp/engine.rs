@@ -64,6 +64,7 @@ pub async fn spawn_session(
         prepare: PrepareOptions::default(),
         provider_factory,
         plugin_hooks: Arc::new(StaticPluginHookSource::default()),
+        image_preprocessor: None,
     })
     .await
     .map_err(|e| anyhow::anyhow!("acp runtime start failed: {e}"))

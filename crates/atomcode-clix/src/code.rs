@@ -194,6 +194,7 @@ pub async fn code(args: CodeArgs) -> Result<()> {
             env!("CARGO_PKG_VERSION")
         ))),
         plugin_hooks: Arc::new(StaticPluginHookSource::default()),
+        image_preprocessor: None,
     })
     .await
     .context("runtime start failed")?;

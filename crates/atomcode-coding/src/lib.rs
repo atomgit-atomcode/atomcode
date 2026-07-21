@@ -77,13 +77,16 @@ pub use provider_factory::{
 pub use rate_limit::{RateLimitWindow, RateLimitWindowSource};
 pub use runtime::{
     CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
-    CodingRuntimeStart, DeferredRuntimeState, DriverCommand, LocalContextInput, ProviderBootstrap,
-    ProviderUnavailableReason, ReconfigureKind, ReprepareInput, RuntimeContextStats, RuntimeError,
-    RuntimeExit, RuntimeExitReason, RuntimeGeneration, RuntimeMode, RuntimePhase, RuntimeRequest,
-    RuntimeSessionInfo, RuntimeSnapshotError, RuntimeStartError, RuntimeStatus, RuntimeTurnStats,
-    RuntimeUnavailable, SequencedRuntimeEvent, SessionChanged, SubmitReceipt, TurnCompletion,
-    UndoResult, UserInput,
+    CodingRuntimeStart, DeferredRuntimeState, DriverCommand, ImagePreprocessor, LocalContextInput,
+    ProviderBootstrap, ProviderUnavailableReason, ReconfigureKind, ReprepareInput,
+    RuntimeContextStats, RuntimeError, RuntimeExit, RuntimeExitReason, RuntimeGeneration,
+    RuntimeMode, RuntimePhase, RuntimeRequest, RuntimeSessionInfo, RuntimeSnapshotError,
+    RuntimeStartError, RuntimeStatus, RuntimeTurnStats, RuntimeUnavailable, SequencedRuntimeEvent,
+    SessionChanged, SubmitReceipt, TurnCompletion, UndoResult, UserInput,
 };
+/// The image type carried by [`UserInput`] / [`ImagePreprocessor`], re-exported
+/// so driver crates can implement the hook without naming `atomcode_kernel`.
+pub use atomcode_kernel::message::ImageContent;
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use todo::TodoHook;
 

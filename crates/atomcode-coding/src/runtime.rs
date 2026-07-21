@@ -429,11 +429,46 @@ impl RuntimeEventEmitter {
 }
 
 /// Inputs needed to build the first runtime generation without a bridge dependency.
+/// Injected hook that rewrites a user turn's `(text, images)` before it is
+/// sent to the model — the seam for vision (VL) preprocessing.
+///
+/// When the active model can't accept images, the implementation replaces
+/// them with a VL-generated text description and returns empty images; a
+/// vision-capable model passes through unchanged. Lives here (rather than the
+/// runtime calling `atomcode_core::vision_preprocessor` directly) so
+/// `atomcode-coding` keeps its no-`core` dependency: the driver (CLI/daemon),
+/// which has `core`, injects the concrete implementation via
+/// [`CodingRuntimeStart::image_preprocessor`], mirroring `provider_factory`.
+///
+/// Runs on the async owner task with the turn already marked in-progress, so
+/// it never blocks the (fire-and-forget) submit call or the UI spinner. It
+/// DOES hold the runtime's owner loop for its duration — controls (cancel,
+/// compact) queue until it returns — matching the retired bridge's behavior.
+#[async_trait::async_trait]
+pub trait ImagePreprocessor: Send + Sync {
+    /// `active_model` is the runtime's resolved main-turn model name (honours
+    /// a `--provider` / `/model` selection), used to decide vision support —
+    /// authoritative, unlike re-reading a config default. `session_id` is the
+    /// active conversation's id, forwarded onto any auxiliary (VL) call so a
+    /// gateway pins it to the same upstream account.
+    async fn preprocess(
+        &self,
+        text: String,
+        images: Vec<ImageContent>,
+        active_model: String,
+        session_id: Option<String>,
+    ) -> UserInput;
+}
+
 pub struct CodingRuntimeStart {
     pub agent: CodingAgentConfig,
     pub prepare: PrepareOptions,
     pub provider_factory: Arc<dyn CodingProviderFactory>,
     pub plugin_hooks: Arc<dyn PluginHookSource>,
+    /// Optional VL preprocessing hook (see [`ImagePreprocessor`]). `None` on
+    /// paths that either can't send images to a non-vision model or already
+    /// preprocess upstream (the daemon today).
+    pub image_preprocessor: Option<Arc<dyn ImagePreprocessor>>,
 }
 
 struct RuntimeResources {
@@ -444,6 +479,7 @@ struct RuntimeResources {
     parts: crate::CodingParts,
     wakeup_tx: mpsc::UnboundedSender<WakeupRequest>,
     loop_active: Arc<std::sync::atomic::AtomicBool>,
+    image_preprocessor: Option<Arc<dyn ImagePreprocessor>>,
 }
 
 /// A native coding runtime. Dropping `events` causes a fail-closed shutdown.
@@ -1245,6 +1281,7 @@ impl CodingRuntime {
             prepare,
             provider_factory,
             plugin_hooks,
+            image_preprocessor,
         } = input;
         if let Some(config) = agent.subagent_config.clone() {
             crate::provider_factory::install_subagent_tiers(
@@ -1321,6 +1358,7 @@ impl CodingRuntime {
                 parts,
                 wakeup_tx,
                 loop_active,
+                image_preprocessor,
             }),
             Some(wakeup_rx),
         );
@@ -2316,6 +2354,39 @@ fn spawn_runtime_owner_with_optional_agent(
                                 format!("{prefix}\n\n{}", input.text)
                             };
                         }
+                        // Vision (VL) preprocessing: when the turn carries images and a
+                        // preprocessor is installed, rewrite `(text, images)` before the
+                        // kernel turn — a non-vision model gets a VL text description with
+                        // images cleared; a vision model passes through. Awaited HERE (turn
+                        // already marked in-progress above, spinner showing) so the
+                        // multi-second VL call never blocks the caller. `None` preprocessor
+                        // (or empty images) is a no-op.
+                        if !input.images.is_empty() {
+                            if let Some(pp) =
+                                resources.as_ref().and_then(|r| r.image_preprocessor.clone())
+                            {
+                                // Authoritative active-turn model + session id come
+                                // from the runtime's own resolved resources, not a
+                                // re-read config default (which would miss a
+                                // `--provider` override).
+                                let active_model = resources
+                                    .as_ref()
+                                    .map(|r| r.config.model.clone())
+                                    .unwrap_or_default();
+                                let session_id = resources
+                                    .as_ref()
+                                    .and_then(|r| r.parts.session.as_ref())
+                                    .map(|b| b.id.clone());
+                                input = pp
+                                    .preprocess(
+                                        std::mem::take(&mut input.text),
+                                        std::mem::take(&mut input.images),
+                                        active_model,
+                                        session_id,
+                                    )
+                                    .await;
+                            }
+                        }
                         if send_agent_command(
                             &agent,
                             AgentCommand::SendMessage {
@@ -2853,6 +2924,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 parts,
                                 wakeup_tx: runtime.wakeup_tx.clone(),
                                 loop_active: Arc::clone(&runtime.loop_active),
+                                // Preserve the injected VL hook across reprepare
+                                // (/model swap, reconfigure).
+                                image_preprocessor: runtime.image_preprocessor.clone(),
                             },
                             Err(error) => {
                                 let error = runtime_prepare_error(error);
@@ -4698,6 +4772,7 @@ mod tests {
                 fail: fail_provider,
             }),
             plugin_hooks: Arc::new(crate::StaticPluginHookSource::default()),
+            image_preprocessor: None,
         }
     }
 
@@ -5507,6 +5582,7 @@ mod tests {
             prepare,
             provider_factory,
             plugin_hooks,
+            ..
         } = native_start(false);
         let parts =
             prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
@@ -5520,6 +5596,7 @@ mod tests {
             parts,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -5589,17 +5666,45 @@ mod tests {
         assert_eq!(handle.status().phase, RuntimePhase::Failed);
     }
 
-    #[tokio::test]
-    async fn recoverable_goal_continuation_send_failure_deactivates_goal_and_fails_runtime() {
-        let (agent, mut kernel_commands, kernel_events) = fake_agent();
+    // A recording `ImagePreprocessor` that folds images into text (mimicking a
+    // VL description) and clears them, flagging whether it was ever called.
+    struct RecordingPreprocessor {
+        called: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl ImagePreprocessor for RecordingPreprocessor {
+        async fn preprocess(
+            &self,
+            text: String,
+            _images: Vec<ImageContent>,
+            _active_model: String,
+            _session_id: Option<String>,
+        ) -> UserInput {
+            self.called.store(true, Ordering::Release);
+            UserInput {
+                text: format!("VL[{text}]"),
+                images: Vec::new(),
+            }
+        }
+    }
+
+    async fn spawn_with_preprocessor(
+        pp: Option<Arc<dyn ImagePreprocessor>>,
+    ) -> (
+        CodingRuntimeHandle,
+        mpsc::UnboundedReceiver<AgentCommand>,
+        KernelRuntimeAdapter,
+    ) {
+        let (agent, kernel_commands, _kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
-        let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
+        let (runtime_tx, _runtime_events) = mpsc::unbounded_channel();
         let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
         let CodingRuntimeStart {
             agent: config,
             prepare,
             provider_factory,
             plugin_hooks,
+            ..
         } = native_start(false);
         let parts =
             prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
@@ -5613,6 +5718,89 @@ mod tests {
             parts,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: pp,
+        };
+        let adapter = spawn_runtime_owner_with_protocol(
+            agent, controls, runtime_tx, true, true, None, Some(resources), Some(wakeup_rx),
+        );
+        (handle, kernel_commands, adapter)
+    }
+
+    // The installed preprocessor runs on an image-carrying submit, and its
+    // rewritten `(text, images)` — not the raw input — is what reaches the
+    // kernel. This is the seam that restores TUI VL image recognition.
+    #[tokio::test]
+    async fn image_submit_runs_installed_preprocessor_before_kernel() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handle, mut kernel_commands, _adapter) =
+            spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor { called: called.clone() }))).await;
+
+        handle
+            .submit(UserInput {
+                text: "look at this".into(),
+                images: vec![ImageContent {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                }],
+            })
+            .await
+            .unwrap();
+
+        match kernel_commands.recv().await {
+            Some(AgentCommand::SendMessage { text, images }) => {
+                assert_eq!(text, "VL[look at this]", "preprocessor output must reach the kernel");
+                assert!(images.is_empty(), "images must be cleared after preprocessing");
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+        assert!(called.load(Ordering::Acquire), "preprocessor must have run");
+    }
+
+    // Guard: a text-only submit skips the preprocessor entirely (no images),
+    // so the original text passes through untouched.
+    #[tokio::test]
+    async fn text_only_submit_skips_preprocessor() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handle, mut kernel_commands, _adapter) =
+            spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor { called: called.clone() }))).await;
+
+        handle.submit(UserInput::from("no images here")).await.unwrap();
+
+        match kernel_commands.recv().await {
+            Some(AgentCommand::SendMessage { text, .. }) => {
+                assert_eq!(text, "no images here", "text-only submit must be unchanged");
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+        assert!(!called.load(Ordering::Acquire), "preprocessor must NOT run without images");
+    }
+
+    #[tokio::test]
+    async fn recoverable_goal_continuation_send_failure_deactivates_goal_and_fails_runtime() {
+        let (agent, mut kernel_commands, kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        let CodingRuntimeStart {
+            agent: config,
+            prepare,
+            provider_factory,
+            plugin_hooks,
+            ..
+        } = native_start(false);
+        let parts =
+            prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
+                .await
+                .unwrap();
+        let resources = RuntimeResources {
+            config,
+            prepare,
+            provider_factory,
+            plugin_hooks,
+            parts,
+            wakeup_tx,
+            loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -5707,6 +5895,7 @@ mod tests {
             parts,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -5755,6 +5944,7 @@ mod tests {
             prepare,
             provider_factory,
             plugin_hooks,
+            ..
         } = native_start(false);
         let parts =
             prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
@@ -5768,6 +5958,7 @@ mod tests {
             parts,
             wakeup_tx: wakeup_tx.clone(),
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -5889,6 +6080,7 @@ mod tests {
             parts,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -5983,6 +6175,7 @@ mod tests {
             prepare,
             provider_factory,
             plugin_hooks,
+            ..
         } = native_start(false);
         let parts =
             prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
@@ -5996,6 +6189,7 @@ mod tests {
             parts,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -6044,6 +6238,7 @@ mod tests {
             prepare,
             provider_factory,
             plugin_hooks,
+            ..
         } = native_start(false);
         let parts =
             prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
@@ -6057,6 +6252,7 @@ mod tests {
             parts,
             wakeup_tx: wakeup_tx.clone(),
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
