@@ -30,6 +30,10 @@ pub enum Msg<'a> {
     /// verbatim server error so user-supplied API keys (sk-...) get
     /// the diagnostic detail.
     ChatAuthExpired,
+    /// Hint appended to a login connection failure (connect/timeout): the
+    /// endpoint is reachable from a browser but the client was reset — likely a
+    /// proxy/firewall path difference. Points at the actionable knobs.
+    NetworkConnectHint,
     // SetupReport renderer (core/coding_plan/setup.rs)
     CpSetupHeader,
     CpLoggedIn {

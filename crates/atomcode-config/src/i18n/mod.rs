@@ -605,4 +605,16 @@ mod tests {
         });
         check!(Msg::UsageCopied);
     }
+
+    #[test]
+    fn network_connect_hint_present_both_langs() {
+        let _g = test_lock();
+        let en = t_with(Locale::En, Msg::NetworkConnectHint);
+        let zh = t_with(Locale::ZhCn, Msg::NetworkConnectHint);
+        assert!(!en.trim().is_empty(), "en hint must be non-empty");
+        assert!(!zh.trim().is_empty(), "zh hint must be non-empty");
+        // Mentions the actionable knobs so the hint is useful.
+        assert!(en.contains("/proxy") && en.contains("HTTPS_PROXY"), "en: {en}");
+        assert!(zh.contains("/proxy") && zh.contains("HTTPS_PROXY"), "zh: {zh}");
+    }
 }

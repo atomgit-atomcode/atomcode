@@ -21,6 +21,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  ⚠ 登录凭证已失效 — 正在重新登录...\n".into(),
         Msg::ChatAuthExpired =>
             "认证已过期，请执行 /login 重新登录".into(),
+        Msg::NetworkConnectHint =>
+            "网络连接失败。若浏览器能打开，可能是代理/防火墙差异：用 /proxy 配置代理或设置 HTTPS_PROXY，或在浏览器打开上面的登录链接完成扫码。可按 Esc 跳过，稍后 /login 重试。".into(),
         Msg::CpSetupHeader =>
             "  AtomCode CodingPlan 配置：\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>

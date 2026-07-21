@@ -21,6 +21,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  ⚠ Stored login expired — re-authenticating...\n".into(),
         Msg::ChatAuthExpired =>
             "Authentication expired — please run /login to sign in again".into(),
+        Msg::NetworkConnectHint =>
+            "Network connect failed. If this works in a browser you may be behind a proxy/firewall: configure a proxy with /proxy or set HTTPS_PROXY, or open the login URL above in a browser to finish. Press Esc to skip and /login later.".into(),
         Msg::CpSetupHeader =>
             "  AtomCode CodingPlan setup:\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
