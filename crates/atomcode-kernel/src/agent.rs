@@ -305,6 +305,18 @@ fn empty_exhaustion_message(
     }
 }
 
+/// The mid-turn input budget: the window minus a reservation for the completion
+/// (`max_tokens`) and a margin covering the byte-based token estimate's undercount.
+/// Used only by the pre-send compaction guard and the over-window advisory — the
+/// DISPLAYED window (`context_window()`) is unchanged, so users still see the model's
+/// full window while the guard keeps the real request (messages + completion) under
+/// the model's usable limit.
+fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
+    let output_reserve = max_tokens.unwrap_or(16_384);
+    let margin = (window / 8).clamp(16_000, 128_000);
+    window.saturating_sub(output_reserve).saturating_sub(margin)
+}
+
 /// Pre-send advisory: the estimated OUTGOING request still meets/exceeds the
 /// model window AFTER the pre-send emergency compaction already tried (or had
 /// nothing to drain). At this point the cause is a single oversized input that
@@ -3818,5 +3830,41 @@ mod steer_buffer_tests {
             steered_total, 1,
             "one folded prompt → Steered {{ count: 1 }}"
         );
+    }
+}
+
+#[cfg(test)]
+mod effective_input_limit_tests {
+    use super::effective_input_limit;
+
+    #[test]
+    fn reserves_output_plus_margin() {
+        // deepseek-v4-flash: 1M window, 16,384 max_tokens.
+        // margin = 1_000_000/8 = 125_000; reserve = 16_384 + 125_000 = 141_384.
+        assert_eq!(effective_input_limit(1_000_000, Some(16_384)), 858_616);
+        // GLM: 200K window, 16,384 max_tokens.
+        // margin = 200_000/8 = 25_000; reserve = 16_384 + 25_000 = 41_384.
+        assert_eq!(effective_input_limit(200_000, Some(16_384)), 158_616);
+    }
+
+    #[test]
+    fn none_max_tokens_uses_default_16384() {
+        assert_eq!(effective_input_limit(1_000_000, None), 858_616);
+    }
+
+    #[test]
+    fn margin_clamps_floor_and_ceiling() {
+        // Small window: 64_000/8 = 8_000 → clamped UP to 16_000.
+        // reserve = 16_384 + 16_000 = 32_384; effective = 31_616.
+        assert_eq!(effective_input_limit(64_000, Some(16_384)), 31_616);
+        // Large window: 2_000_000/8 = 250_000 → clamped DOWN to 128_000.
+        // reserve = 16_384 + 128_000 = 144_384; effective = 1_855_616.
+        assert_eq!(effective_input_limit(2_000_000, Some(16_384)), 1_855_616);
+    }
+
+    #[test]
+    fn tiny_window_saturates_to_zero_never_panics() {
+        // window smaller than the reserve → saturating_sub → 0.
+        assert_eq!(effective_input_limit(1_000, Some(16_384)), 0);
     }
 }
