@@ -45,6 +45,8 @@ pub struct Repo {
     pub default_branch: String,
     #[serde(default)]
     pub owner: User,
+    #[serde(default)]
+    pub project_labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

@@ -77,6 +77,33 @@ impl AtomgitClient {
         self.post_json(&format!("/repos/{owner}/{repo}/tags"), &body)
             .await
     }
+
+    /// Read the repo's `project_labels`.
+    pub async fn repo_labels(&self, owner: &str, repo: &str) -> Result<Vec<String>, String> {
+        let r: crate::atomgit::models::Repo =
+            self.get_json(&format!("/repos/{owner}/{repo}"), &[]).await?;
+        Ok(r.project_labels)
+    }
+
+    /// Replace the repo's `project_labels` wholesale.
+    pub async fn repo_set_labels(&self, owner: &str, repo: &str, labels: &[String]) -> Result<(), String> {
+        let body = serde_json::json!({ "project_labels": labels });
+        let _: crate::atomgit::models::Repo =
+            self.patch_json(&format!("/repos/{owner}/{repo}"), &body).await?;
+        Ok(())
+    }
+
+    /// Ensure `label` is present. Returns `true` if it was added, `false` if it
+    /// was already there. Idempotent (GET then PATCH-if-missing).
+    pub async fn repo_ensure_label(&self, owner: &str, repo: &str, label: &str) -> Result<bool, String> {
+        let mut labels = self.repo_labels(owner, repo).await?;
+        if labels.iter().any(|l| l == label) {
+            return Ok(false);
+        }
+        labels.push(label.to_string());
+        self.repo_set_labels(owner, repo, &labels).await?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -196,5 +223,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.name, "r");
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::super::{AtomgitClient, AtomgitConfig};
+    use crate::atomgit::testutil::StaticToken;
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path, body_json};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn client(server: &MockServer) -> AtomgitClient {
+        AtomgitClient::new(AtomgitConfig {
+            base_url: format!("{}/api/v5", server.uri()),
+            user_agent: "atomcode-test".into(),
+            token: Arc::new(StaticToken("t")),
+        }).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ensure_label_adds_when_missing() {
+        let server = MockServer::start().await;
+        // GET returns labels without "atomcode".
+        Mock::given(method("GET")).and(path("/api/v5/repos/acme/widget"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name":"widget","project_labels":["rust"]})))
+            .mount(&server).await;
+        // PATCH must receive the FULL merged list.
+        Mock::given(method("PATCH")).and(path("/api/v5/repos/acme/widget"))
+            .and(body_json(serde_json::json!({"project_labels":["rust","atomcode"]})))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name":"widget"})))
+            .mount(&server).await;
+
+        let c = client(&server);
+        let added = c.repo_ensure_label("acme", "widget", "atomcode").await.unwrap();
+        assert!(added, "should have added the label");
+    }
+
+    #[tokio::test]
+    async fn ensure_label_noop_when_present() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/v5/repos/acme/widget"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name":"widget","project_labels":["atomcode"]})))
+            .mount(&server).await;
+        // No PATCH mounted → a PATCH would 404 and fail the test.
+        let c = client(&server);
+        let added = c.repo_ensure_label("acme", "widget", "atomcode").await.unwrap();
+        assert!(!added, "should be a no-op when already present");
     }
 }
