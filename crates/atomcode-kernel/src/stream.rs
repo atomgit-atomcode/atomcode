@@ -67,13 +67,18 @@ impl ProviderError {
         // 2. HTTP 400 + message signature (Anthropic "prompt is too long", others).
         if self.http_status == Some(400) {
             let m = self.message.to_ascii_lowercase();
-            const NEEDLES: [&str; 6] = [
+            const NEEDLES: [&str; 11] = [
                 "context length",
                 "context window",
                 "maximum context",
                 "prompt is too long",
                 "reduce the length",
                 "too many tokens",
+                "range of input length", // Bailian / Tencent gateway
+                "input length",          // "input length exceeds context length" variants
+                "exceeds the maximum",   // generic upstream phrasing
+                "maximum prompt length", // Anthropic-style variant
+                "too large for model",   // variant
             ];
             if NEEDLES.iter().any(|n| m.contains(n)) {
                 return true;
@@ -243,5 +248,22 @@ mod overflow_tests {
     #[test]
     fn retryable_429_is_not_overflow() {
         assert!(!err(Some(429), None, "rate limited").is_context_overflow());
+    }
+    #[test]
+    fn detects_gateway_over_limit_shapes() {
+        // Bailian / Tencent shape.
+        assert!(err(
+            Some(400),
+            None,
+            "<400> InvalidParameter: Range of input length should be [1, 1000000]."
+        )
+        .is_context_overflow());
+        // Other variants.
+        assert!(err(Some(400), None, "input length exceeds context length").is_context_overflow());
+        assert!(err(Some(400), None, "This exceeds the maximum for this model").is_context_overflow());
+        assert!(err(Some(400), None, "maximum prompt length is 200000").is_context_overflow());
+        assert!(err(Some(400), None, "too large for model with 8192 maximum").is_context_overflow());
+        // Unrelated 400 stays false.
+        assert!(!err(Some(400), Some("model_not_found"), "no such model").is_context_overflow());
     }
 }
