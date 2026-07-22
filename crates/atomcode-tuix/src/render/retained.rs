@@ -5778,8 +5778,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             // ── body: streaming assistant ──
             UiLine::AssistantText(text) => {
                 if !self.last_mark_was_assistant {
+                    let prev_mark_kind = self.message_marks.last().map(|m| m.kind);
                     self.mark_message(crate::render::MarkKind::Assistant);
                     self.last_mark_was_assistant = true;
+                    if let Some(crate::render::MarkKind::ToolCall | crate::render::MarkKind::ToolResult) = prev_mark_kind {
+                        let tail_blank = self
+                            .body_lines
+                            .last()
+                            .map(|r| r.iter().all(|c| c.ch == ' '))
+                            .unwrap_or(true);
+                        if !tail_blank {
+                            self.push_body_row(Vec::new());
+                        }
+                    }
                 }
                 self.assistant_line_buf.push_str(&scrub_controls(&text));
                 self.flush_assistant_lines();
@@ -13711,6 +13722,38 @@ mod tests {
         r.render(UiLine::User("hi".into()));
         assert_eq!(r.message_marks.len(), 1);
         assert_eq!(r.message_marks[0].kind, crate::render::MarkKind::User);
+    }
+
+    #[test]
+    fn retained_blank_line_between_tool_result_and_assistant() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::ToolCall {
+            name: "web_search".into(),
+            detail: "长沙天气".into(),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "sources: weather.com.cn".into(),
+        });
+        r.render(UiLine::AssistantText("今天长沙的天气情况如下：\n".into()));
+
+        let lines: Vec<String> = r.body_lines
+            .iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+            .collect();
+
+        // There should be a blank spacer line at index 2 (between ToolResult at index 1 and AssistantText at index 3)
+        assert!(lines.len() >= 4, "Expected at least 4 lines, got {:?}", lines);
+        assert!(
+            lines[2].trim().is_empty(),
+            "Expected line 2 to be blank, got {:?}",
+            lines[2]
+        );
+        assert!(
+            lines[3].contains("今"),
+            "Expected line 3 to contain assistant text, got {:?}",
+            lines[3]
+        );
     }
 
     #[test]
