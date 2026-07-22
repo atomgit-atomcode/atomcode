@@ -397,6 +397,11 @@ pub enum MenuKind {
     Marketplace,
     /// Plugin manager details / scope selection screens: 1-line rendering per item, input box hidden
     PluginInfo,
+    /// `/resume` session picker: same chrome as `Plugin` (bordered search box,
+    /// hidden composer, title + bottom hint), but each session row is 2 lines —
+    /// row 1 = bright session title, row 2 = gray metadata. Mirrors `Plugin`
+    /// throughout the render loop EXCEPT the per-item leaf builder.
+    SessionList,
 }
 
 impl MenuKind {
@@ -409,7 +414,7 @@ impl MenuKind {
             MenuKind::Skill | MenuKind::TwoColumn { .. } => {
                 item_count.min((screen_height / 2).max(4))
             }
-            MenuKind::Plugin => {
+            MenuKind::Plugin | MenuKind::SessionList => {
                 let plugin_count = item_count.saturating_sub(3);
                 let max_plugins = (screen_height / 4).max(2);
                 let visible_plugins = plugin_count.min(max_plugins);

@@ -427,8 +427,15 @@ pub enum Msg<'a> {
     },
     SessionNoneSelected,
     /// Persistent footer hint in the `/resume` picker advertising the key
-    /// actions (open / rename / delete) so they're discoverable.
+    /// actions (open / delete / search) so they're discoverable.
     SessionPickerHint,
+    /// Title row of the `/resume` picker: current 1-based position in the
+    /// filtered list, total sessions in the project, and the project name.
+    SessionPickerTitle {
+        n: usize,
+        total: usize,
+        project: &'a str,
+    },
     SessionRenameEditing {
         buffer: &'a str,
     },

@@ -6,16 +6,19 @@
 // with type-to-filter search. Up/Down navigates, Enter loads + replays
 // into scrollback + restores the runtime conversation through the native API,
 // Esc cancels, printable chars + Backspace edit the filter query.
-// F2 renames the selected session.
+//
+// The chrome mirrors the `/plugin` manager (MenuKind::SessionList): a title
+// row with count + project name, a bordered search box (the InputPrompt buffer
+// carries the filter query, NOT the main composer), two-line session rows
+// (bright title + gray metadata), and a muted bottom hint. Rename is no longer
+// supported.
 
 use crate::session::{Session, SessionMeta, TurnStat};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{
-    build_status, format_tool_detail, perform_session_rename, summarise, Buffer, LoopCtx,
-};
+use crate::event_loop::{build_status, format_tool_detail, summarise, Buffer, LoopCtx};
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
@@ -28,10 +31,6 @@ pub struct SessionPicker {
     pub filtered: Vec<usize>,
     /// Index into `filtered`.
     pub selected: usize,
-    /// Whether we are in rename editing mode.
-    pub rename_editing: bool,
-    /// The new name being edited for rename.
-    pub rename_buffer: String,
     /// Index into `sessions` awaiting delete confirmation, or None.
     pub confirm_delete: Option<usize>,
     /// Status message shown in the footer (overwrites previous status).
@@ -46,8 +45,6 @@ impl SessionPicker {
             query: String::new(),
             filtered,
             selected: 0,
-            rename_editing: false,
-            rename_buffer: String::new(),
             confirm_delete: None,
             delete_status: None,
         }
@@ -96,19 +93,17 @@ impl SessionPicker {
     }
 
     /// The static key-legend hint advertising the picker's actions
-    /// (`Enter open · F2 rename · Ctrl+D delete`), or `None` when it shouldn't
-    /// show. Suppressed during rename editing (the selected item label already
-    /// carries the `[Enter: confirm, Esc: cancel]` hint) and for an empty list
-    /// (nothing to act on). Existence of this legend is the reported gap: users
-    /// couldn't tell how to delete a session because the picker showed no keys.
+    /// (`↑↓ move · Enter open · Ctrl+D delete · Type to search · Esc cancel`),
+    /// or `None` for an empty list (nothing to act on). Existence of this legend
+    /// is the reported gap: users couldn't tell how to delete a session because
+    /// the picker showed no keys.
     ///
-    /// NOTE: this is LOWER priority than a `build_status` warning — the caller
-    /// only fills it when the status hint slot is otherwise empty, so opening
-    /// `/resume` never clobbers a no-provider / official-build / usage warning.
-    /// The transient `delete_status` (the user's own Ctrl+D confirmation) is a
-    /// separate, higher-priority channel handled in `draw`.
+    /// NOTE: with the `SessionList` chrome this hint is ALSO rendered as the
+    /// bottom `— … —` row inside the menu, so it's visible even when a
+    /// `build_status` warning occupies the status slot; the status-slot copy
+    /// (below) is a bonus, gated LOWER priority than any warning.
     fn browse_hint(&self) -> Option<String> {
-        if self.rename_editing || self.filtered.is_empty() {
+        if self.filtered.is_empty() {
             return None;
         }
         Some(crate::i18n::t(crate::i18n::Msg::SessionPickerHint).into_owned())
@@ -125,79 +120,6 @@ impl Modal for SessionPicker {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
-        // Handle rename editing mode
-        if self.rename_editing {
-            match code {
-                KeyCode::Esc => {
-                    // Cancel rename editing
-                    self.rename_editing = false;
-                    self.rename_buffer.clear();
-                    self.draw(buf, state, ctx, renderer);
-                    return Ok(ModalAction::Continue);
-                }
-                KeyCode::Enter => {
-                    if let Some(idx) = self.filtered.get(self.selected).copied() {
-                        if let Some(session_meta) = self.sessions.get(idx) {
-                            let id = session_meta.id.clone();
-                            match perform_session_rename(
-                                &session_meta.project_bucket,
-                                &id,
-                                &self.rename_buffer,
-                            ) {
-                                Ok((old_name, new_name)) => {
-                                    // Update the session name in our local list
-                                    if let Some(s) = self.sessions.get_mut(idx) {
-                                        s.name = new_name.clone();
-                                    }
-                                    // Recompute filtered list since new name may no longer match query
-                                    let prev_id = id.clone();
-                                    self.update_filter();
-                                    // Try to keep the same session selected
-                                    self.selected = self
-                                        .filtered
-                                        .iter()
-                                        .position(|&fi| self.sessions[fi].id == prev_id)
-                                        .unwrap_or(0);
-                                    // Show success feedback
-                                    renderer.render(UiLine::CommandOutput(
-                                        crate::i18n::t(crate::i18n::Msg::SessionRenamed {
-                                            old: &old_name,
-                                            new: &new_name,
-                                        })
-                                        .into_owned(),
-                                    ));
-                                    renderer.flush();
-                                }
-                                Err(err) => {
-                                    renderer.render(UiLine::Error(err));
-                                    renderer.flush();
-                                }
-                            }
-                        }
-                    }
-                    self.rename_editing = false;
-                    self.rename_buffer.clear();
-                    self.draw(buf, state, ctx, renderer);
-                    return Ok(ModalAction::Continue);
-                }
-                KeyCode::Backspace => {
-                    self.rename_buffer.pop();
-                    self.draw(buf, state, ctx, renderer);
-                    return Ok(ModalAction::Continue);
-                }
-                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                    self.rename_buffer.push(c);
-                    self.draw(buf, state, ctx, renderer);
-                    return Ok(ModalAction::Continue);
-                }
-                _ => {
-                    self.draw(buf, state, ctx, renderer);
-                    return Ok(ModalAction::Continue);
-                }
-            }
-        }
-
-        // Normal mode handling
         match code {
             KeyCode::Up => {
                 self.up();
@@ -225,24 +147,6 @@ impl Modal for SessionPicker {
                 self.confirm_delete = None;
                 self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
-                Ok(ModalAction::Continue)
-            }
-            KeyCode::F(2) => {
-                // F2 to start rename editing for selected session
-                if let Some(idx) = self.filtered.get(self.selected).copied() {
-                    if let Some(session) = self.sessions.get(idx) {
-                        self.rename_buffer = session.name.clone();
-                        self.rename_editing = true;
-                        self.confirm_delete = None;
-                        self.delete_status = None;
-                        self.draw(buf, state, ctx, renderer);
-                    }
-                } else {
-                    renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::SessionNoneSelected).into_owned(),
-                    ));
-                    renderer.flush();
-                }
                 Ok(ModalAction::Continue)
             }
             KeyCode::Char(c) if mods.contains(KeyModifiers::CONTROL) && c == 'd' => {
@@ -415,13 +319,30 @@ impl Modal for SessionPicker {
         Ok(ModalAction::Continue)
     }
 
-    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
-        let payload = build_menu_payload(self);
+    fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+        // Project name = basename of the working dir (falls back to the full
+        // path string, then to a placeholder, so the title never renders blank).
+        let project = ctx
+            .working_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                let p = ctx.working_dir.to_string_lossy();
+                if p.is_empty() {
+                    "project".to_string()
+                } else {
+                    p.into_owned()
+                }
+            });
+        let payload = build_menu_payload(self, &project);
         let mut status = build_status(state, ctx);
         // Delete confirmation/result is the user's own active interaction — it
         // must always show, overriding any build_status warning. The static key
         // legend is lowest priority: only fill an otherwise-empty hint slot so a
-        // no-provider / official-build / usage warning stays visible in the picker.
+        // no-provider / official-build / usage warning stays visible in the
+        // picker (the legend also renders as the menu's bottom `— … —` row, so
+        // it's never fully hidden even when a warning owns the status slot).
         if let Some(msg) = &self.delete_status {
             status.hint = Some((msg.clone(), crate::render::HintSeverity::Info));
         } else if status.hint.is_none() {
@@ -429,9 +350,12 @@ impl Modal for SessionPicker {
                 status.hint = Some((msg, crate::render::HintSeverity::Info));
             }
         }
+        // The `SessionList` chrome puts the filter query in the (bordered) search
+        // box, so the InputPrompt buffer carries the QUERY — not the main
+        // composer — exactly like `/plugin`.
         renderer.render(UiLine::InputPrompt {
-            buf: buf.text.clone(),
-            cursor_byte: buf.cursor,
+            buf: self.query.clone(),
+            cursor_byte: self.query.len(),
             menu: Some(payload),
             status,
             attachments: Vec::new(),
@@ -440,10 +364,39 @@ impl Modal for SessionPicker {
     }
 }
 
-fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
+/// The four fixed header rows (title, blank, search query, blank) that the
+/// `SessionList` chrome expects before the session rows begin. Session row
+/// `selected` indices are offset by this in the payload so the `▸` marker
+/// lands on the right row (mirrors `plugin_manager`'s `selected_offset`).
+const HEADER_ROWS: usize = 4;
+
+fn build_menu_payload(p: &SessionPicker, project: &str) -> MenuPayload {
+    // Title row: 1-based position in the CURRENT filtered list, total sessions
+    // in the project (constant), and the project name.
+    let total = p.sessions.len();
+    let pos = if p.filtered.is_empty() {
+        0
+    } else {
+        p.selected + 1
+    };
+    let title = crate::i18n::t(crate::i18n::Msg::SessionPickerTitle {
+        n: pos,
+        total,
+        project,
+    })
+    .into_owned();
+    let hint = crate::i18n::t(crate::i18n::Msg::SessionPickerHint).into_owned();
+
+    // Header chrome: title, blank, search query, blank.
+    let mut items: Vec<(String, String)> =
+        vec![(title, String::new()), (String::new(), String::new())];
+    items.push((p.query.clone(), String::new()));
+    items.push((String::new(), String::new()));
+
     // Empty state: surface a hint row so the user can tell the filter is
     // active and which query is excluding everything (otherwise the menu
-    // renders as blank space and looks like the modal hung).
+    // renders as blank chrome and looks like the modal hung). This row is NOT
+    // selectable, so `selected` points past the list (never highlights it).
     if p.filtered.is_empty() {
         let label = if p.sessions.is_empty() {
             "(no sessions in this project yet)".to_string()
@@ -452,46 +405,32 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
         } else {
             format!("(no sessions match \"{}\" — Backspace to clear)", p.query)
         };
+        items.push((label, String::new()));
+        items.push((format!("— {} —", hint), String::new()));
         return MenuPayload {
-            items: vec![(label, String::new())],
-            selected: 0,
-            kind: crate::render::MenuKind::TwoColumn {
-                row_prefix: "",
-                selected_marker: "▸",
-            },
+            items,
+            // Nothing selectable → point past the end so no row is marked.
+            selected: usize::MAX,
+            kind: crate::render::MenuKind::SessionList,
         };
     }
-    let items: Vec<(String, String)> = p
-        .filtered
-        .iter()
-        .enumerate()
-        .map(|(filter_idx, &session_idx)| {
-            let s = &p.sessions[session_idx];
-            let msgs = crate::i18n::t(crate::i18n::Msg::SessionMsgCount {
-                count: s.message_count,
-            });
-            let desc = format!("{} · {}", msgs, humanize_age(s.updated_at));
-            // If in rename editing mode and this is the selected item, show the editing buffer
-            if p.rename_editing && filter_idx == p.selected {
-                (
-                    crate::i18n::t(crate::i18n::Msg::SessionRenameEditing {
-                        buffer: &p.rename_buffer,
-                    })
-                    .into_owned(),
-                    desc,
-                )
-            } else {
-                (s.name.clone(), desc)
-            }
-        })
-        .collect();
+
+    for &session_idx in &p.filtered {
+        let s = &p.sessions[session_idx];
+        let msgs = crate::i18n::t(crate::i18n::Msg::SessionMsgCount {
+            count: s.message_count,
+        });
+        let metadata = format!("{} · {}", msgs, humanize_age(s.updated_at));
+        items.push((s.name.clone(), metadata));
+    }
+    items.push((format!("— {} —", hint), String::new()));
+
     MenuPayload {
+        // Offset the selection past the header chrome so the ▸ marker lands on
+        // the selected session row (rows begin at index HEADER_ROWS).
+        selected: HEADER_ROWS + p.selected,
         items,
-        selected: p.selected,
-        kind: crate::render::MenuKind::TwoColumn {
-            row_prefix: "",
-            selected_marker: "▸",
-        },
+        kind: crate::render::MenuKind::SessionList,
     }
 }
 
@@ -887,26 +826,44 @@ mod tests {
 
     #[test]
     fn browse_hint_advertises_key_actions() {
-        // Discoverability: the picker must surface the delete/rename shortcuts,
-        // else users can't tell how to delete a session (the reported gap).
+        // Discoverability: the picker must surface the delete/open/search
+        // shortcuts, else users can't tell how to act on a session (the reported
+        // gap). Rename is intentionally no longer supported, so it is absent.
         let p = SessionPicker::open(vec![meta("a", 1)]);
         let h = p.browse_hint().expect("browse mode advertises key actions");
         // Locale-independent: the literal shortcuts appear in both en and zh.
         assert!(h.contains("Ctrl+D"), "delete shortcut must be shown: {h:?}");
-        assert!(h.contains("F2"), "rename shortcut must be shown: {h:?}");
         assert!(h.contains("Enter"), "open shortcut must be shown: {h:?}");
+        assert!(h.contains("Esc"), "cancel shortcut must be shown: {h:?}");
+        assert!(
+            !h.contains("F2"),
+            "rename is removed — F2 must not be advertised: {h:?}"
+        );
     }
 
     #[test]
-    fn browse_hint_suppressed_during_rename_and_when_empty() {
-        // Rename editing: the selected item label already carries the Enter/Esc
-        // hint, so no redundant footer. Empty list: nothing to act on.
-        let mut renaming = SessionPicker::open(vec![meta("a", 1)]);
-        renaming.rename_editing = true;
-        assert_eq!(renaming.browse_hint(), None);
-
+    fn browse_hint_suppressed_when_empty() {
+        // Empty list: nothing to act on, so no footer legend.
         let empty = SessionPicker::open(vec![]);
         assert_eq!(empty.browse_hint(), None);
+    }
+
+    #[test]
+    fn no_rename_fields_or_refs_remain() {
+        // Rename removed: the struct must construct without any rename state and
+        // the payload never renders a rename-editing label. (Compile-time proof
+        // that `rename_editing` / `rename_buffer` are gone; if they were
+        // re-added, `..Default`-style construction below would need them.)
+        let p = SessionPicker::open(vec![meta("a", 1)]);
+        let payload = build_menu_payload(&p, "proj");
+        assert!(
+            payload
+                .items
+                .iter()
+                .all(|(name, _)| !name.contains("[Enter: confirm")),
+            "no rename-editing label may appear: {:?}",
+            payload.items
+        );
     }
 
     #[test]
@@ -989,34 +946,108 @@ mod tests {
     #[test]
     fn build_menu_payload_shows_hint_when_filter_matches_nothing() {
         // Regression: typing a query that excludes every session used to
-        // render a blank menu (items.len() == 0), so the user couldn't
-        // tell whether /resume hung, the filter was active, or what.
-        // Now we surface a single non-interactive hint row so the empty
-        // state is visible.
+        // render a blank menu, so the user couldn't tell whether /resume hung,
+        // the filter was active, or what. Now we surface a non-interactive hint
+        // row (after the header chrome) so the empty state is visible.
         let mut p = SessionPicker::open(vec![meta("alpha", 1), meta("beta", 1)]);
         p.query = "zz".to_string();
         p.update_filter();
         assert_eq!(p.filtered.len(), 0);
-        let payload = build_menu_payload(&p);
+        let payload = build_menu_payload(&p, "proj");
+        // 4 header chrome rows + 1 empty-state label + 1 bottom hint = 6.
         assert_eq!(
             payload.items.len(),
-            1,
-            "empty filter should produce a single hint row, got: {:?}",
+            HEADER_ROWS + 2,
+            "empty filter: header chrome + one label + hint, got: {:?}",
             payload.items
         );
-        let (label, _) = &payload.items[0];
+        let (label, _) = &payload.items[HEADER_ROWS];
         assert!(
             label.contains("zz"),
             "hint should echo the user's query so they know which filter is active: {}",
             label
+        );
+        // Nothing selectable → selection points past every row (no highlight).
+        assert!(
+            payload.selected >= payload.items.len(),
+            "empty state must not highlight a row: {}",
+            payload.selected
         );
     }
 
     #[test]
     fn build_menu_payload_shows_hint_when_no_sessions_at_all() {
         let p = SessionPicker::open(vec![]);
-        let payload = build_menu_payload(&p);
-        assert_eq!(payload.items.len(), 1, "must show some empty-state hint");
+        let payload = build_menu_payload(&p, "proj");
+        assert_eq!(
+            payload.items.len(),
+            HEADER_ROWS + 2,
+            "must show header chrome + empty-state label + hint"
+        );
+    }
+
+    #[test]
+    fn build_menu_payload_row_order_and_kind() {
+        // The SessionList chrome must emit: title → blank → query → blank →
+        // one row per session → bottom `— … —` hint, and use MenuKind::SessionList.
+        let mut p = SessionPicker::open(vec![meta("First task", 12), meta("Second task", 8)]);
+        p.query = "task".to_string();
+        p.update_filter();
+        assert_eq!(p.filtered.len(), 2);
+        let payload = build_menu_payload(&p, "atomcode");
+
+        assert_eq!(payload.kind, crate::render::MenuKind::SessionList);
+        // Row 0: title.
+        assert!(
+            payload.items[0].0.contains("atomcode"),
+            "row 0 must be the title with project name: {:?}",
+            payload.items[0]
+        );
+        // Row 1: blank separator.
+        assert_eq!(payload.items[1], (String::new(), String::new()));
+        // Row 2: the search query (goes into the bordered search box).
+        assert_eq!(payload.items[2].0, "task");
+        // Row 3: blank separator.
+        assert_eq!(payload.items[3], (String::new(), String::new()));
+        // Rows 4..: session rows (name, metadata).
+        assert_eq!(payload.items[HEADER_ROWS].0, "First task");
+        assert!(payload.items[HEADER_ROWS].1.contains('·'));
+        assert_eq!(payload.items[HEADER_ROWS + 1].0, "Second task");
+        // Last row: bottom hint wrapped in em-dashes.
+        let last = &payload.items[payload.items.len() - 1].0;
+        assert!(
+            last.starts_with('—') && last.ends_with('—'),
+            "last row must be the em-dash-wrapped hint: {last:?}"
+        );
+        // Selection is offset past the header so ▸ lands on the selected session.
+        assert_eq!(payload.selected, HEADER_ROWS);
+        p.down();
+        let payload2 = build_menu_payload(&p, "atomcode");
+        assert_eq!(payload2.selected, HEADER_ROWS + 1);
+    }
+
+    #[test]
+    fn title_string_format() {
+        // Title = "Resume session (n/total · project)" with n = 1-based position
+        // in the CURRENT filtered list, total = total sessions in the project.
+        let mut p = SessionPicker::open(vec![meta("a", 1), meta("b", 1), meta("c", 1)]);
+        p.down(); // selected = 1 → position 2
+        let payload = build_menu_payload(&p, "atomcode");
+        let title = &payload.items[0].0;
+        assert!(
+            title.contains("2/3") && title.contains("atomcode"),
+            "title must show 1-based position / total · project: {title:?}"
+        );
+
+        // Filtering shrinks the position range but total stays the project count.
+        p.query = "b".to_string();
+        p.update_filter(); // filtered = [b], selected reset to 0 → position 1
+        let payload = build_menu_payload(&p, "atomcode");
+        let title = &payload.items[0].0;
+        assert!(
+            title.contains("1/3"),
+            "position is over the filtered list; total is the whole project: {title:?}"
+        );
     }
 
     // On /resume, todowrite calls no longer render an inline block. Instead the

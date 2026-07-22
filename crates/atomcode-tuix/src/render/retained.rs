@@ -1724,11 +1724,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     format!("  {}", name)
                 }
             }
+            // SessionList only reaches `build_menu_row` for its header chrome
+            // (title row + blank separators); the 2-line session items are
+            // rendered by `build_session_menu_rows`. Render the header plainly.
+            super::MenuKind::SessionList => name.to_string(),
         };
 
         let is_plugin_mgr = matches!(
             kind,
-            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+            super::MenuKind::Plugin
+                | super::MenuKind::Marketplace
+                | super::MenuKind::PluginInfo
+                | super::MenuKind::SessionList
         );
         let mut style = if selected && !is_plugin_mgr {
             CellStyle {
@@ -1976,6 +1983,82 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         rows
+    }
+
+    /// Two-line renderer for a `/resume` session row. Simpler than
+    /// `build_plugin_menu_rows`: row 1 is an optional `▸ ` marker (Border when
+    /// selected, else spaces) + the session title in the terminal's default fg
+    /// (bold when selected) — NO `✓`, NO name padding, NO installed/scope suffix
+    /// logic (a session literally named "… (local)" must NOT get a check). Row 2
+    /// is the whole metadata string (`"12 messages · 1 week ago"`) indented four
+    /// spaces in the muted style.
+    fn build_session_menu_rows(
+        &self,
+        name: &str,
+        desc: &str,
+        selected: bool,
+        rule_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        let name_style = if selected {
+            CellStyle {
+                fg: None,
+                bold: true,
+                reverse: false,
+                faint: false,
+                bg: None,
+            }
+        } else {
+            CellStyle::default()
+        };
+
+        // Row 1: marker + bright title.
+        let mut row1 = Vec::new();
+        if selected {
+            let border_style = self.style_for(Role::Border);
+            push_str_cells_sgr(&mut row1, "▸ ", border_style);
+        } else {
+            push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
+        }
+        push_str_cells_sgr(&mut row1, name, name_style.clone());
+
+        let content_w1 = 2 + crate::width::display_width(name);
+        let right_pad1 = rule_width.saturating_sub(content_w1);
+        for _ in 0..right_pad1 {
+            row1.push(Cell {
+                ch: ' ',
+                width: 1,
+                style: if selected {
+                    name_style.clone()
+                } else {
+                    CellStyle::default()
+                },
+            });
+        }
+
+        // Row 2: gray metadata, indented four spaces.
+        let meta_style = self.style_for(Role::Muted);
+        let line_str = if desc.is_empty() {
+            String::new()
+        } else {
+            format!("    {}", desc)
+        };
+        let mut row2 = Vec::new();
+        push_str_cells_sgr(&mut row2, &line_str, meta_style.clone());
+        let content_w2 = crate::width::display_width(&line_str);
+        let right_pad2 = rule_width.saturating_sub(content_w2);
+        for _ in 0..right_pad2 {
+            row2.push(Cell {
+                ch: ' ',
+                width: 1,
+                style: if selected {
+                    meta_style.clone()
+                } else {
+                    CellStyle::default()
+                },
+            });
+        }
+
+        vec![row1, row2]
     }
 
     fn build_marketplace_menu_rows(
@@ -3014,6 +3097,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Paginate menu using the kind-specific cap.
         let max_menu = self.max_menu_rows(h, 4);
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
+        // The `/resume` session list shares the plugin manager's chrome and
+        // layout (4-row header, bordered search box at idx 2, 2-line items from
+        // idx 4, bottom hint) — only the per-item leaf builder differs. Treat it
+        // as plugin-like everywhere layout math keys off `Plugin`.
+        let plugin_like = matches!(
+            menu_kind,
+            super::MenuKind::Plugin | super::MenuKind::SessionList
+        );
         let (menu_items, selected_in_view, actual_offset) = if let Some(m) = self.menu.as_ref() {
             let len = m.items.len();
             if len == 0 {
@@ -3023,12 +3114,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 super::MenuKind::Plugin
                     | super::MenuKind::Marketplace
                     | super::MenuKind::PluginInfo
+                    | super::MenuKind::SessionList
             ) {
-                let header_h = if menu_kind == super::MenuKind::Plugin {
-                    4
-                } else {
-                    2
-                };
+                let header_h = if plugin_like { 4 } else { 2 };
                 if len < header_h {
                     let sel = if m.selected < len {
                         Some(m.selected)
@@ -3041,20 +3129,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         && m.items[len - 1].0.starts_with('—')
                         && m.items[len - 1].0.ends_with('—');
                     let hint_h = if has_hint { 1 } else { 0 };
-                    let header_row_h = if menu_kind == super::MenuKind::Plugin {
-                        6
-                    } else {
-                        header_h
-                    };
+                    let header_row_h = if plugin_like { 6 } else { header_h };
                     let budget = max_menu.saturating_sub(header_row_h + hint_h);
                     let mut offset = header_h;
                     let mut end = offset;
                     let mut height_sum = 0;
                     while end < len - hint_h {
-                        let item_h = if menu_kind == super::MenuKind::Plugin
-                            && end >= 4
-                            && end < len - hint_h
-                        {
+                        let item_h = if plugin_like && end >= 4 && end < len - hint_h {
                             self.plugin_item_height(&m.items[end].1, rule_width)
                         } else if menu_kind == super::MenuKind::Marketplace
                             && end >= 2
@@ -3086,10 +3167,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             let mut h_sum = 0;
                             end = offset;
                             while end < len - hint_h {
-                                let item_h = if menu_kind == super::MenuKind::Plugin
-                                    && end >= 4
-                                    && end < len - hint_h
-                                {
+                                let item_h = if plugin_like && end >= 4 && end < len - hint_h {
                                     self.plugin_item_height(&m.items[end].1, rule_width)
                                 } else if menu_kind == super::MenuKind::Marketplace
                                     && end >= 2
@@ -3201,17 +3279,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 super::MenuKind::Plugin
                     | super::MenuKind::Marketplace
                     | super::MenuKind::PluginInfo
+                    | super::MenuKind::SessionList
             );
             let mut sum = menu_items
                 .iter()
                 .enumerate()
                 .map(|(i, _)| {
                     let orig_idx = if is_sticky {
-                        let header_h = if menu_kind == super::MenuKind::Plugin {
-                            4
-                        } else {
-                            2
-                        };
+                        let header_h = if plugin_like { 4 } else { 2 };
                         if i < header_h {
                             i
                         } else if has_hint_at_end && i == menu_items.len() - 1 {
@@ -3231,9 +3306,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         } else {
                             1
                         }
-                    } else if menu_kind == super::MenuKind::Plugin && orig_idx == 2 {
+                    } else if plugin_like && orig_idx == 2 {
                         3
-                    } else if menu_kind == super::MenuKind::Plugin
+                    } else if plugin_like
                         && orig_idx >= 4
                         && orig_idx < m.items.len().saturating_sub(1)
                     {
@@ -3310,7 +3385,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let approval_active = self.approval_active();
         let hide_input_box = matches!(
             menu_kind,
-            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+            super::MenuKind::Plugin
+                | super::MenuKind::Marketplace
+                | super::MenuKind::PluginInfo
+                | super::MenuKind::SessionList
         );
         let is_add_url = hide_input_box
             && menu_kind == super::MenuKind::Marketplace
@@ -3391,19 +3469,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Vec::new()
         };
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
+        // `/resume` session list shares the plugin manager's chrome/layout.
+        let plugin_like = matches!(
+            menu_kind,
+            super::MenuKind::Plugin | super::MenuKind::SessionList
+        );
         let mut menu_cells: Vec<Vec<Cell>> = Vec::new();
         let final_len = self.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
         let is_sticky = matches!(
             menu_kind,
-            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+            super::MenuKind::Plugin
+                | super::MenuKind::Marketplace
+                | super::MenuKind::PluginInfo
+                | super::MenuKind::SessionList
         );
         for (i, (name, desc)) in menu_items.iter().enumerate() {
             let orig_idx = if is_sticky {
-                let header_h = if menu_kind == super::MenuKind::Plugin {
-                    4
-                } else {
-                    2
-                };
+                let header_h = if plugin_like { 4 } else { 2 };
                 if i < header_h {
                     i
                 } else if has_hint_at_end && i == menu_items.len() - 1 {
@@ -3435,7 +3517,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 } else {
                     menu_cells.push(Vec::new());
                 }
-            } else if menu_kind == super::MenuKind::Plugin && orig_idx == 2 {
+            } else if plugin_like && orig_idx == 2 {
                 let border_style = if selected {
                     self.style_bold(Role::Brand)
                 } else {
@@ -3482,7 +3564,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 });
                 if name.is_empty() {
                     let muted = self.style_for(Role::Muted);
-                    push_str_cells(&mut content_row, "Search plugins...", &muted);
+                    let placeholder = if menu_kind == super::MenuKind::SessionList {
+                        "Search sessions..."
+                    } else {
+                        "Search plugins..."
+                    };
+                    push_str_cells(&mut content_row, placeholder, &muted);
                 } else {
                     push_str_cells(&mut content_row, name, &CellStyle::default());
                 }
@@ -3537,6 +3624,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     });
                 }
                 menu_cells.push(bot_border);
+            } else if menu_kind == super::MenuKind::SessionList
+                && orig_idx >= 4
+                && orig_idx < final_len.saturating_sub(1)
+            {
+                menu_cells.extend(self.build_session_menu_rows(name, desc, selected, rule_width));
             } else if menu_kind == super::MenuKind::Plugin
                 && orig_idx >= 4
                 && orig_idx < final_len.saturating_sub(1)
@@ -3745,12 +3837,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         let menu_top = attach_top + attachment_rows;
-        let is_search_box_focused = menu_kind == super::MenuKind::Plugin
-            && self
-                .menu
-                .as_ref()
-                .map(|m| m.selected == 2 && m.items.len() >= 3)
-                .unwrap_or(false);
+        let is_search_box_focused = matches!(
+            menu_kind,
+            super::MenuKind::Plugin | super::MenuKind::SessionList
+        ) && self
+            .menu
+            .as_ref()
+            .map(|m| m.selected == 2 && m.items.len() >= 3)
+            .unwrap_or(false);
         if is_add_url {
             let input_row_idx = menu_cells
                 .iter()
@@ -3957,7 +4051,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
         let hide_input_box = matches!(
             menu_kind,
-            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+            super::MenuKind::Plugin
+                | super::MenuKind::Marketplace
+                | super::MenuKind::PluginInfo
+                | super::MenuKind::SessionList
         );
         self.footer_total_rows(
             capped_middle,
@@ -4263,7 +4360,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
         let hide_input_box = matches!(
             menu_kind,
-            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+            super::MenuKind::Plugin
+                | super::MenuKind::Marketplace
+                | super::MenuKind::PluginInfo
+                | super::MenuKind::SessionList
         );
         let has_trailing_empty = total > 0 && self.body_lines[total - 1].is_empty();
         let display_total = if hide_input_box && has_trailing_empty {
@@ -11119,6 +11219,131 @@ mod tests {
         );
     }
 
+    /// DIAGNOSTIC (read-only, no source change): reproduce the provider-402
+    /// sequence at the RENDER boundary and decide whether the "Insufficient
+    /// Balance" line survives once the `✗ 已中断` turn summary follows it.
+    ///
+    /// Real-world timeline the runtime emits before `TurnFinished`:
+    ///   1. tool is in flight (spinner active)         → ToolCallInFlight + Spinner
+    ///   2. provider returns 402                       → UiLine::Error("HTTP 402: …")
+    ///   3. turn ends errored, summary line renders    → UiLine::TurnSeparator{"✗ 已中断 …"}
+    ///   4. loop returns to idle prompt                → InputPrompt
+    ///
+    /// `handle_agent_event`'s Error arm (mod.rs:14690) calls
+    /// `renderer.render(UiLine::Error(error))`; its TurnComplete arm
+    /// (mod.rs:14439, errored) renders `UiLine::TurnSeparator{ "✗ 已中断 …" }`.
+    /// This test drives EXACTLY those UiLine values through the *real*
+    /// terminal renderer (the one users see) + a VirtualTerminal, so we can
+    /// tell whether the summary line OVERWRITES / hides the error text
+    /// (hypothesis B: render-layer loss) or whether both survive (proving the
+    /// render layer is fine and any loss is upstream in the event pipeline).
+    #[test]
+    fn diag_provider_402_error_survives_interrupted_summary() {
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false);
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+
+        // --- 1. tool in flight (spinner active), like the real 402 case ---
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::ToolCallInFlight {
+            id: "call_1".into(),
+            name: "Bash".into(),
+            detail: "cargo build".into(),
+            hint: None,
+        });
+        r.render(UiLine::Spinner {
+            frame: "⠙".into(),
+            label: "Running Bash".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // --- 2. provider 402 → the Error arm's render call ---
+        r.render(UiLine::Error("HTTP 402: Insufficient Balance".into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Snapshot: is the error visible on-screen (grid) right after render,
+        // BEFORE the summary line arrives?
+        let err_visible_after_error = vterm.any_row(|row| row.contains("Insufficient Balance"))
+            || vterm
+                .scrollback_texts()
+                .iter()
+                .any(|l| l.contains("Insufficient Balance"));
+
+        // --- 3. errored TurnComplete → `✗ 已中断 …` summary separator ---
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::TurnSeparator {
+            label: "\u{2717} 已中断 · 1 轮 · 0 工具 · 0 tokens · 2.0s".into(),
+        });
+        // --- 4. back to idle prompt (a redraw that could hide the spinner
+        //         region — the exact place an overwrite would strike) ---
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Collect every line the terminal ever showed: on-screen grid rows
+        // PLUS scrollback (lines that scrolled off but the user did see).
+        let mut all_lines: Vec<String> = vterm.scrollback_texts();
+        for row in 0..vterm.height() as usize {
+            all_lines.push(vterm.row_text(row));
+        }
+        let joined = all_lines.join("\n");
+
+        let err_final_visible = joined.contains("Insufficient Balance");
+        let has_402 = joined.contains("402");
+        // The VirtualTerminal grid renders CJK wide chars with a spacer cell,
+        // so `已中断` appears as `已 中 断` in `row_text`. Strip ASCII spaces
+        // before matching so the display artifact doesn't mask the summary.
+        let joined_nospace: String = joined.chars().filter(|c| *c != ' ').collect();
+        let has_interrupted = joined_nospace.contains("已中断");
+        // Also assert on the renderer's own committed body model — the
+        // append-only scrollback truth independent of terminal geometry.
+        let body_has_error = r.body_lines.iter().any(|row| {
+            row.iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .contains("Insufficient Balance")
+        });
+
+        eprintln!(
+            "DIAG-402 | err_visible_right_after_error={err_visible_after_error} \
+             | err_final_visible={err_final_visible} has_402={has_402} \
+             has_interrupted={has_interrupted} | body_model_has_error={body_has_error}"
+        );
+        eprintln!("DIAG-402 vterm dump:\n{}", vterm.dump());
+
+        // The whole point: if the render layer is sound, BOTH the error and
+        // the interrupted summary are present in the final output. If the
+        // summary/idle redraw overwrote the error, `err_final_visible` is
+        // false while `has_interrupted` is true → hypothesis B (render loss).
+        assert!(
+            has_interrupted,
+            "the `已中断` summary line must render (sanity check)"
+        );
+        assert!(
+            err_final_visible && has_402,
+            "RENDER-LAYER LOSS DETECTED: the `✗ 已中断` summary line hid / \
+             overwrote the `Insufficient Balance` (402) error at the renderer \
+             boundary. err_visible_right_after_error={err_visible_after_error}, \
+             body_model_has_error={body_has_error}. dump:\n{}",
+            vterm.dump()
+        );
+    }
+
     /// Regression (screenshot 47.png): adjacent bash blocks with NO
     /// blank line between them — the previous fix (screenshot 44)
     /// over-corrected by stripping the trailing `\n` from the Ctrl+O
@@ -12898,6 +13123,7 @@ mod tests {
                 checked: vec![false, false, false],
                 text: String::new(),
                 custom_text: String::new(),
+                custom: true,
                 batch: None,
             };
             // Row count: header + blank + question + blank
@@ -12983,6 +13209,7 @@ mod tests {
                 checked: vec![true, false, true],
                 text: String::new(),
                 custom_text: "Zig".into(),
+                custom: true,
                 batch: None,
             };
             assert_eq!(
@@ -13048,6 +13275,7 @@ mod tests {
                 checked: vec![],
                 text: "atomcode".into(),
                 custom_text: String::new(),
+                custom: true,
                 batch: None,
             };
             // header + blank + question + blank + input + hint = 6.
@@ -13094,6 +13322,7 @@ mod tests {
             checked: vec![false, false, false],
             text: String::new(),
             custom_text: String::new(),
+            custom: true,
             batch,
         };
 
