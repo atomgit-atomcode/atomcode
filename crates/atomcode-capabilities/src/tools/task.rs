@@ -63,17 +63,20 @@ impl ToolMiddleware for DenySensitivePaths {
     }
 }
 
-/// The recursive directory a scope confines a `search_replace` root to, if any. Only a
-/// RECURSIVE dir glob grants a root, because search_replace rewrites EVERY file under its
-/// root — so the root is "entirely in scope" only when the scope covers the whole subtree.
-/// `**` → `Some("")` (whole tree); `<literal-dir>/**` → `Some("<literal-dir>")`. A
-/// non-recursive scope (`*.rs`, `src/*.rs`, `Cargo.toml`, `src/**/x.rs`, or a bare dir like
-/// `src/auth`) matches only specific files, never a whole directory, so it grants NO
-/// search_replace root → `None`.
+/// The literal directory prefix of a glob: the leading path segments before the first
+/// segment that contains a glob metacharacter. `src/auth/**` → `src/auth`; `**` → ``;
+/// `Cargo.toml` → `Cargo.toml`. Used to test a `search_replace` DIR root against a scope
+/// (globset's `src/auth/**` does NOT match the bare dir `src/auth`).
 fn recursive_dir_prefix(glob: &str) -> Option<String> {
+    // `**` covers the whole tree.
     if glob == "**" {
         return Some(String::new());
     }
+    // Only a recursive dir glob (`<literal-dir>/**`) confines a search_replace root: the tool
+    // rewrites EVERY file under its root, so the root is "entirely in scope" only when the
+    // scope covers the whole subtree. A non-recursive scope (`*.rs`, `src/*.rs`, `Cargo.toml`,
+    // `src/**/x.rs`, or a bare dir like `src/auth`) matches only specific files, never a whole
+    // directory, so it grants NO search_replace root.
     let prefix = glob.strip_suffix("/**")?;
     if prefix.is_empty() || prefix.contains(['*', '?', '[', ']', '{', '}']) {
         return None;
@@ -119,8 +122,7 @@ struct WorkerScopeGate {
     working_dir: PathBuf,
     /// Compiled globs for single-file targets (`edit_file` / `write_file` `file_path`).
     globs: globset::GlobSet,
-    /// Recursive-scope directories, for confining `search_replace` DIR roots (only `**` /
-    /// `<dir>/**` scopes contribute — see [`recursive_dir_prefix`]).
+    /// Literal directory prefix of each scope, for `search_replace` DIR roots.
     dir_prefixes: Vec<PathBuf>,
     /// Human-readable scope list for deny messages.
     display: String,
