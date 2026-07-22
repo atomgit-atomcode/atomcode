@@ -54,6 +54,11 @@ serde_json = "1"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 is-terminal = "0.4"
+# File-only tracing subscriber (see `init_file_logging`). The workspace emits 110+
+# `tracing::` diagnostics (e.g. `atomcode-label:` from the git-push label middleware)
+# but installed NO subscriber, so they all went to the no-op dispatcher. This wires
+# them to `<config_dir>/logs/atomcode.log`, filtered by RUST_LOG.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Process scan for the uninstall flow (detect running atomcode instances).
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 

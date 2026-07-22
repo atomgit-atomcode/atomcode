@@ -935,6 +935,9 @@ fn real_main() {
 }
 
 async fn async_main() {
+    // Wire `tracing::` diagnostics to `<config_dir>/logs/atomcode.log` (file-only,
+    // TUI-safe). Must run before anything that emits traces so nothing is lost.
+    init_file_logging();
     // Set Windows console to UTF-8 so CJK and other multi-byte characters
     // render correctly instead of showing garbled output (mojibake).
     #[cfg(target_os = "windows")]
@@ -1861,6 +1864,82 @@ fn redirect_stderr_to_log_file() {
     // Windows: NSPasteboard is mac-only; arboard on Windows uses
     // OpenClipboard which doesn't NSLog. Not a known leak path.
     // No-op for now; revisit if a similar Windows issue surfaces.
+}
+
+/// The persistent tracing log path: `<config_dir>/logs/atomcode.log`. Pure so the
+/// join rule is unit-testable; the config dir is resolved by `Config::config_dir()`
+/// (which is `ATOMCODE_HOME`- AND sudo-aware via `real_home_dir`), so the log lands
+/// next to config/sessions instead of diverging under `sudo` — plain `dirs::home_dir()`
+/// there points at root's home, where the user would never find the log.
+fn atomcode_log_path(config_dir: std::path::PathBuf) -> std::path::PathBuf {
+    config_dir.join("logs").join("atomcode.log")
+}
+
+/// The default `RUST_LOG` directive when the env var is unset: `info` for everything,
+/// with the chatty transport crates pinned to `warn` so the log stays about atomcode.
+const DEFAULT_LOG_DIRECTIVES: &str =
+    "info,hyper=warn,hyper_util=warn,h2=warn,rustls=warn,reqwest=warn,tower=warn,mio=warn";
+
+/// Roll size cap for the tracing log. Above this the live file is rotated to a single
+/// `.old` generation, bounding on-disk usage at ~2× this (an always-on `info` log
+/// would otherwise append forever across every session).
+const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// If the log already exceeds [`LOG_ROTATE_BYTES`], move it aside to `<path>.old`
+/// (single generation) so the live file restarts small. Best-effort; errors ignored.
+fn rotate_log_if_large(path: &std::path::Path) {
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > LOG_ROTATE_BYTES {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".old"); // atomcode.log -> atomcode.log.old
+        let _ = std::fs::rename(path, std::path::PathBuf::from(old));
+    }
+}
+
+/// Install a global tracing subscriber that writes to `<config_dir>/logs/atomcode.log`.
+///
+/// The whole workspace emits `tracing::` diagnostics but historically installed NO
+/// subscriber, so every line (including the `atomcode-label:` middleware trace) went
+/// to the no-op dispatcher and vanished. This wires them to a file.
+///
+/// FILE-ONLY BY DESIGN: the TUI owns the terminal, and the stderr redirect only runs
+/// in the detached-daemon path — writing tracing output to real stderr would corrupt
+/// the interactive display. So we always write to our own file handle, never stderr.
+///
+/// Fail-open: any error (can't create dir/file, subscriber already set) leaves the
+/// process running with logging simply disabled. Called once, early.
+fn init_file_logging() {
+    use std::io::Write as _;
+    let path = atomcode_log_path(Config::config_dir());
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    rotate_log_if_large(&path);
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    // Session marker so users can tell one run's lines from another's when grepping.
+    let epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(file, "--- atomcode session start (unix={epoch_secs}) ---");
+
+    let filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| tracing_subscriber::EnvFilter::try_new(v).ok())
+        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_DIRECTIVES));
+
+    // `Mutex<File>` is tracing-subscriber's OWN built-in `MakeWriter`: its
+    // `MutexGuardWriter` holds the lock for the WHOLE formatted event, so concurrent
+    // traces from tokio workers can't interleave mid-line (a per-`write()` re-lock
+    // would). No custom writer needed.
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false) // file, not a terminal
+        .with_env_filter(filter)
+        .with_writer(std::sync::Mutex::new(file))
+        .try_init(); // Err only if a subscriber is already set — fine, ignore.
 }
 
 /// Apply launch-time provider/model overrides to the process-owned config.
@@ -3558,10 +3637,29 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cli_runtime_overrides, close_thinking_chunk, format_thinking_chunk,
-        format_verbose_tool_chunk, resolve_working_dir, runtime_config_from, truncate_log_line,
+        apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
+        format_thinking_chunk, format_verbose_tool_chunk, resolve_working_dir, runtime_config_from,
+        truncate_log_line, DEFAULT_LOG_DIRECTIVES,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn log_path_is_logs_subdir_of_config_dir() {
+        // The log lives at `<config_dir>/logs/atomcode.log`; ATOMCODE_HOME/sudo
+        // resolution is `Config::config_dir()`'s job (covered by its own tests), so
+        // this pins only the join rule.
+        assert_eq!(
+            atomcode_log_path(PathBuf::from("/Users/x/.atomcode")),
+            PathBuf::from("/Users/x/.atomcode/logs/atomcode.log")
+        );
+    }
+
+    #[test]
+    fn default_log_directives_parse() {
+        // A malformed default would silently disable ALL logging via the fallback
+        // path in `init_file_logging`; pin that it is a valid EnvFilter directive.
+        assert!(tracing_subscriber::EnvFilter::try_new(DEFAULT_LOG_DIRECTIVES).is_ok());
+    }
 
     #[test]
     fn verbose_tool_chunk_strips_ephemeral_activity_marker() {
