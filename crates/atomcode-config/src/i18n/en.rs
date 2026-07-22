@@ -477,6 +477,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Provider is unavailable. Use /login to sign in or /provider to configure one.".into(),
         Msg::CmdProviderReloading =>
             "Provider/model is switching. Send after the switch completes.".into(),
+        Msg::SubmitHeldUntilProviderReady =>
+            "  ↳ provider not ready yet — message queued, will send automatically once ready\n".into(),
+        Msg::SubmitHeldUntilLogin =>
+            "  ↳ not signed in — message queued; run /login and it will send automatically\n".into(),
 
         // ── Approval prompt ──
         Msg::ApprovalPromptAlt { tool, detail } =>

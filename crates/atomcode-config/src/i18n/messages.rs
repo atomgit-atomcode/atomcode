@@ -562,6 +562,8 @@ pub enum Msg<'a> {
     CmdNoActiveProvider,
     CmdProviderUnavailable,
     CmdProviderReloading,
+    SubmitHeldUntilProviderReady,
+    SubmitHeldUntilLogin,
 
     // ── Approval prompt ──
     ApprovalPromptAlt {

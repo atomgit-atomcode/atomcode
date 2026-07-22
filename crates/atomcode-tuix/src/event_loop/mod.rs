@@ -938,6 +938,123 @@ fn runtime_ui_availability(phase: atomcode_coding::RuntimePhase) -> RuntimeUiAva
     }
 }
 
+/// Decide whether a foreground submit that the runtime can't accept yet should
+/// be HELD (queued into the type-ahead queue and auto-replayed once the
+/// provider is ready) instead of being dropped with a "provider unavailable"
+/// error.
+///
+/// A brand-new session boots its provider in `RecoverAuthentication` mode; if
+/// the stored auth is momentarily unreadable (or, in daemon mode, the deferred
+/// runtime is still constructing) the runtime lands in `AwaitingProvider` /
+/// `Starting` with no kernel agent, and the first prompt's `Submit` is rejected
+/// (`runtime_phase_accepts_command`). Recovery arrives asynchronously
+/// (`poll_external_auth` → provider reassembly, or startup completion), so the
+/// right behavior is to hold the prompt and let the existing type-ahead drain
+/// send it once the runtime reaches `Available` — not to lose it.
+///
+/// Only the local foreground runtime enters these transient states; the live
+/// (webui bridge) path manages readiness separately, so it is never held here.
+/// Fatal states (`Failed` / `Stopped`) still surface the error.
+fn hold_submit_until_ready(live: bool, availability: RuntimeUiAvailability) -> bool {
+    !live
+        && matches!(
+            availability,
+            RuntimeUiAvailability::AwaitingProvider | RuntimeUiAvailability::Starting
+        )
+}
+
+/// Guard for the type-ahead drain: a queued message must only be replayed when
+/// the local foreground runtime is actually `Available`. Without this, a
+/// foreground event arriving while the runtime is still `AwaitingProvider` /
+/// `Starting` (i.e. before recovery completes) would pop a held message and
+/// submit it into a not-ready runtime, dropping it. Never blocks the live path
+/// (its `ctx.runtime` availability is unrelated to live submit readiness).
+fn drain_blocked_until_ready(live: bool, availability: RuntimeUiAvailability) -> bool {
+    !live && !matches!(availability, RuntimeUiAvailability::Available)
+}
+
+#[cfg(test)]
+mod submit_hold_tests {
+    use super::*;
+
+    #[test]
+    fn holds_first_submit_only_for_transient_bootstrap_states() {
+        // Recoverable: a new session still awaiting auth recovery, or a daemon
+        // deferred runtime still constructing — hold the prompt.
+        assert!(hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::AwaitingProvider
+        ));
+        assert!(hold_submit_until_ready(false, RuntimeUiAvailability::Starting));
+
+        // Fatal / normal states: never hold — either it would submit fine
+        // (Available) or recovery isn't coming (Failed/Stopped) so the error
+        // must surface.
+        assert!(!hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::Available
+        ));
+        assert!(!hold_submit_until_ready(false, RuntimeUiAvailability::Failed));
+        assert!(!hold_submit_until_ready(false, RuntimeUiAvailability::Stopped));
+    }
+
+    #[test]
+    fn never_holds_on_the_live_path() {
+        // The live (webui bridge) runtime manages readiness separately; its
+        // ctx.runtime availability is unrelated to live submit readiness, so we
+        // must never divert a live submit into the type-ahead queue.
+        for availability in [
+            RuntimeUiAvailability::AwaitingProvider,
+            RuntimeUiAvailability::Starting,
+            RuntimeUiAvailability::Available,
+            RuntimeUiAvailability::Failed,
+            RuntimeUiAvailability::Stopped,
+        ] {
+            assert!(!hold_submit_until_ready(true, availability));
+        }
+    }
+
+    #[test]
+    fn drain_only_when_local_runtime_available() {
+        // The type-ahead drain must replay a held message only when the local
+        // runtime is actually Available — otherwise it would pop the message and
+        // submit it into a not-ready runtime, dropping it.
+        assert!(!drain_blocked_until_ready(
+            false,
+            RuntimeUiAvailability::Available
+        ));
+        assert!(drain_blocked_until_ready(
+            false,
+            RuntimeUiAvailability::AwaitingProvider
+        ));
+        assert!(drain_blocked_until_ready(
+            false,
+            RuntimeUiAvailability::Starting
+        ));
+        assert!(drain_blocked_until_ready(false, RuntimeUiAvailability::Failed));
+        assert!(drain_blocked_until_ready(
+            false,
+            RuntimeUiAvailability::Stopped
+        ));
+    }
+
+    #[test]
+    fn drain_never_blocked_on_the_live_path() {
+        // Live type-ahead readiness is not derived from ctx.runtime availability,
+        // so the guard must never block a live drain regardless of the local
+        // runtime phase.
+        for availability in [
+            RuntimeUiAvailability::AwaitingProvider,
+            RuntimeUiAvailability::Starting,
+            RuntimeUiAvailability::Available,
+            RuntimeUiAvailability::Failed,
+            RuntimeUiAvailability::Stopped,
+        ] {
+            assert!(!drain_blocked_until_ready(true, availability));
+        }
+    }
+}
+
 fn command_allowed_while_starting(command: &atomcode_coding::DriverCommand) -> bool {
     use atomcode_coding::DriverCommand;
     matches!(
@@ -5832,7 +5949,18 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // line, dispatch to the agent, and transition
                         // back to Streaming. Remaining queue entries
                         // fire in order on subsequent completions.
-                        if provider_transition_pending(&ctx) || provider_reload_failed {
+                        if provider_transition_pending(&ctx)
+                            || provider_reload_failed
+                            || drain_blocked_until_ready(
+                                ctx.live_binding.is_some(),
+                                ctx.runtime.ui_availability(),
+                            )
+                        {
+                            // Not a safe drain boundary yet: a provider switch is
+                            // mid-flight, it just failed, or the runtime is still
+                            // recovering (AwaitingProvider/Starting). Leave held
+                            // messages queued; the next event (ProviderChanged /
+                            // startup completion) reaches Available and drains them.
                             if config_redraw || provider_reload_failed {
                                 redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                             }
@@ -6266,7 +6394,18 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     }
                     if matches!(app.state.phase, UiPhase::Idle) {
                         let config_redraw = poll_shared_state(&mut ctx);
-                        if provider_transition_pending(&ctx) || provider_reload_failed {
+                        if provider_transition_pending(&ctx)
+                            || provider_reload_failed
+                            || drain_blocked_until_ready(
+                                ctx.live_binding.is_some(),
+                                ctx.runtime.ui_availability(),
+                            )
+                        {
+                            // Not a safe drain boundary yet: a provider switch is
+                            // mid-flight, it just failed, or the runtime is still
+                            // recovering (AwaitingProvider/Starting). Leave held
+                            // messages queued; the next event (ProviderChanged /
+                            // startup completion) reaches Available and drains them.
                             if config_redraw || provider_reload_failed {
                                 redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                             }
@@ -8549,39 +8688,70 @@ fn handle_idle_key(
                     *slot = None;
                 }
                 {
-                    let submitted =
-                        submit_foreground_runtime(ctx, runtime_user_input(expanded, images));
-                    if submitted {
-                        app.state.on_submit();
-                        // CodingPlan drift check — fire before every turn sent
-                        // to a CodingPlan-managed provider, gated by a 15-min
-                        // cooldown so rapid-fire messages don't spam the API.
-                        // Non-CodingPlan users skip entirely (zero network).
-                        if monitor::is_codingplan_provider(&ctx.config.default_provider) {
-                            let cooled = ctx
-                                .monitor_last_check_at
-                                .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
-                                .unwrap_or(true);
-                            if cooled {
-                                ctx.monitor_last_check_at = Some(std::time::Instant::now());
-                                monitor::spawn_check(
-                                    ctx.config.clone(),
-                                    ctx.model_name.clone(),
-                                    ctx.monitor_warning.clone(),
-                                    ctx.wake_tx.clone(),
-                                );
-                            }
-                        }
-                    } else {
-                        app.state.on_submit_rejected();
-                        renderer.render(UiLine::Error(
-                            crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable).into_owned(),
-                        ));
-                        // Commit cleared the input buffer before dispatch. Render that
-                        // empty prompt so the retained renderer does not keep displaying
-                        // the pre-commit text after the synchronous rejection.
+                    let availability = ctx.runtime.ui_availability();
+                    if hold_submit_until_ready(ctx.live_binding.is_some(), availability) {
+                        // New session whose provider is still recovering auth
+                        // (AwaitingProvider) or still starting (daemon deferred).
+                        // The message was already echoed above; hold it in the
+                        // type-ahead queue and let the drain auto-send it once the
+                        // runtime reaches Available (ProviderChanged / startup done)
+                        // rather than dropping it with a "provider unavailable" error.
+                        crate::tuix_trace!("QUE", "hold first submit until provider ready");
+                        app.message_queue.push_back(crate::state::QueuedMessage {
+                            text: expanded,
+                            images,
+                            image_markers: kept_markers,
+                        });
+                        // AwaitingProvider covers both a transient auth race (user
+                        // IS logged in, recovery imminent) and genuinely-not-logged-in.
+                        // For the latter, keep the old actionable guidance to run
+                        // /login — the held message auto-sends once auth lands.
+                        let hint = if availability == RuntimeUiAvailability::AwaitingProvider
+                            && !AuthObservation::read().is_available()
+                        {
+                            crate::i18n::Msg::SubmitHeldUntilLogin
+                        } else {
+                            crate::i18n::Msg::SubmitHeldUntilProviderReady
+                        };
+                        renderer.render(UiLine::CommandOutput(crate::i18n::t(hint).into_owned()));
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                         renderer.flush();
+                    } else {
+                        let submitted =
+                            submit_foreground_runtime(ctx, runtime_user_input(expanded, images));
+                        if submitted {
+                            app.state.on_submit();
+                            // CodingPlan drift check — fire before every turn sent
+                            // to a CodingPlan-managed provider, gated by a 15-min
+                            // cooldown so rapid-fire messages don't spam the API.
+                            // Non-CodingPlan users skip entirely (zero network).
+                            if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+                                let cooled = ctx
+                                    .monitor_last_check_at
+                                    .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
+                                    .unwrap_or(true);
+                                if cooled {
+                                    ctx.monitor_last_check_at = Some(std::time::Instant::now());
+                                    monitor::spawn_check(
+                                        ctx.config.clone(),
+                                        ctx.model_name.clone(),
+                                        ctx.monitor_warning.clone(),
+                                        ctx.wake_tx.clone(),
+                                    );
+                                }
+                            }
+                        } else {
+                            app.state.on_submit_rejected();
+                            renderer.render(UiLine::Error(
+                                crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable)
+                                    .into_owned(),
+                            ));
+                            // Commit cleared the input buffer before dispatch. Render that
+                            // empty prompt so the retained renderer does not keep displaying
+                            // the pre-commit text after the synchronous rejection.
+                            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                            renderer.flush();
+                        }
                     }
                 }
             }

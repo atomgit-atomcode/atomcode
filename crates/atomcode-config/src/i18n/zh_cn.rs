@@ -463,6 +463,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "Provider 当前不可用。请使用 /login 登录，或用 /provider 配置。".into(),
         Msg::CmdProviderReloading =>
             "正在切换 Provider/模型，请等待切换完成后再发送。".into(),
+        Msg::SubmitHeldUntilProviderReady =>
+            "  ↳ provider 尚未就绪，消息已排队，就绪后将自动发送\n".into(),
+        Msg::SubmitHeldUntilLogin =>
+            "  ↳ 尚未登录，消息已排队，执行 /login 登录后将自动发送\n".into(),
 
         // ── 审批提示 ──
         Msg::ApprovalPromptAlt { tool, detail } =>
