@@ -1322,6 +1322,11 @@ pub enum Msg<'a> {
         tool_call_count: usize,
         duration: &'a str,
         total_tokens: usize,
+        /// Short failure cause FOLDED into the separator (`✗ 已中断：<reason> · …`).
+        /// Bound to the always-visible summary because the standalone mid-turn
+        /// error line can be clobbered by a real terminal's Streaming→Idle redraw.
+        /// `None` on resume replay (the reason is live-only, not persisted).
+        reason: Option<&'a str>,
     },
 
     // ── OAuth login chrome (/login + /codingplan share these) ──

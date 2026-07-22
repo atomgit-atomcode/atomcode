@@ -713,6 +713,16 @@ pub struct UiState {
     /// Set on TurnComplete / TurnCancelled / Error to seal
     /// `last_assistant_response`; the next turn's first delta clears it.
     pub response_finalized: bool,
+    /// The failure reason (provider `Error` / `RateLimited`) captured for the
+    /// CURRENT turn, FOLDED into the errored `✗ 已中断：<reason>` summary. The
+    /// standalone red error line is rendered mid-turn (phase `Streaming`, spinner
+    /// active) and can be clobbered by the physical Streaming→Idle redraw on a real
+    /// terminal; the summary renders cleanly at Idle, so folding the reason into it
+    /// guarantees the user always sees WHY the turn stopped. Set by the Error /
+    /// RateLimited handlers; `take()`n when the errored summary renders, and reset
+    /// to `None` when a CLEAN summary renders (`turn_summary_label`) so a reason
+    /// from an error path that produced no summary can never fold into a later turn.
+    pub last_turn_error: Option<String>,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
     /// While waiting on a tool approval, holds the `"Running {Tool}"`
@@ -1004,6 +1014,7 @@ impl UiState {
             turn_saw_reasoning: false,
             last_assistant_response: String::new(),
             response_finalized: false,
+            last_turn_error: None,
             prior_phase: None,
             prior_spinner_label: None,
             approval_panel: None,

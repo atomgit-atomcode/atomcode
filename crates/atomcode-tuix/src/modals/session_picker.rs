@@ -31,6 +31,10 @@ pub struct SessionPicker {
     pub filtered: Vec<usize>,
     /// Index into `filtered`.
     pub selected: usize,
+    /// Whether keyboard focus is on the search box (vs. a session row). When
+    /// true, the bordered search box is highlighted with a live cursor and no
+    /// session row is marked. Reached by pressing Up from the first session.
+    pub search_focused: bool,
     /// Index into `sessions` awaiting delete confirmation, or None.
     pub confirm_delete: Option<usize>,
     /// Status message shown in the footer (overwrites previous status).
@@ -45,6 +49,7 @@ impl SessionPicker {
             query: String::new(),
             filtered,
             selected: 0,
+            search_focused: false,
             confirm_delete: None,
             delete_status: None,
         }
@@ -63,16 +68,34 @@ impl SessionPicker {
     }
 
     pub fn up(&mut self) {
+        self.confirm_delete = None;
         if self.filtered.is_empty() {
             self.selected = 0;
+            self.search_focused = true;
             return;
         }
-        self.selected = self.selected.saturating_sub(1);
-        self.confirm_delete = None;
+        if self.search_focused {
+            // Already at the top — stay in the search box.
+            return;
+        }
+        if self.selected == 0 {
+            // Move focus off the first session and into the search box.
+            self.search_focused = true;
+            return;
+        }
+        self.selected -= 1;
     }
 
     pub fn down(&mut self) {
+        self.confirm_delete = None;
         if self.filtered.is_empty() {
+            self.selected = 0;
+            self.search_focused = false;
+            return;
+        }
+        if self.search_focused {
+            // Leave the search box and land on the first session.
+            self.search_focused = false;
             self.selected = 0;
             return;
         }
@@ -80,7 +103,6 @@ impl SessionPicker {
         if self.selected < max {
             self.selected += 1;
         }
-        self.confirm_delete = None;
     }
 
     pub fn chosen_id(&self) -> Option<String> {
@@ -136,6 +158,9 @@ impl Modal for SessionPicker {
             KeyCode::Backspace => {
                 self.query.pop();
                 self.update_filter();
+                // Editing the query is editing the search box — pull focus there
+                // so the caret appears and no session row looks active.
+                self.search_focused = true;
                 self.confirm_delete = None;
                 self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
@@ -144,13 +169,19 @@ impl Modal for SessionPicker {
             KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
                 self.query.push(c);
                 self.update_filter();
+                self.search_focused = true;
                 self.confirm_delete = None;
                 self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
             KeyCode::Char(c) if mods.contains(KeyModifiers::CONTROL) && c == 'd' => {
-                // Ctrl+D: delete selected session (with confirmation)
+                // Ctrl+D: delete selected session (with confirmation). Ignored
+                // while the search box holds focus — no session row is marked, so
+                // there is nothing unambiguous to delete.
+                if self.search_focused {
+                    return Ok(ModalAction::Continue);
+                }
                 let Some(idx) = self.filtered.get(self.selected).copied() else {
                     renderer.render(UiLine::Error(
                         crate::i18n::t(crate::i18n::Msg::SessionNoneSelected).into_owned(),
@@ -312,6 +343,7 @@ impl Modal for SessionPicker {
             self.query.push(c);
         }
         self.update_filter();
+        self.search_focused = true;
         self.confirm_delete = None;
         self.delete_status = None;
         self.selected = 0;
@@ -368,7 +400,7 @@ impl Modal for SessionPicker {
 /// `SessionList` chrome expects before the session rows begin. Session row
 /// `selected` indices are offset by this in the payload so the `▸` marker
 /// lands on the right row (mirrors `plugin_manager`'s `selected_offset`).
-const HEADER_ROWS: usize = 4;
+pub(crate) const HEADER_ROWS: usize = 4;
 
 fn build_menu_payload(p: &SessionPicker, project: &str) -> MenuPayload {
     // Title row: 1-based position in the CURRENT filtered list, total sessions
@@ -409,8 +441,11 @@ fn build_menu_payload(p: &SessionPicker, project: &str) -> MenuPayload {
         items.push((format!("— {} —", hint), String::new()));
         return MenuPayload {
             items,
-            // Nothing selectable → point past the end so no row is marked.
-            selected: usize::MAX,
+            // No session is selectable. If the search box holds focus (the user
+            // typed a query that excludes everything, or pressed Up), keep it
+            // highlighted with a cursor at row 2; otherwise point past the end so
+            // no row is marked.
+            selected: if p.search_focused { 2 } else { usize::MAX },
             kind: crate::render::MenuKind::SessionList,
         };
     }
@@ -425,10 +460,18 @@ fn build_menu_payload(p: &SessionPicker, project: &str) -> MenuPayload {
     }
     items.push((format!("— {} —", hint), String::new()));
 
+    // When the search box holds focus, mark row 2 (the bordered query field) as
+    // selected so it highlights and shows a cursor; no session row is marked.
+    // Otherwise offset the selection past the header chrome so the ▸ marker
+    // lands on the selected session row (rows begin at index HEADER_ROWS).
+    let selected = if p.search_focused {
+        2
+    } else {
+        HEADER_ROWS + p.selected
+    };
+
     MenuPayload {
-        // Offset the selection past the header chrome so the ▸ marker lands on
-        // the selected session row (rows begin at index HEADER_ROWS).
-        selected: HEADER_ROWS + p.selected,
+        selected,
         items,
         kind: crate::render::MenuKind::SessionList,
     }
@@ -471,6 +514,8 @@ fn turn_divider_label(stat: Option<&TurnStat>) -> String {
             tool_call_count: s.tool_call_count,
             duration: &crate::render::fmt_dur(std::time::Duration::from_millis(s.duration_ms)),
             total_tokens: s.total_tokens,
+            // Resume replay: the reason is live-only (not persisted in TurnStat).
+            reason: None,
         })
         .into_owned(),
         Some(s) => crate::i18n::t(crate::i18n::Msg::TurnSummary {
@@ -924,6 +969,44 @@ mod tests {
         assert_eq!(p.selected, 0);
         p.up();
         assert_eq!(p.selected, 0, "up at top stays put");
+    }
+
+    #[test]
+    fn up_from_first_session_focuses_search_box() {
+        let mut p = SessionPicker::open(vec![meta("a", 1), meta("b", 1)]);
+        p.down();
+        assert_eq!(p.selected, 1);
+        assert!(!p.search_focused);
+        p.up();
+        assert_eq!(p.selected, 0, "up from second lands on first session");
+        assert!(!p.search_focused, "still on a session row, not the box");
+        p.up();
+        assert!(p.search_focused, "up from first session focuses the search box");
+        assert_eq!(p.selected, 0);
+        p.up();
+        assert!(p.search_focused, "up again stays in the search box");
+    }
+
+    #[test]
+    fn down_from_search_box_returns_to_first_session() {
+        let mut p = SessionPicker::open(vec![meta("a", 1), meta("b", 1)]);
+        p.up();
+        assert!(p.search_focused);
+        p.down();
+        assert!(!p.search_focused, "down leaves the search box");
+        assert_eq!(p.selected, 0, "and lands on the first session");
+    }
+
+    #[test]
+    fn empty_filter_focuses_search_box_on_up() {
+        let mut p = SessionPicker::open(vec![meta("x", 1)]);
+        p.query = "zzz".to_string();
+        p.update_filter();
+        assert!(p.filtered.is_empty());
+        p.up();
+        assert!(p.search_focused, "up with no matches parks focus on the box");
+        p.down();
+        assert!(!p.search_focused);
     }
 
     #[test]

@@ -1013,8 +1013,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                 super::fmt_tokens(total_tokens),
                 cached_pct.map(|p| format!(" · {p}% cached")).unwrap_or_default(),
             ).into(),
-        Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✗ Stopped · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
+        Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens, reason } => {
+            let cause = reason.map(|r| format!(": {r}")).unwrap_or_default();
+            format!("✗ Stopped{cause} · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
+        }
         Msg::LoginQrHeader =>
             "  Sign in to AtomGit — scan the QR code with your WeChat:\n\n".into(),
         Msg::LoginUrlAfterQr =>

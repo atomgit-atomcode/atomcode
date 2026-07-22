@@ -962,6 +962,40 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
+    /// The bold highlight colour for the selected `/resume` session (title text,
+    /// `▸` marker, and the search-box caret). Theme-aware per user request: cyan
+    /// on dark, magenta on light — both pop against their background without
+    /// needing a full reverse-video bar.
+    fn session_highlight_style(&self) -> CellStyle {
+        let r = if crate::highlight::theme::is_light_for_render() {
+            Role::Brand
+        } else {
+            Role::Accent
+        };
+        CellStyle {
+            fg: role(self.caps, r),
+            bold: true,
+            reverse: false,
+            faint: false,
+            bg: None,
+        }
+    }
+
+    /// Rendered row count for a `/resume` session item at menu index
+    /// `orig_idx` (>= HEADER_ROWS): 2 rows (title + metadata) for the first
+    /// session, 3 for the rest — the extra row is the leading blank spacer that
+    /// separates cards. This MUST stay in lockstep with the render loop's
+    /// `if orig_idx > HEADER_ROWS { push blank }`; both the paginator's
+    /// fit-loops and the footer `menu_rows` reservation call it so the three
+    /// height accountings never drift.
+    fn session_item_height(orig_idx: usize) -> usize {
+        if orig_idx == crate::modals::session_picker::HEADER_ROWS {
+            2
+        } else {
+            3
+        }
+    }
+
     fn max_menu_rows(&self, h: usize, default: usize) -> usize {
         self.menu
             .as_ref()
@@ -1725,9 +1759,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
             }
             // SessionList only reaches `build_menu_row` for its header chrome
-            // (title row + blank separators); the 2-line session items are
-            // rendered by `build_session_menu_rows`. Render the header plainly.
-            super::MenuKind::SessionList => name.to_string(),
+            // (title row + blank separators + bottom hint); the 2-line session
+            // items are rendered by `build_session_menu_rows`. Indent the title
+            // and hint by PAD_COL so they line up with the search box's left
+            // edge (its `│` border also sits at PAD_COL). Blank separators stay
+            // empty so no stray trailing spaces leak out.
+            super::MenuKind::SessionList => {
+                if name.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}{}", " ".repeat(PAD_COL), name)
+                }
+            }
         };
 
         let is_plugin_mgr = matches!(
@@ -1999,39 +2042,34 @@ impl<W: Write + Send> RetainedRenderer<W> {
         selected: bool,
         rule_width: usize,
     ) -> Vec<Vec<Cell>> {
+        // Selected title + marker use the theme-aware highlight colour (cyan on
+        // dark, magenta on light); unselected rows stay in the terminal default.
         let name_style = if selected {
-            CellStyle {
-                fg: None,
-                bold: true,
-                reverse: false,
-                faint: false,
-                bg: None,
-            }
+            self.session_highlight_style()
         } else {
             CellStyle::default()
         };
 
-        // Row 1: marker + bright title.
+        // Row 1: PAD_COL indent + marker + highlighted title. The leading
+        // PAD_COL puts the `▸` marker under the search box's `│` border (col 2),
+        // and the 2-col marker slot puts the title at col 4 — flush with the
+        // search box text and the metadata row below.
         let mut row1 = Vec::new();
+        push_str_cells_sgr(&mut row1, &" ".repeat(PAD_COL), CellStyle::default());
         if selected {
-            let border_style = self.style_for(Role::Border);
-            push_str_cells_sgr(&mut row1, "▸ ", border_style);
+            push_str_cells_sgr(&mut row1, "▸ ", self.session_highlight_style());
         } else {
             push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
         }
         push_str_cells_sgr(&mut row1, name, name_style.clone());
 
-        let content_w1 = 2 + crate::width::display_width(name);
+        let content_w1 = PAD_COL + 2 + crate::width::display_width(name);
         let right_pad1 = rule_width.saturating_sub(content_w1);
         for _ in 0..right_pad1 {
             row1.push(Cell {
                 ch: ' ',
                 width: 1,
-                style: if selected {
-                    name_style.clone()
-                } else {
-                    CellStyle::default()
-                },
+                style: CellStyle::default(),
             });
         }
 
@@ -3140,7 +3178,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     let mut end = offset;
                     let mut height_sum = 0;
                     while end < len - hint_h {
-                        let item_h = if plugin_like && end >= 4 && end < len - hint_h {
+                        let item_h = if menu_kind == super::MenuKind::SessionList
+                            && end >= 4
+                            && end < len - hint_h
+                        {
+                            Self::session_item_height(end)
+                        } else if plugin_like && end >= 4 && end < len - hint_h {
                             self.plugin_item_height(&m.items[end].1, rule_width)
                         } else if menu_kind == super::MenuKind::Marketplace
                             && end >= 2
@@ -3172,7 +3215,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             let mut h_sum = 0;
                             end = offset;
                             while end < len - hint_h {
-                                let item_h = if plugin_like && end >= 4 && end < len - hint_h {
+                                let item_h = if menu_kind == super::MenuKind::SessionList
+                                    && end >= 4
+                                    && end < len - hint_h
+                                {
+                                    Self::session_item_height(end)
+                                } else if plugin_like && end >= 4 && end < len - hint_h {
                                     self.plugin_item_height(&m.items[end].1, rule_width)
                                 } else if menu_kind == super::MenuKind::Marketplace
                                     && end >= 2
@@ -3313,6 +3361,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         }
                     } else if plugin_like && orig_idx == 2 {
                         3
+                    } else if menu_kind == super::MenuKind::SessionList
+                        && orig_idx >= 4
+                        && orig_idx < m.items.len().saturating_sub(1)
+                    {
+                        // Session cards are 2 rows (first) / 3 rows (rest, incl.
+                        // the leading blank spacer). Metadata uses a single-space
+                        // `·` separator, so `plugin_item_height` would wrongly
+                        // return 2 here and this reservation would undercount the
+                        // footer height — overlapping the goal/status rows onto
+                        // the last card.
+                        Self::session_item_height(orig_idx)
                     } else if plugin_like
                         && orig_idx >= 4
                         && orig_idx < m.items.len().saturating_sub(1)
@@ -3567,7 +3626,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     style: CellStyle::default(),
                     width: 1,
                 });
-                if name.is_empty() {
+                // The `/resume` search box is focusable (Up from the first
+                // session lands here): when focused, show the live query plus a
+                // cursor caret and drop the placeholder, so the user can see
+                // that typing edits THIS field.
+                let box_focused = selected && menu_kind == super::MenuKind::SessionList;
+                if name.is_empty() && !box_focused {
                     let muted = self.style_for(Role::Muted);
                     let placeholder = if menu_kind == super::MenuKind::SessionList {
                         "Search sessions..."
@@ -3577,6 +3641,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut content_row, placeholder, &muted);
                 } else {
                     push_str_cells(&mut content_row, name, &CellStyle::default());
+                    if box_focused {
+                        content_row.push(Cell {
+                            ch: '▏',
+                            style: self.session_highlight_style(),
+                            width: 1,
+                        });
+                    }
                 }
                 let target_w = rule_width + PAD_COL;
                 let mut current_w = 0;
@@ -3633,6 +3704,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 && orig_idx >= 4
                 && orig_idx < final_len.saturating_sub(1)
             {
+                // One blank line of breathing room BEFORE every session except
+                // the first, so entries read as separated cards (title+metadata
+                // tight together) rather than one dense block. `session_item_height`
+                // accounts for this spacer in all three height reservations.
+                if orig_idx > crate::modals::session_picker::HEADER_ROWS {
+                    menu_cells.push(Vec::new());
+                }
                 menu_cells.extend(self.build_session_menu_rows(name, desc, selected, rule_width));
             } else if menu_kind == super::MenuKind::Plugin
                 && orig_idx >= 4
@@ -8302,6 +8380,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_item_height_first_two_rest_three() {
+        // The first session (menu index HEADER_ROWS) is 2 rows; every later
+        // session is 3 (leading blank spacer). All three height accountings —
+        // the two paginator fit-loops and the footer `menu_rows` reservation —
+        // share this helper, so they can never disagree with the render loop.
+        let h0 = crate::modals::session_picker::HEADER_ROWS;
+        assert_eq!(RetainedRenderer::<CountingSink>::session_item_height(h0), 2);
+        assert_eq!(
+            RetainedRenderer::<CountingSink>::session_item_height(h0 + 1),
+            3
+        );
+        assert_eq!(
+            RetainedRenderer::<CountingSink>::session_item_height(h0 + 5),
+            3
+        );
+    }
+
+    #[test]
+    fn session_menu_row_aligns_marker_col2_title_col4() {
+        let (r, _counter) = new_counting(80, 24);
+        // Selected row: PAD_COL spaces, then `▸ `, then the title. So col 2 is
+        // the marker and col 4 is the first title glyph — flush with the search
+        // box's `│` border (col 2) and its text (col 4).
+        let rows = r.build_session_menu_rows("Xtitle", "9 msgs", true, 70);
+        let title = &rows[0];
+        assert_eq!(title[0].ch, ' ');
+        assert_eq!(title[1].ch, ' ');
+        assert_eq!(title[2].ch, '▸', "marker sits under the search box border");
+        assert_eq!(title[4].ch, 'X', "title starts at col 4 (search box text)");
+        // Metadata row is indented 4 spaces → also col 4, aligned with the title.
+        let meta = &rows[1];
+        assert_eq!(meta[4].ch, '9', "metadata aligns with the title at col 4");
+        // Unselected row: no marker, but the title still lands at col 4.
+        let rows_u = r.build_session_menu_rows("Xtitle", "9 msgs", false, 70);
+        assert_eq!(rows_u[0][2].ch, ' ', "no marker when unselected");
+        assert_eq!(rows_u[0][4].ch, 'X', "unselected title also at col 4");
+    }
+
     /// `None` session_name keeps the top rule pristine — no reverse
     /// cells, no text overlay. Guards against the badge leaking onto
     /// auto-named or default sessions.
@@ -11221,131 +11338,6 @@ mod tests {
         assert!(
             cell.fg.is_some(),
             "error text should have a foreground color"
-        );
-    }
-
-    /// DIAGNOSTIC (read-only, no source change): reproduce the provider-402
-    /// sequence at the RENDER boundary and decide whether the "Insufficient
-    /// Balance" line survives once the `✗ 已中断` turn summary follows it.
-    ///
-    /// Real-world timeline the runtime emits before `TurnFinished`:
-    ///   1. tool is in flight (spinner active)         → ToolCallInFlight + Spinner
-    ///   2. provider returns 402                       → UiLine::Error("HTTP 402: …")
-    ///   3. turn ends errored, summary line renders    → UiLine::TurnSeparator{"✗ 已中断 …"}
-    ///   4. loop returns to idle prompt                → InputPrompt
-    ///
-    /// `handle_agent_event`'s Error arm (mod.rs:14690) calls
-    /// `renderer.render(UiLine::Error(error))`; its TurnComplete arm
-    /// (mod.rs:14439, errored) renders `UiLine::TurnSeparator{ "✗ 已中断 …" }`.
-    /// This test drives EXACTLY those UiLine values through the *real*
-    /// terminal renderer (the one users see) + a VirtualTerminal, so we can
-    /// tell whether the summary line OVERWRITES / hides the error text
-    /// (hypothesis B: render-layer loss) or whether both survive (proving the
-    /// render layer is fine and any loss is upstream in the event pipeline).
-    #[test]
-    fn diag_provider_402_error_survives_interrupted_summary() {
-        let _theme = crate::highlight::theme::test_lock();
-        crate::highlight::theme::set_theme_mode(false);
-        let (mut r, buf) = new_capturing(80, 24);
-        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
-
-        // --- 1. tool in flight (spinner active), like the real 402 case ---
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status_basic(),
-            attachments: Vec::new(),
-        });
-        r.render(UiLine::ToolCallInFlight {
-            id: "call_1".into(),
-            name: "Bash".into(),
-            detail: "cargo build".into(),
-            hint: None,
-        });
-        r.render(UiLine::Spinner {
-            frame: "⠙".into(),
-            label: "Running Bash".into(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // --- 2. provider 402 → the Error arm's render call ---
-        r.render(UiLine::Error("HTTP 402: Insufficient Balance".into()));
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Snapshot: is the error visible on-screen (grid) right after render,
-        // BEFORE the summary line arrives?
-        let err_visible_after_error = vterm.any_row(|row| row.contains("Insufficient Balance"))
-            || vterm
-                .scrollback_texts()
-                .iter()
-                .any(|l| l.contains("Insufficient Balance"));
-
-        // --- 3. errored TurnComplete → `✗ 已中断 …` summary separator ---
-        r.render(UiLine::AssistantLineBreak);
-        r.render(UiLine::TurnSeparator {
-            label: "\u{2717} 已中断 · 1 轮 · 0 工具 · 0 tokens · 2.0s".into(),
-        });
-        // --- 4. back to idle prompt (a redraw that could hide the spinner
-        //         region — the exact place an overwrite would strike) ---
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status_basic(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Collect every line the terminal ever showed: on-screen grid rows
-        // PLUS scrollback (lines that scrolled off but the user did see).
-        let mut all_lines: Vec<String> = vterm.scrollback_texts();
-        for row in 0..vterm.height() as usize {
-            all_lines.push(vterm.row_text(row));
-        }
-        let joined = all_lines.join("\n");
-
-        let err_final_visible = joined.contains("Insufficient Balance");
-        let has_402 = joined.contains("402");
-        // The VirtualTerminal grid renders CJK wide chars with a spacer cell,
-        // so `已中断` appears as `已 中 断` in `row_text`. Strip ASCII spaces
-        // before matching so the display artifact doesn't mask the summary.
-        let joined_nospace: String = joined.chars().filter(|c| *c != ' ').collect();
-        let has_interrupted = joined_nospace.contains("已中断");
-        // Also assert on the renderer's own committed body model — the
-        // append-only scrollback truth independent of terminal geometry.
-        let body_has_error = r.body_lines.iter().any(|row| {
-            row.iter()
-                .map(|c| c.ch)
-                .collect::<String>()
-                .contains("Insufficient Balance")
-        });
-
-        eprintln!(
-            "DIAG-402 | err_visible_right_after_error={err_visible_after_error} \
-             | err_final_visible={err_final_visible} has_402={has_402} \
-             has_interrupted={has_interrupted} | body_model_has_error={body_has_error}"
-        );
-        eprintln!("DIAG-402 vterm dump:\n{}", vterm.dump());
-
-        // The whole point: if the render layer is sound, BOTH the error and
-        // the interrupted summary are present in the final output. If the
-        // summary/idle redraw overwrote the error, `err_final_visible` is
-        // false while `has_interrupted` is true → hypothesis B (render loss).
-        assert!(
-            has_interrupted,
-            "the `已中断` summary line must render (sanity check)"
-        );
-        assert!(
-            err_final_visible && has_402,
-            "RENDER-LAYER LOSS DETECTED: the `✗ 已中断` summary line hid / \
-             overwrote the `Insufficient Balance` (402) error at the renderer \
-             boundary. err_visible_right_after_error={err_visible_after_error}, \
-             body_model_has_error={body_has_error}. dump:\n{}",
-            vterm.dump()
         );
     }
 

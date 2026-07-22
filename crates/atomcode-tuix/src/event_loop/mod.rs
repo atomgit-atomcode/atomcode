@@ -12051,6 +12051,14 @@ fn turn_summary_label(
     dur: &str,
 ) -> String {
     if errored {
+        // FOLD the captured failure cause into the separator itself
+        // (`✗ 已中断：账户余额不足（HTTP 402） · …`) so the reason rides the
+        // always-visible summary — the standalone mid-turn red line is emitted
+        // while the spinner is live (phase Streaming) and a real terminal's
+        // Streaming→Idle redraw can clobber it, but this line renders cleanly at
+        // Idle. `.take()` consumes it so it can't leak into a later turn.
+        let reason = state.last_turn_error.take();
+        let reason = reason.as_deref().map(summary_reason_headline);
         // An errored turn already rendered a red Error line just above; a
         // celebratory "✓ Nailed it" under it is contradictory, and we don't
         // burn a DONE_LABELS rotation slot on a failure.
@@ -12059,9 +12067,14 @@ fn turn_summary_label(
             tool_call_count,
             duration: dur,
             total_tokens,
+            reason: reason.as_deref(),
         })
         .into_owned()
     } else {
+        // A clean turn clears any stale reason left by an error path that
+        // produced no summary (SnapshotUnavailable / RuntimeStopped), so it can
+        // never fold into a LATER errored summary.
+        state.last_turn_error = None;
         let done = state.next_done_label();
         crate::i18n::t(crate::i18n::Msg::TurnSummary {
             done,
@@ -12072,6 +12085,69 @@ fn turn_summary_label(
             cached_pct,
         })
         .into_owned()
+    }
+}
+
+/// Squeeze a captured failure reason into a SHORT headline that folds cleanly
+/// into the one-line interrupted-turn summary: first line only (a provider body
+/// can be multi-line), capped by DISPLAY WIDTH (CJK counts 2) with an ellipsis.
+/// Provider billing/auth errors are already concise (`账户余额不足（HTTP 402）`);
+/// this only bites long ones (e.g. the repeat-loop fuse message).
+fn summary_reason_headline(reason: &str) -> String {
+    const MAX_COLS: usize = 40;
+    let first = reason.lines().next().unwrap_or(reason).trim();
+    if crate::width::display_width(first) <= MAX_COLS {
+        return first.to_string();
+    }
+    let mut out = String::new();
+    let mut cols = 0usize;
+    for ch in first.chars() {
+        let w = crate::width::display_width(ch.encode_utf8(&mut [0u8; 4]));
+        if cols + w > MAX_COLS.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+        cols += w;
+    }
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod turn_error_reason_tests {
+    use super::*;
+
+    #[test]
+    fn errored_summary_folds_reason_and_consumes_it() {
+        let mut state = UiState::new();
+        state.last_turn_error = Some("账户余额不足（HTTP 402）".to_string());
+        let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "3.2s");
+        // Reason folded into the separator label (not a separate line).
+        assert!(label.contains("账户余额不足（HTTP 402）"), "{label}");
+        assert!(label.contains("已中断") || label.contains("Stopped"), "{label}");
+        // Consumed: cannot leak into the next turn.
+        assert!(state.last_turn_error.is_none());
+    }
+
+    #[test]
+    fn clean_summary_has_no_reason_and_clears_stale() {
+        let mut state = UiState::new();
+        // A stale reason from a prior no-summary error path.
+        state.last_turn_error = Some("陈旧原因".to_string());
+        let label = turn_summary_label(&mut state, false, 1, 0, 0, None, "1s");
+        assert!(!label.contains("陈旧原因"), "{label}");
+        // Cleared so it can't fold into a LATER errored summary.
+        assert!(state.last_turn_error.is_none());
+    }
+
+    #[test]
+    fn long_reason_is_width_truncated_with_ellipsis() {
+        let long = "stopped: the model repeated the same tool call for 6 consecutive rounds without progress";
+        let head = summary_reason_headline(long);
+        assert!(head.ends_with('…'), "{head}");
+        assert!(crate::width::display_width(&head) <= 40, "{head}");
+        // Multi-line collapses to the first line.
+        assert_eq!(summary_reason_headline("头一行\n第二行"), "头一行");
     }
 }
 
@@ -14768,6 +14844,12 @@ fn handle_agent_event(
             // Seal the reply buffer (any text streamed before the error stays
             // copyable via `/copy`).
             state.response_finalized = true;
+            // Capture the reason so the errored turn-summary can carry it: the
+            // standalone red line below is rendered mid-turn (Streaming, spinner
+            // active) and can be clobbered by the physical Streaming→Idle redraw
+            // on a real terminal — the `✗ 已中断` summary renders cleanly at Idle,
+            // so binding the reason to it guarantees the user sees the cause.
+            state.last_turn_error = Some(error.clone());
             renderer.render(UiLine::Error(error));
             renderer.flush();
             *setup_pending = false;
@@ -15475,6 +15557,15 @@ fn handle_agent_event(
                 auto_resuming,
                 server_message.as_deref(),
             );
+            // A `Pause` (auto_resuming=false) ENDS the turn with
+            // `StopReason::RateLimited` → the errored `✗ 已中断` summary. Bind the
+            // pause reason to that summary too (same rationale as the Error arm),
+            // so a 429 the user can't act on still shows WHY. A WaitAndRetry
+            // (auto_resuming=true) is not terminal — the turn continues — so it
+            // must NOT be captured as a turn-ending reason.
+            if !auto_resuming {
+                state.last_turn_error = Some(line.clone());
+            }
             renderer.render(UiLine::Muted(line));
             renderer.flush();
         }
