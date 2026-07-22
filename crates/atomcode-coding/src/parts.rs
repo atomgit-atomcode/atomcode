@@ -506,6 +506,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // Skill catalog — leading system message (persona → context → memory → skills), so
     // the model sees which skills are installed and can trigger one on a description
     // match. `None` (no skills) makes the hook a no-op. Reconciles in place on resume.
+    // Capture whether any skill is installed BEFORE the catalog is moved — SkillFirstHook
+    // (registered below) uses it to stay a no-op when there's nothing to trigger.
+    let has_skills = skill_catalog.as_ref().is_some_and(|c| !c.trim().is_empty());
     hooks.push(Arc::new(SkillCatalogHook::new(skill_catalog)));
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
@@ -539,6 +542,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     if crate::persona::todo_switch_enabled() {
         hooks.push(Arc::new(crate::todo::TodoHook));
     }
+    // DeepSeek-only opening-turn skill-first reminder. A weak model (deepseek) skips
+    // use_skill and dives straight into exploring/solutioning; a static persona line did
+    // not hold. This injects a forceful <system-reminder> on the opening turn only, where
+    // recency is high. Gated to deepseek (model_needs_firm_execution) + a non-empty skill
+    // catalog (never nudge use_skill when no skills are installed). No-op otherwise.
+    hooks.push(Arc::new(crate::skill_first::SkillFirstHook::new(
+        &cfg.model,
+        has_skills,
+    )));
     // NOTE: the `RateLimitHook` is NOT built here. It gates CodingPlan-specific 429
     // messaging on `cfg.base_url` being the gateway, so — like the turn-level
     // `TelemetryHook` — it must be built in `assemble` (which re-runs on a /model
