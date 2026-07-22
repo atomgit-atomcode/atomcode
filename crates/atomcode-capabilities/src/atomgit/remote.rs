@@ -90,4 +90,37 @@ mod tests {
         assert!(parse_push_target("https://atomgit.com/onlyowner").is_none());
         assert!(parse_push_target("").is_none());
     }
+
+    // `detect_push_target` shells out to real `git` on a temp repo (no network): the gate the
+    // post-push label middleware relies on to decide whether to touch the remote at all.
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git available")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    #[test]
+    fn detect_push_target_reads_origin_and_gates_on_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+
+        // No origin yet → None (not a crash).
+        assert!(detect_push_target(p).is_none(), "no origin → None");
+
+        // A gitcode origin → Some, parsed to owner/repo.
+        git(p, &["remote", "add", "origin", "https://gitcode.com/saulcy/order_a_meal.git"]);
+        let t = detect_push_target(p).expect("gitcode origin → Some");
+        assert_eq!((t.owner.as_str(), t.repo.as_str()), ("saulcy", "order_a_meal"));
+
+        // A non-atomgit origin (github) → None: the middleware skips labelling.
+        git(p, &["remote", "set-url", "origin", "git@github.com:acme/widget.git"]);
+        assert!(detect_push_target(p).is_none(), "github origin → None");
+    }
 }

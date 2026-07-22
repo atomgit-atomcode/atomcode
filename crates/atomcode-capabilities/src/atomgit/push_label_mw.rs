@@ -102,17 +102,44 @@ impl ToolMiddleware for GitPushLabelMiddleware {
         tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
     ) -> BeforeOutcome {
-        if tool.name() == "bash" && is_git_push(&call.arguments) {
-            self.pending.lock().unwrap_or_else(|p| p.into_inner()).insert(call.id.clone());
+        if tool.name() == "bash" {
+            let matched = is_git_push(&call.arguments);
+            if matched {
+                self.pending.lock().unwrap_or_else(|p| p.into_inner()).insert(call.id.clone());
+            }
+            // DEBUG (not default `info`): shows whether the git-push detector fired for each
+            // bash call, so a "label never set" report can be traced to detection vs. push
+            // failure vs. non-atomgit remote with `RUST_LOG=debug`.
+            tracing::debug!("atomcode-label: bash call is_git_push={matched}");
         }
         BeforeOutcome::Proceed
     }
 
     async fn after(&self, result: &mut ToolResult) -> AfterOutcome {
         let was_push = self.pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&result.call_id);
-        if was_push && !result.is_error {
-            if let Some(target) = detect_push_target(&self.working_dir) {
+        if !was_push {
+            return AfterOutcome::Proceed; // not a git push we're tracking
+        }
+        if result.is_error {
+            tracing::debug!("atomcode-label: git push tool reported error; not labelling");
+            return AfterOutcome::Proceed;
+        }
+        // Log the decision at INFO so a successful push always leaves a trace, whether or not it
+        // ends up labelling — otherwise a non-atomgit remote (the common no-op) is invisible.
+        match detect_push_target(&self.working_dir) {
+            Some(target) => {
+                tracing::info!(
+                    "atomcode-label: git push succeeded for {}/{}; ensuring label",
+                    target.owner,
+                    target.repo
+                );
                 self.ensure(target).await; // best-effort
+            }
+            None => {
+                tracing::info!(
+                    "atomcode-label: git push succeeded but origin at {} is not gitcode/atomgit; skipping",
+                    self.working_dir.display()
+                );
             }
         }
         AfterOutcome::Proceed

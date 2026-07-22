@@ -116,6 +116,10 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
     if todo_enabled {
         builder = builder.hook(Arc::new(crate::todo::TodoHook));
     }
+    // NOTE: this function is reachable only from tests/examples (see the `parts.rs::assemble`
+    // header). The PRODUCTION mount of this middleware lives in `parts::assemble`; keep both in
+    // sync — mounting it ONLY here (as was originally done) means it never runs for a real
+    // session (terminal/daemon/webui all build their agent through `parts::assemble`).
     #[cfg(feature = "atomgit")]
     {
         builder = builder.middleware(Arc::new(

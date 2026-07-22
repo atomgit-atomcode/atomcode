@@ -993,6 +993,18 @@ pub fn assemble(
     } else if let Some(snapshot) = parts.runtime_resume.take() {
         builder = builder.resume(snapshot);
     }
+    // Ensure the repo's `atomcode` project label after a successful `git push` to a
+    // gitcode/atomgit remote. THIS is the production mount: the terminal TUI, daemon, and
+    // webui all build their agent here via `parts::assemble`. (`assemble.rs::build_coding_agent`
+    // also mounts it, but that path is reachable only from tests/examples — so before this the
+    // middleware never ran for a real session.) Best-effort: every failure is a `tracing::warn`
+    // and the turn proceeds. Gated on `atomgit` (its sole consumer).
+    #[cfg(feature = "atomgit")]
+    {
+        builder = builder.middleware(Arc::new(
+            atomcode_capabilities::tools::GitPushLabelMiddleware::new(cfg.working_dir.clone()),
+        ));
+    }
     Ok(builder.build())
 }
 
