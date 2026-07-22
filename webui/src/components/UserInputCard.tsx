@@ -108,6 +108,8 @@ function QuestionBody({
 }) {
   const t = useT();
   const freeTextRef = useRef<HTMLInputElement>(null);
+  // Offer the "type your own answer" row unless the question opts out (custom === false).
+  const showOther = q.custom !== false;
   const singleOtherActive = q.mode === 'single' && state.singleSelected === OTHER_SENTINEL;
   const multiOtherActive = q.mode === 'multiple' && state.otherChecked;
   useEffect(() => {
@@ -144,19 +146,21 @@ function QuestionBody({
               </span>
             </label>
           ))}
-          <label class="user-input-option">
-            <input
-              type="radio"
-              name={`uiq-${nameSuffix}`}
-              value={OTHER_SENTINEL}
-              checked={state.singleSelected === OTHER_SENTINEL}
-              onChange={() => set({ singleSelected: OTHER_SENTINEL })}
-              disabled={disabled}
-            />
-            <span class="user-input-option-body">
-              <span class="user-input-option-label">{t('userInput.other')}</span>
-            </span>
-          </label>
+          {showOther && (
+            <label class="user-input-option">
+              <input
+                type="radio"
+                name={`uiq-${nameSuffix}`}
+                value={OTHER_SENTINEL}
+                checked={state.singleSelected === OTHER_SENTINEL}
+                onChange={() => set({ singleSelected: OTHER_SENTINEL })}
+                disabled={disabled}
+              />
+              <span class="user-input-option-body">
+                <span class="user-input-option-label">{t('userInput.other')}</span>
+              </span>
+            </label>
+          )}
           {singleOtherActive && (
             <input
               ref={freeTextRef}
@@ -188,17 +192,19 @@ function QuestionBody({
               </span>
             </label>
           ))}
-          <label class="user-input-option">
-            <input
-              type="checkbox"
-              checked={state.otherChecked}
-              onChange={() => set({ otherChecked: !state.otherChecked })}
-              disabled={disabled}
-            />
-            <span class="user-input-option-body">
-              <span class="user-input-option-label">{t('userInput.other')}</span>
-            </span>
-          </label>
+          {showOther && (
+            <label class="user-input-option">
+              <input
+                type="checkbox"
+                checked={state.otherChecked}
+                onChange={() => set({ otherChecked: !state.otherChecked })}
+                disabled={disabled}
+              />
+              <span class="user-input-option-body">
+                <span class="user-input-option-label">{t('userInput.other')}</span>
+              </span>
+            </label>
+          )}
           {multiOtherActive && (
             <input
               ref={freeTextRef}
@@ -269,6 +275,7 @@ function SingleCard({ req, onDone }: UserInputCardProps) {
     question: req.question,
     mode: req.mode,
     options: req.options,
+    custom: req.custom,
   };
   const submitDisabled = loading || !answerReady(q, state);
 

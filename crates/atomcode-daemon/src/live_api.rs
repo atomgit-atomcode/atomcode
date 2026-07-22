@@ -834,6 +834,8 @@ pub(crate) enum LiveWireEvent {
         /// object). Omitted for a single question — the webui then uses the flat fields above.
         #[serde(skip_serializing_if = "Option::is_none")]
         questions: Option<Vec<serde_json::Value>>,
+        /// Whether to offer the "type your own answer" row (single question). Default true.
+        custom: bool,
     },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
@@ -1000,6 +1002,11 @@ impl NativeLiveWireProjector {
                             .get("questions")
                             .and_then(serde_json::Value::as_array)
                             .cloned(),
+                        custom: request
+                            .payload
+                            .get("custom")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(true),
                     }
                 } else {
                     return None;
