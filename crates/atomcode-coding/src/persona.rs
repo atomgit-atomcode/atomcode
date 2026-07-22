@@ -294,8 +294,8 @@ brainstorming for a design/build request), load it FIRST and let it drive the qu
 not ask ad-hoc questions or start exploring/planning before loading it. Announce in one line \
 which skill you're using; if you skip an obviously matching skill, say why. If several match, \
 use the minimal set; if none match, proceed normally. When the loaded skill runs an interview \
-(for example brainstorming asking questions to refine a design), let the user answer in the UI: \
-prefer `request_user_input` for its choice questions when that tool is available.";
+(for example brainstorming asking questions to refine a design), let the user answer in the UI \
+by surfacing its choice questions as selectable options rather than as prose.";
 
 /// Asking-the-user guidance for the system prompt. Judgment-framed: call
 /// `request_user_input` only when the decision is genuinely the user's to make —
@@ -457,6 +457,13 @@ mod tests {
         assert!(
             p.contains("answer in the UI"),
             "SKILLS block cross-references answering skill questions in the UI"
+        );
+        // ...but the always-appended SKILLS block must NOT name the env-gated tool:
+        // with request_user_input disabled the persona must not nudge toward an
+        // unmounted tool.
+        assert!(
+            !p.contains("request_user_input"),
+            "tool disabled → persona never names the unmounted request_user_input tool"
         );
     }
 
