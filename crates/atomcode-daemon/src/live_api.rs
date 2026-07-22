@@ -45,9 +45,6 @@ pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecisi
     }
 }
 
-/// Web/TUI 共同显示并用于创建 headless runtime 的 provider 选择。
-static LIVE_PROVIDER: StdMutex<Option<String>> = StdMutex::new(None);
-
 /// Web/TUI 共同显示并下发给 Coding Runtime 的审批模式。
 static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::Build);
 
@@ -80,13 +77,6 @@ fn live_current_working_dir(fallback: &Path) -> std::path::PathBuf {
 
 struct AuthoritativeTerminal {
     snapshot: ConversationSnapshot,
-}
-
-/// 设置进程级选中 provider 并把切换广播给所有视图（TUI live 转发器 / 其他 webui tab）。
-/// webui 下拉框（/live/provider）、/live/message 带的 provider、以及 TUI 的 /model 选择器
-/// 都经此处，确保任一端切换模型时，另一端的下拉框与头部显示都能实时跟随。
-pub fn live_set_provider(provider: String) {
-    *LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(provider);
 }
 
 /// 设置 live 视图审批模式；已绑定 runtime 的调用方另行下发 `SetMode`。
@@ -181,15 +171,10 @@ pub async fn live_switch_session(
     crate::native_live::resume_session(session_id).await
 }
 
-/// 当前生效的 provider 名：优先进程级选择（LIVE_PROVIDER），回退 config 默认。
-/// 供 /live 快照在新 tab 连上时回显正确的选中模型。
+/// 当前生效的 provider 名由绑定 runtime 投影；未绑定时才回退共享启动默认。
 fn live_current_provider() -> String {
-    if let Some(p) = LIVE_PROVIDER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-    {
-        return p;
+    if let Ok(binding) = crate::native_live::binding() {
+        return binding.provider;
     }
     Config::load(&Config::default_path())
         .map(|c| c.default_provider)
@@ -1141,8 +1126,13 @@ fn parse_session_id(session_id_str: Option<String>) -> Option<String> {
     })
 }
 
-fn provider_reload_required(active: &str, requested: &str) -> bool {
-    active != requested
+fn provider_reload_required(
+    active: &str,
+    active_fingerprint: &str,
+    requested: &str,
+    requested_fingerprint: &str,
+) -> bool {
+    active != requested || active_fingerprint != requested_fingerprint
 }
 
 /// GET /live 查询参数。`session_id` 可选：提供时绑定到该 native session。
@@ -1206,7 +1196,7 @@ pub(crate) async fn live_stream(
         session_id: join.binding.session_id.clone(),
         session_name,
         project_hash,
-        provider: live_current_provider(),
+        provider: join.binding.provider.clone(),
         mode: live_current_mode_wire(),
         working_dir: snapshot_wd.to_string_lossy().to_string(),
     });
@@ -1271,7 +1261,7 @@ pub(crate) struct LiveMessageReq {
     pub message: String,
     #[serde(default)]
     pub images: Vec<crate::ImageInput>,
-    /// webui 选中的模型（provider 名）。Some 时更新 LIVE_PROVIDER，下一轮生效。
+    /// webui 选中的模型（provider 名）。Some 时切换当前绑定 runtime。
     #[serde(default)]
     pub provider: Option<String>,
     /// 调用方的当前 session_id。
@@ -1352,15 +1342,14 @@ pub(crate) async fn live_message(
 ) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
     let sid = parse_session_id(req.session_id);
-    let active_provider = live_current_provider();
     let requested_provider = req.provider.clone();
-    let provider_name = requested_provider
+    let bootstrap_provider = requested_provider
         .clone()
-        .unwrap_or_else(|| active_provider.clone());
+        .unwrap_or_else(live_current_provider);
     let join = match crate::native_live::ensure_headless_runtime(
         live_current_working_dir(&working_dir),
         state.telemetry.clone(),
-        provider_name.clone(),
+        bootstrap_provider,
         native_runtime_mode(live_current_approval_mode()),
         sid,
     )
@@ -1371,38 +1360,55 @@ pub(crate) async fn live_message(
             return Json(serde_json::json!({ "accepted": false, "error": error }));
         }
     };
+    let active_provider = join.binding.provider.clone();
+    let mut provider_name = active_provider.clone();
     if let Some(requested_provider) = requested_provider {
-        if provider_reload_required(&active_provider, &requested_provider) {
-            let config = match Config::load(&Config::default_path()) {
-                Ok(config) => config,
-                Err(error) => {
-                    return Json(serde_json::json!({
-                        "accepted": false,
-                        "error": format!("load provider config failed: {error}"),
-                    }));
-                }
-            };
-            if !config.providers.contains_key(&requested_provider) {
+        let config = match Config::load(&Config::default_path()) {
+            Ok(config) => config,
+            Err(error) => {
                 return Json(serde_json::json!({
                     "accepted": false,
-                    "error": format!("provider {requested_provider:?} not found"),
+                    "error": format!("load provider config failed: {error}"),
                 }));
             }
+        };
+        if !config.providers.contains_key(&requested_provider) {
+            return Json(serde_json::json!({
+                "accepted": false,
+                "error": format!("provider {requested_provider:?} not found"),
+            }));
+        }
+        let requested_fingerprint =
+            match crate::native_live::provider_fingerprint(&config, &requested_provider) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    return Json(serde_json::json!({ "accepted": false, "error": error }));
+                }
+            };
+        if provider_reload_required(
+            &active_provider,
+            &join.binding.provider_fingerprint,
+            &requested_provider,
+            &requested_fingerprint,
+        ) {
             let runtime_config = chat_runtime_config(
                 &config,
-                &provider_name,
+                &requested_provider,
                 &join.binding.working_dir,
                 state.telemetry.clone(),
             );
             let next = crate::kernel_runtime::coding_config_from_runtime(&runtime_config);
-            if let Err(error) = crate::native_live::reload_provider(next).await {
+            if let Err(error) =
+                crate::native_live::reload_provider(&join.binding, next, requested_fingerprint)
+                    .await
+            {
                 return Json(serde_json::json!({
                     "accepted": false,
                     "error": format!("provider reload rejected: {error:?}"),
                 }));
             }
-            live_set_provider(requested_provider);
         }
+        provider_name = requested_provider;
     }
     let original_images: Vec<ImagePart> = req
         .images
@@ -1471,119 +1477,96 @@ pub(crate) async fn live_switch_session_endpoint(
 #[derive(serde::Deserialize)]
 pub(crate) struct LiveProviderReq {
     pub provider: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// POST /live/provider — webui 切换模型即时同步。
 ///
 /// 与"发送消息才带 provider"不同，下拉框一变就调本端点，让对端立即跟随而无需先发消息。
-/// 行为与 TUI 的 /model 选择器对齐：把它持久化为 config 默认 provider（仅当确为已知
-/// provider，避免把无效名写进配置），再在 live 总线上广播 ProviderChanged，使 TUI 头部
-/// 与其他 webui tab 的下拉框实时更新。下一轮实际用哪个模型由 LIVE_PROVIDER 决定（已在
-/// live_set_provider 里更新）。
+/// 行为与 TUI 的 /model 选择器对齐：只重装当前绑定 runtime，不修改共享启动默认。
 pub(crate) async fn live_provider(
     State(state): State<AppState>,
     Json(req): Json<LiveProviderReq>,
 ) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
-    let store = atomcode_config::ConfigStore::default_store();
-    let mut provider_missing = false;
-    let mut previous_provider = String::new();
-    let commit = match store.update(|config| {
-        if !config.providers.contains_key(&req.provider) {
-            provider_missing = true;
-            anyhow::bail!("provider {:?} not found", req.provider);
-        }
-        previous_provider = config.default_provider.clone();
-        config.default_provider = req.provider.clone();
-        Ok(())
-    }) {
-        Ok(commit) => commit,
-        Err(_) if provider_missing => {
-            return Json(serde_json::json!({
-                "ok": false,
-                "error": format!("provider {:?} not found", req.provider),
-            }));
-        }
+    let config = match Config::load(&Config::default_path()) {
+        Ok(config) => config,
         Err(error) => {
             return Json(serde_json::json!({
                 "ok": false,
-                "error": format!("save provider config failed: {error}"),
+                "error": format!("load provider config failed: {error}"),
             }));
         }
     };
-    let config = commit.snapshot.config.clone();
-    let previous_selected_provider = live_current_provider();
-    let default_changed = previous_provider != req.provider;
-    live_set_provider(req.provider.clone());
-    let join = match crate::native_live::ensure_headless_runtime(
-        live_current_working_dir(&working_dir),
-        state.telemetry.clone(),
-        req.provider.clone(),
-        native_runtime_mode(live_current_approval_mode()),
-        None,
-    )
-    .await
-    {
+    if !config.providers.contains_key(&req.provider) {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": format!("provider {:?} not found", req.provider),
+        }));
+    }
+    let requested_session_id = parse_session_id(req.session_id);
+    let join = match crate::native_live::join_for_provider(requested_session_id.as_deref()) {
         Ok(join) => join,
-        Err(error) => {
-            live_set_provider(previous_selected_provider.clone());
-            let rollback_error = if default_changed {
-                match store.update_if_revision(&commit.snapshot.revision, |config| {
-                    config.default_provider = previous_provider.clone();
-                    Ok(())
-                }) {
-                    Ok(Some(_)) | Ok(None) => None,
-                    Err(error) => Some(error.to_string()),
+        Err(crate::live_hub::HubError::Unbound) => {
+            match crate::native_live::ensure_headless_runtime(
+                live_current_working_dir(&working_dir),
+                state.telemetry.clone(),
+                req.provider.clone(),
+                native_runtime_mode(live_current_approval_mode()),
+                requested_session_id,
+            )
+            .await
+            {
+                Ok(join) => join,
+                Err(error) => {
+                    return Json(serde_json::json!({
+                        "ok": false,
+                        "error": error,
+                    }));
                 }
-            } else {
-                None
-            };
+            }
+        }
+        Err(error) => {
             return Json(serde_json::json!({
                 "ok": false,
-                "error": match rollback_error {
-                    Some(rollback) => format!(
-                        "{error}; config rollback failed: {rollback}"
-                    ),
-                    None => error,
-                },
+                "error": format!("provider session rejected: {error:?}"),
             }));
         }
     };
+    let requested_fingerprint =
+        match crate::native_live::provider_fingerprint(&config, &req.provider) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return Json(serde_json::json!({ "ok": false, "error": error }));
+            }
+        };
+    if !provider_reload_required(
+        &join.binding.provider,
+        &join.binding.provider_fingerprint,
+        &req.provider,
+        &requested_fingerprint,
+    ) {
+        return Json(serde_json::json!({ "ok": true }));
+    }
     let runtime_config = chat_runtime_config(
         &config,
         &req.provider,
         &join.binding.working_dir,
         state.telemetry.clone(),
     );
-    match crate::native_live::reload_provider(crate::kernel_runtime::coding_config_from_runtime(
-        &runtime_config,
-    ))
+    match crate::native_live::reload_provider(
+        &join.binding,
+        crate::kernel_runtime::coding_config_from_runtime(&runtime_config),
+        requested_fingerprint,
+    )
     .await
     {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
-        Err(error) => {
-            live_set_provider(previous_selected_provider.clone());
-            let rollback_error = if default_changed {
-                match store.update_if_revision(&commit.snapshot.revision, |config| {
-                    config.default_provider = previous_provider.clone();
-                    Ok(())
-                }) {
-                    Ok(Some(_)) | Ok(None) => None,
-                    Err(error) => Some(error.to_string()),
-                }
-            } else {
-                None
-            };
-            Json(serde_json::json!({
-                "ok": false,
-                "error": match rollback_error {
-                    Some(rollback) => format!(
-                        "provider reload rejected: {error:?}; config rollback failed: {rollback}"
-                    ),
-                    None => format!("provider reload rejected: {error:?}"),
-                },
-            }))
-        }
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "error": format!("provider reload rejected: {error:?}"),
+        })),
     }
 }
 
@@ -1726,11 +1709,18 @@ pub(crate) async fn live_reasoning_effort(
             &binding.working_dir,
             state.telemetry.clone(),
         );
-        if let Err(error) = crate::native_live::reload_provider(
-            crate::kernel_runtime::coding_config_from_runtime(&runtime_config),
-        )
-        .await
-        {
+        let reload_result = match crate::native_live::provider_fingerprint(&config, &target) {
+            Ok(fingerprint) => {
+                crate::native_live::reload_provider(
+                    &binding,
+                    crate::kernel_runtime::coding_config_from_runtime(&runtime_config),
+                    fingerprint,
+                )
+                .await
+            }
+            Err(error) => Err(crate::live_hub::HubError::RuntimeRejected(error)),
+        };
+        if let Err(error) = reload_result {
             let rollback_error =
                 match store.update_if_revision(&commit.snapshot.revision, |config| {
                     if let Some(provider) = config.providers.get_mut(&target) {
@@ -2114,9 +2104,25 @@ mod tests {
     }
 
     #[test]
-    fn live_message_does_not_reload_the_already_active_provider() {
-        assert!(!provider_reload_required("ds-gf", "ds-gf"));
-        assert!(provider_reload_required("ds-gf", "other"));
+    fn live_message_reloads_only_when_the_runtime_provider_identity_changes() {
+        assert!(!provider_reload_required(
+            "ds-gf",
+            "fingerprint-a",
+            "ds-gf",
+            "fingerprint-a",
+        ));
+        assert!(provider_reload_required(
+            "ds-gf",
+            "fingerprint-a",
+            "ds-gf",
+            "fingerprint-b",
+        ));
+        assert!(provider_reload_required(
+            "ds-gf",
+            "fingerprint-a",
+            "other",
+            "fingerprint-a",
+        ));
     }
 
     #[test]

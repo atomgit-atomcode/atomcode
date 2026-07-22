@@ -1682,7 +1682,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     format!("+ {}  {}", name, desc)
                 }
             }
-            super::MenuKind::Skill => {
+            super::MenuKind::Skill | super::MenuKind::Action => {
                 // Bare `<name>  <desc>` — no command prefix. Selection arrow
                 // only. Pad by display width so CJK names align (same logic
                 // as SlashCommand).

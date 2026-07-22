@@ -746,11 +746,11 @@ export async function postLiveSwitchSession(sessionId: string): Promise<void> {
 
 /** Sync-mode model switch: notify the daemon immediately when the dropdown
  *  changes (not just on send), so the TUI header and other tabs follow. */
-export async function postLiveProvider(provider: string): Promise<void> {
+export async function postLiveProvider(provider: string, sessionId?: string | null): Promise<void> {
   const resp = await fetch('/live/provider', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ provider }),
+    body: JSON.stringify({ provider, ...(sessionId ? { session_id: sessionId } : {}) }),
   });
   if (!resp.ok) throw new Error(`switch live provider failed: ${resp.status}`);
   const body = await resp.json() as { ok?: boolean; error?: string };

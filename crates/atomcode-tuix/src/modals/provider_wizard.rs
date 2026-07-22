@@ -14,7 +14,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
 use crate::event_loop::{
-    build_status, save_and_reload, select_provider_and_reload, Buffer, LoopCtx,
+    build_status, save_and_reload, set_default_provider_and_reload, Buffer, LoopCtx,
 };
 use crate::input::key_action::classify;
 use crate::render::{MenuPayload, Renderer, UiLine};
@@ -358,8 +358,15 @@ fn handle_key(
                 }
                 KeyCode::Enter => {
                     let chosen = providers[selected].clone();
-                    select_provider_and_reload(ctx, &chosen, renderer);
-                    return Ok(ModalAction::Close);
+                    if set_default_provider_and_reload(ctx, &chosen, renderer) {
+                        return Ok(ModalAction::Close);
+                    }
+                    *wizard = ProviderWizard::SetDefaultPick {
+                        providers,
+                        selected,
+                    };
+                    redraw(buf, state, ctx, wizard, renderer);
+                    return Ok(ModalAction::Continue);
                 }
                 _ => {}
             }
@@ -374,33 +381,36 @@ fn handle_key(
         ProviderWizard::DeleteConfirm { target } => {
             match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    ctx.config.providers.remove(&target);
+                    let mut desired = ctx.config.clone();
+                    desired.providers.remove(&target);
                     // If we just dropped the default, fall back to any
                     // remaining provider or blank.
-                    if ctx.config.default_provider == target {
-                        ctx.config.default_provider = ctx
-                            .config
-                            .providers
-                            .keys()
-                            .next()
-                            .cloned()
-                            .unwrap_or_default();
+                    if desired.default_provider == target {
+                        desired.default_provider =
+                            desired.providers.keys().next().cloned().unwrap_or_default();
                     }
-                    save_and_reload(
+                    if save_and_reload(
                         ctx,
+                        desired,
                         renderer,
                         crate::i18n::t(crate::i18n::Msg::ProviderDeleted { name: &target })
                             .into_owned(),
-                    );
+                        true,
+                    ) {
+                        return Ok(ModalAction::Close);
+                    }
+                    *wizard = ProviderWizard::DeleteConfirm { target };
+                    redraw(buf, state, ctx, wizard, renderer);
+                    return Ok(ModalAction::Continue);
                 }
                 _ => {
                     push(
                         renderer,
                         &crate::i18n::t(crate::i18n::Msg::ProviderDeleteKept),
                     );
+                    Ok(ModalAction::Close)
                 }
             }
-            Ok(ModalAction::Close)
         }
 
         // ── Text-input states: Enter submits, chars edit buf, others pass through Buffer. ──
@@ -558,19 +568,33 @@ fn handle_key(
                             // without an extra /model step.
                             let name = draft.name.clone();
                             let model = draft.model.clone();
-                            let cfg = draft.into_config();
-                            ctx.config.providers.insert(name.clone(), cfg);
-                            ctx.config.default_provider = name.clone();
-                            save_and_reload(
+                            let cfg = draft.clone().into_config();
+                            let mut desired = ctx.config.clone();
+                            desired.providers.insert(name.clone(), cfg);
+                            desired.default_provider = name.clone();
+                            if save_and_reload(
                                 ctx,
+                                desired,
                                 renderer,
                                 crate::i18n::t(crate::i18n::Msg::ProviderAdded {
                                     name: &name,
                                     model: &model,
                                 })
                                 .into_owned(),
-                            );
-                            return Ok(ModalAction::Close);
+                                true,
+                            ) {
+                                return Ok(ModalAction::Close);
+                            }
+                            buf.text = answer;
+                            buf.cursor = buf.text.len();
+                            *wizard = ProviderWizard::Add {
+                                step,
+                                draft,
+                                plan,
+                                idx,
+                            };
+                            redraw(buf, state, ctx, wizard, renderer);
+                            return Ok(ModalAction::Continue);
                         }
                         let next = plan[next_idx];
                         if matches!(next, WizardStep::Name) {
@@ -639,16 +663,29 @@ fn handle_key(
                     }
                     None => {
                         // Commit edit: merge draft onto existing provider.
-                        if let Some(existing) = ctx.config.providers.get_mut(&target) {
+                        let mut desired = ctx.config.clone();
+                        if let Some(existing) = desired.providers.get_mut(&target) {
                             draft.apply_onto(existing);
                         }
-                        save_and_reload(
+                        if save_and_reload(
                             ctx,
+                            desired,
                             renderer,
                             crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &target })
                                 .into_owned(),
-                        );
-                        return Ok(ModalAction::Close);
+                            false,
+                        ) {
+                            return Ok(ModalAction::Close);
+                        }
+                        buf.text = answer;
+                        buf.cursor = buf.text.len();
+                        *wizard = ProviderWizard::Edit {
+                            target,
+                            step,
+                            draft,
+                        };
+                        redraw(buf, state, ctx, wizard, renderer);
+                        return Ok(ModalAction::Continue);
                     }
                 }
             }
@@ -695,7 +732,7 @@ fn redraw(
                 ),
             ],
             selected: *selected,
-            kind: crate::render::MenuKind::SlashCommand,
+            kind: crate::render::MenuKind::Action,
         }),
         ProviderWizard::EditPick {
             providers,

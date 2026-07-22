@@ -35,7 +35,7 @@ use anyhow::Result;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCompletion};
 use atomcode_coding::CodingRuntimeHandle;
 use atomcode_config::config::Config;
-use atomcode_config::{ConfigRevision, ConfigSnapshot, ConfigStore};
+use atomcode_config::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};
 use atomcode_daemon::legacy_convert::snapshot_to_core;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::{mpsc, watch};
@@ -2753,6 +2753,14 @@ pub(crate) struct PendingProviderReload {
     previous_model_name: Option<String>,
     announce: Option<String>,
     manual_reload_announce: bool,
+    selection_mode_after_success: Option<crate::ProviderSelectionMode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderProjectionObservation {
+    generation: atomcode_coding::RuntimeGeneration,
+    provider: String,
+    model: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2779,6 +2787,7 @@ pub struct LoopCtx {
     pub(crate) config_store: ConfigStore,
     pub(crate) observed_config_revision: Option<ConfigRevision>,
     pub(crate) pending_provider_reload: Option<PendingProviderReload>,
+    pub(crate) pending_provider_projection: Option<ProviderProjectionObservation>,
     pub(crate) observed_auth: Option<AuthObservation>,
     pub(crate) pending_provider_deactivation: bool,
     pub runtime: RuntimeControl,
@@ -4247,6 +4256,25 @@ mod buffer_tests {
 mod menu_tests {
     use super::*;
     use crate::custom_commands::CustomCommandRegistry;
+
+    #[test]
+    fn pending_transition_routes_enter_through_common_commit_gate() {
+        assert!(!menu_handles_selection_key(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+            true,
+        ));
+        assert!(menu_handles_selection_key(
+            KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+            true,
+        ));
+        assert!(menu_handles_selection_key(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+            false,
+        ));
+    }
 
     #[test]
     fn non_slash_input_returns_no_menu() {
@@ -6571,9 +6599,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             _ = config_poll_tick.tick() => {
                 let idle_boundary = matches!(app.state.phase, UiPhase::Idle)
                     && app.active_modal.is_none();
+                let projection_changed = idle_boundary
+                    && ctx.pending_provider_reload.is_none()
+                    && retry_pending_provider_projection(&mut ctx, &mut app.state, renderer);
                 let config_changed = idle_boundary && poll_external_config(&mut ctx);
                 let auth_changed = poll_external_auth(&mut ctx);
-                if idle_boundary && (config_changed || auth_changed) {
+                if idle_boundary && (projection_changed || config_changed || auth_changed) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
             }
@@ -7001,9 +7032,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             _ = config_poll_tick.tick() => {
                 let idle_boundary = matches!(app.state.phase, UiPhase::Idle)
                     && app.active_modal.is_none();
+                let projection_changed = idle_boundary
+                    && ctx.pending_provider_reload.is_none()
+                    && retry_pending_provider_projection(&mut ctx, &mut app.state, renderer);
                 let config_changed = idle_boundary && poll_external_config(&mut ctx);
                 let auth_changed = poll_external_auth(&mut ctx);
-                if idle_boundary && (config_changed || auth_changed) {
+                if idle_boundary && (projection_changed || config_changed || auth_changed) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
             }
@@ -7504,6 +7538,59 @@ fn merge_persisted_config_preserving_active(current: &Config, mut persisted: Con
     persisted
 }
 
+fn config_for_persistence(
+    desired: &Config,
+    persisted: &Config,
+    persist_runtime_provider_as_default: bool,
+) -> Config {
+    let mut saved = desired.clone();
+    if !persist_runtime_provider_as_default {
+        if let Some(provider) = persisted.providers.get(&persisted.default_provider) {
+            saved
+                .providers
+                .entry(persisted.default_provider.clone())
+                .or_insert_with(|| provider.clone());
+        }
+        saved.default_provider = persisted.default_provider.clone();
+    }
+    saved
+}
+
+struct DesiredConfigCommit {
+    commit: ConfigCommit,
+    previous: Config,
+}
+
+fn commit_desired_config(
+    store: &ConfigStore,
+    observed_revision: Option<&ConfigRevision>,
+    desired: &Config,
+    persist_runtime_provider_as_default: bool,
+) -> Result<DesiredConfigCommit, anyhow::Error> {
+    let revision = observed_revision_for_write(observed_revision)?;
+    let mut previous = None;
+    let commit = store
+        .update_if_revision(&revision, |persisted| {
+            previous = Some(persisted.clone());
+            *persisted =
+                config_for_persistence(desired, persisted, persist_runtime_provider_as_default);
+            Ok(())
+        })?
+        .ok_or_else(|| anyhow::anyhow!("config changed in another process; retry"))?;
+    Ok(DesiredConfigCommit {
+        commit,
+        previous: previous.expect("successful ConfigStore update observed the previous snapshot"),
+    })
+}
+
+fn observed_revision_for_write(
+    observed: Option<&ConfigRevision>,
+) -> Result<ConfigRevision, anyhow::Error> {
+    observed
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("configuration state is not synchronized; retry"))
+}
+
 #[cfg(test)]
 mod external_config_tests {
     use super::*;
@@ -7593,6 +7680,71 @@ mod external_config_tests {
         assert_eq!(merged.providers["main"].model, "pinned-model");
         assert!(merged.providers.contains_key("new-provider"));
         assert_eq!(merged.language, Some(atomcode_config::locale::Locale::ZhCn));
+    }
+
+    #[test]
+    fn runtime_local_selection_is_not_written_back_as_shared_default() {
+        let mut persisted = config("global-model", false);
+        let global = persisted.providers.remove("main").unwrap();
+        persisted.providers.insert("global".into(), global);
+        persisted.default_provider = "global".into();
+        let mut desired = config("previous-local-model", false);
+        desired.providers.insert(
+            "local".into(),
+            ProviderConfig {
+                model: "local-model".into(),
+                ..desired.providers["main"].clone()
+            },
+        );
+        desired.default_provider = "local".into();
+        desired.language = Some(atomcode_config::locale::Locale::ZhCn);
+
+        let saved = config_for_persistence(&desired, &persisted, false);
+
+        assert_eq!(saved.default_provider, "global");
+        assert_eq!(saved.providers["global"].model, "global-model");
+        assert_eq!(saved.language, Some(atomcode_config::locale::Locale::ZhCn));
+        assert_eq!(saved.providers["local"].model, "local-model");
+    }
+
+    #[test]
+    fn config_save_without_an_observed_revision_fails_closed() {
+        assert!(observed_revision_for_write(None).is_err());
+    }
+
+    #[test]
+    fn config_cas_conflict_does_not_commit_the_staged_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        let initial = store.replace(&config("runtime-model", false)).unwrap();
+        let external = store.replace(&config("external-model", false)).unwrap();
+        let desired = config("staged-model", false);
+
+        assert!(
+            commit_desired_config(&store, Some(&initial.snapshot.revision), &desired, false,)
+                .is_err()
+        );
+        let persisted = store.read().unwrap();
+        assert_eq!(persisted.config.providers["main"].model, "external-model");
+        assert_eq!(persisted.revision, external.snapshot.revision);
+    }
+
+    #[test]
+    fn explicit_default_update_can_change_shared_default() {
+        let persisted = config("global-model", false);
+        let mut desired = persisted.clone();
+        desired.providers.insert(
+            "next".into(),
+            ProviderConfig {
+                model: "next-model".into(),
+                ..desired.providers["main"].clone()
+            },
+        );
+        desired.default_provider = "next".into();
+
+        let saved = config_for_persistence(&desired, &persisted, true);
+
+        assert_eq!(saved.default_provider, "next");
     }
 
     #[test]
@@ -7774,6 +7926,37 @@ mod external_config_tests {
     }
 
     #[test]
+    fn failed_projection_attempt_retains_the_authoritative_observation() {
+        let observation = ProviderProjectionObservation {
+            generation: atomcode_coding::RuntimeGeneration(5),
+            provider: "provider-b".into(),
+            model: Some("model-b".into()),
+        };
+        let mut pending = Some(observation.clone());
+
+        assert_eq!(
+            current_provider_projection(
+                pending.as_ref(),
+                Some(atomcode_coding::RuntimeGeneration(5)),
+            ),
+            Some(observation.clone()),
+        );
+        finish_provider_projection_attempt(
+            &mut pending,
+            &observation,
+            ProviderProjectionResult::Deferred,
+        );
+        assert_eq!(pending, Some(observation.clone()));
+
+        finish_provider_projection_attempt(
+            &mut pending,
+            &observation,
+            ProviderProjectionResult::Current,
+        );
+        assert_eq!(pending, None);
+    }
+
+    #[test]
     fn durable_reload_success_requires_the_same_config_revision() {
         let tmp = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(tmp.path().join("config.toml"));
@@ -7880,6 +8063,14 @@ fn provider_reload_failure_was_superseded(
     current: Option<atomcode_coding::RuntimeGeneration>,
 ) -> bool {
     origin != current
+}
+
+fn current_provider_projection(
+    pending: Option<&ProviderProjectionObservation>,
+    current: Option<atomcode_coding::RuntimeGeneration>,
+) -> Option<ProviderProjectionObservation> {
+    let observation = pending?;
+    (current == Some(observation.generation)).then(|| observation.clone())
 }
 
 fn provider_projection_is_current(
@@ -8003,6 +8194,7 @@ fn reconcile_persisted_config(
         previous_model_name: None,
         announce: None,
         manual_reload_announce,
+        selection_mode_after_success: None,
     });
     Ok(PersistedConfigReload::Queued)
 }
@@ -8116,6 +8308,7 @@ fn poll_external_auth(ctx: &mut LoopCtx) -> bool {
                     previous_model_name: None,
                     announce: None,
                     manual_reload_announce: false,
+                    selection_mode_after_success: None,
                 });
             }
             Err(error) => {
@@ -9124,6 +9317,27 @@ fn menu_for_display(buf: &Buffer, ctx: &LoopCtx) -> Option<Vec<(String, String)>
     )
 }
 
+fn session_projection_pending(ctx: &LoopCtx) -> bool {
+    ctx.pending_session_transition.is_some()
+        || ctx.pending_session_resume.is_some()
+        || ctx.pending_external_session_projection.is_some()
+        || ctx.pending_capability_reload
+}
+
+fn idle_commit_gate_pending(ctx: &LoopCtx) -> bool {
+    provider_transition_pending(ctx) || session_projection_pending(ctx)
+}
+
+fn menu_handles_selection_key(
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    commit_gate_pending: bool,
+) -> bool {
+    matches!(code, KeyCode::Enter | KeyCode::Tab)
+        && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+        && !(code == KeyCode::Enter && commit_gate_pending)
+}
+
 fn handle_idle_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -9201,8 +9415,8 @@ fn handle_idle_key(
                 );
                 return Ok(());
             }
-            (KeyCode::Enter | KeyCode::Tab, m)
-                if !m.contains(crossterm::event::KeyModifiers::SHIFT) =>
+            (selection_key @ (KeyCode::Enter | KeyCode::Tab), m)
+                if menu_handles_selection_key(selection_key, m, idle_commit_gate_pending(ctx)) =>
             {
                 // Tab and Enter both pick the highlighted entry, but
                 // they diverge on no-arg top-level commands:
@@ -9708,11 +9922,7 @@ fn handle_idle_key(
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
-            if ctx.pending_session_transition.is_some()
-                || ctx.pending_session_resume.is_some()
-                || ctx.pending_external_session_projection.is_some()
-                || ctx.pending_capability_reload
-            {
+            if session_projection_pending(ctx) {
                 if let Err(error) = retry_pending_session_projections(&mut app.state, renderer, ctx)
                 {
                     renderer.render(UiLine::Error(error));
@@ -9721,11 +9931,7 @@ fn handle_idle_key(
                     return Ok(());
                 }
             }
-            if ctx.pending_session_transition.is_some()
-                || ctx.pending_session_resume.is_some()
-                || ctx.pending_external_session_projection.is_some()
-                || ctx.pending_capability_reload
-            {
+            if session_projection_pending(ctx) {
                 renderer.render(UiLine::Warning(
                     crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
                 ));
@@ -10669,8 +10875,10 @@ fn rollback_pending_provider_reload(
 
 pub(crate) fn save_and_reload(
     ctx: &mut LoopCtx,
+    desired: Config,
     renderer: &mut dyn Renderer,
     success_message: String,
+    persist_runtime_provider_as_default: bool,
 ) -> bool {
     if provider_transition_pending(ctx) {
         renderer.render(UiLine::Error(
@@ -10680,41 +10888,17 @@ pub(crate) fn save_and_reload(
         return false;
     }
     let store = ctx.config_store.clone();
-    let desired = ctx.config.clone();
+    let previous_runtime_config = ctx.config.clone();
     let previous_model_name = ctx.model_name.clone();
-    let mut previous_persisted = None;
-    let commit = match ctx.observed_config_revision.as_ref() {
-        Some(revision) => store
-            .update_if_revision(revision, |config| {
-                previous_persisted = Some(config.clone());
-                *config = desired.clone();
-                Ok(())
-            })
-            .and_then(|commit| {
-                commit.ok_or_else(|| anyhow::anyhow!("config changed in another process; retry"))
-            }),
-        None => store.update(|config| {
-            previous_persisted = Some(config.clone());
-            *config = desired.clone();
-            Ok(())
-        }),
-    };
-    match commit {
-        Ok(commit) => {
-            let rollback_persisted_config = previous_persisted;
-            let rollback_runtime_config = rollback_persisted_config.as_ref().map(|previous| {
-                let active_is_ephemeral = desired
-                    .providers
-                    .get(&desired.default_provider)
-                    .is_some_and(|provider| provider.ephemeral);
-                if ctx.provider_selection_mode == crate::ProviderSelectionMode::Pinned
-                    || active_is_ephemeral
-                {
-                    merge_persisted_config_preserving_active(&desired, previous.clone())
-                } else {
-                    previous.clone()
-                }
-            });
+    match commit_desired_config(
+        &store,
+        ctx.observed_config_revision.as_ref(),
+        &desired,
+        persist_runtime_provider_as_default,
+    ) {
+        Ok(DesiredConfigCommit { commit, previous }) => {
+            let rollback_persisted_config = Some(previous);
+            let rollback_runtime_config = Some(previous_runtime_config);
             let origin_generation = ctx.runtime.current_generation();
             atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
             if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
@@ -10729,6 +10913,7 @@ pub(crate) fn save_and_reload(
                         previous_model_name: Some(previous_model_name),
                         announce: None,
                         manual_reload_announce: false,
+                        selection_mode_after_success: None,
                     },
                 );
                 let suffix = rollback
@@ -10751,26 +10936,11 @@ pub(crate) fn save_and_reload(
                 previous_model_name: Some(previous_model_name),
                 announce: Some(success_message),
                 manual_reload_announce: false,
+                selection_mode_after_success: None,
             });
             true
         }
         Err(e) => {
-            ctx.model_name = previous_model_name;
-            if let Ok(snapshot) = store.read() {
-                let active_is_ephemeral = desired
-                    .providers
-                    .get(&desired.default_provider)
-                    .is_some_and(|provider| provider.ephemeral);
-                ctx.config = if ctx.provider_selection_mode == crate::ProviderSelectionMode::Pinned
-                    || active_is_ephemeral
-                {
-                    merge_persisted_config_preserving_active(&desired, snapshot.config)
-                } else {
-                    snapshot.config
-                };
-                ctx.observed_config_revision = Some(snapshot.revision);
-                atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
-            }
             renderer.render(UiLine::Error(
                 crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
                     error: &format!("{}", e),
@@ -10783,6 +10953,9 @@ pub(crate) fn save_and_reload(
     }
 }
 
+/// Switch only this `CodingRuntime`. The shared `config.toml` default remains a
+/// startup default for other processes; the explicit provider-management action
+/// below is the only interactive path that changes it.
 pub(crate) fn select_provider_and_reload(
     ctx: &mut LoopCtx,
     provider_name: &str,
@@ -10799,40 +10972,60 @@ pub(crate) fn select_provider_and_reload(
         return false;
     };
     let selected_model = selected.model.clone();
-    let selected_ephemeral = selected.ephemeral;
-
-    if selected_ephemeral {
-        let mut desired = ctx.config.clone();
-        desired.default_provider = provider_name.to_string();
-        let origin_generation = ctx.runtime.current_generation();
-        atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
-        if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
-            atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
-            renderer.render(UiLine::Error(format!(
-                "provider reload could not be started: {error}"
-            )));
-            renderer.flush();
-            return false;
-        }
-        ctx.pending_provider_reload = Some(PendingProviderReload {
-            origin_generation,
-            desired_config: desired,
-            persisted_revision: None,
-            rollback_persisted_config: None,
-            rollback_runtime_config: None,
-            previous_model_name: None,
-            announce: Some(
-                crate::i18n::t(crate::i18n::Msg::ModelSwitched {
-                    provider: provider_name,
-                    model: &selected_model,
-                })
-                .into_owned(),
-            ),
-            manual_reload_announce: false,
-        });
-        return true;
+    let mut desired = ctx.config.clone();
+    desired.default_provider = provider_name.to_string();
+    let origin_generation = ctx.runtime.current_generation();
+    atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+    if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+        atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        renderer.render(UiLine::Error(format!(
+            "provider reload could not be started: {error}"
+        )));
+        renderer.flush();
+        return false;
     }
 
+    ctx.pending_provider_reload = Some(PendingProviderReload {
+        origin_generation,
+        desired_config: desired,
+        persisted_revision: None,
+        rollback_persisted_config: None,
+        rollback_runtime_config: None,
+        previous_model_name: None,
+        announce: Some(
+            crate::i18n::t(crate::i18n::Msg::ModelSwitched {
+                provider: provider_name,
+                model: &selected_model,
+            })
+            .into_owned(),
+        ),
+        manual_reload_announce: false,
+        selection_mode_after_success: Some(crate::ProviderSelectionMode::Pinned),
+    });
+    true
+}
+
+/// Persist an explicit provider-management "set default" action and reload this
+/// runtime transactionally. This is intentionally separate from `/model`.
+pub(crate) fn set_default_provider_and_reload(
+    ctx: &mut LoopCtx,
+    provider_name: &str,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    if provider_transition_pending(ctx) {
+        return false;
+    }
+    let Some(selected) = ctx.config.providers.get(provider_name) else {
+        renderer.render(UiLine::Error(format!(
+            "provider {provider_name:?} is no longer available"
+        )));
+        renderer.flush();
+        return false;
+    };
+    if selected.ephemeral {
+        return select_provider_and_reload(ctx, provider_name, renderer);
+    }
+    let selected_model = selected.model.clone();
     let store = ctx.config_store.clone();
     let mut previous_persisted = None;
     let commit = match store.update(|config| {
@@ -10879,6 +11072,7 @@ pub(crate) fn select_provider_and_reload(
                 previous_model_name: Some(ctx.model_name.clone()),
                 announce: None,
                 manual_reload_announce: false,
+                selection_mode_after_success: None,
             },
         );
         let suffix = rollback
@@ -10908,6 +11102,7 @@ pub(crate) fn select_provider_and_reload(
             .into_owned(),
         ),
         manual_reload_announce: false,
+        selection_mode_after_success: Some(crate::ProviderSelectionMode::FollowGlobalDefault),
     });
     true
 }
@@ -13612,7 +13807,6 @@ fn apply_provider_projection(
     atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
     state.on_model_window_changed(ctx.config.default_context_window());
     sync_reasoning_effort_from_provider(ctx);
-    atomcode_daemon::live_set_provider(provider.clone());
     if let Ok(mut warning) = ctx.monitor_warning.lock() {
         *warning = None;
     }
@@ -13651,59 +13845,89 @@ fn discard_pending_provider_reload(ctx: &mut LoopCtx, renderer: &mut dyn Rendere
     }
 }
 
-fn sync_committed_provider_projection(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderProjectionResult {
+    Applied,
+    Current,
+    Deferred,
+}
+
+fn finish_provider_projection_attempt(
+    pending: &mut Option<ProviderProjectionObservation>,
+    observation: &ProviderProjectionObservation,
+    result: ProviderProjectionResult,
+) {
+    if result != ProviderProjectionResult::Deferred && pending.as_ref() == Some(observation) {
+        *pending = None;
+    }
+}
+
+fn stage_provider_projection(
+    ctx: &mut LoopCtx,
+    generation: atomcode_coding::RuntimeGeneration,
+    provider: String,
+    model: Option<String>,
+) {
+    if ctx
+        .pending_provider_projection
+        .as_ref()
+        .is_some_and(|current| {
+            current.generation == generation
+                && current.provider == provider
+                && model.is_none()
+                && current.model.is_some()
+        })
+    {
+        return;
+    }
+    ctx.pending_provider_projection = Some(ProviderProjectionObservation {
+        generation,
+        provider,
+        model,
+    });
+}
+
+fn sync_provider_projection(
     ctx: &mut LoopCtx,
     state: &mut UiState,
     renderer: &mut dyn Renderer,
-    provider: String,
-    runtime_model: Option<String>,
-) -> bool {
-    let expected_model = runtime_model.as_deref();
-    let current_ephemeral_model = ctx
-        .config
-        .providers
-        .get(&provider)
-        .filter(|configured| {
-            ctx.config.default_provider == provider
-                && configured.ephemeral
-                && expected_model.is_none_or(|expected| expected == configured.model)
-        })
-        .map(|configured| configured.model.clone());
-    if let Some(configured_model) = current_ephemeral_model {
-        let model = runtime_model.unwrap_or(configured_model);
-        if provider_projection_is_current(
-            &ctx.config.default_provider,
-            &ctx.model_name,
-            ctx.observed_config_revision.as_ref(),
-            &provider,
-            &model,
-            None,
-        ) {
-            return false;
+    observation: &ProviderProjectionObservation,
+) -> ProviderProjectionResult {
+    let snapshot = match ctx.config_store.read() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            crate::tuix_trace!(
+                "CONFIG",
+                "provider projection could not read ConfigStore: {error:#}"
+            );
+            return ProviderProjectionResult::Deferred;
         }
-        apply_provider_projection(ctx, state, renderer, provider, model);
-        return true;
-    }
-
-    // ProviderChanged has two delivery paths without a reliable ordering
-    // contract. Outside an explicitly active ephemeral provider, accept it only
-    // when the exact ConfigStore snapshot still names that provider as default.
-    // Merely finding the provider in the map is insufficient: a late event for
-    // A must never overwrite a newer committed default B.
-    let Ok(snapshot) = ctx.config_store.read() else {
-        return false;
     };
-    if !config_commits_provider(&snapshot.config, &provider) {
-        return false;
-    }
+    sync_provider_projection_from_snapshot(ctx, state, renderer, observation, snapshot)
+}
+
+fn sync_provider_projection_from_snapshot(
+    ctx: &mut LoopCtx,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    observation: &ProviderProjectionObservation,
+    snapshot: ConfigSnapshot,
+) -> ProviderProjectionResult {
+    let provider = &observation.provider;
+    let runtime_model = observation.model.as_deref();
+    let follows_persisted_default = config_commits_provider(&snapshot.config, provider);
     let revision = snapshot.revision;
     let desired = desired_config_from_snapshot(ctx, snapshot.config);
     let Some((config, configured_model)) =
-        select_committed_provider(desired, &provider, expected_model)
+        select_committed_provider(desired, provider, runtime_model)
     else {
-        return false;
+        crate::tuix_trace!(
+            "CONFIG",
+            "provider projection rejected unknown provider/model provider={provider:?} model={runtime_model:?}"
+        );
+        return ProviderProjectionResult::Deferred;
     };
-    let model = runtime_model.unwrap_or(configured_model);
+    let model = runtime_model.unwrap_or(&configured_model).to_string();
     if provider_projection_is_current(
         &ctx.config.default_provider,
         &ctx.model_name,
@@ -13712,13 +13936,50 @@ fn sync_committed_provider_projection(
         &model,
         Some(&revision),
     ) {
-        return false;
+        return ProviderProjectionResult::Current;
     }
     ctx.config = config;
     ctx.observed_config_revision = Some(revision);
     ctx.observed_auth = None;
-    apply_provider_projection(ctx, state, renderer, provider, model);
-    true
+    if !follows_persisted_default {
+        ctx.provider_selection_mode = crate::ProviderSelectionMode::Pinned;
+    }
+    apply_provider_projection(ctx, state, renderer, provider.clone(), model);
+    ProviderProjectionResult::Applied
+}
+
+fn retry_pending_provider_projection(
+    ctx: &mut LoopCtx,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    let current_generation = ctx.runtime.current_generation();
+    if current_generation.is_none() {
+        return false;
+    }
+    let Some(observation) =
+        current_provider_projection(ctx.pending_provider_projection.as_ref(), current_generation)
+    else {
+        if ctx.pending_provider_projection.is_some() {
+            crate::tuix_trace!(
+                "CONFIG",
+                "discarded stale provider projection generation={:?} current={:?}",
+                ctx.pending_provider_projection
+                    .as_ref()
+                    .map(|observation| observation.generation.0),
+                current_generation.map(|generation| generation.0),
+            );
+            ctx.pending_provider_projection = None;
+        }
+        return false;
+    };
+    let result = sync_provider_projection(ctx, state, renderer, &observation);
+    finish_provider_projection_attempt(&mut ctx.pending_provider_projection, &observation, result);
+    match result {
+        ProviderProjectionResult::Applied => true,
+        ProviderProjectionResult::Current => false,
+        ProviderProjectionResult::Deferred => false,
+    }
 }
 
 fn drain_foreground_replay_events(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
@@ -13764,6 +14025,20 @@ fn handle_runtime_event(
                     envelope.generation,
                     current_generation.map(|generation| generation.0),
                 );
+                return;
+            }
+            if let CodingRuntimeEvent::ProviderChanged { provider, model } = &envelope.event {
+                stage_provider_projection(
+                    ctx,
+                    atomcode_coding::RuntimeGeneration(envelope.generation),
+                    provider.clone(),
+                    Some(model.clone()),
+                );
+                if ctx.pending_provider_reload.is_none()
+                    && retry_pending_provider_projection(ctx, state, renderer)
+                {
+                    renderer.flush();
+                }
                 return;
             }
             handle_runtime_event(
@@ -14294,17 +14569,14 @@ fn handle_runtime_event(
                 CodingRuntimeEvent::ProviderChanged { provider, model } => {
                     // Ready and deferred runtimes forward ProviderChanged and the
                     // awaitable reload terminal through different tasks, so their
-                    // arrival order is not a commit contract. A staged TUI reload
-                    // is committed only by ProviderReloadFinished(Ok); this event
-                    // is then merely an observation of the same transition.
-                    if ctx.pending_provider_reload.is_none() {
-                        if sync_committed_provider_projection(
-                            ctx,
-                            state,
-                            renderer,
-                            provider,
-                            Some(model),
-                        ) {
+                    // arrival order is not a commit contract. Sequenced observations
+                    // that arrive during a staged reload are retained above; reaching
+                    // this branch means no local transition still owns the projection.
+                    if let Some(generation) = ctx.runtime.current_generation() {
+                        stage_provider_projection(ctx, generation, provider, Some(model));
+                        if ctx.pending_provider_reload.is_none()
+                            && retry_pending_provider_projection(ctx, state, renderer)
+                        {
                             renderer.flush();
                         }
                     }
@@ -14312,6 +14584,7 @@ fn handle_runtime_event(
                 }
                 CodingRuntimeEvent::ProviderReloadFinished(Err(error)) => {
                     let mut message = format!("provider reload failed: {error}");
+                    let mut retry_provider_projection = false;
                     if let Some(pending) = ctx.pending_provider_reload.take() {
                         let current_generation = ctx.runtime.current_generation();
                         if provider_reload_failure_was_superseded(
@@ -14322,12 +14595,26 @@ fn handle_runtime_event(
                             // since enqueue, this terminal can be the losing
                             // side of a concurrent live/config-watcher race.
                             // Do not roll back or seal the same disk revision as
-                            // failed; reconcile the actual runtime owner again.
+                            // failed; project the authoritative winning event.
                             ctx.observed_config_revision = None;
+                            retry_provider_projection = current_provider_projection(
+                                ctx.pending_provider_projection.as_ref(),
+                                current_generation,
+                            )
+                            .is_some();
                             message.push_str(
-                                "; a newer runtime generation won the transition; reconciling current configuration",
+                                "; a newer runtime generation won the transition; following the runtime owner",
                             );
                         } else {
+                            if ctx
+                                .pending_provider_projection
+                                .as_ref()
+                                .is_some_and(|observation| {
+                                    Some(observation.generation) == pending.origin_generation
+                                })
+                            {
+                                ctx.pending_provider_projection = None;
+                            }
                             let rollback = rollback_pending_provider_reload(ctx, pending);
                             if rollback.persisted_superseded {
                                 // A newer disk commit won the CAS/read race.
@@ -14341,6 +14628,9 @@ fn handle_runtime_event(
                                 ));
                             }
                         }
+                    }
+                    if retry_provider_projection {
+                        retry_pending_provider_projection(ctx, state, renderer);
                     }
                     atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
                     renderer.render(UiLine::Error(message));
@@ -14358,7 +14648,16 @@ fn handle_runtime_event(
                             generation.0,
                             current_generation.map(|generation| generation.0),
                         );
+                        let retry_provider_projection = current_provider_projection(
+                            ctx.pending_provider_projection.as_ref(),
+                            current_generation,
+                        )
+                        .is_some();
                         discard_pending_provider_reload(ctx, renderer, &reason);
+                        if retry_provider_projection {
+                            retry_pending_provider_projection(ctx, state, renderer);
+                            renderer.flush();
+                        }
                         crate::tuix_trace!(
                             "CONFIG",
                             "ignored unmatched provider reload terminal generation={} current={:?}",
@@ -14393,10 +14692,14 @@ fn handle_runtime_event(
                         desired_config,
                         announce,
                         manual_reload_announce,
+                        selection_mode_after_success,
                         ..
                     } = pending;
                     let (provider, model) = resolved_provider_and_model(&desired_config);
                     ctx.config = desired_config;
+                    if let Some(mode) = selection_mode_after_success {
+                        ctx.provider_selection_mode = mode;
+                    }
                     apply_provider_projection(
                         ctx,
                         state,
@@ -14404,6 +14707,20 @@ fn handle_runtime_event(
                         provider.clone(),
                         model.clone(),
                     );
+                    if ctx
+                        .pending_provider_projection
+                        .as_ref()
+                        .is_some_and(|observation| {
+                            observation.generation == generation
+                                && observation.provider == provider
+                                && observation
+                                    .model
+                                    .as_deref()
+                                    .is_none_or(|value| value == model)
+                        })
+                    {
+                        ctx.pending_provider_projection = None;
+                    }
                     if !can_announce {
                         ctx.observed_config_revision = None;
                         let error = persisted_verification_error.unwrap_or_else(|| {
@@ -16803,14 +17120,17 @@ fn handle_agent_event(
         }
         AgentEvent::ProviderChanged(provider) => {
             // Live-sync: another view (webui dropdown) switched the model —
-            // mirror the already-committed runtime + ConfigStore state into the
-            // TUI. `/live/provider` performs the native reassembly before this
-            // event is published; sending another reload here would create an
-            // untracked second transition and break TUI single-flight ordering.
-            if ctx.pending_provider_reload.is_none()
-                && sync_committed_provider_projection(ctx, state, renderer, provider, None)
-            {
-                renderer.flush();
+            // mirror the already-committed runtime state into the TUI without
+            // persisting it as the shared default. Sending another reload here
+            // would create an untracked second transition and break single-flight
+            // ordering.
+            if let Some(generation) = ctx.runtime.current_generation() {
+                stage_provider_projection(ctx, generation, provider, None);
+                if ctx.pending_provider_reload.is_none()
+                    && retry_pending_provider_projection(ctx, state, renderer)
+                {
+                    renderer.flush();
+                }
             }
         }
         AgentEvent::ModeChanged { plan, bypass } => {

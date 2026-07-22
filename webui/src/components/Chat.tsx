@@ -1343,7 +1343,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }
     const previous = provider;
     setProvider(name);
-    void postLiveProvider(name).catch((error) => {
+    void postLiveProvider(name, sessionId).catch((error) => {
       setProvider(previous);
       setHistoryHint(t('chat.connError', { msg: String(error) }));
     });

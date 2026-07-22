@@ -32,6 +32,8 @@ fn headless() -> &'static Mutex<Option<HeadlessRuntime>> {
 pub fn register_embedded_runtime(
     session_id: String,
     working_dir: PathBuf,
+    provider: String,
+    provider_fingerprint: String,
     snapshot: SessionSnapshot,
     control: Arc<dyn LiveRuntimeControl>,
 ) -> Result<LiveBinding, HubError> {
@@ -41,7 +43,14 @@ pub fn register_embedded_runtime(
     if headless_owner.is_some() {
         return Err(HubError::RuntimeUnavailable);
     }
-    let binding = hub().bind(session_id, working_dir, snapshot, control)?;
+    let binding = hub().bind_with_provider(
+        session_id,
+        working_dir,
+        provider,
+        provider_fingerprint,
+        snapshot,
+        control,
+    )?;
     *EMBEDDED_BINDING
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some(binding.clone());
@@ -106,6 +115,10 @@ pub fn join() -> Result<LiveJoin, HubError> {
     hub().join()
 }
 
+pub fn join_for_provider(expected_session_id: Option<&str>) -> Result<LiveJoin, HubError> {
+    hub().join_for_provider(expected_session_id)
+}
+
 pub fn binding() -> Result<LiveBinding, HubError> {
     hub().binding()
 }
@@ -166,9 +179,33 @@ pub async fn set_mode(mode: RuntimeMode) -> Result<(), HubError> {
 }
 
 pub async fn reload_provider(
+    expected: &LiveBinding,
     next: atomcode_coding::CodingAgentConfig,
+    provider_fingerprint: String,
 ) -> Result<atomcode_coding::RuntimeGeneration, HubError> {
-    hub().reload_provider(next).await
+    hub()
+        .reload_provider(expected, next, provider_fingerprint)
+        .await
+}
+
+pub fn provider_fingerprint(
+    config: &atomcode_config::config::Config,
+    provider_name: &str,
+) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+
+    if !config.providers.contains_key(provider_name) {
+        return Err(format!("provider {provider_name:?} not found"));
+    }
+    let mut normalized = config.clone();
+    normalized.default_provider = provider_name.to_string();
+    // Serialize through Value so map keys are canonicalized before hashing;
+    // Config contains HashMaps whose iteration order differs across processes.
+    let canonical = serde_json::to_value(&normalized)
+        .map_err(|error| format!("serialize provider configuration failed: {error}"))?;
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|error| format!("serialize provider configuration failed: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 pub async fn resume_session(
@@ -313,6 +350,7 @@ pub async fn ensure_headless_runtime(
     if !config.providers.contains_key(&provider_name) {
         return Err(format!("provider {provider_name:?} not found"));
     }
+    let provider_fingerprint = provider_fingerprint(&config, &provider_name)?;
     let runtime_config: CodingRuntimeConfig =
         crate::live_api::chat_runtime_config(&config, &provider_name, &working_dir, telemetry);
     let (session_mode, initial_snapshot) = match requested_session_id {
@@ -349,9 +387,11 @@ pub async fn ensure_headless_runtime(
         .map(|session| session.id)
         .ok_or_else(|| "live runtime started without a persistent session".to_string())?;
     let binding = hub()
-        .bind(
+        .bind_with_provider(
             session_id.clone(),
             working_dir.clone(),
+            provider_name,
+            provider_fingerprint,
             initial_snapshot,
             Arc::new(handle.clone()),
         )

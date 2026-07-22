@@ -1394,6 +1394,7 @@ mod tests {
                 StreamEvent::ToolCallDelta { .. } => "tooldelta",
                 StreamEvent::Usage(_) => "usage",
                 StreamEvent::ResponseId(_) => "response_id",
+                StreamEvent::ResponseModel(_) => "response_model",
                 StreamEvent::Done { .. } => "done",
                 StreamEvent::Error(_) => "error",
                 StreamEvent::Malformed => "malformed",

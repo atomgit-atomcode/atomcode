@@ -234,17 +234,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── Provider wizard ──
         Msg::ProviderWizardHeader =>
-            "  Provider management — Add / Edit / Delete / Set default. Esc to cancel.\n".into(),
+            "  Manage providers: add, edit, delete, or set the global default. Press Esc to cancel.\n".into(),
         Msg::ProviderWizardCancelled =>
             "(cancelled)".into(),
-        Msg::ProviderMenuAdd => "add".into(),
-        Msg::ProviderMenuAddDesc => "Add a new provider".into(),
-        Msg::ProviderMenuEdit => "edit".into(),
-        Msg::ProviderMenuEditDesc => "Edit an existing provider".into(),
-        Msg::ProviderMenuDelete => "delete".into(),
-        Msg::ProviderMenuDeleteDesc => "Remove a provider".into(),
-        Msg::ProviderMenuSetDefault => "set-default".into(),
-        Msg::ProviderMenuSetDefaultDesc => "Switch the default provider".into(),
+        Msg::ProviderMenuAdd => "Add".into(),
+        Msg::ProviderMenuAddDesc => "Create a provider configuration".into(),
+        Msg::ProviderMenuEdit => "Edit".into(),
+        Msg::ProviderMenuEditDesc => "Modify an existing provider configuration".into(),
+        Msg::ProviderMenuDelete => "Delete".into(),
+        Msg::ProviderMenuDeleteDesc => "Delete an existing provider configuration".into(),
+        Msg::ProviderMenuSetDefault => "Set global default".into(),
+        Msg::ProviderMenuSetDefaultDesc =>
+            "Set the default provider and switch this session".into(),
         Msg::ProviderImportPrompt =>
             "Paste a template to auto-detect (curl / JSON / TOML), or Enter to fill manually:".into(),
         Msg::ProviderImportParsed { base_url, type_name, model } =>
@@ -256,7 +257,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDeleteConfirm { name } =>
             format!("Delete \"{name}\"? [y/N]").into(),
         Msg::ProviderDeleted { name } =>
-            format!("Removed \"{name}\".").into(),
+            format!("Deleted \"{name}\".").into(),
         Msg::ProviderDeleteKept => "(kept)".into(),
         Msg::ProviderDefaultSet { name } =>
             format!("Default set to {name}.").into(),
@@ -877,8 +878,9 @@ Msg::CmdDescSetup =>
         Msg::CmdDescLogin => "Sign in with AtomGit OAuth and claim CodingPlan models".into(),
         Msg::CmdDescLogout => "Sign out of AtomGit".into(),
         Msg::CmdDescWhoami => "Show current logged-in user".into(),
-        Msg::CmdDescModel => "Switch provider / model".into(),
-        Msg::CmdDescProvider => "Manage providers (add / edit / delete)".into(),
+        Msg::CmdDescModel => "Switch this session's provider / model".into(),
+        Msg::CmdDescProvider =>
+            "Manage providers (add / edit / delete / set global default)".into(),
         Msg::CmdDescStatus => "Show session status".into(),
         Msg::CmdDescConfig => "Show config path".into(),
         Msg::CmdDescReload => "Reload $ATOMCODE_HOME/config.toml from disk".into(),

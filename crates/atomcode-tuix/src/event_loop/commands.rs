@@ -285,6 +285,8 @@ mod bg_live_guard_tests {
             generation: 3,
             session_id: "session".into(),
             working_dir: PathBuf::from("/project"),
+            provider: "provider".into(),
+            provider_fingerprint: "fingerprint".into(),
         };
         let mut binding = Some(original.clone());
 
@@ -445,16 +447,21 @@ pub(crate) fn attach_live_runtime(
     let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
         &ctx.current_session.to_conversation_snapshot(),
     );
+    let provider_fingerprint = atomcode_daemon::native_live::provider_fingerprint(
+        &ctx.config,
+        &ctx.config.default_provider,
+    )?;
     let binding = atomcode_daemon::native_live::register_embedded_runtime(
         ctx.current_session.id.to_string(),
         ctx.working_dir.clone(),
+        ctx.config.default_provider.clone(),
+        provider_fingerprint,
         snapshot,
         std::sync::Arc::new(ctx.runtime.clone()),
     )
     .map_err(|error| format!("共享当前 runtime 失败：{error:?}"))?;
-    // The runtime binding owns execution, while these process-level values seed the
-    // first live snapshot before any ProviderChanged/ModeChanged event exists.
-    atomcode_daemon::live_set_provider(ctx.config.default_provider.clone());
+    // The runtime binding owns execution; the process-level mode seeds the first
+    // live snapshot before any ModeChanged event exists.
     atomcode_daemon::live_set_mode(mode);
     ctx.live_binding = Some(binding);
     let mut remote_commands = atomcode_daemon::native_live::register_remote_command_sink();
@@ -2985,7 +2992,7 @@ fn execute_slash_command_impl(
         "think" => {
             let sub = arg.trim().to_ascii_lowercase();
             let provider_name = ctx.config.default_provider.clone();
-            let provider = ctx.config.providers.get_mut(&provider_name);
+            let provider = ctx.config.providers.get(&provider_name);
             match provider {
                 None => {
                     renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
@@ -3007,25 +3014,50 @@ fn execute_slash_command_impl(
                         ));
                         renderer.flush();
                     } else if sub == "on" {
-                        p.thinking_enabled = Some(true);
                         let budget = p.thinking_budget.unwrap_or(10_000);
+                        let mut desired = ctx.config.clone();
+                        desired
+                            .providers
+                            .get_mut(&provider_name)
+                            .unwrap()
+                            .thinking_enabled = Some(true);
                         save_and_reload(
                             ctx,
+                            desired,
                             renderer,
                             t(Msg::ThinkEnabled { budget }).into_owned(),
+                            false,
                         );
                     } else if sub == "off" {
-                        p.thinking_enabled = Some(false);
-                        save_and_reload(ctx, renderer, t(Msg::ThinkDisabled).into_owned());
+                        let mut desired = ctx.config.clone();
+                        desired
+                            .providers
+                            .get_mut(&provider_name)
+                            .unwrap()
+                            .thinking_enabled = Some(false);
+                        save_and_reload(
+                            ctx,
+                            desired,
+                            renderer,
+                            t(Msg::ThinkDisabled).into_owned(),
+                            false,
+                        );
                     } else if let Some(rest) = sub.strip_prefix("budget") {
                         let num_str = rest.trim();
                         match num_str.parse::<u32>() {
                             Ok(n) if n >= 1024 => {
-                                p.thinking_budget = Some(n);
+                                let mut desired = ctx.config.clone();
+                                desired
+                                    .providers
+                                    .get_mut(&provider_name)
+                                    .unwrap()
+                                    .thinking_budget = Some(n);
                                 save_and_reload(
                                     ctx,
+                                    desired,
                                     renderer,
                                     t(Msg::ThinkBudgetSet { n }).into_owned(),
+                                    false,
                                 );
                             }
                             Ok(n) => {
@@ -3059,7 +3091,7 @@ fn execute_slash_command_impl(
                 renderer.flush();
                 return Ok(());
             }
-            let provider = ctx.config.providers.get_mut(&provider_name);
+            let provider = ctx.config.providers.get(&provider_name);
             match provider {
                 None => {
                     renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
@@ -3074,20 +3106,32 @@ fn execute_slash_command_impl(
                         )));
                         renderer.flush();
                     } else if sub == "high" || sub == "max" {
-                        p.reasoning_effort = Some(sub.to_string());
-                        ctx.reasoning_effort = Some(sub.to_string());
+                        let mut desired = ctx.config.clone();
+                        desired
+                            .providers
+                            .get_mut(&provider_name)
+                            .unwrap()
+                            .reasoning_effort = Some(sub.to_string());
                         crate::event_loop::save_and_reload(
                             ctx,
+                            desired,
                             renderer,
                             format!("  ○ Reasoning effort set to: {sub}\n"),
+                            false,
                         );
                     } else if sub == "off" {
-                        p.reasoning_effort = None;
-                        ctx.reasoning_effort = None;
+                        let mut desired = ctx.config.clone();
+                        desired
+                            .providers
+                            .get_mut(&provider_name)
+                            .unwrap()
+                            .reasoning_effort = None;
                         crate::event_loop::save_and_reload(
                             ctx,
+                            desired,
                             renderer,
                             "  ○ Reasoning effort: default (API auto)\n".to_string(),
+                            false,
                         );
                     } else {
                         renderer.render(UiLine::CommandOutput(

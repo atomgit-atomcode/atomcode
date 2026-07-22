@@ -38,6 +38,8 @@ pub struct LiveBinding {
     pub generation: u64,
     pub session_id: String,
     pub working_dir: PathBuf,
+    pub provider: String,
+    pub provider_fingerprint: String,
 }
 
 #[derive(Clone, Debug)]
@@ -114,10 +116,30 @@ impl LiveViewHub {
         }
     }
 
+    #[cfg(test)]
     pub fn bind(
         &self,
         session_id: impl Into<String>,
         working_dir: PathBuf,
+        snapshot: SessionSnapshot,
+        control: Arc<dyn LiveRuntimeControl>,
+    ) -> Result<LiveBinding, HubError> {
+        self.bind_with_provider(
+            session_id,
+            working_dir,
+            String::new(),
+            String::new(),
+            snapshot,
+            control,
+        )
+    }
+
+    pub fn bind_with_provider(
+        &self,
+        session_id: impl Into<String>,
+        working_dir: PathBuf,
+        provider: impl Into<String>,
+        provider_fingerprint: impl Into<String>,
         snapshot: SessionSnapshot,
         control: Arc<dyn LiveRuntimeControl>,
     ) -> Result<LiveBinding, HubError> {
@@ -141,6 +163,8 @@ impl LiveViewHub {
             generation: status.generation,
             session_id: session_id.into(),
             working_dir,
+            provider: provider.into(),
+            provider_fingerprint: provider_fingerprint.into(),
         };
         state.binding = Some(BoundRuntime {
             identity: identity.clone(),
@@ -156,6 +180,13 @@ impl LiveViewHub {
     }
 
     pub fn join(&self) -> Result<LiveJoin, HubError> {
+        self.join_for_provider(None)
+    }
+
+    pub fn join_for_provider(
+        &self,
+        expected_session_id: Option<&str>,
+    ) -> Result<LiveJoin, HubError> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let binding = state
             .binding
@@ -163,6 +194,9 @@ impl LiveViewHub {
             .ok_or(HubError::Unbound)?
             .identity
             .clone();
+        if expected_session_id.is_some_and(|expected| expected != binding.session_id) {
+            return Err(HubError::StaleBinding);
+        }
         if let Some(error) = &state.snapshot_error {
             return Err(HubError::SnapshotUnavailable(error.clone()));
         }
@@ -342,14 +376,21 @@ impl LiveViewHub {
 
     pub async fn reload_provider(
         &self,
+        expected: &LiveBinding,
         next: atomcode_coding::CodingAgentConfig,
+        provider_fingerprint: String,
     ) -> Result<atomcode_coding::RuntimeGeneration, HubError> {
-        let (binding, handle) = self.bound_handle()?;
+        let handle = self.bound_handle_for(expected)?;
+        let provider = next.provider_name.clone();
         let generation = handle
             .reassemble_provider(next)
             .await
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
-        self.commit_reconfigure_generation(&binding, generation)?;
+        self.commit_reconfigure_generation(
+            expected,
+            generation,
+            Some((provider, provider_fingerprint)),
+        )?;
         Ok(generation)
     }
 
@@ -591,6 +632,13 @@ impl LiveViewHub {
                 let current = state.binding.as_mut().expect("binding checked above");
                 current.identity.working_dir = working_dir.clone();
             }
+            CodingRuntimeEvent::ProviderChanged { provider, .. } => {
+                let current = state.binding.as_mut().expect("binding checked above");
+                if current.identity.provider != *provider {
+                    current.identity.provider_fingerprint.clear();
+                }
+                current.identity.provider = provider.clone();
+            }
             _ => {}
         }
         self.publish_view_locked(&mut state, LiveViewEvent::Runtime(event), replay);
@@ -654,14 +702,38 @@ impl LiveViewHub {
         Ok((binding.identity.clone(), handle))
     }
 
+    fn bound_handle_for(&self, expected: &LiveBinding) -> Result<CodingRuntimeHandle, HubError> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let binding = state.binding.as_ref().ok_or(HubError::Unbound)?;
+        if binding.identity.id != expected.id
+            || binding.identity.generation != expected.generation
+            || binding.identity.session_id != expected.session_id
+            || binding.identity.working_dir != expected.working_dir
+        {
+            return Err(HubError::StaleBinding);
+        }
+        let status = binding.control.status();
+        if status.generation != binding.identity.generation {
+            return Err(HubError::RuntimeGenerationChanged {
+                expected: binding.identity.generation,
+                actual: status.generation,
+            });
+        }
+        binding.control.handle().ok_or(HubError::RuntimeUnavailable)
+    }
+
     fn commit_reconfigure_generation(
         &self,
         binding: &LiveBinding,
         generation: atomcode_coding::RuntimeGeneration,
+        provider: Option<(String, String)>,
     ) -> Result<(), HubError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let current = state.binding.as_mut().ok_or(HubError::Unbound)?;
-        if current.identity.id != binding.id {
+        if current.identity.id != binding.id
+            || current.identity.session_id != binding.session_id
+            || current.identity.working_dir != binding.working_dir
+        {
             return Err(HubError::StaleBinding);
         }
         let actual = current.control.status().generation;
@@ -676,6 +748,10 @@ impl LiveViewHub {
                 expected: generation.0,
                 actual: current.identity.generation,
             });
+        }
+        if let Some((provider, fingerprint)) = provider {
+            current.identity.provider = provider;
+            current.identity.provider_fingerprint = fingerprint;
         }
         if current.identity.generation < generation.0 {
             current.identity.generation = generation.0;
@@ -1213,6 +1289,28 @@ mod tests {
     }
 
     #[test]
+    fn provider_join_rejects_a_stale_session_atomically() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        hub.bind(
+            "session-1",
+            PathBuf::from("/one"),
+            snapshot("committed"),
+            control,
+        )
+        .unwrap();
+
+        assert_eq!(
+            match hub.join_for_provider(Some("session-2")) {
+                Ok(_) => panic!("a provider request must not switch sessions"),
+                Err(error) => error,
+            },
+            HubError::StaleBinding,
+        );
+        assert_eq!(hub.binding().unwrap().session_id, "session-1");
+    }
+
+    #[test]
     fn reconfigure_event_for_same_session_keeps_committed_snapshot_available() {
         let hub = LiveViewHub::new();
         let (control, _) = control();
@@ -1263,10 +1361,46 @@ mod tests {
             phase: RuntimePhase::Ready,
         };
 
-        hub.commit_reconfigure_generation(&binding, atomcode_coding::RuntimeGeneration(2))
+        hub.commit_reconfigure_generation(&binding, atomcode_coding::RuntimeGeneration(2), None)
             .unwrap();
 
         assert_eq!(hub.join().unwrap().binding.generation, 2);
+    }
+
+    #[test]
+    fn provider_commit_rejects_a_binding_whose_session_changed() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind(
+                "session-1",
+                PathBuf::from("/one"),
+                snapshot("committed"),
+                control.clone(),
+            )
+            .unwrap();
+        *control.status.lock().unwrap() = RuntimeStatus {
+            generation: 2,
+            phase: RuntimePhase::Ready,
+        };
+        hub.replace_snapshot(
+            &binding,
+            "session-2".into(),
+            PathBuf::from("/two"),
+            snapshot("new"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            hub.commit_reconfigure_generation(
+                &binding,
+                atomcode_coding::RuntimeGeneration(2),
+                Some(("provider-b".into(), "fingerprint-b".into())),
+            )
+            .unwrap_err(),
+            HubError::StaleBinding,
+        );
+        assert_ne!(hub.binding().unwrap().provider, "provider-b");
     }
 
     #[test]
@@ -1298,7 +1432,7 @@ mod tests {
         )
         .unwrap();
 
-        hub.commit_reconfigure_generation(&binding, atomcode_coding::RuntimeGeneration(2))
+        hub.commit_reconfigure_generation(&binding, atomcode_coding::RuntimeGeneration(2), None)
             .unwrap();
 
         let error = hub
@@ -1315,6 +1449,39 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error, HubError::StaleEvent);
+    }
+
+    #[test]
+    fn provider_event_updates_the_bound_runtime_projection() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind_with_provider(
+                "session-1",
+                PathBuf::from("/one"),
+                "provider-a",
+                "fingerprint-a",
+                snapshot("committed"),
+                control,
+            )
+            .unwrap();
+
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::ProviderChanged {
+                    provider: "provider-b".into(),
+                    model: "model-b".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        let projected = hub.binding().unwrap();
+        assert_eq!(projected.provider, "provider-b");
+        assert!(projected.provider_fingerprint.is_empty());
     }
 
     #[test]

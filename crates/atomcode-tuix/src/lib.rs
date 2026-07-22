@@ -67,7 +67,8 @@ use crate::terminal::TerminalCaps;
 pub enum ProviderSelectionMode {
     /// Follow changes to the shared default provider in `config.toml`.
     FollowGlobalDefault,
-    /// Keep an explicit launch-time `--provider` / `--model` selection.
+    /// Keep this runtime's explicit provider selection. This includes launch-time
+    /// `--provider` / `--model` overrides and successful interactive `/model` switches.
     Pinned,
 }
 
@@ -731,6 +732,7 @@ pub async fn run(
         // earlier, so another process may have committed between those reads.
         observed_config_revision: None,
         pending_provider_reload: None,
+        pending_provider_projection: None,
         // Reconcile authentication against the runtime after startup. Keeping
         // this unobserved closes the race where auth.toml changes while the
         // runtime is still being assembled.

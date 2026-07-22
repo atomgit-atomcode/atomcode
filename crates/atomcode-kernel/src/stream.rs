@@ -136,6 +136,10 @@ pub enum StreamEvent {
     /// `Message.meta.provider_response_id`. Optional — a provider/adapter that surfaces
     /// no id simply never emits this.
     ResponseId(String),
+    /// The model identity reported by the provider in the response payload. This may
+    /// differ from the requested model when a gateway aliases or misroutes requests.
+    /// Optional and observational: adapters that do not report it emit nothing.
+    ResponseModel(String),
     /// Mid-stream failure (429/5xx/timeout/auth/…). Cleanly fails the turn.
     Error(ProviderError),
     /// The adapter received a chunk it could NOT parse (e.g. a non-JSON `data:` line

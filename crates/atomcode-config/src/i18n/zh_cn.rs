@@ -224,17 +224,17 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── Provider 向导 ──
         Msg::ProviderWizardHeader =>
-            "  Provider 管理 — 添加 / 编辑 / 删除 / 设为默认。按 Esc 取消。\n".into(),
+            "  管理 Provider：添加、编辑、删除或设置全局默认。按 Esc 取消。\n".into(),
         Msg::ProviderWizardCancelled =>
             "（已取消）".into(),
         Msg::ProviderMenuAdd => "添加".into(),
-        Msg::ProviderMenuAddDesc => "添加新 Provider".into(),
+        Msg::ProviderMenuAddDesc => "新建 Provider 配置".into(),
         Msg::ProviderMenuEdit => "编辑".into(),
-        Msg::ProviderMenuEditDesc => "编辑已有 Provider".into(),
+        Msg::ProviderMenuEditDesc => "修改已有 Provider 配置".into(),
         Msg::ProviderMenuDelete => "删除".into(),
-        Msg::ProviderMenuDeleteDesc => "移除 Provider".into(),
-        Msg::ProviderMenuSetDefault => "设为默认".into(),
-        Msg::ProviderMenuSetDefaultDesc => "切换默认 Provider".into(),
+        Msg::ProviderMenuDeleteDesc => "删除已有 Provider 配置".into(),
+        Msg::ProviderMenuSetDefault => "设为全局默认".into(),
+        Msg::ProviderMenuSetDefaultDesc => "设置默认 Provider，并切换当前会话".into(),
         Msg::ProviderImportPrompt =>
             "粘贴模板自动识别（curl / JSON / TOML），或直接回车手动填写：".into(),
         Msg::ProviderImportParsed { base_url, type_name, model } =>
@@ -246,7 +246,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDeleteConfirm { name } =>
             format!("删除 \"{name}\"？[y/N]").into(),
         Msg::ProviderDeleted { name } =>
-            format!("已移除 \"{name}\"。").into(),
+            format!("已删除 \"{name}\"。").into(),
         Msg::ProviderDeleteKept => "（已保留）".into(),
         Msg::ProviderDefaultSet { name } =>
             format!("默认已设为 {name}。").into(),
@@ -862,8 +862,8 @@ Msg::CmdDescSetup =>
         Msg::CmdDescLogin => "使用 AtomGit OAuth 登录并领取 CodingPlan 模型".into(),
         Msg::CmdDescLogout => "退出 AtomGit 登录".into(),
         Msg::CmdDescWhoami => "显示当前登录用户".into(),
-        Msg::CmdDescModel => "切换 Provider / 模型".into(),
-        Msg::CmdDescProvider => "管理 Provider（添加 / 编辑 / 删除）".into(),
+        Msg::CmdDescModel => "切换当前会话的 Provider / 模型".into(),
+        Msg::CmdDescProvider => "管理 Provider（添加、编辑、删除、设为全局默认）".into(),
         Msg::CmdDescStatus => "显示会话状态".into(),
         Msg::CmdDescConfig => "显示配置文件路径".into(),
         Msg::CmdDescReload => "从磁盘重新加载 $ATOMCODE_HOME/config.toml".into(),

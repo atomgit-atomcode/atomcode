@@ -1107,6 +1107,12 @@ pub fn assemble(
 
 const ATOMCODE_PERSONA_PREFIX: &str =
     "You are AtomCode, an AI coding agent by AtomGit running the ";
+const MODEL_CHANGE_CONTEXT_PREFIX: &str = "=== MODEL CHANGE ===";
+
+fn persona_model(text: &str) -> Option<&str> {
+    text.strip_prefix(ATOMCODE_PERSONA_PREFIX)
+        .and_then(|rest| rest.split_once(" model.").map(|(model, _)| model))
+}
 
 /// Legacy drivers persist conversation history without the separately supplied
 /// system prompt. A v2 resume must restore that prompt, while a model switch must
@@ -1120,6 +1126,15 @@ fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, model: &str) {
     let is_persona = |message: &Message| {
         message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
     };
+    let is_model_change = |message: &Message| {
+        message.role == Role::System && message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)
+    };
+    let previous_model = snapshot
+        .messages
+        .iter()
+        .find(|message| is_persona(message))
+        .and_then(|message| persona_model(&message.text))
+        .map(str::to_owned);
     let already_current = snapshot
         .messages
         .first()
@@ -1128,13 +1143,26 @@ fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, model: &str) {
             .messages
             .iter()
             .skip(1)
-            .all(|message| !is_persona(message));
+            .all(|message| !is_persona(message))
+        && snapshot
+            .messages
+            .iter()
+            .filter(|message| is_model_change(message))
+            .count()
+            <= 1;
     if already_current {
         return;
     }
 
-    snapshot.messages.retain(|message| !is_persona(message));
+    snapshot
+        .messages
+        .retain(|message| !is_persona(message) && !is_model_change(message));
     snapshot.messages.insert(0, Message::system(persona));
+    if let Some(previous_model) = previous_model.filter(|previous| previous != model) {
+        snapshot.messages.push(Message::system(format!(
+            "{MODEL_CHANGE_CONTEXT_PREFIX}\nThe active model changed from {previous_model} to {model}. From this point onward, {model} is the current model. Treat any earlier assistant claim about its model identity as historical context, not the current runtime identity."
+        )));
+    }
     snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
 }
 
@@ -1356,7 +1384,50 @@ mod tests {
             .text
             .contains("running the deepseek-v4-flash model"));
         assert!(!snapshot.messages[0].text.contains("old-model"));
+        let transitions: Vec<_> = snapshot
+            .messages
+            .iter()
+            .filter(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX))
+            .collect();
+        assert_eq!(transitions.len(), 1);
+        assert!(transitions[0].text.contains("old-model"));
+        assert!(transitions[0].text.contains("deepseek-v4-flash"));
+        assert_eq!(
+            snapshot.messages.last(),
+            transitions.first().copied(),
+            "the model-change boundary must be the most recent system context"
+        );
         assert_eq!(snapshot.cache_epoch, 1);
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn repeated_model_switch_keeps_one_current_transition_boundary() {
+        atomcode_config::config::offline::reset_offline_verdict_for_test();
+        let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        let mut snapshot = SessionSnapshot::new(vec![
+            Message::system(coding_persona(
+                "model-a",
+                crate::persona::todo_switch_enabled(),
+                crate::persona::request_user_input_switch_enabled(),
+            )),
+            Message::user("what model are you?"),
+            Message::assistant("I am model-a", vec![]),
+        ]);
+
+        reconcile_coding_persona(&mut snapshot, "model-b");
+        reconcile_coding_persona(&mut snapshot, "model-c");
+
+        let transitions: Vec<_> = snapshot
+            .messages
+            .iter()
+            .filter(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX))
+            .collect();
+        assert_eq!(transitions.len(), 1);
+        assert!(transitions[0].text.contains("model-b"));
+        assert!(transitions[0].text.contains("model-c"));
+        assert!(!transitions[0].text.contains("model-a"));
+        assert_eq!(snapshot.messages.last(), transitions.first().copied());
     }
 
     #[test]

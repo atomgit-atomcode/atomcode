@@ -570,10 +570,7 @@ async fn open_stream(
                     // OpenAI `error` object. GLM returns top-level `{"code","message"}`.
                     let detail = extract_error_detail(&text);
                     let envelope = serde_json::from_str::<serde_json::Value>(&text).ok();
-                    let provider_code = envelope
-                        .as_ref()
-                        .and_then(|v| v.get("error"))
-                        .and_then(error_code);
+                    let provider_code = envelope.as_ref().and_then(provider_error_code);
                     return Err(ProviderError {
                         retryable: retry::is_retryable_status(code),
                         message: friendly_http_error(code, &detail),
@@ -905,8 +902,8 @@ fn truncate_msg(s: &str) -> String {
 fn extract_error_detail(text: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
         if let Some(detail) = v.get("detail") {
-            if let Some(msg) = detail.get("message").and_then(|m| m.as_str()) {
-                return truncate_msg(msg.trim());
+            if detail.is_object() {
+                return parse_error_obj(detail);
             }
             if let Some(s) = detail.as_str() {
                 return truncate_msg(s.trim());
@@ -920,8 +917,8 @@ fn extract_error_detail(text: &str) -> String {
                 return truncate_msg(s.trim());
             }
         }
-        if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
-            return truncate_msg(msg.trim());
+        if v.get("message").and_then(|m| m.as_str()).is_some() {
+            return parse_error_obj(&v);
         }
     }
     truncate_msg(text)
@@ -956,19 +953,31 @@ fn parse_error_obj(err: &serde_json::Value) -> String {
 
 /// Extract the provider's STRUCTURED error code from an error object: `code` (string or
 /// number) if present, else fall back to `type`. For `ProviderError.code`.
+fn error_code_value(code: &serde_json::Value) -> Option<String> {
+    match code {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 fn error_code(err: &serde_json::Value) -> Option<String> {
-    err.get("code")
-        .and_then(|c| match c {
-            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        })
-        .or_else(|| {
-            err.get("type")
-                .and_then(|t| t.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        })
+    err.get("code").and_then(error_code_value).or_else(|| {
+        err.get("type")
+            .and_then(|t| t.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    })
+}
+
+/// Extract a code from either the standard nested `error` envelope or vendor-style
+/// top-level `{code,message}` responses.
+fn provider_error_code(envelope: &serde_json::Value) -> Option<String> {
+    envelope
+        .get("error")
+        .and_then(error_code)
+        .or_else(|| envelope.get("detail").and_then(error_code))
+        .or_else(|| envelope.get("code").and_then(error_code_value))
 }
 
 /// Concise, human-friendly Chinese headline for common BILLING / AUTH failures,
@@ -989,7 +998,6 @@ fn friendly_http_error(code: u16, detail: &str) -> String {
     let headline = match code {
         401 => "API key 未授权或已失效",
         402 => "账户余额不足",
-        403 => "无访问权限或 API key 无效",
         _ => return format!("HTTP {code}: {detail}"),
     };
     format!("{headline}（HTTP {code}）")
@@ -1014,6 +1022,8 @@ struct SseDecoder {
     done: bool,
     /// True once the provider's response id has been emitted (emit it exactly once).
     response_id_seen: bool,
+    /// True once the provider-reported model has been emitted.
+    response_model_seen: bool,
     seen_finish: bool,
     tool_call_delta_count: usize,
 }
@@ -1027,6 +1037,7 @@ impl SseDecoder {
             truncated: false,
             done: false,
             response_id_seen: false,
+            response_model_seen: false,
             seen_finish: false,
             tool_call_delta_count: 0,
         }
@@ -1112,6 +1123,12 @@ impl SseDecoder {
             if let Some(id) = chunk.id.as_deref().filter(|s| !s.is_empty()) {
                 self.response_id_seen = true;
                 out.push(StreamEvent::ResponseId(id.to_string()));
+            }
+        }
+        if !self.response_model_seen {
+            if let Some(model) = chunk.model.as_deref().filter(|s| !s.is_empty()) {
+                self.response_model_seen = true;
+                out.push(StreamEvent::ResponseModel(model.to_string()));
             }
         }
         // A mid-stream provider error chunk: surface it (code + reason) and TERMINATE —
@@ -1238,6 +1255,9 @@ struct ChunkResponse {
     /// The provider's own response/completion id (same across all chunks).
     #[serde(default)]
     id: Option<String>,
+    /// Provider-reported model identity (may be an alias or the actual routed model).
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     choices: Vec<Choice>,
     #[serde(default)]
@@ -1900,6 +1920,7 @@ mod tests {
                 StreamEvent::ToolCallDelta { .. } => "tooldelta",
                 StreamEvent::Usage(_) => "usage",
                 StreamEvent::ResponseId(_) => "response_id",
+                StreamEvent::ResponseModel(_) => "response_model",
                 StreamEvent::Done { .. } => "done",
                 StreamEvent::Error(_) => "error",
                 StreamEvent::Malformed => "malformed",
@@ -2279,6 +2300,40 @@ mod tests {
     }
 
     #[test]
+    fn sse_emits_provider_response_model_once() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(
+            d.feed(
+                line(json!({
+                    "id":"resp_xyz",
+                    "model":"deepseek-v4-flash",
+                    "choices":[{"delta":{"content":"a"}}]
+                }))
+                .as_bytes(),
+            ),
+        );
+        ev.extend(
+            d.feed(
+                line(json!({
+                    "id":"resp_xyz",
+                    "model":"deepseek-v4-flash",
+                    "choices":[{"delta":{"content":"b"}}]
+                }))
+                .as_bytes(),
+            ),
+        );
+        let models: Vec<String> = ev
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ResponseModel(model) => Some(model.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(models, vec!["deepseek-v4-flash"]);
+    }
+
+    #[test]
     fn sse_mid_stream_error_chunk_surfaces_code_and_reason() {
         let mut d = SseDecoder::new();
         let ev = d.feed(
@@ -2350,17 +2405,27 @@ mod tests {
         // FastAPI / AtomGit `{"detail":{"message":...}}`.
         assert_eq!(
             extract_error_detail(r#"{"detail":{"code":"X","message":"请升级"}}"#),
-            "请升级"
+            "[X] 请升级"
         );
         // FastAPI `{"detail":"..."}` string form.
         assert_eq!(extract_error_detail(r#"{"detail":"nope"}"#), "nope");
-        // GLM-style TOP-LEVEL `{"code","message"}` — the case that previously dumped raw JSON.
+        // GLM-style TOP-LEVEL `{"code","message"}` keeps both fields so callers can
+        // distinguish auth, quota, and concurrency failures that share one HTTP status.
         assert_eq!(
             extract_error_detail(r#"{"code":"1113","message":"余额不足或无可用资源包,请充值。"}"#),
-            "余额不足或无可用资源包,请充值。"
+            "[1113] 余额不足或无可用资源包,请充值。"
         );
         // Non-JSON / unknown shape → raw body (truncated).
         assert_eq!(extract_error_detail("plain text error"), "plain text error");
+        assert_eq!(
+            provider_error_code(&json!({
+                "detail": {
+                    "code": "atomgit_session_concurrency_conflict",
+                    "message": "busy"
+                }
+            })),
+            Some("atomgit_session_concurrency_conflict".into())
+        );
     }
 
     #[test]
@@ -2371,8 +2436,15 @@ mod tests {
             friendly_http_error(402, "Insufficient Balance"),
             "账户余额不足（HTTP 402）"
         );
-        // 403 权限 / 401 鉴权.
-        assert_eq!(friendly_http_error(403, "forbidden"), "无访问权限或 API key 无效（HTTP 403）");
+        // 403 is NOT necessarily auth: AtomGit also uses it for session-concurrency
+        // conflicts. Preserve the structured reason instead of inventing an API-key error.
+        assert_eq!(
+            friendly_http_error(
+                403,
+                "[atomgit_session_concurrency_conflict/403] 该模型不支持多窗口同时发起请求"
+            ),
+            "HTTP 403: [atomgit_session_concurrency_conflict/403] 该模型不支持多窗口同时发起请求"
+        );
         assert!(friendly_http_error(401, "").contains("API key"));
         // 429 is NOT wrapped (kernel rate-limit path owns it — must keep the
         // literal `HTTP 429: ` prefix so `rate_limit_server_message` can strip it).

@@ -1968,6 +1968,7 @@ impl RunningAgent {
             let mut usage = TokenUsage::default();
             let mut truncated = false;
             let mut response_id: Option<String> = None;
+            let mut response_model: Option<String> = None;
             // Did the provider STREAM any model output this round (text / reasoning /
             // tool call), BEFORE any hook transform? This — not the post-hook
             // accumulated text — is the empty-200 discriminator: a hook that redacts
@@ -2158,6 +2159,7 @@ impl RunningAgent {
                     // output later) does not lose the earlier fields to last-wins.
                     StreamEvent::Usage(u) => usage.merge_max(u),
                     StreamEvent::ResponseId(id) => response_id = Some(id),
+                    StreamEvent::ResponseModel(model) => response_model = Some(model),
                     // A mid-stream error CLEANLY FAILS the turn: surface it and end —
                     // do NOT fall through to a fake empty-success completion.
                     // 429 mid-stream: consult the host hook before emitting an Error.
@@ -2427,6 +2429,7 @@ impl RunningAgent {
                 turn_id,
                 request_id,
                 provider_response_id: response_id,
+                provider_model: response_model,
                 session_id: self.session_id.as_deref().map(str::to_string),
                 finish_reason,
             };

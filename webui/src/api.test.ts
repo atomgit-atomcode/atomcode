@@ -31,6 +31,30 @@ test('postLiveMessage does not send approval_mode because live mode is global', 
   }
 });
 
+test('postLiveProvider scopes the runtime switch to the active session', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    return new Response('{"ok":true}', { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const { postLiveProvider } = await import('./api.ts');
+
+    await postLiveProvider('provider-b', 'session-1');
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, '/live/provider');
+    assert.deepEqual(JSON.parse(String(calls[0].init?.body)), {
+      provider: 'provider-b',
+      session_id: 'session-1',
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('live control APIs reject protocol-level failures', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(

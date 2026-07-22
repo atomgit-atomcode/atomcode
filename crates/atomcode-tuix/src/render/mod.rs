@@ -385,6 +385,9 @@ pub enum MenuKind {
     /// `$`-trigger skills picker. Rows show the bare skill name + description,
     /// no `/`, `/skills`, or `$` prefix; selection marked with `▸`.
     Skill,
+    /// Modal action picker. Rows show a bare action label + description,
+    /// with no slash-command prefix; selection is marked with `▸`.
+    Action,
     TwoColumn {
         row_prefix: &'static str,
         selected_marker: &'static str,
@@ -411,7 +414,7 @@ impl MenuKind {
     pub fn max_visible_rows(&self, screen_height: usize, item_count: usize) -> usize {
         match self {
             MenuKind::SlashCommand | MenuKind::AtMention => item_count.min(4),
-            MenuKind::Skill | MenuKind::TwoColumn { .. } => {
+            MenuKind::Skill | MenuKind::Action | MenuKind::TwoColumn { .. } => {
                 item_count.min((screen_height / 2).max(4))
             }
             MenuKind::Plugin | MenuKind::SessionList => {
