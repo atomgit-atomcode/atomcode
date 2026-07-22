@@ -161,7 +161,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "copy",    desc: "Copy a code block from the last reply to the clipboard (/copy, /copy N, /copy all, /copy msg)", needs_args: false, hidden: false },
     Command { name: "save",    desc: "Save the current conversation to a markdown file (/save, /save [filename])", needs_args: false, hidden: false },
     Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true, hidden: false },
-    Command { name: "todo",    desc: "Reprint the current todo list derived from the session transcript", needs_args: false, hidden: false },
+    Command { name: "todo",    desc: "Show the todo list; /todo add <task> appends one, /todo clear wipes it", needs_args: false, hidden: false },
     Command { name: "desktop", desc: "Open the AtomCode desktop app (or show the download link)", needs_args: false, hidden: false },
 ];
 

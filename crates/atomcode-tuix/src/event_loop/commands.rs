@@ -3166,26 +3166,21 @@ fn execute_slash_command_impl(
                 Some((k, r)) => (k, r.trim()),
                 None => (arg.trim(), ""),
             };
-            if kw.eq_ignore_ascii_case("add") {
-                if rest.is_empty() {
-                    renderer.render(UiLine::CommandOutput(t(Msg::TodoAddUsage).into_owned()));
-                    renderer.flush();
-                } else {
-                    add_todo(ctx, state, rest);
-                    let out = format_todo_command(
-                        &ctx.current_session.messages,
-                        ctx.caps.unicode_symbols,
-                    );
-                    renderer.render(UiLine::CommandOutput(out));
-                    renderer.flush();
-                }
+            let is_add = kw.eq_ignore_ascii_case("add");
+            if is_add && rest.is_empty() {
+                // `/todo add` with no text → usage hint, no mutation, no reprint.
+                renderer.render(UiLine::CommandOutput(t(Msg::TodoAddUsage).into_owned()));
+                renderer.flush();
             } else {
-                // Only reseed on clear when there's actually something to clear,
-                // so a no-op `/todo clear` doesn't pollute the transcript with an
-                // empty-todowrite pair.
-                if kw.eq_ignore_ascii_case("clear") && state.active_todos.is_some() {
+                if is_add {
+                    add_todo(ctx, state, rest);
+                } else if kw.eq_ignore_ascii_case("clear") && state.active_todos.is_some() {
+                    // Only reseed when there's something to clear, so a no-op
+                    // doesn't pollute the transcript with an empty-todowrite pair.
                     clear_todos(ctx, state);
                 }
+                // Re-print the (possibly mutated) list as confirmation — shared by
+                // add-success, clear, and a bare `/todo`.
                 let out =
                     format_todo_command(&ctx.current_session.messages, ctx.caps.unicode_symbols);
                 renderer.render(UiLine::CommandOutput(out));
@@ -5898,15 +5893,22 @@ fn todo_add_messages(
     ]
 }
 
-/// `/todo add <content>` — deterministically append a pending task without
-/// waiting on the model. Same reseed path as [`clear_todos`]: append the
-/// synthetic `add` pair and push it into the kernel conversation, so the next
-/// turn's TodoHook sees the new task and the model can act on it; then refresh
-/// the live panel from the updated transcript and persist.
-fn add_todo(ctx: &mut LoopCtx, state: &mut UiState, content: &str) {
-    let id = format!("todo-add-{}", ctx.current_session.messages.len());
+/// Append a synthetic todo-mutation message `pair` to the conversation and reseed
+/// the kernel (the proven `/resume` `SetConversation` path), then rebuild the live
+/// panel from the resulting transcript and persist. The subtle reseed dance lives
+/// HERE so `/todo add` and `/todo clear` can't drift. The caller supplies the pair
+/// (each carries a unique `tool_call_id` — the message count grows by 2 per call,
+/// so a constant id would be rejected as a duplicate by a strict gateway). The
+/// panel is refolded from the transcript, which naturally yields `None` after a
+/// clear (empty `todowrite`) and the appended task after an add — one code path
+/// for both.
+fn reseed_todo_conversation(
+    ctx: &mut LoopCtx,
+    state: &mut UiState,
+    pair: Vec<atomcode_core::conversation::message::Message>,
+) {
     let mut snapshot = ctx.current_session.to_conversation_snapshot();
-    snapshot.messages.extend(todo_add_messages(id, content));
+    snapshot.messages.extend(pair);
     ctx.runtime
         .dispatch(atomcode_coding::DriverCommand::RestoreSnapshot(
             atomcode_daemon::legacy_convert::snapshot_to_kernel(&snapshot),
@@ -5920,28 +5922,19 @@ fn add_todo(ctx: &mut LoopCtx, state: &mut UiState, content: &str) {
     crate::event_loop::sync_todo_titles(state);
 }
 
+/// `/todo add <content>` — deterministically append a pending task without waiting
+/// on the model, so the next turn's TodoHook sees it and the model can act on it.
+fn add_todo(ctx: &mut LoopCtx, state: &mut UiState, content: &str) {
+    let id = format!("todo-add-{}", ctx.current_session.messages.len());
+    reseed_todo_conversation(ctx, state, todo_add_messages(id, content));
+}
+
 /// `/todo clear` — deterministically wipe the task list without waiting on the
-/// model. Appends the synthetic empty-`todowrite` pair and reseeds the kernel
-/// conversation (the proven `/resume` `SetConversation` path), so the next turn's
-/// TodoHook derives an empty list and injects nothing; then clears the live panel
-/// + local mirror and persists.
+/// model, so cancelled/stale tasks stop reappearing (the next turn derives an
+/// empty list and injects nothing).
 fn clear_todos(ctx: &mut LoopCtx, state: &mut UiState) {
-    // Unique tool_call id per invocation (the message count grows by 2 each
-    // clear) — a constant id would collide if `/todo clear` ran twice, which a
-    // strict gateway can reject as duplicate `tool_call_id`.
     let id = format!("todo-clear-{}", ctx.current_session.messages.len());
-    let mut snapshot = ctx.current_session.to_conversation_snapshot();
-    snapshot.messages.extend(todo_clear_messages(id));
-    ctx.runtime
-        .dispatch(atomcode_coding::DriverCommand::RestoreSnapshot(
-            atomcode_daemon::legacy_convert::snapshot_to_kernel(&snapshot),
-        ))
-        .ok();
-    ctx.current_session
-        .update_from_conversation_snapshot(snapshot);
-    ctx.current_session.touch();
-    state.active_todos = None;
-    crate::event_loop::sync_todo_titles(state);
+    reseed_todo_conversation(ctx, state, todo_clear_messages(id));
 }
 
 /// Build the `/todo` output from the session message history.
