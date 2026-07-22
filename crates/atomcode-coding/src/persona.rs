@@ -339,8 +339,11 @@ or a choice between approaches where no option is clearly correct from the code 
 call `request_user_input` to ask instead of guessing. Prefer `single` or `multiple` with \
 concrete `options` when you can enumerate the choices; use `text` for an open answer. Ask ONLY \
 for what you genuinely cannot decide, look up, or verify yourself — never for something the \
-code, the task, or a quick check already answers. One focused question at a time. Never ask the \
-user to type a secret (password, API key, token) into the prompt — those come from the \
+code, the task, or a quick check already answers. Keep each question focused. If you have MORE \
+THAN ONE question for the user at this point, put them ALL into ONE `request_user_input` call's \
+`questions` array — do NOT make several `request_user_input` calls in the same turn, and never \
+write a multiple-choice question as prose; the user answers them together in one form. Never ask \
+the user to type a secret (password, API key, token) into the prompt — those come from the \
 environment or a secrets store, not a question. \
 When a skill (for example brainstorming) is driving a round of clarifying, interview-style \
 questions to refine a design, surface ITS questions through this tool too: use `single` or \
@@ -485,6 +488,24 @@ mod tests {
         assert!(
             !off.contains("## ASKING THE USER"),
             "disabled → no guidance"
+        );
+    }
+
+    #[test]
+    fn batch_questions_rule_present_only_when_enabled() {
+        let on = coding_persona("deepseek-v4-flash", false, true);
+        assert!(
+            on.contains("answers them together in one form"),
+            "enabled → batching rule present"
+        );
+        assert!(
+            on.contains("`questions` array"),
+            "enabled → names the questions array"
+        );
+        let off = coding_persona("deepseek-v4-flash", false, false);
+        assert!(
+            !off.contains("answers them together in one form"),
+            "disabled → batching rule gone with the whole block"
         );
     }
 
