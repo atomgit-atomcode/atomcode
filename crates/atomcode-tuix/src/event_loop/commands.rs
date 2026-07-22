@@ -318,6 +318,30 @@ pub(crate) fn attach_live_runtime(
             }
         }
     });
+    if let Ok(live_join) = atomcode_daemon::native_live::join() {
+        let mut receiver = live_join.receiver;
+        let event_tx = ctx.runtime_event_tx.clone();
+        let runtime_id = ctx.foreground_runtime_id;
+        tokio::spawn(async move {
+            while let Ok(observation) = receiver.recv().await {
+                if let atomcode_daemon::live_hub::LiveViewEvent::InputAccepted(input) =
+                    observation.event
+                {
+                    if event_tx
+                        .send(super::bg_runtime::RuntimeEvent {
+                            runtime_id,
+                            event: super::bg_runtime::RuntimeEventPayload::Ui(
+                                super::ui_event::UiEvent::UserEcho(input.text),
+                            ),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+    }
     renderer.render(UiLine::CommandOutput(
         "已共享当前会话（与浏览器实时互通）".to_string(),
     ));

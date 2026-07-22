@@ -31,7 +31,7 @@ pub const SUBAGENT_ACTIVITY_MARKER: char = '\u{1e}';
 /// 900s (15 min) is generous on purpose — this is the TOTAL time for ALL of a subtask's
 /// rounds, and a thorough read-only review on a slow hidden-reasoning model (GLM) can take
 /// many minutes. It only exists to bound a genuinely wedged/looping child. Overridable via
-/// the `ATOMCODE_SUBAGENT_TIMEOUT` env var (see coding/parts.rs `subagent_timeout_from_env`).
+/// the `ATOMCODE_SUBAGENT_TIMEOUT` env var (see coding/parts.rs `subagent_runtime_knobs`).
 const DEFAULT_SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 /// After a timed-out child is cancelled, how long to wait for it to unwind cooperatively
 /// and hand back its partial work before we detach it and report a bare timeout.
@@ -67,15 +67,21 @@ impl ToolMiddleware for DenySensitivePaths {
 /// segment that contains a glob metacharacter. `src/auth/**` → `src/auth`; `**` → ``;
 /// `Cargo.toml` → `Cargo.toml`. Used to test a `search_replace` DIR root against a scope
 /// (globset's `src/auth/**` does NOT match the bare dir `src/auth`).
-fn literal_dir_prefix(glob: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    for seg in glob.split('/') {
-        if seg.contains(['*', '?', '[', ']', '{', '}']) {
-            break;
-        }
-        out.push(seg);
+fn recursive_dir_prefix(glob: &str) -> Option<String> {
+    // `**` covers the whole tree.
+    if glob == "**" {
+        return Some(String::new());
     }
-    out.join("/")
+    // Only a recursive dir glob (`<literal-dir>/**`) confines a search_replace root: the tool
+    // rewrites EVERY file under its root, so the root is "entirely in scope" only when the
+    // scope covers the whole subtree. A non-recursive scope (`*.rs`, `src/*.rs`, `Cargo.toml`,
+    // `src/**/x.rs`, or a bare dir like `src/auth`) matches only specific files, never a whole
+    // directory, so it grants NO search_replace root.
+    let prefix = glob.strip_suffix("/**")?;
+    if prefix.is_empty() || prefix.contains(['*', '?', '[', ']', '{', '}']) {
+        return None;
+    }
+    Some(prefix.to_string())
 }
 
 /// Lexically collapse `.` / `..` WITHOUT touching the filesystem (targets may be new files
@@ -132,7 +138,9 @@ impl WorkerScopeGate {
             // one way and allow them the other.
             if let Ok(g) = globset::GlobBuilder::new(s).literal_separator(true).build() {
                 builder.add(g);
-                dir_prefixes.push(PathBuf::from(literal_dir_prefix(s)));
+                if let Some(dir) = recursive_dir_prefix(s) {
+                    dir_prefixes.push(PathBuf::from(dir));
+                }
             }
         }
         let globs = builder.build().unwrap_or_else(|_| globset::GlobSet::empty());
@@ -218,8 +226,13 @@ impl WorkerScopeGate {
             .map(|p| p.to_string_lossy().replace('\\', "/"))
     }
 
-    /// Whether a working-dir-relative DIRECTORY is within scope: it equals or lives under any
-    /// scope's literal dir prefix. An empty prefix (scope like `**`) covers the whole tree.
+    /// Whether a working-dir-relative DIRECTORY (a `search_replace` root) is within scope: it
+    /// equals or lives under any RECURSIVE scope's dir (see [`recursive_dir_prefix`]). An empty
+    /// prefix (scope `**`) covers the whole tree. Only recursive `<dir>/**` scopes grant a root
+    /// here — a non-recursive scope (`*.rs`, `src/*.rs`, `Cargo.toml`, or a bare dir `src/auth`)
+    /// covers only specific files, so it grants NO search_replace root even though it may still
+    /// match a single-file `edit_file`/`write_file` target. A worker wanting to search_replace a
+    /// whole directory must declare it recursively: `src/auth/**`.
     fn dir_in_scope(&self, rel_dir: &str) -> bool {
         let rd = Path::new(rel_dir);
         self.dir_prefixes.iter().any(|p| {
@@ -1299,12 +1312,18 @@ mod tests {
     }
 
     #[test]
-    fn literal_dir_prefix_cuts_at_first_glob_segment() {
-        use super::literal_dir_prefix as p;
-        assert_eq!(p("src/auth/**"), "src/auth");
-        assert_eq!(p("src/**/x.rs"), "src");
-        assert_eq!(p("**"), "");
-        assert_eq!(p("Cargo.toml"), "Cargo.toml");
+    fn recursive_dir_prefix_only_grants_roots_for_recursive_scopes() {
+        use super::recursive_dir_prefix as p;
+        // Recursive dir globs grant a search_replace root at their literal dir.
+        assert_eq!(p("src/auth/**"), Some("src/auth".into()));
+        assert_eq!(p("**"), Some(String::new())); // whole tree
+        // Non-recursive scopes cover only specific files → NO search_replace root.
+        assert_eq!(p("src/**/x.rs"), None); // matches only x.rs files, not whole dirs
+        assert_eq!(p("src/*.rs"), None);
+        assert_eq!(p("*.rs"), None);
+        assert_eq!(p("Cargo.toml"), None);
+        assert_eq!(p("src/auth"), None); // bare dir matches only itself, not its contents
+        assert_eq!(p("src/*/**"), None); // non-literal prefix before /** → not granted
     }
 
     #[test]
@@ -1385,6 +1404,26 @@ mod tests {
         assert!(deny.contains("whole tree") || deny.contains("path"), "{deny}");
         // root escaping the workspace → denied
         assert!(g.violation("search_replace", r#"{"path":"../outside"}"#).is_some());
+
+        // Regression: a NON-recursive glob scope must NOT grant a wide search_replace root.
+        // `["*.rs"]` (root-level .rs files) must not let search_replace rewrite the whole tree,
+        // and `["src/*.rs"]` must not let it rewrite all of src/.
+        let g_root = WorkerScopeGate::new(&["*.rs".into()], Path::new("/w"));
+        assert!(
+            g_root.violation("search_replace", r#"{"path":"src/db"}"#).is_some(),
+            "*.rs scope must not grant a search_replace root under src/"
+        );
+        assert!(
+            g_root.violation("search_replace", r#"{"path":"."}"#).is_some(),
+            "*.rs scope must not grant a whole-tree search_replace root"
+        );
+        let g_srcrs = WorkerScopeGate::new(&["src/*.rs".into()], Path::new("/w"));
+        assert!(
+            g_srcrs.violation("search_replace", r#"{"path":"src/db"}"#).is_some(),
+            "src/*.rs scope must not grant a search_replace root over src/db"
+        );
+        // ...but a single-file write still matches the file glob (unchanged).
+        assert!(g_srcrs.violation("edit_file", r#"{"file_path":"src/main.rs"}"#).is_none());
     }
 
     #[test]

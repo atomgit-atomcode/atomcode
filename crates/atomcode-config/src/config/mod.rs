@@ -64,23 +64,28 @@ impl Default for LoopConfig {
     }
 }
 
-/// Sub-agent execution policy (enable + resilience knobs).
-/// Drives `agent::parallel_edit::SubAgentTask::execute` and the
-/// `try_sub_agent_dispatch` config gate.
+/// `[subagent]` execution policy for the `task` subagent tool.
+///
+/// `max_concurrent` and `timeout_secs` are the LIVE knobs: `coding::parts` reads them via
+/// `subagent_runtime_knobs` and wires them into `TaskTool` (with `ATOMCODE_SUBAGENT_TIMEOUT`
+/// overriding `timeout_secs`). The tool's master ON/OFF is the env gate `ATOMCODE_SUBAGENT`
+/// (default ON, opt out with `ATOMCODE_SUBAGENT=0`) — NOT `enabled` here; `enabled`,
+/// `initial_turns`, and `max_turns` are vestigial from the retired `parallel_edit` dispatch
+/// path and are not currently consulted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SubAgentConfig {
-    /// Master switch. `false` makes `try_sub_agent_dispatch` return None
-    /// immediately and the parent agent falls back to serial execution.
+    /// Vestigial: the live master switch is the env gate `ATOMCODE_SUBAGENT` (default ON),
+    /// not this field. Kept for config back-compat.
     pub enabled: bool,
-    /// Initial per-task turn budget. Adaptive logic may extend up to
-    /// `max_turns`. See `ResilienceConfig::initial_turns`.
+    /// Vestigial (retired resilience path); not currently read.
     pub initial_turns: usize,
-    /// Hard cap on per-task turns regardless of progress signals.
+    /// Vestigial (retired resilience path); not currently read.
     pub max_turns: usize,
-    /// Max parallel sub-agents per pool batch.
+    /// Max parallel subagents the `task` tool runs at once (floored to 1). Default 3.
     pub max_concurrent: usize,
-    /// Wall-time timeout for a single sub-agent (seconds).
+    /// Per-subtask wall-time timeout in seconds (floored to 30s). Default 900 (15 min).
+    /// Overridden by the `ATOMCODE_SUBAGENT_TIMEOUT` env var when set.
     pub timeout_secs: u64,
 }
 
@@ -91,7 +96,8 @@ impl Default for SubAgentConfig {
             initial_turns: 4,
             max_turns: 12,
             max_concurrent: 3,
-            timeout_secs: 300,
+            // Matches the `task` tool's shipped default so wiring config is not a silent change.
+            timeout_secs: 900,
         }
     }
 }
@@ -142,8 +148,8 @@ pub struct Config {
     /// Only applies when working inside a git repository.
     #[serde(default)]
     pub auto_commit: bool,
-    /// Sub-agent execution policy. Missing from older configs → defaults to
-    /// enabled=true, initial_turns=4, max_turns=12, max_concurrent=3, timeout_secs=300.
+    /// `task` subagent tool policy (`max_concurrent` / `timeout_secs`). Missing from older
+    /// configs → defaults to max_concurrent=3, timeout_secs=900. See [`SubAgentConfig`].
     #[serde(default)]
     pub subagent: SubAgentConfig,
     /// /loop command policy. Missing from older configs → max_rounds=100.

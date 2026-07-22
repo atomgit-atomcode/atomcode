@@ -84,6 +84,38 @@ const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
 /// many) so a model that truncates every round cannot livelock the loop.
 const MAX_TRUNCATION_CONTINUATIONS: u32 = 2;
 
+/// CROSS-ROUND REPETITION FUSE (FAILURE PERCEPTION). A weak model can spin on the
+/// byte-identical tool call round after round — e.g. `echo`-ing a question to the
+/// user instead of ending the turn to let them answer — with NO agency to stop. The
+/// per-batch dedup gate only catches repeats WITHIN one assistant message, so this
+/// bounds repeats ACROSS rounds. At [`REPEAT_NUDGE_AT`] consecutive identical rounds
+/// the kernel injects ONE corrective nudge (tools still on) so the model can
+/// self-correct; if it still repeats up to [`MAX_REPEAT_ROUNDS`], the turn is
+/// force-stopped with `StopReason::RepeatLoop`. Always on — a bug class, not a
+/// workload knob (same rationale as `max_continuations`).
+const MAX_REPEAT_ROUNDS: u32 = 6;
+const REPEAT_NUDGE_AT: u32 = 3;
+const REPEAT_LOOP_NUDGE: &str =
+    "You have now issued the SAME tool call with the SAME arguments several rounds in a row \
+     with no new result — you are stuck in a loop. STOP repeating it. If you are trying to ask \
+     the user something, do NOT print it with a shell command (its output only comes back to \
+     you); instead end your turn with a plain text question, or use a request-user-input tool if \
+     available. If the task is done, reply with a short summary and no tool calls. If you are \
+     blocked, say what you need.";
+
+/// Canonical signature of a round's tool calls for the cross-round repetition fuse:
+/// the SORTED `name(arguments)` pairs (order-independent so a reordered parallel batch
+/// still matches). Keyed on the MODEL's emitted `(name, arguments)` — the same identity
+/// the per-batch dedup uses — so a reworded argument counts as progress and resets the fuse.
+fn round_tool_signature(calls: &[ToolCall]) -> String {
+    let mut parts: Vec<String> = calls
+        .iter()
+        .map(|c| format!("{}\u{0}{}", c.name, c.arguments))
+        .collect();
+    parts.sort();
+    parts.join("\u{1}")
+}
+
 /// Maximum number of `parallel_safe` (read-only) tools that run CONCURRENTLY in
 /// Phase ② of the tool loop. Read from `ATOMCODE_MAX_PARALLEL_TOOLS` (a positive
 /// integer); anything unset, unparseable, or `< 1` falls back to the default 4.
@@ -1412,6 +1444,12 @@ impl RunningAgent {
         // decrements that reset `round` to 1) AND tells the empty-exhaustion
         // terminal not to repeat the same size-blame.
         let mut over_window_warned = false;
+        // CROSS-ROUND REPETITION FUSE state (see `MAX_REPEAT_ROUNDS`): the signature of
+        // the previous tool-call round, how many CONSECUTIVE rounds have matched it, and
+        // whether the one-shot corrective nudge has already fired for the current streak.
+        let mut last_round_sig: Option<String> = None;
+        let mut repeat_rounds: u32 = 0;
+        let mut repeat_nudged = false;
         loop {
             round += 1;
             // Mint this request's id AND build this round's TurnCtx UP FRONT — before
@@ -2268,6 +2306,10 @@ impl RunningAgent {
             // call) — re-derive the calls to execute from the (possibly edited) message
             // so a dropped call is NOT executed.
             let pending_calls = assistant_msg.tool_calls.clone();
+            // Capture the repetition-fuse signature BEFORE the tool loop consumes
+            // `pending_calls` (moved by the `for call in pending_calls` below); the fuse
+            // check runs at the round boundary. Empty on the no-tool-calls path (unused there).
+            let round_sig = round_tool_signature(&pending_calls);
             convo.push(assistant_msg);
             if pending_calls.is_empty() {
                 // A prompt steered in during this round keeps the turn going: loop back so the
@@ -2793,6 +2835,37 @@ impl RunningAgent {
                     "[Images returned by the tool calls above are attached for you to view.]",
                     std::mem::take(&mut turn_images),
                 ));
+            }
+            // ── CROSS-ROUND REPETITION FUSE ──
+            // Reached only on the tool-call path (the empty-calls path returned/continued
+            // above), at a clean round boundary: this round's assistant tool_calls +
+            // their tool_results are all applied, so `finish_turn` here is API-valid. If
+            // the model keeps emitting the byte-identical call(s) round after round it is
+            // stuck with no agency to stop — nudge once, then force-stop. See
+            // `MAX_REPEAT_ROUNDS`.
+            if last_round_sig.as_deref() == Some(round_sig.as_str()) {
+                repeat_rounds += 1;
+            } else {
+                repeat_rounds = 1;
+                last_round_sig = Some(round_sig);
+                repeat_nudged = false;
+            }
+            if repeat_rounds >= MAX_REPEAT_ROUNDS {
+                self.rt.emit(AgentEvent::Error {
+                    message: format!(
+                        "stopped: the model repeated the same tool call for {repeat_rounds} \
+                         consecutive rounds without progress"
+                    ),
+                    http_status: None,
+                    code: None,
+                });
+                self.finish_turn(convo, StopReason::RepeatLoop, &turn_ctx)
+                    .await;
+                return;
+            }
+            if repeat_rounds == REPEAT_NUDGE_AT && !repeat_nudged {
+                repeat_nudged = true;
+                convo.push(Message::synthetic_user(REPEAT_LOOP_NUDGE.to_string()));
             }
         }
     }
@@ -4121,5 +4194,137 @@ mod synthetic_send_tests {
 
         handle.commands.send(AgentCommand::Shutdown).unwrap();
         let _ = handle.task.await;
+    }
+}
+
+#[cfg(test)]
+mod repeat_loop_tests {
+    //! Cross-round repetition fuse (`MAX_REPEAT_ROUNDS`): a model that emits the
+    //! byte-identical tool call round after round (e.g. a weak model echoing a
+    //! question to the user instead of ending the turn) must be nudged once and then
+    //! force-stopped, not left to spin forever.
+    use super::*;
+    use crate::message::Role;
+    use crate::testkit::{EchoTool, RecordingProvider};
+    use crate::tool::{ToolCall, ToolRegistry};
+
+    #[tokio::test]
+    async fn identical_tool_call_every_round_is_nudged_then_force_stopped() {
+        // Script far MORE identical rounds than the fuse allows; each emits the SAME
+        // (name, arguments) echo call with a DISTINCT id (mirrors a real model that
+        // varies only the call id). The fuse must stop the turn well before they run out.
+        let round = |id: &str| {
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: id.into(),
+                    name: "echo".into(),
+                    arguments: r#"{"text":"please tell me the topic"}"#.into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ]
+        };
+        let scripted = 20usize;
+        let rounds: Vec<Vec<StreamEvent>> = (0..scripted).map(|i| round(&format!("c{i}"))).collect();
+        let provider = Arc::new(RecordingProvider::new(rounds).with_ctx_window(1_000_000));
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        let mut handle = Agent::builder()
+            .provider(provider.clone())
+            .tools(reg.mount(&["echo"]))
+            .persona("neutral test agent")
+            .build()
+            .spawn();
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage { text: "go".into(), images: vec![] })
+            .unwrap();
+        while let Some(ev) = handle.events.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+
+        handle.commands.send(AgentCommand::Snapshot).unwrap();
+        let mut messages = Vec::new();
+        while let Some(ev) = handle.events.recv().await {
+            if let AgentEvent::Snapshot { snapshot } = ev {
+                messages = snapshot.messages;
+                break;
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+
+        // The fuse force-stopped the turn BEFORE the scripted rounds ran out.
+        let rounds_run = provider.recorded().len();
+        assert!(
+            rounds_run <= MAX_REPEAT_ROUNDS as usize,
+            "fuse must stop within {MAX_REPEAT_ROUNDS} rounds, ran {rounds_run}"
+        );
+        assert!(rounds_run < scripted, "the turn must not consume all scripted rounds");
+        assert!(
+            rounds_run >= REPEAT_NUDGE_AT as usize,
+            "should run at least until the one-shot nudge fires"
+        );
+        // The one-shot corrective nudge was injected as a SYNTHETIC user message.
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == Role::User && m.synthetic && m.text.contains("stuck in a loop")),
+            "the repetition fuse must inject a corrective nudge before stopping"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_tool_calls_each_round_do_not_trip_the_fuse() {
+        // Same tool, DIFFERENT arguments each round → not a repeat → the fuse never fires;
+        // the turn ends only when the model stops (empty queue → Done). Guards against the
+        // fuse killing legitimate progress.
+        let round = |i: usize| {
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("c{i}"),
+                    name: "echo".into(),
+                    arguments: format!(r#"{{"text":"step {i}"}}"#),
+                }),
+                StreamEvent::Done { truncated: false },
+            ]
+        };
+        // MORE distinct rounds than MAX_REPEAT_ROUNDS — must ALL run (no false trip).
+        let scripted = (MAX_REPEAT_ROUNDS as usize) + 4;
+        let rounds: Vec<Vec<StreamEvent>> = (0..scripted).map(round).collect();
+        let provider = Arc::new(RecordingProvider::new(rounds).with_ctx_window(1_000_000));
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        let mut handle = Agent::builder()
+            .provider(provider.clone())
+            .tools(reg.mount(&["echo"]))
+            .persona("neutral test agent")
+            .build()
+            .spawn();
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage { text: "go".into(), images: vec![] })
+            .unwrap();
+        while let Some(ev) = handle.events.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+
+        // All distinct rounds ran (the empty queue, not the fuse, ended the turn — plus
+        // one final call returning the default `Done` with no tool call). A count past
+        // MAX_REPEAT_ROUNDS proves the fuse did NOT falsely trip on genuine progress.
+        let ran = provider.recorded().len();
+        assert!(
+            ran >= scripted,
+            "distinct-argument rounds must not trip the repetition fuse (ran {ran}, expected >= {scripted})"
+        );
     }
 }

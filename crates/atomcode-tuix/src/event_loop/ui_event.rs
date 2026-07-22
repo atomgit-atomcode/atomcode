@@ -16,6 +16,11 @@ pub enum UiEvent {
     ToolCallStreaming {
         name: String,
         hint: String,
+        /// Char length of THIS streamed argument fragment — accumulated into
+        /// `turn_output_chars` so the spinner's `↑ N tokens` indicator ticks
+        /// while the model emits a long tool call (the fragment content itself
+        /// isn't shown; only `hint`'s first chars are).
+        arg_chars: usize,
     },
     ToolCallStarted {
         id: String,

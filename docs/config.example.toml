@@ -222,14 +222,18 @@ mode = "follow_system"
 # }
 
 # =============================================================================
-# Subagent 设置（并行子代理）
+# Subagent 设置（`task` 工具：主 agent 把子任务派发给隔离上下文的子 agent）
 # =============================================================================
+# 总开关是环境变量 ATOMCODE_SUBAGENT（默认开启）——用 `ATOMCODE_SUBAGENT=0` 关闭。
+# 下面的 `enabled` 字段是历史遗留、当前不生效；真正开关看上面的环境变量。
+# 生效的旋钮只有 max_concurrent（并发子 agent 数）和 timeout_secs（单个子任务墙钟超时，
+# 秒；可被 ATOMCODE_SUBAGENT_TIMEOUT 环境变量覆盖）。
 [subagent]
-enabled = true
-initial_turns = 4
-max_turns = 12
-max_concurrent = 3
-timeout_secs = 300
+enabled = true          # 遗留字段，不生效（改这个不会关掉 subagent；用 ATOMCODE_SUBAGENT=0）
+initial_turns = 4       # 遗留字段，不生效
+max_turns = 12          # 遗留字段，不生效
+max_concurrent = 3      # 生效：并发子 agent 上限（下限 1）
+timeout_secs = 900      # 生效：单个子任务超时（秒，下限 30；ATOMCODE_SUBAGENT_TIMEOUT 覆盖）
 
 # =============================================================================
 # LSP（语言服务器协议）

@@ -3271,6 +3271,30 @@ mod buffer_tests {
     }
 
     #[test]
+    fn spinner_label_shows_parenthesized_clock_and_token_activity() {
+        let mut s = UiState::new();
+        s.on_submit();
+        // No output yet: parenthesized whole-seconds clock (never `Xms`), no tokens.
+        let bare = format_spinner_label(&s, 0, None);
+        assert!(bare.contains("(0s)"), "expected `(0s)` clock, got {bare:?}");
+        assert!(!bare.contains("ms"), "clock must not show millis, got {bare:?}");
+        assert!(
+            !bare.contains("tokens"),
+            "no token count before any output, got {bare:?}"
+        );
+
+        // Once output streams, the `↑ N tokens` liveness counter joins the clock
+        // inside the parens (49_600 chars ≈ 12.4K tokens at 4 chars/token,
+        // formatted by the shared `fmt_tokens` → `12.40K`).
+        s.turn_output_chars = 49_600;
+        let active = format_spinner_label(&s, 0, None);
+        assert!(
+            active.contains("(0s \u{b7} \u{2191} 12.40K tokens)"),
+            "expected `(0s · ↑ 12.40K tokens)`, got {active:?}"
+        );
+    }
+
+    #[test]
     fn spinner_label_shows_subagent_activity_when_present() {
         // While a `task` fan-out is running, the spinner shows the children's latest
         // live activity in place of the generic thinking word — and reverts when cleared.
@@ -9528,7 +9552,7 @@ fn handle_idle_key(
                 // already cached above from the raw form, so Ctrl+C edit
                 // restores the editable path, not the marker.
                 attach_typed_image_paths(app, ctx, &mut expanded, &mut images, &mut kept_markers);
-                {
+                if ctx.live_binding.is_none() {
                     // Echo the EXACT text the agent receives (`expanded`): the
                     // full pasted body with `[Pasted #N …]` placeholders expanded
                     // and typed image paths already rewritten to `[Image #N]`
@@ -10857,7 +10881,7 @@ fn handle_streaming_key(
                     q_markers.push(n);
                 }
             }
-            {
+            if ctx.live_binding.is_none() {
                 // Same as the idle submit path: echo the EXACT text queued for
                 // the agent (`expanded`) — the full pasted body, no
                 // `[Pasted #N …]` placeholder — while history keeps the folded
@@ -12866,10 +12890,14 @@ fn project_kernel_event(
         Kernel::Reasoning(text) => Some(AgentEvent::ReasoningDelta(text)),
         Kernel::ToolCallStreaming {
             name, arguments, ..
-        } => Some(AgentEvent::ToolCallStreaming {
-            name: name.unwrap_or_else(|| "tool".into()),
-            hint: arguments.chars().take(80).collect(),
-        }),
+        } => {
+            let arg_chars = arguments.chars().count();
+            Some(AgentEvent::ToolCallStreaming {
+                name: name.unwrap_or_else(|| "tool".into()),
+                hint: arguments.chars().take(80).collect(),
+                arg_chars,
+            })
+        }
         Kernel::ToolBatchStarted { batch_id, calls } => {
             Some(AgentEvent::ToolBatchStarted { batch_id, calls })
         }
@@ -13316,7 +13344,7 @@ fn handle_runtime_event(
                 }
                 CodingRuntimeEvent::RuntimeStopped(_) => return,
                 CodingRuntimeEvent::ModeChanged { mode } => {
-                    state.agent_mode = match mode {
+                    let agent_mode = match mode {
                         atomcode_coding::RuntimeMode::Build => crate::state::AgentMode::Build,
                         atomcode_coding::RuntimeMode::AcceptEdits => {
                             crate::state::AgentMode::AcceptEdits
@@ -13324,6 +13352,8 @@ fn handle_runtime_event(
                         atomcode_coding::RuntimeMode::Auto => crate::state::AgentMode::Auto,
                         atomcode_coding::RuntimeMode::Plan => crate::state::AgentMode::Plan,
                     };
+                    state.agent_mode = agent_mode;
+                    atomcode_daemon::live_set_mode(agent_mode);
                     return;
                 }
                 CodingRuntimeEvent::WorkingDirectoryChanged(directory) => {
@@ -14027,7 +14057,7 @@ fn commit_native_session_changed(
             &session.to_conversation_snapshot(),
         );
         Some(
-            atomcode_daemon::native_live::commit_runtime_snapshot(
+            atomcode_daemon::native_live::replace_snapshot(
                 &binding,
                 session_id.clone(),
                 working_dir.clone(),
@@ -14659,6 +14689,9 @@ fn handle_agent_event(
 
     match ev {
         AgentEvent::TextDelta(text) => {
+            // Count streamed output for the spinner's `↑ N tokens` liveness
+            // indicator (before `text` is moved into the renderer).
+            state.turn_output_chars += text.chars().count();
             render_assistant_text(text, state, think, renderer);
         }
         AgentEvent::ReasoningDelta(text) => {
@@ -14666,6 +14699,8 @@ fn handle_agent_event(
             // visibility — the blank-turn notice uses it to say "only reasoning,
             // press Ctrl+O" vs "no output at all".
             state.turn_saw_reasoning = true;
+            // Reasoning counts as streamed output for the `↑ N tokens` indicator.
+            state.turn_output_chars += text.chars().count();
             // Display reasoning/thinking content in verbose mode (Ctrl+O)
             // Only show when the user has enabled it
             if state.show_reasoning {
@@ -14679,7 +14714,13 @@ fn handle_agent_event(
                 }
             }
         }
-        AgentEvent::ToolCallStreaming { name, .. } => {
+        AgentEvent::ToolCallStreaming {
+            name, arg_chars, ..
+        } => {
+            // A turn that spends minutes emitting one huge tool call (e.g. a
+            // giant script) would otherwise show no motion; count its argument
+            // stream so `↑ N tokens` keeps ticking and it doesn't look hung.
+            state.turn_output_chars += arg_chars;
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
         AgentEvent::ToolCallStarted {
@@ -16743,7 +16784,7 @@ fn format_spinner_label(
         };
         let mut out = base.into_owned();
         if let Some(d) = state.phase_elapsed() {
-            out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
+            out.push_str(&format!(" · {}", fmt_elapsed(d.as_millis() as u64)));
         }
         return out;
     }
@@ -16787,13 +16828,26 @@ fn format_spinner_label(
     // (The mid-stream "· esc to cancel" stall hint was removed by request — esc
     // still cancels, it's just no longer advertised in the spinner. The stall
     // machinery (`stream_stalled`) stays for the compaction-slow variant.)
-    // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
-    // `Running ReadFile… 4s`. CC behaviour: timer resets on every phase
-    // transition so the user reads "this thing has been running for N
-    // seconds", not "the whole turn so far is 1301s". LAST, so its per-frame
-    // width changes never shift anything after it.
+    // Phase elapsed + live output counter, grouped in parens at the very end —
+    // `Noodling… (49m44s · ↑ 12.4k tokens)`, matching Claude Code. Phase elapsed
+    // (NOT total turn) so the timer reads "this operation has run N seconds",
+    // resetting on every phase transition. `fmt_elapsed` starts at whole seconds
+    // (never `340ms`) so the clock doesn't flicker millisecond digits. The token
+    // estimate is the liveness proof — it keeps ticking through a long single
+    // generation (text / reasoning / tool-call args) so the turn never looks
+    // hung. Shown only once output has started (no `↑ 0 tokens`). LAST, so its
+    // per-frame width changes never shift anything before it.
     if let Some(d) = state.phase_elapsed() {
-        out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
+        let elapsed = fmt_elapsed(d.as_millis() as u64);
+        let tokens = state.turn_output_token_estimate();
+        if tokens > 0 {
+            out.push_str(&format!(
+                " ({elapsed} · \u{2191} {} tokens)",
+                crate::i18n::fmt_tokens(tokens)
+            ));
+        } else {
+            out.push_str(&format!(" ({elapsed})"));
+        }
     }
     out
 }

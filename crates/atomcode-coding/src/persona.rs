@@ -41,6 +41,15 @@ pub(crate) fn request_user_input_switch_enabled() -> bool {
     )
 }
 
+/// Whether the `task` subagent tool is mounted — mirrors the tool-mount gate in
+/// [`crate::parts`] by delegating to the SAME `subagent_enabled_from_env` helper, so the
+/// system-prompt delegation guidance and the mounted tool can never disagree. Env
+/// `ATOMCODE_SUBAGENT`, default ON (opt out with `=0`): only advertise delegation when the
+/// tool actually exists, else the model calls a tool that isn't there.
+pub(crate) fn subagent_delegation_enabled() -> bool {
+    crate::parts::subagent_enabled_from_env(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref())
+}
+
 /// Whether the `memory` tool is mounted (mirrors the registration gate in
 /// `register_coding_tools_with_vision`): env `ATOMCODE_MEMORY_TOOL` != 0/false/off.
 pub(crate) fn memory_tool_enabled() -> bool {
@@ -137,6 +146,15 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     if memory_tool_enabled() {
         p.push_str(MEMORY_USAGE);
     }
+    // Delegation guidance for the `task` subagent tool — surfaced in the system prompt (not
+    // just the tool description) because weak main models (observed: GLM) under-weight tool
+    // descriptions and so never delegate. MUST stay gated on the SAME condition as the
+    // `task` tool mount in `parts.rs` (`ATOMCODE_SUBAGENT`, default ON, opt out with `=0`):
+    // nudging the model toward an unmounted tool provokes a phantom tool call. `subagent_delegation_enabled()`
+    // reuses the tool-mount's own gate helper so the two can't drift.
+    if subagent_delegation_enabled() {
+        p.push_str(SUBAGENT_DELEGATION);
+    }
     // Skill-trigger guidance — surfaced in the system prompt (not just the `use_skill`
     // tool description + the AVAILABLE SKILLS catalog's own guidance line) because weak
     // models (GLM / DeepSeek) under-weight both and so only ever fire a skill when the
@@ -224,6 +242,12 @@ jumping straight to code on a design/brainstorm request.\n\
 NEVER delete, comment out, `#[ignore]` / skip, or weaken a test, type, assertion, error \
 path, or feature just to make the error or a red test disappear — that hides the bug, it \
 does not fix it.\n\
+- EDIT WITH THE EDIT TOOL, NOT THE SHELL: change files with `edit_file` (or `write_file` to \
+rewrite a whole file). NEVER use `sed`/`awk`/`perl -i` or `>`/`>>`/tee redirection to edit \
+source files — it mangles indentation and encoding (worst on Windows) and snowballs into \
+corruption. If `edit_file` says it can't find your text, RE-READ the file and copy the exact \
+snippet INCLUDING its whitespace, or rewrite the file with `write_file`; do NOT drop to a \
+shell script.\n\
 - VERIFY BEFORE FINISHING: after editing code, actually run the project's check (`cargo \
 check` / `tsc --noEmit` / the build or test command — not `ls`/`echo`) and confirm it \
 PASSES before handing back. If it does not compile, the task is NOT done. If you did not \
@@ -321,15 +345,24 @@ or a choice between approaches where no option is clearly correct from the code 
 call `request_user_input` to ask instead of guessing. Prefer `single` or `multiple` with \
 concrete `options` when you can enumerate the choices; use `text` for an open answer. Ask ONLY \
 for what you genuinely cannot decide, look up, or verify yourself — never for something the \
-code, the task, or a quick check already answers. One focused question at a time. Never ask the \
-user to type a secret (password, API key, token) into the prompt — those come from the \
+code, the task, or a quick check already answers. Keep each question focused. If you have MORE \
+THAN ONE question for the user at this point, put them ALL into ONE `request_user_input` call's \
+`questions` array — do NOT make several `request_user_input` calls in the same turn, and never \
+write a multiple-choice question as prose; the user answers them together in one form. Never ask \
+the user to type a secret (password, API key, token) into the prompt — those come from the \
 environment or a secrets store, not a question. \
 When a skill (for example brainstorming) is driving a round of clarifying, interview-style \
 questions to refine a design, surface ITS questions through this tool too: use `single` or \
 `multiple` with concrete `options` for choice questions and `text` for an open answer, so the \
 user answers in the UI instead of reading a prose question. The 'ask sparingly, only for what \
 you cannot decide yourself' guidance above governs YOUR OWN ad-hoc questions; it does not \
-constrain a skill's structured interview.";
+constrain a skill's structured interview. \
+NEVER try to talk to the user by printing text with a shell command (e.g. `echo \"...\"`): a \
+tool's output comes back only to YOU, not the user, so you will loop forever waiting for an \
+answer that never arrives. To reach the user, EITHER call `request_user_input`, OR end your \
+turn with the question in plain text and stop (no tool call) so they can reply. And never \
+re-issue the SAME tool call round after round expecting a different result — if a call didn't \
+get what you need, change approach or ask.";
 
 /// Memory-tool usage guidance. Judgment-framed: only persist durable, non-obvious
 /// learnings — not standard facts or session one-offs. Only injected when the
@@ -342,6 +375,25 @@ with the `memory` tool (`action:\"remember\"`). Do NOT record obvious facts, sta
 tool/language behavior, anything already in AGENTS.md, or session-specific one-offs. Keep \
 each entry to one concise line. This is a judgment call, not a requirement — only record \
 what a future session would genuinely benefit from.";
+
+/// Delegation-discipline guidance for the `task` subagent tool. Judgment-framed (when to
+/// delegate + hard rules for doing it well) — surfaced in the system prompt because a weak
+/// main model won't learn to delegate from the tool description alone. Only injected when the
+/// `task` tool is actually mounted (see the `subagent_delegation_enabled()` gate in
+/// `coding_persona`, which mirrors the tool-mount switch). The rules encode the two failure
+/// modes the design flagged: vague prompts drift the fast worker model, and parallel workers
+/// on overlapping files collide.
+const SUBAGENT_DELEGATION: &str = "\n\n## DELEGATING WITH `task`:\n\
+You can offload subtasks to isolated-context subagents with the `task` tool. Delegate work \
+that is parallelizable, mechanical, or pure read-only investigation; keep the cross-file \
+reasoning and the final decisions for yourself. Rules: (1) give each subtask a \
+TIGHTLY-specified prompt — exact files, exact change — because the fast worker model drifts \
+on vague instructions; (2) when dispatching several `worker` subtasks at once, give them \
+NON-OVERLAPPING file scopes so they cannot clobber each other; (3) use `explore` (read-only) \
+for 'where/how' investigation and `worker` for edits; mark a subtask `hard` only when it \
+genuinely needs the stronger, slower model — default to the fast model otherwise. After a \
+`worker` finishes, REVIEW its diff before continuing: you own the final result, not the \
+subagent.";
 
 const RULES: &str = "\
 Solve tasks efficiently, minimizing round-trips. Act decisively — go straight to tool calls or answers.
@@ -446,6 +498,24 @@ mod tests {
     }
 
     #[test]
+    fn batch_questions_rule_present_only_when_enabled() {
+        let on = coding_persona("deepseek-v4-flash", false, true);
+        assert!(
+            on.contains("answers them together in one form"),
+            "enabled → batching rule present"
+        );
+        assert!(
+            on.contains("`questions` array"),
+            "enabled → names the questions array"
+        );
+        let off = coding_persona("deepseek-v4-flash", false, false);
+        assert!(
+            !off.contains("answers them together in one form"),
+            "disabled → batching rule gone with the whole block"
+        );
+    }
+
+    #[test]
     fn brainstorming_bridge_present_only_when_enabled() {
         let on = coding_persona("deepseek-v4-flash", false, true);
         assert!(
@@ -484,6 +554,16 @@ mod tests {
         assert!(
             !frontier.contains("SKILL/PROCESS FIRST"),
             "frontier → untouched"
+        );
+        // DeepSeek's block must also forbid editing files via the shell (the "写着写着跟
+        // sed 干起来" corruption): use edit_file/write_file, never sed. Only in the block.
+        assert!(
+            ds.contains("EDIT WITH THE EDIT TOOL"),
+            "deepseek → discipline block forbids shell-editing (use edit_file, not sed)"
+        );
+        assert!(
+            !frontier.contains("EDIT WITH THE EDIT TOOL"),
+            "frontier → untouched (no execution block)"
         );
     }
 
@@ -1097,6 +1177,46 @@ mod tests {
     }
 
     #[test]
+    fn subagent_delegation_clause_covers_the_delegation_rules() {
+        // Content lock (no global env — `ATOMCODE_SUBAGENT` also drives runtime assembly, so
+        // set_var'ing it here would race concurrent runtime tests and flake them). The clause
+        // must name the tool, both subagent types, the non-overlapping-scopes rule for
+        // parallel workers, and the review-the-diff discipline — the two failure modes the
+        // design flagged (vague prompts drift the fast worker; overlapping workers collide).
+        assert!(SUBAGENT_DELEGATION.contains("## DELEGATING WITH `task`"));
+        assert!(
+            SUBAGENT_DELEGATION.contains("NON-OVERLAPPING"),
+            "parallel workers must get non-overlapping file scopes"
+        );
+        assert!(
+            SUBAGENT_DELEGATION.contains("explore") && SUBAGENT_DELEGATION.contains("worker"),
+            "must name both subagent types"
+        );
+        assert!(
+            SUBAGENT_DELEGATION.contains("REVIEW its diff"),
+            "must direct the main agent to review a worker's diff"
+        );
+    }
+
+    #[test]
+    fn subagent_delegation_is_wired_into_the_persona_and_gated_by_its_mount_switch() {
+        // The clause is appended IFF `subagent_delegation_enabled()` is true, which delegates
+        // to the SAME `parts::subagent_enabled_from_env` gate the `task` tool-mount reads — so
+        // guidance and tool can't disagree. Assert the persona advertises `task` EXACTLY when
+        // that gate is on. Done without mutating the process-global env var — reading the
+        // live gate keeps this correct under either setting while staying flake-free.
+        assert_eq!(
+            coding_persona("glm-5.2", true, false).contains("## DELEGATING WITH `task`"),
+            subagent_delegation_enabled(),
+            "persona advertises `task` exactly when its mount gate is on"
+        );
+        // Gate parity with the tool mount: default ON (unset → on), off only for 0/false/off.
+        assert!(crate::parts::subagent_enabled_from_env(None));
+        assert!(crate::parts::subagent_enabled_from_env(Some("1")));
+        assert!(!crate::parts::subagent_enabled_from_env(Some("0")));
+    }
+
+    #[test]
     #[serial_test::serial(atomcode_memory_tool_env)]
     fn persona_includes_memory_guidance_when_enabled() {
         std::env::remove_var("ATOMCODE_MEMORY_TOOL");
@@ -1154,6 +1274,12 @@ mod tests {
         assert!(
             p.contains("## ASKING THE USER"),
             "guidance must be present when switch is default-on: {p}"
+        );
+        // The anti-echo / anti-loop guidance (root-cause nudge for the "echo a question
+        // to the user in a loop" failure) must be part of this section.
+        assert!(
+            p.contains("shell command") && p.contains("loop"),
+            "asking guidance must warn against printing questions via a shell command: {p}"
         );
     }
 }

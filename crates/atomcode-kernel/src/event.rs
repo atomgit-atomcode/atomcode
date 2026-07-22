@@ -24,6 +24,10 @@ pub enum StopReason {
     /// The `max_continuations` safety fuse tripped (a `offer_continuation` hook
     /// kept injecting continuations with no model agency to stop — a runaway loop).
     MaxContinuations,
+    /// The cross-round repetition fuse tripped: the model emitted byte-identical
+    /// tool call(s) for too many consecutive rounds without progress (e.g. a weak
+    /// model echoing a question to the user instead of ending the turn).
+    RepeatLoop,
     /// The provider failed to open the stream OR errored mid-stream.
     ProviderError,
     /// A liveness `stream_timeout` elapsed waiting for the next stream event.

@@ -140,6 +140,27 @@ impl Tool for EditFileTool {
                     diff,
                 ));
             }
+            // Tier 2: block-anchor match (first+last line anchors, interior drift tolerated).
+            // Absorbs the "model got one interior line slightly wrong" case that otherwise
+            // sends a weak model reaching for `sed`. Unique + ≥half-match guarded.
+            if let Some((anchor_result, _)) =
+                try_block_anchor_replace(&content, &a.old_string, &a.new_string)
+            {
+                if anchor_result != content {
+                    if let Err(e) = tokio::fs::write(&path, &anchor_result).await {
+                        return err(format!(
+                            "edit_file: failed to write {}: {e}",
+                            crate::pathnorm::to_display(&path)
+                        ));
+                    }
+                    let diff = build_compact_diff(&content, &anchor_result);
+                    return ok(format!(
+                        "Edited {} (anchored block match, 1 replacement)\n{}",
+                        crate::pathnorm::to_display(&path),
+                        diff,
+                    ));
+                }
+            }
             return err(format!(
                 "edit_file: old_string not found in {}. The file was NOT modified. Re-read \
                  the file and copy the exact text (including whitespace).",
@@ -225,6 +246,45 @@ fn leading_ws_chars(s: &str) -> usize {
     s.chars().take_while(|c| c.is_whitespace()).count()
 }
 
+/// Re-anchor `new_lines` to the file's REAL indentation at `original_line`: the first
+/// non-empty new line is the anchor, and each line's SIGNED indent offset from it is
+/// re-applied on top of the matched file line's actual leading whitespace (tabs
+/// preserved, multi-byte whitespace counted by CHARACTER). Shared by both fuzzy tiers
+/// ([`try_fuzzy_replace`] and [`try_block_anchor_replace`]).
+fn reanchored_replacement(new_lines: &[&str], original_line: &str) -> Vec<String> {
+    // Anchor indent = the first non-empty line of new_string. Using the first non-empty
+    // line (NOT the min indent) avoids the indent-drift an outdented closing `}` causes.
+    let new_base_indent = new_lines
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| leading_ws_chars(l))
+        .unwrap_or(0);
+    let file_indent = leading_ws_chars(original_line);
+    let file_indent_str: String = original_line.chars().take(file_indent).collect();
+    new_lines
+        .iter()
+        .map(|l| {
+            if l.trim().is_empty() {
+                String::new()
+            } else {
+                let line_indent = leading_ws_chars(l);
+                let signed_relative = line_indent as isize - new_base_indent as isize;
+                let total_indent = if signed_relative >= 0 {
+                    // Same/deeper than anchor: keep the file's indent prefix (preserves the
+                    // tab/space mix) and extend with plain spaces.
+                    format!("{}{}", file_indent_str, " ".repeat(signed_relative as usize))
+                } else {
+                    // Outdented from anchor: drop chars from the tail of the file's indent.
+                    let drop = (-signed_relative) as usize;
+                    let keep = file_indent.saturating_sub(drop);
+                    file_indent_str.chars().take(keep).collect()
+                };
+                format!("{}{}", total_indent, l.trim())
+            }
+        })
+        .collect()
+}
+
 /// Whitespace-normalized fuzzy replace (faithful port of the v1 editor's
 /// `try_fuzzy_replace`). Matches `old_string` against `content` line-by-line with each
 /// line `.trim()`-ed, so a model that reproduced indentation with the wrong whitespace
@@ -282,57 +342,16 @@ fn try_fuzzy_replace(
         return None;
     }
 
-    // Anchor indent = the first non-empty line of new_string. Relative offsets (deeper
-    // OR outdented) are preserved as signed deltas from the file's actual indent. (Using
-    // the first non-empty line rather than the min indent avoids the indent-drift bug
-    // that an outdented closing `}` would otherwise cause.)
+    // Re-anchor the replacement to each match's REAL indentation (see `reanchored_replacement`).
     let new_lines: Vec<&str> = new_string.lines().collect();
-    let new_base_indent = new_lines
-        .iter()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| leading_ws_chars(l))
-        .unwrap_or(0);
-
     let mut result_lines: Vec<String> = content_lines.iter().map(|l| l.to_string()).collect();
-
     let to_replace = if replace_all {
         &matches[..]
     } else {
         &matches[..1]
     };
     for &(start, end) in to_replace.iter().rev() {
-        let original_line = content_lines[start];
-        let file_indent = leading_ws_chars(original_line);
-        let file_indent_str: String = original_line.chars().take(file_indent).collect();
-
-        let replacement: Vec<String> = new_lines
-            .iter()
-            .map(|l| {
-                if l.trim().is_empty() {
-                    String::new()
-                } else {
-                    let line_indent = leading_ws_chars(l);
-                    let signed_relative = line_indent as isize - new_base_indent as isize;
-                    let total_indent = if signed_relative >= 0 {
-                        // Same/deeper than anchor: keep the file's indent prefix
-                        // (preserves the tab/space mix) and extend with plain spaces.
-                        format!(
-                            "{}{}",
-                            file_indent_str,
-                            " ".repeat(signed_relative as usize)
-                        )
-                    } else {
-                        // Outdented from anchor: drop chars from the tail of the file's
-                        // indent prefix.
-                        let drop = (-signed_relative) as usize;
-                        let keep = file_indent.saturating_sub(drop);
-                        file_indent_str.chars().take(keep).collect()
-                    };
-                    format!("{}{}", total_indent, l.trim())
-                }
-            })
-            .collect();
-
+        let replacement = reanchored_replacement(&new_lines, content_lines[start]);
         result_lines.splice(start..end, replacement);
     }
 
@@ -348,6 +367,73 @@ fn try_fuzzy_replace(
     }
     let count = if replace_all { matches.len() } else { 1 };
     Some((result, count))
+}
+
+/// BLOCK-ANCHOR fuzzy replace — the tier below [`try_fuzzy_replace`]. When the model
+/// reproduced a multi-line block but got an INTERIOR line slightly wrong (a typo, a
+/// reordered token, a comment tweak), the whitespace-normalized tier — which requires
+/// EVERY trimmed line to match — fails, and a weak model then resorts to a shell script.
+/// This tier anchors on the FIRST and LAST trimmed lines and tolerates interior drift,
+/// replacing the whole window (re-anchored to the file's real indent via
+/// [`reanchored_replacement`]).
+///
+/// Conservative guards so it can't clobber the wrong block: needs ≥ 3 lines; both
+/// anchors non-empty and ≥ 3 trimmed chars (so a bare `{`/`}` can't anchor); the window
+/// length equals the old block's; at least HALF the lines still match trimmed (a
+/// coincidental anchor hit on an unrelated block is rejected); and the anchored window
+/// must be UNIQUE (no `replace_all` at this tier — guessing which of several to rewrite
+/// is unsafe). Returns `None` on any miss so the caller falls back to the not-found error.
+fn try_block_anchor_replace(
+    content: &str,
+    old_string: &str,
+    new_string: &str,
+) -> Option<(String, usize)> {
+    let old_lines: Vec<&str> = old_string.lines().collect();
+    let n = old_lines.len();
+    if n < 3 {
+        return None; // need first + last anchors AND ≥ 1 interior line
+    }
+    let first = old_lines[0].trim();
+    let last = old_lines[n - 1].trim();
+    if first.chars().count() < 3 || last.chars().count() < 3 {
+        return None; // anchors too short to identify a block safely
+    }
+
+    let content_lines: Vec<&str> = content.lines().collect();
+    let has_trailing_newline = content.ends_with('\n');
+    let mut matches: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i + n <= content_lines.len() {
+        if content_lines[i].trim() == first && content_lines[i + n - 1].trim() == last {
+            // Require ≥ half the lines to still match (trimmed) at their position, so a
+            // block that merely shares first/last lines with an unrelated region is rejected.
+            let matched = (0..n)
+                .filter(|&k| content_lines[i + k].trim() == old_lines[k].trim())
+                .count();
+            if matched * 2 >= n {
+                matches.push(i);
+            }
+        }
+        i += 1;
+    }
+    if matches.len() != 1 {
+        return None; // no match, or ambiguous → let the caller error out
+    }
+
+    let start = matches[0];
+    let new_lines: Vec<&str> = new_string.lines().collect();
+    let replacement = reanchored_replacement(&new_lines, content_lines[start]);
+    let mut result_lines: Vec<String> = content_lines.iter().map(|l| l.to_string()).collect();
+    result_lines.splice(start..start + n, replacement);
+
+    let mut result = result_lines.join("\n");
+    if has_trailing_newline && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    if content.contains("\r\n") {
+        result = coerce_eol(&result, "\r\n");
+    }
+    Some((result, 1))
 }
 
 #[cfg(test)]
@@ -685,6 +771,88 @@ mod tests {
     // 3 bytes / 1 char), the old byte-based `file_indent` fed into `chars().take(n)`
     // grabbed content chars into the indent prefix, producing corruption like
     // "\u{3000}x x = 99". The fix (leading_ws_chars) keeps exactly the whitespace.
+    // BLOCK-ANCHOR tier: the model reproduced a multi-line block but got ONE interior
+    // line slightly wrong (`let b = 20;` vs the file's `let b = 2;`) AND used spaces where
+    // the file uses tabs. Exact + whitespace-normalized fuzzy both fail (fuzzy needs EVERY
+    // trimmed line to match). Block-anchor matches on the first/last trimmed lines, replaces
+    // the real window, and re-anchors to the file's tabs — so the model doesn't reach for sed.
+    #[tokio::test]
+    async fn block_anchor_matches_interior_drift_and_preserves_tabs() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("f.rs"),
+            "fn f() {\n\tlet a = 1;\n\tlet b = 2;\n\tlet c = 3;\n}\n",
+        )
+        .unwrap();
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"f.rs","old_string":"    let a = 1;\n    let b = 20;\n    let c = 3;","new_string":"    let a = 1;\n    let b = 99;\n    let c = 3;"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "block-anchor must succeed: {}", r.content);
+        assert!(r.content.contains("anchored block"), "should report an anchored match: {}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("f.rs")).unwrap(),
+            "fn f() {\n\tlet a = 1;\n\tlet b = 99;\n\tlet c = 3;\n}\n",
+            "the intended edit applies with the file's tab indentation preserved"
+        );
+    }
+
+    // Guard: a block that merely SHARES its first/last line with an unrelated region (all
+    // interior lines differ) must be REJECTED (< half match), not clobbered.
+    #[tokio::test]
+    async fn block_anchor_rejects_low_similarity_block() {
+        let d = tempfile::tempdir().unwrap();
+        let original = "start marker\nreal one\nreal two\nreal three\nend marker\n";
+        std::fs::write(d.path().join("a.txt"), original).unwrap();
+        let r = EditFileTool
+            .execute(
+                // first/last match, but all 3 interior lines are wrong → 2/5 < half → reject.
+                r#"{"file_path":"a.txt","old_string":"start marker\nWRONG a\nWRONG b\nWRONG c\nend marker","new_string":"start marker\nX\nend marker"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "a low-similarity block must be refused: {}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            original,
+            "file must be unchanged"
+        );
+    }
+
+    // Guard: two windows share the same first/last anchors → ambiguous → refuse.
+    #[tokio::test]
+    async fn block_anchor_rejects_ambiguous_windows() {
+        let d = tempfile::tempdir().unwrap();
+        let original = "open block\n  middle here\nclose block\n\nopen block\n  other mid\nclose block\n";
+        std::fs::write(d.path().join("a.txt"), original).unwrap();
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"a.txt","old_string":"open block\n  drifted\nclose block","new_string":"open block\n  changed\nclose block"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "ambiguous anchored windows must be refused: {}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), original);
+    }
+
+    // Guard: bare-brace anchors (`{` / `}`, < 3 trimmed chars) can't anchor a block.
+    #[tokio::test]
+    async fn block_anchor_ignores_short_anchors() {
+        let d = tempfile::tempdir().unwrap();
+        let original = "if x {\n\tfoo();\n}\n";
+        std::fs::write(d.path().join("a.rs"), original).unwrap();
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"a.rs","old_string":"{\n    bar();\n}","new_string":"{\n    baz();\n}"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "short brace anchors must not fire: {}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("a.rs")).unwrap(), original);
+    }
+
     #[tokio::test]
     async fn fuzzy_preserves_multibyte_whitespace_indentation() {
         let d = tempfile::tempdir().unwrap();
