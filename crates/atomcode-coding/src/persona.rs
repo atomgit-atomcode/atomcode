@@ -178,7 +178,7 @@ fn model_needs_firm_tool_steering(model: &str) -> bool {
 /// early) was actually reported to slip. GLM is more capable and is deliberately EXCLUDED —
 /// it still gets the tool block but not this one. Add another substring here (by evidence)
 /// if a further model is observed to need it.
-fn model_needs_firm_execution(model: &str) -> bool {
+pub(crate) fn model_needs_firm_execution(model: &str) -> bool {
     model.to_ascii_lowercase().contains("deepseek")
 }
 

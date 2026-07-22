@@ -52,6 +52,7 @@ pub mod telemetry;
 mod assemble;
 mod init_prompt;
 mod rate_limit;
+mod skill_first;
 pub mod subagent_tiers;
 mod todo;
 
