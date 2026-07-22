@@ -12682,7 +12682,7 @@ fn handle_runtime_event(
                 }
                 CodingRuntimeEvent::RuntimeStopped(_) => return,
                 CodingRuntimeEvent::ModeChanged { mode } => {
-                    state.agent_mode = match mode {
+                    let agent_mode = match mode {
                         atomcode_coding::RuntimeMode::Build => crate::state::AgentMode::Build,
                         atomcode_coding::RuntimeMode::AcceptEdits => {
                             crate::state::AgentMode::AcceptEdits
@@ -12690,6 +12690,8 @@ fn handle_runtime_event(
                         atomcode_coding::RuntimeMode::Auto => crate::state::AgentMode::Auto,
                         atomcode_coding::RuntimeMode::Plan => crate::state::AgentMode::Plan,
                     };
+                    state.agent_mode = agent_mode;
+                    atomcode_daemon::live_set_mode(agent_mode);
                     return;
                 }
                 CodingRuntimeEvent::WorkingDirectoryChanged(directory) => {
@@ -13306,7 +13308,7 @@ fn commit_native_session_changed(
             &session.to_conversation_snapshot(),
         );
         Some(
-            atomcode_daemon::native_live::commit_runtime_snapshot(
+            atomcode_daemon::native_live::replace_snapshot(
                 &binding,
                 session_id.clone(),
                 working_dir.clone(),

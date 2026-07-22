@@ -92,6 +92,14 @@ pub fn live_set_provider(provider: String) {
 /// 设置 live 视图审批模式；已绑定 runtime 的调用方另行下发 `SetMode`。
 pub fn live_set_mode(mode: ApprovalMode) {
     *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+    if let Ok(binding) = crate::native_live::binding() {
+        let _ = crate::native_live::publish_unsequenced(
+            &binding,
+            atomcode_coding::CodingRuntimeEvent::ModeChanged {
+                mode: native_runtime_mode(mode),
+            },
+        );
+    }
 }
 
 #[cfg(test)]
