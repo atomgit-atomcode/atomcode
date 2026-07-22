@@ -471,6 +471,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  用法：/undo 或 /undo N（N 为轮次号）。\n".into(),
         Msg::CmdNoChanges =>
             "  （无变更）\n".into(),
+        Msg::CmdDiffTruncated =>
+            "  … diff 输出已截断\n".into(),
         Msg::CmdCheckingUpdate =>
             "  正在检查更新...\n".into(),
         Msg::CmdNoActiveProvider =>

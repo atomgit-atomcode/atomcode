@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, type CommandResult, UserInputRequestEvent } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, type CommandResult, UserInputRequestEvent } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -55,6 +55,20 @@ import {
 } from '../lib/atMention';
 import { toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage } from '../lib/historyMessages';
+import {
+  chatRecoveryPolicy,
+  classifyChatDone,
+  createLiveLifecycleState,
+  isCurrentChatStream,
+  liveDetachDisposition,
+  liveSnapshotQueueDisposition,
+  reduceChatRecovery,
+  reduceLiveLifecycle,
+  restoreLiveSnapshot,
+  syncAttachDisposition,
+  type ChatRecoveryEvent,
+  type ChatRecoveryState,
+} from '../lib/chatTerminal';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -66,6 +80,13 @@ interface Message {
    *  type stays backward-compatible with the few code paths that build a
    *  Message literal without a clock (e.g. the queued-placeholder). */
   ts?: number;
+}
+
+interface QueuedMessage {
+  id: number;
+  text: string;
+  images?: ImageData[];
+  approvalMode: ApprovalMode;
 }
 
 /** Concatenate all text segments (error-detection, skill-title, etc.). */
@@ -407,16 +428,34 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // without a stale closure (refs always reflect the latest render value).
   const busyRef = useRef(false);
   busyRef.current = busy;
+  const [chatRecovery, setChatRecovery] = useState<ChatRecoveryState>('ready');
+  const chatRecoveryRef = useRef<ChatRecoveryState>('ready');
+  chatRecoveryRef.current = chatRecovery;
+  const recoveryPolicy = chatRecoveryPolicy(chatRecovery);
+
+  function transitionChatRecovery(event: ChatRecoveryEvent): ChatRecoveryState {
+    const next = reduceChatRecovery(chatRecoveryRef.current, event);
+    chatRecoveryRef.current = next;
+    setChatRecovery(next);
+    return next;
+  }
   // True for the entire duration of a /compact postCommand await so sendMessage
   // can refuse to fire while the session .json is being rewritten on disk.
   const compactingRef = useRef(false);
   // AI 执行中输入的消息排队于此，待当前回合 done 后依次自动发送（对齐 VSCode 插件）。
-  const [queued, setQueued] = useState<{
-    id: number;
-    text: string;
-    images?: ImageData[];
-    approvalMode: ApprovalMode;
-  }[]>([]);
+  const [queued, setQueuedState] = useState<QueuedMessage[]>([]);
+  const queuedRef = useRef(queued);
+  queuedRef.current = queued;
+  function setQueued(
+    update: QueuedMessage[] | ((current: QueuedMessage[]) => QueuedMessage[]),
+  ) {
+    // SSE callbacks can run before Preact commits the next render. Keep the ref
+    // authoritative synchronously so a reconnect snapshot cannot miss a just-
+    // queued message and accidentally drain it under an unknown terminal.
+    const next = typeof update === 'function' ? update(queuedRef.current) : update;
+    queuedRef.current = next;
+    setQueuedState(next);
+  }
   const queueIdRef = useRef(0);
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
@@ -449,6 +488,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const [sync, setSync] = useState<boolean>(() => {
     try { return new URLSearchParams(location.search).get('sync') === '1'; } catch { return false; }
   });
+  const syncRef = useRef(sync);
+  syncRef.current = sync;
   // Pending live-session permission request (shown as PermissionCard, calls /live/permission).
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
@@ -457,6 +498,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
+  const liveLifecycleRef = useRef(createLiveLifecycleState());
   // Wall-clock of the last byte received on the /live stream (any event OR the
   // 15s keepalive ping). A watchdog reconnects when this goes stale, catching
   // silently-dead half-open connections after long idle.
@@ -476,6 +518,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 当前 Chat 正在显示的会话 id。用于区分「外部切换会话(需重置+加载历史)」
   // 与「本次新建会话首条消息完成后自己拿到的 id(不应重置)」。
   const activeIdRef = useRef<string | null>(null);
+  // Distinguish async work from A -> B -> A session switches. Comparing only
+  // the session id would let the first A's late active-check/cancel result
+  // mutate the replacement A view.
+  const sessionGenerationRef = useRef(0);
+  const renderedSessionIdRef = useRef(sessionId);
+  if (renderedSessionIdRef.current !== sessionId) {
+    // Advance during render, before a passive effect can abort the old reader.
+    // An accepted first-turn `done` pre-binds activeIdRef to its new id, so that
+    // normal null -> canonical-id prop update does not invalidate its own tail.
+    if (activeIdRef.current !== sessionId) sessionGenerationRef.current += 1;
+    renderedSessionIdRef.current = sessionId;
+  }
   // 已为哪个 sessionId 触发过历史加载（或它是本 Chat 自建的会话）。用于避免
   // project_hash 迟到（刷新后由 App 异步回填）导致的重复加载 / 覆盖当前对话。
   const loadedForRef = useRef<string | null>(null);
@@ -507,7 +561,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 会话 id 变化（外部切换 / 新建按钮）才重置画布。本 Chat 自建会话首条消息完成后
     // sessionId 变成自己的 id（activeIdRef 已同步），不重置，以免清空刚看到的对话。
     if (sessionId !== activeIdRef.current) {
+      const switchGeneration = sessionGenerationRef.current;
       const prevId = activeIdRef.current;
+      const detachedRequestId = requestIdRef.current;
+      const detachedController = abortRef.current;
       if (prevId && messagesRef.current.length > 0) {
         messageCacheRef.current.set(prevId, messagesRef.current);
       }
@@ -515,8 +572,32 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       activeIdRef.current = sessionId;
       loadedForRef.current = null;
       optimisticFiredRef.current = false;
-      abortRef.current?.abort();
+      // An existing session stays send-locked until `/chat/active` proves it
+      // has no detached operation. Its canonical id is already a safe stop
+      // alias, including while the discovery request is pending or unavailable.
+      requestIdRef.current = sessionId;
+      abortRef.current = null;
+      transitionChatRecovery({ type: 'session_switch', hasSession: sessionId !== null });
+      if (detachedRequestId) {
+        const cancellation = detachedController
+          ? cancelDetachedChat(detachedRequestId, detachedController)
+          : stopChat(detachedRequestId);
+        void cancellation.catch((error) => {
+          // A -> B -> A can reuse an id. Generation, not id equality, keeps a
+          // late cancellation failure out of the replacement view.
+          if (sessionGenerationRef.current === switchGeneration) {
+            pushCommandNotice(t('chat.cancelFailed', { error: String(error) }));
+          }
+        });
+      } else {
+        detachedController?.abort();
+      }
+      liveLifecycleRef.current = createLiveLifecycleState();
       setBusy(false);
+      setQueued([]);
+      setLivePending(null);
+      setUserInputReq(null);
+      onPermissionResolved?.(null);
 
       const cached = sessionId ? messageCacheRef.current.get(sessionId) : undefined;
       if (cached && cached.length > 0) {
@@ -539,13 +620,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // 故由广播回流引起的 sessionId 变化进不来这个分支（条件已不成立），不会再次广播。
       if (sync && sessionId) {
         postLiveSwitchSession(sessionId).catch((error) => {
+          if (sessionGenerationRef.current !== switchGeneration) return;
+          stopLiveStream();
           setSync(false);
+          setBusy(false);
+          setQueued([]);
           setHistoryHint(t('sync.switchFailed', { error: String(error) }));
         });
       }
     }
 
-    if (!sessionId) return;
+    if (!sessionId) {
+      requestIdRef.current = null;
+      return;
+    }
     // 已为该会话加载过历史（或它是本 Chat 自建会话）→ 不重复加载、不覆盖。
     if (loadedForRef.current === sessionId) return;
 
@@ -564,41 +652,66 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setLoading(true);
     }
     const loadId = sessionId;
-    getSession(projectHash, loadId)
-      .then((detail) => {
-        // 加载期间用户可能已切走，确保结果仍对应当前会话。
-        if (activeIdRef.current !== loadId) return;
-        // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
-        const loaded = sessionMessagesToDisplay(detail.messages);
-        const currentCached = messageCacheRef.current.get(loadId);
+    const loadGeneration = sessionGenerationRef.current;
+    Promise.allSettled([getSession(projectHash, loadId), getActiveChatSessions()])
+      .then(([sessionResult, activeResult]) => {
+        // Generation also covers A -> B -> A; id equality alone is insufficient.
+        if (
+          activeIdRef.current !== loadId ||
+          sessionGenerationRef.current !== loadGeneration
+        ) return;
 
-        if (currentCached && currentCached.length > 0) {
-          // If the loaded messages from the backend are shorter than the cached messages,
-          // it means the backend task is still running or hasn't saved yet.
-          // Keep the cached messages and do not overwrite them with stale backend history.
-          if (loaded.length >= currentCached.length) {
-            setMessages(loaded);
-            messageCacheRef.current.delete(loadId);
-          }
-        } else {
-          if (loaded.length > 0) {
+        let nextHint: string | null = null;
+        if (sessionResult.status === 'fulfilled') {
+          // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
+          const loaded = sessionMessagesToDisplay(sessionResult.value.messages);
+          const currentCached = messageCacheRef.current.get(loadId);
+
+          if (currentCached && currentCached.length > 0) {
+            // If the loaded messages from the backend are shorter than the cached messages,
+            // it means the backend task is still running or hasn't saved yet.
+            // Keep the cached messages and do not overwrite them with stale backend history.
+            if (loaded.length >= currentCached.length) {
+              setMessages(loaded);
+              messageCacheRef.current.delete(loadId);
+            }
+          } else if (loaded.length > 0) {
             // A newly loaded session starts at the bottom regardless of prior scroll state.
             atBottomRef.current = true;
             setMessages(loaded);
-            setHistoryHint(null);
-          } else {
-            // 空会话：不再显示「继续会话」提示，交给落地页（landing）。
-            setHistoryHint(null);
           }
-        }
-        setLoading(false);
-      })
-      .catch(() => {
-        // 失败回退提示，并清掉标记以允许后续重试。
-        if (activeIdRef.current === loadId) {
+        } else {
           loadedForRef.current = null;
-          setHistoryHint(t('chat.continueSession', { id: loadId.slice(0, 8) }));
+          nextHint = t('chat.continueSession', { id: loadId.slice(0, 8) });
         }
+
+        if (activeResult.status === 'fulfilled') {
+          const active = activeResult.value.includes(loadId);
+          transitionChatRecovery({ type: 'active_check_succeeded', active });
+          if (active) {
+            requestIdRef.current = loadId;
+            if (!syncRef.current) setBusy(false);
+            setQueued([]);
+            nextHint = t('chat.detachedActive');
+            pushCommandNotice(t('chat.detachedActive'));
+          } else if (requestIdRef.current === loadId) {
+            requestIdRef.current = null;
+          }
+        } else {
+          // `/chat` has no stream reattach endpoint. The registry is authoritative
+          // when available; if discovery fails, keep the canonical stop alias and
+          // fail closed instead of allowing a possibly concurrent send.
+          requestIdRef.current = loadId;
+          transitionChatRecovery({ type: 'active_check_failed' });
+          if (!syncRef.current) setBusy(false);
+          setQueued([]);
+          nextHint = t('chat.activeCheckFailed', { error: String(activeResult.reason) });
+          pushCommandNotice(nextHint);
+          // Allow a later metadata/session refresh to retry discovery.
+          loadedForRef.current = null;
+        }
+
+        setHistoryHint(nextHint);
         setLoading(false);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -752,7 +865,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       attempt += 1;
       if (attempt > 6) {
         stopLiveStream();
+        liveLifecycleRef.current = createLiveLifecycleState();
         setSync(false);
+        setBusy(false);
+        setQueued([]);
+        setLivePending(null);
+        setUserInputReq(null);
+        setHistoryHint(t('sync.reconnectFailed'));
+        pushNoticeToLastAssistant(t('sync.reconnectFailed'));
         return;
       }
       const delay = Math.min(1000 * 2 ** (attempt - 1), 15000);
@@ -764,7 +884,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     const run = () => {
       const startedAt = Date.now();
       streamLive(
-        onLiveEvent,
+        (event) => {
+          // Abort alone does not retract a callback already queued by the old
+          // reader. Controller identity is the live-stream generation fence.
+          if (liveAbortRef.current === controller && !controller.signal.aborted) {
+            onLiveEvent(event);
+          }
+        },
         controller.signal,
         activeIdRef.current,
         () => {
@@ -887,7 +1013,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'tool_progress': return { type: 'tool_progress', id: e.id, progress: e.progress };
       case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
-      case 'error': return { type: 'error', message: e.message };
       case 'warning': return { type: 'warning', message: e.message };
       case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming, server_message: e.server_message ?? null };
       // NOTE: no artifact_* mapping. This is safe today because the /sync live
@@ -914,22 +1039,25 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       const loaded = sessionMessagesToDisplay(e.messages).map(m => ({ ...m, ts: m.ts ?? Date.now() }));
       // Live snapshot (session switch / reconnect) → start at the bottom.
       atBottomRef.current = true;
-      // The daemon commits the user message into the snapshot at turn START, so
-      // a snapshot ending in a `user` message means a turn is in progress and
-      // its assistant reply is still streaming via the replay/live events that
-      // follow. Append the empty assistant placeholder those events append into
-      // (the live `user` event that normally creates it isn't replayed), and
-      // mark busy — otherwise a mid-turn reconnect drops the in-flight reply,
-      // and a reconnect after the turn finished during a dead window would
-      // otherwise leave `busy` stuck true. Idle snapshots clear busy.
-      const inProgress = loaded.length > 0 && loaded[loaded.length - 1].role === 'user';
-      if (inProgress) {
-        setMessages([...loaded, { role: 'assistant', parts: [], ts: Date.now() }]);
-        setBusy(true);
-      } else {
-        setMessages(loaded.length > 0 ? loaded : []);
-        setBusy(false);
+      // A persisted snapshot does not carry live activity. Replay emits the
+      // authoritative input/state observations immediately after it; only those
+      // may restore `busy`. In particular, a history ending in a user message can
+      // be an already-failed turn and must not manufacture an in-flight reply.
+      const queueDisposition = liveSnapshotQueueDisposition(
+        liveLifecycleRef.current.running || busyRef.current,
+        queuedRef.current.length,
+      );
+      const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, { type: 'snapshot' });
+      liveLifecycleRef.current = lifecycle.state;
+      const restored = restoreLiveSnapshot(loaded);
+      setMessages(restored.messages.length > 0 ? restored.messages : []);
+      setBusy(restored.running);
+      if (queueDisposition.discardQueued) {
+        setQueued([]);
+        pushCommandNotice(t('sync.reconnectTerminalUnknown'));
       }
+      setLivePending(null);
+      setUserInputReq(null);
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
       if (e.provider) {
@@ -942,6 +1070,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，
       // 避免 App 回填 project_hash 时触发重复加载覆盖当前画布。
       if (e.session_id) {
+        if (activeIdRef.current !== e.session_id) {
+          sessionGenerationRef.current += 1;
+        }
         activeIdRef.current = e.session_id;
         loadedForRef.current = e.session_id;
         onSessionId(e.session_id);
@@ -989,6 +1120,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       const alreadyViewing = activeIdRef.current === e.session_id;
       activeIdRef.current = e.session_id;
       if (!alreadyViewing) {
+        sessionGenerationRef.current += 1;
         onSessionId(e.session_id);
         setMessages([]);
         // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
@@ -1017,6 +1149,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     switch (e.type) {
       case 'user': {
+        const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
+          type: 'input_accepted',
+        });
+        liveLifecycleRef.current = lifecycle.state;
+        setBusy(lifecycle.state.running);
         // Append the peer's user message + empty assistant placeholder
         const now = Date.now();
         setMessages((prev) => [
@@ -1027,15 +1164,35 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         break;
       }
       case 'state': {
-        setBusy(e.running);
-        // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
-        // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
-        if (!e.running) {
+        const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
+          type: 'state',
+          running: e.running,
+          stopReason: e.stop_reason,
+          message: e.message,
+        });
+        liveLifecycleRef.current = lifecycle.state;
+        setBusy(lifecycle.state.running);
+        if (lifecycle.terminal) {
+          if (lifecycle.terminal.discardQueued) {
+            setQueued([]);
+            pushNoticeToLastAssistant(t('chat.incomplete', { msg: lifecycle.terminal.detail }));
+          }
+          // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
+          // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
           setLivePending(null);
           setUserInputReq(null);
           // turn 完成后 session 已落盘，通知 App 刷新侧栏列表。
           onLiveTurnDone?.();
         }
+        break;
+      }
+      case 'error': {
+        const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
+          type: 'error',
+          message: e.message,
+        });
+        liveLifecycleRef.current = lifecycle.state;
+        pushNoticeToLastAssistant(t('chat.error', { msg: lifecycle.diagnostic ?? e.message }));
         break;
       }
       case 'permission_request': {
@@ -1067,6 +1224,25 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   function toggleSync() {
     setSync((prev) => {
       const next = !prev;
+      if (next) {
+        const attach = syncAttachDisposition(
+          busyRef.current,
+          chatRecoveryRef.current,
+        );
+        if (!attach.allowed) {
+          pushCommandNotice(t('sync.stopBeforeAttach'));
+          return prev;
+        }
+      }
+      if (!next) {
+        const detach = liveDetachDisposition(
+          liveLifecycleRef.current.running || busyRef.current,
+        );
+        if (!detach.allowed) {
+          pushNoticeToLastAssistant(t('sync.stopBeforeDetach'));
+          return prev;
+        }
+      }
       if (next) {
         // 重新开启同步：先让已绑定的 Coding Runtime 恢复当前会话，再读取 live hub 快照。
         const sid = activeIdRef.current;
@@ -1456,17 +1632,31 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         onPermission(event as PermissionRequestEvent);
         break;
 
-      case 'done':
+      case 'done': {
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
         activeIdRef.current = event.session_id;
         loadedForRef.current = event.session_id;
         onSessionId(event.session_id);
+        const terminal = classifyChatDone({
+          stopReason: event.stop_reason,
+          message: event.message,
+        });
+        if (terminal.discardQueued) {
+          // An abnormal terminal preserves the partial transcript, but queued
+          // input was composed under the assumption that this turn succeeded.
+          // Never execute it automatically after an incomplete turn.
+          setQueued([]);
+          pushNoticeToLastAssistant(t('chat.incomplete', { msg: terminal.detail }));
+        }
+        transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
         break;
+      }
 
       case 'stopped':
+        transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         setQueued([]); // 用户中止：丢弃排队消息（对齐 VSCode 插件）
         onPermissionResolved?.(null);
@@ -1474,6 +1664,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
       case 'error':
         appendToLastAssistant('\n\n' + t('chat.error', { msg: event.message }));
+        transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         setQueued([]); // 出错：丢弃排队消息
         onPermissionResolved?.(null);
@@ -1561,6 +1752,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     images: ImageData[],
     approvalMode: ApprovalMode = modeState.confirmedMode,
   ) {
+    if (!chatRecoveryPolicy(chatRecoveryRef.current).allowSend) {
+      pushCommandNotice(t('chat.recoveryBlocked'));
+      return;
+    }
     // Actually sending a message (immediate OR drained from the queue) re-engages
     // auto-follow — the user wants to see their message + the reply. Placed HERE, not in
     // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
@@ -1615,6 +1810,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     abortRef.current = controller;
     const requestId = crypto.randomUUID();
     requestIdRef.current = requestId;
+    const requestGeneration = sessionGenerationRef.current;
+    let keepStopAlias = false;
 
     try {
       const body = {
@@ -1627,22 +1824,55 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         approval_mode: approvalMode,
       };
 
-      await streamChat(body, handleEvent, controller.signal);
+      await streamChat(
+        body,
+        (event) => {
+          if (
+            isCurrentChatStream(
+              requestId,
+              requestGeneration,
+              requestIdRef.current,
+              sessionGenerationRef.current,
+              controller.signal.aborted,
+            )
+          ) {
+            handleEvent(event);
+          }
+        },
+        controller.signal,
+      );
     } catch (err: unknown) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        // User cancelled
-      } else {
+      const stillCurrent = isCurrentChatStream(
+        requestId,
+        requestGeneration,
+        requestIdRef.current,
+        sessionGenerationRef.current,
+        controller.signal.aborted,
+      );
+      const aborted = err instanceof Error && err.name === 'AbortError';
+      if (!aborted && stillCurrent) {
+        // Transport loss is not a turn terminal. Keep the request alias so the
+        // user can retry the existing stop protocol, but release the visual
+        // busy state and prohibit sends/queue drain until recovery is explicit.
+        keepStopAlias = true;
+        transitionChatRecovery({ type: 'transport_lost' });
         const msg = err instanceof Error ? err.message : String(err);
         appendToLastAssistant('\n\n' + t('chat.connError', { msg }));
       }
-      setBusy(false);
-      setQueued([]); // 连接错误：与 stopped/error 一致，丢弃排队消息
-      // 中止/连接错误时流被掐断，不会再有 done/stopped 事件 → 兜底清掉审批卡片，
-      // 否则点「停止」时若正挂着审批卡片，它会一直残留。
-      onPermissionResolved?.(null);
+      if (stillCurrent) {
+        setBusy(false);
+        setQueued([]); // 连接错误：与 stopped/error 一致，丢弃排队消息
+        // 中止/连接错误时流被掐断，不会再有 done/stopped 事件 → 兜底清掉审批卡片，
+        // 否则点「停止」时若正挂着审批卡片，它会一直残留。
+        onPermissionResolved?.(null);
+      }
     } finally {
-      abortRef.current = null;
-      if (requestIdRef.current === requestId) requestIdRef.current = null;
+      if (abortRef.current === controller) abortRef.current = null;
+      if (
+        requestIdRef.current === requestId &&
+        sessionGenerationRef.current === requestGeneration &&
+        !keepStopAlias
+      ) requestIdRef.current = null;
     }
   }
 
@@ -1665,6 +1895,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           .catch((e) => pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) })));
         return;
       }
+    }
+
+    if (!chatRecoveryPolicy(chatRecoveryRef.current).allowSend) {
+      pushCommandNotice(t('chat.recoveryBlocked'));
+      return;
     }
 
     // 清空输入框（无论立即发送还是排队）。
@@ -1693,13 +1928,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // 当前回合结束(done)后，依次发送排队消息；stopped/error/连接错误已清空队列。
   useEffect(() => {
-    if (busy || queued.length === 0 || modeState.pendingMode) return;
+    if (
+      busy ||
+      queued.length === 0 ||
+      modeState.pendingMode ||
+      !chatRecoveryPolicy(chatRecoveryRef.current).allowQueueDrain
+    ) return;
     const next = queued[0];
     setQueued((q) => q.slice(1));
     void deliver(next.text, next.images ?? [], next.approvalMode);
     // deliver 为组件内函数声明，闭包始终取最新渲染值；仅以 busy/queued 触发。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy, queued, modeState.pendingMode]);
+  }, [busy, queued, modeState.pendingMode, chatRecovery]);
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.isComposing) return;
@@ -1760,18 +2000,34 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   async function handleStop() {
     try {
-      if (sync) {
+      const recoveryNeedsStop = chatRecoveryPolicy(
+        chatRecoveryRef.current,
+      ).allowStop;
+      if (requestIdRef.current && (!sync || recoveryNeedsStop)) {
+        const requestAlias = requestIdRef.current;
+        const detached = abortRef.current === null;
+        await stopChat(requestAlias);
+        if (detached && requestIdRef.current === requestAlias) {
+          transitionChatRecovery({ type: 'stop_succeeded' });
+          requestIdRef.current = null;
+          if (!sync) setBusy(false);
+          setQueued([]);
+          onPermissionResolved?.(null);
+          pushCommandNotice(t('chat.detachedStopped'));
+        }
+      } else if (sync) {
         await postLiveStop();
-      } else if (requestIdRef.current) {
-        await stopChat(requestIdRef.current);
       }
-    } catch {
-      // If the cancellation endpoint itself is unavailable, at least restore
-      // the local UI instead of leaving the stop button stuck indefinitely.
-      abortRef.current?.abort();
-      setBusy(false);
+    } catch (error) {
       setQueued([]);
-      onPermissionResolved?.(null);
+      pushNoticeToLastAssistant(t('chat.cancelFailed', { error: String(error) }));
+      if (!sync) {
+        // Keep an attached stream alive so a later authoritative terminal can
+        // still recover it. A detached stream has no reattach path, so it stays
+        // explicitly locked with its stop alias available for retry.
+        transitionChatRecovery({ type: 'stop_failed' });
+        if (abortRef.current === null) setBusy(false);
+      }
     }
   }
 
@@ -2194,10 +2450,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           onChange={(p) => switchProvider(p)}
           onDefaultChange={followDefaultProvider}
         />
-        {busy ? (
+        {busy || recoveryPolicy.allowStop ? (
           <>
             {/* 执行中仍可发送：按下即排队，当前回合结束后自动发出。 */}
-            {(input.trim() || pendingImages.length > 0) && (
+            {recoveryPolicy.allowSend && (input.trim() || pendingImages.length > 0) && (
               <button
                 class="btn-send"
                 onClick={sendMessage}
@@ -2216,9 +2472,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           <button
             class="btn-send"
             onClick={sendMessage}
-            disabled={Boolean(modeState.pendingMode) || (!input.trim() && pendingImages.length === 0)}
-            title={t('chat.send')}
-            aria-label={t('chat.send')}
+            disabled={!recoveryPolicy.allowSend || Boolean(modeState.pendingMode) || (!input.trim() && pendingImages.length === 0)}
+            title={recoveryPolicy.allowSend ? t('chat.send') : t('chat.recoveryBlocked')}
+            aria-label={recoveryPolicy.allowSend ? t('chat.send') : t('chat.recoveryBlocked')}
           >
             ↑
           </button>

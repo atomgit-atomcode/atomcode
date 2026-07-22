@@ -173,6 +173,7 @@ export interface ChatState {
   messages: ChatMessage[];
   queuedMessages: ChatMessage[];
   isGenerating: boolean;
+  recoveryLocked: boolean;
   isSessionList: boolean;
   viewMode: 'sidebar' | 'tab';
   currentModel: string;
@@ -200,6 +201,11 @@ export interface ChatState {
   approvalModePending: boolean;
 }
 
+export type SessionTerminalState =
+  | { type: 'done'; tokens?: number; toolCalls?: number; sessionId?: string; stopReason?: string; message?: string }
+  | { type: 'stopped' }
+  | { type: 'error'; message: string };
+
 // ─── Actions dispatched by the reducer ──────────────────────────
 
 export type ChatAction =
@@ -222,9 +228,11 @@ export type ChatAction =
   | { type: 'ARTIFACT_END'; id: string }
   | { type: 'SET_TOKENS'; prompt: number; completion: number; total: number }
   | { type: 'GENERATION_DONE'; tokens?: number }
-  | { type: 'LOAD_SESSION_MESSAGES'; messages: Array<{ role: string; content: unknown; synthetic?: boolean; internal_origin?: string; internalOrigin?: string; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }> }
+  | { type: 'LOAD_SESSION_MESSAGES'; messages: Array<{ role: string; content: unknown; synthetic?: boolean; internal_origin?: string; internalOrigin?: string; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }>; terminal?: SessionTerminalState }
   | { type: 'GENERATION_STOPPED' }
   | { type: 'GENERATION_ERROR'; message: string }
+  | { type: 'RECOVERY_REQUIRED' }
+  | { type: 'RECOVERY_CLEARED' }
   | { type: 'CLEAR_CHAT' }
   | { type: 'SET_MODELS'; models: ModelInfo[] }
   | { type: 'SET_PROVIDERS'; providers: ProviderInfo[]; defaultProvider?: string }
@@ -250,14 +258,15 @@ export type ChatAction =
   | { type: 'SEARCH_NEXT' }
   | { type: 'SEARCH_PREV' }
   | { type: 'RESUME_STREAMING' }
-  | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string; approvalMode?: ApprovalMode; approvalModePending?: boolean };
+  | { type: 'INIT'; generating: boolean; recoveryLocked?: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string; approvalMode?: ApprovalMode; approvalModePending?: boolean };
 
 // ─── Messages from the VS Code extension host ──────────────────
 
 export type ExtensionMessage =
-  | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string; approvalMode?: ApprovalMode; approvalModePending?: boolean }
+  | { type: 'init'; generating: boolean; recoveryLocked?: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string; approvalMode?: ApprovalMode; approvalModePending?: boolean }
   | { type: 'userMessage'; text: string; images?: ImageData[] }
   | { type: 'queuedMessageSent'; id: string }
+  | { type: 'clearQueuedMessages' }
   | { type: 'assistantMessage'; text: string }
   | { type: 'generationStarted' }
   | { type: 'text'; content: string }
@@ -271,10 +280,12 @@ export type ExtensionMessage =
   | { type: 'artifactContent'; id: string; content: string }
   | { type: 'artifactEnd'; id: string }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
-  | { type: 'done'; tokens?: number; toolCalls?: number; sessionId?: string }
-  | { type: 'sessionMessages'; messages: Array<{ role: string; content: unknown; synthetic?: boolean; internal_origin?: string; internalOrigin?: string; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }> }
+  | { type: 'done'; tokens?: number; toolCalls?: number; sessionId?: string; stopReason?: string; message?: string }
+  | { type: 'sessionMessages'; messages: Array<{ role: string; content: unknown; synthetic?: boolean; internal_origin?: string; internalOrigin?: string; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }>; terminal?: SessionTerminalState }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
+  | { type: 'recoveryRequired' }
+  | { type: 'recoveryCleared' }
   | { type: 'generationStopped' }
   | { type: 'clearChat' }
   | { type: 'focusInput' }

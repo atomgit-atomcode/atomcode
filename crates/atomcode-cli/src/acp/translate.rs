@@ -70,7 +70,12 @@ use atomcode_kernel::event::StopReason as KStop;
 pub fn stop_reason(r: KStop) -> Result<AcpStop, &'static str> {
     match r {
         KStop::Stopped => Ok(AcpStop::EndTurn),
-        KStop::MaxRounds | KStop::MaxContinuations => Ok(AcpStop::MaxTurnRequests),
+        KStop::MaxRounds
+        | KStop::MaxContinuations
+        | KStop::RepeatLoop
+        | KStop::ToolLoopDetected => {
+            Ok(AcpStop::MaxTurnRequests)
+        }
         KStop::Cancelled => Ok(AcpStop::Cancelled),
         KStop::PromptRejected => Ok(AcpStop::Refusal),
         KStop::ProviderError => Err("provider error"),
@@ -162,6 +167,11 @@ mod tests {
             stop_reason(K::MaxContinuations).unwrap(),
             Acp::MaxTurnRequests
         );
+        assert_eq!(
+            stop_reason(K::ToolLoopDetected).unwrap(),
+            Acp::MaxTurnRequests
+        );
+        assert_eq!(stop_reason(K::RepeatLoop).unwrap(), Acp::MaxTurnRequests);
         assert_eq!(stop_reason(K::Cancelled).unwrap(), Acp::Cancelled);
         assert_eq!(stop_reason(K::PromptRejected).unwrap(), Acp::Refusal);
         assert!(stop_reason(K::ProviderError).is_err());

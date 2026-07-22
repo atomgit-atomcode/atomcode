@@ -393,7 +393,8 @@ impl UserInputBatch {
             .iter()
             .map(|p| {
                 if Self::panel_answered(p) {
-                    p.build_response().unwrap_or_else(UserInputResponse::declined)
+                    p.build_response()
+                        .unwrap_or_else(UserInputResponse::declined)
                 } else {
                     UserInputResponse::declined()
                 }
@@ -407,7 +408,10 @@ impl UserInputBatch {
         match p.build_response() {
             Some(r) => {
                 !r.selected.is_empty()
-                    || r.text.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false)
+                    || r.text
+                        .as_deref()
+                        .map(|t| !t.trim().is_empty())
+                        .unwrap_or(false)
             }
             None => false,
         }
@@ -665,7 +669,7 @@ pub struct UiState {
     /// `explore#4 · grep unwrap`), set from marker-prefixed progress chunks and
     /// spliced into the spinner label in-place so a multi-minute fan-out isn't a
     /// silent `Pondering…`. `None` when no subtask activity is current; cleared
-    /// when the `task` tool finishes and at every turn end/cancel/error.
+    /// when the `task` tool finishes and at every authoritative turn terminal.
     pub subagent_activity: Option<String>,
     /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
     /// When false, `tick_spinner` and the spinner-label ellipsis fall
@@ -710,7 +714,7 @@ pub struct UiState {
     /// Cleared lazily: the first delta after [`UiState::response_finalized`]
     /// wipes it, so between turns it still holds the last reply for `/copy`.
     pub last_assistant_response: String,
-    /// Set on TurnComplete / TurnCancelled / Error to seal
+    /// Set on an authoritative turn terminal to seal
     /// `last_assistant_response`; the next turn's first delta clears it.
     pub response_finalized: bool,
     /// The failure reason (provider `Error` / `RateLimited`) captured for the
@@ -748,7 +752,7 @@ pub struct UiState {
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
     /// When the current turn started. Set by on_submit, cleared on
-    /// turn-complete / turn-cancelled / error. Used to surface the
+    /// turn-complete / turn-cancelled. Used to surface the
     /// total wall-clock duration in the TurnComplete event payload.
     pub turn_started_at: Option<std::time::Instant>,
     /// When the current phase began. Reset on every phase transition
@@ -756,7 +760,7 @@ pub struct UiState {
     /// on_tool_call_started) so the spinner shows time spent on the
     /// CURRENT operation — `Pondering… 12s`, `Running ReadFile… 4s`
     /// — instead of accumulating over the whole turn. Cleared on
-    /// turn-complete / turn-cancelled / error so the idle spinner
+    /// turn-complete / turn-cancelled so the idle spinner
     /// (rare) doesn't tick a stale duration.
     pub phase_started_at: Option<std::time::Instant>,
     /// When the last stream activity (any foreground agent event) was observed.
@@ -786,8 +790,7 @@ pub struct UiState {
     /// Re-attached on `VisionPreprocessFailed` so the user can retry without
     /// re-pasting. Overwritten each image-carrying submit; only read on
     /// failure. Parallel vecs (aligned by index).
-    pub last_submitted_pasted_images:
-        Vec<atomcode_core::conversation::message::ImagePart>,
+    pub last_submitted_pasted_images: Vec<atomcode_core::conversation::message::ImagePart>,
     pub last_submitted_pasted_markers: Vec<usize>,
     /// `/context` dispatched a `RefreshContextStats` command and is
     /// waiting for the resulting rich ContextStats event to render the
@@ -948,9 +951,9 @@ pub struct PendingSeparator {
     /// Whether the turn ran inside an active `/loop` (decides `⚡ loop round N`
     /// vs the normal summary when flushed mid-loop).
     pub was_loop_round: bool,
-    /// Whether the turn ended with `TurnStopReason::Error`. Lets the deferred
-    /// flush render the ✗ "stopped" summary instead of a celebratory ✓ under
-    /// the red Error line (preserves the pre-/goal-merge behaviour).
+    /// Whether the turn ended abnormally (error, cancellation, or a safety
+    /// limit). Lets the deferred flush render the ✗ "stopped" summary instead
+    /// of a celebratory ✓ for an incomplete turn.
     pub errored: bool,
     /// Cache-hit ratio over the turn's input, if the provider reported cached
     /// tokens. `None` ⇒ no annotation. Rendered as `· N% cached`.
@@ -1385,29 +1388,13 @@ impl UiState {
         self.steer_pending = self.steer_pending.saturating_sub(count);
     }
 
+    /// Record a diagnostic error observation without ending the turn locally.
+    ///
+    /// Kernel errors can precede the runtime-owned `TurnFinished` event (for
+    /// example when a safety limit trips). Moving to `Idle` here would let the
+    /// event loop submit type-ahead input into a turn that is still active.
     pub fn on_error(&mut self) {
-        self.phase = UiPhase::Idle;
-        self.spinner_label.clear();
-        self.compacting = false;
-        self.compaction_forced_streaming = false;
-        self.turn_started_at = None;
-        self.phase_started_at = None;
-        self.subagent_activity = None;
-        // Parity with on_turn_complete/on_turn_cancelled: clear the blank-turn
-        // flags so an errored turn can't leak a stale notice into a reused turn.
-        self.turn_rendered_visible_text = false;
-        self.turn_saw_reasoning = false;
-        self.approval_panel = None;
-        self.user_input_panel = None;
-        self.user_input_batch = None;
-        self.steer_pending = 0;
-        // The todo panel is per-session, not per-turn: it survives turn
-        // termination (mirrors on_turn_complete). Clearing it here nuked the
-        // plan, and a "继续" turn only sends incremental todowrite updates that
-        // fold against the existing panel (a no-op on an empty base), so the
-        // panel could never rebuild — it stayed gone while the model kept
-        // executing. Only a session switch / new session / explicit clear drops
-        // `active_todos` + `todo_titles`.
+        // The authoritative terminal owns all phase and per-turn cleanup.
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
@@ -2241,11 +2228,11 @@ mod tests {
     }
 
     #[test]
-    fn error_returns_to_idle() {
+    fn error_is_diagnostic_until_the_authoritative_terminal() {
         let mut s = UiState::new();
         s.on_submit();
         s.on_error();
-        assert_eq!(s.phase, UiPhase::Idle);
+        assert_eq!(s.phase, UiPhase::Streaming);
     }
 
     #[test]
@@ -2668,7 +2655,12 @@ mod tests {
         assert_eq!(st.steer_pending, 0, "cleared on cancel");
         st.on_steer_sent();
         st.on_error();
-        assert_eq!(st.steer_pending, 0, "cleared on error");
+        assert_eq!(
+            st.steer_pending, 1,
+            "a diagnostic error must not clean up a still-active turn"
+        );
+        st.on_turn_complete();
+        assert_eq!(st.steer_pending, 0, "cleared by the terminal");
         st.on_steer_sent();
         st.on_submit();
         assert_eq!(st.steer_pending, 0, "a fresh turn starts at 0");

@@ -668,6 +668,7 @@ pub async fn run(
     );
     let bg_manager = event_loop::bg_runtime::BgRuntimeManager::new(
         current_session.clone(),
+        working_dir.clone(),
         foreground_runtime_id,
         event_loop::RuntimeEndpoint {
             native: runtime.clone(),
@@ -747,6 +748,7 @@ pub async fn run(
         foreground_runtime_id,
         runtime_event_tx,
         runtime_event_rx,
+        foreground_replay_events: std::collections::VecDeque::new(),
         working_dir,
         previous_dir: None,
         recent_dirs,

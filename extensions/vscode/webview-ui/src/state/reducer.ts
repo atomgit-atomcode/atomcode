@@ -11,6 +11,7 @@ import type {
   SearchState,
   AuthStatus,
   ProviderInfo,
+  SessionTerminalState,
 } from './types';
 import { blocksFromLegacyMessage } from './blocks';
 import { buildSearchMatches } from '../utils/search';
@@ -294,6 +295,57 @@ function settleOpenTools(
   );
 }
 
+function mergeTerminalIntoHistory(
+  messages: ChatMessage[],
+  terminal?: SessionTerminalState,
+): ChatMessage[] {
+  if (!terminal) return messages;
+  const next = [...messages];
+  const assistantIndex = lastAssistantIndex(next);
+  const assistant = assistantIndex >= 0 ? next[assistantIndex] : undefined;
+
+  if (terminal.type === 'done') {
+    if (assistant) {
+      let settled = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
+      if (terminal.stopReason && terminal.stopReason !== 'stopped') {
+        settled = upsertStatusBlock(settled, {
+          kind: 'warning',
+          message: terminal.message || `The turn ended before completion (${terminal.stopReason}).`,
+        });
+      }
+      next[assistantIndex] = settled;
+    } else if (terminal.stopReason && terminal.stopReason !== 'stopped') {
+      next.push({
+        id: nextId(),
+        role: 'error',
+        text: terminal.message || `The turn ended before completion (${terminal.stopReason}).`,
+        timestamp: Date.now(),
+      });
+    }
+    return next;
+  }
+
+  if (terminal.type === 'stopped') {
+    if (assistant) {
+      next[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
+    }
+    return next;
+  }
+
+  if (assistant) {
+    next[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'error', terminal.message);
+  }
+  if (next.at(-1)?.role !== 'error' || next.at(-1)?.text !== terminal.message) {
+    next.push({
+      id: nextId(),
+      role: 'error',
+      text: terminal.message,
+      timestamp: Date.now(),
+    });
+  }
+  return next;
+}
+
 function updatePermissionBlock(
   message: ChatMessage,
   id: string,
@@ -386,6 +438,7 @@ export const initialState: ChatState = {
   messages: [],
   queuedMessages: [],
   isGenerating: false,
+  recoveryLocked: false,
   isSessionList: document.body.dataset.viewMode === 'sidebar',
   viewMode: document.body.dataset.viewMode === 'sidebar' ? 'sidebar' : 'tab',
   currentModel: 'default',
@@ -502,6 +555,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         isGenerating: true,
+        recoveryLocked: false,
         messages: [...state.messages, assistant],
       };
     }
@@ -510,6 +564,11 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
     // START_GENERATION: create a fresh streaming assistant message that
     // subsequent text/toolStart events will append to.
     case 'RESUME_STREAMING': {
+      if (state.messages.some((message) => message.role === 'assistant' && message.streaming)) {
+        return state.isGenerating && !state.recoveryLocked
+          ? state
+          : { ...state, isGenerating: true, recoveryLocked: false };
+      }
       const assistant: ChatMessage = {
         id: nextId(),
         role: 'assistant',
@@ -522,6 +581,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         isGenerating: true,
+        recoveryLocked: false,
         messages: [...state.messages, assistant],
       };
     }
@@ -541,12 +601,15 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        const tools: ToolCallData[] = action.calls.map((c) => ({
-          id: c.id,
-          name: c.name,
-          args: c.args,
-          status: 'queued' as const,
-        }));
+        const existingIds = new Set((assistant.toolCalls ?? []).map((tool) => tool.id));
+        const tools: ToolCallData[] = action.calls
+          .filter((call) => !existingIds.has(call.id))
+          .map((c) => ({
+            id: c.id,
+            name: c.name,
+            args: c.args,
+            status: 'queued' as const,
+          }));
         msgs[assistantIndex] = {
           ...assistant,
           toolCalls: [...(assistant.toolCalls ?? []), ...tools],
@@ -759,6 +822,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         isGenerating: false,
+        recoveryLocked: false,
         messages: msgs,
         tokenCount,
       };
@@ -771,7 +835,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       if (assistant) {
         msgs[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
       }
-      return { ...state, isGenerating: false, messages: msgs, queuedMessages: [] };
+      return { ...state, isGenerating: false, recoveryLocked: false, messages: msgs, queuedMessages: [] };
     }
 
     case 'GENERATION_ERROR': {
@@ -787,12 +851,18 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
         text: action.message,
         timestamp: Date.now(),
       };
-      return { ...state, isGenerating: false, messages: [...msgs, errMsg], queuedMessages: [] };
+      return { ...state, isGenerating: false, recoveryLocked: false, messages: [...msgs, errMsg], queuedMessages: [] };
     }
+
+    case 'RECOVERY_REQUIRED':
+      return { ...state, recoveryLocked: true, queuedMessages: [] };
+
+    case 'RECOVERY_CLEARED':
+      return { ...state, recoveryLocked: false };
 
     // ─── Session management ─────────────────────────
     case 'CLEAR_CHAT':
-      return { ...state, messages: [], queuedMessages: [], tokenCount: undefined, contextFiles: [], isGenerating: false };
+      return { ...state, messages: [], queuedMessages: [], tokenCount: undefined, contextFiles: [], isGenerating: false, recoveryLocked: false };
 
     case 'SET_MODELS': {
       const hasCurrent = action.models.some((m) => m.provider === state.currentProvider);
@@ -884,7 +954,8 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         activeSessionId: action.sessionId,
-        activeProjectHash: action.projectHash,
+        activeProjectHash: action.projectHash
+          ?? (action.sessionId === state.activeSessionId ? state.activeProjectHash : undefined),
       };
 
     // ─── Context files ──────────────────────────────
@@ -1010,7 +1081,11 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
         };
         messages.push({ ...message, blocks: role === 'assistant' ? blocksFromLegacyMessage(message) : undefined });
       }
-      return { ...state, messages, isGenerating: false };
+      return {
+        ...state,
+        messages: mergeTerminalIntoHistory(messages, action.terminal),
+        isGenerating: false,
+      };
     }
 
     case 'SET_SEARCH_QUERY': {
@@ -1110,6 +1185,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         isGenerating: action.generating,
+        recoveryLocked: action.recoveryLocked ?? false,
         currentModel: action.currentModel ?? state.currentModel,
         viewMode: action.viewMode ?? state.viewMode,
         activeSessionId: action.activeSessionId ?? state.activeSessionId,

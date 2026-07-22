@@ -877,6 +877,9 @@ pub(crate) struct PendingSessionTransition {
 pub(crate) enum SessionTransitionEffect {
     #[default]
     None,
+    CdCommand {
+        echo: String,
+    },
     EnterWorktree {
         original_dir: PathBuf,
     },
@@ -897,7 +900,7 @@ impl SessionTransitionEffect {
         match self {
             Self::EnterWorktree { original_dir } => *marker = Some(original_dir.clone()),
             Self::LeaveWorktree { .. } | Self::CleanupCurrentWorktree { .. } => *marker = None,
-            Self::None => {}
+            Self::None | Self::CdCommand { .. } => {}
         }
     }
 }
@@ -994,6 +997,12 @@ mod session_resume_tests {
 
         assert_eq!(marker, None);
         enter.commit_marker(&mut marker);
+        assert_eq!(marker, Some(original.clone()));
+
+        let cd = SessionTransitionEffect::CdCommand {
+            echo: "/cd /other".into(),
+        };
+        cd.commit_marker(&mut marker);
         assert_eq!(marker, Some(original.clone()));
 
         let leave = SessionTransitionEffect::LeaveWorktree {
@@ -1096,6 +1105,144 @@ fn provider_transition_blocks_queue_drain(
     provider_transition_pending || drain_blocked_until_ready(live, availability)
 }
 
+/// What an observed runtime event is allowed to do to the type-ahead queue.
+///
+/// Kernel `AgentEvent::Error` is deliberately absent: it is diagnostic and can
+/// precede the runtime-owned turn terminal. Only `TurnFinished(Stopped)` opens
+/// one FIFO drain slot; every other authoritative terminal drops queued work so
+/// an incomplete turn cannot silently start another one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeAheadQueueAction {
+    None,
+    DrainOne,
+    Clear,
+}
+
+fn stop_reason_queue_action(reason: atomcode_kernel::event::StopReason) -> TypeAheadQueueAction {
+    if matches!(reason, atomcode_kernel::event::StopReason::Stopped) {
+        TypeAheadQueueAction::DrainOne
+    } else {
+        TypeAheadQueueAction::Clear
+    }
+}
+
+fn native_queue_action(event: &CodingRuntimeEvent) -> TypeAheadQueueAction {
+    match event {
+        CodingRuntimeEvent::TurnFinished(atomcode_coding::TurnCompletion::Completed {
+            reason,
+            ..
+        }) => stop_reason_queue_action(*reason),
+        CodingRuntimeEvent::TurnFinished(
+            atomcode_coding::TurnCompletion::SnapshotUnavailable { .. },
+        )
+        | CodingRuntimeEvent::RuntimeStopped(_) => TypeAheadQueueAction::Clear,
+        _ => TypeAheadQueueAction::None,
+    }
+}
+
+fn type_ahead_queue_action(event: &bg_runtime::RuntimeEventPayload) -> TypeAheadQueueAction {
+    match event {
+        bg_runtime::RuntimeEventPayload::Native(event) => native_queue_action(event),
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => {
+            native_queue_action(&envelope.event)
+        }
+        // Transitional UI terminals may close presentation state, but they are
+        // not runtime-owned proof that a new submit is safe.
+        bg_runtime::RuntimeEventPayload::Ui(
+            AgentEvent::TurnComplete { .. } | AgentEvent::TurnCancelled { .. },
+        ) => TypeAheadQueueAction::Clear,
+        _ => TypeAheadQueueAction::None,
+    }
+}
+
+/// What a runtime event is allowed to do to a fixed-interval prompt loop.
+/// A normal runtime-owned terminal releases the next scheduled iteration;
+/// every authoritative failure tears the loop down. Presentation-only natural
+/// completion deliberately does neither and therefore cannot race ahead of
+/// `TurnFinished`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixedIntervalLoopAction {
+    None,
+    Release,
+    Clear,
+}
+
+fn fixed_interval_loop_action(event: &bg_runtime::RuntimeEventPayload) -> FixedIntervalLoopAction {
+    match event {
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => fixed_interval_loop_action(
+            &bg_runtime::RuntimeEventPayload::Native(envelope.event.clone()),
+        ),
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+            atomcode_coding::TurnCompletion::Completed { reason, .. },
+        )) => {
+            if matches!(reason, atomcode_kernel::event::StopReason::Stopped) {
+                FixedIntervalLoopAction::Release
+            } else {
+                FixedIntervalLoopAction::Clear
+            }
+        }
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+            atomcode_coding::TurnCompletion::SnapshotUnavailable { .. },
+        ))
+        | bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::RuntimeStopped(_))
+        | bg_runtime::RuntimeEventPayload::Ui(AgentEvent::TurnCancelled { .. }) => {
+            FixedIntervalLoopAction::Clear
+        }
+        bg_runtime::RuntimeEventPayload::Ui(AgentEvent::TurnComplete { stop_reason, .. }) => {
+            if matches!(stop_reason, ui_event::UiTurnStopReason::Natural) {
+                FixedIntervalLoopAction::None
+            } else {
+                FixedIntervalLoopAction::Clear
+            }
+        }
+        _ => FixedIntervalLoopAction::None,
+    }
+}
+
+fn apply_fixed_interval_loop_action(
+    action: FixedIntervalLoopAction,
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+) {
+    match action {
+        FixedIntervalLoopAction::None => {}
+        FixedIntervalLoopAction::Release => {
+            if let Some(controller) = ctx.loop_ctrl.as_mut() {
+                controller.mark_turn_stopped_normally();
+            }
+        }
+        FixedIntervalLoopAction::Clear => {
+            ctx.loop_ctrl = None;
+            state.loop_label = None;
+            state.loop_round = 0;
+            state.loop_started_at = None;
+        }
+    }
+}
+
+fn apply_type_ahead_queue_action<T>(
+    action: TypeAheadQueueAction,
+    queue: &mut VecDeque<T>,
+    drain_authorized: &mut bool,
+) {
+    match action {
+        TypeAheadQueueAction::None => {}
+        TypeAheadQueueAction::DrainOne => *drain_authorized = true,
+        TypeAheadQueueAction::Clear => {
+            queue.clear();
+            *drain_authorized = false;
+        }
+    }
+}
+
+fn pop_authorized_type_ahead<T>(queue: &mut VecDeque<T>, drain_authorized: &mut bool) -> Option<T> {
+    if !*drain_authorized {
+        return None;
+    }
+    *drain_authorized = false;
+    queue.pop_front()
+}
+
 fn is_provider_reload_failure(event: &bg_runtime::RuntimeEventPayload) -> bool {
     match event {
         bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::ProviderReloadFinished(
@@ -1112,6 +1259,249 @@ fn is_provider_reload_failure(event: &bg_runtime::RuntimeEventPayload) -> bool {
 #[cfg(test)]
 mod submit_hold_tests {
     use super::*;
+
+    fn native_turn_finished(
+        reason: atomcode_kernel::event::StopReason,
+    ) -> bg_runtime::RuntimeEventPayload {
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+            atomcode_coding::TurnCompletion::Completed {
+                turn_id: 1,
+                reason,
+                snapshot: std::sync::Arc::new(atomcode_kernel::message::SessionSnapshot::new(
+                    Vec::new(),
+                )),
+                stats: Default::default(),
+            },
+        ))
+    }
+
+    #[test]
+    fn only_natural_turn_terminal_authorizes_type_ahead_drain() {
+        assert_eq!(
+            type_ahead_queue_action(&native_turn_finished(
+                atomcode_kernel::event::StopReason::Stopped,
+            )),
+            TypeAheadQueueAction::DrainOne
+        );
+        assert_eq!(
+            type_ahead_queue_action(&native_turn_finished(
+                atomcode_kernel::event::StopReason::MaxRounds,
+            )),
+            TypeAheadQueueAction::Clear
+        );
+
+        let presentation_only = bg_runtime::RuntimeEventPayload::Ui(AgentEvent::TurnComplete {
+            duration: Duration::default(),
+            total_tokens: 0,
+            turn_count: 0,
+            tool_call_count: 0,
+            stop_reason: ui_event::UiTurnStopReason::Natural,
+            snapshot: Default::default(),
+        });
+        assert_eq!(
+            type_ahead_queue_action(&presentation_only),
+            TypeAheadQueueAction::Clear
+        );
+
+        let snapshot_unavailable =
+            bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+                atomcode_coding::TurnCompletion::SnapshotUnavailable {
+                    turn_id: 1,
+                    reason: atomcode_kernel::event::StopReason::Stopped,
+                    error: atomcode_coding::RuntimeSnapshotError {
+                        message: "snapshot failed".into(),
+                    },
+                    stats: Default::default(),
+                },
+            ));
+        assert_eq!(
+            type_ahead_queue_action(&snapshot_unavailable),
+            TypeAheadQueueAction::Clear
+        );
+    }
+
+    #[test]
+    fn max_rounds_continuations_and_tool_loop_clear_type_ahead() {
+        for reason in [
+            atomcode_kernel::event::StopReason::MaxRounds,
+            atomcode_kernel::event::StopReason::MaxContinuations,
+            atomcode_kernel::event::StopReason::RepeatLoop,
+            atomcode_kernel::event::StopReason::ToolLoopDetected,
+            atomcode_kernel::event::StopReason::Cancelled,
+            atomcode_kernel::event::StopReason::ProviderError,
+            atomcode_kernel::event::StopReason::Timeout,
+            atomcode_kernel::event::StopReason::PromptRejected,
+            atomcode_kernel::event::StopReason::RateLimited,
+        ] {
+            assert_eq!(
+                stop_reason_queue_action(reason),
+                TypeAheadQueueAction::Clear
+            );
+        }
+        assert_eq!(
+            stop_reason_queue_action(atomcode_kernel::event::StopReason::Stopped),
+            TypeAheadQueueAction::DrainOne
+        );
+    }
+
+    #[test]
+    fn agent_error_is_diagnostic_and_does_not_touch_type_ahead() {
+        let event = bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+            atomcode_kernel::event::AgentEvent::Error {
+                message: "round limit reached".into(),
+                http_status: None,
+                code: None,
+            },
+        ));
+        assert_eq!(type_ahead_queue_action(&event), TypeAheadQueueAction::None);
+
+        let mut queue = VecDeque::from(["next"]);
+        let mut authorized = false;
+        apply_type_ahead_queue_action(TypeAheadQueueAction::None, &mut queue, &mut authorized);
+        assert_eq!(queue, VecDeque::from(["next"]));
+        assert!(!authorized);
+    }
+
+    #[test]
+    fn fixed_interval_loop_continues_only_after_authoritative_stopped() {
+        assert_eq!(
+            fixed_interval_loop_action(&native_turn_finished(
+                atomcode_kernel::event::StopReason::Stopped,
+            )),
+            FixedIntervalLoopAction::Release
+        );
+        for reason in [
+            atomcode_kernel::event::StopReason::MaxRounds,
+            atomcode_kernel::event::StopReason::MaxContinuations,
+            atomcode_kernel::event::StopReason::RepeatLoop,
+            atomcode_kernel::event::StopReason::ToolLoopDetected,
+            atomcode_kernel::event::StopReason::ProviderError,
+            atomcode_kernel::event::StopReason::Timeout,
+            atomcode_kernel::event::StopReason::Cancelled,
+            atomcode_kernel::event::StopReason::PromptRejected,
+            atomcode_kernel::event::StopReason::RateLimited,
+        ] {
+            assert_eq!(
+                fixed_interval_loop_action(&native_turn_finished(reason)),
+                FixedIntervalLoopAction::Clear
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_and_runtime_stop_fail_closed_even_if_snapshot_reason_is_stopped() {
+        let snapshot_unavailable =
+            bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+                atomcode_coding::TurnCompletion::SnapshotUnavailable {
+                    turn_id: 1,
+                    reason: atomcode_kernel::event::StopReason::Stopped,
+                    error: atomcode_coding::RuntimeSnapshotError {
+                        message: "snapshot failed".into(),
+                    },
+                    stats: Default::default(),
+                },
+            ));
+        assert_eq!(
+            fixed_interval_loop_action(&snapshot_unavailable),
+            FixedIntervalLoopAction::Clear
+        );
+
+        let runtime_stopped = bg_runtime::RuntimeEventPayload::Native(
+            CodingRuntimeEvent::RuntimeStopped(atomcode_coding::RuntimeExit {
+                reason: atomcode_coding::RuntimeExitReason::OwnerStopped,
+                forced: false,
+            }),
+        );
+        assert_eq!(
+            fixed_interval_loop_action(&runtime_stopped),
+            FixedIntervalLoopAction::Clear
+        );
+    }
+
+    #[test]
+    fn legacy_turn_complete_respects_stop_reason_without_authorizing_continuation() {
+        let legacy = |stop_reason| {
+            bg_runtime::RuntimeEventPayload::Ui(AgentEvent::TurnComplete {
+                duration: Duration::default(),
+                total_tokens: 0,
+                turn_count: 0,
+                tool_call_count: 0,
+                stop_reason,
+                snapshot: Default::default(),
+            })
+        };
+
+        assert_eq!(
+            fixed_interval_loop_action(&legacy(ui_event::UiTurnStopReason::Natural)),
+            FixedIntervalLoopAction::None
+        );
+        assert_eq!(
+            fixed_interval_loop_action(&legacy(ui_event::UiTurnStopReason::TurnLimit)),
+            FixedIntervalLoopAction::Clear
+        );
+    }
+
+    #[test]
+    fn abnormal_terminal_revokes_drain_and_clears_all_queued_work() {
+        let mut queue = VecDeque::from(["next", "later"]);
+        let mut authorized = true;
+        apply_type_ahead_queue_action(TypeAheadQueueAction::Clear, &mut queue, &mut authorized);
+        assert!(queue.is_empty());
+        assert!(!authorized);
+    }
+
+    #[test]
+    fn natural_terminal_releases_exactly_one_fifo_entry() {
+        let mut queue = VecDeque::from(["first", "second"]);
+        let mut authorized = false;
+        apply_type_ahead_queue_action(TypeAheadQueueAction::DrainOne, &mut queue, &mut authorized);
+
+        assert_eq!(
+            pop_authorized_type_ahead(&mut queue, &mut authorized),
+            Some("first")
+        );
+        assert!(!authorized);
+        assert_eq!(queue, VecDeque::from(["second"]));
+        assert_eq!(pop_authorized_type_ahead(&mut queue, &mut authorized), None);
+        assert_eq!(queue, VecDeque::from(["second"]));
+    }
+
+    #[test]
+    fn diagnostic_error_then_turn_limit_never_advances_type_ahead() {
+        let diagnostic = bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+            atomcode_kernel::event::AgentEvent::Error {
+                message: "maximum rounds reached".into(),
+                http_status: None,
+                code: None,
+            },
+        ));
+        let mut state = UiState::new();
+        state.on_submit();
+        let mut queue = VecDeque::from(["must not run"]);
+        let mut authorized = false;
+
+        state.on_error();
+        apply_type_ahead_queue_action(
+            type_ahead_queue_action(&diagnostic),
+            &mut queue,
+            &mut authorized,
+        );
+        assert_eq!(state.phase, UiPhase::Streaming);
+        assert_eq!(queue, VecDeque::from(["must not run"]));
+        assert!(!authorized);
+
+        state.on_turn_complete();
+        apply_type_ahead_queue_action(
+            type_ahead_queue_action(&native_turn_finished(
+                atomcode_kernel::event::StopReason::MaxRounds,
+            )),
+            &mut queue,
+            &mut authorized,
+        );
+        assert_eq!(state.phase, UiPhase::Idle);
+        assert!(queue.is_empty());
+        assert!(!authorized);
+    }
 
     #[test]
     fn holds_first_submit_only_for_transient_bootstrap_states() {
@@ -2410,6 +2800,10 @@ pub struct LoopCtx {
     pub foreground_runtime_id: bg_runtime::RuntimeId,
     pub runtime_event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     pub runtime_event_rx: mpsc::UnboundedReceiver<bg_runtime::RuntimeEvent>,
+    /// Events captured while a runtime was backgrounded. `/bg <slot>` moves
+    /// them here and the loop drains them before reading the shared transport
+    /// again, preserving Request-before-terminal ordering.
+    pub foreground_replay_events: VecDeque<bg_runtime::RuntimeEventPayload>,
     pub working_dir: PathBuf,
     pub previous_dir: Option<PathBuf>,
     /// Recently visited project directories, most recent first (max 5).
@@ -3277,7 +3671,10 @@ mod buffer_tests {
         // No output yet: parenthesized whole-seconds clock (never `Xms`), no tokens.
         let bare = format_spinner_label(&s, 0, None);
         assert!(bare.contains("(0s)"), "expected `(0s)` clock, got {bare:?}");
-        assert!(!bare.contains("ms"), "clock must not show millis, got {bare:?}");
+        assert!(
+            !bare.contains("ms"),
+            "clock must not show millis, got {bare:?}"
+        );
         assert!(
             !bare.contains("tokens"),
             "no token count before any output, got {bare:?}"
@@ -5595,6 +5992,11 @@ pub struct App {
     /// finishes. Matches CC's "type-ahead" UX — queue the next prompt
     /// while the model is still thinking and it fires automatically.
     pub message_queue: VecDeque<crate::state::QueuedMessage>,
+    /// A queue entry may be submitted only after an explicit safe boundary:
+    /// either the runtime accepted a natural turn terminal, or an idle submit
+    /// was deliberately held while the provider was starting/reconfiguring.
+    /// Diagnostic events never arm this latch.
+    queue_drain_authorized: bool,
     /// Streaming-state `<think>…</think>` stripper. Kept on App (not
     /// a local in the streaming arm) because it carries state across
     /// agent events — a tag straddling two chunks would break if the
@@ -5621,7 +6023,7 @@ pub struct App {
     /// True while a setup skill turn is in flight. On `TurnComplete`,
     /// skill/command registries are reloaded so newly-created skills
     /// become visible to the LLM immediately. Cleared on
-    /// TurnComplete / TurnCancelled / Error.
+    /// an authoritative TurnComplete / TurnCancelled terminal.
     pub setup_pending: bool,
     /// Accumulates reasoning/thinking content for display in verbose mode.
     /// Flushed on newline or when buffer exceeds threshold.
@@ -5681,6 +6083,7 @@ impl App {
             menu: MenuState::new(),
             active_modal: None,
             message_queue: VecDeque::new(),
+            queue_drain_authorized: false,
             think: ThinkStripper::new(),
             pending_tools: std::collections::HashMap::new(),
             exit_pending: None,
@@ -6439,24 +6842,28 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Agent events ──
-            // Consumed regardless of phase. Gating on Streaming missed
-            // the TurnComplete that arrives *after* an Error event: the
-            // Error handler flips phase to Idle, so the very next event
-            // on the channel is stuck until the user submits again —
-            // which is what "得发两次你好才结束" looked like in the UI.
-            // Phase-specific behaviour (spinner redraw, type-ahead queue
-            // drain) lives inside the match arms on `app.state.phase`.
+            // Consumed regardless of phase. A diagnostic Error may precede the
+            // authoritative TurnFinished, so terminal and queue decisions are
+            // derived from the runtime event itself rather than UI phase.
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let provider_reload_failed =
                         is_provider_reload_failure(&runtime_event.event);
+                    let queue_action = type_ahead_queue_action(&runtime_event.event);
+                    let loop_action = fixed_interval_loop_action(&runtime_event.event);
                     if let Err(error) = publish_live_runtime_event(&ctx, &runtime_event.event) {
                         renderer.render(UiLine::Error(error));
                         renderer.flush();
                     }
                     let pre_phase = app.state.phase;
+                    apply_fixed_interval_loop_action(loop_action, &mut app.state, &mut ctx);
                     handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    apply_type_ahead_queue_action(
+                        queue_action,
+                        &mut app.message_queue,
+                        &mut app.queue_drain_authorized,
+                    );
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
                     // that asked for it finished or timed out); dismiss it so `Password:`
                     // doesn't linger in the input box.
@@ -6473,12 +6880,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // boundary. Reconcile before draining type-ahead so the
                         // next queued message cannot start on the stale model.
                         let config_redraw = poll_shared_state(&mut ctx);
-                        // Turn just ended — drain the type-ahead queue.
-                        // Pop the oldest queued message, echo as a User
-                        // line, dispatch to the agent, and transition
-                        // back to Streaming. Remaining queue entries
-                        // fire in order on subsequent completions.
-                        if provider_transition_blocks_queue_drain(
+                        // Pop exactly one FIFO entry only when a natural
+                        // TurnFinished (or an explicitly held idle submit)
+                        // authorized it. Other idle events may redraw, but can
+                        // never advance type-ahead work.
+                        if !app.queue_drain_authorized {
+                            redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        } else if provider_transition_blocks_queue_drain(
                             provider_transition_pending(&ctx),
                             ctx.live_binding.is_some(),
                             ctx.runtime.ui_availability(),
@@ -6490,7 +6898,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             if config_redraw || provider_reload_failed {
                                 redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                             }
-                        } else if let Some(queued) = app.message_queue.pop_front() {
+                        } else if let Some(queued) = pop_authorized_type_ahead(
+                            &mut app.message_queue,
+                            &mut app.queue_drain_authorized,
+                        ) {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                             if submit_foreground_runtime(
                                 &ctx,
@@ -6885,24 +7296,28 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Agent events ──
-            // Consumed regardless of phase. Gating on Streaming missed
-            // the TurnComplete that arrives *after* an Error event: the
-            // Error handler flips phase to Idle, so the very next event
-            // on the channel is stuck until the user submits again —
-            // which is what "得发两次你好才结束" looked like in the UI.
-            // Phase-specific behaviour (spinner redraw, type-ahead queue
-            // drain) lives inside the match arms on `app.state.phase`.
+            // Consumed regardless of phase. A diagnostic Error may precede the
+            // authoritative TurnFinished, so terminal and queue decisions are
+            // derived from the runtime event itself rather than UI phase.
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let provider_reload_failed =
                         is_provider_reload_failure(&runtime_event.event);
+                    let queue_action = type_ahead_queue_action(&runtime_event.event);
+                    let loop_action = fixed_interval_loop_action(&runtime_event.event);
                     if let Err(error) = publish_live_runtime_event(&ctx, &runtime_event.event) {
                         renderer.render(UiLine::Error(error));
                         renderer.flush();
                     }
                     let pre_phase = app.state.phase;
+                    apply_fixed_interval_loop_action(loop_action, &mut app.state, &mut ctx);
                     handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    apply_type_ahead_queue_action(
+                        queue_action,
+                        &mut app.message_queue,
+                        &mut app.queue_drain_authorized,
+                    );
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
                     // that asked for it finished or timed out); dismiss it so `Password:`
                     // doesn't linger in the input box.
@@ -6916,7 +7331,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     }
                     if matches!(app.state.phase, UiPhase::Idle) {
                         let config_redraw = poll_shared_state(&mut ctx);
-                        if provider_transition_blocks_queue_drain(
+                        if !app.queue_drain_authorized {
+                            redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        } else if provider_transition_blocks_queue_drain(
                             provider_transition_pending(&ctx),
                             ctx.live_binding.is_some(),
                             ctx.runtime.ui_availability(),
@@ -6928,7 +7345,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             if config_redraw || provider_reload_failed {
                                 redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                             }
-                        } else if let Some(queued) = app.message_queue.pop_front() {
+                        } else if let Some(queued) = pop_authorized_type_ahead(
+                            &mut app.message_queue,
+                            &mut app.queue_drain_authorized,
+                        ) {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                             if submit_foreground_runtime(
                                 &ctx,
@@ -6955,6 +7375,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 }
             }
         }
+
+        drain_foreground_replay_events(&mut app, &mut ctx, renderer);
 
         // ── Fixed-interval /loop decision (turn-completion driven) ──
         // Runs after EVERY select! wakeup, so it sees both edges that matter:
@@ -9590,6 +10012,11 @@ fn handle_idle_key(
                             images,
                             image_markers: kept_markers,
                         });
+                        // This is not type-ahead from an active turn. The user
+                        // submitted while idle and we intentionally deferred it
+                        // until the runtime becomes available, so readiness may
+                        // consume it without waiting for a turn terminal.
+                        app.queue_drain_authorized = true;
                         // AwaitingProvider covers both a transient auth race (user
                         // IS logged in, recovery imminent) and genuinely-not-logged-in.
                         // For the latter, keep the old actionable guidance to run
@@ -10509,6 +10936,7 @@ pub(crate) fn apply_persisted_config(
 /// up within a frame.
 fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, ctx: &LoopCtx) {
     app.message_queue.clear();
+    app.queue_drain_authorized = false;
     if let Some(msg) = app.state.last_submitted_message.take() {
         // Cursor at the end (edit-and-resend), but suppress the slash menu
         // for one frame so a restored `/command` doesn't re-pop the list.
@@ -10872,6 +11300,7 @@ fn handle_streaming_key(
                 )?;
                 if !readonly {
                     app.message_queue.clear();
+                    app.queue_drain_authorized = false;
                     app.pending_tools.clear();
                     app.think.reset();
                     app.reasoning_buffer.clear();
@@ -13017,11 +13446,62 @@ fn kernel_stop_reason(reason: atomcode_kernel::event::StopReason) -> ui_event::U
     match reason {
         Kernel::Stopped => Core::Natural,
         Kernel::MaxRounds | Kernel::MaxContinuations => Core::TurnLimit,
+        Kernel::RepeatLoop | Kernel::ToolLoopDetected => Core::StepLimit,
         Kernel::Cancelled => Core::Cancelled,
         Kernel::ProviderError | Kernel::Timeout | Kernel::PromptRejected | Kernel::RateLimited => {
             Core::Error
         }
         _ => Core::Error,
+    }
+}
+
+fn turn_is_incomplete(reason: ui_event::UiTurnStopReason) -> bool {
+    !matches!(reason, ui_event::UiTurnStopReason::Natural)
+}
+
+fn should_run_setup_post_turn(reason: ui_event::UiTurnStopReason) -> bool {
+    matches!(reason, ui_event::UiTurnStopReason::Natural)
+}
+
+#[cfg(test)]
+mod kernel_terminal_projection_tests {
+    use super::{kernel_stop_reason, should_run_setup_post_turn, turn_is_incomplete};
+    use crate::event_loop::ui_event::UiTurnStopReason;
+    use atomcode_kernel::event::StopReason;
+
+    #[test]
+    fn detected_tool_loops_are_step_limits_not_success() {
+        for stop in [StopReason::RepeatLoop, StopReason::ToolLoopDetected] {
+            let reason = kernel_stop_reason(stop);
+            assert_eq!(reason, UiTurnStopReason::StepLimit);
+            assert!(turn_is_incomplete(reason));
+        }
+    }
+
+    #[test]
+    fn every_non_natural_terminal_is_persisted_as_incomplete() {
+        assert!(!turn_is_incomplete(UiTurnStopReason::Natural));
+        for reason in [
+            UiTurnStopReason::TurnLimit,
+            UiTurnStopReason::StepLimit,
+            UiTurnStopReason::Cancelled,
+            UiTurnStopReason::Error,
+        ] {
+            assert!(turn_is_incomplete(reason));
+        }
+    }
+
+    #[test]
+    fn setup_post_run_side_effects_require_natural_completion() {
+        assert!(should_run_setup_post_turn(UiTurnStopReason::Natural));
+        for reason in [
+            UiTurnStopReason::TurnLimit,
+            UiTurnStopReason::StepLimit,
+            UiTurnStopReason::Cancelled,
+            UiTurnStopReason::Error,
+        ] {
+            assert!(!should_run_setup_post_turn(reason));
+        }
     }
 }
 
@@ -13241,6 +13721,22 @@ fn sync_committed_provider_projection(
     true
 }
 
+fn drain_foreground_replay_events(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    while let Some(event) = ctx.foreground_replay_events.pop_front() {
+        handle_runtime_event(
+            event,
+            &mut app.state,
+            &mut app.think,
+            renderer,
+            &mut app.pending_tools,
+            ctx,
+            &mut app.setup_pending,
+            &mut app.reasoning_buffer,
+            &mut app.buf,
+        );
+    }
+}
+
 fn handle_runtime_event(
     event: bg_runtime::RuntimeEventPayload,
     state: &mut UiState,
@@ -13418,6 +13914,11 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::TurnFinished(completion) => {
+                    ctx.pending_runtime_request_id = None;
+                    let snapshot_unavailable = matches!(
+                        &completion,
+                        atomcode_coding::TurnCompletion::SnapshotUnavailable { .. }
+                    );
                     let event = match completion {
                         atomcode_coding::TurnCompletion::Completed {
                             reason,
@@ -13467,28 +13968,47 @@ fn handle_runtime_event(
                         reasoning_buffer,
                         buf,
                     );
+                    if snapshot_unavailable {
+                        finish_failed_turn_without_snapshot(
+                            state,
+                            think,
+                            pending_tools,
+                            setup_pending,
+                            reasoning_buffer,
+                        );
+                    }
                     return;
                 }
-                CodingRuntimeEvent::RuntimeStopped(_)
-                    if matches!(state.phase, UiPhase::Streaming | UiPhase::Approval) =>
-                {
-                    handle_agent_event(
-                        AgentEvent::Error {
-                            error: "coding runtime stopped before turn terminal".into(),
-                            snapshot: Default::default(),
-                        },
-                        state,
-                        think,
-                        renderer,
-                        pending_tools,
-                        ctx,
-                        setup_pending,
-                        reasoning_buffer,
-                        buf,
-                    );
+                CodingRuntimeEvent::RuntimeStopped(_) => {
+                    ctx.pending_runtime_request_id = None;
+                    if matches!(
+                        state.phase,
+                        UiPhase::Streaming | UiPhase::Approval | UiPhase::UserInput
+                    ) {
+                        handle_agent_event(
+                            AgentEvent::Error {
+                                error: "coding runtime stopped before turn terminal".into(),
+                                snapshot: Default::default(),
+                            },
+                            state,
+                            think,
+                            renderer,
+                            pending_tools,
+                            ctx,
+                            setup_pending,
+                            reasoning_buffer,
+                            buf,
+                        );
+                        finish_failed_turn_without_snapshot(
+                            state,
+                            think,
+                            pending_tools,
+                            setup_pending,
+                            reasoning_buffer,
+                        );
+                    }
                     return;
                 }
-                CodingRuntimeEvent::RuntimeStopped(_) => return,
                 CodingRuntimeEvent::ModeChanged { mode } => {
                     let agent_mode = match mode {
                         atomcode_coding::RuntimeMode::Build => crate::state::AgentMode::Build,
@@ -13615,12 +14135,18 @@ fn handle_runtime_event(
                     renderer.flush();
                     return;
                 }
-                CodingRuntimeEvent::VisionPreprocessSuccess { vl_model, char_count } => {
+                CodingRuntimeEvent::VisionPreprocessSuccess {
+                    vl_model,
+                    char_count,
+                } => {
                     // Reuse the existing UiEvent handler so the "✓ VL recognised
                     // image, returned N chars · <model>" toast renders identically
                     // to the pre-bridge-retirement behavior.
                     handle_agent_event(
-                        AgentEvent::VisionPreprocessSuccess { vl_model, char_count },
+                        AgentEvent::VisionPreprocessSuccess {
+                            vl_model,
+                            char_count,
+                        },
                         state,
                         think,
                         renderer,
@@ -13989,30 +14515,44 @@ fn handle_runtime_event(
         },
         bg_runtime::RuntimeEventPayload::Driver(
             bg_runtime::DriverEvent::CapabilitiesReloadFinished { result },
-        ) => {
-            match result {
-                Err(error) => {
-                    ctx.pending_capability_reload = false;
-                    ctx.pending_capability_projection = None;
-                    let message = error.to_string();
-                    renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::CmdCapabilityReloadFailed {
-                            error: &message,
-                        })
+        ) => match result {
+            Err(error) => {
+                ctx.pending_capability_reload = false;
+                ctx.pending_capability_projection = None;
+                let message = error.to_string();
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::CmdCapabilityReloadFailed { error: &message })
                         .into_owned(),
-                    ));
+                ));
+                renderer.flush();
+            }
+            Ok(changed) => {
+                ctx.pending_capability_projection = Some(changed);
+                if let Err(error) = retry_pending_session_projections(state, renderer, ctx) {
+                    renderer.render(UiLine::Error(error));
                     renderer.flush();
                 }
-                Ok(changed) => {
-                    ctx.pending_capability_projection = Some(changed);
-                    if let Err(error) = retry_pending_session_projections(state, renderer, ctx) {
-                        renderer.render(UiLine::Error(error));
-                        renderer.flush();
-                    }
-                }
             }
-        }
+        },
     }
+}
+
+/// Close the local presentation only for an authoritative failure terminal
+/// that cannot be projected as a normal `TurnComplete` (missing snapshot or a
+/// runtime stop that violated the turn-terminal contract).
+fn finish_failed_turn_without_snapshot(
+    state: &mut UiState,
+    think: &mut ThinkStripper,
+    pending_tools: &mut std::collections::HashMap<String, (String, String, bool)>,
+    setup_pending: &mut bool,
+    reasoning_buffer: &mut String,
+) {
+    state.response_finalized = true;
+    state.on_turn_complete();
+    think.reset();
+    pending_tools.clear();
+    reasoning_buffer.clear();
+    *setup_pending = false;
 }
 
 fn publish_live_runtime_event(
@@ -14198,6 +14738,7 @@ fn commit_native_session_changed(
     ctx: &mut LoopCtx,
 ) -> Result<(), String> {
     let session_id = session.id.clone();
+    let working_dir = atomcode_capabilities::pathnorm::strip_verbatim_path(&working_dir);
     let next_live_binding = if let Some(binding) = ctx.live_binding.clone() {
         let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
             &session.to_conversation_snapshot(),
@@ -14215,13 +14756,7 @@ fn commit_native_session_changed(
         None
     };
 
-    if ctx.working_dir != working_dir {
-        ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, working_dir.clone()));
-        ctx.file_index.reset(working_dir.clone());
-        commands::push_recent_dir(&mut ctx.recent_dirs, working_dir.clone());
-        commands::save_recent_dirs(&ctx.recent_dirs);
-        atomcode_daemon::live_set_working_dir(working_dir.clone());
-    }
+    commit_working_dir_projection(ctx, working_dir);
     ctx.current_session_id = Some(session_id.clone());
     ctx.loop_ctrl = None;
     state.loop_label = None;
@@ -14241,7 +14776,7 @@ fn commit_native_session_changed(
     commands::bind_telemetry_to_session(ctx, &session);
     ctx.current_session = session;
     ctx.bg_manager
-        .set_foreground_session(ctx.current_session.clone());
+        .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
     if let Some(binding) = next_live_binding {
         ctx.live_binding = Some(binding);
     }
@@ -14263,6 +14798,49 @@ fn commit_native_session_changed(
     renderer.flush();
     renderer.end_sync();
     Ok(())
+}
+
+/// Commit the TUI-side projection of a runtime-owned working directory.
+///
+/// Session metadata is not authoritative for the physical project bucket:
+/// legacy imports can retain a stale embedded path. Runtime transitions and
+/// `/bg` resumes must funnel through this helper so every path-sensitive TUI
+/// projection changes together.
+pub(crate) fn commit_working_dir_projection(ctx: &mut LoopCtx, working_dir: PathBuf) {
+    let Some(working_dir) = planned_runtime_working_dir(&ctx.working_dir, &working_dir) else {
+        return;
+    };
+    ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, working_dir.clone()));
+    ctx.file_index.reset(working_dir.clone());
+    commands::push_recent_dir(&mut ctx.recent_dirs, working_dir.clone());
+    commands::save_recent_dirs(&ctx.recent_dirs);
+    atomcode_daemon::live_set_working_dir(working_dir);
+}
+
+fn planned_runtime_working_dir(
+    current: &std::path::Path,
+    incoming: &std::path::Path,
+) -> Option<PathBuf> {
+    let incoming = atomcode_capabilities::pathnorm::strip_verbatim_path(incoming);
+    (current != incoming).then_some(incoming)
+}
+
+#[cfg(test)]
+mod working_dir_projection_tests {
+    use super::planned_runtime_working_dir;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn runtime_working_dir_plan_normalizes_before_comparing() {
+        assert_eq!(
+            planned_runtime_working_dir(Path::new("/old"), Path::new(r"\\?\C:\repo")),
+            Some(PathBuf::from(r"C:\repo"))
+        );
+        assert_eq!(
+            planned_runtime_working_dir(Path::new("/same"), Path::new("/same")),
+            None
+        );
+    }
 }
 
 fn truncate_local_shell_output(mut output: String) -> String {
@@ -14346,7 +14924,7 @@ fn handle_undo_success(
     ctx.current_session.retain_turn_stats_after_undo(new_len);
     ctx.current_session.touch();
     ctx.bg_manager
-        .set_foreground_session(ctx.current_session.clone());
+        .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
     crate::modals::session_picker::replay_session(renderer, state, &ctx.current_session, true);
     buf.set_restored_text(restored_prompt);
     renderer.render(UiLine::CommandOutput(
@@ -15244,7 +15822,7 @@ fn handle_agent_event(
             if !snapshot.messages.is_empty() {
                 apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
-                    .set_foreground_session(ctx.current_session.clone());
+                    .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
             }
 
             // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
@@ -15367,7 +15945,7 @@ fn handle_agent_event(
             }
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
-            let errored = matches!(stop_reason, ui_event::UiTurnStopReason::Error);
+            let errored = turn_is_incomplete(stop_reason);
             // Footer token count: bill output + UNCACHED input (re-reading the
             // cached prefix each round is near-free). The event's `total_tokens`
             // is the v2 gross sum (prompt+completion per round) which overstates
@@ -15465,7 +16043,7 @@ fn handle_agent_event(
                     tool_call_count,
                     duration_ms: duration.as_millis() as u64,
                     total_tokens,
-                    errored: matches!(stop_reason, ui_event::UiTurnStopReason::Error),
+                    errored: turn_is_incomplete(stop_reason),
                     used_tokens: last_used,
                     ctx_window: last_window,
                 });
@@ -15491,7 +16069,8 @@ fn handle_agent_event(
             // setup post-run side effects — only on successful TurnComplete.
             // Reload skills/commands so newly-created skills become visible
             // to the LLM immediately.
-            if std::mem::take(setup_pending) {
+            let setup_was_pending = std::mem::take(setup_pending);
+            if setup_was_pending && should_run_setup_post_turn(stop_reason) {
                 let (skills_loaded, warnings) = reload_plugins(ctx);
                 let warn_count = warnings.len();
                 renderer.render(UiLine::CommandOutput(
@@ -15590,9 +16169,6 @@ fn handle_agent_event(
             if error.contains("reasoning_effort") {
                 ctx.reasoning_effort = None;
             }
-            // Seal the reply buffer (any text streamed before the error stays
-            // copyable via `/copy`).
-            state.response_finalized = true;
             // Capture the reason so the errored turn-summary can carry it: the
             // standalone red line below is rendered mid-turn (Streaming, spinner
             // active) and can be clobbered by the physical Streaming→Idle redraw
@@ -15601,18 +16177,15 @@ fn handle_agent_event(
             state.last_turn_error = Some(error.clone());
             renderer.render(UiLine::Error(error));
             renderer.flush();
-            *setup_pending = false;
+            // Diagnostic only. The runtime emits the authoritative
+            // `TurnFinished` after kernel errors such as MaxRounds, RepeatLoop and
+            // ToolLoopDetected; that terminal owns phase, buffer and setup
+            // cleanup. Ending the turn here races queued input into the still
+            // active runtime.
             state.on_error();
-            // Same reset rationale as TurnComplete / TurnCancelled — an
-            // aborted turn is another way to leave `<think>` half-open.
-            think.reset();
-            // Persist on Error too — without this, a first-turn LLM
-            // failure (auth, rate limit, gateway 5xx, our own 5-min
-            // total-request timeout, etc.) silently drops the user's
-            // typed message from disk so the next `/resume` shows
-            // nothing for that conversation. Empty `messages` from
-            // the streaming-error forwarder is treated as a no-op
-            // by persist_current_session.
+            // Preserve a non-empty diagnostic snapshot without treating it as
+            // a terminal. Native kernel diagnostics currently carry an empty
+            // snapshot, so this is normally a no-op.
             persist_current_session(ctx, snapshot, renderer);
         }
         AgentEvent::Warning(w) => {
@@ -15629,14 +16202,20 @@ fn handle_agent_event(
                 *slot = Some(msg);
             }
         }
-        AgentEvent::VisionPreprocessSuccess { vl_model, char_count } => {
+        AgentEvent::VisionPreprocessSuccess {
+            vl_model,
+            char_count,
+        } => {
             // Format here (not in agent) so we can localize / restyle
             // without bumping the AgentEvent contract. Char count helps
             // users notice degenerate near-zero VL outputs that would
             // mislead the main model into "image failed" responses.
             let msg = crate::i18n::t(crate::i18n::Msg::VisionPreprocessSuccess { char_count })
                 .into_owned();
-            renderer.render(UiLine::VisionPreprocessSuccess { msg, model: vl_model });
+            renderer.render(UiLine::VisionPreprocessSuccess {
+                msg,
+                model: vl_model,
+            });
             renderer.flush();
         }
         AgentEvent::RestorePendingImages { images, markers } => {
@@ -15708,13 +16287,11 @@ fn handle_agent_event(
             // Strip the Windows `\\?\` verbatim prefix: the emitter (runtime / kernel
             // turn runner) canonicalizes the target, so `new_dir` can arrive as
             // `\\?\C:\…` and would otherwise re-verbatim `ctx.working_dir` (and
-            // recent_dirs) after `apply_cd` just stripped it. This is the one
-            // `working_dir` writer that does not funnel through `apply_cd`.
-            let new_dir = atomcode_capabilities::pathnorm::strip_verbatim_path(&new_dir);
-            if ctx.working_dir != new_dir {
-                ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
-                commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
-            }
+            // recent_dirs) after `apply_cd` just stripped it. The shared projection
+            // helper normalizes this event and updates every path-sensitive sink.
+            commit_working_dir_projection(ctx, new_dir);
+            ctx.bg_manager
+                .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
         }
         AgentEvent::ProjectSwitched(new_dir) => {
             // A webui /cd switched the project directory (delivered via the
@@ -16196,7 +16773,7 @@ fn handle_agent_event(
             if !snapshot.messages.is_empty() || !snapshot.cold_summaries.is_empty() {
                 apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
-                    .set_foreground_session(ctx.current_session.clone());
+                    .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
             }
         }
         AgentEvent::ConversationRestored { .. } | AgentEvent::ConversationRestoreFailed { .. } => {}
@@ -16336,7 +16913,7 @@ fn apply_ai_session_name(ctx: &mut LoopCtx, name: String, renderer: &mut dyn Ren
     ctx.current_session.ai_named = true;
     ctx.current_session.touch();
     ctx.bg_manager
-        .set_foreground_session(ctx.current_session.clone());
+        .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
 }
 
 /// Keep the transitional UI projection in sync. Durable persistence belongs to
@@ -16351,7 +16928,7 @@ fn persist_current_session(
     }
     apply_session_snapshot(&mut ctx.current_session, snapshot);
     ctx.bg_manager
-        .set_foreground_session(ctx.current_session.clone());
+        .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
     let _ = renderer;
     true
 }

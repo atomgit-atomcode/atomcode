@@ -508,7 +508,10 @@ pub(crate) fn chat_runtime_config(
         keep_interrupted_context: config.keep_interrupted_context,
         user_agent: p.and_then(|p| p.user_agent.clone()),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
-        loop_max_rounds: config.loop_config.max_rounds,
+        loop_max_rounds: atomcode_coding::resolve_loop_max_rounds(
+            config.loop_config.max_rounds,
+            std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
+        ),
         subagent_config: Some(Arc::new(config.clone())),
     }
 }
@@ -704,8 +707,7 @@ pub(crate) async fn run_chat_turn_v2(
                     &naming_project_bucket,
                     &naming_session_id,
                     &name,
-                )
-                {
+                ) {
                     let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
                         "session naming failed: {error}"
                     )));
@@ -809,7 +811,13 @@ pub(crate) enum LiveWireEvent {
         total: usize,
     },
     #[serde(rename = "state")]
-    State { running: bool },
+    State {
+        running: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     #[serde(rename = "error")]
     Error { message: String },
     /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
@@ -897,7 +905,11 @@ impl NativeLiveWireProjector {
                     .collect(),
             },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(event)) => match event {
-                Kernel::TurnStarted => LiveWireEvent::State { running: true },
+                Kernel::TurnStarted => LiveWireEvent::State {
+                    running: true,
+                    stop_reason: None,
+                    message: None,
+                },
                 Kernel::TextDelta(content) => LiveWireEvent::TextDelta { content },
                 Kernel::Reasoning(content) => LiveWireEvent::ReasoningDelta { content },
                 Kernel::ToolStarted { call } => {
@@ -1012,9 +1024,24 @@ impl NativeLiveWireProjector {
                     return None;
                 }
             }
-            crate::live_hub::LiveViewEvent::Runtime(Runtime::TurnFinished(_)) => {
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::TurnFinished(completion)) => {
                 self.tools.clear();
-                LiveWireEvent::State { running: false }
+                match completion {
+                    atomcode_coding::TurnCompletion::Completed { reason, .. } => {
+                        LiveWireEvent::State {
+                            running: false,
+                            stop_reason: Some(crate::stop_reason_wire(reason).to_string()),
+                            message: None,
+                        }
+                    }
+                    atomcode_coding::TurnCompletion::SnapshotUnavailable { error, .. } => {
+                        LiveWireEvent::State {
+                            running: false,
+                            stop_reason: Some("snapshot_unavailable".into()),
+                            message: Some(error.message),
+                        }
+                    }
+                }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ModeChanged { mode }) => {
                 LiveWireEvent::Mode {
@@ -1043,9 +1070,16 @@ impl NativeLiveWireProjector {
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ControllerWarning(message)) => {
                 LiveWireEvent::Warning { message }
             }
-            crate::live_hub::LiveViewEvent::Runtime(Runtime::RuntimeStopped(_)) => {
-                LiveWireEvent::Error {
-                    message: "coding runtime stopped".into(),
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::RuntimeStopped(exit)) => {
+                self.tools.clear();
+                LiveWireEvent::State {
+                    running: false,
+                    stop_reason: Some("runtime_stopped".into()),
+                    message: Some(format!(
+                        "coding runtime stopped: {:?}{}",
+                        exit.reason,
+                        if exit.forced { " (forced)" } else { "" }
+                    )),
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
@@ -2301,6 +2335,86 @@ mod tests {
         assert_eq!(json["reset_label"], "5h");
         assert_eq!(json["secs_until_reset"], 7200);
         assert_eq!(json["server_message"], "provider quota exhausted");
+    }
+
+    #[test]
+    fn native_live_projector_preserves_the_authoritative_stop_reason() {
+        for (reason, expected) in [
+            (atomcode_kernel::event::StopReason::MaxRounds, "max_rounds"),
+            (
+                atomcode_kernel::event::StopReason::RepeatLoop,
+                "repeat_loop",
+            ),
+            (
+                atomcode_kernel::event::StopReason::ToolLoopDetected,
+                "tool_loop_detected",
+            ),
+        ] {
+            let mut projector = NativeLiveWireProjector::default();
+            let wire = projector
+                .project(crate::live_hub::LiveViewEvent::Runtime(
+                    CodingRuntimeEvent::TurnFinished(atomcode_coding::TurnCompletion::Completed {
+                        turn_id: 7,
+                        reason,
+                        snapshot: std::sync::Arc::new(
+                            atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
+                        ),
+                        stats: atomcode_coding::RuntimeTurnStats::default(),
+                    }),
+                ))
+                .expect("turn terminal must reach the live wire");
+            let json = serde_json::to_value(wire).unwrap();
+            assert_eq!(json["type"], "state");
+            assert_eq!(json["running"], false);
+            assert_eq!(json["stop_reason"], expected);
+            assert!(json.get("message").is_none());
+        }
+    }
+
+    #[test]
+    fn native_live_projector_projects_runtime_stop_as_authoritative_state() {
+        let mut projector = NativeLiveWireProjector::default();
+        projector
+            .tools
+            .insert("call-1".into(), ("bash".into(), std::time::Instant::now()));
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::RuntimeStopped(atomcode_coding::RuntimeExit {
+                    reason: atomcode_coding::RuntimeExitReason::OwnerStopped,
+                    forced: false,
+                }),
+            ))
+            .expect("runtime stop must reach the live wire");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "state");
+        assert_eq!(json["running"], false);
+        assert_eq!(json["stop_reason"], "runtime_stopped");
+        assert!(json["message"].as_str().is_some_and(|m| !m.is_empty()));
+        assert!(projector.tools.is_empty());
+    }
+
+    #[test]
+    fn native_live_projector_prioritizes_snapshot_failure_over_inner_stop_reason() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::TurnFinished(
+                    atomcode_coding::TurnCompletion::SnapshotUnavailable {
+                        turn_id: 7,
+                        reason: atomcode_kernel::event::StopReason::Stopped,
+                        error: atomcode_coding::RuntimeSnapshotError {
+                            message: "snapshot failed".into(),
+                        },
+                        stats: atomcode_coding::RuntimeTurnStats::default(),
+                    },
+                ),
+            ))
+            .expect("snapshot failure must reach the live wire");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "state");
+        assert_eq!(json["running"], false);
+        assert_eq!(json["stop_reason"], "snapshot_unavailable");
+        assert_eq!(json["message"], "snapshot failed");
     }
 
     #[test]

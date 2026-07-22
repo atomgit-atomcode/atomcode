@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use atomcode_kernel::agent::ToolLoopPolicy;
+
 /// Everything [`build_coding_agent`](crate::build_coding_agent) needs: provider
 /// credentials, the working directory the tools are scoped to, and liveness bounds.
 ///
@@ -38,12 +40,16 @@ pub struct CodingAgentConfig {
     pub request_timeout: Option<Duration>,
     /// Safety fuse: max edit-then-verify continuations per turn (kernel default is 50).
     pub max_continuations: u32,
-    /// Coarse safety fuse: max LLM tool-call ROUNDS per turn before the kernel force-stops
-    /// (`StopReason::MaxRounds`). Backstop for a model that loops with VARYING calls — the
-    /// kernel's built-in repetition fuse already catches byte-identical loops fast. Generous
-    /// (well above a normal turn's round count) so it never cuts legit long work; `0` =
-    /// unbounded (fuse not wired).
+    /// Coarse safety fuse for LLM/tool rounds in one turn (`0` = unbounded).
+    /// This bounds varying-call runaways that the kernel's repetition guards cannot catch.
+    /// It is deliberately generous, produces an explicit incomplete terminal, and may be
+    /// overridden with `ATOMCODE_TURN_MAX_ROUNDS`.
     pub max_rounds: u32,
+    /// Exact no-progress loop policy. `None` disables it for explicitly intentional
+    /// identical repetition. Defaults to 3/4 and is configurable through
+    /// `ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD` / `ATOMCODE_TOOL_LOOP_STOP_THRESHOLD`;
+    /// a stop threshold of `0` disables the policy.
+    pub tool_loop_policy: Option<ToolLoopPolicy>,
     /// Goal-mode round cap (0 = unbounded). Override via `ATOMCODE_GOAL_MAX_ROUNDS`.
     pub goal_max_rounds: u32,
     /// Goal-mode wall-clock cap in seconds (0 = unbounded). Override via
@@ -201,7 +207,10 @@ impl CodingRuntimeConfig {
             skip_tls_verify: provider
                 .map(|provider| provider.skip_tls_verify)
                 .unwrap_or(false),
-            loop_max_rounds: config.loop_config.max_rounds,
+            loop_max_rounds: resolve_loop_max_rounds(
+                config.loop_config.max_rounds,
+                std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
+            ),
             subagent_config: Some(Arc::new(config.clone())),
         }
     }
@@ -362,6 +371,46 @@ fn default_goal_max_rounds() -> u32 {
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(200)
 }
+fn default_turn_max_rounds() -> u32 {
+    std::env::var("ATOMCODE_TURN_MAX_ROUNDS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(200)
+}
+
+fn default_tool_loop_policy() -> Option<ToolLoopPolicy> {
+    resolve_tool_loop_policy(
+        std::env::var("ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD")
+            .ok()
+            .as_deref(),
+        std::env::var("ATOMCODE_TOOL_LOOP_STOP_THRESHOLD")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn resolve_tool_loop_policy(
+    warning_env: Option<&str>,
+    stop_env: Option<&str>,
+) -> Option<ToolLoopPolicy> {
+    let requested_stop = stop_env.and_then(|value| value.trim().parse::<u32>().ok());
+    if requested_stop == Some(0) {
+        return None;
+    }
+    // Values below 3 cannot satisfy the public policy invariant (warning >= 2
+    // and warning < stop), so malformed/unsafe external input retains the shipped
+    // 3/4 policy instead of panicking or silently disabling protection.
+    let stop = requested_stop.filter(|value| *value >= 3).unwrap_or(4);
+    let fallback_warning = 3.min(stop - 1).max(2);
+    let warning = warning_env
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value >= 2 && *value < stop)
+        .unwrap_or(fallback_warning);
+    Some(
+        ToolLoopPolicy::new(warning, stop)
+            .expect("resolved tool-loop thresholds satisfy the policy invariant"),
+    )
+}
 fn default_goal_max_duration_secs() -> u64 {
     std::env::var("ATOMCODE_GOAL_MAX_DURATION_SECS")
         .ok()
@@ -369,10 +418,20 @@ fn default_goal_max_duration_secs() -> u64 {
         .unwrap_or(7200)
 }
 fn default_loop_max_rounds() -> u32 {
-    std::env::var("ATOMCODE_LOOP_MAX_ROUNDS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(100)
+    resolve_loop_max_rounds(
+        100,
+        std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
+    )
+}
+
+/// Resolve the product-level `/loop` round high-water mark.
+///
+/// Drivers with their own loop controller must use this resolver too so the
+/// `ATOMCODE_LOOP_MAX_ROUNDS` override, including `0 = unbounded`, has one
+/// meaning across runtime-owned and driver-owned loop modes.
+pub fn resolve_loop_max_rounds(configured: u32, env: Option<&str>) -> u32 {
+    env.and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(configured)
 }
 
 impl CodingAgentConfig {
@@ -394,7 +453,8 @@ impl CodingAgentConfig {
             stream_timeout: default_stream_timeout(),
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
-            max_rounds: 200,
+            max_rounds: default_turn_max_rounds(),
+            tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
             goal_max_duration_secs: default_goal_max_duration_secs(),
             loop_max_rounds: default_loop_max_rounds(),
@@ -422,12 +482,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn goal_caps_have_generous_defaults() {
+    fn round_caps_have_generous_defaults() {
         let c = CodingAgentConfig::new("k", "https://x/v1", "m", "/tmp");
+        assert_eq!(c.max_rounds, 200);
         assert_eq!(c.goal_max_rounds, 200);
         assert_eq!(c.goal_max_duration_secs, 7200);
-        // Per-turn round-cap backstop: generous, well above a normal turn, but bounded.
-        assert_eq!(c.max_rounds, 200);
+    }
+
+    #[test]
+    fn loop_round_env_override_wins_over_toml_and_preserves_zero() {
+        assert_eq!(resolve_loop_max_rounds(100, Some("250")), 250);
+        assert_eq!(resolve_loop_max_rounds(100, Some("0")), 0);
+        assert_eq!(resolve_loop_max_rounds(80, Some("invalid")), 80);
+        assert_eq!(resolve_loop_max_rounds(80, None), 80);
+    }
+
+    #[test]
+    fn tool_loop_env_policy_is_validated_and_can_be_disabled() {
+        let policy = resolve_tool_loop_policy(Some("10"), Some("12")).unwrap();
+        assert_eq!(policy.warning_threshold(), 10);
+        assert_eq!(policy.stop_threshold(), 12);
+        assert!(resolve_tool_loop_policy(Some("10"), Some("0")).is_none());
+
+        let fallback = resolve_tool_loop_policy(Some("99"), Some("4")).unwrap();
+        assert_eq!(fallback.warning_threshold(), 3);
+        assert_eq!(fallback.stop_threshold(), 4);
     }
 
     #[test]
@@ -562,6 +641,7 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("request_timeout", &self.request_timeout)
             .field("max_continuations", &self.max_continuations)
             .field("max_rounds", &self.max_rounds)
+            .field("tool_loop_policy", &self.tool_loop_policy)
             .field("goal_max_rounds", &self.goal_max_rounds)
             .field("goal_max_duration_secs", &self.goal_max_duration_secs)
             .field("chat_options", &self.chat_options)

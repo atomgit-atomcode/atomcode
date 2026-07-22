@@ -382,6 +382,25 @@ export class DaemonClient {
   streamChat(req: ChatRequest, callbacks: ChatStreamCallbacks): AbortController {
     const controller = new AbortController();
     const payload = JSON.stringify(req);
+    let terminalSeen = false;
+    const guardedCallbacks: ChatStreamCallbacks = {
+      ...callbacks,
+      onDone: (...args) => {
+        if (terminalSeen) return;
+        terminalSeen = true;
+        callbacks.onDone(...args);
+      },
+      onStopped: () => {
+        if (terminalSeen) return;
+        terminalSeen = true;
+        callbacks.onStopped();
+      },
+      onError: (message) => {
+        if (terminalSeen) return;
+        terminalSeen = true;
+        callbacks.onError(message);
+      },
+    };
 
     const options: http.RequestOptions = {
       hostname: this.host,
@@ -402,7 +421,7 @@ export class DaemonClient {
         res.on('data', (chunk: Buffer) => chunks.push(chunk));
         res.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf-8');
-          callbacks.onError(`HTTP ${res.statusCode}: ${this.errorMessage(res.statusCode, raw)}`);
+          guardedCallbacks.onError(`HTTP ${res.statusCode}: ${this.errorMessage(res.statusCode, raw)}`);
         });
         return;
       }
@@ -427,25 +446,34 @@ export class DaemonClient {
           // SSE data line
           if (trimmed.startsWith('data: ')) {
             const data = trimmed.slice(6);
-            this.handleSSEData(data, callbacks);
+            if (!terminalSeen) {
+              this.handleSSEData(data, guardedCallbacks);
+            }
           }
         }
       });
 
       res.on('end', () => {
         // Process any remaining data in the buffer
-        if (buffer.trim().startsWith('data: ')) {
+        if (!terminalSeen && buffer.trim().startsWith('data: ')) {
           const data = buffer.trim().slice(6);
-          this.handleSSEData(data, callbacks);
+          this.handleSSEData(data, guardedCallbacks);
+        }
+        if (!terminalSeen) {
+          if (controller.signal.aborted) {
+            guardedCallbacks.onStopped();
+          } else {
+            guardedCallbacks.onError('Stream ended before a terminal event');
+          }
         }
       });
 
       res.on('error', (err) => {
         const classified = classifyDaemonStreamError(err.message, controller.signal.aborted);
         if (classified.type === 'stopped') {
-          callbacks.onStopped();
+          guardedCallbacks.onStopped();
         } else {
-          callbacks.onError(classified.message);
+          guardedCallbacks.onError(classified.message);
         }
       });
     });
@@ -466,19 +494,19 @@ export class DaemonClient {
                 controller.signal.addEventListener('abort', () => retryController.abort());
               }
             } else {
-              callbacks.onError('Daemon not running');
+              guardedCallbacks.onError('Daemon not running');
             }
           }).catch(() => {
-            callbacks.onError('Daemon not running');
+            guardedCallbacks.onError('Daemon not running');
           });
         } else {
-          callbacks.onError('Daemon not running');
+          guardedCallbacks.onError('Daemon not running');
         }
       } else if (controller.signal.aborted) {
         // Intentional abort, don't report as error
-        callbacks.onStopped();
+        guardedCallbacks.onStopped();
       } else {
-        callbacks.onError(`Connection error: ${err.message}`);
+        guardedCallbacks.onError(`Connection error: ${err.message}`);
       }
     });
 
@@ -559,7 +587,13 @@ export class DaemonClient {
         });
         break;
       case 'done':
-        callbacks.onDone(event.tokens, event.tool_calls, event.session_id);
+        callbacks.onDone(
+          event.tokens,
+          event.tool_calls,
+          event.session_id,
+          event.stop_reason,
+          event.message,
+        );
         break;
       case 'stopped':
         callbacks.onStopped();

@@ -26,7 +26,7 @@ export type SSEEvent =
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
-  | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string }
+  | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
@@ -85,6 +85,32 @@ export async function stopChat(requestId: string): Promise<void> {
   if (!resp.ok) throw new Error(`stop chat failed: ${resp.status}`);
 }
 
+export async function getActiveChatSessions(): Promise<string[]> {
+  const resp = await fetch('/chat/active', { headers: authHeaders() });
+  if (!resp.ok) throw new Error(`active chats failed: ${resp.status}`);
+  const body: unknown = await resp.json();
+  if (!Array.isArray(body) || !body.every((entry) => typeof entry === 'string')) {
+    throw new Error('active chats returned an invalid payload');
+  }
+  return body;
+}
+
+/**
+ * Detach a local `/chat` stream without orphaning its daemon operation.
+ *
+ * Session switches cannot keep consuming the old SSE response, but aborting
+ * fetch alone does not prove the daemon turn stopped. Abort the local reader
+ * immediately, then use the existing cancellation endpoint; callers must
+ * surface rejection because the old turn may still own the runtime.
+ */
+export async function cancelDetachedChat(
+  requestId: string,
+  controller: AbortController,
+): Promise<void> {
+  controller.abort();
+  await stopChat(requestId);
+}
+
 export async function streamChat(
   body: StreamChatBody,
   onEvent: (event: SSEEvent) => void,
@@ -107,6 +133,14 @@ export async function streamChat(
   const reader = resp.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let terminalSeen = false;
+
+  const emit = (event: SSEEvent) => {
+    if (event.type === 'done' || event.type === 'stopped' || event.type === 'error') {
+      terminalSeen = true;
+    }
+    onEvent(event);
+  };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -131,7 +165,7 @@ export async function streamChat(
 
       try {
         const parsed = JSON.parse(jsonStr) as SSEEvent;
-        onEvent(parsed);
+        emit(parsed);
       } catch {
         // Ignore malformed lines (keep-alive comments, etc.)
       }
@@ -148,12 +182,21 @@ export async function streamChat(
       if (jsonStr) {
         try {
           const parsed = JSON.parse(jsonStr) as SSEEvent;
-          onEvent(parsed);
+          emit(parsed);
         } catch {
           // Ignore
         }
       }
     }
+  }
+
+  if (signal?.aborted) {
+    const error = new Error('chat stream aborted');
+    error.name = 'AbortError';
+    throw error;
+  }
+  if (!terminalSeen) {
+    throw new Error('chat stream ended before an authoritative terminal event');
   }
 }
 
@@ -616,7 +659,7 @@ export type LiveWireEvent =
   | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
-  | { type: 'state'; running: boolean }
+  | { type: 'state'; running: boolean; stop_reason?: string; message?: string }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }

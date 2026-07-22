@@ -68,3 +68,86 @@ test('collection APIs reject server error payloads instead of returning non-arra
     globalThis.fetch = originalFetch;
   }
 });
+
+test('streamChat rejects a clean EOF without an authoritative terminal', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    'data: {"type":"text","content":"partial"}\n\n',
+    { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+  )) as typeof fetch;
+
+  try {
+    const { streamChat } = await import('./api.ts');
+    const events: unknown[] = [];
+    await assert.rejects(
+      () => streamChat({ message: 'hello' }, (event) => events.push(event)),
+      /ended before an authoritative terminal/i,
+    );
+    assert.deepEqual(events, [{ type: 'text', content: 'partial' }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('streamChat accepts done, stopped, and error as authoritative terminals', async () => {
+  const originalFetch = globalThis.fetch;
+  const { streamChat } = await import('./api.ts');
+
+  try {
+    for (const terminal of [
+      { type: 'done', tokens: null, tool_calls: null, session_id: 'session-1' },
+      { type: 'stopped' },
+      { type: 'error', message: 'provider failed' },
+    ]) {
+      globalThis.fetch = (async () => new Response(
+        `data: ${JSON.stringify(terminal)}\n\n`,
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      )) as typeof fetch;
+      await streamChat({ message: 'hello' }, () => {});
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('cancelDetachedChat aborts the local stream and uses the existing stop protocol', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    return new Response(null, { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const { cancelDetachedChat } = await import('./api.ts');
+    const controller = new AbortController();
+    await cancelDetachedChat('request-1', controller);
+
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, '/chat/stop');
+    assert.deepEqual(JSON.parse(String(calls[0].init?.body)), {
+      session_id: 'request-1',
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('getActiveChatSessions reads the authoritative detached chat registry', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL) => {
+    assert.equal(String(url), '/chat/active');
+    return new Response(JSON.stringify(['session-1', 'session-2']), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+
+  try {
+    const { getActiveChatSessions } = await import('./api.ts');
+    assert.deepEqual(await getActiveChatSessions(), ['session-1', 'session-2']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

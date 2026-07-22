@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import * as http from 'node:http';
 import { DaemonClient, classifyDaemonStreamError, formatDaemonHttpError } from '../../src/daemon/client';
 
 function testBodyLimitErrorIsReadable() {
@@ -141,6 +142,171 @@ function testRateLimitedSseIsForwardedToCallback() {
   });
 }
 
+function testDoneSseForwardsAuthoritativeStopReason() {
+  const client = new DaemonClient(13456);
+  let received: unknown;
+  const callbacks = {
+    onText: () => undefined,
+    onToolBatch: () => undefined,
+    onToolStart: () => undefined,
+    onToolProgress: () => undefined,
+    onToolResult: () => undefined,
+    onTokens: () => undefined,
+    onArtifactStart: () => undefined,
+    onArtifactContent: () => undefined,
+    onArtifactEnd: () => undefined,
+    onDone: (...args: unknown[]) => { received = args; },
+    onStopped: () => undefined,
+    onError: () => undefined,
+    onWarning: () => undefined,
+    onRateLimited: () => undefined,
+    onPermissionRequest: () => undefined,
+  };
+
+  (client as unknown as { handleSSEData: (data: string, callbacks: unknown) => void })
+    .handleSSEData(JSON.stringify({
+      type: 'done',
+      tokens: 42,
+      tool_calls: 4,
+      session_id: 'session-1',
+      stop_reason: 'tool_loop_detected',
+      message: 'The turn stopped before another repeated call.',
+    }), callbacks);
+
+  assert.deepEqual(received, [
+    42,
+    4,
+    'session-1',
+    'tool_loop_detected',
+    'The turn stopped before another repeated call.',
+  ]);
+}
+
+async function testCleanEofWithoutTerminalFailsTheStream() {
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    response.end('data: {"type":"text","content":"partial"}\n\n');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const client = new DaemonClient(address.port);
+    const errors: string[] = [];
+    const terminal = new Promise<void>((resolve) => {
+      client.streamChat({ message: 'hello' }, {
+        onText: () => undefined,
+        onToolBatch: () => undefined,
+        onToolStart: () => undefined,
+        onToolProgress: () => undefined,
+        onToolResult: () => undefined,
+        onTokens: () => undefined,
+        onArtifactStart: () => undefined,
+        onArtifactContent: () => undefined,
+        onArtifactEnd: () => undefined,
+        onDone: () => resolve(),
+        onStopped: () => resolve(),
+        onError: (message) => {
+          errors.push(message);
+          resolve();
+        },
+        onWarning: () => undefined,
+        onRateLimited: () => undefined,
+        onPermissionRequest: () => undefined,
+      });
+    });
+
+    await Promise.race([
+      terminal,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('stream EOF produced no terminal callback')), 1_000)),
+    ]);
+    assert.deepEqual(errors, ['Stream ended before a terminal event']);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+}
+
+async function testCleanEofAfterDoneDoesNotEmitASecondTerminal() {
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    response.end('data: {"type":"done","tokens":1,"tool_calls":0,"stop_reason":"stopped"}\n\n');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const client = new DaemonClient(address.port);
+    const terminals: string[] = [];
+    client.streamChat({ message: 'hello' }, {
+      onText: () => undefined,
+      onToolBatch: () => undefined,
+      onToolStart: () => undefined,
+      onToolProgress: () => undefined,
+      onToolResult: () => undefined,
+      onTokens: () => undefined,
+      onArtifactStart: () => undefined,
+      onArtifactContent: () => undefined,
+      onArtifactEnd: () => undefined,
+      onDone: () => { terminals.push('done'); },
+      onStopped: () => { terminals.push('stopped'); },
+      onError: () => { terminals.push('error'); },
+      onWarning: () => undefined,
+      onRateLimited: () => undefined,
+      onPermissionRequest: () => undefined,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(terminals, ['done']);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+}
+
+async function testEventsAfterTerminalAreIgnored() {
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    response.end([
+      'data: {"type":"done","tokens":1,"tool_calls":0,"stop_reason":"stopped"}',
+      'data: {"type":"text","content":"late text"}',
+      '',
+    ].join('\n'));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const client = new DaemonClient(address.port);
+    const terminals: string[] = [];
+    const text: string[] = [];
+    client.streamChat({ message: 'hello' }, {
+      onText: (content) => { text.push(content); },
+      onToolBatch: () => undefined,
+      onToolStart: () => undefined,
+      onToolProgress: () => undefined,
+      onToolResult: () => undefined,
+      onTokens: () => undefined,
+      onArtifactStart: () => undefined,
+      onArtifactContent: () => undefined,
+      onArtifactEnd: () => undefined,
+      onDone: () => { terminals.push('done'); },
+      onStopped: () => { terminals.push('stopped'); },
+      onError: () => { terminals.push('error'); },
+      onWarning: () => undefined,
+      onRateLimited: () => undefined,
+      onPermissionRequest: () => undefined,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(terminals, ['done']);
+    assert.deepEqual(text, []);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+}
+
 testBodyLimitErrorIsReadable();
 testJsonWrappedBodyLimitErrorIsReadable();
 testRegularErrorsKeepServerMessage();
@@ -149,3 +315,12 @@ testNonManualAbortStreamErrorKeepsMessage();
 testPermissionRequestSseIsForwardedToCallback();
 testWarningSseIsForwardedToCallback();
 testRateLimitedSseIsForwardedToCallback();
+testDoneSseForwardsAuthoritativeStopReason();
+void Promise.resolve()
+  .then(testCleanEofWithoutTerminalFailsTheStream)
+  .then(testCleanEofAfterDoneDoesNotEmitASecondTerminal)
+  .then(testEventsAfterTerminalAreIgnored)
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

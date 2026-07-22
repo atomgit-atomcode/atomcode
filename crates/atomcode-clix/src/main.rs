@@ -393,6 +393,9 @@ async fn review(args: ReviewArgs) -> Result<()> {
         );
     }
 
+    let mut incomplete_reasons: Vec<String> = review_incomplete_reason("initial pass", &run)
+        .into_iter()
+        .collect();
     let mut findings = report.findings();
     // Drop findings anchored to files OUTSIDE the diff's changed set — the reviewer is
     // scoped to diff-introduced problems, but the model occasionally reads an un-changed
@@ -442,6 +445,9 @@ async fn review(args: ReviewArgs) -> Result<()> {
                     profile.join(", ")
                 );
             }
+            if let Some(reason) = review_incomplete_reason("coverage pass", &run2) {
+                incomplete_reasons.push(reason);
+            }
             let mut extra = report2.findings();
             drop_out_of_scope(&mut extra, &changed_files);
             let added = merge_findings(&mut findings, extra);
@@ -458,8 +464,9 @@ async fn review(args: ReviewArgs) -> Result<()> {
         println!("{}", render_json(&findings, &run.text, run.usage)?);
     } else if !findings.is_empty() {
         print!("{}", render_findings(&findings));
-    } else if run.error.is_some() {
-        // Don't claim "clean" — the run didn't finish, so we can't conclude there are no issues.
+    } else if !incomplete_reasons.is_empty() {
+        // Don't claim "clean" — at least one pass did not finish, so zero collected
+        // findings is not evidence that the whole diff is clean.
         println!("Review did not complete — no findings were collected.");
     } else {
         println!("No findings — the diff looks clean.");
@@ -472,17 +479,10 @@ async fn review(args: ReviewArgs) -> Result<()> {
     // delivered — a stall AFTER findings were collected still produced the review, so warn
     // but succeed; a failure with no findings (auth/connect/immediate stall) is a real
     // failure CI must detect.
-    // Cut-short detection: an error OR a non-`Stopped` terminal (Cancelled via max-duration,
-    // Timeout, MaxRounds) means the run didn't finish on the model's own terms. If nothing was
-    // delivered, that's a real failure CI/callers must see — NEVER a clean "no issues" run
-    // (the max-duration cancel path emits Cancelled WITHOUT an error, so checking error alone
-    // would silently pass a cut-short review as clean). With findings already collected the
-    // review still produced value: warn but succeed.
-    if review_incomplete(run.stop, run.error.is_some()) {
-        let why = run
-            .error
-            .clone()
-            .unwrap_or_else(|| format!("{:?}", run.stop));
+    // Cut-short detection covers BOTH the initial and coverage passes. Otherwise a
+    // clean first pass followed by a failed re-review could be reported as clean.
+    if !incomplete_reasons.is_empty() {
+        let why = incomplete_reasons.join("; ");
         if findings.is_empty() {
             bail!("review did not complete ({why}): no findings collected");
         }
@@ -519,6 +519,16 @@ struct ReviewRun {
     tool_counts: std::collections::BTreeMap<String, usize>,
     /// Total tool calls.
     tool_calls: usize,
+}
+
+fn review_incomplete_reason(label: &str, run: &ReviewRun) -> Option<String> {
+    review_incomplete(run.stop, run.error.is_some()).then(|| {
+        let reason = run
+            .error
+            .clone()
+            .unwrap_or_else(|| format!("{:?}", run.stop));
+        format!("{label}: {reason}")
+    })
 }
 
 impl ReviewRun {
@@ -1044,6 +1054,28 @@ mod tests {
         assert!(review_incomplete(StopReason::MaxRounds, false));
         // 有 error 即使 Stopped 也算未完成。
         assert!(review_incomplete(StopReason::Stopped, true));
+    }
+
+    #[test]
+    fn coverage_pass_terminal_is_reported_with_its_own_reason() {
+        let run = ReviewRun {
+            stop: StopReason::ToolLoopDetected,
+            ..ReviewRun::default()
+        };
+        assert_eq!(
+            review_incomplete_reason("coverage pass", &run).as_deref(),
+            Some("coverage pass: ToolLoopDetected")
+        );
+
+        let run = ReviewRun {
+            stop: StopReason::Stopped,
+            error: Some("stream closed without terminal".into()),
+            ..ReviewRun::default()
+        };
+        assert_eq!(
+            review_incomplete_reason("coverage pass", &run).as_deref(),
+            Some("coverage pass: stream closed without terminal")
+        );
     }
 
     #[test]

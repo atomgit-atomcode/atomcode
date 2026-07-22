@@ -24,10 +24,14 @@ pub enum StopReason {
     /// The `max_continuations` safety fuse tripped (a `offer_continuation` hook
     /// kept injecting continuations with no model agency to stop — a runaway loop).
     MaxContinuations,
-    /// The cross-round repetition fuse tripped: the model emitted byte-identical
-    /// tool call(s) for too many consecutive rounds without progress (e.g. a weak
-    /// model echoing a question to the user instead of ending the turn).
+    /// The always-on coarse repetition fuse observed the same model-emitted tool
+    /// call pattern for too many consecutive rounds, even though exact results may
+    /// have varied or the opt-in exact guard was disabled.
     RepeatLoop,
+    /// The opt-in exact tool-loop guard reached its configured stop threshold for
+    /// the same call (or all-read-only batch), model-visible result(s), and success
+    /// state after a warning failed to make the model change course.
+    ToolLoopDetected,
     /// The provider failed to open the stream OR errored mid-stream.
     ProviderError,
     /// A liveness `stream_timeout` elapsed waiting for the next stream event.
@@ -60,7 +64,9 @@ pub enum AgentCommand {
     /// compaction, mid-turn FIFO queueing), but the conversation message is pushed
     /// via `Message::synthetic_user`, so `sacred_floor` skips it and hosts can hide
     /// it from user-facing projections.
-    SendSyntheticMessage { text: String },
+    SendSyntheticMessage {
+        text: String,
+    },
     /// Answer a pending AgentEvent::Request, correlated by id.
     Respond {
         id: RequestId,
@@ -157,8 +163,9 @@ pub enum AgentEvent {
     },
     /// TERMINAL turn event. `reason` (FAILURE PERCEPTION) says WHY the turn ended —
     /// `Stopped` (normal) vs a failure/fuse (`ProviderError`/`Timeout`/`MaxRounds`/
-    /// `MaxContinuations`/`Cancelled`/`PromptRejected`). A driver can no longer
-    /// mistake a failed turn for an empty success.
+    /// `MaxContinuations`/`RepeatLoop`/`ToolLoopDetected`/`Cancelled`/
+    /// `PromptRejected`). A driver can no longer mistake a failed turn for an empty
+    /// success.
     TurnComplete {
         reason: StopReason,
     },
@@ -269,7 +276,9 @@ mod tests {
 
     #[test]
     fn send_synthetic_message_serde_roundtrip() {
-        let cmd = AgentCommand::SendSyntheticMessage { text: "continue".into() };
+        let cmd = AgentCommand::SendSyntheticMessage {
+            text: "continue".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         let back: AgentCommand = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, AgentCommand::SendSyntheticMessage { text } if text == "continue"));

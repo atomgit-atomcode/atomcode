@@ -58,7 +58,8 @@ mod todo;
 
 pub use assemble::{build_coding_agent, build_coding_agent_with};
 pub use config::{
-    apply_provider_config, CodingAgentConfig, CodingRuntimeConfig, SubagentProvider, TierProvider,
+    apply_provider_config, resolve_loop_max_rounds, CodingAgentConfig, CodingRuntimeConfig,
+    SubagentProvider, TierProvider,
 };
 pub use controllers::{GoalProgress, LoopProgress};
 pub use discipline::VerifyCadenceHook;

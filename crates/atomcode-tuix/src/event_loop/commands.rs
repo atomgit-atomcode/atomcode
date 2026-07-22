@@ -47,7 +47,9 @@ const MAX_RECENT_DIRS: usize = 5;
 fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
     if matches!(
         state.phase,
-        crate::state::UiPhase::Streaming | crate::state::UiPhase::Approval
+        crate::state::UiPhase::Streaming
+            | crate::state::UiPhase::Approval
+            | crate::state::UiPhase::UserInput
     ) {
         bg_runtime::RuntimeState::Running
     } else {
@@ -104,39 +106,6 @@ pub(crate) fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
     }
 }
 
-/// Scan session messages for a pending tool approval — an
-/// `AssistantWithToolCalls` message whose tool calls lack corresponding
-/// `ToolResult` entries.  Returns `(display_name, detail)` of the first
-/// unpaired tool call, or `None` if all tool calls have results.
-fn find_pending_approval(session: &Session) -> Option<(String, String)> {
-    use crate::event_loop::format_tool_detail;
-    use atomcode_core::conversation::message::{MessageContent, Role};
-
-    // Collect all call_ids that already have a ToolResult.
-    let mut answered_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for m in &session.messages {
-        if let (Role::Tool, MessageContent::ToolResult(r)) = (&m.role, &m.content) {
-            answered_ids.insert(r.call_id.clone());
-        }
-    }
-
-    // Walk messages in reverse to find the most recent unpaired tool call.
-    for m in session.messages.iter().rev() {
-        if let (Role::Assistant, MessageContent::AssistantWithToolCalls { tool_calls, .. }) =
-            (&m.role, &m.content)
-        {
-            for tc in tool_calls.iter().rev() {
-                if !answered_ids.contains(&tc.id) {
-                    let display = super::display_tool_name(&tc.name);
-                    let detail = format_tool_detail(&tc.name, &tc.arguments);
-                    return Some((display, detail));
-                }
-            }
-        }
-    }
-    None
-}
-
 fn short_task_name(task: &str) -> String {
     let first_line = task.lines().next().unwrap_or(task).trim();
     let mut out: String = first_line.chars().take(80).collect();
@@ -174,25 +143,213 @@ fn sync_bg_foreground(ctx: &mut LoopCtx) {
             native: ctx.runtime.clone(),
         },
         ctx.current_session.clone(),
+        ctx.working_dir.clone(),
     );
 }
 
-fn ensure_bg_foreground_switch_allowed(provider_transition: bool) -> Result<(), &'static str> {
+fn ensure_bg_foreground_switch_allowed(
+    live_binding: bool,
+    provider_transition: bool,
+    pending_runtime_request: bool,
+) -> Result<(), &'static str> {
     if provider_transition {
         Err("/bg cannot switch the foreground while a provider transition is in progress")
+    } else if pending_runtime_request {
+        Err("/bg cannot switch the foreground while an interactive runtime request is pending")
+    } else if live_binding {
+        Err("/bg cannot switch the foreground while live sync is attached; run /sync off first")
     } else {
         Ok(())
     }
 }
 
+fn apply_resumed_runtime_state(state: &mut UiState, runtime_state: bg_runtime::RuntimeState) {
+    if matches!(runtime_state, bg_runtime::RuntimeState::Running) {
+        state.on_submit();
+    } else {
+        state.on_turn_complete();
+    }
+}
+
+fn schedule_resumed_runtime_replay(
+    replay_queue: &mut std::collections::VecDeque<bg_runtime::RuntimeEventPayload>,
+    events: Vec<bg_runtime::RuntimeEventPayload>,
+) {
+    replay_queue.extend(events);
+}
+
+fn foreground_turn_replay_events(state: &UiState) -> Vec<bg_runtime::RuntimeEventPayload> {
+    if !matches!(
+        state.phase,
+        crate::state::UiPhase::Streaming
+            | crate::state::UiPhase::Approval
+            | crate::state::UiPhase::UserInput
+    ) {
+        return Vec::new();
+    }
+
+    let mut events = Vec::new();
+    if let Some(message) = state.last_submitted_message.as_ref() {
+        events.push(bg_runtime::RuntimeEventPayload::Ui(
+            crate::event_loop::ui_event::UiEvent::UserEcho(message.clone()),
+        ));
+    }
+    if !state.response_finalized && !state.last_assistant_response.is_empty() {
+        events.push(bg_runtime::RuntimeEventPayload::Ui(
+            crate::event_loop::ui_event::UiEvent::TextDelta(state.last_assistant_response.clone()),
+        ));
+    }
+    events
+}
+
+fn finalize_background_submission<E>(
+    manager: &mut bg_runtime::BgRuntimeManager,
+    slot: usize,
+    result: Result<(), E>,
+) -> Result<(), E> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            manager
+                .drop_slot(slot)
+                .expect("the newly appended background slot must still exist");
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
-mod bg_provider_transition_guard_tests {
-    use super::ensure_bg_foreground_switch_allowed;
+mod bg_live_guard_tests {
+    use std::path::PathBuf;
+
+    use super::{
+        apply_resumed_runtime_state, detach_live_binding_with, ensure_bg_foreground_switch_allowed,
+        finalize_background_submission, foreground_turn_replay_events,
+        schedule_resumed_runtime_replay,
+    };
+    use crate::event_loop::bg_runtime::{BgRuntimeManager, RuntimeEventPayload, RuntimeState};
+    use crate::session::Session;
+    use crate::state::{UiPhase, UiState};
+
+    #[test]
+    fn live_binding_blocks_only_foreground_bg_switches() {
+        assert!(ensure_bg_foreground_switch_allowed(true, false, false).is_err());
+        assert!(ensure_bg_foreground_switch_allowed(false, false, false).is_ok());
+    }
 
     #[test]
     fn provider_transition_blocks_foreground_owner_switches() {
-        assert!(ensure_bg_foreground_switch_allowed(true).is_err());
-        assert!(ensure_bg_foreground_switch_allowed(false).is_ok());
+        assert!(ensure_bg_foreground_switch_allowed(false, true, false).is_err());
+        assert!(ensure_bg_foreground_switch_allowed(false, false, false).is_ok());
+    }
+
+    #[test]
+    fn pending_runtime_request_blocks_foreground_owner_switches() {
+        assert!(ensure_bg_foreground_switch_allowed(false, false, true).is_err());
+        assert!(ensure_bg_foreground_switch_allowed(false, false, false).is_ok());
+    }
+
+    #[test]
+    fn running_background_resume_keeps_the_foreground_streaming() {
+        let mut state = UiState::with_unicode(true);
+        state.on_turn_complete();
+
+        apply_resumed_runtime_state(&mut state, RuntimeState::Running);
+
+        assert_eq!(state.phase, UiPhase::Streaming);
+    }
+
+    #[test]
+    fn backgrounding_current_turn_keeps_the_already_rendered_prefix() {
+        let mut state = UiState::with_unicode(true);
+        state.on_submit();
+        state.last_submitted_message = Some("question".into());
+        state.last_assistant_response = "partial answer".into();
+        state.response_finalized = false;
+
+        let events = foreground_turn_replay_events(&state);
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RuntimeEventPayload::Ui(crate::event_loop::ui_event::UiEvent::UserEcho(user)),
+                RuntimeEventPayload::Ui(crate::event_loop::ui_event::UiEvent::TextDelta(answer)),
+            ] if user == "question" && answer == "partial answer"
+        ));
+    }
+
+    #[test]
+    fn failed_live_unbind_preserves_the_local_guard_binding() {
+        let original = atomcode_daemon::live_hub::LiveBinding {
+            id: 7,
+            generation: 3,
+            session_id: "session".into(),
+            working_dir: PathBuf::from("/project"),
+        };
+        let mut binding = Some(original.clone());
+
+        let result = detach_live_binding_with(&mut binding, |_| {
+            Err(atomcode_daemon::live_hub::HubError::ActiveTurn)
+        });
+
+        assert!(result.is_err());
+        assert_eq!(binding, Some(original));
+    }
+
+    #[test]
+    fn failed_background_submit_removes_the_unstarted_slot() {
+        let project = PathBuf::from("/project");
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(project.clone()));
+        let slot = manager
+            .push_test_background(Session::default_session(project), RuntimeState::Running)
+            .unwrap();
+
+        let result =
+            finalize_background_submission(&mut manager, slot, Err::<(), _>("runtime unavailable"));
+
+        assert_eq!(result, Err("runtime unavailable"));
+        assert!(manager.backgrounds().is_empty());
+    }
+
+    #[test]
+    fn resumed_request_is_prioritized_ahead_of_the_shared_runtime_queue() {
+        let mut transport_queue = std::collections::VecDeque::from([RuntimeEventPayload::Ui(
+            crate::event_loop::ui_event::UiEvent::TurnComplete {
+                duration: std::time::Duration::default(),
+                total_tokens: 0,
+                turn_count: 0,
+                tool_call_count: 0,
+                stop_reason: crate::event_loop::ui_event::UiTurnStopReason::Natural,
+                snapshot: Default::default(),
+            },
+        )]);
+        let mut replay_queue = std::collections::VecDeque::new();
+        let request = atomcode_coding::RuntimeRequest {
+            id: 42,
+            kind: atomcode_capabilities::tools::APPROVAL_KIND.into(),
+            payload: serde_json::json!({}),
+            snapshot: None,
+        };
+
+        schedule_resumed_runtime_replay(
+            &mut replay_queue,
+            vec![RuntimeEventPayload::Native(
+                atomcode_coding::CodingRuntimeEvent::Request(request),
+            )],
+        );
+
+        let queued = replay_queue.pop_front().unwrap();
+        assert!(matches!(
+            queued,
+            RuntimeEventPayload::Native(atomcode_coding::CodingRuntimeEvent::Request(request))
+                if request.id == 42
+        ));
+        assert!(matches!(
+            transport_queue.pop_front(),
+            Some(RuntimeEventPayload::Ui(
+                crate::event_loop::ui_event::UiEvent::TurnComplete { .. }
+            ))
+        ));
     }
 }
 
@@ -349,11 +506,22 @@ pub(crate) fn attach_live_runtime(
 }
 
 fn detach_live_runtime(ctx: &mut LoopCtx) -> Result<bool, String> {
-    let Some(binding) = ctx.live_binding.take() else {
+    detach_live_binding_with(&mut ctx.live_binding, |binding| {
+        atomcode_daemon::native_live::unregister_embedded_runtime(binding)
+    })
+}
+
+fn detach_live_binding_with(
+    binding: &mut Option<atomcode_daemon::live_hub::LiveBinding>,
+    unregister: impl FnOnce(
+        &atomcode_daemon::live_hub::LiveBinding,
+    ) -> Result<(), atomcode_daemon::live_hub::HubError>,
+) -> Result<bool, String> {
+    let Some(current) = binding.as_ref() else {
         return Ok(false);
     };
-    atomcode_daemon::native_live::unregister_embedded_runtime(&binding)
-        .map_err(|error| format!("停止共享当前 runtime 失败：{error:?}"))?;
+    unregister(current).map_err(|error| format!("停止共享当前 runtime 失败：{error:?}"))?;
+    *binding = None;
     Ok(true)
 }
 
@@ -475,6 +643,7 @@ pub(crate) fn fire_interval_payload(
                 state.on_submit();
                 if let Some(c) = ctx.loop_ctrl.as_mut() {
                     c.consecutive_failures = 0;
+                    c.mark_turn_submitted();
                 }
             } else if let Some(c) = ctx.loop_ctrl.as_mut() {
                 c.consecutive_failures = c.consecutive_failures.saturating_add(1);
@@ -496,6 +665,9 @@ pub(crate) fn fire_interval_payload(
                     c.consecutive_failures += 1;
                 } else {
                     c.consecutive_failures = 0;
+                    if !matches!(state.phase, crate::state::UiPhase::Idle) {
+                        c.mark_turn_submitted();
+                    }
                 }
             }
         }
@@ -546,8 +718,12 @@ pub(crate) fn start_interval_loop(
     };
     let mut c = crate::event_loop::loop_ctrl::LoopController::new_interval(secs, p);
     c.next_fire_at = Some(std::time::Instant::now() + c.interval);
-    // Honor configured max_rounds (parity with self-paced mode).
-    c.max_rounds = ctx.config.loop_config.max_rounds;
+    // Honor the same TOML + env resolution as the runtime-owned self-paced
+    // loop. In particular, ATOMCODE_LOOP_MAX_ROUNDS=0 is unbounded here too.
+    c.max_rounds = atomcode_coding::resolve_loop_max_rounds(
+        ctx.config.loop_config.max_rounds,
+        std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
+    );
     ctx.loop_ctrl = Some(c);
     state.loop_label = Some(format!("{secs}s · {payload}"));
     state.loop_round = 0;
@@ -1477,8 +1653,10 @@ fn execute_slash_command_impl(
                 match perform_session_rename(&project_bucket, &ctx.current_session.id, &new_name) {
                     Ok((old_name, _)) => {
                         ctx.current_session.rename(new_name.clone());
-                        ctx.bg_manager
-                            .set_foreground_session(ctx.current_session.clone());
+                        ctx.bg_manager.set_foreground_session(
+                            ctx.current_session.clone(),
+                            ctx.working_dir.clone(),
+                        );
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::SessionRenamed {
                                 old: &old_name,
@@ -1519,8 +1697,15 @@ fn execute_slash_command_impl(
             renderer.flush();
         }
         "diff" => {
-            match build_diff_text(ctx) {
-                Ok(s) => renderer.render(UiLine::CommandOutput(s)),
+            match build_interactive_diff(&ctx.working_dir) {
+                Ok(None) => {
+                    renderer.render(UiLine::CommandOutput(t(Msg::CmdNoChanges).into_owned()))
+                }
+                Ok(Some(parsed)) => {
+                    for line in interactive_diff_lines(parsed) {
+                        renderer.render(line);
+                    }
+                }
                 Err(e) => renderer.render(UiLine::Error(e)),
             }
             renderer.flush();
@@ -2117,7 +2302,13 @@ fn execute_slash_command_impl(
             }
             let new_dir = resolve_cd(arg, &ctx.working_dir, ctx.previous_dir.as_deref());
             match new_dir {
-                Ok(path) => match apply_cd(ctx, path) {
+                Ok(path) => match apply_cd_with_effect(
+                    ctx,
+                    path,
+                    crate::event_loop::SessionTransitionEffect::CdCommand {
+                        echo: format!("/cd {arg}"),
+                    },
+                ) {
                     Ok(_) => renderer.render(UiLine::CommandOutput(
                         t(Msg::CmdSessionTransitionPending).into_owned(),
                     )),
@@ -2140,9 +2331,11 @@ fn execute_slash_command_impl(
                     )));
                 }
                 bg_runtime::BgCommand::BackgroundCurrent => {
-                    if let Err(error) =
-                        ensure_bg_foreground_switch_allowed(provider_transition_pending(ctx))
-                    {
+                    if let Err(error) = ensure_bg_foreground_switch_allowed(
+                        ctx.live_binding.is_some(),
+                        provider_transition_pending(ctx),
+                        ctx.pending_runtime_request_id.is_some(),
+                    ) {
                         renderer.render(UiLine::Error(error.into()));
                         renderer.flush();
                         return Ok(());
@@ -2159,15 +2352,18 @@ fn execute_slash_command_impl(
                         return Ok(());
                     }
                     let old_short_id = ctx.current_session.short_id().to_string();
+                    let old_replay_events = foreground_turn_replay_events(state);
                     let new_session = Session::default_session(ctx.working_dir.clone());
                     let new_short_id = new_session.short_id().to_string();
                     let (runtime_id, endpoint, new_session) = spawn_runtime(ctx, new_session);
                     let old_state = foreground_state_from_ui(state);
-                    let slot = match ctx.bg_manager.background_current(
+                    let slot = match ctx.bg_manager.background_current_with_replay(
                         endpoint.clone(),
                         new_session.clone(),
+                        ctx.working_dir.clone(),
                         runtime_id,
                         old_state,
+                        old_replay_events,
                     ) {
                         Ok(slot) => slot,
                         Err(bg_runtime::BgError::SlotLimit { max }) => {
@@ -2178,8 +2374,11 @@ fn execute_slash_command_impl(
                             return Ok(());
                         }
                         Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
+                        Err(
+                            bg_runtime::BgError::NoRuntimeClient { .. }
+                            | bg_runtime::BgError::SessionProjectionUnavailable { .. },
+                        ) => unreachable!("background_current cannot return a resume error"),
                     };
-
                     ctx.runtime = endpoint.native;
                     ctx.foreground_runtime_id = runtime_id;
                     ctx.current_session = new_session;
@@ -2211,9 +2410,11 @@ fn execute_slash_command_impl(
                     renderer.end_sync();
                 }
                 bg_runtime::BgCommand::Resume(slot) => {
-                    if let Err(error) =
-                        ensure_bg_foreground_switch_allowed(provider_transition_pending(ctx))
-                    {
+                    if let Err(error) = ensure_bg_foreground_switch_allowed(
+                        ctx.live_binding.is_some(),
+                        provider_transition_pending(ctx),
+                        ctx.pending_runtime_request_id.is_some(),
+                    ) {
                         renderer.render(UiLine::Error(error.into()));
                         renderer.flush();
                         return Ok(());
@@ -2242,46 +2443,44 @@ fn execute_slash_command_impl(
                             renderer.flush();
                             return Ok(());
                         }
+                        Err(bg_runtime::BgError::NoRuntimeClient { .. }) => {
+                            renderer.render(UiLine::Error(t(Msg::BgNoRuntimeClient).into_owned()));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(bg_runtime::BgError::SessionProjectionUnavailable {
+                            error, ..
+                        }) => {
+                            renderer.render(UiLine::Error(format!(
+                                "background session could not be loaded: {error}"
+                            )));
+                            renderer.flush();
+                            return Ok(());
+                        }
                     };
-                    let Some(endpoint) = outcome.resumed_endpoint else {
-                        renderer.render(UiLine::Error(t(Msg::BgNoRuntimeClient).into_owned()));
-                        renderer.flush();
-                        return Ok(());
-                    };
+                    let endpoint = outcome.resumed_endpoint;
 
                     // Switching sessions: stop any active /loop so its TUI-side interval
                     // controller can't keep firing the old payload into the newly-resumed
                     // session (and clear the stale footer). ClearLoop reaches the outgoing
                     // agent before the swap below.
                     stop_active_loop(state, ctx);
+                    super::commit_working_dir_projection(ctx, outcome.resumed_working_dir.clone());
                     ctx.runtime = endpoint.native;
                     ctx.foreground_runtime_id = outcome.resumed_runtime_id;
                     ctx.current_session = outcome.resumed_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
-                    state.on_turn_complete();
+                    apply_resumed_runtime_state(state, outcome.resumed_state);
                     crate::modals::session_picker::replay_session(
                         renderer,
                         state,
                         &ctx.current_session,
                         true,
                     );
-
-                    // If the resumed session was waiting for tool approval,
-                    // re-render the approval prompt so the user can
-                    // continue interacting.  Detect this by looking for
-                    // an AssistantWithToolCalls message whose tool_calls
-                    // lack corresponding ToolResult entries.
-                    let pending_approval = find_pending_approval(&ctx.current_session);
-                    if let Some((tool_name, detail)) = pending_approval {
-                        state.approval_panel = Some(crate::state::ApprovalPanel {
-                            options: crate::event_loop::build_approval_options(&tool_name),
-                            selected: 0,
-                            tool: tool_name,
-                            detail,
-                            cache_key: String::new(),
-                        });
-                        state.on_approval_needed("");
-                    }
+                    schedule_resumed_runtime_replay(
+                        &mut ctx.foreground_replay_events,
+                        outcome.replay_events,
+                    );
 
                     let short_id = ctx.current_session.short_id().to_string();
                     let mut msg = t(Msg::BgResumed {
@@ -2314,6 +2513,10 @@ fn execute_slash_command_impl(
                             return Ok(());
                         }
                         Err(bg_runtime::BgError::SlotLimit { .. }) => unreachable!(),
+                        Err(
+                            bg_runtime::BgError::NoRuntimeClient { .. }
+                            | bg_runtime::BgError::SessionProjectionUnavailable { .. },
+                        ) => unreachable!("drop_slot cannot return a resume error"),
                     };
                     if matches!(dropped.state, bg_runtime::RuntimeState::Running) {
                         if let Some(endpoint) = dropped.endpoint.as_ref() {
@@ -2362,6 +2565,7 @@ fn execute_slash_command_impl(
                 runtime_id,
                 endpoint.clone(),
                 session,
+                ctx.working_dir.clone(),
                 bg_runtime::RuntimeState::Running,
             ) {
                 Ok(slot) => slot,
@@ -2373,13 +2577,32 @@ fn execute_slash_command_impl(
                     return Ok(());
                 }
                 Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
+                Err(
+                    bg_runtime::BgError::NoRuntimeClient { .. }
+                    | bg_runtime::BgError::SessionProjectionUnavailable { .. },
+                ) => unreachable!("push_background_runtime cannot return a resume error"),
             };
-            endpoint
-                .native
-                .dispatch_when_ready(atomcode_coding::DriverCommand::Submit(
-                    task.to_string().into(),
-                ))
-                .ok();
+            let submit_result =
+                endpoint
+                    .native
+                    .dispatch_when_ready(atomcode_coding::DriverCommand::Submit(
+                        task.to_string().into(),
+                    ));
+            if let Err(error) =
+                finalize_background_submission(&mut ctx.bg_manager, slot, submit_result)
+            {
+                renderer.render(UiLine::Error(format!(
+                    "background task could not be started: {error}"
+                )));
+                renderer.flush();
+                return Ok(());
+            }
+            ctx.bg_manager.apply_background_event(
+                runtime_id,
+                bg_runtime::RuntimeEventPayload::Ui(
+                    crate::event_loop::ui_event::UiEvent::UserEcho(task.to_string()),
+                ),
+            );
             renderer.render(UiLine::CommandOutput(
                 t(Msg::BgTaskStarted {
                     slot,
@@ -3933,6 +4156,14 @@ pub(crate) fn complete_session_transition_effect(
     effect.commit_marker(&mut ctx.worktree_original_dir);
     match effect {
         SessionTransitionEffect::None | SessionTransitionEffect::EnterWorktree { .. } => {}
+        SessionTransitionEffect::CdCommand { echo } => {
+            renderer.render(UiLine::User(echo));
+            let path = ctx.working_dir.display().to_string();
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::DirChanged { path: &path }).into_owned(),
+            ));
+            renderer.flush();
+        }
         SessionTransitionEffect::LeaveWorktree {
             original_dir,
             branch,
@@ -4383,25 +4614,297 @@ pub(super) fn build_whoami_text() -> String {
     }
 }
 
-/// `/diff` 的改动概要文本（Err = 渲染为错误行的文案）。TUI arm 与手机远程执行共用。
-pub(super) fn build_diff_text(ctx: &LoopCtx) -> Result<String, String> {
-    match std::process::Command::new("git")
-        .args(["diff", "--stat"])
-        .current_dir(&ctx.working_dir)
-        .output()
-    {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout).to_string();
-            Ok(if s.is_empty() {
-                t(Msg::CmdNoChanges).into_owned()
-            } else {
-                s
-            })
+const MAX_INTERACTIVE_DIFF_BYTES: usize = 512 * 1024;
+const MAX_INTERACTIVE_DIFF_ENTRIES: usize = 120;
+const MAX_REMOTE_DIFF_BYTES: usize = 128 * 1024;
+const MAX_DIFF_STDERR_BYTES: usize = 64 * 1024;
+
+struct GitDiffCapture {
+    stdout: String,
+    truncated: bool,
+}
+
+fn diff_failed(error: impl std::fmt::Display) -> String {
+    let error = error.to_string();
+    t(Msg::DiffFailed { error: &error }).into_owned()
+}
+
+fn run_git_diff_bounded(
+    working_dir: &std::path::Path,
+    args: &[&str],
+    max_stdout_bytes: usize,
+) -> Result<GitDiffCapture, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(working_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(diff_failed)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| diff_failed("git diff stdout was not captured"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| diff_failed("git diff stderr was not captured"))?;
+
+    // Drain stderr concurrently so a repository hook/configuration error cannot
+    // fill that pipe and deadlock while stdout is being read. Keep only a bounded
+    // prefix for the user-visible error, but continue draining the rest.
+    let stderr_reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut kept = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = stderr.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            if kept.len() < MAX_DIFF_STDERR_BYTES {
+                let remaining = MAX_DIFF_STDERR_BYTES - kept.len();
+                kept.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
         }
-        Err(e) => Err(t(Msg::DiffFailed {
-            error: &format!("{}", e),
-        })
-        .into_owned()),
+        Ok(kept)
+    });
+
+    let mut stdout_bytes = Vec::with_capacity(max_stdout_bytes.min(64 * 1024));
+    let mut limited = stdout.take(max_stdout_bytes.saturating_add(1) as u64);
+    if let Err(error) = limited.read_to_end(&mut stdout_bytes) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr_reader.join();
+        return Err(diff_failed(error));
+    }
+    let truncated = stdout_bytes.len() > max_stdout_bytes;
+    if truncated {
+        stdout_bytes.truncate(max_stdout_bytes);
+        if let Some(last_newline) = stdout_bytes.iter().rposition(|byte| *byte == b'\n') {
+            stdout_bytes.truncate(last_newline + 1);
+        }
+        let _ = child.kill();
+    }
+
+    let status = child.wait().map_err(diff_failed)?;
+    let stderr_bytes = stderr_reader
+        .join()
+        .map_err(|_| diff_failed("git diff stderr reader panicked"))?
+        .map_err(diff_failed)?;
+    if !truncated && !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+        return Err(diff_failed(if stderr.is_empty() {
+            format!("git diff exited with {status}")
+        } else {
+            stderr
+        }));
+    }
+
+    Ok(GitDiffCapture {
+        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+        truncated,
+    })
+}
+
+fn build_interactive_diff(
+    working_dir: &std::path::Path,
+) -> Result<Option<crate::render::diff::ParsedDiff>, String> {
+    let capture = run_git_diff_bounded(
+        working_dir,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--unified=3",
+            "--",
+        ],
+        MAX_INTERACTIVE_DIFF_BYTES,
+    )?;
+    if capture.stdout.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let mut parsed = crate::render::diff::parse_unified_diff_files(
+        &capture.stdout,
+        MAX_INTERACTIVE_DIFF_ENTRIES,
+    );
+    parsed.truncated |= capture.truncated;
+    Ok(Some(parsed))
+}
+
+/// Convert parsed diff files into stable replay units. Consecutive
+/// `CommandOutput` values are coalesced by the retained renderer, so file
+/// headers and non-hunk summaries must carry their line boundaries inside one
+/// value; otherwise a resize can replay them as one concatenated row.
+fn interactive_diff_lines(parsed: crate::render::diff::ParsedDiff) -> Vec<UiLine> {
+    fn append_text(pending: &mut String, text: &str) {
+        let text = text.trim_end_matches('\n');
+        if text.is_empty() {
+            return;
+        }
+        if !pending.is_empty() {
+            pending.push('\n');
+        }
+        pending.push_str(text);
+    }
+
+    fn flush_text(lines: &mut Vec<UiLine>, pending: &mut String) {
+        if !pending.is_empty() {
+            lines.push(UiLine::CommandOutput(std::mem::take(pending)));
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut pending_text = String::new();
+    for file in parsed.files {
+        append_text(&mut pending_text, &file.header);
+        if !file.entries.is_empty() {
+            flush_text(&mut lines, &mut pending_text);
+            lines.push(UiLine::DiffBlock(file.entries));
+        }
+        if let Some(summary) = file.summary {
+            append_text(&mut pending_text, &summary);
+        }
+    }
+    if parsed.truncated {
+        append_text(&mut pending_text, t(Msg::CmdDiffTruncated).as_ref());
+    }
+    flush_text(&mut lines, &mut pending_text);
+    lines
+}
+
+/// Compact `/diff` summary used by the phone/remote command surface. The
+/// interactive TUI renders file-scoped unified hunks instead.
+pub(super) fn build_diff_stat_text(ctx: &LoopCtx) -> Result<String, String> {
+    let capture = run_git_diff_bounded(
+        &ctx.working_dir,
+        &[
+            "diff",
+            "--stat",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--",
+        ],
+        MAX_REMOTE_DIFF_BYTES,
+    )?;
+    if capture.stdout.is_empty() {
+        return Ok(t(Msg::CmdNoChanges).into_owned());
+    }
+    if capture.truncated {
+        Ok(format!("{}{}", capture.stdout, t(Msg::CmdDiffTruncated)))
+    } else {
+        Ok(capture.stdout)
+    }
+}
+
+#[cfg(test)]
+mod interactive_diff_tests {
+    use super::{build_interactive_diff, interactive_diff_lines};
+    use crate::render::diff::{ParsedDiff, ParsedDiffFile};
+    use crate::render::{DiffKind, UiLine};
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn clean_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("temp git repo");
+        git(repo.path(), &["init"]);
+        std::fs::write(repo.path().join("README.md"), "original\n").expect("write fixture");
+        git(repo.path(), &["add", "README.md"]);
+        git(
+            repo.path(),
+            &[
+                "-c",
+                "user.email=tuix@local",
+                "-c",
+                "user.name=tuix",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        repo
+    }
+
+    #[test]
+    fn interactive_diff_distinguishes_clean_and_dirty_repositories() {
+        let repo = clean_repo();
+        assert!(build_interactive_diff(repo.path()).unwrap().is_none());
+
+        std::fs::write(repo.path().join("README.md"), "modified\n").expect("dirty fixture");
+        let parsed = build_interactive_diff(repo.path())
+            .unwrap()
+            .expect("dirty repository should produce a patch");
+
+        assert_eq!(parsed.files.len(), 1);
+        assert!(parsed.files[0].header.starts_with("diff --git "));
+        assert!(parsed.files[0]
+            .entries
+            .iter()
+            .any(|entry| entry.kind == DiffKind::Del && entry.text == "original"));
+        assert!(parsed.files[0]
+            .entries
+            .iter()
+            .any(|entry| entry.kind == DiffKind::Add && entry.text == "modified"));
+    }
+
+    #[test]
+    fn interactive_diff_reports_non_git_directory_as_an_error() {
+        let dir = tempfile::tempdir().expect("plain tempdir");
+        assert!(build_interactive_diff(dir.path()).is_err());
+    }
+
+    #[test]
+    fn interactive_diff_groups_adjacent_text_for_resize_replay() {
+        let lines = interactive_diff_lines(ParsedDiff {
+            files: vec![
+                ParsedDiffFile {
+                    header: "diff --git a/image.png b/image.png".into(),
+                    entries: Vec::new(),
+                    summary: Some("Binary files a/image.png and b/image.png differ".into()),
+                },
+                ParsedDiffFile {
+                    header: "diff --git a/script.sh b/script.sh".into(),
+                    entries: Vec::new(),
+                    summary: Some("old mode 100644\nnew mode 100755".into()),
+                },
+            ],
+            truncated: false,
+        });
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "adjacent command text must be one replay unit"
+        );
+        let UiLine::CommandOutput(text) = &lines[0] else {
+            panic!("expected grouped command output, got {lines:?}");
+        };
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            vec![
+                "diff --git a/image.png b/image.png",
+                "Binary files a/image.png and b/image.png differ",
+                "diff --git a/script.sh b/script.sh",
+                "old mode 100644",
+                "new mode 100755",
+            ]
+        );
     }
 }
 
@@ -4532,7 +5035,7 @@ pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> O
             state.cached_tokens,
         )),
         "whoami" => Some(build_whoami_text()),
-        "diff" => Some(build_diff_text(ctx).unwrap_or_else(|e| e)),
+        "diff" => Some(build_diff_stat_text(ctx).unwrap_or_else(|e| e)),
         _ => None,
     }
 }
@@ -7141,10 +7644,16 @@ mod todo_command_tests {
             synthetic: false,
             internal_origin: None,
         }];
-        msgs.extend(super::todo_add_messages("todo-add-1".to_string(), "ship it"));
+        msgs.extend(super::todo_add_messages(
+            "todo-add-1".to_string(),
+            "ship it",
+        ));
         let out = format_todo_command(&msgs, false);
         assert!(out.contains("do x"), "existing task must remain:\n{out}");
-        assert!(out.contains("[ ] ship it"), "new pending task appended:\n{out}");
+        assert!(
+            out.contains("[ ] ship it"),
+            "new pending task appended:\n{out}"
+        );
     }
 
     #[test]
@@ -7152,7 +7661,10 @@ mod todo_command_tests {
         // No prior plan: `/todo add` alone should create a one-item list.
         let msgs = super::todo_add_messages("todo-add-0".to_string(), "first task");
         let out = format_todo_command(&msgs, false);
-        assert!(out.contains("[ ] first task"), "add-from-empty seeds the list:\n{out}");
+        assert!(
+            out.contains("[ ] first task"),
+            "add-from-empty seeds the list:\n{out}"
+        );
     }
 
     #[test]

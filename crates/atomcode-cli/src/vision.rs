@@ -108,7 +108,10 @@ fn apply_outcome(
                     text: merged,
                     images: Vec::new(),
                 },
-                Some(VisionNotice::Recognised { vl_model, char_count }),
+                Some(VisionNotice::Recognised {
+                    vl_model,
+                    char_count,
+                }),
             )
         }
         PreprocessOutcome::Failed { reason } => {
@@ -151,10 +154,19 @@ mod tests {
                 vl_model: "qwen-vl".to_string(),
             },
         );
-        assert!(input.images.is_empty(), "Replaced clears images for the model");
-        assert!(input.text.contains("你好世界"), "VL text folded into caption");
+        assert!(
+            input.images.is_empty(),
+            "Replaced clears images for the model"
+        );
+        assert!(
+            input.text.contains("你好世界"),
+            "VL text folded into caption"
+        );
         match notice {
-            Some(VisionNotice::Recognised { vl_model, char_count }) => {
+            Some(VisionNotice::Recognised {
+                vl_model,
+                char_count,
+            }) => {
                 assert_eq!(char_count, 4, "must be VL char count, not bytes/merged len");
                 assert_eq!(vl_model, "qwen-vl");
             }
@@ -167,7 +179,9 @@ mod tests {
         let (input, notice) = apply_outcome(
             "hi".to_string(),
             vec![img()],
-            PreprocessOutcome::Failed { reason: "boom".into() },
+            PreprocessOutcome::Failed {
+                reason: "boom".into(),
+            },
         );
         assert!(input.images.is_empty());
         assert!(input.text.contains("[图片识别失败]"));

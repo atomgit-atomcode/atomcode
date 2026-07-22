@@ -427,7 +427,10 @@ mod tests {
         let via_alias = reg.find("new").expect("/new must resolve to /session");
         assert_eq!(via_alias.name, "session");
         // The alias inherits the canonical command's args behavior.
-        assert_eq!(via_alias.needs_args, reg.find("session").unwrap().needs_args);
+        assert_eq!(
+            via_alias.needs_args,
+            reg.find("session").unwrap().needs_args
+        );
     }
 
     #[test]

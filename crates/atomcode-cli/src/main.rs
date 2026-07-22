@@ -71,8 +71,37 @@ fn notify_stop_reason(
         T::Stopped => N::Natural,
         T::Cancelled => N::Cancelled,
         T::MaxRounds | T::MaxContinuations => N::TurnLimit,
+        T::RepeatLoop | T::ToolLoopDetected => N::StepLimit,
         T::ProviderError | T::Timeout | T::PromptRejected | T::RateLimited => N::Error,
         _ => N::Error,
+    }
+}
+
+fn headless_completion_exit_code(
+    completion: &atomcode_coding::TurnCompletion,
+    current: i32,
+) -> i32 {
+    match completion {
+        // Snapshot failure is a failure of the completion contract itself;
+        // the kernel reason inside it cannot turn the variant into success.
+        atomcode_coding::TurnCompletion::SnapshotUnavailable { .. } => current.max(1),
+        atomcode_coding::TurnCompletion::Completed { reason, .. } => match reason {
+            atomcode_kernel::event::StopReason::Cancelled => 130,
+            atomcode_kernel::event::StopReason::Stopped
+            | atomcode_kernel::event::StopReason::RateLimited => current,
+            _ => current.max(1),
+        },
+    }
+}
+
+fn headless_completion_notify_reason(
+    completion: &atomcode_coding::TurnCompletion,
+) -> atomcode_capabilities::notify::NotifyStopReason {
+    match completion {
+        atomcode_coding::TurnCompletion::Completed { reason, .. } => notify_stop_reason(*reason),
+        atomcode_coding::TurnCompletion::SnapshotUnavailable { .. } => {
+            atomcode_capabilities::notify::NotifyStopReason::Error
+        }
     }
 }
 
@@ -1550,8 +1579,8 @@ async fn run() -> Result<i32> {
         )?,
         None => None,
     }
-        .map(atomcode_tuix::session::Session::from_catalog_view)
-        .transpose()?;
+    .map(atomcode_tuix::session::Session::from_catalog_view)
+    .transpose()?;
     let (mut native_headless_runtime, mut native_tui_runtime) = if is_headless {
         (Some(native_runtime), None)
     } else {
@@ -1941,7 +1970,11 @@ fn init_file_logging() {
         }
     }
     rotate_log_if_large(&path);
-    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
         return;
     };
     // Session marker so users can tell one run's lines from another's when grepping.
@@ -2271,9 +2304,9 @@ async fn run_native_headless(
             CodingRuntimeEvent::TurnFinished(completion) => {
                 saw_turn_terminal = true;
                 close_native_thinking(&mut thinking_line_open);
-                let reason = match completion {
+                let reason = match &completion {
                     TurnCompletion::Completed { reason, .. }
-                    | TurnCompletion::SnapshotUnavailable { reason, .. } => reason,
+                    | TurnCompletion::SnapshotUnavailable { reason, .. } => *reason,
                 };
                 if !last_text_ended_with_newline {
                     println!();
@@ -2286,7 +2319,7 @@ async fn run_native_headless(
                         turn_count: rounds,
                         tool_call_count: tool_calls,
                         total_tokens: Some(total_tokens),
-                        stop_reason: notify_stop_reason(reason),
+                        stop_reason: headless_completion_notify_reason(&completion),
                         working_dir: Some(&working_dir),
                     },
                 );
@@ -2297,18 +2330,20 @@ async fn run_native_headless(
                         atomcode_config::i18n::fmt_tokens(total_tokens),
                         rounds,
                         tool_calls,
-                        if reason == StopReason::Stopped {
-                            String::new()
-                        } else {
-                            format!(" stopped={:?}", reason)
+                        match &completion {
+                            TurnCompletion::Completed { .. } if reason == StopReason::Stopped =>
+                                String::new(),
+                            TurnCompletion::Completed { .. } => {
+                                format!(" stopped={reason:?}")
+                            }
+                            TurnCompletion::SnapshotUnavailable { error, .. } => format!(
+                                " completion=SnapshotUnavailable reason={reason:?} error={}",
+                                error.message
+                            ),
                         }
                     );
                 }
-                exit_code = match reason {
-                    StopReason::Cancelled => 130,
-                    StopReason::Stopped | StopReason::RateLimited => exit_code,
-                    _ => exit_code.max(1),
-                };
+                exit_code = headless_completion_exit_code(&completion, exit_code);
                 break;
             }
             CodingRuntimeEvent::RuntimeStopped(_) => {
@@ -3663,7 +3698,8 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 mod tests {
     use super::{
         apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
-        format_thinking_chunk, format_verbose_tool_chunk, resolve_working_dir, runtime_config_from,
+        format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
+        headless_completion_notify_reason, resolve_working_dir, runtime_config_from,
         truncate_log_line, DEFAULT_LOG_DIRECTIVES,
     };
     use std::path::PathBuf;
@@ -3691,6 +3727,24 @@ mod tests {
         assert_eq!(
             format_verbose_tool_chunk("\u{1e}review · round 2 · read_file"),
             "[progress] review · round 2 · read_file\n"
+        );
+    }
+
+    #[test]
+    fn snapshot_unavailable_is_headless_failure_even_when_reason_is_stopped() {
+        let completion = atomcode_coding::TurnCompletion::SnapshotUnavailable {
+            turn_id: 1,
+            reason: atomcode_kernel::event::StopReason::Stopped,
+            error: atomcode_coding::RuntimeSnapshotError {
+                message: "snapshot failed".into(),
+            },
+            stats: Default::default(),
+        };
+
+        assert_eq!(headless_completion_exit_code(&completion, 0), 1);
+        assert_eq!(
+            headless_completion_notify_reason(&completion),
+            atomcode_capabilities::notify::NotifyStopReason::Error
         );
     }
 

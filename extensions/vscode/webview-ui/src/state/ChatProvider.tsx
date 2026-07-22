@@ -78,6 +78,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           dispatch({
             type: 'INIT',
             generating: msg.generating,
+            recoveryLocked: msg.recoveryLocked,
             currentModel: msg.currentModel,
             viewMode: msg.viewMode,
             activeSessionId: msg.activeSessionId,
@@ -97,6 +98,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           break;
         case 'queuedMessageSent':
           dispatch({ type: 'SEND_QUEUED_MESSAGE', id: msg.id });
+          break;
+        case 'clearQueuedMessages':
+          dispatch({ type: 'CLEAR_QUEUED_MESSAGES' });
           break;
         case 'assistantMessage':
           dispatch({ type: 'ADD_ASSISTANT_MESSAGE', text: msg.text });
@@ -185,6 +189,16 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           break;
         case 'done':
           markStreamActivity();
+          if (msg.stopReason && msg.stopReason !== 'stopped') {
+            const detail = msg.message || createTranslator(stateRef.current.locale)(
+              'stream.incomplete',
+              { reason: msg.stopReason },
+            );
+            dispatch({
+              type: 'STREAM_WARNING',
+              message: detail,
+            });
+          }
           dispatch({ type: 'GENERATION_DONE', tokens: msg.tokens });
           if (msg.sessionId) {
             dispatch({ type: 'SET_ACTIVE_SESSION', sessionId: msg.sessionId });
@@ -199,6 +213,12 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           markStreamActivity();
           dispatch({ type: 'GENERATION_ERROR', message: msg.message });
           break;
+        case 'recoveryRequired':
+          dispatch({ type: 'RECOVERY_REQUIRED' });
+          break;
+        case 'recoveryCleared':
+          dispatch({ type: 'RECOVERY_CLEARED' });
+          break;
         case 'clearChat':
           dispatch({ type: 'CLEAR_CHAT' });
           break;
@@ -211,6 +231,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           break;
         case 'sessionSelected':
           dispatch({ type: 'SET_ACTIVE_SESSION', sessionId: msg.sessionId, projectHash: msg.projectHash });
+          getVSCodeApi().setState({ sessionId: msg.sessionId, projectHash: msg.projectHash });
           break;
         case 'models':
           dispatch({ type: 'SET_MODELS', models: msg.models });
@@ -259,7 +280,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           dispatch({ type: 'SET_SETUP_STATUS', error: msg.message });
           break;
         case 'sessionMessages':
-          dispatch({ type: 'LOAD_SESSION_MESSAGES', messages: msg.messages });
+          dispatch({ type: 'LOAD_SESSION_MESSAGES', messages: msg.messages, terminal: msg.terminal });
           break;
         case 'context':
           dispatch({
@@ -335,7 +356,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   const send = useCallback(
     (text: string, images?: ImageData[]) => {
       const state = stateRef.current;
-      if (state.approvalModePending) return;
+      if (state.approvalModePending || state.recoveryLocked) return;
       const ctx = state.contextFiles.length > 0
         ? state.contextFiles.map((f) => ({
             path: f.path,
@@ -371,7 +392,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   );
 
   const stop = useCallback(() => {
-    postMessage({ type: 'stop' });
+    postMessage({ type: 'stop', sessionId: stateRef.current.activeSessionId });
   }, []);
 
   const newConversation = useCallback(() => {

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::AppState;
 use atomcode_capabilities::session::{
     LoadedSession, SessionLease as NativeSessionLease, SessionManager as NativeSessionManager,
-    SessionMeta as NativeSessionMeta,
+    SessionMeta as NativeSessionMeta, SessionStoreError,
 };
 use atomcode_config::config::memory::MemoryStore;
 use atomcode_core::conversation::Conversation;
@@ -217,10 +217,9 @@ fn load_command_session_view(
         .ok_or_else(|| anyhow::anyhow!("session {id:?} not found"))
 }
 
-fn exec_native_undo(mut session: NativeCommandSession, arg: &str) -> anyhow::Result<CommandResult> {
-    let available = session
-        .loaded
-        .snapshot
+fn exec_native_undo(session: NativeCommandSession, arg: &str) -> anyhow::Result<CommandResult> {
+    let expected_snapshot = session.loaded.snapshot;
+    let available = expected_snapshot
         .messages
         .iter()
         .filter(|message| {
@@ -231,34 +230,39 @@ fn exec_native_undo(mut session: NativeCommandSession, arg: &str) -> anyhow::Res
         return Ok(CommandResult::Undo { undone: 0 });
     }
     let target = arg.trim().parse::<usize>().ok();
-    let undo = atomcode_coding::runtime::undo_snapshot_to_prompt(&session.loaded.snapshot, target)?;
+    let undo = atomcode_coding::runtime::undo_snapshot_to_prompt(&expected_snapshot, target)?;
     let message_count = undo.snapshot.messages.len();
-    session
-        .loaded
-        .meta
-        .turn_stats
-        .retain(|stat| !stat.position_valid || stat.after_message <= message_count);
-    let surviving_turn_ids: std::collections::BTreeSet<_> = session
-        .loaded
-        .meta
-        .turn_stats
-        .iter()
-        .filter_map(|stat| {
-            (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
-        })
-        .collect();
-    session
-        .loaded
-        .presentation
-        .retain_turns(&surviving_turn_ids);
-    session.loaded.meta.message_count = u32::try_from(message_count)?;
-    session.loaded.meta.turn_count = u32::try_from(session.loaded.meta.turn_stats.len())?;
-    session.loaded.meta.updated_at = atomcode_capabilities::session::now_ms();
+    let persisted_message_count = u32::try_from(message_count)?;
     session.manager.commit_native_runtime_mutation(
         &session.lease,
         &undo.snapshot,
-        &session.loaded.presentation,
-        &session.loaded.meta,
+        move |current_snapshot, meta, presentation| {
+            if current_snapshot != &expected_snapshot {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session mutation",
+                    message: "session snapshot changed while preparing undo".into(),
+                });
+            }
+            meta.turn_stats
+                .retain(|stat| !stat.position_valid || stat.after_message <= message_count);
+            let surviving_turn_ids: std::collections::BTreeSet<_> = meta
+                .turn_stats
+                .iter()
+                .filter_map(|stat| {
+                    (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
+                })
+                .collect();
+            presentation.retain_turns(&surviving_turn_ids);
+            meta.message_count = persisted_message_count;
+            meta.turn_count =
+                u32::try_from(meta.turn_stats.len()).map_err(|_| SessionStoreError::TooLarge {
+                    kind: "session turn stats",
+                    limit: u32::MAX as usize,
+                    actual: meta.turn_stats.len(),
+                })?;
+            meta.updated_at = atomcode_capabilities::session::now_ms();
+            Ok(())
+        },
     )?;
     Ok(CommandResult::Undo {
         undone: undo
@@ -268,54 +272,66 @@ fn exec_native_undo(mut session: NativeCommandSession, arg: &str) -> anyhow::Res
 }
 
 fn commit_native_compaction(
-    mut session: NativeCommandSession,
+    session: NativeCommandSession,
     messages: Vec<atomcode_kernel::message::Message>,
     mutation: atomcode_coding::runtime::SnapshotCompactionMutation,
 ) -> anyhow::Result<()> {
     use atomcode_coding::runtime::SnapshotCompactionMutation;
 
-    if let SnapshotCompactionMutation::Replace {
-        old_start,
-        old_end,
-        new_end,
-    } = mutation
-    {
-        session.loaded.meta.turn_stats.retain_mut(|stat| {
-            if !stat.position_valid {
-                return true;
-            }
-            if stat.after_message > old_start && stat.after_message < old_end {
-                false
-            } else {
-                if stat.after_message >= old_end {
-                    stat.after_message = new_end + stat.after_message.saturating_sub(old_end);
-                }
-                true
-            }
-        });
-    }
-    session.loaded.snapshot.messages = messages;
-    let surviving_turn_ids: std::collections::BTreeSet<_> = session
-        .loaded
-        .meta
-        .turn_stats
-        .iter()
-        .filter_map(|stat| {
-            (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
-        })
-        .collect();
-    session
-        .loaded
-        .presentation
-        .retain_turns(&surviving_turn_ids);
-    session.loaded.meta.message_count = u32::try_from(session.loaded.snapshot.messages.len())?;
-    session.loaded.meta.turn_count = u32::try_from(session.loaded.meta.turn_stats.len())?;
-    session.loaded.meta.updated_at = atomcode_capabilities::session::now_ms();
+    let expected_snapshot = session.loaded.snapshot;
+    let mut snapshot = expected_snapshot.clone();
+    snapshot.messages = messages;
+    let message_count = snapshot.messages.len();
+    let persisted_message_count = u32::try_from(message_count)?;
     session.manager.commit_native_runtime_mutation(
         &session.lease,
-        &session.loaded.snapshot,
-        &session.loaded.presentation,
-        &session.loaded.meta,
+        &snapshot,
+        move |current_snapshot, meta, presentation| {
+            if current_snapshot != &expected_snapshot {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session mutation",
+                    message: "session snapshot changed while preparing compaction".into(),
+                });
+            }
+            if let SnapshotCompactionMutation::Replace {
+                old_start,
+                old_end,
+                new_end,
+            } = mutation
+            {
+                meta.turn_stats.retain_mut(|stat| {
+                    if !stat.position_valid {
+                        return true;
+                    }
+                    if stat.after_message > old_start && stat.after_message < old_end {
+                        false
+                    } else {
+                        if stat.after_message >= old_end {
+                            stat.after_message =
+                                new_end + stat.after_message.saturating_sub(old_end);
+                        }
+                        true
+                    }
+                });
+            }
+            let surviving_turn_ids: std::collections::BTreeSet<_> = meta
+                .turn_stats
+                .iter()
+                .filter_map(|stat| {
+                    (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
+                })
+                .collect();
+            presentation.retain_turns(&surviving_turn_ids);
+            meta.message_count = persisted_message_count;
+            meta.turn_count =
+                u32::try_from(meta.turn_stats.len()).map_err(|_| SessionStoreError::TooLarge {
+                    kind: "session turn stats",
+                    limit: u32::MAX as usize,
+                    actual: meta.turn_stats.len(),
+                })?;
+            meta.updated_at = atomcode_capabilities::session::now_ms();
+            Ok(())
+        },
     )?;
     Ok(())
 }
@@ -837,7 +853,7 @@ mod tests {
     use atomcode_config::config::memory::MemoryStore;
 
     #[test]
-    fn native_undo_commits_snapshot_meta_and_presentation_together() {
+    fn native_undo_preserves_updates_after_session_load() {
         use atomcode_capabilities::session::{
             DisplayAnchor, PresentationEntry, PresentationRole, TurnStat,
         };
@@ -912,16 +928,29 @@ mod tests {
         };
         manager.write_presentation(id, &presentation).unwrap();
         let lease = manager.acquire_lease(id).unwrap();
+        let loaded = LoadedSession {
+            snapshot,
+            meta,
+            presentation,
+        };
+
+        manager.rename(id, "renamed after load").unwrap();
+        manager
+            .append_presentation(
+                id,
+                PresentationEntry {
+                    anchor: DisplayAnchor::AfterTurn { turn_id: 1 },
+                    role: PresentationRole::Assistant,
+                    text: "late keep".into(),
+                },
+            )
+            .unwrap();
 
         let result = exec_native_undo(
             NativeCommandSession {
                 manager: NativeSessionManager::with_root(dir.path()),
                 lease,
-                loaded: LoadedSession {
-                    snapshot,
-                    meta,
-                    presentation,
-                },
+                loaded,
             },
             "",
         )
@@ -934,13 +963,20 @@ mod tests {
         assert_eq!(meta.turn_count, 2);
         assert!(!meta.turn_stats[0].position_valid);
         assert_eq!(meta.turn_stats[0].total_tokens, 10);
+        assert_eq!(meta.name, "renamed after load");
+        assert!(meta.user_renamed);
         let presentation = manager.read_presentation(id).unwrap();
-        assert_eq!(presentation.entries.len(), 1);
+        assert_eq!(presentation.entries.len(), 2);
         assert_eq!(presentation.entries[0].text, "keep");
+        assert_eq!(presentation.entries[1].text, "late keep");
+        assert!(presentation
+            .entries
+            .iter()
+            .all(|entry| entry.text != "drop"));
     }
 
     #[test]
-    fn native_compaction_reindexes_stats_and_prunes_removed_turn_anchors() {
+    fn native_compaction_preserves_updates_and_prunes_removed_turn_anchors() {
         use atomcode_capabilities::session::{
             DisplayAnchor, PresentationEntry, PresentationRole, TurnStat,
         };
@@ -994,16 +1030,29 @@ mod tests {
         };
         manager.write_presentation(id, &presentation).unwrap();
         let lease = manager.acquire_lease(id).unwrap();
+        let loaded = LoadedSession {
+            snapshot,
+            meta,
+            presentation,
+        };
+
+        manager.rename(id, "renamed after load").unwrap();
+        manager
+            .append_presentation(
+                id,
+                PresentationEntry {
+                    anchor: DisplayAnchor::AfterTurn { turn_id: 2 },
+                    role: PresentationRole::Assistant,
+                    text: "late kept".into(),
+                },
+            )
+            .unwrap();
 
         commit_native_compaction(
             NativeCommandSession {
                 manager: NativeSessionManager::with_root(dir.path()),
                 lease,
-                loaded: LoadedSession {
-                    snapshot,
-                    meta,
-                    presentation,
-                },
+                loaded,
             },
             vec![
                 atomcode_kernel::message::Message::user("summary"),
@@ -1026,9 +1075,16 @@ mod tests {
         assert_eq!(meta.turn_count, 2);
         assert_eq!(meta.turn_stats[0].after_message, 1);
         assert_eq!(meta.turn_stats[1].after_message, 3);
+        assert_eq!(meta.name, "renamed after load");
+        assert!(meta.user_renamed);
         let presentation = manager.read_presentation(id).unwrap();
-        assert_eq!(presentation.entries.len(), 1);
+        assert_eq!(presentation.entries.len(), 2);
         assert_eq!(presentation.entries[0].text, "kept");
+        assert_eq!(presentation.entries[1].text, "late kept");
+        assert!(presentation
+            .entries
+            .iter()
+            .all(|entry| entry.text != "removed"));
     }
 
     #[test]

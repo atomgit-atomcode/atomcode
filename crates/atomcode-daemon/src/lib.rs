@@ -69,7 +69,7 @@ use axum::{
 };
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -330,11 +330,185 @@ type ProjectStateStore = Arc<RwLock<ProjectState>>;
 pub(crate) static DAEMON_PROJECT: std::sync::Mutex<Option<ProjectStateStore>> =
     std::sync::Mutex::new(None);
 
-/// Active chat tasks (session_id -> cancellation token)
-type ChatTasksStore = Arc<RwLock<HashMap<String, CancellationToken>>>;
+/// One admitted `/chat` operation. Aliases include both the persisted session id
+/// and the browser-generated request id so either client protocol can stop it.
+struct ActiveChatOperation {
+    session_id: Option<String>,
+    aliases: Vec<String>,
+    cancellation: CancellationToken,
+    stopped: bool,
+}
 
-/// Stopped sessions (session_id) - used to prevent saving stopped chats
-type StoppedSessionsStore = Arc<RwLock<HashSet<String>>>;
+#[derive(Default)]
+struct ActiveChatIndex {
+    operations: HashMap<String, ActiveChatOperation>,
+    aliases: HashMap<String, String>,
+}
+
+/// Atomic admission and identity-aware cleanup for background `/chat` turns.
+///
+/// The old `HashMap<alias, CancellationToken>` overwrote an existing entry when
+/// two requests targeted the same session, then let the older task remove the
+/// replacement entry during cleanup. Keeping operations and aliases in one lock
+/// makes single-flight admission and compare-by-operation cleanup indivisible.
+#[derive(Clone, Default)]
+struct ActiveChatRegistry {
+    inner: Arc<RwLock<ActiveChatIndex>>,
+}
+
+struct ActiveChatAdmission {
+    operation_id: String,
+    cancellation: CancellationToken,
+}
+
+#[derive(Debug)]
+enum ActiveChatAdmissionError {
+    SessionBusy,
+    RequestBusy,
+}
+
+impl ActiveChatRegistry {
+    async fn admit(
+        &self,
+        session_id: Option<&str>,
+        request_id: Option<&str>,
+    ) -> Result<ActiveChatAdmission, ActiveChatAdmissionError> {
+        let mut index = self.inner.write().await;
+        if session_id.is_some_and(|alias| index.aliases.contains_key(alias)) {
+            return Err(ActiveChatAdmissionError::SessionBusy);
+        }
+        if request_id.is_some_and(|alias| index.aliases.contains_key(alias)) {
+            return Err(ActiveChatAdmissionError::RequestBusy);
+        }
+
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let cancellation = CancellationToken::new();
+        let mut aliases = Vec::with_capacity(2);
+        for alias in [session_id, request_id].into_iter().flatten() {
+            if !aliases.iter().any(|existing| existing == alias) {
+                aliases.push(alias.to_string());
+            }
+        }
+        for alias in &aliases {
+            index.aliases.insert(alias.clone(), operation_id.clone());
+        }
+        index.operations.insert(
+            operation_id.clone(),
+            ActiveChatOperation {
+                session_id: session_id.map(str::to_string),
+                aliases,
+                cancellation: cancellation.clone(),
+                stopped: false,
+            },
+        );
+
+        Ok(ActiveChatAdmission {
+            operation_id,
+            cancellation,
+        })
+    }
+
+    /// Bind the runtime's canonical session id after a first-turn session has
+    /// been allocated (or a requested id has been resolved to its canonical id).
+    async fn bind_session(&self, operation_id: &str, session_id: &str) -> anyhow::Result<()> {
+        let mut index = self.inner.write().await;
+        if let Some(owner) = index.aliases.get(session_id) {
+            if owner != operation_id {
+                anyhow::bail!("chat session {session_id} became active while this turn started");
+            }
+        }
+        let operation = index
+            .operations
+            .get_mut(operation_id)
+            .ok_or_else(|| anyhow::anyhow!("chat operation is no longer active"))?;
+        operation.session_id = Some(session_id.to_string());
+        if !operation.aliases.iter().any(|alias| alias == session_id) {
+            operation.aliases.push(session_id.to_string());
+        }
+        index
+            .aliases
+            .insert(session_id.to_string(), operation_id.to_string());
+        Ok(())
+    }
+
+    /// Mark and cooperatively cancel an operation addressed by either alias.
+    async fn stop_alias(&self, alias: &str) -> bool {
+        let cancellation = {
+            let mut index = self.inner.write().await;
+            let Some(operation_id) = index.aliases.get(alias).cloned() else {
+                return false;
+            };
+            let Some(operation) = index.operations.get_mut(&operation_id) else {
+                return false;
+            };
+            operation.stopped = true;
+            operation.cancellation.clone()
+        };
+        cancellation.cancel();
+        true
+    }
+
+    async fn was_stopped(&self, operation_id: &str) -> bool {
+        self.inner
+            .read()
+            .await
+            .operations
+            .get(operation_id)
+            .is_some_and(|operation| operation.stopped)
+    }
+
+    /// Remove only the exact operation that finished. A late cleanup from an
+    /// older generation can never erase a replacement operation's aliases.
+    async fn complete(&self, operation_id: &str) -> bool {
+        let mut index = self.inner.write().await;
+        let Some(operation) = index.operations.remove(operation_id) else {
+            return false;
+        };
+        for alias in operation.aliases {
+            if index
+                .aliases
+                .get(&alias)
+                .is_some_and(|owner| owner == operation_id)
+            {
+                index.aliases.remove(&alias);
+            }
+        }
+        true
+    }
+
+    async fn active_session_ids(&self) -> Vec<String> {
+        let mut sessions: Vec<String> = self
+            .inner
+            .read()
+            .await
+            .operations
+            .values()
+            .filter_map(|operation| operation.session_id.clone())
+            .collect();
+        sessions.sort();
+        sessions.dedup();
+        sessions
+    }
+
+    async fn has_active_operations(&self) -> bool {
+        !self.inner.read().await.operations.is_empty()
+    }
+
+    #[cfg(test)]
+    async fn cancel_all(&self) {
+        let cancellations: Vec<CancellationToken> = self
+            .inner
+            .read()
+            .await
+            .operations
+            .values()
+            .map(|operation| operation.cancellation.clone())
+            .collect();
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
+    }
+}
 
 const DANGEROUS_TOOLS_ENV: &str = "ATOMCODE_DAEMON_ENABLE_DANGEROUS_TOOLS";
 
@@ -352,10 +526,8 @@ impl Drop for SseConnectionGuard {
 pub struct AppState {
     pub sessions: SessionStore,
     pub project: ProjectStateStore,
-    /// Active chat tasks that can be cancelled
-    pub chat_tasks: ChatTasksStore,
-    /// Sessions that were stopped - their messages should not be saved
-    pub stopped_sessions: StoppedSessionsStore,
+    /// Admitted background chat operations and their session/request aliases.
+    active_chats: ActiveChatRegistry,
     /// MCP server registry (global, used for /mcp/status backward compat)
     pub mcp_registry: Arc<RwLock<Arc<McpRegistry>>>,
     /// Per-project MCP registry cache (keyed by working_dir)
@@ -2226,10 +2398,7 @@ pub struct ImageInput {
 pub enum ChatEvent {
     /// Exact provider/model resolved for this request.
     #[serde(rename = "runtime_info")]
-    RuntimeInfo {
-        provider: String,
-        model: String,
-    },
+    RuntimeInfo { provider: String, model: String },
     /// Tool batch started (all tools in this assistant turn)
     #[serde(rename = "tool_batch")]
     ToolBatchStarted {
@@ -2290,6 +2459,14 @@ pub enum ChatEvent {
         tokens: usize,
         tool_calls: usize,
         session_id: String,
+        /// Native runtime terminal reason. Additive so older clients can keep
+        /// treating `done` as before while newer clients distinguish success,
+        /// cancellation, safety fuses, provider failure, and timeouts.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+        /// Last runtime error associated with this terminal, when available.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
     /// A tool requires user approval. The browser must POST the decision
     /// back to `/chat/permission` keyed by `session_id`. The decider blocks
@@ -2327,6 +2504,24 @@ pub enum ChatEvent {
         #[serde(default)]
         server_message: Option<String>,
     },
+}
+
+pub(crate) fn stop_reason_wire(reason: atomcode_kernel::event::StopReason) -> &'static str {
+    use atomcode_kernel::event::StopReason;
+
+    match reason {
+        StopReason::Stopped => "stopped",
+        StopReason::MaxRounds => "max_rounds",
+        StopReason::RepeatLoop => "repeat_loop",
+        StopReason::ToolLoopDetected => "tool_loop_detected",
+        StopReason::MaxContinuations => "max_continuations",
+        StopReason::ProviderError => "provider_error",
+        StopReason::Timeout => "timeout",
+        StopReason::Cancelled => "cancelled",
+        StopReason::PromptRejected => "prompt_rejected",
+        StopReason::RateLimited => "rate_limited",
+        _ => "unknown",
+    }
 }
 
 #[cfg(test)]
@@ -2432,6 +2627,79 @@ mod chat_event_type_tests {
                 tool_name,
                 ..
             }] if session_id == "session-1" && call_id == "call-42" && tool_name == "bash"
+        ));
+    }
+
+    #[test]
+    fn abnormal_completed_turn_reaches_done_with_its_authoritative_reason() {
+        for (reason, expected) in [
+            (atomcode_kernel::event::StopReason::MaxRounds, "max_rounds"),
+            (
+                atomcode_kernel::event::StopReason::RepeatLoop,
+                "repeat_loop",
+            ),
+            (
+                atomcode_kernel::event::StopReason::ToolLoopDetected,
+                "tool_loop_detected",
+            ),
+        ] {
+            let mut projector = ChatRuntimeProjector::default();
+            let events = projector.project_runtime(
+                atomcode_coding::CodingRuntimeEvent::TurnFinished(
+                    atomcode_coding::TurnCompletion::Completed {
+                        turn_id: 7,
+                        reason,
+                        snapshot: std::sync::Arc::new(
+                            atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
+                        ),
+                        stats: atomcode_coding::RuntimeTurnStats::default(),
+                    },
+                ),
+                "session-1",
+            );
+
+            let done = events
+                .iter()
+                .find(|event| matches!(event, ChatEvent::Done { .. }))
+                .expect("TurnFinished must reach the HTTP terminal event");
+            let json = serde_json::to_value(done).unwrap();
+            assert_eq!(json["stop_reason"], expected);
+        }
+    }
+
+    #[test]
+    fn agent_error_is_diagnostic_until_turn_finished_is_authoritative() {
+        let mut projector = ChatRuntimeProjector::default();
+        let diagnostic = projector.project_runtime(
+            atomcode_coding::CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Error {
+                message: "provider failed".into(),
+                http_status: Some(500),
+                code: None,
+            }),
+            "session-1",
+        );
+        assert!(matches!(diagnostic.as_slice(), [ChatEvent::Warning { .. }]));
+
+        let terminal = projector.project_runtime(
+            atomcode_coding::CodingRuntimeEvent::TurnFinished(
+                atomcode_coding::TurnCompletion::Completed {
+                    turn_id: 8,
+                    reason: atomcode_kernel::event::StopReason::ProviderError,
+                    snapshot: std::sync::Arc::new(atomcode_kernel::message::SessionSnapshot::new(
+                        Vec::new(),
+                    )),
+                    stats: atomcode_coding::RuntimeTurnStats::default(),
+                },
+            ),
+            "session-1",
+        );
+        assert!(matches!(
+            terminal.as_slice(),
+            [ChatEvent::Done {
+                stop_reason: Some(reason),
+                message: Some(message),
+                ..
+            }] if reason == "provider_error" && message == "provider failed"
         ));
     }
 }
@@ -2743,6 +3011,9 @@ struct ChatRuntimeProjector {
     live_tools: HashMap<String, (String, std::time::Instant)>,
     total_tokens: usize,
     tool_call_count: usize,
+    terminal_reason: Option<atomcode_kernel::event::StopReason>,
+    terminal_seen: bool,
+    last_error: Option<String>,
 }
 
 impl Default for ChatRuntimeProjector {
@@ -2752,6 +3023,9 @@ impl Default for ChatRuntimeProjector {
             live_tools: HashMap::new(),
             total_tokens: 0,
             tool_call_count: 0,
+            terminal_reason: None,
+            terminal_seen: false,
+            last_error: None,
         }
     }
 }
@@ -2822,18 +3096,63 @@ impl ChatRuntimeProjector {
             } => vec![ChatEvent::Error {
                 message: format!("compact failed: {error}"),
             }],
+            CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                reason, stats, ..
+            }) => {
+                if self.terminal_seen {
+                    return Vec::new();
+                }
+                self.terminal_seen = true;
+                self.terminal_reason = Some(reason);
+                if let Some(usage) = stats.last_usage {
+                    self.total_tokens = (usage.tokens.prompt + usage.tokens.completion) as usize;
+                }
+                self.tool_call_count = self.tool_call_count.max(stats.tool_call_count);
+
+                let mut events = Vec::new();
+                if let Some(event) = self.finish() {
+                    events.push(event);
+                }
+                events.push(ChatEvent::Done {
+                    tokens: self.total_tokens,
+                    tool_calls: self.tool_call_count,
+                    session_id: permission_session_id.to_string(),
+                    stop_reason: Some(stop_reason_wire(reason).to_string()),
+                    message: self.last_error.clone(),
+                });
+                if reason == atomcode_kernel::event::StopReason::Cancelled {
+                    // Legacy clients still understand `stopped`; typed clients latch
+                    // the authoritative `done(cancelled)` emitted immediately before it.
+                    events.push(ChatEvent::Stopped);
+                }
+                events
+            }
             CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
-                error, ..
-            }) => vec![ChatEvent::Error {
-                message: error.message,
-            }],
+                reason,
+                error,
+                ..
+            }) => {
+                if self.terminal_seen {
+                    return Vec::new();
+                }
+                self.terminal_seen = true;
+                self.terminal_reason = Some(reason);
+                self.last_error = Some(error.message.clone());
+                let mut events = Vec::new();
+                if let Some(event) = self.finish() {
+                    events.push(event);
+                }
+                events.push(ChatEvent::Error {
+                    message: error.message,
+                });
+                events
+            }
             CodingRuntimeEvent::ControllerWarning(message) => {
                 vec![ChatEvent::Warning { message }]
             }
             CodingRuntimeEvent::CompactionStarted { .. }
             | CodingRuntimeEvent::CompactionFinished { .. }
             | CodingRuntimeEvent::RuntimeStopped(_)
-            | CodingRuntimeEvent::TurnFinished(_)
             | CodingRuntimeEvent::ModeChanged { .. }
             | CodingRuntimeEvent::Reconfiguring { .. }
             | CodingRuntimeEvent::Reconfigured { .. }
@@ -2897,7 +3216,12 @@ impl ChatRuntimeProjector {
                     total,
                 }]
             }
-            Agent::Error { message, .. } => vec![ChatEvent::Error { message }],
+            Agent::Error { message, .. } => {
+                self.last_error = Some(message.clone());
+                // Agent errors are diagnostics until the runtime emits TurnFinished.
+                // Emitting a terminal HTTP error here would create Error + Done for one turn.
+                vec![ChatEvent::Warning { message }]
+            }
             Agent::Warning(message) => vec![ChatEvent::Warning { message }],
             Agent::RateLimited {
                 reset_at_display,
@@ -2989,7 +3313,7 @@ async fn chat_stream(
     State(state): State<AppState>,
     axum::Extension(client_mode): axum::Extension<SessionMode>,
     Json(mut req): Json<ChatRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     // Parse session UUID for telemetry scope
     let session_uuid = req
         .session_id
@@ -3002,27 +3326,42 @@ async fn chat_stream(
         req.working_dir = Some(project.working_dir.clone());
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<ChatEvent>();
-
-    // Create cancellation token for this chat
-    let cancel_token = CancellationToken::new();
-
-    // New chats do not have a session id until completion, so use a browser-known
-    // request id when available to keep their first turn cancellable too.
-    let cancellation_key = req
-        .request_id
-        .clone()
-        .or_else(|| req.session_id.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    state
-        .chat_tasks
-        .write()
+    let admission = match state
+        .active_chats
+        .admit(req.session_id.as_deref(), req.request_id.as_deref())
         .await
-        .insert(cancellation_key.clone(), cancel_token.clone());
+    {
+        Ok(admission) => admission,
+        Err(error) => {
+            let (code, message) = match error {
+                ActiveChatAdmissionError::SessionBusy => (
+                    "session_busy",
+                    "This session already has an active chat operation",
+                ),
+                ActiveChatAdmissionError::RequestBusy => (
+                    "request_busy",
+                    "This request id already has an active chat operation",
+                ),
+            };
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    success: false,
+                    error: message.to_string(),
+                    code: Some(code.to_string()),
+                    retryable: Some(true),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let (tx, rx) = mpsc::unbounded_channel::<ChatEvent>();
+    let operation_id = admission.operation_id;
+    let cancel_token = admission.cancellation;
 
     // Clone state for the spawned task
-    let chat_tasks = state.chat_tasks.clone();
-    let stopped_sessions = state.stopped_sessions.clone();
+    let active_chats = state.active_chats.clone();
     let mcp_cache = state.mcp_cache.clone();
     let telemetry = state.telemetry.clone();
     let pending_permissions = state.pending_permissions.clone();
@@ -3047,12 +3386,13 @@ async fn chat_stream(
     // Spawn the chat processing task
     tokio::spawn(async move {
         CurrentContext::scope(ctx_for_task, || async move {
+            let cleanup_operation_id = operation_id.clone();
             if let Err(e) = process_chat_request(
                 req,
                 tx.clone(),
                 cancel_token,
-                cancellation_key.clone(),
-                stopped_sessions.clone(),
+                operation_id,
+                active_chats.clone(),
                 mcp_cache,
                 telemetry,
                 pending_permissions,
@@ -3065,8 +3405,7 @@ async fn chat_stream(
                 });
             }
 
-            // Cleanup: remove from chat_tasks
-            chat_tasks.write().await.remove(&cancellation_key);
+            active_chats.complete(&cleanup_operation_id).await;
         })
         .await;
     });
@@ -3091,11 +3430,13 @@ async fn chat_stream(
         Ok(axum::response::sse::Event::default().comment("bye"))
     }));
 
-    Sse::new(guarded_stream).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("ping"),
-    )
+    Sse::new(guarded_stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response()
 }
 
 /// Process a chat request and stream events
@@ -3103,8 +3444,8 @@ async fn process_chat_request(
     req: ChatRequest,
     event_tx: mpsc::UnboundedSender<ChatEvent>,
     cancel_token: CancellationToken,
-    cancellation_key: String,
-    stopped_sessions: StoppedSessionsStore,
+    operation_id: String,
+    active_chats: ActiveChatRegistry,
     // CodingRuntime builds its own MCP; this per-project cache is warmed by
     // the /context, /compact and /live paths, not the chat turn.
     _mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
@@ -3164,6 +3505,9 @@ async fn process_chat_request(
     } else {
         (uuid::Uuid::new_v4().to_string(), Default::default())
     };
+    active_chats
+        .bind_session(&operation_id, &session_id)
+        .await?;
 
     // Bind the persisted conversation id to the one-off active provider used by the
     // VL preprocessor, preserving the same gateway affinity as the main chat turn.
@@ -3234,12 +3578,7 @@ async fn process_chat_request(
     // Check if session was stopped before we started the turn loop.
     // If so, save the current conversation (session messages + user message)
     // and return so the user can resume from this point later.
-    if stopped_sessions
-        .write()
-        .await
-        .take(&cancellation_key)
-        .is_some()
-    {
+    if active_chats.was_stopped(&operation_id).await {
         // Save what we have — align with TUI behaviour: a stopped
         // conversation should still be resumable via /resume.
         {
@@ -3253,11 +3592,6 @@ async fn process_chat_request(
             }
         }
         let _ = event_tx.send(ChatEvent::Stopped);
-        let _ = event_tx.send(ChatEvent::Done {
-            tokens: 0,
-            tool_calls: 0,
-            session_id: session_id.clone(),
-        });
         // Turn never ran — the turn task (which registers the responder) never
         // spawned, so this is a defensive no-op cleanup for interactive Build mode.
         if registered_permission_responder {
@@ -3314,20 +3648,29 @@ async fn process_chat_request(
         }
     }
 
-    // Finalize any pending artifact
-    if let Some(event) = projector.finish() {
-        let _ = event_tx.send(event);
+    // A closed producer is not success by itself. Only the native runtime's
+    // TurnFinished event can authorize `done`.
+    if !projector.terminal_seen {
+        if let Some(event) = projector.finish() {
+            let _ = event_tx.send(event);
+        }
+        let _ = event_tx.send(ChatEvent::Error {
+            message: "coding runtime event stream closed before turn terminal".into(),
+        });
     }
 
     // Save session after conversation completes.
     // If the session was stopped mid-turn, clean up the partial conversation
     // and save it so the user can /resume from this point — same behaviour as
     // the TUI (persist_current_session on TurnCancelled).
-    let was_stopped = stopped_sessions.read().await.contains(&cancellation_key);
+    let was_stopped = active_chats.was_stopped(&operation_id).await;
 
     {
         let mut conv = conversation.lock().await;
-        if was_stopped {
+        if was_stopped
+            && (projector.terminal_reason == Some(atomcode_kernel::event::StopReason::Cancelled)
+                || !projector.terminal_seen)
+        {
             conv.cancel_current_turn();
         }
         let submitted_images: Vec<atomcode_core::conversation::message::ImagePart> = req
@@ -3347,18 +3690,6 @@ async fn process_chat_request(
     // The native SnapshotHook owns terminal persistence. The core projection above
     // exists only to shape the HTTP response and must never be written back.
 
-    // Clean up stopped sessions marker if present
-    if was_stopped {
-        stopped_sessions.write().await.remove(&cancellation_key);
-        let _ = event_tx.send(ChatEvent::Stopped);
-    }
-
-    // Send done event
-    let _ = event_tx.send(ChatEvent::Done {
-        tokens: projector.total_tokens,
-        tool_calls: projector.tool_call_count,
-        session_id,
-    });
     // Turn finished (the forwarding loop above exits when runtime_event_rx closes).
     // Drop the permission
     // registration so it doesn't leak. Only registered in interactive Build mode.
@@ -3510,16 +3841,9 @@ async fn stop_chat(
     let session_uuid = uuid::Uuid::parse_str(&req.session_id).ok();
     let state_clone = state.clone();
     daemon_scope(&state, session_uuid, client_mode, || async move {
-        // Add to stopped sessions set
-        state_clone
-            .stopped_sessions
-            .write()
-            .await
-            .insert(req.session_id.clone());
-
-        // Cancel the chat task if it exists
-        if let Some(cancel_token) = state_clone.chat_tasks.read().await.get(&req.session_id) {
-            cancel_token.cancel();
+        // The legacy payload field is named `session_id`, but WebUI sends its
+        // first-turn request id here. The registry intentionally resolves both.
+        if state_clone.active_chats.stop_alias(&req.session_id).await {
             state_clone.telemetry.track(Event::UseCommand {
                 type_: "stop".into(),
                 success: Some(true),
@@ -3534,7 +3858,6 @@ async fn stop_chat(
                 }),
             )
         } else {
-            // Session wasn't running, but we marked it as stopped
             state_clone.telemetry.track(Event::UseCommand {
                 type_: "stop".into(),
                 success: Some(true),
@@ -3545,10 +3868,7 @@ async fn stop_chat(
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
                     success: true,
-                    message: format!(
-                        "Chat session {} marked as stopped (was not running)",
-                        req.session_id
-                    ),
+                    message: format!("Chat session {} was not running", req.session_id),
                 }),
             )
         }
@@ -3558,8 +3878,7 @@ async fn stop_chat(
 
 /// GET /chat/active - Return list of session IDs currently generating
 async fn active_chat_sessions(State(state): State<AppState>) -> impl IntoResponse {
-    let sessions: Vec<String> = state.chat_tasks.read().await.keys().cloned().collect();
-    Json(sessions)
+    Json(state.active_chats.active_session_ids().await)
 }
 
 /// POST /chat/permission - Deliver a permission decision for a pending tool-approval request.
@@ -3830,6 +4149,7 @@ fn spawn_idle_timeout_task(
     idle_timeout_secs: u64,
     last_activity: Arc<std::sync::atomic::AtomicI64>,
     active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    active_chats: ActiveChatRegistry,
     shutdown_tx: watch::Sender<bool>,
 ) {
     if idle_timeout_secs == 0 {
@@ -3844,6 +4164,9 @@ fn spawn_idle_timeout_task(
             let conns = active_connections.load(std::sync::atomic::Ordering::Relaxed);
             if conns > 0 {
                 continue; // Active streaming connections, not idle
+            }
+            if active_chats.has_active_operations().await {
+                continue; // The SSE consumer disconnected, but its chat still runs.
             }
             let last = last_activity.load(std::sync::atomic::Ordering::Relaxed);
             let elapsed = now_unix_ms() - last;
@@ -4644,8 +4967,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     let state = AppState {
         sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
         project: project_store,
-        chat_tasks: Arc::new(RwLock::new(HashMap::new())),
-        stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
+        active_chats: ActiveChatRegistry::default(),
         mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
         mcp_cache: Arc::new(RwLock::new(HashMap::new())),
         login_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -4787,6 +5109,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             auth_token::require_app_user_id,
         ));
 
+    let active_chats = state.active_chats.clone();
     let app = public
         .merge(protected)
         .with_state(state)
@@ -4799,6 +5122,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         idle_timeout_secs,
         last_activity,
         active_connections,
+        active_chats,
         shutdown_tx,
     );
     if !quiet {
@@ -4997,6 +5321,244 @@ mod tests {
                 None => std::env::remove_var("ATOMCODE_HOME"),
             }
         }
+    }
+
+    fn chat_test_telemetry(home: &ScopedChatHome) -> Arc<Telemetry> {
+        Telemetry::init(
+            atomcode_telemetry::ResolvedConfig {
+                state: TelemetryState::Disabled("test"),
+                endpoint: String::new(),
+                atomcode_dir: home._dir.path().to_path_buf(),
+            },
+            "test".into(),
+        )
+    }
+
+    fn chat_test_state(home: &ScopedChatHome) -> AppState {
+        let working_dir = home._dir.path().to_path_buf();
+        let (shutdown_tx, _) = watch::channel(false);
+        AppState {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            project: Arc::new(RwLock::new(ProjectState {
+                working_dir: working_dir.clone(),
+                previous_dir: None,
+                recent_dirs: Vec::new(),
+                name: "chat-test".into(),
+            })),
+            active_chats: ActiveChatRegistry::default(),
+            mcp_registry: Arc::new(RwLock::new(Arc::new(McpRegistry::new()))),
+            mcp_cache: Arc::new(RwLock::new(HashMap::new())),
+            login_sessions: Arc::new(RwLock::new(HashMap::new())),
+            login_start_lock: Arc::new(Mutex::new(())),
+            daemon_instance_id: Arc::from("chat-test-instance"),
+            telemetry: chat_test_telemetry(home),
+            repo_origin: detect_repo_origin(&working_dir),
+            shutdown_tx,
+            last_activity: Arc::new(std::sync::atomic::AtomicI64::new(now_unix_ms())),
+            active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            webui_tokens: auth_token::WebuiTokenStore::default(),
+            enforce_token: false,
+            app_user_id: String::new(),
+            pending_permissions: permission_bridge::PermissionResponders::new(),
+            bind_host: "127.0.0.1".into(),
+            bind_port: 13456,
+            webui_cookie_name: auth_token::webui_cookie_name(13456),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_admission_rejects_the_same_session_across_request_aliases() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let session_id = "11111111-1111-4111-8111-111111111111";
+        let request = |request_id: &str| ChatRequest {
+            message: "hold this turn".into(),
+            working_dir: Some(home._dir.path().to_path_buf()),
+            provider: None,
+            session_id: Some(session_id.into()),
+            request_id: Some(request_id.into()),
+            images: Vec::new(),
+            approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+        };
+
+        let first = chat_stream(
+            State(state.clone()),
+            axum::Extension(SessionMode::Vscode),
+            Json(request("request-a")),
+        )
+        .await
+        .into_response();
+        let second = chat_stream(
+            State(state.clone()),
+            axum::Extension(SessionMode::Vscode),
+            Json(request("request-b")),
+        )
+        .await
+        .into_response();
+        let first_status = first.status();
+        let second_status = second.status();
+
+        state.active_chats.cancel_all().await;
+        drop((first, second));
+        tokio::task::yield_now().await;
+
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(
+            second_status,
+            StatusCode::CONFLICT,
+            "a distinct request alias must not bypass same-session admission"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_chat_listing_exposes_real_sessions_not_request_aliases() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let session_id = "22222222-2222-4222-8222-222222222222";
+        let response = chat_stream(
+            State(state.clone()),
+            axum::Extension(SessionMode::Vscode),
+            Json(ChatRequest {
+                message: "hold this turn".into(),
+                working_dir: Some(home._dir.path().to_path_buf()),
+                provider: None,
+                session_id: Some(session_id.into()),
+                request_id: Some("request-only-alias".into()),
+                images: Vec::new(),
+                approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+            }),
+        )
+        .await
+        .into_response();
+
+        let active = active_chat_sessions(State(state.clone()))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(active.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let active_ids: Vec<String> = serde_json::from_slice(&bytes).unwrap();
+
+        state.active_chats.cancel_all().await;
+        drop(response);
+        tokio::task::yield_now().await;
+
+        assert_eq!(active_ids, vec![session_id.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn stale_chat_cleanup_cannot_remove_a_replacement_operation() {
+        let registry = ActiveChatRegistry::default();
+        let first = registry.admit(Some("session-1"), None).await.unwrap();
+        assert!(registry.complete(&first.operation_id).await);
+        let replacement = registry.admit(Some("session-1"), None).await.unwrap();
+
+        assert!(!registry.complete(&first.operation_id).await);
+
+        assert!(
+            registry
+                .active_session_ids()
+                .await
+                .iter()
+                .any(|session| session == "session-1"),
+            "cleanup for an older operation must compare identity before removal"
+        );
+        registry.complete(&replacement.operation_id).await;
+    }
+
+    #[tokio::test]
+    async fn stop_accepts_both_session_and_request_aliases() {
+        let registry = ActiveChatRegistry::default();
+        let by_request = registry
+            .admit(Some("session-1"), Some("request-1"))
+            .await
+            .unwrap();
+        assert!(registry.stop_alias("request-1").await);
+        assert!(by_request.cancellation.is_cancelled());
+        registry.complete(&by_request.operation_id).await;
+
+        let by_session = registry
+            .admit(Some("session-2"), Some("request-2"))
+            .await
+            .unwrap();
+        assert!(registry.stop_alias("session-2").await);
+        assert!(by_session.cancellation.is_cancelled());
+        registry.complete(&by_session.operation_id).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_without_turn_finished_never_emits_done() {
+        use atomcode_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+
+        let home = ScopedChatHome::new();
+        let working_dir = home._dir.path().to_path_buf();
+        let mut config = Config::with_default_provider("main");
+        config.providers.insert(
+            "main".into(),
+            test_provider("test-model", "http://127.0.0.1:9/v1".into()),
+        );
+        config.save(&Config::default_path()).unwrap();
+
+        let session_id = "33333333-3333-4333-8333-333333333333";
+        let manager = SessionManager::for_project(&working_dir);
+        let lease = manager.acquire_lease(session_id).unwrap();
+        let mut meta = SessionMeta::new(session_id, working_dir.to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&atomcode_kernel::message::SessionSnapshot::new(Vec::new())),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats.admit(Some(session_id), None).await.unwrap();
+        let operation_id = admission.operation_id.clone();
+        process_chat_request(
+            ChatRequest {
+                message: "this runtime cannot acquire the held session".into(),
+                working_dir: Some(working_dir),
+                provider: Some("main".into()),
+                session_id: Some(session_id.into()),
+                request_id: None,
+                images: Vec::new(),
+                approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+            },
+            event_tx,
+            admission.cancellation,
+            admission.operation_id,
+            active_chats.clone(),
+            Arc::new(RwLock::new(HashMap::new())),
+            chat_test_telemetry(&home),
+            permission_bridge::PermissionResponders::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        active_chats.complete(&operation_id).await;
+        drop(lease);
+
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Error { .. })),
+            "the missing runtime terminal must be surfaced as an error"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Done { .. })),
+            "Done requires an authoritative TurnFinished"
+        );
     }
 
     async fn spawn_openai_sse(
@@ -5314,6 +5876,12 @@ mod tests {
             "test".into(),
         );
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats
+            .admit(None, Some("chat-vl-regression"))
+            .await
+            .unwrap();
+        let operation_id = admission.operation_id.clone();
         process_chat_request(
             ChatRequest {
                 message: "explain this screenshot".into(),
@@ -5328,9 +5896,9 @@ mod tests {
                 approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
             },
             event_tx,
-            CancellationToken::new(),
-            "chat-vl-regression".into(),
-            Arc::new(RwLock::new(std::collections::HashSet::new())),
+            admission.cancellation,
+            admission.operation_id,
+            active_chats.clone(),
             Arc::new(RwLock::new(HashMap::new())),
             telemetry,
             permission_bridge::PermissionResponders::new(),
@@ -5338,6 +5906,7 @@ mod tests {
         )
         .await
         .expect("chat request succeeds");
+        active_chats.complete(&operation_id).await;
 
         let vl_request = tokio::time::timeout(std::time::Duration::from_secs(2), vl_request)
             .await

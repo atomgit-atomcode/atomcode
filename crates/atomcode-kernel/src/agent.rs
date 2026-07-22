@@ -32,6 +32,80 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 /// `AgentBuilder::max_tool_result_bytes` — but the default is bounded.
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
 
+/// Opt-in policy for exact, no-progress tool-loop detection.
+///
+/// The default policy warns after three consecutive executions of the same call
+/// (or all-read-only batch) return the same model-visible result(s) and success
+/// state, then stops after the fourth. Products may choose higher thresholds for
+/// intentional polling/repetition, or leave the policy disabled. The kernel default
+/// is OFF — a runtime opts in explicitly through [`AgentBuilder::tool_loop_policy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolLoopPolicy {
+    warning_threshold: u32,
+    stop_threshold: u32,
+}
+
+impl ToolLoopPolicy {
+    /// Build an exact-loop policy. The warning must leave the model at least one
+    /// real chance to change course before the stop threshold, and the first
+    /// repeat is never enough evidence to warn.
+    pub fn new(warning_threshold: u32, stop_threshold: u32) -> Result<Self, &'static str> {
+        if warning_threshold < 2 {
+            return Err("tool-loop warning threshold must be at least 2");
+        }
+        if warning_threshold >= stop_threshold {
+            return Err("tool-loop warning threshold must be lower than stop threshold");
+        }
+        Ok(Self {
+            warning_threshold,
+            stop_threshold,
+        })
+    }
+
+    pub fn warning_threshold(self) -> u32 {
+        self.warning_threshold
+    }
+
+    pub fn stop_threshold(self) -> u32 {
+        self.stop_threshold
+    }
+}
+
+impl Default for ToolLoopPolicy {
+    fn default() -> Self {
+        Self {
+            warning_threshold: 3,
+            stop_threshold: 4,
+        }
+    }
+}
+
+fn tool_loop_course_correction(policy: ToolLoopPolicy) -> String {
+    format!(
+        "[Tool-loop guard] The same tool call or read-only batch has returned the same \
+         result(s) {} times. Do not repeat it unchanged. Reassess the task, use a different \
+         action, or explain why no further progress is possible. If repetition is intentional, \
+         make the progress observable instead of issuing the identical call again.",
+        policy.warning_threshold()
+    )
+}
+
+fn tool_loop_warning(policy: ToolLoopPolicy) -> String {
+    format!(
+        "possible tool loop: the same call or read-only batch returned the same result(s) {} \
+         times; asking the model to change course",
+        policy.warning_threshold()
+    )
+}
+
+fn tool_loop_terminal_warning(policy: ToolLoopPolicy) -> String {
+    format!(
+        "tool loop detected: the same call or read-only batch returned the same result(s) {} \
+         times; stopping before another model request",
+        policy.stop_threshold()
+    )
+}
+
 /// Bounded overflow-recovery retries per round (covers ladder tiers 0..=2). After this
 /// many failed compact-and-retry attempts the kernel surfaces the overflow error rather
 /// than spinning — a genuinely-unrecoverable history (sacred floor alone over the window).
@@ -84,33 +158,26 @@ const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
 /// many) so a model that truncates every round cannot livelock the loop.
 const MAX_TRUNCATION_CONTINUATIONS: u32 = 2;
 
-/// CROSS-ROUND REPETITION FUSE (FAILURE PERCEPTION). A weak model can spin on the
-/// byte-identical tool call round after round — e.g. `echo`-ing a question to the
-/// user instead of ending the turn to let them answer — with NO agency to stop. The
-/// per-batch dedup gate only catches repeats WITHIN one assistant message, so this
-/// bounds repeats ACROSS rounds. At [`REPEAT_NUDGE_AT`] consecutive identical rounds
-/// the kernel injects ONE corrective nudge (tools still on) so the model can
-/// self-correct; if it still repeats up to [`MAX_REPEAT_ROUNDS`], the turn is
-/// force-stopped with `StopReason::RepeatLoop`. Always on — a bug class, not a
-/// workload knob (same rationale as `max_continuations`).
+/// Always-on, coarse cross-round repetition fuse. The opt-in exact guard below
+/// compares the executed call, effective cwd, result and success state; this fuse
+/// covers the broader failure mode where the model keeps choosing the same action
+/// even while results change, or when a product has disabled exact detection.
 const MAX_REPEAT_ROUNDS: u32 = 6;
 const REPEAT_NUDGE_AT: u32 = 3;
 const REPEAT_LOOP_NUDGE: &str =
-    "You have now issued the SAME tool call with the SAME arguments several rounds in a row \
-     with no new result — you are stuck in a loop. STOP repeating it. If you are trying to ask \
-     the user something, do NOT print it with a shell command (its output only comes back to \
-     you); instead end your turn with a plain text question, or use a request-user-input tool if \
-     available. If the task is done, reply with a short summary and no tool calls. If you are \
-     blocked, say what you need.";
+    "You have issued the SAME tool call with the SAME arguments several rounds in a row. \
+     Stop repeating it and change your approach. If you are trying to ask the user something, \
+     do not print it with a shell command; end your turn with a plain-text question, or use a \
+     request-user-input tool when available. If the task is done, reply with a short summary \
+     and no tool calls. If you are blocked, explain what you need.";
 
-/// Canonical signature of a round's tool calls for the cross-round repetition fuse:
-/// the SORTED `name(arguments)` pairs (order-independent so a reordered parallel batch
-/// still matches). Keyed on the MODEL's emitted `(name, arguments)` — the same identity
-/// the per-batch dedup uses — so a reworded argument counts as progress and resets the fuse.
+/// Order-independent signature of the model-emitted calls in one round. Call ids
+/// are deliberately excluded because providers commonly mint a new id for every
+/// otherwise-identical retry.
 fn round_tool_signature(calls: &[ToolCall]) -> String {
     let mut parts: Vec<String> = calls
         .iter()
-        .map(|c| format!("{}\u{0}{}", c.name, c.arguments))
+        .map(|call| format!("{}\u{0}{}", call.name, call.arguments))
         .collect();
     parts.sort();
     parts.join("\u{1}")
@@ -362,7 +429,11 @@ fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
 /// (the effective input budget — window minus output reserve minus margin), so it
 /// warns BEFORE the real request crosses the model's usable limit. The user-facing
 /// text still references the full `ctx_window` — the reserve is internal.
-fn over_window_advisory(est_prompt_tokens: u32, ctx_window: u32, trigger_limit: u32) -> Option<String> {
+fn over_window_advisory(
+    est_prompt_tokens: u32,
+    ctx_window: u32,
+    trigger_limit: u32,
+) -> Option<String> {
     if ctx_window == 0 || (est_prompt_tokens as u64) < (trigger_limit as u64) {
         return None;
     }
@@ -412,6 +483,78 @@ enum CallPlan {
         /// uses it to pick a read-lock (concurrent) vs write-lock (barrier).
         parallel_safe: bool,
     },
+}
+
+/// A Phase ② result plus the exact working directory supplied to the tool. Ready
+/// `CallPlan::Result` values have no execution context and therefore can never be
+/// candidates for exact-loop detection.
+struct ExecutedCallResult {
+    result: ToolResult,
+    effective_cwd: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ToolLoopCallFingerprint {
+    tool_name: String,
+    canonical_arguments: String,
+    effective_cwd: std::path::PathBuf,
+    result_content: String,
+    is_error: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ToolLoopFingerprint {
+    /// Multi-call candidates are all parallel-safe, so emission order is not
+    /// semantic progress. A single side-effecting call is unaffected by sorting.
+    calls: Vec<ToolLoopCallFingerprint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolLoopDecision {
+    Continue,
+    Warn,
+    Stop,
+}
+
+/// Session-owned, ephemeral streak state. It is deliberately not stored in a
+/// snapshot: replacing/resuming an Agent starts fresh, while synthetic turns on
+/// the same live session retain the streak.
+struct ToolLoopState {
+    policy: ToolLoopPolicy,
+    last: Option<ToolLoopFingerprint>,
+    consecutive: u32,
+}
+
+impl ToolLoopState {
+    fn new(policy: ToolLoopPolicy) -> Self {
+        Self {
+            policy,
+            last: None,
+            consecutive: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last = None;
+        self.consecutive = 0;
+    }
+
+    fn observe(&mut self, fingerprint: ToolLoopFingerprint) -> ToolLoopDecision {
+        if self.last.as_ref() == Some(&fingerprint) {
+            self.consecutive = self.consecutive.saturating_add(1);
+        } else {
+            self.last = Some(fingerprint);
+            self.consecutive = 1;
+        }
+
+        if self.consecutive >= self.policy.stop_threshold {
+            ToolLoopDecision::Stop
+        } else if self.consecutive == self.policy.warning_threshold {
+            ToolLoopDecision::Warn
+        } else {
+            ToolLoopDecision::Continue
+        }
+    }
 }
 
 /// Build the equality key for calls emitted by the model before middleware
@@ -574,6 +717,8 @@ pub struct Agent {
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
     hooks: Arc<dyn LifecycleHooks>,
     max_rounds: Option<u32>,
+    /// Opt-in exact tool-loop policy. `None` keeps the neutral kernel behavior.
+    tool_loop_policy: Option<ToolLoopPolicy>,
     /// SAFETY FUSE (FAILURE PERCEPTION): max times a `offer_continuation` hook may CONTINUE a
     /// single turn (inject a synthetic user message and loop again) before the
     /// kernel forcibly stops with `StopReason::MaxContinuations`. `None` = unlimited
@@ -704,6 +849,7 @@ impl Agent {
             hooks: self.hooks,
             rt: RequestCtx::new(ev_tx, self.request_timeout),
             max_rounds: self.max_rounds,
+            tool_loop_policy: self.tool_loop_policy,
             max_continuations: self.max_continuations,
             resume: self.resume,
             max_tool_result_bytes: self.max_tool_result_bytes,
@@ -804,6 +950,9 @@ struct RunningAgent {
     hooks: Arc<dyn LifecycleHooks>,
     rt: RequestCtx,
     max_rounds: Option<u32>,
+    /// Opt-in exact tool-loop policy. State derived from this policy is owned by
+    /// `session_loop`, not by the immutable runtime configuration.
+    tool_loop_policy: Option<ToolLoopPolicy>,
     /// SAFETY FUSE: bound on `offer_continuation` continuations per turn (see `Agent`). `None`
     /// = unlimited. Default `Some(50)`.
     max_continuations: Option<u32>,
@@ -1048,6 +1197,9 @@ impl RunningAgent {
             .map(|s| s.version == SNAPSHOT_VERSION)
             .unwrap_or(false);
         self.hooks.session_start(&mut convo, resumed).await;
+        // Exact-loop evidence belongs to this live session. It is intentionally
+        // neither shared outside the session loop nor restored from snapshots.
+        let mut tool_loop_state = self.tool_loop_policy.map(ToolLoopState::new);
         // FIFO queue for commands that arrive MID-TURN and must NOT be dropped: a
         // `Snapshot` (a driver waiting on its reply would otherwise hang) and a
         // `SendMessage` (the user's next prompt would otherwise vanish). They are
@@ -1089,6 +1241,7 @@ impl RunningAgent {
                             &mut convo,
                             &mut cmd_rx,
                             &mut pending,
+                            &mut tool_loop_state,
                             PromptKind::User,
                             text,
                             images,
@@ -1099,7 +1252,10 @@ impl RunningAgent {
                     }
                     // DRAIN queued mid-turn commands (FIFO) now that the turn is done
                     // and `convo` is free (see `drain_pending`).
-                    if self.drain_pending(&mut convo, &mut cmd_rx, &mut pending).await {
+                    if self
+                        .drain_pending(&mut convo, &mut cmd_rx, &mut pending, &mut tool_loop_state)
+                        .await
+                    {
                         break;
                     }
                 }
@@ -1113,6 +1269,7 @@ impl RunningAgent {
                             &mut convo,
                             &mut cmd_rx,
                             &mut pending,
+                            &mut tool_loop_state,
                             PromptKind::Synthetic,
                             text,
                             Vec::new(),
@@ -1121,7 +1278,10 @@ impl RunningAgent {
                     if shutdown {
                         break;
                     }
-                    if self.drain_pending(&mut convo, &mut cmd_rx, &mut pending).await {
+                    if self
+                        .drain_pending(&mut convo, &mut cmd_rx, &mut pending, &mut tool_loop_state)
+                        .await
+                    {
                         break;
                     }
                 }
@@ -1141,6 +1301,7 @@ impl RunningAgent {
         convo: &mut Conversation,
         cmd_rx: &mut UnboundedReceiver<AgentCommand>,
         pending: &mut std::collections::VecDeque<AgentCommand>,
+        tool_loop_state: &mut Option<ToolLoopState>,
         kind: PromptKind,
         mut text: String,
         images: Vec<ImageContent>,
@@ -1155,6 +1316,14 @@ impl RunningAgent {
                 reason: StopReason::PromptRejected,
             });
             return false;
+        }
+        // A real user submission starts a new intent scope. A synthetic prompt is
+        // host-driven continuation of the same accepted operation and therefore
+        // deliberately keeps the evidence accumulated by previous turns.
+        if kind == PromptKind::User {
+            if let Some(state) = tool_loop_state.as_mut() {
+                state.reset();
+            }
         }
         // ── TASK BOUNDARY auto-compaction ──
         // After the prompt is accepted but BEFORE the new user message enters
@@ -1188,8 +1357,13 @@ impl RunningAgent {
         // so a middleware blocked on approval can be answered out-of-band.
         let steer: SteerBuf =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-        let mut turn =
-            Box::pin(self.run_turn(convo, turn_token.clone(), rollback_len, steer.clone()));
+        let mut turn = Box::pin(self.run_turn(
+            convo,
+            turn_token.clone(),
+            rollback_len,
+            steer.clone(),
+            tool_loop_state.as_mut(),
+        ));
         let mut shutdown = false;
         loop {
             tokio::select! {
@@ -1266,6 +1440,7 @@ impl RunningAgent {
         convo: &mut Conversation,
         cmd_rx: &mut UnboundedReceiver<AgentCommand>,
         pending: &mut std::collections::VecDeque<AgentCommand>,
+        tool_loop_state: &mut Option<ToolLoopState>,
     ) -> bool {
         while let Some(queued) = pending.pop_front() {
             match queued {
@@ -1276,7 +1451,15 @@ impl RunningAgent {
                 }
                 AgentCommand::SendMessage { text, images } => {
                     if self
-                        .process_send_message(convo, cmd_rx, pending, PromptKind::User, text, images)
+                        .process_send_message(
+                            convo,
+                            cmd_rx,
+                            pending,
+                            tool_loop_state,
+                            PromptKind::User,
+                            text,
+                            images,
+                        )
                         .await
                     {
                         return true;
@@ -1288,6 +1471,7 @@ impl RunningAgent {
                             convo,
                             cmd_rx,
                             pending,
+                            tool_loop_state,
                             PromptKind::Synthetic,
                             text,
                             Vec::new(),
@@ -1300,7 +1484,8 @@ impl RunningAgent {
                 // A mid-turn /compact runs HERE — the turn boundary, the documented
                 // cache-safe trigger point.
                 AgentCommand::Compact { focus } => {
-                    self.run_compaction(convo, CompactTrigger::Manual { focus }).await;
+                    self.run_compaction(convo, CompactTrigger::Manual { focus })
+                        .await;
                 }
                 // Only Snapshot/SendMessage/SendSyntheticMessage/Compact are ever enqueued.
                 _ => {}
@@ -1393,6 +1578,7 @@ impl RunningAgent {
         cancel: tokio_util::sync::CancellationToken,
         rollback_len: usize,
         steer: SteerBuf,
+        mut tool_loop_state: Option<&mut ToolLoopState>,
     ) {
         self.hooks.turn_start(convo).await;
         self.rt.emit(AgentEvent::TurnStarted);
@@ -1444,9 +1630,9 @@ impl RunningAgent {
         // decrements that reset `round` to 1) AND tells the empty-exhaustion
         // terminal not to repeat the same size-blame.
         let mut over_window_warned = false;
-        // CROSS-ROUND REPETITION FUSE state (see `MAX_REPEAT_ROUNDS`): the signature of
-        // the previous tool-call round, how many CONSECUTIVE rounds have matched it, and
-        // whether the one-shot corrective nudge has already fired for the current streak.
+        // Per-turn state for the always-on coarse fuse. Unlike the exact guard's
+        // session-owned streak, this only describes consecutive rounds of this
+        // running turn.
         let mut last_round_sig: Option<String> = None;
         let mut repeat_rounds: u32 = 0;
         let mut repeat_nudged = false;
@@ -1492,6 +1678,15 @@ impl RunningAgent {
                 b.drain(..).collect()
             };
             if !steered.is_empty() {
+                // A real user steer changes the intent of the currently-running
+                // turn. Evidence collected before that intervention must not be
+                // compared with calls made in response to the new instruction.
+                if let Some(state) = tool_loop_state.as_deref_mut() {
+                    state.reset();
+                }
+                last_round_sig = None;
+                repeat_rounds = 0;
+                repeat_nudged = false;
                 let n = steered.len();
                 for s in steered {
                     convo.push(Message::user_with_images(s.text, s.images));
@@ -2306,12 +2501,20 @@ impl RunningAgent {
             // call) — re-derive the calls to execute from the (possibly edited) message
             // so a dropped call is NOT executed.
             let pending_calls = assistant_msg.tool_calls.clone();
-            // Capture the repetition-fuse signature BEFORE the tool loop consumes
-            // `pending_calls` (moved by the `for call in pending_calls` below); the fuse
-            // check runs at the round boundary. Empty on the no-tool-calls path (unused there).
+            // Capture before `pending_calls` is consumed by execution. The coarse
+            // fuse compares what the model chose, independent of tool results.
             let round_sig = round_tool_signature(&pending_calls);
             convo.push(assistant_msg);
             if pending_calls.is_empty() {
+                // Exact-loop evidence is consecutive across tool rounds only. A
+                // no-tool assistant reply is an observable break in that sequence,
+                // even if a host later opens a synthetic follow-up turn.
+                if let Some(state) = tool_loop_state.as_deref_mut() {
+                    state.reset();
+                }
+                last_round_sig = None;
+                repeat_rounds = 0;
+                repeat_nudged = false;
                 // A prompt steered in during this round keeps the turn going: loop back so the
                 // top-of-loop drain folds it in and the model responds to it in-turn.
                 // (needs_follow_up = model produced tool calls OR a steer is pending.)
@@ -2611,10 +2814,14 @@ impl RunningAgent {
             // Results aligned to `plans`: `None` for Skip / not-executed slots; the
             // ready `Result(r)` payloads are moved into place so Phase ③ has a
             // single uniform view. Execute slots are filled by the drain below.
-            let mut results: Vec<Option<ToolResult>> = (0..plans.len()).map(|_| None).collect();
+            let mut results: Vec<Option<ExecutedCallResult>> =
+                (0..plans.len()).map(|_| None).collect();
             for (i, plan) in plans.iter().enumerate() {
                 if let CallPlan::Result(r) = plan {
-                    results[i] = Some(r.clone());
+                    results[i] = Some(ExecutedCallResult {
+                        result: r.clone(),
+                        effective_cwd: None,
+                    });
                 }
             }
 
@@ -2666,14 +2873,15 @@ impl RunningAgent {
                     }
                     // SNAPSHOT cwd AFTER acquiring the lock so a prior write-locked
                     // `change_dir` (which held the exclusive barrier) is visible here.
+                    let effective_cwd = match &cwd {
+                        Some(c) => c
+                            .read()
+                            .map(|g| g.clone())
+                            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()),
+                        None => std::env::current_dir().unwrap_or_default(),
+                    };
                     let ctx = ToolContext {
-                        working_dir: match &cwd {
-                            Some(c) => c
-                                .read()
-                                .map(|g| g.clone())
-                                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()),
-                            None => std::env::current_dir().unwrap_or_default(),
-                        },
+                        working_dir: effective_cwd.clone(),
                         cancel: cancel.clone(),
                         // Live progress seam: a tool MAY report mid-execution status,
                         // tagged with THIS call's id, straight to the driver.
@@ -2710,7 +2918,13 @@ impl RunningAgent {
                         },
                     };
                     r.call_id = call.id.clone();
-                    (idx, Some(r))
+                    (
+                        idx,
+                        Some(ExecutedCallResult {
+                            result: r,
+                            effective_cwd: Some(effective_cwd),
+                        }),
+                    )
                 });
             }
             // Drain in emission order. A future may yield `None` (cancel-skipped);
@@ -2734,8 +2948,29 @@ impl RunningAgent {
             // that never started applies nothing (its tool_call is left dangling for
             // the roll-back / backfill tail below) — the concurrent analogue of the
             // serial `cancel_boundary` cut.
-            for result_slot in results.iter_mut() {
-                let Some(mut result) = result_slot.take() else {
+            // The exact guard accepts either one REAL execution (including Bash /
+            // writes, which must not repeat indefinitely) or an all-read-only batch.
+            // Mixed/multi-mutating batches, stubs, unknown/blocked calls, and
+            // duplicates remain ineligible and break the streak.
+            let mut loop_candidate = tool_loop_state.is_some()
+                && !plans.is_empty()
+                && (matches!(plans.as_slice(), [CallPlan::Execute { .. }])
+                    || plans.iter().all(|plan| {
+                        matches!(
+                            plan,
+                            CallPlan::Execute {
+                                parallel_safe: true,
+                                ..
+                            }
+                        )
+                    }));
+            let mut loop_calls = Vec::with_capacity(plans.len());
+            for (plan, result_slot) in plans.iter().zip(results.iter_mut()) {
+                let Some(ExecutedCallResult {
+                    mut result,
+                    effective_cwd,
+                }) = result_slot.take()
+                else {
                     continue; // Skip plan (no result to apply)
                 };
                 // ToolMiddleware after-chain: transform / observe the result and
@@ -2755,6 +2990,29 @@ impl RunningAgent {
                 // (deterministic → prefix-cache safe). The tiny `(cancelled)`/error
                 // stubs never reach the cap, so they pass through untouched.
                 cap_tool_result(&mut result, self.max_tool_result_bytes);
+
+                // Build the fingerprint from what ACTUALLY executed and what the
+                // model will ACTUALLY see: middleware-final args, execution-time
+                // cwd, and the post-middleware, size-capped result. Success/failure
+                // is part of the identity: the same failed Bash call is also no
+                // progress. Image and post-blocked calls remain excluded.
+                if loop_candidate && result.images.is_empty() && post_block.is_none() {
+                    if let (CallPlan::Execute { tool, call, .. }, Some(effective_cwd)) =
+                        (plan, effective_cwd)
+                    {
+                        loop_calls.push(ToolLoopCallFingerprint {
+                            tool_name: tool.name().to_string(),
+                            canonical_arguments: canonicalize_tool_args(&call.arguments),
+                            effective_cwd,
+                            result_content: result.content.clone(),
+                            is_error: result.is_error,
+                        });
+                    } else {
+                        loop_candidate = false;
+                    }
+                } else {
+                    loop_candidate = false;
+                }
                 if result.is_error {
                     self.hooks.on_error(&result.content).await;
                 } else if batch_start.is_some() {
@@ -2797,13 +3055,17 @@ impl RunningAgent {
                 // now inserted during classification. The record semantics are
                 // identical, just moved earlier; nothing to record here.
             }
+            let loop_fingerprint = loop_candidate.then(|| {
+                loop_calls.sort();
+                ToolLoopFingerprint { calls: loop_calls }
+            });
             // ── Cancel during the batch: close batch + roll back the turn ──
             // Reached only when Phase ② observed a cancel. The results that DID
             // complete were applied above so their ToolResult events fired; the
             // cancel-skipped Execute slots applied nothing (dangling tool_calls now
             // rolled back / backfilled by finish_cancelled). Close any batch and
             // finish the cancelled turn — exactly the old loop's checkpoint path.
-            if cancelled_during_batch {
+            if cancelled_during_batch || cancel.is_cancelled() {
                 if let Some((batch_id, started_at)) = &batch_start {
                     self.rt.emit(AgentEvent::ToolBatchCompleted {
                         batch_id: batch_id.clone(),
@@ -2836,25 +3098,65 @@ impl RunningAgent {
                     std::mem::take(&mut turn_images),
                 ));
             }
-            // ── CROSS-ROUND REPETITION FUSE ──
-            // Reached only on the tool-call path (the empty-calls path returned/continued
-            // above), at a clean round boundary: this round's assistant tool_calls +
-            // their tool_results are all applied, so `finish_turn` here is API-valid. If
-            // the model keeps emitting the byte-identical call(s) round after round it is
-            // stuck with no agency to stop — nudge once, then force-stop. See
-            // `MAX_REPEAT_ROUNDS`.
+            // Enforce only after every ToolResult has been emitted/stored and any
+            // batch has been closed. This preserves provider pairing and UI event
+            // ordering; there is never a pre-execution fake result. Cancel was
+            // checked above and therefore wins over this terminal.
+            let real_steer_pending = !steer.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+            let mut exact_streak_active = false;
+            if let Some(state) = tool_loop_state.as_deref_mut() {
+                // A steer can arrive while the provider streams or the tool runs.
+                // Honor that real user intent before warning/stopping; the next
+                // round's normal drain will append the prompt to the conversation.
+                let policy = state.policy;
+                let exact_loop_decision = match (real_steer_pending, loop_fingerprint) {
+                    (false, Some(fingerprint)) => state.observe(fingerprint),
+                    _ => {
+                        state.reset();
+                        ToolLoopDecision::Continue
+                    }
+                };
+                exact_streak_active = state.consecutive > 1;
+                match exact_loop_decision {
+                    ToolLoopDecision::Continue => {}
+                    ToolLoopDecision::Warn => {
+                        self.rt.emit(AgentEvent::Warning(tool_loop_warning(policy)));
+                        convo.push(Message::synthetic_user(tool_loop_course_correction(policy)));
+                    }
+                    ToolLoopDecision::Stop => {
+                        self.rt
+                            .emit(AgentEvent::Warning(tool_loop_terminal_warning(policy)));
+                        self.finish_turn(convo, StopReason::ToolLoopDetected, &turn_ctx)
+                            .await;
+                        return;
+                    }
+                }
+            }
+
+            if real_steer_pending {
+                last_round_sig = None;
+                repeat_rounds = 0;
+                repeat_nudged = false;
+                continue;
+            }
+
             if last_round_sig.as_deref() == Some(round_sig.as_str()) {
-                repeat_rounds += 1;
+                repeat_rounds = repeat_rounds.saturating_add(1);
             } else {
-                repeat_rounds = 1;
                 last_round_sig = Some(round_sig);
+                repeat_rounds = 1;
                 repeat_nudged = false;
             }
-            if repeat_rounds >= MAX_REPEAT_ROUNDS {
+
+            // A configured exact guard owns a stable-result streak so its custom
+            // thresholds remain meaningful. The coarse fuse still tracks those
+            // rounds and becomes active whenever exact evidence is absent (changing
+            // results, ineligible batches, or no exact policy).
+            if !exact_streak_active && repeat_rounds >= MAX_REPEAT_ROUNDS {
                 self.rt.emit(AgentEvent::Error {
                     message: format!(
-                        "stopped: the model repeated the same tool call for {repeat_rounds} \
-                         consecutive rounds without progress"
+                        "stopped: the model repeated the same tool-call pattern for \
+                         {repeat_rounds} consecutive rounds"
                     ),
                     http_status: None,
                     code: None,
@@ -2863,7 +3165,7 @@ impl RunningAgent {
                     .await;
                 return;
             }
-            if repeat_rounds == REPEAT_NUDGE_AT && !repeat_nudged {
+            if !exact_streak_active && repeat_rounds >= REPEAT_NUDGE_AT && !repeat_nudged {
                 repeat_nudged = true;
                 convo.push(Message::synthetic_user(REPEAT_LOOP_NUDGE.to_string()));
             }
@@ -2881,6 +3183,7 @@ pub struct AgentBuilder {
     /// an empty Vec yields an empty `HookChain` that behaves exactly like `NoopHooks`.
     hooks: Vec<Arc<dyn LifecycleHooks>>,
     max_rounds: Option<u32>,
+    tool_loop_policy: Option<ToolLoopPolicy>,
     max_continuations: Option<u32>,
     resume: Option<SessionSnapshot>,
     max_tool_result_bytes: usize,
@@ -2916,6 +3219,9 @@ impl Default for AgentBuilder {
             middlewares: Vec::new(),
             hooks: Vec::new(),
             max_rounds: None,
+            // Neutral default: exact loop detection is product policy and must be
+            // enabled explicitly by the runtime assembling this agent.
+            tool_loop_policy: None,
             // SAFETY FUSE DEFAULTS ON (Some(50)). This DIFFERS from `max_rounds` /
             // timeouts (which default None/OFF because they are perf/latency POLICY):
             // an unbounded `offer_continuation` continuation loop is a BUG class — the kernel
@@ -2997,6 +3303,16 @@ impl AgentBuilder {
     /// Hard cap on LLM rounds per turn (safety fuse; None = unlimited).
     pub fn max_rounds(mut self, n: u32) -> Self {
         self.max_rounds = Some(n);
+        self
+    }
+    /// Enable conservative exact tool-loop detection for this live session.
+    ///
+    /// The kernel default is OFF. When enabled, state stays local to the session
+    /// loop: a real user prompt/steer resets it, while a host-injected synthetic
+    /// continuation preserves it so an automated goal cannot evade the guard by
+    /// repeatedly opening fresh turns.
+    pub fn tool_loop_policy(mut self, policy: ToolLoopPolicy) -> Self {
+        self.tool_loop_policy = Some(policy);
         self
     }
     /// SAFETY FUSE: max times a `offer_continuation` hook may CONTINUE a single turn (inject a
@@ -3202,6 +3518,7 @@ impl AgentBuilder {
             // run-loop call sites are unchanged — they still call one hook object.
             hooks: Arc::new(HookChain::new(self.hooks)),
             max_rounds: self.max_rounds,
+            tool_loop_policy: self.tool_loop_policy,
             max_continuations: self.max_continuations,
             resume: self.resume,
             max_tool_result_bytes: self.max_tool_result_bytes,
@@ -4059,13 +4376,19 @@ mod synthetic_send_tests {
         let mut handle = Agent::builder()
             .provider(provider)
             .tools(ToolRegistry::new().mount(&[]))
-            .hooks(Arc::new(RewritePromptHook::new("rewrite", "!!", log.clone())))
+            .hooks(Arc::new(RewritePromptHook::new(
+                "rewrite",
+                "!!",
+                log.clone(),
+            )))
             .build()
             .spawn();
 
         handle
             .commands
-            .send(AgentCommand::SendSyntheticMessage { text: "continue".into() })
+            .send(AgentCommand::SendSyntheticMessage {
+                text: "continue".into(),
+            })
             .unwrap();
         while let Some(ev) = handle.events.recv().await {
             if matches!(ev, AgentEvent::TurnComplete { .. }) {
@@ -4095,8 +4418,14 @@ mod synthetic_send_tests {
             .iter()
             .find(|m| m.role == Role::User)
             .expect("a user message must be stored");
-        assert!(user.synthetic, "a synthetic prompt must be stored as synthetic");
-        assert_eq!(user.text, "continue!!", "the hook's rewrite must land in storage");
+        assert!(
+            user.synthetic,
+            "a synthetic prompt must be stored as synthetic"
+        );
+        assert_eq!(
+            user.text, "continue!!",
+            "the hook's rewrite must land in storage"
+        );
     }
 
     // (2) A synthetic user message never anchors `sacred_floor`: only the FIRST REAL
@@ -4107,8 +4436,8 @@ mod synthetic_send_tests {
         c.push(Message::system("persona")); // index 0
         c.push(Message::synthetic_user("[goal-mode continuation]")); // index 1 — NOT anchor
         c.push(Message::user("the real task")); // index 2 — the real anchor
-        // Floor = system + through the first REAL user (index 2) → count 3; the
-        // synthetic at index 1 does not pull the floor up short.
+                                                // Floor = system + through the first REAL user (index 2) → count 3; the
+                                                // synthetic at index 1 does not pull the floor up short.
         assert_eq!(c.sacred_floor(), 3);
     }
 
@@ -4122,7 +4451,9 @@ mod synthetic_send_tests {
         reg.register(Arc::new(EchoTool));
         reg.register(Arc::new(InjectCommandTool::new(
             deferred.clone(),
-            AgentCommand::SendSyntheticMessage { text: "SECOND-SYNTHETIC".into() },
+            AgentCommand::SendSyntheticMessage {
+                text: "SECOND-SYNTHETIC".into(),
+            },
         )));
 
         let provider = Arc::new(
@@ -4161,7 +4492,10 @@ mod synthetic_send_tests {
 
         handle
             .commands
-            .send(AgentCommand::SendMessage { text: "FIRST-PROMPT".into(), images: vec![] })
+            .send(AgentCommand::SendMessage {
+                text: "FIRST-PROMPT".into(),
+                images: vec![],
+            })
             .unwrap();
 
         // TWO TurnComplete events: turn 1, then the drained mid-turn synthetic's turn 2.
@@ -4174,7 +4508,10 @@ mod synthetic_send_tests {
                 }
             }
         }
-        assert_eq!(completes, 2, "the queued mid-turn synthetic must run its own turn");
+        assert_eq!(
+            completes, 2,
+            "the queued mid-turn synthetic must run its own turn"
+        );
 
         // The queued synthetic entered history as a SYNTHETIC user message and reached
         // the provider on turn 2 — proof it was not lost and kept its synthetic marker.
@@ -4194,137 +4531,5 @@ mod synthetic_send_tests {
 
         handle.commands.send(AgentCommand::Shutdown).unwrap();
         let _ = handle.task.await;
-    }
-}
-
-#[cfg(test)]
-mod repeat_loop_tests {
-    //! Cross-round repetition fuse (`MAX_REPEAT_ROUNDS`): a model that emits the
-    //! byte-identical tool call round after round (e.g. a weak model echoing a
-    //! question to the user instead of ending the turn) must be nudged once and then
-    //! force-stopped, not left to spin forever.
-    use super::*;
-    use crate::message::Role;
-    use crate::testkit::{EchoTool, RecordingProvider};
-    use crate::tool::{ToolCall, ToolRegistry};
-
-    #[tokio::test]
-    async fn identical_tool_call_every_round_is_nudged_then_force_stopped() {
-        // Script far MORE identical rounds than the fuse allows; each emits the SAME
-        // (name, arguments) echo call with a DISTINCT id (mirrors a real model that
-        // varies only the call id). The fuse must stop the turn well before they run out.
-        let round = |id: &str| {
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: id.into(),
-                    name: "echo".into(),
-                    arguments: r#"{"text":"please tell me the topic"}"#.into(),
-                }),
-                StreamEvent::Done { truncated: false },
-            ]
-        };
-        let scripted = 20usize;
-        let rounds: Vec<Vec<StreamEvent>> = (0..scripted).map(|i| round(&format!("c{i}"))).collect();
-        let provider = Arc::new(RecordingProvider::new(rounds).with_ctx_window(1_000_000));
-
-        let mut reg = ToolRegistry::new();
-        reg.register(Arc::new(EchoTool));
-        let mut handle = Agent::builder()
-            .provider(provider.clone())
-            .tools(reg.mount(&["echo"]))
-            .persona("neutral test agent")
-            .build()
-            .spawn();
-
-        handle
-            .commands
-            .send(AgentCommand::SendMessage { text: "go".into(), images: vec![] })
-            .unwrap();
-        while let Some(ev) = handle.events.recv().await {
-            if matches!(ev, AgentEvent::TurnComplete { .. }) {
-                break;
-            }
-        }
-
-        handle.commands.send(AgentCommand::Snapshot).unwrap();
-        let mut messages = Vec::new();
-        while let Some(ev) = handle.events.recv().await {
-            if let AgentEvent::Snapshot { snapshot } = ev {
-                messages = snapshot.messages;
-                break;
-            }
-        }
-        handle.commands.send(AgentCommand::Shutdown).unwrap();
-        let _ = handle.task.await;
-
-        // The fuse force-stopped the turn BEFORE the scripted rounds ran out.
-        let rounds_run = provider.recorded().len();
-        assert!(
-            rounds_run <= MAX_REPEAT_ROUNDS as usize,
-            "fuse must stop within {MAX_REPEAT_ROUNDS} rounds, ran {rounds_run}"
-        );
-        assert!(rounds_run < scripted, "the turn must not consume all scripted rounds");
-        assert!(
-            rounds_run >= REPEAT_NUDGE_AT as usize,
-            "should run at least until the one-shot nudge fires"
-        );
-        // The one-shot corrective nudge was injected as a SYNTHETIC user message.
-        assert!(
-            messages
-                .iter()
-                .any(|m| m.role == Role::User && m.synthetic && m.text.contains("stuck in a loop")),
-            "the repetition fuse must inject a corrective nudge before stopping"
-        );
-    }
-
-    #[tokio::test]
-    async fn distinct_tool_calls_each_round_do_not_trip_the_fuse() {
-        // Same tool, DIFFERENT arguments each round → not a repeat → the fuse never fires;
-        // the turn ends only when the model stops (empty queue → Done). Guards against the
-        // fuse killing legitimate progress.
-        let round = |i: usize| {
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: format!("c{i}"),
-                    name: "echo".into(),
-                    arguments: format!(r#"{{"text":"step {i}"}}"#),
-                }),
-                StreamEvent::Done { truncated: false },
-            ]
-        };
-        // MORE distinct rounds than MAX_REPEAT_ROUNDS — must ALL run (no false trip).
-        let scripted = (MAX_REPEAT_ROUNDS as usize) + 4;
-        let rounds: Vec<Vec<StreamEvent>> = (0..scripted).map(round).collect();
-        let provider = Arc::new(RecordingProvider::new(rounds).with_ctx_window(1_000_000));
-
-        let mut reg = ToolRegistry::new();
-        reg.register(Arc::new(EchoTool));
-        let mut handle = Agent::builder()
-            .provider(provider.clone())
-            .tools(reg.mount(&["echo"]))
-            .persona("neutral test agent")
-            .build()
-            .spawn();
-
-        handle
-            .commands
-            .send(AgentCommand::SendMessage { text: "go".into(), images: vec![] })
-            .unwrap();
-        while let Some(ev) = handle.events.recv().await {
-            if matches!(ev, AgentEvent::TurnComplete { .. }) {
-                break;
-            }
-        }
-        handle.commands.send(AgentCommand::Shutdown).unwrap();
-        let _ = handle.task.await;
-
-        // All distinct rounds ran (the empty queue, not the fuse, ended the turn — plus
-        // one final call returning the default `Done` with no tool call). A count past
-        // MAX_REPEAT_ROUNDS proves the fuse did NOT falsely trip on genuine progress.
-        let ran = provider.recorded().len();
-        assert!(
-            ran >= scripted,
-            "distinct-argument rounds must not trip the repetition fuse (ran {ran}, expected >= {scripted})"
-        );
     }
 }

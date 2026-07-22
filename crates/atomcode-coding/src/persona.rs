@@ -133,6 +133,9 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     if todo_enabled {
         p.push_str(TODO_USAGE);
     }
+    // Communication and polling semantics apply even when the optional structured
+    // input tool is disabled: plain-text turn completion is always available.
+    p.push_str(USER_COMMUNICATION_AND_POLLING);
     // `request_user_input` tool usage guidance — surfaced in the system prompt so weak models
     // (GLM / DeepSeek) that under-weight tool descriptions still see the judgment line.
     // MUST stay gated on the SAME condition as the tool registration in `atomcode-capabilities`
@@ -356,13 +359,17 @@ questions to refine a design, surface ITS questions through this tool too: use `
 `multiple` with concrete `options` for choice questions and `text` for an open answer, so the \
 user answers in the UI instead of reading a prose question. The 'ask sparingly, only for what \
 you cannot decide yourself' guidance above governs YOUR OWN ad-hoc questions; it does not \
-constrain a skill's structured interview. \
-NEVER try to talk to the user by printing text with a shell command (e.g. `echo \"...\"`): a \
-tool's output comes back only to YOU, not the user, so you will loop forever waiting for an \
-answer that never arrives. To reach the user, EITHER call `request_user_input`, OR end your \
-turn with the question in plain text and stop (no tool call) so they can reply. And never \
-re-issue the SAME tool call round after round expecting a different result — if a call didn't \
-get what you need, change approach or ask.";
+constrain a skill's structured interview.";
+
+/// Always-present workflow guidance for the failure mode behind issue #1169.
+/// It deliberately does not name the optional structured input tool.
+const USER_COMMUNICATION_AND_POLLING: &str = "\n\n## USER COMMUNICATION AND POLLING:\n\
+Never try to communicate with the user through shell output (for example `echo \"...\"`). \
+Tool output returns to you, not to the user. To ask a question, end the turn with the question \
+in plain text and make no tool call, so the user can reply. Do not repeat an unchanged call \
+merely hoping for a different answer. Repetition is valid when the task has an explicit wait \
+condition, interval, or observable progress, or when the user requested a bounded number of \
+repetitions; honor that count or deadline, then report the outcome.";
 
 /// Memory-tool usage guidance. Judgment-framed: only persist durable, non-obvious
 /// learnings — not standard facts or session one-offs. Only injected when the
@@ -494,6 +501,14 @@ mod tests {
         assert!(
             !off.contains("## ASKING THE USER"),
             "disabled → no guidance"
+        );
+        assert!(
+            off.contains("Never try to communicate with the user through shell output"),
+            "anti-echo guidance must remain when the optional input tool is disabled"
+        );
+        assert!(
+            off.contains("explicit wait condition, interval, or observable progress"),
+            "legitimate bounded polling must be distinguished from no-progress repetition"
         );
     }
 
@@ -1275,11 +1290,12 @@ mod tests {
             p.contains("## ASKING THE USER"),
             "guidance must be present when switch is default-on: {p}"
         );
-        // The anti-echo / anti-loop guidance (root-cause nudge for the "echo a question
-        // to the user in a loop" failure) must be part of this section.
+        // The root-cause guidance is always present and permits bounded polling;
+        // it is intentionally independent of this optional tool section.
         assert!(
-            p.contains("shell command") && p.contains("loop"),
-            "asking guidance must warn against printing questions via a shell command: {p}"
+            p.contains("Never try to communicate with the user through shell output")
+                && p.contains("explicit wait condition, interval, or observable progress"),
+            "persona must distinguish the echo loop from legitimate bounded polling: {p}"
         );
     }
 }

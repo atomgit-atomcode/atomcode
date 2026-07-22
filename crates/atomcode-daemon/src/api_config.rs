@@ -163,17 +163,21 @@ mod tests {
 
     #[test]
     fn provider_info_reports_login_dependency_from_gateway() {
-        assert!(provider_info(
-            "renamed",
-            &provider("https://llm-api.atomgit.com/v1"),
-            "renamed"
-        )
-        .requires_login);
-        assert!(!provider_info(
-            "AtomGit-looking-custom",
-            &provider("https://example.test/v1"),
-            "AtomGit-looking-custom"
-        )
-        .requires_login);
+        assert!(
+            provider_info(
+                "renamed",
+                &provider("https://llm-api.atomgit.com/v1"),
+                "renamed"
+            )
+            .requires_login
+        );
+        assert!(
+            !provider_info(
+                "AtomGit-looking-custom",
+                &provider("https://example.test/v1"),
+                "AtomGit-looking-custom"
+            )
+            .requires_login
+        );
     }
 }

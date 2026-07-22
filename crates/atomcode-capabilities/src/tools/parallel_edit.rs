@@ -13,7 +13,7 @@
 
 use super::{err, ok};
 use async_trait::async_trait;
-use atomcode_kernel::agent::{Agent, AutoRespond};
+use atomcode_kernel::agent::{Agent, AutoRespond, ToolLoopPolicy};
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, Tool, ToolContext, ToolResult};
@@ -39,6 +39,8 @@ pub struct ParallelEditTool {
     make_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     persona: String,
     max_files: usize,
+    max_rounds: Option<u32>,
+    tool_loop_policy: Option<ToolLoopPolicy>,
 }
 
 impl ParallelEditTool {
@@ -51,6 +53,8 @@ impl ParallelEditTool {
             make_tools: Box::new(make_tools),
             persona: DEFAULT_PERSONA.to_string(),
             max_files: DEFAULT_MAX_FILES,
+            max_rounds: Some(super::DEFAULT_CHILD_MAX_ROUNDS),
+            tool_loop_policy: Some(ToolLoopPolicy::default()),
         }
     }
     /// Override the per-child system prompt.
@@ -61,6 +65,19 @@ impl ParallelEditTool {
     /// Override the max number of files per call (default 12).
     pub fn with_max_files(mut self, max: usize) -> Self {
         self.max_files = max.max(2);
+        self
+    }
+    /// Override the per-child model-round high-water mark. `0` disables this cap;
+    /// the exact no-progress policy is configured independently.
+    pub fn with_max_rounds(mut self, n: u32) -> Self {
+        self.max_rounds = (n != 0).then_some(n);
+        self
+    }
+
+    /// Use the embedding product's exact no-progress policy. `None` disables it
+    /// for intentional repeated operations; the independent round cap still applies.
+    pub fn with_tool_loop_policy(mut self, policy: Option<ToolLoopPolicy>) -> Self {
+        self.tool_loop_policy = policy;
         self
     }
 }
@@ -194,13 +211,19 @@ impl Tool for ParallelEditTool {
                 "File to edit: {}\n\nInstruction:\n{}{}\n\nEdit ONLY this file using your tools, then stop.",
                 f.path, f.instruction, contract_block
             );
-            let child = Agent::builder()
+            let mut builder = Agent::builder()
                 .provider((self.make_provider)())
                 .tools((self.make_tools)())
                 .persona(self.persona.clone())
                 .working_dir(ctx.working_dir.clone())
-                .cancel_token(ctx.cancel.child_token())
-                .build();
+                .cancel_token(ctx.cancel.child_token());
+            if let Some(policy) = self.tool_loop_policy {
+                builder = builder.tool_loop_policy(policy);
+            }
+            if let Some(max_rounds) = self.max_rounds {
+                builder = builder.max_rounds(max_rounds);
+            }
+            let child = builder.build();
             let path = f.path.clone();
             // Cheap clone (Arc inside); moved into the child task so it can report the
             // moment THIS child settles — concurrent, so lines interleave by real
@@ -475,6 +498,22 @@ mod tests {
             },
             || ToolRegistry::new().mount(&[]), // children need no tools for these tests
         )
+    }
+
+    #[test]
+    fn child_round_limit_is_configurable_and_zero_means_unbounded() {
+        assert_eq!(tool(None).max_rounds, Some(200));
+        assert_eq!(tool(None).with_max_rounds(500).max_rounds, Some(500));
+        assert_eq!(tool(None).with_max_rounds(0).max_rounds, None);
+    }
+
+    #[test]
+    fn child_exact_loop_policy_can_be_inherited_or_disabled() {
+        assert_eq!(tool(None).tool_loop_policy, Some(ToolLoopPolicy::default()));
+        assert_eq!(
+            tool(None).with_tool_loop_policy(None).tool_loop_policy,
+            None
+        );
     }
 
     #[tokio::test]

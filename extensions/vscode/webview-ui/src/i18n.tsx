@@ -125,6 +125,7 @@ const zh = {
   'stream.rateLimitedRetrying': '触发限流，{seconds} 秒后重试…',
   'stream.rateLimitedPaused': '触发限流，等待恢复…',
   'stream.idleNotice': '仍在等待模型响应…',
+  'stream.incomplete': '本轮未完成（{reason}）。已保留当前结果，可在新一轮中继续。',
 
   'permission.deny': '拒绝',
   'permission.allow': '允许',
@@ -293,6 +294,7 @@ const en: Record<MsgKey, string> = {
   'stream.rateLimitedRetrying': 'Rate limited. Retrying in {seconds}s...',
   'stream.rateLimitedPaused': 'Rate limited. Waiting to resume...',
   'stream.idleNotice': 'Still waiting for the model...',
+  'stream.incomplete': 'Turn incomplete ({reason}). Partial results were preserved; continue in a new turn.',
 
   'permission.deny': 'Deny',
   'permission.allow': 'Allow',

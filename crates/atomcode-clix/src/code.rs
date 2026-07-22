@@ -241,12 +241,17 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     // exit NON-ZERO — `--yolo -p` is the CI mode, and CI needs the signal.
     if let Some(p) = args.prompt {
         handle.submit(UserInput::from(p)).await?;
-        let reason = drive_turn(&handle, &mut events, &mut input, args.yolo, &mut sigint).await;
+        let outcome = drive_turn(&handle, &mut events, &mut input, args.yolo, &mut sigint).await;
         finish(handle, task, session_id).await?;
         telemetry.shutdown(crate::tel::FLUSH_TIMEOUT).await;
-        return match reason {
-            Some(StopReason::Stopped) => Ok(()),
-            Some(other) => bail!("turn did not complete normally: {other:?}"),
+        return match outcome {
+            Some(TurnOutcome::Completed(StopReason::Stopped)) => Ok(()),
+            Some(TurnOutcome::Completed(other)) => {
+                bail!("turn did not complete normally: {other:?}")
+            }
+            Some(TurnOutcome::SnapshotUnavailable { reason, error }) => {
+                bail!("turn snapshot unavailable after {reason:?}: {error}")
+            }
             None => bail!("agent terminated unexpectedly"),
         };
     }
@@ -332,14 +337,32 @@ async fn finish(
 /// Drive ONE turn: render events until `TurnComplete`; answer approval requests
 /// (interactive, or auto-allow under --yolo); Ctrl-C (via the shared SIGINT channel)
 /// cancels the turn — the kernel also unparks a pending approval, fail-closed.
-/// Returns the turn's final `StopReason`, or `None` when the agent task died.
+/// Returns the runtime-owned completion variant, or `None` when the agent task died.
+#[derive(Debug, PartialEq, Eq)]
+enum TurnOutcome {
+    Completed(StopReason),
+    SnapshotUnavailable { reason: StopReason, error: String },
+}
+
+fn turn_outcome(completion: TurnCompletion) -> TurnOutcome {
+    match completion {
+        TurnCompletion::Completed { reason, .. } => TurnOutcome::Completed(reason),
+        TurnCompletion::SnapshotUnavailable { reason, error, .. } => {
+            TurnOutcome::SnapshotUnavailable {
+                reason,
+                error: error.message,
+            }
+        }
+    }
+}
+
 async fn drive_turn(
     handle: &CodingRuntimeHandle,
     events: &mut CodingRuntimeEvents,
     input: &mut Lines<BufReader<Stdin>>,
     yolo: bool,
     sigint: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
-) -> Option<StopReason> {
+) -> Option<TurnOutcome> {
     use std::io::Write;
     let mut streamed = false;
     // Once a cancel is in flight, any approval Request still buffered in the event
@@ -421,23 +444,19 @@ async fn drive_turn(
             } => {
                 eprintln!("[compact failed] {error}");
             }
-            CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { reason, .. }) => {
+            CodingRuntimeEvent::TurnFinished(completion) => {
                 if streamed {
                     println!();
                 }
-                match reason {
-                    StopReason::Stopped => {}
-                    ref other => eprintln!("[turn ended: {other:?}]"),
+                let outcome = turn_outcome(completion);
+                match &outcome {
+                    TurnOutcome::Completed(StopReason::Stopped) => {}
+                    TurnOutcome::Completed(other) => eprintln!("[turn ended: {other:?}]"),
+                    TurnOutcome::SnapshotUnavailable { reason, error } => {
+                        eprintln!("[turn snapshot unavailable after {reason:?}: {error}]")
+                    }
                 }
-                return Some(reason);
-            }
-            CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
-                reason,
-                error,
-                ..
-            }) => {
-                eprintln!("[turn snapshot unavailable: {}]", error.message);
-                return Some(reason);
+                return Some(outcome);
             }
             _ => {}
         }
@@ -711,5 +730,25 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
         assert!(fmt_ts(0).starts_with("1970-01-01 00:00"));
+    }
+
+    #[test]
+    fn snapshot_unavailable_is_not_a_successful_stopped_turn() {
+        let completion = TurnCompletion::SnapshotUnavailable {
+            turn_id: 1,
+            reason: StopReason::Stopped,
+            error: atomcode_coding::RuntimeSnapshotError {
+                message: "snapshot failed".into(),
+            },
+            stats: Default::default(),
+        };
+
+        assert!(matches!(
+            turn_outcome(completion),
+            TurnOutcome::SnapshotUnavailable {
+                reason: StopReason::Stopped,
+                ..
+            }
+        ));
     }
 }

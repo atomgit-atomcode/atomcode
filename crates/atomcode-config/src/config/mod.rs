@@ -54,7 +54,7 @@ pub fn platform_rules() -> &'static str {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoopConfig {
-    /// Hard cap on /loop iterations (both modes) before auto-stop.
+    /// Hard cap on /loop iterations (both modes) before auto-stop; `0` is unbounded.
     pub max_rounds: u32,
 }
 
@@ -66,9 +66,10 @@ impl Default for LoopConfig {
 
 /// `[subagent]` execution policy for the `task` subagent tool.
 ///
-/// `max_concurrent` and `timeout_secs` are the LIVE knobs: `coding::parts` reads them via
-/// `subagent_runtime_knobs` and wires them into `TaskTool` (with `ATOMCODE_SUBAGENT_TIMEOUT`
-/// overriding `timeout_secs`). The tool's master ON/OFF is the env gate `ATOMCODE_SUBAGENT`
+/// `max_concurrent`, `timeout_secs`, and `max_rounds` are the LIVE knobs: `coding::parts`
+/// reads them via `subagent_runtime_knobs` and wires them into `TaskTool`. Environment
+/// overrides are `ATOMCODE_SUBAGENT_TIMEOUT` and `ATOMCODE_SUBAGENT_MAX_ROUNDS`.
+/// The tool's master ON/OFF is the env gate `ATOMCODE_SUBAGENT`
 /// (default ON, opt out with `ATOMCODE_SUBAGENT=0`) — NOT `enabled` here; `enabled`,
 /// `initial_turns`, and `max_turns` are vestigial from the retired `parallel_edit` dispatch
 /// path and are not currently consulted.
@@ -87,6 +88,9 @@ pub struct SubAgentConfig {
     /// Per-subtask wall-time timeout in seconds (floored to 30s). Default 900 (15 min).
     /// Overridden by the `ATOMCODE_SUBAGENT_TIMEOUT` env var when set.
     pub timeout_secs: u64,
+    /// Per-subtask model-round high-water mark. Default 200; `0` means unbounded.
+    /// Overridden by `ATOMCODE_SUBAGENT_MAX_ROUNDS` when set.
+    pub max_rounds: u32,
 }
 
 impl Default for SubAgentConfig {
@@ -98,6 +102,7 @@ impl Default for SubAgentConfig {
             max_concurrent: 3,
             // Matches the `task` tool's shipped default so wiring config is not a silent change.
             timeout_secs: 900,
+            max_rounds: 200,
         }
     }
 }
@@ -148,8 +153,8 @@ pub struct Config {
     /// Only applies when working inside a git repository.
     #[serde(default)]
     pub auto_commit: bool,
-    /// `task` subagent tool policy (`max_concurrent` / `timeout_secs`). Missing from older
-    /// configs → defaults to max_concurrent=3, timeout_secs=900. See [`SubAgentConfig`].
+    /// `task` subagent tool policy. Missing from older configs uses the defaults in
+    /// [`SubAgentConfig`], including a configurable 200-round high-water mark.
     #[serde(default)]
     pub subagent: SubAgentConfig,
     /// /loop command policy. Missing from older configs → max_rounds=100.

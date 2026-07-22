@@ -10,9 +10,12 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
-    PresentationFile, SessionLease, SessionMeta, SessionStoreError, StorageOwner,
+    DisplayAnchor, PresentationEntry, SessionLease, SessionStoreError, TurnStat,
 };
+#[cfg(test)]
+use atomcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::checkpoint::CompactionCheckpointError;
 use atomcode_kernel::event::{AgentCommand, AgentEvent, RequestId, StopReason};
@@ -43,11 +46,16 @@ pub enum CodingRuntimeEvent {
     Agent(AgentEvent),
     /// Vision (VL) preprocessing recognised the turn's image(s) — the driver
     /// renders a "✓ VL recognised image, returned N chars" status line.
-    VisionPreprocessSuccess { vl_model: String, char_count: usize },
+    VisionPreprocessSuccess {
+        vl_model: String,
+        char_count: usize,
+    },
     /// Vision (VL) preprocessing failed — the driver surfaces a warning and
     /// re-attaches the images it remembers from submit so the user can retry
     /// without re-pasting from the clipboard.
-    VisionPreprocessFailed { reason: String },
+    VisionPreprocessFailed {
+        reason: String,
+    },
     /// A potentially slow compaction strategy has started.
     CompactionStarted {
         trigger: CompactTrigger,
@@ -778,6 +786,16 @@ pub struct CodingRuntimeHandle {
     terminal: watch::Receiver<Option<RuntimeExit>>,
 }
 
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub struct RuntimeSnapshotReceipt {
+    snapshot: Arc<SessionSnapshot>,
+    undo_snapshot: Arc<SessionSnapshot>,
+    revision: u64,
+}
+
+type RuntimeSnapshotWaiter = oneshot::Sender<Result<RuntimeSnapshotReceipt, RuntimeError>>;
+
 /// Readiness of a runtime whose asynchronous preparation is owned by a driver adapter.
 /// Once ready, consumers read the authoritative phase from the stable runtime handle
 /// instead of maintaining a second lifecycle state mirror.
@@ -979,6 +997,10 @@ impl CodingRuntimeHandle {
     }
 
     pub async fn snapshot(&self) -> Result<Arc<SessionSnapshot>, RuntimeError> {
+        Ok(self.snapshot_with_revision().await?.snapshot)
+    }
+
+    async fn snapshot_with_revision(&self) -> Result<RuntimeSnapshotReceipt, RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
         self.tx
@@ -1120,13 +1142,14 @@ impl CodingRuntimeHandle {
 
     pub async fn undo_to_prompt(&self, nth: Option<usize>) -> Result<UndoResult, RuntimeError> {
         let generation = self.status().generation;
-        let original = self.snapshot().await?;
-        let undo = undo_snapshot_to_prompt(&original, nth)?;
+        let original = self.snapshot_with_revision().await?;
+        let undo = undo_snapshot_to_prompt(&original.undo_snapshot, nth)?;
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::ApplyUndo {
                 generation,
-                original,
+                expected_revision: original.revision,
+                original: original.undo_snapshot,
                 truncated: undo.snapshot,
                 restored_prompt: undo.restored_prompt,
                 target_n: undo.target_n,
@@ -1540,7 +1563,7 @@ pub enum CodingRuntimeControl {
     },
     Snapshot {
         generation: u64,
-        done: oneshot::Sender<Result<Arc<SessionSnapshot>, RuntimeError>>,
+        done: oneshot::Sender<Result<RuntimeSnapshotReceipt, RuntimeError>>,
     },
     Cancel {
         generation: u64,
@@ -1577,6 +1600,7 @@ pub enum CodingRuntimeControl {
     },
     ApplyUndo {
         generation: u64,
+        expected_revision: u64,
         original: Arc<SessionSnapshot>,
         truncated: SessionSnapshot,
         restored_prompt: String,
@@ -1805,6 +1829,10 @@ struct CompactionTracker {
 }
 
 impl CompactionTracker {
+    fn is_active(&self) -> bool {
+        !self.manual.is_empty() || self.non_manual_started.is_some()
+    }
+
     fn accepted_manual(&mut self, trigger: CompactTrigger) {
         self.manual.push_back(ManualCompactionFlight {
             trigger,
@@ -1961,9 +1989,10 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut forced_shutdown = false;
         let mut exit_reason = RuntimeExitReason::OwnerStopped;
         let mut next_turn_id = 0u64;
+        let mut conversation_revision = 0u64;
         let mut active_turn = None;
         let mut pending_requests = BTreeSet::new();
-        let mut snapshot_waiters = Vec::new();
+        let mut snapshot_waiters: Vec<RuntimeSnapshotWaiter> = Vec::new();
         let mut snapshot_in_flight = false;
         let mut terminal_reason = None;
         let mut turn_stats = RuntimeTurnStats::default();
@@ -1975,6 +2004,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut pending_wakeup: Option<WakeupRequest> = None;
         let mut held_turn: Option<(u64, StopReason, Arc<SessionSnapshot>, RuntimeTurnStats)> = None;
         let mut ai_name_attempted = false;
+        let mut persistence_failure = None;
         if let Some(reason) = provider_unavailable_reason {
             let _ = runtime_event_tx.send(CodingRuntimeEvent::ProviderUnavailable {
                 reason,
@@ -2033,20 +2063,54 @@ fn spawn_runtime_owner_with_optional_agent(
                                 active_turn.is_some(),
                             );
                         }
-                        let _ = stop_current_agent(
+                        let stop_report = stop_current_agent(
                             &mut agent,
                             &mut compactions,
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            resources
+                                .as_ref()
+                                .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
                         )
                         .await;
+                        if fail_close_after_stopped_persistence(
+                            &stop_report,
+                            resources.as_ref(),
+                            &mut goal,
+                            &mut loop_state,
+                            &mut pending_wakeup,
+                            &mut held_turn,
+                            &mut active_turn,
+                            &mut terminal_reason,
+                            &mut turn_stats,
+                            &mut conversation_revision,
+                            &mut snapshot_waiters,
+                            &mut agent_available,
+                            controls.state.as_ref(),
+                            generation,
+                            &runtime_event_tx,
+                        )
+                        .is_some()
+                        {
+                            persistence_failure = stop_report.persistence_failure.clone();
+                        }
                         agent = None;
                         agent_available = false;
                         observed_tokens = None;
                         let _ = done.send(());
                     }
                     Some(OwnerControl::Replace { agent: replacement, done }) => {
+                        if persistence_failure.is_some() {
+                            agent = None;
+                            agent_available = false;
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::Failed),
+                                Ordering::Release,
+                            );
+                            let _ = done.send(());
+                            continue;
+                        }
                         let resume_after_replace = !compaction_suspended;
                         if resume_after_replace {
                             generation = generation.wrapping_add(1);
@@ -2069,14 +2133,43 @@ fn spawn_runtime_owner_with_optional_agent(
                                 active_turn.is_some(),
                             );
                         }
-                        let _ = stop_current_agent(
+                        let stop_report = stop_current_agent(
                             &mut agent,
                             &mut compactions,
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            resources
+                                .as_ref()
+                                .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
                         )
                         .await;
+                        if fail_close_after_stopped_persistence(
+                            &stop_report,
+                            resources.as_ref(),
+                            &mut goal,
+                            &mut loop_state,
+                            &mut pending_wakeup,
+                            &mut held_turn,
+                            &mut active_turn,
+                            &mut terminal_reason,
+                            &mut turn_stats,
+                            &mut conversation_revision,
+                            &mut snapshot_waiters,
+                            &mut agent_available,
+                            controls.state.as_ref(),
+                            generation,
+                            &runtime_event_tx,
+                        )
+                        .is_some()
+                        {
+                            persistence_failure = stop_report.persistence_failure.clone();
+                            agent = None;
+                            compaction_suspended = false;
+                            observed_tokens = None;
+                            let _ = done.send(());
+                            continue;
+                        }
                         agent = Some(replacement);
                         agent_available = true;
                         observed_tokens = None;
@@ -2115,6 +2208,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeShutdown,
+                            resources
+                                .as_ref()
+                                .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
                         )
                         .await;
                         forced_shutdown = stop_report.forced;
@@ -2125,10 +2221,28 @@ fn spawn_runtime_owner_with_optional_agent(
                                 &mut active_turn,
                                 &mut terminal_reason,
                                 &mut turn_stats,
+                                &mut conversation_revision,
                                 &mut snapshot_waiters,
                                 &runtime_event_tx,
                             );
                         }
+                        let _ = fail_close_after_stopped_persistence(
+                            &stop_report,
+                            resources.as_ref(),
+                            &mut goal,
+                            &mut loop_state,
+                            &mut pending_wakeup,
+                            &mut held_turn,
+                            &mut active_turn,
+                            &mut terminal_reason,
+                            &mut turn_stats,
+                            &mut conversation_revision,
+                            &mut snapshot_waiters,
+                            &mut agent_available,
+                            controls.state.as_ref(),
+                            generation,
+                            &runtime_event_tx,
+                        );
                         interrupt_queued_controls(
                             &mut controls,
                             &runtime_event_tx,
@@ -2173,7 +2287,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             state.tokens_used = state.tokens_used.saturating_add((usage.prompt + usage.completion) as u64);
                         }
                     }
-                    let mut finish = false;
+                    let mut finish_reason = None;
                     let mut continuation = None;
                     match outcome.result {
                         GoalResult::Met(verdict) => {
@@ -2182,7 +2296,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 state.last_reason = Some(verdict);
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
-                            finish = true;
+                            finish_reason = Some(StopReason::Stopped);
                         }
                         GoalResult::NotMet(verdict) => {
                             if let Some(state) = goal.as_mut() {
@@ -2197,26 +2311,26 @@ fn spawn_runtime_owner_with_optional_agent(
                             if let Some(state) = goal.as_mut() {
                                 state.evaluator_failures = state.evaluator_failures.saturating_add(1);
                                 state.last_reason = Some(format!("evaluator failed: {error}"));
-                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                 if state.evaluator_failures >= MAX_EVAL_FAILURES {
                                     state.active = false;
-                                    finish = true;
+                                    finish_reason = Some(StopReason::ProviderError);
                                 } else {
                                     continuation = Some(goal_continuation_message(&format!("evaluator error: {error}"), &state.condition));
                                 }
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal evaluator failed: {error}")));
                         }
                     }
-                    if finish {
-                        if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                    if let Some(reason) = finish_reason {
+                        if let Some((turn_id, _held_reason, snapshot, stats)) = held_turn.take() {
                             active_turn = None;
                             goal = None;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
                         }
                     } else if let Some(text) = continuation {
-                        if send_agent_command(&agent, AgentCommand::SendMessage { text, images: vec![] }) {
+                        if send_agent_command(&agent, AgentCommand::SendSyntheticMessage { text }) {
                             held_turn = None;
                             terminal_reason = None;
                             turn_stats = RuntimeTurnStats::default();
@@ -2231,12 +2345,17 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
                                 "goal stopped: continuation dispatch failed".into(),
                             ));
-                            if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                            if let Some((turn_id, _held_reason, snapshot, stats)) = held_turn.take() {
                                 active_turn = None;
                                 terminal_reason = None;
                                 turn_stats = RuntimeTurnStats::default();
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
-                                    TurnCompletion::Completed { turn_id, reason, snapshot, stats },
+                                    TurnCompletion::Completed {
+                                        turn_id,
+                                        reason: StopReason::ProviderError,
+                                        snapshot,
+                                        stats,
+                                    },
                                 ));
                             }
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
@@ -2251,7 +2370,9 @@ fn spawn_runtime_owner_with_optional_agent(
                     {
                         continue;
                     }
-                    let at_limit = loop_state.as_ref().is_some_and(|state| state.round >= state.max_rounds);
+                    let at_limit = loop_state
+                        .as_ref()
+                        .is_some_and(LoopState::round_limit_reached);
                     if at_limit {
                         if let Some(mut state) = loop_state.take() {
                             state.active = false;
@@ -2260,9 +2381,14 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::LoopChanged(state.progress()));
                         }
                         if let Some(runtime) = resources.as_ref() { runtime.loop_active.store(false, Ordering::Release); }
-                        if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                        if let Some((turn_id, _held_reason, snapshot, stats)) = held_turn.take() {
                             active_turn = None;
-                            let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                                turn_id,
+                                reason: StopReason::MaxRounds,
+                                snapshot,
+                                stats,
+                            }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
                         }
                     } else {
@@ -2289,12 +2415,17 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
                                 "loop stopped: continuation dispatch failed".into(),
                             ));
-                            if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                            if let Some((turn_id, _held_reason, snapshot, stats)) = held_turn.take() {
                                 active_turn = None;
                                 terminal_reason = None;
                                 turn_stats = RuntimeTurnStats::default();
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
-                                    TurnCompletion::Completed { turn_id, reason, snapshot, stats },
+                                    TurnCompletion::Completed {
+                                        turn_id,
+                                        reason: StopReason::ProviderError,
+                                        snapshot,
+                                        stats,
+                                    },
                                 ));
                             }
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
@@ -2302,6 +2433,16 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                 }
                 control = controls.recv(), if controls_open => match control {
+                    Some(control)
+                        if persistence_failure.is_some()
+                            && !matches!(&control, CodingRuntimeControl::Shutdown { .. }) =>
+                    {
+                        reject_runtime_control(
+                            control,
+                            &runtime_event_tx,
+                            CompactionInterruption::RuntimeUnavailable,
+                        );
+                    }
                     Some(CodingRuntimeControl::Compact { generation: request_generation, focus }) => {
                         let trigger = CompactTrigger::Manual { focus: focus.clone() };
                         if request_generation != generation || compaction_suspended {
@@ -2721,6 +2862,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
                         finish_stopped_native_turn(
@@ -2729,9 +2871,32 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut active_turn,
                             &mut terminal_reason,
                             &mut turn_stats,
+                            &mut conversation_revision,
                             &mut snapshot_waiters,
                             &runtime_event_tx,
                         );
+                        if let Some(error) = fail_close_after_stopped_persistence(
+                            &stop_report,
+                            Some(&runtime),
+                            &mut goal,
+                            &mut loop_state,
+                            &mut pending_wakeup,
+                            &mut held_turn,
+                            &mut active_turn,
+                            &mut terminal_reason,
+                            &mut turn_stats,
+                            &mut conversation_revision,
+                            &mut snapshot_waiters,
+                            &mut agent_available,
+                            controls.state.as_ref(),
+                            generation,
+                            &runtime_event_tx,
+                        ) {
+                            persistence_failure = stop_report.persistence_failure.clone();
+                            resources = Some(runtime);
+                            let _ = done.send(Err(error));
+                            continue;
+                        }
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
 
                         let old_config = runtime.config.clone();
@@ -2868,6 +3033,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            resources
+                                .as_ref()
+                                .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
                         )
                         .await;
                         finish_stopped_native_turn(
@@ -2876,9 +3044,31 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut active_turn,
                             &mut terminal_reason,
                             &mut turn_stats,
+                            &mut conversation_revision,
                             &mut snapshot_waiters,
                             &runtime_event_tx,
                         );
+                        if let Some(error) = fail_close_after_stopped_persistence(
+                            &stop_report,
+                            resources.as_ref(),
+                            &mut goal,
+                            &mut loop_state,
+                            &mut pending_wakeup,
+                            &mut held_turn,
+                            &mut active_turn,
+                            &mut terminal_reason,
+                            &mut turn_stats,
+                            &mut conversation_revision,
+                            &mut snapshot_waiters,
+                            &mut agent_available,
+                            controls.state.as_ref(),
+                            generation,
+                            &runtime_event_tx,
+                        ) {
+                            persistence_failure = stop_report.persistence_failure.clone();
+                            let _ = done.send(Err(error));
+                            continue;
+                        }
                         if let Some(runtime) = resources.as_mut() {
                             preserve_sessionless_snapshot(runtime, &stop_report);
                             if let Some(provider) = runtime.config.subagent_fast_provider.as_ref() {
@@ -3085,6 +3275,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
                         if controller_interrupted {
@@ -3096,9 +3287,41 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut active_turn,
                             &mut terminal_reason,
                             &mut turn_stats,
+                            &mut conversation_revision,
                             &mut snapshot_waiters,
                             &runtime_event_tx,
                         );
+                        if let Some(error) = fail_close_after_stopped_persistence(
+                            &stop_report,
+                            Some(&runtime),
+                            &mut goal,
+                            &mut loop_state,
+                            &mut pending_wakeup,
+                            &mut held_turn,
+                            &mut active_turn,
+                            &mut terminal_reason,
+                            &mut turn_stats,
+                            &mut conversation_revision,
+                            &mut snapshot_waiters,
+                            &mut agent_available,
+                            controls.state.as_ref(),
+                            generation,
+                            &runtime_event_tx,
+                        ) {
+                            persistence_failure = stop_report.persistence_failure.clone();
+                            let _ = replacement.commands.send(AgentCommand::Shutdown);
+                            let cleanup_error =
+                                discard_uncommitted_session(operation, &candidate).err();
+                            resources = Some(runtime);
+                            let error = match cleanup_error {
+                                Some(cleanup_error) => RuntimeError::ReconfigureFailed(format!(
+                                    "{error}; candidate cleanup failed: {cleanup_error}"
+                                )),
+                                None => error,
+                            };
+                            let _ = done.send(Err(error));
+                            continue;
+                        }
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
                         runtime = candidate;
                         agent = Some(replacement);
@@ -3133,6 +3356,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     Some(CodingRuntimeControl::ApplyUndo {
                         generation: request_generation,
+                        expected_revision,
                         original,
                         truncated,
                         restored_prompt,
@@ -3140,7 +3364,12 @@ fn spawn_runtime_owner_with_optional_agent(
                         prompts_before,
                         done,
                     }) => {
-                        if request_generation != generation || compaction_suspended || active_turn.is_some() {
+                        if request_generation != generation
+                            || expected_revision != conversation_revision
+                            || compaction_suspended
+                            || compactions.is_active()
+                            || active_turn.is_some()
+                        {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
@@ -3148,11 +3377,50 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
-                        let undo_sidecars = match persist_runtime_undo(&mut runtime, &truncated) {
+                        let undo_sidecars = match persist_runtime_undo(
+                            &mut runtime,
+                            Some(original.as_ref()),
+                            &truncated,
+                        ) {
                             Ok(sidecars) => sidecars,
                             Err(error) => {
+                                if error.is_snapshot_conflict() {
+                                    resources = Some(runtime);
+                                    let _ = done.send(Err(RuntimeError::Busy));
+                                    continue;
+                                }
+                                let health_error = native_session_health_error(&runtime);
+                                if error.requires_fail_close() || health_error.is_some() {
+                                    let detail = health_error
+                                        .as_deref()
+                                        .map(|health| {
+                                            format!(
+                                                "; canonical native session health check failed: {health}"
+                                            )
+                                        })
+                                        .unwrap_or_default();
+                                    persistence_failure = Some(format!("{error}{detail}"));
+                                    let _ = send_agent_command(&agent, AgentCommand::Shutdown);
+                                    agent = None;
+                                    agent_available = false;
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::Failed),
+                                        Ordering::Release,
+                                    );
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
+                                        AgentEvent::Error {
+                                            message: format!(
+                                                "undo persistence could not be proven safe; runtime stopped: {error}{detail}"
+                                            ),
+                                            http_status: None,
+                                            code: None,
+                                        },
+                                    ));
+                                }
                                 resources = Some(runtime);
-                                let _ = done.send(Err(RuntimeError::ReconfigureFailed(error)));
+                                let _ = done.send(Err(RuntimeError::ReconfigureFailed(
+                                    error.to_string(),
+                                )));
                                 continue;
                             }
                         };
@@ -3163,14 +3431,37 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::Reconfiguring {
                             operation: ReconfigureKind::Undo,
                         });
-                        let _ = stop_current_agent(
+                        let stop_report = stop_current_agent(
                             &mut agent,
                             &mut compactions,
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
+                        if let Some(error) = fail_close_after_stopped_persistence(
+                            &stop_report,
+                            Some(&runtime),
+                            &mut goal,
+                            &mut loop_state,
+                            &mut pending_wakeup,
+                            &mut held_turn,
+                            &mut active_turn,
+                            &mut terminal_reason,
+                            &mut turn_stats,
+                            &mut conversation_revision,
+                            &mut snapshot_waiters,
+                            &mut agent_available,
+                            controls.state.as_ref(),
+                            generation,
+                            &runtime_event_tx,
+                        ) {
+                            persistence_failure = stop_report.persistence_failure.clone();
+                            resources = Some(runtime);
+                            let _ = done.send(Err(error));
+                            continue;
+                        }
                         match assemble_runtime_resources(&mut runtime) {
                             Ok(replacement) => {
                                 agent = Some(replacement);
@@ -3201,35 +3492,63 @@ fn spawn_runtime_owner_with_optional_agent(
                             Err(candidate_error) => {
                                 let restore_error = restore_runtime_undo(
                                     &mut runtime,
+                                    &truncated,
                                     original.as_ref(),
                                     undo_sidecars,
                                 )
                                 .err();
-                                match assemble_runtime_resources(&mut runtime) {
-                                    Ok(rollback) => {
-                                        agent = Some(rollback);
-                                        agent_available = true;
-                                        controls.state.store(
-                                            runtime_phase_state(generation, RuntimePhase::Ready),
-                                            Ordering::Release,
-                                        );
-                                    }
-                                    Err(rollback_error) => {
-                                        agent = None;
-                                        agent_available = false;
-                                        controls.state.store(
-                                            runtime_phase_state(generation, RuntimePhase::Failed),
-                                            Ordering::Release,
-                                        );
-                                        let _ = runtime_event_tx.send(
-                                            CodingRuntimeEvent::Agent(AgentEvent::Error {
-                                                message: format!(
-                                                    "undo rollback failed: {rollback_error}"
+                                if let Some(error) = restore_error.as_ref() {
+                                    persistence_failure = Some(format!(
+                                        "undo rollback persistence failed: {error}"
+                                    ));
+                                    agent = None;
+                                    agent_available = false;
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::Failed),
+                                        Ordering::Release,
+                                    );
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
+                                        AgentEvent::Error {
+                                            message: format!(
+                                                "undo rollback persistence failed; runtime stopped: {error}"
+                                            ),
+                                            http_status: None,
+                                            code: None,
+                                        },
+                                    ));
+                                } else {
+                                    match assemble_runtime_resources(&mut runtime) {
+                                        Ok(rollback) => {
+                                            agent = Some(rollback);
+                                            agent_available = true;
+                                            controls.state.store(
+                                                runtime_phase_state(
+                                                    generation,
+                                                    RuntimePhase::Ready,
                                                 ),
-                                                http_status: None,
-                                                code: None,
-                                            }),
-                                        );
+                                                Ordering::Release,
+                                            );
+                                        }
+                                        Err(rollback_error) => {
+                                            agent = None;
+                                            agent_available = false;
+                                            controls.state.store(
+                                                runtime_phase_state(
+                                                    generation,
+                                                    RuntimePhase::Failed,
+                                                ),
+                                                Ordering::Release,
+                                            );
+                                            let _ = runtime_event_tx.send(
+                                                CodingRuntimeEvent::Agent(AgentEvent::Error {
+                                                    message: format!(
+                                                        "undo rollback failed: {rollback_error}"
+                                                    ),
+                                                    http_status: None,
+                                                    code: None,
+                                                }),
+                                            );
+                                        }
                                     }
                                 }
                                 resources = Some(runtime);
@@ -3273,6 +3592,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
                         finish_stopped_native_turn(
@@ -3281,17 +3601,46 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut active_turn,
                             &mut terminal_reason,
                             &mut turn_stats,
+                            &mut conversation_revision,
                             &mut snapshot_waiters,
                             &runtime_event_tx,
                         );
-                        let original = current_runtime_snapshot(&runtime)
-                            .or_else(|| stop_report.snapshot.clone());
+                        if let Some(error) = fail_close_after_stopped_persistence(
+                            &stop_report,
+                            Some(&runtime),
+                            &mut goal,
+                            &mut loop_state,
+                            &mut pending_wakeup,
+                            &mut held_turn,
+                            &mut active_turn,
+                            &mut terminal_reason,
+                            &mut turn_stats,
+                            &mut conversation_revision,
+                            &mut snapshot_waiters,
+                            &mut agent_available,
+                            controls.state.as_ref(),
+                            generation,
+                            &runtime_event_tx,
+                        ) {
+                            persistence_failure = stop_report.persistence_failure.clone();
+                            resources = Some(runtime);
+                            let _ = done.send(Err(error));
+                            continue;
+                        }
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
-                        let persisted = persist_runtime_undo(&mut runtime, &snapshot);
-                        let candidate = persisted
-                            .as_ref()
-                            .map_err(|error| error.clone())
-                            .and_then(|_| assemble_runtime_resources(&mut runtime));
+                        let original = current_runtime_snapshot(&runtime)
+                            .or_else(|| stop_report.snapshot.clone())
+                            .or_else(|| runtime.parts.runtime_resume_snapshot());
+                        let persisted = persist_runtime_undo(
+                            &mut runtime,
+                            original.as_ref(),
+                            &snapshot,
+                        );
+                        let candidate = match persisted.as_ref() {
+                            Ok(_) => assemble_runtime_resources(&mut runtime)
+                                .map_err(NativePersistenceError::certain),
+                            Err(error) => Err(error.clone()),
+                        };
                         match candidate {
                             Ok(replacement) => {
                                 agent = Some(replacement);
@@ -3317,39 +3666,74 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let _ = done.send(Ok(changed));
                             }
                             Err(candidate_error) => {
-                                let restore_error = original.as_ref().and_then(|original| {
-                                    restore_runtime_undo(
-                                        &mut runtime,
-                                        original,
-                                        persisted.ok().flatten(),
-                                    )
-                                    .err()
-                                });
-                                match assemble_runtime_resources(&mut runtime) {
-                                    Ok(rollback) => {
-                                        agent = Some(rollback);
-                                        agent_available = true;
-                                        controls.state.store(
-                                            runtime_phase_state(generation, RuntimePhase::Ready),
-                                            Ordering::Release,
-                                        );
-                                    }
-                                    Err(rollback_error) => {
-                                        agent = None;
-                                        agent_available = false;
-                                        controls.state.store(
-                                            runtime_phase_state(generation, RuntimePhase::Failed),
-                                            Ordering::Release,
-                                        );
-                                        let _ = runtime_event_tx.send(
-                                            CodingRuntimeEvent::Agent(AgentEvent::Error {
-                                                message: format!(
-                                                    "conversation restore rollback failed: {rollback_error}"
+                                let persistence_succeeded = persisted.is_ok();
+                                let restore_error = if persistence_succeeded {
+                                    original.as_ref().and_then(|original| {
+                                        restore_runtime_undo(
+                                            &mut runtime,
+                                            &snapshot,
+                                            original,
+                                            persisted.ok().flatten(),
+                                        )
+                                        .err()
+                                    })
+                                } else {
+                                    None
+                                };
+                                let fail_close_reason = persistence_fail_close_reason(
+                                    &candidate_error,
+                                    restore_error.as_ref(),
+                                );
+                                if let Some(reason) = fail_close_reason {
+                                    persistence_failure = Some(reason.clone());
+                                    agent = None;
+                                    agent_available = false;
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::Failed),
+                                        Ordering::Release,
+                                    );
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
+                                        AgentEvent::Error {
+                                            message: format!(
+                                                "conversation restore persistence failed; runtime stopped: {reason}"
+                                            ),
+                                            http_status: None,
+                                            code: None,
+                                        },
+                                    ));
+                                } else {
+                                    match assemble_runtime_resources(&mut runtime) {
+                                        Ok(rollback) => {
+                                            agent = Some(rollback);
+                                            agent_available = true;
+                                            controls.state.store(
+                                                runtime_phase_state(
+                                                    generation,
+                                                    RuntimePhase::Ready,
                                                 ),
-                                                http_status: None,
-                                                code: None,
-                                            }),
-                                        );
+                                                Ordering::Release,
+                                            );
+                                        }
+                                        Err(rollback_error) => {
+                                            agent = None;
+                                            agent_available = false;
+                                            controls.state.store(
+                                                runtime_phase_state(
+                                                    generation,
+                                                    RuntimePhase::Failed,
+                                                ),
+                                                Ordering::Release,
+                                            );
+                                            let _ = runtime_event_tx.send(
+                                                CodingRuntimeEvent::Agent(AgentEvent::Error {
+                                                    message: format!(
+                                                        "conversation restore rollback failed: {rollback_error}"
+                                                    ),
+                                                    http_status: None,
+                                                    code: None,
+                                                }),
+                                            );
+                                        }
                                     }
                                 }
                                 resources = Some(runtime);
@@ -3504,6 +3888,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeShutdown,
+                            resources
+                                .as_ref()
+                                .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
                         )
                         .await;
                         forced_shutdown = stop_report.forced;
@@ -3514,10 +3901,28 @@ fn spawn_runtime_owner_with_optional_agent(
                                 &mut active_turn,
                                 &mut terminal_reason,
                                 &mut turn_stats,
+                                &mut conversation_revision,
                                 &mut snapshot_waiters,
                                 &runtime_event_tx,
                             );
                         }
+                        let _ = fail_close_after_stopped_persistence(
+                            &stop_report,
+                            resources.as_ref(),
+                            &mut goal,
+                            &mut loop_state,
+                            &mut pending_wakeup,
+                            &mut held_turn,
+                            &mut active_turn,
+                            &mut terminal_reason,
+                            &mut turn_stats,
+                            &mut conversation_revision,
+                            &mut snapshot_waiters,
+                            &mut agent_available,
+                            controls.state.as_ref(),
+                            generation,
+                            &runtime_event_tx,
+                        );
                         interrupt_queued_controls(
                             &mut controls,
                             &runtime_event_tx,
@@ -3536,12 +3941,111 @@ fn spawn_runtime_owner_with_optional_agent(
                     None => break,
                 },
                 event = receive_agent_event(&mut agent) => match event {
-                    Some(event) => match handle_compaction_event(
-                        event,
-                        &mut compactions,
-                        &mut observed_tokens,
-                        &runtime_event_tx,
-                    ) {
+                    Some(event) => {
+                        if let AgentEvent::Compacted {
+                            committed: true,
+                            snapshot: Some(snapshot),
+                            ..
+                        } = &event
+                        {
+                            if let Some(runtime) = resources.as_mut() {
+                                if runtime.parts.session.is_none() {
+                                    runtime.parts.set_runtime_resume(snapshot.clone());
+                                }
+                            }
+                        }
+                        if matches!(
+                            &event,
+                            AgentEvent::Compacted {
+                                committed: true,
+                                ..
+                            }
+                        ) {
+                            conversation_revision = conversation_revision.wrapping_add(1);
+                        }
+                        let uncertain_compaction = matches!(
+                            &event,
+                            AgentEvent::CompactionFailed { .. }
+                        )
+                        .then(|| {
+                            resources.as_ref().and_then(|runtime| {
+                                runtime.parts.take_snapshot_persistence_uncertain()
+                            })
+                        })
+                        .flatten();
+                        let event = handle_compaction_event(
+                            event,
+                            &mut compactions,
+                            &mut observed_tokens,
+                            &runtime_event_tx,
+                        );
+                        if let Some(error) = uncertain_compaction {
+                            persistence_failure = Some(error.clone());
+                            let message = format!(
+                                "compaction persistence became uncertain; runtime stopped: {error}"
+                            );
+                            pending_requests.clear();
+                            pending_wakeup = None;
+                            terminal_reason = None;
+                            held_turn = None;
+                            if let Some(mut state) = goal.take() {
+                                state.cancel.cancel();
+                                state.active = false;
+                                state.last_reason = Some(
+                                    "ended: compaction persistence became uncertain".into(),
+                                );
+                                let _ = runtime_event_tx
+                                    .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            }
+                            if let Some(mut state) = loop_state.take() {
+                                state.cancel.cancel();
+                                state.active = false;
+                                state.last_reason = Some(
+                                    "ended: compaction persistence became uncertain".into(),
+                                );
+                                let _ = runtime_event_tx
+                                    .send(CodingRuntimeEvent::LoopChanged(state.progress()));
+                            }
+                            if let Some(runtime) = resources.as_ref() {
+                                runtime.loop_active.store(false, Ordering::Release);
+                            }
+                            for waiter in snapshot_waiters.drain(..) {
+                                let _ = waiter.send(Err(RuntimeError::SnapshotUnavailable(
+                                    message.clone(),
+                                )));
+                            }
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
+                                AgentEvent::Error {
+                                    message: message.clone(),
+                                    http_status: None,
+                                    code: None,
+                                },
+                            ));
+                            if let Some(turn_id) = active_turn.take() {
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::TurnFinished(
+                                        TurnCompletion::SnapshotUnavailable {
+                                            turn_id,
+                                            reason: StopReason::ProviderError,
+                                            error: RuntimeSnapshotError { message },
+                                            stats: std::mem::take(&mut turn_stats),
+                                        },
+                                    ),
+                                );
+                            } else {
+                                turn_stats = RuntimeTurnStats::default();
+                            }
+                            snapshot_in_flight = false;
+                            let _ = send_agent_command(&agent, AgentCommand::Shutdown);
+                            agent = None;
+                            agent_available = false;
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::Failed),
+                                Ordering::Release,
+                            );
+                            continue;
+                        }
+                        match event {
                         Some(event) if native_protocol => match event {
                             AgentEvent::Usage(meta) => {
                                 observed_tokens = Some(meta.used_tokens as usize);
@@ -3577,12 +4081,108 @@ fn spawn_runtime_owner_with_optional_agent(
                                     .take()
                                     .map(|started| started.elapsed())
                                     .unwrap_or_default();
+                                if let Some(error) = resources.as_ref().and_then(|runtime| {
+                                    runtime.parts.take_snapshot_persistence_uncertain()
+                                }) {
+                                    persistence_failure = Some(error.clone());
+                                    let turn_id = active_turn.take().unwrap_or_default();
+                                    terminal_reason = None;
+                                    pending_requests.clear();
+                                    pending_wakeup = None;
+                                    if let Some(mut state) = goal.take() {
+                                        state.cancel.cancel();
+                                        state.active = false;
+                                        state.last_reason = Some(
+                                            "ended: session persistence became uncertain".into(),
+                                        );
+                                        let _ = runtime_event_tx.send(
+                                            CodingRuntimeEvent::GoalChanged(state.progress()),
+                                        );
+                                    }
+                                    if let Some(mut state) = loop_state.take() {
+                                        state.cancel.cancel();
+                                        state.active = false;
+                                        state.last_reason = Some(
+                                            "ended: session persistence became uncertain".into(),
+                                        );
+                                        let _ = runtime_event_tx.send(
+                                            CodingRuntimeEvent::LoopChanged(state.progress()),
+                                        );
+                                    }
+                                    if let Some(runtime) = resources.as_ref() {
+                                        runtime.loop_active.store(false, Ordering::Release);
+                                    }
+                                    let message = format!(
+                                        "session persistence became uncertain; runtime stopped: {error}"
+                                    );
+                                    for waiter in snapshot_waiters.drain(..) {
+                                        let _ = waiter.send(Err(RuntimeError::SnapshotUnavailable(
+                                            message.clone(),
+                                        )));
+                                    }
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
+                                        AgentEvent::Error {
+                                            message: message.clone(),
+                                            http_status: None,
+                                            code: None,
+                                        },
+                                    ));
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::TurnFinished(
+                                            TurnCompletion::SnapshotUnavailable {
+                                                turn_id,
+                                                reason: StopReason::ProviderError,
+                                                error: RuntimeSnapshotError { message },
+                                                stats: std::mem::take(&mut turn_stats),
+                                            },
+                                        ),
+                                    );
+                                    snapshot_in_flight = false;
+                                    let _ = send_agent_command(&agent, AgentCommand::Shutdown);
+                                    agent = None;
+                                    agent_available = false;
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::Failed),
+                                        Ordering::Release,
+                                    );
+                                    continue;
+                                }
                                 terminal_reason = Some(reason);
                                 if !snapshot_in_flight {
                                     if send_agent_command(&agent, AgentCommand::Snapshot) {
                                         snapshot_in_flight = true;
                                     } else {
                                         let turn_id = active_turn.take().unwrap_or_default();
+                                        terminal_reason = None;
+                                        pending_requests.clear();
+                                        pending_wakeup = None;
+                                        if let Some(mut state) = goal.take() {
+                                            state.cancel.cancel();
+                                            state.active = false;
+                                            state.last_reason = Some(
+                                                "ended: kernel snapshot command delivery failed"
+                                                    .into(),
+                                            );
+                                            let _ = runtime_event_tx.send(
+                                                CodingRuntimeEvent::GoalChanged(state.progress()),
+                                            );
+                                        }
+                                        if let Some(mut state) = loop_state.take() {
+                                            state.cancel.cancel();
+                                            state.active = false;
+                                            state.last_reason = Some(
+                                                "ended: kernel snapshot command delivery failed"
+                                                    .into(),
+                                            );
+                                            let _ = runtime_event_tx.send(
+                                                CodingRuntimeEvent::LoopChanged(state.progress()),
+                                            );
+                                        }
+                                        if let Some(runtime) = resources.as_ref() {
+                                            runtime
+                                                .loop_active
+                                                .store(false, Ordering::Release);
+                                        }
                                         let error = RuntimeSnapshotError {
                                             message: "kernel snapshot command delivery failed".into(),
                                         };
@@ -3597,7 +4197,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             CodingRuntimeEvent::TurnFinished(
                                                 TurnCompletion::SnapshotUnavailable {
                                                     turn_id,
-                                                    reason,
+                                                    reason: StopReason::ProviderError,
                                                     error,
                                                     stats,
                                                 },
@@ -3616,14 +4216,32 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             AgentEvent::Snapshot { snapshot } => {
                                 snapshot_in_flight = false;
+                                if terminal_reason.is_some() {
+                                    conversation_revision = conversation_revision.wrapping_add(1);
+                                }
+                                if let Some(runtime) = resources.as_mut() {
+                                    if runtime.parts.session.is_none() {
+                                        runtime.parts.set_runtime_resume(snapshot.clone());
+                                    }
+                                }
                                 let snapshot = Arc::new(snapshot);
+                                let undo_snapshot = resources
+                                    .as_ref()
+                                    .and_then(current_runtime_snapshot)
+                                    .map(Arc::new)
+                                    .unwrap_or_else(|| snapshot.clone());
                                 for waiter in snapshot_waiters.drain(..) {
-                                    let _ = waiter.send(Ok(snapshot.clone()));
+                                    let _ = waiter.send(Ok(RuntimeSnapshotReceipt {
+                                        snapshot: snapshot.clone(),
+                                        undo_snapshot: undo_snapshot.clone(),
+                                        revision: conversation_revision,
+                                    }));
                                 }
                                 if let Some(reason) = terminal_reason.take() {
                                     pending_requests.clear();
                                     let stats = std::mem::take(&mut turn_stats);
                                     let turn_id = active_turn.unwrap_or_default();
+                                    let mut completion_reason = reason;
                                     if reason != StopReason::Cancelled && !ai_name_attempted {
                                         if let Some(conversation) =
                                             crate::session_title::first_exchange_text(&snapshot.messages)
@@ -3681,11 +4299,24 @@ fn spawn_runtime_owner_with_optional_agent(
                                             );
                                         }
                                         let stop_reason = state.cap_reached();
-                                        let evaluate = matches!(reason, StopReason::Stopped | StopReason::MaxContinuations);
-                                        let recoverable = matches!(reason, StopReason::Timeout | StopReason::ProviderError | StopReason::MaxRounds);
+                                        let evaluate = matches!(
+                                            reason,
+                                            StopReason::Stopped
+                                                | StopReason::MaxContinuations
+                                                | StopReason::MaxRounds
+                                        );
+                                        let recoverable = matches!(
+                                            reason,
+                                            StopReason::Timeout | StopReason::ProviderError
+                                        );
                                         if let Some(why) = stop_reason {
                                             state.active = false;
                                             state.last_reason = Some(format!("stopped: {why}"));
+                                            completion_reason = match why {
+                                                "round limit" => StopReason::MaxRounds,
+                                                "time limit" => StopReason::Timeout,
+                                                _ => StopReason::ProviderError,
+                                            };
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal stopped: {why} — goal not met; run /goal again to continue")));
                                         } else if evaluate {
@@ -3727,7 +4358,10 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     &state.condition,
                                                 );
                                                 held_turn = None;
-                                                if send_agent_command(&agent, AgentCommand::SendMessage { text, images: vec![] }) {
+                                                if send_agent_command(
+                                                    &agent,
+                                                    AgentCommand::SendSyntheticMessage { text },
+                                                ) {
                                                     let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                                     continue;
                                                 }
@@ -3745,7 +4379,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     CodingRuntimeEvent::TurnFinished(
                                                         TurnCompletion::Completed {
                                                             turn_id,
-                                                            reason,
+                                                            reason: StopReason::ProviderError,
                                                             snapshot,
                                                             stats,
                                                         },
@@ -3762,6 +4396,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             } else {
                                                 state.active = false;
                                                 state.last_reason = Some("stopped: too many failed rounds".into());
+                                                completion_reason = StopReason::ProviderError;
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("goal stopped: too many failed rounds".into()));
                                             }
@@ -3790,6 +4425,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             state.active = false;
                                             state.last_reason = Some("completed".into());
                                         } else {
+                                            pending_wakeup = None;
                                             state.active = false;
                                             state.last_reason = Some(format!("ended: {reason:?}"));
                                         }
@@ -3803,7 +4439,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         CodingRuntimeEvent::TurnFinished(
                                             TurnCompletion::Completed {
                                                 turn_id,
-                                                reason,
+                                                reason: completion_reason,
                                                 snapshot,
                                                 stats,
                                             },
@@ -3847,7 +4483,8 @@ fn spawn_runtime_owner_with_optional_agent(
                                 break;
                             }
                         }
-                        None => {}
+                            None => {}
+                        }
                     },
                     None => {
                         if native_protocol {
@@ -3855,6 +4492,24 @@ fn spawn_runtime_owner_with_optional_agent(
                             let unavailable = RuntimeError::SnapshotUnavailable(message.into());
                             for waiter in snapshot_waiters.drain(..) {
                                 let _ = waiter.send(Err(unavailable.clone()));
+                            }
+                            let _ = pending_wakeup.take();
+                            if let Some(mut state) = goal.take() {
+                                state.cancel.cancel();
+                                state.active = false;
+                                state.last_reason = Some("ended: kernel event stream closed".into());
+                                let _ = runtime_event_tx
+                                    .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            }
+                            if let Some(mut state) = loop_state.take() {
+                                state.cancel.cancel();
+                                state.active = false;
+                                state.last_reason = Some("ended: kernel event stream closed".into());
+                                let _ = runtime_event_tx
+                                    .send(CodingRuntimeEvent::LoopChanged(state.progress()));
+                            }
+                            if let Some(runtime) = resources.as_ref() {
+                                runtime.loop_active.store(false, Ordering::Release);
                             }
                             if let Some(turn_id) = active_turn.take() {
                                 let reason = terminal_reason
@@ -3892,15 +4547,39 @@ fn spawn_runtime_owner_with_optional_agent(
             CompactionInterruption::RuntimeShutdown,
         );
         if !shutdown_was_handled {
-            forced_shutdown = stop_current_agent(
+            let stop_report = stop_current_agent(
                 &mut agent,
                 &mut compactions,
                 &mut observed_tokens,
                 &runtime_event_tx,
                 CompactionInterruption::RuntimeShutdown,
+                resources
+                    .as_ref()
+                    .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
             )
-            .await
-            .forced;
+            .await;
+            forced_shutdown = stop_report.forced;
+            let _ = fail_close_after_stopped_persistence(
+                &stop_report,
+                resources.as_ref(),
+                &mut goal,
+                &mut loop_state,
+                &mut pending_wakeup,
+                &mut held_turn,
+                &mut active_turn,
+                &mut terminal_reason,
+                &mut turn_stats,
+                &mut conversation_revision,
+                &mut snapshot_waiters,
+                &mut agent_available,
+                controls.state.as_ref(),
+                generation,
+                &runtime_event_tx,
+            );
+            controls.state.store(
+                runtime_phase_state(generation, RuntimePhase::Stopped),
+                Ordering::Release,
+            );
         }
         // Release the active-session lease before publishing the shutdown terminal,
         // so a caller may safely start a replacement immediately after `shutdown`.
@@ -3939,47 +4618,53 @@ fn interrupt_queued_controls(
     // everything already accepted remains drainable here.
     controls.rx.close();
     while let Ok(control) = controls.rx.try_recv() {
-        match control {
-            CodingRuntimeControl::Compact { focus, .. } => emit_compaction_interrupted(
-                runtime_event_tx,
-                CompactTrigger::Manual { focus },
-                reason,
-            ),
-            CodingRuntimeControl::Shutdown { .. } => {}
-            CodingRuntimeControl::Submit { done, .. } => {
-                let _ = done.send(Err(RuntimeError::Unavailable));
-            }
-            CodingRuntimeControl::Respond { done, .. }
-            | CodingRuntimeControl::Cancel { done, .. }
-            | CodingRuntimeControl::SetMode { done, .. }
-            | CodingRuntimeControl::QueueLocalContext { done, .. } => {
-                let _ = done.send(Err(RuntimeError::Unavailable));
-            }
-            CodingRuntimeControl::Snapshot { done, .. } => {
-                let _ = done.send(Err(RuntimeError::Unavailable));
-            }
-            CodingRuntimeControl::ContextStats { done, .. } => {
-                let _ = done.send(Err(RuntimeError::Unavailable));
-            }
-            CodingRuntimeControl::ReassembleProvider { done, .. }
-            | CodingRuntimeControl::DeactivateProvider { done, .. } => {
-                let _ = done.send(Err(RuntimeError::Unavailable));
-            }
-            CodingRuntimeControl::Reprepare { done, .. } => {
-                let _ = done.send(Err(RuntimeError::Unavailable));
-            }
-            CodingRuntimeControl::ApplyUndo { done, .. } => {
-                let _ = done.send(Err(RuntimeError::Unavailable));
-            }
-            CodingRuntimeControl::RestoreSnapshot { done, .. } => {
-                let _ = done.send(Err(RuntimeError::Unavailable));
-            }
-            CodingRuntimeControl::StartGoal { done, .. }
-            | CodingRuntimeControl::StopGoal { done, .. }
-            | CodingRuntimeControl::StartLoop { done, .. }
-            | CodingRuntimeControl::StopLoop { done, .. } => {
-                let _ = done.send(Err(RuntimeError::Unavailable));
-            }
+        reject_runtime_control(control, runtime_event_tx, reason);
+    }
+}
+
+fn reject_runtime_control(
+    control: CodingRuntimeControl,
+    runtime_event_tx: &RuntimeEventEmitter,
+    reason: CompactionInterruption,
+) {
+    match control {
+        CodingRuntimeControl::Compact { focus, .. } => {
+            emit_compaction_interrupted(runtime_event_tx, CompactTrigger::Manual { focus }, reason)
+        }
+        CodingRuntimeControl::Shutdown { .. } => {}
+        CodingRuntimeControl::Submit { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::Respond { done, .. }
+        | CodingRuntimeControl::Cancel { done, .. }
+        | CodingRuntimeControl::SetMode { done, .. }
+        | CodingRuntimeControl::QueueLocalContext { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::Snapshot { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::ContextStats { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::ReassembleProvider { done, .. }
+        | CodingRuntimeControl::DeactivateProvider { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::Reprepare { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::ApplyUndo { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::RestoreSnapshot { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::StartGoal { done, .. }
+        | CodingRuntimeControl::StopGoal { done, .. }
+        | CodingRuntimeControl::StartLoop { done, .. }
+        | CodingRuntimeControl::StopLoop { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
         }
     }
 }
@@ -4238,94 +4923,216 @@ fn session_changed(generation: u64, runtime: &RuntimeResources) -> SessionChange
 }
 
 struct NativeUndoSidecars {
-    meta: SessionMeta,
-    presentation: PresentationFile,
+    message_count: u32,
+    turn_count: u32,
+    turn_stats: Vec<TurnStat>,
+    removed_presentation: Vec<(usize, PresentationEntry)>,
+}
+
+#[derive(Clone, Debug)]
+struct NativePersistenceError {
+    message: String,
+    uncertain_commit: bool,
+    snapshot_conflict: bool,
+}
+
+impl NativePersistenceError {
+    fn certain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            uncertain_commit: false,
+            snapshot_conflict: false,
+        }
+    }
+
+    fn snapshot_conflict(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            uncertain_commit: false,
+            snapshot_conflict: true,
+        }
+    }
+
+    fn requires_fail_close(&self) -> bool {
+        self.uncertain_commit
+    }
+
+    fn is_snapshot_conflict(&self) -> bool {
+        self.snapshot_conflict
+    }
+}
+
+impl From<SessionStoreError> for NativePersistenceError {
+    fn from(error: SessionStoreError) -> Self {
+        let uncertain_commit = error.is_uncertain_commit();
+        Self {
+            message: error.to_string(),
+            uncertain_commit,
+            snapshot_conflict: false,
+        }
+    }
+}
+
+impl std::fmt::Display for NativePersistenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+fn persistence_fail_close_reason(
+    candidate_error: &NativePersistenceError,
+    restore_error: Option<&NativePersistenceError>,
+) -> Option<String> {
+    if candidate_error.requires_fail_close() {
+        Some(candidate_error.to_string())
+    } else {
+        restore_error.map(|error| format!("snapshot rollback persistence failed: {error}"))
+    }
 }
 
 fn persist_runtime_undo(
     runtime: &mut RuntimeResources,
+    expected_snapshot: Option<&SessionSnapshot>,
     snapshot: &SessionSnapshot,
-) -> Result<Option<NativeUndoSidecars>, String> {
+) -> Result<Option<NativeUndoSidecars>, NativePersistenceError> {
     let Some(binding) = runtime.parts.session.as_ref() else {
         runtime.parts.set_runtime_resume(snapshot.clone());
         return Ok(None);
     };
-    let original_meta = binding
+    let message_count = u32::try_from(snapshot.messages.len()).map_err(|_| {
+        NativePersistenceError::certain("snapshot message count exceeds native metadata")
+    })?;
+    let mut snapshot_conflict = false;
+    let sidecars = binding
         .manager
-        .read_meta(&binding.id)
-        .map_err(|error| error.to_string())?;
-    if original_meta.owner != StorageOwner::Native {
-        binding
-            .manager
-            .save_snapshot(&binding.id, snapshot)
-            .map_err(|error| error.to_string())?;
-        return Ok(None);
-    }
-    let original_presentation = match binding.manager.read_presentation(&binding.id) {
-        Ok(presentation) => presentation,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => PresentationFile::default(),
-        Err(error) => return Err(error.to_string()),
-    };
-    let mut meta = original_meta.clone();
-    meta.turn_stats
-        .retain(|stat| !stat.position_valid || stat.after_message <= snapshot.messages.len());
-    let surviving_turn_ids: BTreeSet<_> = meta
-        .turn_stats
-        .iter()
-        .filter_map(|stat| {
-            (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
-        })
-        .collect();
-    let mut presentation = original_presentation.clone();
-    presentation.retain_turns(&surviving_turn_ids);
-    meta.message_count = u32::try_from(snapshot.messages.len())
-        .map_err(|_| "snapshot message count exceeds native metadata".to_string())?;
-    meta.turn_count = u32::try_from(meta.turn_stats.len())
-        .map_err(|_| "turn count exceeds native metadata".to_string())?;
-    meta.updated_at = atomcode_capabilities::session::now_ms();
-    binding
-        .manager
-        .commit_native_runtime_mutation(&binding.lease, snapshot, &presentation, &meta)
-        .map_err(|error| error.to_string())?;
-    Ok(Some(NativeUndoSidecars {
-        meta: original_meta,
-        presentation: original_presentation,
-    }))
+        .commit_native_runtime_mutation(
+            &binding.lease,
+            snapshot,
+            |current_snapshot, meta, presentation| {
+                if expected_snapshot.is_some_and(|expected| current_snapshot != expected) {
+                    snapshot_conflict = true;
+                    return Err(SessionStoreError::Corrupt {
+                        kind: "session mutation conflict",
+                        message: "canonical snapshot changed before undo commit".into(),
+                    });
+                }
+                let mut sidecars = NativeUndoSidecars {
+                    message_count: meta.message_count,
+                    turn_count: meta.turn_count,
+                    turn_stats: meta.turn_stats.clone(),
+                    removed_presentation: Vec::new(),
+                };
+                meta.turn_stats.retain(|stat| {
+                    !stat.position_valid || stat.after_message <= snapshot.messages.len()
+                });
+                let surviving_turn_ids: BTreeSet<_> = meta
+                    .turn_stats
+                    .iter()
+                    .filter_map(|stat| {
+                        (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
+                    })
+                    .collect();
+                let original_entries = std::mem::take(&mut presentation.entries);
+                for (index, entry) in original_entries.into_iter().enumerate() {
+                    let keep = match entry.anchor {
+                        DisplayAnchor::AtStart => true,
+                        DisplayAnchor::AfterTurn { turn_id } => {
+                            surviving_turn_ids.contains(&turn_id)
+                        }
+                    };
+                    if keep {
+                        presentation.entries.push(entry);
+                    } else {
+                        sidecars.removed_presentation.push((index, entry));
+                    }
+                }
+                meta.message_count = message_count;
+                meta.turn_count = u32::try_from(meta.turn_stats.len()).map_err(|_| {
+                    SessionStoreError::Corrupt {
+                        kind: "session mutation",
+                        message: "turn count exceeds native metadata".into(),
+                    }
+                })?;
+                meta.updated_at = atomcode_capabilities::session::now_ms();
+                Ok(sidecars)
+            },
+        )
+        .map_err(|error| {
+            if snapshot_conflict {
+                NativePersistenceError::snapshot_conflict(error.to_string())
+            } else {
+                NativePersistenceError::from(error)
+            }
+        })?;
+    Ok(Some(sidecars))
 }
 
 fn restore_runtime_undo(
     runtime: &mut RuntimeResources,
+    expected_current_snapshot: &SessionSnapshot,
     snapshot: &SessionSnapshot,
     sidecars: Option<NativeUndoSidecars>,
-) -> Result<(), String> {
+) -> Result<(), NativePersistenceError> {
     let Some(sidecars) = sidecars else {
         return persist_runtime_snapshot(runtime, snapshot);
     };
-    let binding = runtime
-        .parts
-        .session
-        .as_ref()
-        .ok_or_else(|| "native undo rollback lost its session binding".to_string())?;
+    let binding = runtime.parts.session.as_ref().ok_or_else(|| {
+        NativePersistenceError::certain("native undo rollback lost its session binding")
+    })?;
+    let NativeUndoSidecars {
+        message_count,
+        turn_count,
+        turn_stats,
+        removed_presentation,
+    } = sidecars;
+    let mut snapshot_conflict = false;
     binding
         .manager
         .commit_native_runtime_mutation(
             &binding.lease,
             snapshot,
-            &sidecars.presentation,
-            &sidecars.meta,
+            |current_snapshot, meta, presentation| {
+                if current_snapshot != expected_current_snapshot {
+                    snapshot_conflict = true;
+                    return Err(SessionStoreError::Corrupt {
+                        kind: "session mutation conflict",
+                        message: "canonical snapshot changed before undo rollback".into(),
+                    });
+                }
+                meta.message_count = message_count;
+                meta.turn_count = turn_count;
+                meta.turn_stats = turn_stats;
+                for (original_index, entry) in removed_presentation {
+                    presentation
+                        .entries
+                        .insert(original_index.min(presentation.entries.len()), entry);
+                }
+                meta.updated_at = atomcode_capabilities::session::now_ms();
+                Ok(())
+            },
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            if snapshot_conflict {
+                NativePersistenceError::snapshot_conflict(error.to_string())
+            } else {
+                NativePersistenceError::from(error)
+            }
+        })
 }
 
 fn persist_runtime_snapshot(
     runtime: &mut RuntimeResources,
     snapshot: &SessionSnapshot,
-) -> Result<(), String> {
+) -> Result<(), NativePersistenceError> {
     if let Some(binding) = runtime.parts.session.as_ref() {
         binding
             .manager
-            .save_snapshot(&binding.id, snapshot)
-            .map_err(|error| error.to_string())
+            .commit_native_runtime_mutation(
+                &binding.lease,
+                snapshot,
+                |_current_snapshot, _meta, _presentation| Ok(()),
+            )
+            .map_err(NativePersistenceError::from)
     } else {
         runtime.parts.set_runtime_resume(snapshot.clone());
         Ok(())
@@ -4335,6 +5142,15 @@ fn persist_runtime_snapshot(
 fn current_runtime_snapshot(runtime: &RuntimeResources) -> Option<SessionSnapshot> {
     let binding = runtime.parts.session.as_ref()?;
     binding.manager.load_snapshot(&binding.id).ok()
+}
+
+fn native_session_health_error(runtime: &RuntimeResources) -> Option<String> {
+    let binding = runtime.parts.session.as_ref()?;
+    binding
+        .manager
+        .load_native_session(&binding.id)
+        .err()
+        .map(|error| error.to_string())
 }
 
 struct RuntimeUndoPlan {
@@ -4447,6 +5263,25 @@ struct StopReport {
     forced: bool,
     reason: Option<StopReason>,
     snapshot: Option<SessionSnapshot>,
+    conversation_changed: bool,
+    persistence_failure: Option<String>,
+}
+
+fn record_stopped_conversation_event(report: &mut StopReport, event: &AgentEvent) {
+    match event {
+        AgentEvent::TurnComplete { .. } => report.conversation_changed = true,
+        AgentEvent::Compacted {
+            committed: true,
+            snapshot,
+            ..
+        } => {
+            report.conversation_changed = true;
+            if let Some(snapshot) = snapshot {
+                report.snapshot = Some(snapshot.clone());
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn stop_current_agent(
@@ -4455,10 +5290,15 @@ async fn stop_current_agent(
     observed_tokens: &mut Option<usize>,
     runtime_event_tx: &RuntimeEventEmitter,
     reason: CompactionInterruption,
+    persistence_status: Option<SnapshotPersistenceStatus>,
 ) -> StopReport {
     let Some(mut agent) = agent.take() else {
         compactions.interrupt_all(reason, runtime_event_tx);
-        return StopReport::default();
+        return StopReport {
+            persistence_failure: persistence_status
+                .and_then(|status| status.take_uncertain_commit()),
+            ..StopReport::default()
+        };
     };
     let _ = agent.commands.send(AgentCommand::Shutdown);
     let timeout = tokio::time::sleep(std::time::Duration::from_secs(5));
@@ -4473,6 +5313,7 @@ async fn stop_current_agent(
             }
             event = agent.events.recv(), if events_open => match event {
                 Some(event) => {
+                    record_stopped_conversation_event(&mut report, &event);
                     match handle_compaction_event(
                         event,
                         compactions,
@@ -4503,6 +5344,7 @@ async fn stop_current_agent(
     }
 
     while let Ok(event) = agent.events.try_recv() {
+        record_stopped_conversation_event(&mut report, &event);
         match handle_compaction_event(event, compactions, observed_tokens, runtime_event_tx) {
             Some(AgentEvent::Usage(meta)) => {
                 *observed_tokens = Some(meta.used_tokens as usize);
@@ -4513,6 +5355,8 @@ async fn stop_current_agent(
         }
     }
     compactions.interrupt_all(reason, runtime_event_tx);
+    report.persistence_failure =
+        persistence_status.and_then(|status| status.take_uncertain_commit());
     report
 }
 
@@ -4522,17 +5366,49 @@ fn finish_stopped_native_turn(
     active_turn: &mut Option<u64>,
     terminal_reason: &mut Option<StopReason>,
     turn_stats: &mut RuntimeTurnStats,
-    snapshot_waiters: &mut Vec<oneshot::Sender<Result<Arc<SessionSnapshot>, RuntimeError>>>,
+    conversation_revision: &mut u64,
+    snapshot_waiters: &mut Vec<RuntimeSnapshotWaiter>,
     runtime_event_tx: &RuntimeEventEmitter,
 ) {
+    if report.conversation_changed || active_turn.is_some() {
+        *conversation_revision = (*conversation_revision).wrapping_add(1);
+    }
+    if let Some(error) = report.persistence_failure.as_ref() {
+        let message = format!(
+            "session persistence became uncertain while stopping the current agent: {error}"
+        );
+        for waiter in snapshot_waiters.drain(..) {
+            let _ = waiter.send(Err(RuntimeError::SnapshotUnavailable(message.clone())));
+        }
+        if let Some(turn_id) = active_turn.take() {
+            let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
+                TurnCompletion::SnapshotUnavailable {
+                    turn_id,
+                    reason: StopReason::ProviderError,
+                    error: RuntimeSnapshotError { message },
+                    stats: std::mem::take(turn_stats),
+                },
+            ));
+        }
+        *terminal_reason = None;
+        return;
+    }
     let snapshot = report.snapshot.clone().or_else(|| {
         let binding = resources?.parts.session.as_ref()?;
         binding.manager.load_snapshot(&binding.id).ok()
     });
     if let Some(snapshot) = snapshot {
         let snapshot = Arc::new(snapshot);
+        let undo_snapshot = resources
+            .and_then(current_runtime_snapshot)
+            .map(Arc::new)
+            .unwrap_or_else(|| snapshot.clone());
         for waiter in snapshot_waiters.drain(..) {
-            let _ = waiter.send(Ok(snapshot.clone()));
+            let _ = waiter.send(Ok(RuntimeSnapshotReceipt {
+                snapshot: snapshot.clone(),
+                undo_snapshot: undo_snapshot.clone(),
+                revision: *conversation_revision,
+            }));
         }
         if let Some(turn_id) = active_turn.take() {
             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
@@ -4567,6 +5443,70 @@ fn finish_stopped_native_turn(
         }
     }
     *terminal_reason = None;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fail_close_after_stopped_persistence(
+    report: &StopReport,
+    resources: Option<&RuntimeResources>,
+    goal: &mut Option<GoalState>,
+    loop_state: &mut Option<LoopState>,
+    pending_wakeup: &mut Option<WakeupRequest>,
+    held_turn: &mut Option<(u64, StopReason, Arc<SessionSnapshot>, RuntimeTurnStats)>,
+    active_turn: &mut Option<u64>,
+    terminal_reason: &mut Option<StopReason>,
+    turn_stats: &mut RuntimeTurnStats,
+    conversation_revision: &mut u64,
+    snapshot_waiters: &mut Vec<RuntimeSnapshotWaiter>,
+    agent_available: &mut bool,
+    state: &AtomicU64,
+    generation: u64,
+    runtime_event_tx: &RuntimeEventEmitter,
+) -> Option<RuntimeError> {
+    let error = report.persistence_failure.as_ref()?;
+    finish_stopped_native_turn(
+        report,
+        resources,
+        active_turn,
+        terminal_reason,
+        turn_stats,
+        conversation_revision,
+        snapshot_waiters,
+        runtime_event_tx,
+    );
+    if let Some(mut current) = goal.take() {
+        current.cancel.cancel();
+        current.active = false;
+        current.last_reason = Some("ended: session persistence became uncertain".into());
+        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(current.progress()));
+    }
+    if let Some(mut current) = loop_state.take() {
+        current.cancel.cancel();
+        current.active = false;
+        current.last_reason = Some("ended: session persistence became uncertain".into());
+        let _ = runtime_event_tx.send(CodingRuntimeEvent::LoopChanged(current.progress()));
+    }
+    if let Some(runtime) = resources {
+        runtime.loop_active.store(false, Ordering::Release);
+    }
+    *pending_wakeup = None;
+    *held_turn = None;
+    *active_turn = None;
+    *terminal_reason = None;
+    *agent_available = false;
+    state.store(
+        runtime_phase_state(generation, RuntimePhase::Failed),
+        Ordering::Release,
+    );
+    let message = format!(
+        "session persistence became uncertain while stopping the current agent; runtime stopped: {error}"
+    );
+    let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(AgentEvent::Error {
+        message: message.clone(),
+        http_status: None,
+        code: None,
+    }));
+    Some(RuntimeError::ReconfigureFailed(message))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4678,10 +5618,19 @@ mod tests {
         builds: std::sync::atomic::AtomicUsize,
     }
 
+    struct FailSecondBuildFactory {
+        builds: std::sync::atomic::AtomicUsize,
+    }
+
     struct BlockAndFailSecondBuildFactory {
         builds: std::sync::atomic::AtomicUsize,
         entered: Arc<std::sync::Barrier>,
         release: Arc<std::sync::Barrier>,
+    }
+
+    struct DeletePresentationAndFailSecondBuildFactory {
+        builds: std::sync::atomic::AtomicUsize,
+        presentation_path: std::path::PathBuf,
     }
 
     impl CodingProviderFactory for RecoverableAuthFactory {
@@ -4723,6 +5672,27 @@ mod tests {
         }
     }
 
+    impl CodingProviderFactory for FailSecondBuildFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            if self.builds.fetch_add(1, Ordering::AcqRel) == 1 {
+                Err(crate::ProviderBuildError::Adapter(
+                    "candidate provider failed".into(),
+                ))
+            } else {
+                Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![
+                    vec![
+                        atomcode_kernel::stream::StreamEvent::TextDelta("answer".into()),
+                        atomcode_kernel::stream::StreamEvent::Done { truncated: false },
+                    ],
+                ])))
+            }
+        }
+    }
+
     impl CodingProviderFactory for BlockAndFailSecondBuildFactory {
         fn build(
             &self,
@@ -4741,6 +5711,28 @@ mod tests {
             self.release.wait();
             Err(crate::ProviderBuildError::Adapter(
                 "blocked candidate failed".into(),
+            ))
+        }
+    }
+
+    impl CodingProviderFactory for DeletePresentationAndFailSecondBuildFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            if self.builds.fetch_add(1, Ordering::AcqRel) == 0 {
+                return Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(
+                    vec![],
+                )));
+            }
+            std::fs::remove_file(&self.presentation_path).map_err(|error| {
+                crate::ProviderBuildError::Adapter(format!(
+                    "could not arrange rollback persistence failure: {error}"
+                ))
+            })?;
+            Err(crate::ProviderBuildError::Adapter(
+                "candidate provider failed after presentation removal".into(),
             ))
         }
     }
@@ -4811,6 +5803,13 @@ mod tests {
         builds: std::sync::atomic::AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct GoalNotMetProviderFactory {
+        builds: std::sync::atomic::AtomicUsize,
+    }
+
+    struct GoalMetProviderFactory;
+
     impl CodingProviderFactory for CountingProviderFactory {
         fn build(
             &self,
@@ -4821,6 +5820,39 @@ mod tests {
             Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(
                 Vec::new(),
             )))
+        }
+    }
+
+    impl CodingProviderFactory for GoalNotMetProviderFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![
+                vec![
+                    atomcode_kernel::stream::StreamEvent::TextDelta(
+                        "Verdict: no needs more work".into(),
+                    ),
+                    atomcode_kernel::stream::StreamEvent::Done { truncated: false },
+                ],
+            ])))
+        }
+    }
+
+    impl CodingProviderFactory for GoalMetProviderFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![
+                vec![
+                    atomcode_kernel::stream::StreamEvent::TextDelta("Verdict: yes goal met".into()),
+                    atomcode_kernel::stream::StreamEvent::Done { truncated: false },
+                ],
+            ])))
         }
     }
 
@@ -4963,6 +5995,26 @@ mod tests {
         }
     }
 
+    fn persist_native_session(
+        manager: &atomcode_capabilities::session::SessionManager,
+        id: &str,
+        working_dir: &std::path::Path,
+        snapshot: &SessionSnapshot,
+    ) {
+        let lease = manager.acquire_lease(id).unwrap();
+        let mut meta = SessionMeta::new(id, working_dir.to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = u32::try_from(snapshot.messages.len()).unwrap();
+        manager
+            .commit_native_import(
+                &lease,
+                Some(snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+    }
+
     async fn next_native_event(runtime: &mut CodingRuntime) -> CodingRuntimeEvent {
         tokio::time::timeout(std::time::Duration::from_secs(2), runtime.events.recv())
             .await
@@ -5020,11 +6072,1225 @@ mod tests {
         )
     }
 
+    async fn controller_test_runtime(
+        provider_factory: Arc<dyn CodingProviderFactory>,
+    ) -> (
+        CodingRuntimeHandle,
+        mpsc::UnboundedReceiver<AgentCommand>,
+        mpsc::UnboundedSender<AgentEvent>,
+        mpsc::UnboundedReceiver<CodingRuntimeEvent>,
+        mpsc::UnboundedSender<WakeupRequest>,
+        Arc<std::sync::atomic::AtomicBool>,
+        KernelRuntimeAdapter,
+    ) {
+        let config = native_start(false).agent;
+        controller_test_runtime_with_config(provider_factory, config).await
+    }
+
+    async fn controller_test_runtime_with_config(
+        provider_factory: Arc<dyn CodingProviderFactory>,
+        config: CodingAgentConfig,
+    ) -> (
+        CodingRuntimeHandle,
+        mpsc::UnboundedReceiver<AgentCommand>,
+        mpsc::UnboundedSender<AgentEvent>,
+        mpsc::UnboundedReceiver<CodingRuntimeEvent>,
+        mpsc::UnboundedSender<WakeupRequest>,
+        Arc<std::sync::atomic::AtomicBool>,
+        KernelRuntimeAdapter,
+    ) {
+        let (agent, kernel_commands, kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, runtime_events) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        let CodingRuntimeStart {
+            prepare,
+            plugin_hooks,
+            ..
+        } = native_start(false);
+        let parts =
+            prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
+                .await
+                .unwrap();
+        let loop_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let resources = RuntimeResources {
+            config,
+            prepare,
+            provider_factory,
+            plugin_hooks,
+            parts,
+            wakeup_tx: wakeup_tx.clone(),
+            loop_active: loop_active.clone(),
+            image_preprocessor: None,
+        };
+        let adapter = spawn_runtime_owner_with_protocol(
+            agent,
+            controls,
+            runtime_tx,
+            true,
+            true,
+            None,
+            Some(resources),
+            Some(wakeup_rx),
+        );
+        (
+            handle,
+            kernel_commands,
+            kernel_events,
+            runtime_events,
+            wakeup_tx,
+            loop_active,
+            adapter,
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    enum ShutdownPersistenceTerminal {
+        TurnComplete,
+        CompactionFailed,
+    }
+
+    fn persistence_failing_on_shutdown_agent(
+        status: SnapshotPersistenceStatus,
+        terminal: ShutdownPersistenceTerminal,
+    ) -> AgentHandle {
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Some(command) = command_rx.recv().await {
+                if matches!(command, AgentCommand::Shutdown) {
+                    status.report_uncertain_commit(
+                        "shutdown checkpoint failed and rollback was incomplete",
+                    );
+                    let event = match terminal {
+                        ShutdownPersistenceTerminal::TurnComplete => AgentEvent::TurnComplete {
+                            reason: StopReason::Cancelled,
+                        },
+                        ShutdownPersistenceTerminal::CompactionFailed => {
+                            AgentEvent::CompactionFailed {
+                                trigger: CompactTrigger::Manual { focus: None },
+                                error: CompactionCheckpointError::new("checkpoint failed"),
+                            }
+                        }
+                    };
+                    let _ = event_tx.send(event);
+                    break;
+                }
+            }
+        });
+        AgentHandle {
+            commands,
+            events,
+            task,
+        }
+    }
+
+    async fn reconfigure_persistence_race_runtime(
+        terminal: ShutdownPersistenceTerminal,
+    ) -> (
+        CodingRuntimeHandle,
+        mpsc::UnboundedReceiver<CodingRuntimeEvent>,
+        KernelRuntimeAdapter,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, runtime_events) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let parts = prepare_with_plugin_hook_source(
+            &start.agent,
+            start.prepare.clone(),
+            start.plugin_hooks.as_ref(),
+        )
+        .await
+        .unwrap();
+        let status = parts
+            .snapshot_persistence_status()
+            .expect("persistent parts must expose snapshot persistence status");
+        let agent = persistence_failing_on_shutdown_agent(status, terminal);
+        let resources = RuntimeResources {
+            config: start.agent,
+            prepare: start.prepare,
+            provider_factory: start.provider_factory,
+            plugin_hooks: start.plugin_hooks,
+            parts,
+            wakeup_tx,
+            loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
+        };
+        let adapter = spawn_runtime_owner_with_protocol(
+            agent,
+            controls,
+            runtime_tx,
+            true,
+            true,
+            None,
+            Some(resources),
+            Some(wakeup_rx),
+        );
+        (handle, runtime_events, adapter, home, project)
+    }
+
+    fn assert_failed_reconfigure_events(
+        runtime_events: &mut mpsc::UnboundedReceiver<CodingRuntimeEvent>,
+        expect_turn_terminal: bool,
+        expect_compaction_terminal: bool,
+    ) {
+        let mut saw_error = false;
+        let mut saw_turn_terminal = false;
+        let mut saw_compaction_terminal = false;
+        while let Ok(event) = runtime_events.try_recv() {
+            match event {
+                CodingRuntimeEvent::Agent(AgentEvent::Error { message, .. }) => {
+                    saw_error |= message.contains("persistence became uncertain");
+                }
+                CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
+                    reason: StopReason::ProviderError,
+                    ..
+                }) => saw_turn_terminal = true,
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Failed { .. },
+                } => saw_compaction_terminal = true,
+                CodingRuntimeEvent::ProviderChanged { .. }
+                | CodingRuntimeEvent::SessionChanged(_)
+                | CodingRuntimeEvent::Reconfigured { .. } => {
+                    panic!("uncertain persistence must not publish reconfigure success")
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_error, "uncertain persistence must emit an agent error");
+        assert_eq!(saw_turn_terminal, expect_turn_terminal);
+        assert_eq!(saw_compaction_terminal, expect_compaction_terminal);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn provider_reconfigure_fails_when_stop_drains_an_uncertain_turn_commit() {
+        let (handle, mut runtime_events, _adapter, _home, project) =
+            reconfigure_persistence_race_runtime(ShutdownPersistenceTerminal::TurnComplete).await;
+        handle.submit(UserInput::from("active turn")).await.unwrap();
+        let next = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "next-model",
+            project.path(),
+        );
+
+        assert!(matches!(
+            handle.reassemble_provider(next.clone()).await,
+            Err(RuntimeError::ReconfigureFailed(message))
+                if message.contains("persistence became uncertain")
+        ));
+        assert_eq!(
+            handle.status(),
+            RuntimeStatus {
+                generation: 0,
+                phase: RuntimePhase::Failed,
+            }
+        );
+        assert_failed_reconfigure_events(&mut runtime_events, true, false);
+        assert_eq!(
+            handle.reassemble_provider(next).await,
+            Err(RuntimeError::Unavailable),
+            "fail-close must remain sticky for this owner"
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn provider_reconfigure_fails_when_stop_drains_an_uncertain_compaction() {
+        let (handle, mut runtime_events, _adapter, _home, project) =
+            reconfigure_persistence_race_runtime(ShutdownPersistenceTerminal::CompactionFailed)
+                .await;
+        handle.compact(None).unwrap();
+        let next = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "next-model",
+            project.path(),
+        );
+
+        assert!(matches!(
+            handle.reassemble_provider(next).await,
+            Err(RuntimeError::ReconfigureFailed(message))
+                if message.contains("persistence became uncertain")
+        ));
+        assert_eq!(
+            handle.status(),
+            RuntimeStatus {
+                generation: 0,
+                phase: RuntimePhase::Failed,
+            }
+        );
+        assert_failed_reconfigure_events(&mut runtime_events, false, true);
+        assert_eq!(
+            handle.submit(UserInput::from("must fail")).await,
+            Err(RuntimeError::Unavailable)
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn uncertain_snapshot_hook_commit_fail_closes_the_completed_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let (agent, mut kernel_commands, kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let mut parts = prepare_with_plugin_hook_source(
+            &start.agent,
+            start.prepare.clone(),
+            start.plugin_hooks.as_ref(),
+        )
+        .await
+        .unwrap();
+        parts.report_snapshot_persistence_uncertain(
+            "session commit failed and rollback was incomplete",
+        );
+        let loop_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let resources = RuntimeResources {
+            config: start.agent,
+            prepare: start.prepare,
+            provider_factory: start.provider_factory,
+            plugin_hooks: start.plugin_hooks,
+            parts,
+            wakeup_tx,
+            loop_active,
+            image_preprocessor: None,
+        };
+        let _adapter = spawn_runtime_owner_with_protocol(
+            agent,
+            controls,
+            runtime_tx,
+            true,
+            true,
+            None,
+            Some(resources),
+            Some(wakeup_rx),
+        );
+
+        handle.submit(UserInput::from("turn")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+
+        let mut saw_error = false;
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::Agent(AgentEvent::Error { message, .. })) => {
+                        saw_error = message.contains("persistence became uncertain")
+                    }
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime events closed before the turn terminal"),
+                }
+            }
+        })
+        .await
+        .expect("uncertain snapshot commit lost the turn terminal");
+        assert!(saw_error);
+        assert!(matches!(
+            completion,
+            TurnCompletion::SnapshotUnavailable {
+                reason: StopReason::ProviderError,
+                ..
+            }
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::Failed);
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Shutdown)
+        ));
+        assert_eq!(
+            handle.submit(UserInput::from("must fail")).await,
+            Err(RuntimeError::Unavailable)
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn uncertain_compaction_checkpoint_fail_closes_the_runtime() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let (agent, mut kernel_commands, kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let mut parts = prepare_with_plugin_hook_source(
+            &start.agent,
+            start.prepare.clone(),
+            start.plugin_hooks.as_ref(),
+        )
+        .await
+        .unwrap();
+        parts.report_snapshot_persistence_uncertain(
+            "compaction commit failed and rollback was incomplete",
+        );
+        let resources = RuntimeResources {
+            config: start.agent,
+            prepare: start.prepare,
+            provider_factory: start.provider_factory,
+            plugin_hooks: start.plugin_hooks,
+            parts,
+            wakeup_tx,
+            loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
+        };
+        let _adapter = spawn_runtime_owner_with_protocol(
+            agent,
+            controls,
+            runtime_tx,
+            true,
+            true,
+            None,
+            Some(resources),
+            Some(wakeup_rx),
+        );
+
+        handle.compact(None).unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Compact { focus: None })
+        ));
+        kernel_events
+            .send(AgentEvent::CompactionFailed {
+                trigger: CompactTrigger::Manual { focus: None },
+                error: CompactionCheckpointError::new("checkpoint failed"),
+            })
+            .unwrap();
+
+        let mut saw_failed_compaction = false;
+        let error_message = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::CompactionFinished {
+                        completion: CompactionCompletion::Failed { .. },
+                    }) => saw_failed_compaction = true,
+                    Some(CodingRuntimeEvent::Agent(AgentEvent::Error { message, .. })) => {
+                        break message
+                    }
+                    Some(_) => {}
+                    None => panic!("runtime events closed before persistence failure"),
+                }
+            }
+        })
+        .await
+        .expect("uncertain compaction failure was not propagated");
+        assert!(saw_failed_compaction);
+        assert!(error_message.contains("compaction persistence became uncertain"));
+        assert_eq!(handle.status().phase, RuntimePhase::Failed);
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Shutdown)
+        ));
+        assert_eq!(
+            handle.submit(UserInput::from("must fail")).await,
+            Err(RuntimeError::Unavailable)
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn met_goal_overrides_held_max_rounds_terminal() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(GoalMetProviderFactory)).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::MaxRounds,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(CodingRuntimeEvent::TurnFinished(completion)) =
+                    runtime_events.recv().await
+                {
+                    break completion;
+                }
+            }
+        })
+        .await
+        .expect("met goal lost its held turn terminal");
+        assert!(matches!(
+            terminal,
+            TurnCompletion::Completed {
+                reason: StopReason::Stopped,
+                ..
+            }
+        ));
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn goal_evaluator_exhaustion_reports_provider_error() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: true })).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        for attempt in 1..=MAX_EVAL_FAILURES {
+            kernel_events
+                .send(AgentEvent::TurnComplete {
+                    reason: StopReason::Stopped,
+                })
+                .unwrap();
+            assert!(matches!(
+                kernel_commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            kernel_events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![Message::assistant(
+                        "not evaluated",
+                        vec![],
+                    )]),
+                })
+                .unwrap();
+            if attempt < MAX_EVAL_FAILURES {
+                assert!(matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                        .await
+                        .expect("evaluator retry was not dispatched"),
+                    Some(AgentCommand::SendSyntheticMessage { .. })
+                ));
+            }
+        }
+
+        let mut saw_inactive_goal = false;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                        active: false, ..
+                    })) => saw_inactive_goal = true,
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime events closed before evaluator terminal"),
+                }
+            }
+        })
+        .await
+        .expect("evaluator exhaustion lost the held terminal");
+        assert!(
+            saw_inactive_goal,
+            "evaluator exhaustion must deactivate /goal"
+        );
+        assert!(matches!(
+            terminal,
+            TurnCompletion::Completed {
+                reason: StopReason::ProviderError,
+                ..
+            }
+        ));
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn goal_round_cap_reports_max_rounds() {
+        let mut config = native_start(false).agent;
+        config.goal_max_rounds = 1;
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime_with_config(
+            Arc::new(GoalNotMetProviderFactory::default()),
+            config,
+        )
+        .await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        let _ = kernel_commands.recv().await;
+
+        for attempt in 0..2 {
+            kernel_events
+                .send(AgentEvent::TurnComplete {
+                    reason: StopReason::Stopped,
+                })
+                .unwrap();
+            assert!(matches!(
+                kernel_commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            kernel_events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![Message::assistant("not done", vec![])]),
+                })
+                .unwrap();
+            if attempt == 0 {
+                assert!(matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                        .await
+                        .expect("first goal continuation was not dispatched"),
+                    Some(AgentCommand::SendSyntheticMessage { .. })
+                ));
+            }
+        }
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(CodingRuntimeEvent::TurnFinished(completion)) =
+                    runtime_events.recv().await
+                {
+                    break completion;
+                }
+            }
+        })
+        .await
+        .expect("goal round cap lost the turn terminal");
+        assert!(matches!(
+            terminal,
+            TurnCompletion::Completed {
+                reason: StopReason::MaxRounds,
+                ..
+            }
+        ));
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loop_round_cap_reports_max_rounds() {
+        let mut config = native_start(false).agent;
+        config.loop_max_rounds = 1;
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime_with_config(
+            Arc::new(TestProviderFactory { fail: false }),
+            config,
+        )
+        .await;
+
+        handle.start_loop("watch CI").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        let _ = kernel_commands.recv().await;
+
+        for attempt in 0..2 {
+            wakeup_tx
+                .send(WakeupRequest {
+                    delay_seconds: 0,
+                    reason: format!("round {attempt}"),
+                    prompt: "check CI".into(),
+                })
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if matches!(
+                        runtime_events.recv().await,
+                        Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
+                            active: true,
+                            last_reason: Some(reason),
+                            ..
+                        })) if reason.starts_with("scheduled in")
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("loop wakeup was not registered");
+            kernel_events
+                .send(AgentEvent::TurnComplete {
+                    reason: StopReason::Stopped,
+                })
+                .unwrap();
+            assert!(matches!(
+                kernel_commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            kernel_events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![Message::assistant("checked", vec![])]),
+                })
+                .unwrap();
+            if attempt == 0 {
+                assert!(matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        kernel_commands.recv()
+                    )
+                    .await
+                    .expect("first loop continuation was not dispatched"),
+                    Some(AgentCommand::SendMessage { text, .. }) if text == "check CI"
+                ));
+            }
+        }
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(CodingRuntimeEvent::TurnFinished(completion)) =
+                    runtime_events.recv().await
+                {
+                    break completion;
+                }
+            }
+        })
+        .await
+        .expect("loop round cap lost the held terminal");
+        assert!(matches!(
+            terminal,
+            TurnCompletion::Completed {
+                reason: StopReason::MaxRounds,
+                ..
+            }
+        ));
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loop_continuation_send_failure_reports_provider_error() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            wakeup_tx,
+            loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_loop("watch CI").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        let _ = kernel_commands.recv().await;
+        wakeup_tx
+            .send(WakeupRequest {
+                delay_seconds: 0,
+                reason: "retry".into(),
+                prompt: "check CI".into(),
+            })
+            .unwrap();
+        let _ = runtime_events.recv().await;
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        drop(kernel_commands);
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("checked", vec![])]),
+            })
+            .unwrap();
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(CodingRuntimeEvent::TurnFinished(completion)) =
+                    runtime_events.recv().await
+                {
+                    break completion;
+                }
+            }
+        })
+        .await
+        .expect("loop continuation failure lost the held terminal");
+        assert!(matches!(
+            terminal,
+            TurnCompletion::Completed {
+                reason: StopReason::ProviderError,
+                ..
+            }
+        ));
+        assert!(!loop_active.load(Ordering::Acquire));
+        assert_eq!(handle.status().phase, RuntimePhase::Failed);
+    }
+
+    #[tokio::test]
+    async fn goal_snapshot_dispatch_failure_deactivates_controller() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        let _ = kernel_commands.recv().await;
+        drop(kernel_commands);
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+
+        let mut saw_inactive_goal = false;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                        active: false, ..
+                    })) => saw_inactive_goal = true,
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime events closed before snapshot failure terminal"),
+                }
+            }
+        })
+        .await
+        .expect("snapshot dispatch failure lost the goal terminal");
+        assert!(saw_inactive_goal, "snapshot failure must deactivate /goal");
+        assert!(matches!(
+            terminal,
+            TurnCompletion::SnapshotUnavailable {
+                reason: StopReason::ProviderError,
+                ..
+            }
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::Failed);
+    }
+
+    #[tokio::test]
+    async fn loop_snapshot_dispatch_failure_clears_wakeup_and_active_state() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            wakeup_tx,
+            loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_loop("watch CI").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        let _ = kernel_commands.recv().await;
+        wakeup_tx
+            .send(WakeupRequest {
+                delay_seconds: 60,
+                reason: "wait for CI".into(),
+                prompt: "check CI".into(),
+            })
+            .unwrap();
+        let _ = runtime_events.recv().await;
+        drop(kernel_commands);
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+
+        let mut saw_inactive_loop = false;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
+                        active: false, ..
+                    })) => saw_inactive_loop = true,
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime events closed before snapshot failure terminal"),
+                }
+            }
+        })
+        .await
+        .expect("snapshot dispatch failure lost the loop terminal");
+        assert!(saw_inactive_loop, "snapshot failure must deactivate /loop");
+        assert!(!loop_active.load(Ordering::Acquire));
+        assert!(matches!(
+            terminal,
+            TurnCompletion::SnapshotUnavailable {
+                reason: StopReason::ProviderError,
+                ..
+            }
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::Failed);
+    }
+
+    #[tokio::test]
+    async fn goal_evaluator_continuation_is_a_synthetic_turn() {
+        let factory = Arc::new(GoalNotMetProviderFactory::default());
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(factory.clone()).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                ..
+            }))
+        ));
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "initial turn"
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("not done", vec![])]),
+            })
+            .unwrap();
+
+        let continuation =
+            tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                .await
+                .expect("goal evaluator did not dispatch its continuation");
+        assert!(matches!(
+            continuation,
+            Some(AgentCommand::SendSyntheticMessage { text })
+                if text.contains("needs more work")
+        ));
+        assert_eq!(factory.builds.load(Ordering::SeqCst), 1);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn max_rounds_goal_terminal_is_evaluated_before_continuing() {
+        let factory = Arc::new(GoalNotMetProviderFactory::default());
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(factory.clone()).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                ..
+            }))
+        ));
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "initial turn"
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::MaxRounds,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("not done", vec![])]),
+            })
+            .unwrap();
+
+        let continuation =
+            tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                .await
+                .expect("max-rounds goal terminal did not produce a continuation decision");
+        assert_eq!(
+            factory.builds.load(Ordering::SeqCst),
+            1,
+            "MaxRounds must enter the evaluator instead of the unproductive retry path"
+        );
+        assert!(matches!(
+            continuation,
+            Some(AgentCommand::SendSyntheticMessage { text })
+                if text.contains("needs more work")
+        ));
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_loop_detected_terminates_goal_without_continuation() {
+        let factory = Arc::new(GoalNotMetProviderFactory::default());
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(factory.clone()).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                ..
+            }))
+        ));
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "initial turn"
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::ToolLoopDetected,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("looping", vec![])]),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: false,
+                last_reason: Some(reason),
+                ..
+            })) if reason.contains("ToolLoopDetected")
+        ));
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::TurnFinished(
+                TurnCompletion::Completed {
+                    reason: StopReason::ToolLoopDetected,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(
+            factory.builds.load(Ordering::SeqCst),
+            0,
+            "tool-loop detection must not invoke the goal evaluator"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), kernel_commands.recv(),)
+                .await
+                .is_err(),
+            "tool-loop detection must not dispatch a continuation"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loop_kernel_stream_failure_clears_wakeup_and_active_state() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            wakeup_tx,
+            loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_loop("watch CI").await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
+                active: true,
+                ..
+            }))
+        ));
+        assert!(loop_active.load(Ordering::Acquire));
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "initial turn"
+        ));
+        wakeup_tx
+            .send(WakeupRequest {
+                delay_seconds: 60,
+                reason: "wait for CI".into(),
+                prompt: "check CI".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
+                active: true,
+                ..
+            }))
+        ));
+
+        drop(kernel_events);
+        let mut saw_inactive_loop = false;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
+                        active: false, ..
+                    })) => saw_inactive_loop = true,
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime event stream closed before loop terminal"),
+                }
+            }
+        })
+        .await
+        .expect("kernel stream failure lost the loop terminal");
+
+        assert!(saw_inactive_loop, "abnormal terminal must deactivate /loop");
+        assert!(
+            !loop_active.load(Ordering::Acquire),
+            "abnormal terminal must disable schedule_wakeup immediately"
+        );
+        assert!(matches!(
+            terminal,
+            TurnCompletion::SnapshotUnavailable {
+                reason: StopReason::ProviderError,
+                ..
+            }
+        ));
+    }
+
     fn shutdown_reporting_agent(report_started: bool, report_compacted: bool) -> AgentHandle {
+        shutdown_reporting_agent_with_snapshot(report_started, report_compacted, None)
+    }
+
+    fn shutdown_reporting_agent_with_snapshot(
+        report_started: bool,
+        report_compacted: bool,
+        compacted_snapshot: Option<SessionSnapshot>,
+    ) -> AgentHandle {
         let (commands, mut command_rx) = mpsc::unbounded_channel();
         let (event_tx, events) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             let mut pending = None;
+            let mut compacted_snapshot = compacted_snapshot;
             while let Some(command) = command_rx.recv().await {
                 match command {
                     AgentCommand::Compact { focus } => {
@@ -5044,7 +7310,7 @@ mod tests {
                                     bytes_before: 100,
                                     bytes_after: 50,
                                     committed: true,
-                                    snapshot: None,
+                                    snapshot: compacted_snapshot.take(),
                                 });
                             }
                         }
@@ -5344,6 +7610,114 @@ mod tests {
                 completion: CompactionCompletion::Completed(outcome),
             }) if outcome.committed && outcome.removed_messages == 2
         ));
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_agent_retains_a_committed_compaction_snapshot_and_revision() {
+        let compacted = SessionSnapshot::new(vec![Message::user("compacted")]);
+        let mut agent = Some(shutdown_reporting_agent_with_snapshot(
+            true,
+            true,
+            Some(compacted.clone()),
+        ));
+        let trigger = CompactTrigger::Manual {
+            focus: Some("before reload".into()),
+        };
+        agent
+            .as_ref()
+            .unwrap()
+            .commands
+            .send(AgentCommand::Compact {
+                focus: Some("before reload".into()),
+            })
+            .unwrap();
+        let mut compactions = CompactionTracker::default();
+        compactions.accepted_manual(trigger);
+        let mut observed_tokens = None;
+        let (raw, _events) = mpsc::unbounded_channel();
+        let emitter = RuntimeEventEmitter {
+            raw,
+            tagged: None,
+            generation: Arc::new(AtomicU64::new(0)),
+        };
+
+        let report = stop_current_agent(
+            &mut agent,
+            &mut compactions,
+            &mut observed_tokens,
+            &emitter,
+            CompactionInterruption::RuntimeReconfigured,
+            None,
+        )
+        .await;
+
+        assert!(report.conversation_changed);
+        assert_eq!(report.snapshot, Some(compacted));
+        let mut active_turn = None;
+        let mut terminal_reason = None;
+        let mut turn_stats = RuntimeTurnStats::default();
+        let mut conversation_revision = 7;
+        let mut snapshot_waiters = Vec::new();
+        finish_stopped_native_turn(
+            &report,
+            None,
+            &mut active_turn,
+            &mut terminal_reason,
+            &mut turn_stats,
+            &mut conversation_revision,
+            &mut snapshot_waiters,
+            &emitter,
+        );
+        assert_eq!(conversation_revision, 8);
+    }
+
+    #[tokio::test]
+    async fn undo_rejects_an_accepted_compaction_before_mutating_state() {
+        let (agent, mut kernel_commands, kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, _runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner_with_protocol(
+            agent, controls, runtime_tx, true, true, None, None, None,
+        );
+        let snapshot_task = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.snapshot_with_revision().await.unwrap() })
+        };
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        let original_snapshot = SessionSnapshot::new(vec![Message::user("first prompt")]);
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: original_snapshot,
+            })
+            .unwrap();
+        let original = snapshot_task.await.unwrap();
+        let undo = undo_snapshot_to_prompt(&original.snapshot, None).unwrap();
+
+        handle.compact(Some("in flight".into())).unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Compact { .. })
+        ));
+        let (done, result) = oneshot::channel();
+        handle
+            .tx
+            .send(CodingRuntimeControl::ApplyUndo {
+                generation: handle.status().generation,
+                expected_revision: original.revision,
+                original: original.snapshot,
+                truncated: undo.snapshot,
+                restored_prompt: undo.restored_prompt,
+                target_n: undo.target_n,
+                prompts_before: undo.prompts_before,
+                done,
+            })
+            .unwrap();
+
+        assert!(matches!(result.await.unwrap(), Err(RuntimeError::Busy)));
         adapter.shutdown().await.unwrap();
     }
 
@@ -5845,7 +8219,7 @@ mod tests {
             terminal,
             TurnCompletion::Completed {
                 turn_id: 1,
-                reason: StopReason::Stopped,
+                reason: StopReason::ProviderError,
                 snapshot,
                 ..
             } if snapshot.as_ref() == &expected
@@ -5939,7 +8313,14 @@ mod tests {
             image_preprocessor: pp,
         };
         let adapter = spawn_runtime_owner_with_protocol(
-            agent, controls, runtime_tx, true, true, None, Some(resources), Some(wakeup_rx),
+            agent,
+            controls,
+            runtime_tx,
+            true,
+            true,
+            None,
+            Some(resources),
+            Some(wakeup_rx),
         );
         (handle, kernel_commands, runtime_events, adapter)
     }
@@ -5951,7 +8332,10 @@ mod tests {
     async fn image_submit_runs_installed_preprocessor_before_kernel() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (handle, mut kernel_commands, mut runtime_events, _adapter) =
-            spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor { called: called.clone() }))).await;
+            spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor {
+                called: called.clone(),
+            })))
+            .await;
 
         handle
             .submit(UserInput {
@@ -5966,8 +8350,14 @@ mod tests {
 
         match kernel_commands.recv().await {
             Some(AgentCommand::SendMessage { text, images }) => {
-                assert_eq!(text, "VL[look at this]", "preprocessor output must reach the kernel");
-                assert!(images.is_empty(), "images must be cleared after preprocessing");
+                assert_eq!(
+                    text, "VL[look at this]",
+                    "preprocessor output must reach the kernel"
+                );
+                assert!(
+                    images.is_empty(),
+                    "images must be cleared after preprocessing"
+                );
             }
             other => panic!("expected SendMessage, got {other:?}"),
         }
@@ -5982,7 +8372,10 @@ mod tests {
                 saw_success = true;
             }
         }
-        assert!(saw_success, "runtime must emit VisionPreprocessSuccess for the toast");
+        assert!(
+            saw_success,
+            "runtime must emit VisionPreprocessSuccess for the toast"
+        );
     }
 
     // Guard: a text-only submit skips the preprocessor entirely (no images),
@@ -5991,9 +8384,15 @@ mod tests {
     async fn text_only_submit_skips_preprocessor() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (handle, mut kernel_commands, _runtime_events, _adapter) =
-            spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor { called: called.clone() }))).await;
+            spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor {
+                called: called.clone(),
+            })))
+            .await;
 
-        handle.submit(UserInput::from("no images here")).await.unwrap();
+        handle
+            .submit(UserInput::from("no images here"))
+            .await
+            .unwrap();
 
         match kernel_commands.recv().await {
             Some(AgentCommand::SendMessage { text, .. }) => {
@@ -6001,7 +8400,10 @@ mod tests {
             }
             other => panic!("expected SendMessage, got {other:?}"),
         }
-        assert!(!called.load(Ordering::Acquire), "preprocessor must NOT run without images");
+        assert!(
+            !called.load(Ordering::Acquire),
+            "preprocessor must NOT run without images"
+        );
     }
 
     // On VL failure the runtime emits VisionPreprocessFailed (the driver
@@ -6026,7 +8428,10 @@ mod tests {
         // Kernel receives text-only (images cleared for the non-vision model).
         match kernel_commands.recv().await {
             Some(AgentCommand::SendMessage { images, .. }) => {
-                assert!(images.is_empty(), "failed VL must clear images for the model");
+                assert!(
+                    images.is_empty(),
+                    "failed VL must clear images for the model"
+                );
             }
             other => panic!("expected SendMessage, got {other:?}"),
         }
@@ -6495,6 +8900,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
     async fn fresh_session_clears_held_loop_without_duplicate_terminal() {
         let (agent, mut kernel_commands, kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
@@ -6786,6 +9192,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
     async fn fresh_session_is_runtime_owned_and_returns_new_identity() {
         let runtime = CodingRuntime::start(native_start(false)).await.unwrap();
 
@@ -6878,12 +9285,12 @@ mod tests {
         std::env::set_var("ATOMCODE_HOME", home.path());
         let session_id = "leased-runtime";
         let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
-        manager
-            .save_snapshot(
-                session_id,
-                &SessionSnapshot::new(vec![Message::user("persisted")]),
-            )
-            .unwrap();
+        persist_native_session(
+            &manager,
+            session_id,
+            project.path(),
+            &SessionSnapshot::new(vec![Message::user("persisted")]),
+        );
         let start = || {
             let mut start = native_start(false);
             start.agent.working_dir = project.path().to_path_buf();
@@ -6916,12 +9323,12 @@ mod tests {
         std::env::set_var("ATOMCODE_HOME", home.path());
         let id = "imported-runtime";
         let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
-        manager
-            .save_snapshot(id, &SessionSnapshot::new(vec![Message::user("persisted")]))
-            .unwrap();
-        let mut meta = SessionMeta::new(id, project.path().to_string_lossy(), 1);
-        meta.owner = StorageOwner::Native;
-        manager.write_meta(&meta).unwrap();
+        persist_native_session(
+            &manager,
+            id,
+            project.path(),
+            &SessionSnapshot::new(vec![Message::user("persisted")]),
+        );
         let lease = manager.acquire_lease(id).unwrap();
         let mut start = native_start(false);
         start.agent.working_dir = project.path().to_path_buf();
@@ -7036,12 +9443,12 @@ mod tests {
         std::env::set_var("ATOMCODE_HOME", home.path());
         let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
         for id in ["session-a", "session-b"] {
-            manager
-                .save_snapshot(
-                    id,
-                    &SessionSnapshot::new(vec![Message::user(format!("snapshot {id}"))]),
-                )
-                .unwrap();
+            persist_native_session(
+                &manager,
+                id,
+                project.path(),
+                &SessionSnapshot::new(vec![Message::user(format!("snapshot {id}"))]),
+            );
         }
         let mut start = native_start(false);
         start.agent.working_dir = project.path().to_path_buf();
@@ -7075,18 +9482,55 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
+    async fn incomplete_resume_fails_before_runtime_can_accept_a_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let session_id = "incomplete-runtime";
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        let snapshot = SessionSnapshot::new(vec![Message::user("persisted")]);
+        manager.save_snapshot(session_id, &snapshot).unwrap();
+        let mut meta = SessionMeta::new(session_id, project.path().to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        manager.write_meta(&meta).unwrap();
+
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(session_id.into());
+        let error = match CodingRuntime::start(start).await {
+            Ok(runtime) => {
+                runtime.handle.shutdown().await.unwrap();
+                panic!("an incomplete aggregate must not produce a runtime handle");
+            }
+            Err(error) => error,
+        };
+        let RuntimeStartError::Prepare(error) = error else {
+            panic!("expected prepare failure, got {error}");
+        };
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<SessionStoreError>()),
+            Some(SessionStoreError::NotFound { path })
+                if path == &manager.presentation_path(session_id).unwrap()
+        ));
+        manager.acquire_lease(session_id).unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
     async fn startup_failure_releases_the_prepared_session_lease() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMCODE_HOME", home.path());
         let session_id = "failed-runtime";
         let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
-        manager
-            .save_snapshot(
-                session_id,
-                &SessionSnapshot::new(vec![Message::user("persisted")]),
-            )
-            .unwrap();
+        persist_native_session(
+            &manager,
+            session_id,
+            project.path(),
+            &SessionSnapshot::new(vec![Message::user("persisted")]),
+        );
         let mut start = native_start(true);
         start.agent.working_dir = project.path().to_path_buf();
         start.prepare.session = crate::SessionMode::Resume(session_id.into());
@@ -7106,12 +9550,12 @@ mod tests {
         std::env::set_var("ATOMCODE_HOME", home.path());
         let session_id = "dropped-runtime";
         let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
-        manager
-            .save_snapshot(
-                session_id,
-                &SessionSnapshot::new(vec![Message::user("persisted")]),
-            )
-            .unwrap();
+        persist_native_session(
+            &manager,
+            session_id,
+            project.path(),
+            &SessionSnapshot::new(vec![Message::user("persisted")]),
+        );
         let mut start = native_start(false);
         start.agent.working_dir = project.path().to_path_buf();
         start.prepare.session = crate::SessionMode::Resume(session_id.into());
@@ -7163,6 +9607,558 @@ mod tests {
         let current = runtime.handle.snapshot().await.unwrap();
         assert_eq!(current.messages, result.snapshot.messages);
         runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_reassemble_preserves_the_latest_sessionless_snapshot() {
+        let mut runtime = CodingRuntime::start(native_start(false)).await.unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("first prompt"))
+            .await
+            .unwrap();
+        let before = loop {
+            if let CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                snapshot, ..
+            }) = runtime.events.recv().await.unwrap().event
+            {
+                break snapshot;
+            }
+        };
+        let next = CodingAgentConfig::new("key", "https://example.test/v1", "next", ".");
+
+        runtime.handle.reassemble_provider(next).await.unwrap();
+        let visible = |snapshot: &SessionSnapshot| {
+            snapshot
+                .messages
+                .iter()
+                .filter(|message| message.role != atomcode_kernel::message::Role::System)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let next_again =
+            CodingAgentConfig::new("key", "https://example.test/v1", "next-again", ".");
+        runtime
+            .handle
+            .reassemble_provider(next_again)
+            .await
+            .unwrap();
+        let after_second_reassemble = runtime.handle.snapshot().await.unwrap();
+        assert_eq!(visible(&before), visible(&after_second_reassemble));
+        let persona = after_second_reassemble
+            .messages
+            .iter()
+            .find(|message| {
+                message.role == atomcode_kernel::message::Role::System
+                    && message.text.starts_with("You are AtomCode")
+            })
+            .expect("sessionless reassemble must preserve a coding persona");
+        assert!(persona.text.contains("next-again"));
+        assert!(!persona.text.contains("running test"));
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_sessionless_restore_rolls_back_to_the_original_snapshot() {
+        let factory = Arc::new(FailSecondBuildFactory {
+            builds: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut start = native_start(false);
+        start.provider_factory = factory;
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("original prompt"))
+            .await
+            .unwrap();
+        let original = loop {
+            if let CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                snapshot, ..
+            }) = runtime.events.recv().await.unwrap().event
+            {
+                break snapshot;
+            }
+        };
+        let mut candidate = original.as_ref().clone();
+        candidate.messages.push(Message::user("replacement prompt"));
+
+        assert!(matches!(
+            runtime.handle.restore_snapshot(candidate).await,
+            Err(RuntimeError::ReconfigureFailed(message))
+                if message.contains("candidate provider failed")
+        ));
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        let restored = runtime.handle.snapshot().await.unwrap();
+        assert_eq!(restored.as_ref(), original.as_ref());
+        assert!(restored
+            .messages
+            .iter()
+            .all(|message| message.text != "replacement prompt"));
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn undo_rejects_a_snapshot_after_the_conversation_revision_changes() {
+        let mut runtime = CodingRuntime::start(native_start(false)).await.unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("first prompt"))
+            .await
+            .unwrap();
+        loop {
+            if matches!(
+                runtime.events.recv().await.unwrap().event,
+                CodingRuntimeEvent::TurnFinished(_)
+            ) {
+                break;
+            }
+        }
+
+        let original = runtime.handle.snapshot_with_revision().await.unwrap();
+        let undo = undo_snapshot_to_prompt(&original.snapshot, None).unwrap();
+
+        runtime
+            .handle
+            .submit(UserInput::from("second prompt"))
+            .await
+            .unwrap();
+        loop {
+            if matches!(
+                runtime.events.recv().await.unwrap().event,
+                CodingRuntimeEvent::TurnFinished(_)
+            ) {
+                break;
+            }
+        }
+
+        let (done, result) = oneshot::channel();
+        runtime
+            .handle
+            .tx
+            .send(CodingRuntimeControl::ApplyUndo {
+                generation: runtime.handle.status().generation,
+                expected_revision: original.revision,
+                original: original.snapshot,
+                truncated: undo.snapshot,
+                restored_prompt: undo.restored_prompt,
+                target_n: undo.target_n,
+                prompts_before: undo.prompts_before,
+                done,
+            })
+            .unwrap();
+
+        assert!(matches!(result.await.unwrap(), Err(RuntimeError::Busy)));
+        let current = runtime.handle.snapshot().await.unwrap();
+        assert!(current
+            .messages
+            .iter()
+            .any(|message| message.text == "second prompt"));
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn native_undo_snapshot_cas_preserves_a_newer_canonical_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let id = "undo-snapshot-cas";
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        let initial = SessionSnapshot::new(vec![
+            Message::user("first prompt"),
+            Message::assistant("first answer", Vec::new()),
+        ]);
+        persist_native_session(&manager, id, project.path(), &initial);
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.into());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let original = runtime.handle.snapshot_with_revision().await.unwrap();
+        let undo = undo_snapshot_to_prompt(&original.undo_snapshot, None).unwrap();
+        let newer = SessionSnapshot::new(vec![
+            Message::user("first prompt"),
+            Message::assistant("first answer", Vec::new()),
+            Message::user("concurrent prompt"),
+        ]);
+        manager.save_snapshot(id, &newer).unwrap();
+        let (done, result) = oneshot::channel();
+        runtime
+            .handle
+            .tx
+            .send(CodingRuntimeControl::ApplyUndo {
+                generation: runtime.handle.status().generation,
+                expected_revision: original.revision,
+                original: original.undo_snapshot,
+                truncated: undo.snapshot,
+                restored_prompt: undo.restored_prompt,
+                target_n: undo.target_n,
+                prompts_before: undo.prompts_before,
+                done,
+            })
+            .unwrap();
+
+        assert!(matches!(result.await.unwrap(), Err(RuntimeError::Busy)));
+        assert_eq!(manager.load_snapshot(id).unwrap(), newer);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn native_undo_persistence_error_fail_closes_an_unhealthy_aggregate() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let id = "undo-unhealthy-native";
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        let snapshot = SessionSnapshot::new(vec![
+            Message::user("first prompt"),
+            Message::assistant("answer", Vec::new()),
+        ]);
+        persist_native_session(&manager, id, project.path(), &snapshot);
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.into());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let presentation_path = manager.presentation_path(id).unwrap();
+        std::fs::remove_file(&presentation_path).unwrap();
+
+        let error = runtime.handle.undo_to_prompt(None).await.unwrap_err();
+
+        let RuntimeError::ReconfigureFailed(message) = &error else {
+            panic!("expected presentation persistence error, got {error:?}");
+        };
+        assert!(
+            message.contains(presentation_path.to_string_lossy().as_ref()),
+            "expected missing presentation path in error, got {error:?}"
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Failed);
+        assert_eq!(
+            runtime.handle.submit(UserInput::from("must fail")).await,
+            Err(RuntimeError::Unavailable)
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn native_undo_rollback_persistence_failure_is_sticky() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let id = "undo-rollback-persistence-failure";
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        let snapshot = SessionSnapshot::new(vec![
+            Message::user("first prompt"),
+            Message::assistant("answer", Vec::new()),
+        ]);
+        persist_native_session(&manager, id, project.path(), &snapshot);
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.into());
+        start.provider_factory = Arc::new(DeletePresentationAndFailSecondBuildFactory {
+            builds: std::sync::atomic::AtomicUsize::new(0),
+            presentation_path: manager.presentation_path(id).unwrap(),
+        });
+        let runtime = CodingRuntime::start(start).await.unwrap();
+
+        // Resume may normalize the live snapshot (for example, refreshing the
+        // current persona) before a turn persists it. Align the canonical CAS
+        // preimage so this test reaches the intended rollback-failure branch.
+        let live_snapshot = runtime.handle.snapshot().await.unwrap();
+        manager.save_snapshot(id, &live_snapshot).unwrap();
+        assert_eq!(
+            live_snapshot.as_ref(),
+            &manager.load_snapshot(id).unwrap(),
+            "live and canonical snapshots must agree before undo"
+        );
+
+        let undo = runtime.handle.undo_to_prompt(None).await;
+        assert!(
+            matches!(
+                &undo,
+                Err(RuntimeError::ReconfigureFailed(message))
+                    if message.contains("snapshot restore failed")
+            ),
+            "unexpected undo result: {undo:?}"
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Failed);
+        assert_eq!(
+            runtime.handle.submit(UserInput::from("must fail")).await,
+            Err(RuntimeError::Unavailable)
+        );
+        assert_eq!(
+            runtime.handle.reload_capabilities().await,
+            Err(RuntimeError::Unavailable)
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn restore_snapshot_rollback_persistence_failure_is_sticky() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let id = "restore-rollback-persistence-failure";
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        let initial = SessionSnapshot::new(vec![Message::user("initial")]);
+        persist_native_session(&manager, id, project.path(), &initial);
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.into());
+        start.provider_factory = Arc::new(DeletePresentationAndFailSecondBuildFactory {
+            builds: std::sync::atomic::AtomicUsize::new(0),
+            presentation_path: manager.presentation_path(id).unwrap(),
+        });
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let live_snapshot = runtime.handle.snapshot().await.unwrap();
+        manager.save_snapshot(id, &live_snapshot).unwrap();
+        let mut replacement = live_snapshot.as_ref().clone();
+        replacement.messages.push(Message::user("replacement"));
+
+        let restore = runtime.handle.restore_snapshot(replacement).await;
+        assert!(
+            matches!(
+                &restore,
+                Err(RuntimeError::ReconfigureFailed(message))
+                    if message.contains("snapshot restore failed")
+            ),
+            "unexpected restore result: {restore:?}"
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Failed);
+        let mut saw_rollback_persistence_error = false;
+        while let Ok(event) = runtime.events.try_recv() {
+            if let CodingRuntimeEvent::Agent(AgentEvent::Error { message, .. }) = event.event {
+                saw_rollback_persistence_error |=
+                    message.contains("snapshot rollback persistence failed");
+            }
+        }
+        assert!(saw_rollback_persistence_error);
+        assert_eq!(
+            runtime.handle.submit(UserInput::from("must fail")).await,
+            Err(RuntimeError::Unavailable)
+        );
+        assert_eq!(
+            runtime.handle.reload_capabilities().await,
+            Err(RuntimeError::Unavailable)
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn native_undo_rollback_merges_concurrent_sidecar_updates() {
+        use atomcode_capabilities::session::presentation::PRESENTATION_VERSION;
+        use atomcode_capabilities::session::{
+            ImportInfo, ImportKind, PresentationRole, SessionManager,
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let id = "undo-sidecar-merge";
+        let manager = SessionManager::for_project(project.path());
+        let original_snapshot = SessionSnapshot::new(vec![
+            Message::user("first"),
+            Message::assistant("first answer", Vec::new()),
+            Message::user("second"),
+            Message::assistant("second answer", Vec::new()),
+        ]);
+        let original_stats = vec![
+            TurnStat {
+                after_message: 2,
+                position_valid: true,
+                turn_id: 1,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 10,
+                total_tokens: 20,
+                errored: false,
+                used_tokens: 10,
+                ctx_window: 1_000,
+            },
+            TurnStat {
+                after_message: 4,
+                position_valid: true,
+                turn_id: 2,
+                round_count: 1,
+                tool_call_count: 1,
+                duration_ms: 30,
+                total_tokens: 40,
+                errored: false,
+                used_tokens: 20,
+                ctx_window: 1_000,
+            },
+        ];
+        let at_start = PresentationEntry {
+            anchor: DisplayAnchor::AtStart,
+            role: PresentationRole::Assistant,
+            text: "session header".into(),
+        };
+        let first_turn = PresentationEntry {
+            anchor: DisplayAnchor::AfterTurn { turn_id: 1 },
+            role: PresentationRole::Assistant,
+            text: "first divider".into(),
+        };
+        let removed_second_turn = PresentationEntry {
+            anchor: DisplayAnchor::AfterTurn { turn_id: 2 },
+            role: PresentationRole::Assistant,
+            text: "second divider".into(),
+        };
+        let initial_presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![
+                at_start.clone(),
+                first_turn.clone(),
+                removed_second_turn.clone(),
+            ],
+        };
+        let mut original_meta = SessionMeta::new(id, project.path().to_string_lossy(), 100);
+        original_meta.owner = StorageOwner::Native;
+        original_meta.message_count = 4;
+        original_meta.turn_count = 2;
+        original_meta.turn_stats = original_stats.clone();
+        let lease = manager.acquire_lease(id).unwrap();
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&original_snapshot),
+                Some(&initial_presentation),
+                &original_meta,
+            )
+            .unwrap();
+        drop(lease);
+
+        let CodingRuntimeStart {
+            mut agent,
+            mut prepare,
+            provider_factory,
+            plugin_hooks,
+            image_preprocessor,
+        } = native_start(false);
+        agent.working_dir = project.path().to_path_buf();
+        prepare.session = crate::SessionMode::Resume(id.into());
+        let parts = prepare_with_plugin_hook_source(&agent, prepare.clone(), plugin_hooks.as_ref())
+            .await
+            .unwrap();
+        let (wakeup_tx, _wakeup_rx) = mpsc::unbounded_channel();
+        let mut resources = RuntimeResources {
+            config: agent,
+            prepare,
+            provider_factory,
+            plugin_hooks,
+            parts,
+            wakeup_tx,
+            loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor,
+        };
+
+        let mut truncated = original_snapshot.clone();
+        truncated.messages.truncate(2);
+        let receipt = persist_runtime_undo(&mut resources, Some(&original_snapshot), &truncated)
+            .unwrap()
+            .expect("native undo must retain a sidecar rollback receipt");
+        assert_eq!(manager.load_snapshot(id).unwrap(), truncated);
+        assert_eq!(
+            manager.read_meta(id).unwrap().turn_stats,
+            original_stats[..1]
+        );
+        assert_eq!(
+            manager.read_presentation(id).unwrap().entries,
+            vec![at_start.clone(), first_turn.clone()]
+        );
+
+        let concurrent_import = ImportInfo {
+            legacy_schema: "test-v1".into(),
+            source_sha256: "a".repeat(64),
+            importer_version: 3,
+            kind: ImportKind::MetadataOnly,
+        };
+        manager.rename(id, "renamed while undo rebuilds").unwrap();
+        manager
+            .update_meta(id, |meta| {
+                meta.ai_named = true;
+                meta.import_info = Some(concurrent_import.clone());
+                meta.updated_at = 1;
+            })
+            .unwrap();
+        let concurrent_append = PresentationEntry {
+            anchor: DisplayAnchor::AfterTurn { turn_id: 1 },
+            role: PresentationRole::User,
+            text: "appended while undo rebuilds".into(),
+        };
+        manager
+            .append_presentation(id, concurrent_append.clone())
+            .unwrap();
+        let rollback_started_at = atomcode_capabilities::session::now_ms();
+
+        restore_runtime_undo(
+            &mut resources,
+            &truncated,
+            &original_snapshot,
+            Some(receipt),
+        )
+        .unwrap();
+
+        assert_eq!(manager.load_snapshot(id).unwrap(), original_snapshot);
+        let restored_meta = manager.read_meta(id).unwrap();
+        assert_eq!(restored_meta.owner, StorageOwner::Native);
+        assert_eq!(restored_meta.name, "renamed while undo rebuilds");
+        assert!(restored_meta.user_renamed);
+        assert!(restored_meta.ai_named);
+        assert_eq!(restored_meta.import_info, Some(concurrent_import));
+        assert_eq!(restored_meta.message_count, 4);
+        assert_eq!(restored_meta.turn_count, 2);
+        assert_eq!(restored_meta.turn_stats, original_stats);
+        assert!(restored_meta.updated_at >= rollback_started_at);
+        assert_eq!(
+            manager.read_presentation(id).unwrap().entries,
+            vec![at_start, first_turn, removed_second_turn, concurrent_append,]
+        );
+
+        let mut second_truncated = original_snapshot.clone();
+        second_truncated.messages.truncate(2);
+        let second_receipt =
+            persist_runtime_undo(&mut resources, Some(&original_snapshot), &second_truncated)
+                .unwrap()
+                .expect("second native undo must retain a rollback receipt");
+        let concurrently_advanced = SessionSnapshot::new(vec![
+            Message::user("concurrent"),
+            Message::assistant("newer answer", Vec::new()),
+        ]);
+        manager.save_snapshot(id, &concurrently_advanced).unwrap();
+
+        let error = restore_runtime_undo(
+            &mut resources,
+            &second_truncated,
+            &original_snapshot,
+            Some(second_receipt),
+        )
+        .unwrap_err();
+        assert!(error.is_snapshot_conflict());
+        assert_eq!(manager.load_snapshot(id).unwrap(), concurrently_advanced);
+    }
+
+    #[test]
+    fn uncertain_session_commit_requires_runtime_fail_close() {
+        let error = NativePersistenceError::from(SessionStoreError::UncertainCommit {
+            id: "s1".into(),
+            commit_error: "meta fsync failed".into(),
+            rollback_errors: vec!["snapshot rollback failed".into()],
+        });
+
+        assert!(error.requires_fail_close());
+        assert!(error.to_string().contains("rollback was incomplete"));
+        assert_eq!(
+            persistence_fail_close_reason(&error, None),
+            Some(error.to_string())
+        );
+        let certain_candidate = NativePersistenceError::certain("provider build failed");
+        let restore_error = NativePersistenceError::certain("rollback write failed");
+        assert_eq!(
+            persistence_fail_close_reason(&certain_candidate, Some(&restore_error)),
+            Some("snapshot rollback persistence failed: rollback write failed".into())
+        );
     }
 
     #[test]
@@ -7221,5 +10217,4 @@ mod tests {
             .iter()
             .any(|message| message.text.contains("anchored summary")));
     }
-
 }

@@ -583,6 +583,7 @@ pub enum Msg<'a> {
     CmdUndoBusy,
     CmdUndoBadArg,
     CmdNoChanges,
+    CmdDiffTruncated,
     CmdCheckingUpdate,
     CmdNoActiveProvider,
     CmdProviderUnavailable,

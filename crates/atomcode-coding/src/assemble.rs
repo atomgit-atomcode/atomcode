@@ -103,14 +103,18 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
         .max_continuations(cfg.max_continuations)
         // Ctrl-C semantics: false = UNDO (default), true = PRESERVE the interrupted turn.
         .keep_interrupted_context(cfg.keep_interrupted_context);
+    if let Some(policy) = cfg.tool_loop_policy {
+        builder = builder.tool_loop_policy(policy);
+    }
+    // Coarse round-cap backstop: the repetition guards catch exact loops quickly, while this
+    // also bounds varying-call runaways. `0` leaves the neutral kernel fuse unwired.
+    if cfg.max_rounds != 0 {
+        builder = builder.max_rounds(cfg.max_rounds);
+    }
     // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
     // answered (interactive). Kernel defaults to unbounded when unset, so None = park.
     if let Some(d) = cfg.request_timeout {
         builder = builder.request_timeout(d);
-    }
-    // Coarse round-cap backstop (kernel repetition fuse is the fast path). `0` = unbounded.
-    if cfg.max_rounds > 0 {
-        builder = builder.max_rounds(cfg.max_rounds);
     }
     // Todo-list hook: injects the current todo list as a per-turn <system-reminder> so
     // the model always sees progress even after compaction. Gated on ATOMCODE_TODO env

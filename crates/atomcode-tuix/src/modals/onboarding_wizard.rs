@@ -617,11 +617,21 @@ impl OnboardingWizard {
             // the letter bodies. Each row is 49 cells; logo_pad
             // centres the 49-wide logo inside draw_panel's content area.
             let logo_pad = " ".repeat(cell_w.saturating_sub(49) / 2);
-            content.push(format!("{logo_pad}███  █████  ███  █     █  ████  ███  ████  █████"));
-            content.push(format!("{logo_pad}█   █   █   █   █ ██   ██ █     █   █ █   █ █    "));
-            content.push(format!("{logo_pad}█████   █   █   █ █ █ █ █ █     █   █ █   █ ████ "));
-            content.push(format!("{logo_pad}█   █   █   █   █ █  █  █ █     █   █ █   █ █    "));
-            content.push(format!("{logo_pad}█   █   █    ███  █     █  ████  ███  ████  █████"));
+            content.push(format!(
+                "{logo_pad}███  █████  ███  █     █  ████  ███  ████  █████"
+            ));
+            content.push(format!(
+                "{logo_pad}█   █   █   █   █ ██   ██ █     █   █ █   █ █    "
+            ));
+            content.push(format!(
+                "{logo_pad}█████   █   █   █ █ █ █ █ █     █   █ █   █ ████ "
+            ));
+            content.push(format!(
+                "{logo_pad}█   █   █   █   █ █  █  █ █     █   █ █   █ █    "
+            ));
+            content.push(format!(
+                "{logo_pad}█   █   █    ███  █     █  ████  ███  ████  █████"
+            ));
             content.push(String::new());
             content.push(
                 t(Msg::OnboardingIntroVersionLine {

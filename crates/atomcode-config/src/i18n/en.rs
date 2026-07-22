@@ -485,6 +485,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Usage: /undo  or  /undo N  (N = turn number).\n".into(),
         Msg::CmdNoChanges =>
             "  (no changes)\n".into(),
+        Msg::CmdDiffTruncated =>
+            "  … diff output truncated\n".into(),
         Msg::CmdCheckingUpdate =>
             "  Checking for updates...\n".into(),
         Msg::CmdNoActiveProvider =>

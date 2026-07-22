@@ -22,6 +22,27 @@ use tokio::sync::Mutex;
 
 use crate::acp::engine::EngineConfig;
 
+fn prompt_terminal(
+    stop: StopReason,
+    last_error: Option<String>,
+) -> Result<agent_client_protocol::schema::v1::StopReason, String> {
+    crate::acp::translate::stop_reason(stop)
+        .map_err(|fallback| last_error.unwrap_or_else(|| fallback.to_string()))
+}
+
+fn prompt_completion_terminal(
+    completion: &TurnCompletion,
+    last_error: Option<String>,
+) -> Result<agent_client_protocol::schema::v1::StopReason, String> {
+    match completion {
+        TurnCompletion::Completed { reason, .. } => prompt_terminal(*reason, last_error),
+        TurnCompletion::SnapshotUnavailable { reason, error, .. } => Err(format!(
+            "{} (turn completion: SnapshotUnavailable, reason: {reason:?})",
+            error.message
+        )),
+    }
+}
+
 // ── Session table ─────────────────────────────────────────────────────────────
 
 /// Per-session state held in the shared table.
@@ -182,7 +203,7 @@ pub async fn run_prompt_turn(
     // poisons the NEXT prompt (which would read the stale `TurnComplete` first).
     // Capture the error message and decide the response AFTER the loop.
     let mut last_error: Option<String> = None;
-    let stop = loop {
+    let terminal = loop {
         match rx.recv().await.map(|event| event.event) {
             Some(CodingRuntimeEvent::Request(request)) if request.kind == "approval" => {
                 if auto_approve {
@@ -219,17 +240,7 @@ pub async fn run_prompt_turn(
                 eprintln!("acp: unhandled kernel request kind; responding null");
                 let _ = runtime.respond(request.id, serde_json::Value::Null).await;
             }
-            Some(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
-                reason, ..
-            })) => break reason,
-            Some(CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
-                reason,
-                error,
-                ..
-            })) => {
-                last_error = Some(error.message);
-                break reason;
-            }
+            Some(CodingRuntimeEvent::TurnFinished(completion)) => break Ok(completion),
             Some(CodingRuntimeEvent::Agent(AgentEvent::Error { message, .. })) => {
                 // Do NOT return — keep looping so the trailing `TurnComplete` is
                 // consumed and cannot poison the next prompt on this session.
@@ -242,24 +253,27 @@ pub async fn run_prompt_turn(
             }
             Some(CodingRuntimeEvent::RuntimeStopped(_)) => {
                 last_error = Some("acp: coding runtime stopped before turn terminal".into());
-                break StopReason::ProviderError;
+                break Err(StopReason::ProviderError);
             }
             Some(_) => {}
             None => {
                 last_error =
                     Some("acp: coding runtime event stream closed before turn terminal".into());
-                break StopReason::ProviderError;
+                break Err(StopReason::ProviderError);
             }
         }
     };
 
-    if let Some(msg) = last_error {
-        responder.respond_with_internal_error(msg)
-    } else {
-        match crate::acp::translate::stop_reason(stop) {
-            Ok(sr) => responder.respond(PromptResponse::new(sr)),
-            Err(msg) => responder.respond_with_internal_error(msg),
-        }
+    // TurnFinished is authoritative. Budget/loop fuses may emit an AgentError
+    // diagnostic immediately before their typed terminal; ACP must still return
+    // MaxTurnRequests instead of misreporting an internal provider failure.
+    let response = match terminal {
+        Ok(completion) => prompt_completion_terminal(&completion, last_error),
+        Err(stop) => prompt_terminal(stop, last_error),
+    };
+    match response {
+        Ok(sr) => responder.respond(PromptResponse::new(sr)),
+        Err(message) => responder.respond_with_internal_error(message),
     }
 }
 
@@ -316,6 +330,48 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].media_type, "image/png");
         assert_eq!(images[0].data, "BASE64");
+    }
+
+    #[test]
+    fn typed_fuse_terminal_overrides_preceding_error_diagnostic() {
+        use agent_client_protocol::schema::v1::StopReason as AcpStop;
+
+        assert_eq!(
+            prompt_terminal(StopReason::MaxRounds, Some("max rounds diagnostic".into()),).unwrap(),
+            AcpStop::MaxTurnRequests,
+        );
+        assert_eq!(
+            prompt_terminal(
+                StopReason::ToolLoopDetected,
+                Some("tool loop diagnostic".into()),
+            )
+            .unwrap(),
+            AcpStop::MaxTurnRequests,
+        );
+        assert_eq!(
+            prompt_terminal(
+                StopReason::ProviderError,
+                Some("provider connection failed".into()),
+            )
+            .unwrap_err(),
+            "provider connection failed",
+        );
+    }
+
+    #[test]
+    fn snapshot_unavailable_is_acp_failure_even_when_reason_is_stopped() {
+        let completion = TurnCompletion::SnapshotUnavailable {
+            turn_id: 1,
+            reason: StopReason::Stopped,
+            error: atomcode_coding::RuntimeSnapshotError {
+                message: "snapshot failed".into(),
+            },
+            stats: Default::default(),
+        };
+
+        let error = prompt_completion_terminal(&completion, None).unwrap_err();
+        assert!(error.contains("snapshot failed"));
+        assert!(error.contains("Stopped"));
     }
 
     #[tokio::test]

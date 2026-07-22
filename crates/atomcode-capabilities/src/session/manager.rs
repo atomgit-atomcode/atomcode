@@ -4,6 +4,8 @@
 //! The hooks (snapshot / transcript) and the recall tool call into this; the manager
 //! itself does only file IO, so it is fully unit-testable with a temp root.
 
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -17,7 +19,9 @@ use std::sync::{Barrier, Mutex};
 use atomcode_kernel::message::{Message, Role, SessionSnapshot, SNAPSHOT_VERSION};
 use serde::{de::IgnoredAny, Deserialize, Serialize};
 
-use super::presentation::{PresentationEntry, PresentationFile, MAX_PRESENTATION_BYTES};
+use super::presentation::{
+    DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, MAX_PRESENTATION_BYTES,
+};
 
 /// Fast-listing metadata for ONE session — read to populate a `/resume` picker WITHOUT
 /// parsing the (large) snapshot / transcript files. Persisted as `<id>.meta`.
@@ -89,9 +93,18 @@ pub enum SessionStoreError {
         path: PathBuf,
         source: io::Error,
     },
+    UncertainCommit {
+        id: String,
+        commit_error: String,
+        rollback_errors: Vec<String>,
+    },
 }
 
 impl SessionStoreError {
+    pub fn is_uncertain_commit(&self) -> bool {
+        matches!(self, Self::UncertainCommit { .. })
+    }
+
     pub fn kind(&self) -> io::ErrorKind {
         match self {
             Self::InvalidId { .. } => io::ErrorKind::InvalidInput,
@@ -104,6 +117,7 @@ impl SessionStoreError {
             | Self::Corrupt { .. }
             | Self::UnsafeFile { .. } => io::ErrorKind::InvalidData,
             Self::Io { source, .. } => source.kind(),
+            Self::UncertainCommit { .. } => io::ErrorKind::Other,
         }
     }
 }
@@ -158,6 +172,15 @@ impl fmt::Display for SessionStoreError {
                 write!(f, "unsafe session file {}: {reason}", path.display())
             }
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::UncertainCommit {
+                id,
+                commit_error,
+                rollback_errors,
+            } => write!(
+                f,
+                "session {id:?} commit failed ({commit_error}) and rollback was incomplete: {}",
+                rollback_errors.join("; ")
+            ),
         }
     }
 }
@@ -431,6 +454,16 @@ pub struct LoadedSession {
     pub presentation: PresentationFile,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum NativeImportCommitOutcome {
+    Committed(SessionMeta),
+    Conflict {
+        meta: SessionMeta,
+        snapshot: Option<SessionSnapshot>,
+        presentation: Option<PresentationFile>,
+    },
+}
+
 /// Minimal, core-free view of a historical `<id>.json`. Unknown fields, including
 /// the full conversation, are streamed past by serde instead of entering catalog memory.
 #[derive(Deserialize)]
@@ -495,6 +528,38 @@ pub struct SessionManager {
     root: PathBuf,
     #[cfg(test)]
     meta_read_pause: Mutex<Option<Arc<MetaReadPause>>>,
+    #[cfg(test)]
+    commit_write_faults: Mutex<VecDeque<CommitWriteFault>>,
+    #[cfg(test)]
+    commit_write_log: Mutex<Vec<CommitArtifact>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitArtifact {
+    Snapshot,
+    Presentation,
+    Meta,
+}
+
+struct CommitReplacement {
+    artifact: CommitArtifact,
+    path: PathBuf,
+    before: Option<Vec<u8>>,
+    after: Vec<u8>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitFaultTiming {
+    BeforeReplace,
+    AfterReplace,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommitWriteFault {
+    artifact: CommitArtifact,
+    timing: CommitFaultTiming,
 }
 
 /// A cloneable RAII claim on one active session. The OS releases the advisory
@@ -580,6 +645,10 @@ impl SessionManager {
             root,
             #[cfg(test)]
             meta_read_pause: Mutex::new(None),
+            #[cfg(test)]
+            commit_write_faults: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            commit_write_log: Mutex::new(Vec::new()),
         }
     }
 
@@ -589,6 +658,10 @@ impl SessionManager {
             root: root.into(),
             #[cfg(test)]
             meta_read_pause: Mutex::new(None),
+            #[cfg(test)]
+            commit_write_faults: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            commit_write_log: Mutex::new(Vec::new()),
         }
     }
 
@@ -673,10 +746,12 @@ impl SessionManager {
 
     /// Persist the working-set snapshot (atomic). Overwrites every turn.
     pub fn save_snapshot(&self, id: &str, snap: &SessionSnapshot) -> SessionResult<()> {
-        self.ensure_native_writable(id, "save snapshot")?;
         validate_snapshot(snap)?;
         let bytes = serialize_bounded(snap, "snapshot", MAX_SNAPSHOT_BYTES)?;
-        atomic_write(&self.snapshot_path(id)?, &bytes)
+        self.with_meta_lock(id, || {
+            self.ensure_native_writable(id, "save snapshot")?;
+            atomic_write(&self.snapshot_path(id)?, &bytes)
+        })
     }
 
     pub fn load_snapshot(&self, id: &str) -> SessionResult<SessionSnapshot> {
@@ -721,11 +796,11 @@ impl SessionManager {
     /// Atomically mutate an existing meta across threads and processes. The advisory
     /// lock covers the whole read-modify-write sequence; `write_meta` alone only
     /// serializes complete replacements and must not be used with a stale prior read.
-    pub fn update_meta(
+    pub fn update_meta<T>(
         &self,
         id: &str,
-        update: impl FnOnce(&mut SessionMeta),
-    ) -> SessionResult<()> {
+        update: impl FnOnce(&mut SessionMeta) -> T,
+    ) -> SessionResult<T> {
         self.with_meta_lock(id, || {
             let mut meta = self.read_meta(id)?;
             if meta.owner == StorageOwner::Legacy {
@@ -735,9 +810,18 @@ impl SessionManager {
                     operation: "update native metadata",
                 });
             }
-            update(&mut meta);
+            let original_owner = meta.owner.clone();
+            let result = update(&mut meta);
             ensure_meta_id(id, &meta)?;
-            self.write_meta_unlocked(&meta)
+            if meta.owner != original_owner {
+                return Err(SessionStoreError::OwnershipConflict {
+                    id: id.to_string(),
+                    owner: meta.owner,
+                    operation: "change storage owner through metadata update",
+                });
+            }
+            self.write_meta_unlocked(&meta)?;
+            Ok(result)
         })
     }
 
@@ -778,6 +862,214 @@ impl SessionManager {
         let lock = open_lock_file(&lock_path)?;
         fs2::FileExt::lock_exclusive(&lock).map_err(|e| io_at(&lock_path, e))?;
         operation()
+    }
+
+    fn commit_atomic_write(
+        &self,
+        _artifact: CommitArtifact,
+        path: &Path,
+        bytes: &[u8],
+    ) -> SessionResult<()> {
+        #[cfg(test)]
+        {
+            self.commit_write_log.lock().unwrap().push(_artifact);
+            if self.take_commit_write_fault(_artifact, CommitFaultTiming::BeforeReplace) {
+                return Err(io_at(
+                    path,
+                    io::Error::other("injected commit failure before replacement"),
+                ));
+            }
+        }
+        atomic_write(path, bytes)?;
+        #[cfg(test)]
+        if self.take_commit_write_fault(_artifact, CommitFaultTiming::AfterReplace) {
+            return Err(io_at(
+                path,
+                io::Error::other("injected commit failure after replacement"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit_replacements_with_rollback(
+        &self,
+        id: &str,
+        replacements: &[CommitReplacement],
+    ) -> SessionResult<()> {
+        let mut attempted = Vec::with_capacity(replacements.len());
+        for (index, replacement) in replacements.iter().enumerate() {
+            attempted.push(index);
+            if let Err(commit_error) = self.commit_atomic_write(
+                replacement.artifact,
+                &replacement.path,
+                &replacement.after,
+            ) {
+                let mut rollback_errors = Vec::new();
+                // Restore the catalog-visible metadata commit point first, then
+                // unwind sidecars in reverse publication order.
+                for attempted_index in attempted.into_iter().rev() {
+                    let attempted_replacement = &replacements[attempted_index];
+                    let rollback = match attempted_replacement.before.as_deref() {
+                        Some(before) => self.commit_atomic_write(
+                            attempted_replacement.artifact,
+                            &attempted_replacement.path,
+                            before,
+                        ),
+                        None => self.commit_atomic_remove(
+                            attempted_replacement.artifact,
+                            &attempted_replacement.path,
+                        ),
+                    };
+                    if let Err(rollback_error) = rollback {
+                        rollback_errors.push(format!(
+                            "{}: {rollback_error}",
+                            attempted_replacement.path.display()
+                        ));
+                    }
+                }
+                if rollback_errors.is_empty() {
+                    return Err(commit_error);
+                }
+                return Err(SessionStoreError::UncertainCommit {
+                    id: id.to_string(),
+                    commit_error: commit_error.to_string(),
+                    rollback_errors,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_atomic_remove(&self, _artifact: CommitArtifact, path: &Path) -> SessionResult<()> {
+        #[cfg(test)]
+        {
+            self.commit_write_log.lock().unwrap().push(_artifact);
+            if self.take_commit_write_fault(_artifact, CommitFaultTiming::BeforeReplace) {
+                return Err(io_at(
+                    path,
+                    io::Error::other("injected commit failure before removal"),
+                ));
+            }
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io_at(path, error)),
+        }
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| io_at(parent, error))?;
+        }
+        #[cfg(test)]
+        if self.take_commit_write_fault(_artifact, CommitFaultTiming::AfterReplace) {
+            return Err(io_at(
+                path,
+                io::Error::other("injected commit failure after removal"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_snapshot_artifact(&self, id: &str) -> SessionResult<(SessionSnapshot, Vec<u8>)> {
+        let bytes =
+            read_regular_file_bounded(&self.snapshot_path(id)?, "snapshot", MAX_SNAPSHOT_BYTES)?;
+        let snapshot: SessionSnapshot = deserialize(&bytes, "snapshot")?;
+        validate_snapshot(&snapshot)?;
+        Ok((snapshot, bytes))
+    }
+
+    fn read_optional_snapshot_artifact(
+        &self,
+        id: &str,
+    ) -> SessionResult<Option<(SessionSnapshot, Vec<u8>)>> {
+        match self.read_snapshot_artifact(id) {
+            Ok(artifact) => Ok(Some(artifact)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_presentation_artifact(&self, id: &str) -> SessionResult<(PresentationFile, Vec<u8>)> {
+        let bytes = read_regular_file_bounded(
+            &self.presentation_path(id)?,
+            "presentation",
+            MAX_PRESENTATION_BYTES,
+        )?;
+        let presentation: PresentationFile = deserialize(&bytes, "presentation")?;
+        presentation.validate()?;
+        Ok((presentation, bytes))
+    }
+
+    fn read_optional_presentation_artifact(
+        &self,
+        id: &str,
+    ) -> SessionResult<Option<(PresentationFile, Vec<u8>)>> {
+        match self.read_presentation_artifact(id) {
+            Ok(artifact) => Ok(Some(artifact)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_meta_artifact(&self, id: &str) -> SessionResult<(SessionMeta, Vec<u8>)> {
+        let bytes =
+            read_regular_file_bounded(&self.meta_path(id)?, "session meta", MAX_META_BYTES)?;
+        let meta: SessionMeta = deserialize(&bytes, "session meta")?;
+        if meta.v > META_VERSION {
+            return Err(SessionStoreError::FutureSchema {
+                kind: "session meta",
+                found: meta.v,
+                supported: META_VERSION,
+            });
+        }
+        validate_meta(&meta)?;
+        ensure_meta_id(id, &meta)?;
+        #[cfg(test)]
+        if let Some(pause) = self.meta_read_pause.lock().unwrap().take() {
+            pause.entered.wait();
+            pause.resume.wait();
+        }
+        Ok((meta, bytes))
+    }
+
+    fn read_optional_meta_artifact(
+        &self,
+        id: &str,
+    ) -> SessionResult<Option<(SessionMeta, Vec<u8>)>> {
+        match self.read_meta_artifact(id) {
+            Ok(artifact) => Ok(Some(artifact)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(test)]
+    fn take_commit_write_fault(&self, artifact: CommitArtifact, timing: CommitFaultTiming) -> bool {
+        let mut faults = self.commit_write_faults.lock().unwrap();
+        if faults
+            .front()
+            .is_some_and(|fault| fault.artifact == artifact && fault.timing == timing)
+        {
+            faults.pop_front();
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_commit_write(&self, artifact: CommitArtifact, timing: CommitFaultTiming) {
+        self.commit_write_faults
+            .lock()
+            .unwrap()
+            .push_back(CommitWriteFault { artifact, timing });
+    }
+
+    #[cfg(test)]
+    fn take_commit_write_log(&self) -> Vec<CommitArtifact> {
+        std::mem::take(&mut *self.commit_write_log.lock().unwrap())
     }
 
     pub fn read_meta(&self, id: &str) -> SessionResult<SessionMeta> {
@@ -845,20 +1137,22 @@ impl SessionManager {
     /// any missing artifact is an explicit error; callers must cut over through the
     /// importer instead of manufacturing defaults.
     pub fn load_native_session(&self, id: &str) -> SessionResult<LoadedSession> {
-        let meta = self.read_meta(id)?;
-        if meta.owner != StorageOwner::Native {
-            return Err(SessionStoreError::OwnershipConflict {
-                id: id.to_string(),
-                owner: meta.owner,
-                operation: "load native session",
-            });
-        }
-        let snapshot = self.load_snapshot(id)?;
-        let presentation = self.read_presentation(id)?;
-        Ok(LoadedSession {
-            meta,
-            snapshot,
-            presentation,
+        self.with_meta_lock(id, || {
+            let meta = self.read_meta(id)?;
+            if meta.owner != StorageOwner::Native {
+                return Err(SessionStoreError::OwnershipConflict {
+                    id: id.to_string(),
+                    owner: meta.owner,
+                    operation: "load native session",
+                });
+            }
+            let snapshot = self.load_snapshot(id)?;
+            let presentation = self.read_presentation(id)?;
+            Ok(LoadedSession {
+                meta,
+                snapshot,
+                presentation,
+            })
         })
     }
 
@@ -908,64 +1202,504 @@ impl SessionManager {
 
         self.with_meta_lock(lease.id(), || {
             self.cleanup_import_staging(lease.id())?;
-            if let Some(bytes) = &snapshot_bytes {
-                atomic_write(&self.snapshot_path(lease.id())?, bytes)?;
+            let current_meta = self.read_optional_meta_artifact(lease.id())?;
+            match current_meta.as_ref().map(|(meta, _)| meta) {
+                None => {
+                    if snapshot.is_none() || presentation.is_none() {
+                        return Err(SessionStoreError::Corrupt {
+                            kind: "session import",
+                            message: "a new native aggregate requires snapshot and presentation"
+                                .into(),
+                        });
+                    }
+                }
+                Some(existing) if existing.owner == StorageOwner::Legacy => {}
+                Some(existing) if existing.owner == StorageOwner::Native && existing == meta => {}
+                Some(existing) => {
+                    return Err(SessionStoreError::OwnershipConflict {
+                        id: lease.id().to_string(),
+                        owner: existing.owner.clone(),
+                        operation: "replace import metadata without expected-state CAS",
+                    });
+                }
             }
-            if let Some(bytes) = &presentation_bytes {
-                atomic_write(&self.presentation_path(lease.id())?, bytes)?;
+            let replacing_legacy_sidecars = current_meta
+                .as_ref()
+                .is_some_and(|(meta, _)| meta.owner == StorageOwner::Legacy);
+            let (current_snapshot, invalid_snapshot_preimage) =
+                match self.read_optional_snapshot_artifact(lease.id()) {
+                    Err(SessionStoreError::Corrupt { .. })
+                        if replacing_legacy_sidecars && snapshot.is_some() =>
+                    {
+                        (
+                            None,
+                            Some(read_regular_file_bounded(
+                                &self.snapshot_path(lease.id())?,
+                                "snapshot",
+                                MAX_SNAPSHOT_BYTES,
+                            )?),
+                        )
+                    }
+                    result => (result?, None),
+                };
+            let (current_presentation, invalid_presentation_preimage) =
+                match self.read_optional_presentation_artifact(lease.id()) {
+                    Err(SessionStoreError::Corrupt { .. })
+                        if replacing_legacy_sidecars && presentation.is_some() =>
+                    {
+                        (
+                            None,
+                            Some(read_regular_file_bounded(
+                                &self.presentation_path(lease.id())?,
+                                "presentation",
+                                MAX_PRESENTATION_BYTES,
+                            )?),
+                        )
+                    }
+                    result => (result?, None),
+                };
+            if current_meta
+                .as_ref()
+                .is_some_and(|(existing, _)| existing.owner == StorageOwner::Native)
+                && (snapshot.is_some_and(|snapshot| {
+                    current_snapshot.as_ref().map(|(current, _)| current) != Some(snapshot)
+                }) || presentation.is_some_and(|presentation| {
+                    current_presentation.as_ref().map(|(current, _)| current) != Some(presentation)
+                }))
+            {
+                return Err(SessionStoreError::OwnershipConflict {
+                    id: lease.id().to_string(),
+                    owner: StorageOwner::Native,
+                    operation: "replace native sidecars without expected-state CAS",
+                });
+            }
+            self.publish_native_import_locked(
+                lease.id(),
+                current_meta,
+                current_snapshot,
+                current_presentation,
+                invalid_snapshot_preimage,
+                invalid_presentation_preimage,
+                snapshot,
+                snapshot_bytes.as_deref(),
+                presentation,
+                presentation_bytes.as_deref(),
+                meta,
+                &meta_bytes,
+            )
+        })
+    }
+
+    /// Publish an import only if all existing native artifacts still match the
+    /// state observed by the importer. `None` in the expected sidecars means the
+    /// file was absent, not "ignore this artifact". A conflict performs no writes
+    /// and returns the complete fresh state so the caller can recompute safely.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_native_import_if_unchanged(
+        &self,
+        lease: &SessionLease,
+        expected_meta: &SessionMeta,
+        expected_snapshot: Option<&SessionSnapshot>,
+        expected_presentation: Option<&PresentationFile>,
+        snapshot: Option<&SessionSnapshot>,
+        presentation: Option<&PresentationFile>,
+        meta: &SessionMeta,
+    ) -> SessionResult<NativeImportCommitOutcome> {
+        self.validate_lease(lease)?;
+        ensure_meta_id(lease.id(), expected_meta)?;
+        ensure_meta_id(lease.id(), meta)?;
+        if meta.owner != StorageOwner::Native {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session import",
+                message: "commit point requires owner=native".into(),
+            });
+        }
+        if expected_meta.owner != StorageOwner::Unconfirmed {
+            return Err(SessionStoreError::OwnershipConflict {
+                id: lease.id().to_string(),
+                owner: expected_meta.owner.clone(),
+                operation: "commit native import through unconfirmed-state CAS",
+            });
+        }
+        validate_meta(expected_meta)?;
+        validate_meta(meta)?;
+        if let Some(snapshot) = expected_snapshot {
+            validate_snapshot(snapshot)?;
+        }
+        if let Some(presentation) = expected_presentation {
+            presentation.validate()?;
+        }
+        let snapshot_bytes = snapshot
+            .map(|snapshot| {
+                validate_snapshot(snapshot)?;
+                serialize_bounded(snapshot, "snapshot", MAX_SNAPSHOT_BYTES)
+            })
+            .transpose()?;
+        let presentation_bytes = presentation
+            .map(|presentation| {
+                presentation.validate()?;
+                serialize_pretty_bounded(presentation, "presentation", MAX_PRESENTATION_BYTES)
+            })
+            .transpose()?;
+        let meta_bytes = serialize_pretty_bounded(meta, "session meta", MAX_META_BYTES)?;
+
+        self.with_meta_lock(lease.id(), || {
+            self.cleanup_import_staging(lease.id())?;
+            let Some(current_meta) = self.read_optional_meta_artifact(lease.id())? else {
+                return Err(SessionStoreError::NotFound {
+                    path: self.meta_path(lease.id())?,
+                });
+            };
+            let current_snapshot = self.read_optional_snapshot_artifact(lease.id())?;
+            let current_presentation = self.read_optional_presentation_artifact(lease.id())?;
+            if current_meta.0 != *expected_meta
+                || current_snapshot.as_ref().map(|(snapshot, _)| snapshot) != expected_snapshot
+                || current_presentation
+                    .as_ref()
+                    .map(|(presentation, _)| presentation)
+                    != expected_presentation
+            {
+                return Ok(NativeImportCommitOutcome::Conflict {
+                    meta: current_meta.0,
+                    snapshot: current_snapshot.map(|(snapshot, _)| snapshot),
+                    presentation: current_presentation.map(|(presentation, _)| presentation),
+                });
+            }
+            self.publish_native_import_locked(
+                lease.id(),
+                Some(current_meta),
+                current_snapshot,
+                current_presentation,
+                None,
+                None,
+                snapshot,
+                snapshot_bytes.as_deref(),
+                presentation,
+                presentation_bytes.as_deref(),
+                meta,
+                &meta_bytes,
+            )?;
+            Ok(NativeImportCommitOutcome::Committed(meta.clone()))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_native_import_locked(
+        &self,
+        id: &str,
+        current_meta: Option<(SessionMeta, Vec<u8>)>,
+        current_snapshot: Option<(SessionSnapshot, Vec<u8>)>,
+        current_presentation: Option<(PresentationFile, Vec<u8>)>,
+        invalid_snapshot_preimage: Option<Vec<u8>>,
+        invalid_presentation_preimage: Option<Vec<u8>>,
+        snapshot: Option<&SessionSnapshot>,
+        snapshot_bytes: Option<&[u8]>,
+        presentation: Option<&PresentationFile>,
+        presentation_bytes: Option<&[u8]>,
+        meta: &SessionMeta,
+        meta_bytes: &[u8],
+    ) -> SessionResult<()> {
+        let final_snapshot = snapshot
+            .or_else(|| current_snapshot.as_ref().map(|(snapshot, _)| snapshot))
+            .ok_or_else(|| SessionStoreError::NotFound {
+                path: self.snapshot_path(id).expect("validated session id"),
+            })?;
+        validate_snapshot(final_snapshot)?;
+        let final_presentation = presentation
+            .or_else(|| {
+                current_presentation
+                    .as_ref()
+                    .map(|(presentation, _)| presentation)
+            })
+            .ok_or_else(|| SessionStoreError::NotFound {
+                path: self.presentation_path(id).expect("validated session id"),
+            })?;
+        final_presentation.validate()?;
+
+        let mut replacements = Vec::with_capacity(3);
+        if let Some(snapshot) = snapshot {
+            if current_snapshot.as_ref().map(|(current, _)| current) != Some(snapshot) {
+                replacements.push(CommitReplacement {
+                    artifact: CommitArtifact::Snapshot,
+                    path: self.snapshot_path(id)?,
+                    before: current_snapshot
+                        .as_ref()
+                        .map(|(_, bytes)| bytes.clone())
+                        .or_else(|| invalid_snapshot_preimage.clone()),
+                    after: snapshot_bytes
+                        .expect("serialized supplied snapshot")
+                        .to_vec(),
+                });
+            }
+        }
+        if let Some(presentation) = presentation {
+            if current_presentation.as_ref().map(|(current, _)| current) != Some(presentation) {
+                replacements.push(CommitReplacement {
+                    artifact: CommitArtifact::Presentation,
+                    path: self.presentation_path(id)?,
+                    before: current_presentation
+                        .as_ref()
+                        .map(|(_, bytes)| bytes.clone())
+                        .or_else(|| invalid_presentation_preimage.clone()),
+                    after: presentation_bytes
+                        .expect("serialized supplied presentation")
+                        .to_vec(),
+                });
+            }
+        }
+        if current_meta.as_ref().map(|(current, _)| current) != Some(meta) {
+            replacements.push(CommitReplacement {
+                artifact: CommitArtifact::Meta,
+                path: self.meta_path(id)?,
+                before: current_meta.as_ref().map(|(_, bytes)| bytes.clone()),
+                after: meta_bytes.to_vec(),
+            });
+        }
+        self.commit_replacements_with_rollback(id, &replacements)
+    }
+
+    /// Publish the durable intent for a full legacy cutover before replacing any
+    /// snapshot or presentation sidecar. A subsequent importer run can therefore
+    /// distinguish an interrupted cutover from an owner-native session whose
+    /// historical metadata is missing.
+    pub fn begin_legacy_import(
+        &self,
+        lease: &SessionLease,
+        intent_meta: &SessionMeta,
+    ) -> SessionResult<()> {
+        self.validate_lease(lease)?;
+        ensure_meta_id(lease.id(), intent_meta)?;
+        if intent_meta.owner != StorageOwner::Legacy {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session import",
+                message: "legacy import intent requires owner=legacy".into(),
+            });
+        }
+        if intent_meta.import_info.is_some() {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session import",
+                message: "legacy import intent must not claim completed import provenance".into(),
+            });
+        }
+        validate_meta(intent_meta)?;
+        let meta_bytes = serialize_pretty_bounded(intent_meta, "session meta", MAX_META_BYTES)?;
+
+        self.with_meta_lock(lease.id(), || {
+            match self.read_meta(lease.id()) {
+                Ok(existing) if existing.owner == StorageOwner::Native => {
+                    return Err(SessionStoreError::OwnershipConflict {
+                        id: lease.id().to_string(),
+                        owner: StorageOwner::Native,
+                        operation: "begin legacy import",
+                    });
+                }
+                Ok(existing) if existing.owner == StorageOwner::Unconfirmed => {
+                    return Err(SessionStoreError::OwnershipConflict {
+                        id: lease.id().to_string(),
+                        owner: StorageOwner::Unconfirmed,
+                        operation: "begin legacy import without expected-state CAS",
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
             atomic_write(&self.meta_path(lease.id())?, &meta_bytes)
         })
     }
 
+    /// Publish a legacy import intent only if the complete pre-cutover aggregate
+    /// still matches the state observed by the importer. `None` is an exact
+    /// expectation that the artifact is absent. A conflict performs no writes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_legacy_import_if_unchanged(
+        &self,
+        lease: &SessionLease,
+        expected_meta: Option<&SessionMeta>,
+        expected_snapshot: Option<&SessionSnapshot>,
+        expected_presentation: Option<&PresentationFile>,
+        intent_meta: &SessionMeta,
+    ) -> SessionResult<bool> {
+        self.validate_lease(lease)?;
+        ensure_meta_id(lease.id(), intent_meta)?;
+        if let Some(expected_meta) = expected_meta {
+            ensure_meta_id(lease.id(), expected_meta)?;
+            validate_meta(expected_meta)?;
+            if expected_meta.owner != StorageOwner::Unconfirmed {
+                return Err(SessionStoreError::OwnershipConflict {
+                    id: lease.id().to_string(),
+                    owner: expected_meta.owner.clone(),
+                    operation: "begin legacy import with expected-state CAS",
+                });
+            }
+        }
+        if let Some(expected_snapshot) = expected_snapshot {
+            validate_snapshot(expected_snapshot)?;
+        }
+        if let Some(expected_presentation) = expected_presentation {
+            expected_presentation.validate()?;
+        }
+        if intent_meta.owner != StorageOwner::Legacy || intent_meta.import_info.is_some() {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session import",
+                message: "legacy import intent must use owner=legacy without completed provenance"
+                    .into(),
+            });
+        }
+        validate_meta(intent_meta)?;
+        let intent_bytes = serialize_pretty_bounded(intent_meta, "session meta", MAX_META_BYTES)?;
+
+        self.with_meta_lock(lease.id(), || {
+            let current_meta = self.read_optional_meta_artifact(lease.id())?;
+            let current_snapshot = self.read_optional_snapshot_artifact(lease.id())?;
+            let current_presentation = self.read_optional_presentation_artifact(lease.id())?;
+            if current_meta.as_ref().map(|(meta, _)| meta) != expected_meta
+                || current_snapshot.as_ref().map(|(snapshot, _)| snapshot) != expected_snapshot
+                || current_presentation
+                    .as_ref()
+                    .map(|(presentation, _)| presentation)
+                    != expected_presentation
+            {
+                return Ok(false);
+            }
+            self.commit_atomic_write(
+                CommitArtifact::Meta,
+                &self.meta_path(lease.id())?,
+                &intent_bytes,
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Commit a prepared owner-native metadata repair only if metadata, snapshot,
+    /// and presentation still match the state on which the repair was based. The
+    /// sidecars are CAS evidence only and are never rewritten by this operation.
+    pub fn commit_native_sidecar_repair_if_unchanged(
+        &self,
+        lease: &SessionLease,
+        expected_meta: &SessionMeta,
+        expected_snapshot: &SessionSnapshot,
+        expected_presentation: &PresentationFile,
+        repaired_meta: &SessionMeta,
+    ) -> SessionResult<bool> {
+        self.validate_lease(lease)?;
+        ensure_meta_id(lease.id(), expected_meta)?;
+        ensure_meta_id(lease.id(), repaired_meta)?;
+        if expected_meta.owner != StorageOwner::Native
+            || repaired_meta.owner != StorageOwner::Native
+        {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session sidecar repair",
+                message: "sidecar repair requires owner=native metadata".into(),
+            });
+        }
+        validate_meta(expected_meta)?;
+        validate_meta(repaired_meta)?;
+        validate_snapshot(expected_snapshot)?;
+        expected_presentation.validate()?;
+        let repaired_meta_bytes =
+            serialize_pretty_bounded(repaired_meta, "session meta", MAX_META_BYTES)?;
+
+        self.with_meta_lock(lease.id(), || {
+            let current_meta = self.read_meta(lease.id())?;
+            if current_meta.owner != StorageOwner::Native {
+                return Err(SessionStoreError::OwnershipConflict {
+                    id: lease.id().to_string(),
+                    owner: current_meta.owner,
+                    operation: "commit native sidecar repair",
+                });
+            }
+            let current_snapshot = self.load_snapshot(lease.id())?;
+            let current_presentation = self.read_presentation(lease.id())?;
+            if &current_meta != expected_meta
+                || &current_snapshot != expected_snapshot
+                || &current_presentation != expected_presentation
+            {
+                return Ok(false);
+            }
+            if &current_meta != repaired_meta {
+                atomic_write(&self.meta_path(lease.id())?, &repaired_meta_bytes)?;
+            }
+            Ok(true)
+        })
+    }
+
     /// Commit an owner-native runtime mutation under the active session lease.
-    /// All payloads are validated and serialized before the first replacement;
+    /// The snapshot is prepared before locking; metadata and presentation are then
+    /// loaded and mutated under their shared cross-process lock so a stale caller
+    /// cannot overwrite a concurrent rename or presentation append. All three
+    /// payloads are validated and serialized before the first replacement;
     /// metadata is written last and is the catalog-visible commit point.
-    pub fn commit_native_runtime_mutation(
+    pub fn commit_native_runtime_mutation<T>(
         &self,
         lease: &SessionLease,
         snapshot: &SessionSnapshot,
-        presentation: &PresentationFile,
-        meta: &SessionMeta,
-    ) -> SessionResult<()> {
+        mutate: impl FnOnce(
+            &SessionSnapshot,
+            &mut SessionMeta,
+            &mut PresentationFile,
+        ) -> SessionResult<T>,
+    ) -> SessionResult<T> {
         self.validate_lease(lease)?;
-        if meta.id != lease.id() {
-            return Err(SessionStoreError::Corrupt {
-                kind: "session mutation",
-                message: format!(
-                    "lease id {:?} does not match metadata id {:?}",
-                    lease.id(),
-                    meta.id
-                ),
-            });
-        }
-        if meta.owner != StorageOwner::Native {
-            return Err(SessionStoreError::OwnershipConflict {
-                id: meta.id.clone(),
-                owner: meta.owner.clone(),
-                operation: "commit native runtime mutation",
-            });
-        }
         validate_snapshot(snapshot)?;
-        presentation.validate()?;
-        validate_meta(meta)?;
         let snapshot_bytes = serialize_bounded(snapshot, "snapshot", MAX_SNAPSHOT_BYTES)?;
-        let presentation_bytes =
-            serialize_pretty_bounded(presentation, "presentation", MAX_PRESENTATION_BYTES)?;
-        let meta_bytes = serialize_pretty_bounded(meta, "session meta", MAX_META_BYTES)?;
 
         self.with_meta_lock(lease.id(), || {
-            let current = self.read_meta(lease.id())?;
-            if current.owner != StorageOwner::Native {
+            let (current_snapshot, original_snapshot_bytes) =
+                self.read_snapshot_artifact(lease.id())?;
+            let (mut meta, original_meta_bytes) = self.read_meta_artifact(lease.id())?;
+            if meta.owner != StorageOwner::Native {
                 return Err(SessionStoreError::OwnershipConflict {
                     id: lease.id().to_string(),
-                    owner: current.owner,
+                    owner: meta.owner,
                     operation: "commit native runtime mutation",
                 });
             }
-            atomic_write(&self.snapshot_path(lease.id())?, &snapshot_bytes)?;
-            atomic_write(&self.presentation_path(lease.id())?, &presentation_bytes)?;
-            atomic_write(&self.meta_path(lease.id())?, &meta_bytes)
+            let (mut presentation, original_presentation_bytes) =
+                self.read_presentation_artifact(lease.id())?;
+            let original_meta = meta.clone();
+            let original_presentation = presentation.clone();
+            let result = mutate(&current_snapshot, &mut meta, &mut presentation)?;
+            ensure_meta_id(lease.id(), &meta)?;
+            if meta.owner != StorageOwner::Native {
+                return Err(SessionStoreError::OwnershipConflict {
+                    id: lease.id().to_string(),
+                    owner: meta.owner,
+                    operation: "commit native runtime mutation",
+                });
+            }
+            validate_meta(&meta)?;
+            presentation.validate()?;
+            let presentation_bytes =
+                serialize_pretty_bounded(&presentation, "presentation", MAX_PRESENTATION_BYTES)?;
+            let meta_bytes = serialize_pretty_bounded(&meta, "session meta", MAX_META_BYTES)?;
+            let mut replacements = Vec::with_capacity(3);
+            if current_snapshot != *snapshot {
+                replacements.push(CommitReplacement {
+                    artifact: CommitArtifact::Snapshot,
+                    path: self.snapshot_path(lease.id())?,
+                    before: Some(original_snapshot_bytes),
+                    after: snapshot_bytes,
+                });
+            }
+            if original_presentation != presentation {
+                replacements.push(CommitReplacement {
+                    artifact: CommitArtifact::Presentation,
+                    path: self.presentation_path(lease.id())?,
+                    before: Some(original_presentation_bytes),
+                    after: presentation_bytes,
+                });
+            }
+            if original_meta != meta {
+                replacements.push(CommitReplacement {
+                    artifact: CommitArtifact::Meta,
+                    path: self.meta_path(lease.id())?,
+                    before: Some(original_meta_bytes),
+                    after: meta_bytes,
+                });
+            }
+            self.commit_replacements_with_rollback(lease.id(), &replacements)?;
+            Ok(result)
         })
     }
 
@@ -1033,6 +1767,52 @@ impl SessionManager {
             };
             presentation.entries.push(entry);
             self.write_presentation_unlocked(id, &presentation)
+        })
+    }
+
+    /// Append catalog/UI messages at the latest valid native turn boundary. Meta
+    /// lookup, anchor selection and presentation read-modify-write are one locked
+    /// operation so a concurrent importer repair cannot invalidate the anchor or
+    /// overwrite the appended entries.
+    pub fn append_presentation_at_latest_valid_turn(
+        &self,
+        id: &str,
+        messages: &[(PresentationRole, String)],
+    ) -> SessionResult<usize> {
+        self.with_meta_lock(id, || {
+            let meta = self.read_meta(id)?;
+            if meta.owner != StorageOwner::Native {
+                return Err(SessionStoreError::OwnershipConflict {
+                    id: id.to_string(),
+                    owner: meta.owner,
+                    operation: "append native presentation",
+                });
+            }
+            let anchor = meta
+                .turn_stats
+                .iter()
+                .rev()
+                .find(|stat| stat.position_valid && stat.turn_id != 0)
+                .map(|stat| DisplayAnchor::AfterTurn {
+                    turn_id: stat.turn_id,
+                })
+                .unwrap_or(DisplayAnchor::AtStart);
+            let mut presentation = self.read_presentation(id)?;
+            presentation
+                .entries
+                .extend(messages.iter().map(|(role, text)| PresentationEntry {
+                    anchor,
+                    role: *role,
+                    text: text.clone(),
+                }));
+            self.write_presentation_unlocked(id, &presentation)?;
+            (meta.message_count as usize)
+                .checked_add(presentation.entries.len())
+                .ok_or(SessionStoreError::TooLarge {
+                    kind: "catalog message count",
+                    limit: usize::MAX,
+                    actual: usize::MAX,
+                })
         })
     }
 
@@ -1635,7 +2415,8 @@ fn catalog_diagnostic_from_error(
         | SessionStoreError::AmbiguousId { .. }
         | SessionStoreError::LeaseMismatch { .. }
         | SessionStoreError::OwnershipConflict { .. }
-        | SessionStoreError::Io { .. } => CatalogDiagnosticKind::Io,
+        | SessionStoreError::Io { .. }
+        | SessionStoreError::UncertainCommit { .. } => CatalogDiagnosticKind::Io,
     };
     CatalogDiagnostic {
         project_bucket,
@@ -2078,13 +2859,16 @@ fn io_at(path: &Path, source: io::Error) -> SessionStoreError {
 }
 
 /// Write `bytes` to `path` atomically: write a sibling `*.tmp` then `rename` over the
-/// target, so a crash mid-write never leaves a half-written (corrupt) session file. The
-/// tmp's extension (`…tmp`) is ignored by [`SessionManager::list`]'s `*.meta` filter,
-/// so a leftover tmp from a crash never appears as a session.
+/// target, then sync the parent directory on Unix so the new directory entry survives
+/// power loss. A crash mid-write never leaves a half-written (corrupt) session file.
+/// The tmp's extension (`…tmp`) is ignored by [`SessionManager::list`]'s `*.meta`
+/// filter, so a leftover tmp from a crash never appears as a session.
 fn atomic_write(path: &Path, bytes: &[u8]) -> SessionResult<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
-    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
     reject_existing_non_regular(path)?;
     static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
     let sequence = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
@@ -2105,7 +2889,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> SessionResult<()> {
             .map_err(|e| io_at(&tmp, e))?;
         file.write_all(bytes).map_err(|e| io_at(&tmp, e))?;
         file.sync_all().map_err(|e| io_at(&tmp, e))?;
-        fs::rename(&tmp, path).map_err(|e| io_at(path, e))
+        fs::rename(&tmp, path).map_err(|e| io_at(path, e))?;
+        #[cfg(unix)]
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| io_at(parent, e))?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -2125,6 +2914,14 @@ mod tests {
 
     fn snap(texts: &[&str]) -> SessionSnapshot {
         SessionSnapshot::new(texts.iter().map(|t| Message::user(*t)).collect())
+    }
+
+    fn native_artifact_bytes(mgr: &SessionManager, id: &str) -> [Vec<u8>; 3] {
+        [
+            std::fs::read(mgr.snapshot_path(id).unwrap()).unwrap(),
+            std::fs::read(mgr.presentation_path(id).unwrap()).unwrap(),
+            std::fs::read(mgr.meta_path(id).unwrap()).unwrap(),
+        ]
     }
 
     #[test]
@@ -2651,6 +3448,297 @@ mod tests {
     }
 
     #[test]
+    fn native_import_never_publishes_an_incomplete_aggregate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut legacy = SessionMeta::new("s1", "/p", 1);
+        legacy.owner = StorageOwner::Legacy;
+        mgr.write_meta(&legacy).unwrap();
+        std::fs::write(mgr.snapshot_path("s1").unwrap(), b"not a snapshot").unwrap();
+        std::fs::write(
+            mgr.presentation_path("s1").unwrap(),
+            serde_json::to_vec(&PresentationFile::default()).unwrap(),
+        )
+        .unwrap();
+        let mut native = legacy.clone();
+        native.owner = StorageOwner::Native;
+
+        assert!(mgr
+            .commit_native_import(&lease, None, None, &native)
+            .is_err());
+        assert_eq!(mgr.read_meta("s1").unwrap(), legacy);
+
+        let fresh_lease = mgr.acquire_lease("fresh").unwrap();
+        let mut fresh = SessionMeta::new("fresh", "/p", 1);
+        fresh.owner = StorageOwner::Native;
+        assert!(matches!(
+            mgr.commit_native_import(&fresh_lease, None, None, &fresh),
+            Err(SessionStoreError::Corrupt {
+                kind: "session import",
+                ..
+            })
+        ));
+        assert!(!mgr.meta_path("fresh").unwrap().exists());
+    }
+
+    #[test]
+    fn unconfirmed_import_requires_full_expected_state_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let expected_meta = SessionMeta::new("s1", "/p", 1);
+        let expected_snapshot = snap(&["native"]);
+        let expected_presentation = PresentationFile::default();
+        mgr.write_meta(&expected_meta).unwrap();
+        mgr.save_snapshot("s1", &expected_snapshot).unwrap();
+        mgr.write_presentation("s1", &expected_presentation)
+            .unwrap();
+        let mut native = expected_meta.clone();
+        native.owner = StorageOwner::Native;
+
+        assert!(matches!(
+            mgr.commit_native_import(&lease, None, None, &native),
+            Err(SessionStoreError::OwnershipConflict {
+                owner: StorageOwner::Unconfirmed,
+                ..
+            })
+        ));
+        let outcome = mgr
+            .commit_native_import_if_unchanged(
+                &lease,
+                &expected_meta,
+                Some(&expected_snapshot),
+                Some(&expected_presentation),
+                None,
+                None,
+                &native,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            NativeImportCommitOutcome::Committed(native.clone())
+        );
+        assert_eq!(mgr.load_native_session("s1").unwrap().meta, native);
+    }
+
+    #[test]
+    fn native_import_cas_conflict_returns_fresh_complete_state_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let expected_meta = SessionMeta::new("s1", "/p", 1);
+        let expected_snapshot = snap(&["before"]);
+        let expected_presentation = PresentationFile::default();
+        mgr.write_meta(&expected_meta).unwrap();
+        mgr.save_snapshot("s1", &expected_snapshot).unwrap();
+        mgr.write_presentation("s1", &expected_presentation)
+            .unwrap();
+        let mut concurrent_meta = expected_meta.clone();
+        concurrent_meta.name = "concurrent rename".into();
+        concurrent_meta.user_renamed = true;
+        mgr.write_meta(&concurrent_meta).unwrap();
+        let concurrent_snapshot = snap(&["concurrent"]);
+        mgr.save_snapshot("s1", &concurrent_snapshot).unwrap();
+        let mut concurrent_presentation = expected_presentation.clone();
+        concurrent_presentation.entries.push(presentation_entry(
+            DisplayAnchor::AtStart,
+            "concurrent append",
+        ));
+        mgr.write_presentation("s1", &concurrent_presentation)
+            .unwrap();
+        let before = native_artifact_bytes(&mgr, "s1");
+        let mut desired_meta = expected_meta.clone();
+        desired_meta.owner = StorageOwner::Native;
+
+        let outcome = mgr
+            .commit_native_import_if_unchanged(
+                &lease,
+                &expected_meta,
+                Some(&expected_snapshot),
+                Some(&expected_presentation),
+                None,
+                None,
+                &desired_meta,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            NativeImportCommitOutcome::Conflict {
+                meta: concurrent_meta,
+                snapshot: Some(concurrent_snapshot),
+                presentation: Some(concurrent_presentation),
+            }
+        );
+        assert_eq!(native_artifact_bytes(&mgr, "s1"), before);
+    }
+
+    #[test]
+    fn native_import_cas_treats_absent_sidecars_as_exact_expectations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let expected_meta = SessionMeta::new("s1", "/p", 1);
+        let expected_snapshot = snap(&["before"]);
+        mgr.write_meta(&expected_meta).unwrap();
+        mgr.save_snapshot("s1", &expected_snapshot).unwrap();
+        let concurrent_presentation = PresentationFile::default();
+        mgr.write_presentation("s1", &concurrent_presentation)
+            .unwrap();
+        let mut desired_meta = expected_meta.clone();
+        desired_meta.owner = StorageOwner::Native;
+
+        let outcome = mgr
+            .commit_native_import_if_unchanged(
+                &lease,
+                &expected_meta,
+                Some(&expected_snapshot),
+                None,
+                None,
+                Some(&concurrent_presentation),
+                &desired_meta,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            NativeImportCommitOutcome::Conflict {
+                meta: expected_meta.clone(),
+                snapshot: Some(expected_snapshot.clone()),
+                presentation: Some(concurrent_presentation.clone()),
+            }
+        );
+        assert_eq!(mgr.read_meta("s1").unwrap(), expected_meta);
+
+        std::fs::remove_file(mgr.snapshot_path("s1").unwrap()).unwrap();
+        let outcome = mgr
+            .commit_native_import_if_unchanged(
+                &lease,
+                &expected_meta,
+                Some(&expected_snapshot),
+                Some(&concurrent_presentation),
+                Some(&expected_snapshot),
+                None,
+                &desired_meta,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            NativeImportCommitOutcome::Conflict { snapshot: None, .. }
+        ));
+        assert_eq!(mgr.read_meta("s1").unwrap(), expected_meta);
+        assert!(!mgr.snapshot_path("s1").unwrap().exists());
+    }
+
+    #[test]
+    fn native_import_cas_rolls_back_all_preimages_after_meta_replacement_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let expected_meta = SessionMeta::new("s1", "/p", 1);
+        let expected_snapshot = snap(&["before"]);
+        let expected_presentation = PresentationFile::default();
+        mgr.write_meta(&expected_meta).unwrap();
+        mgr.save_snapshot("s1", &expected_snapshot).unwrap();
+        mgr.write_presentation("s1", &expected_presentation)
+            .unwrap();
+        let before = native_artifact_bytes(&mgr, "s1");
+        let mut desired_meta = expected_meta.clone();
+        desired_meta.owner = StorageOwner::Native;
+        let desired_snapshot = snap(&["after"]);
+        mgr.fail_commit_write(CommitArtifact::Meta, CommitFaultTiming::AfterReplace);
+
+        let error = mgr
+            .commit_native_import_if_unchanged(
+                &lease,
+                &expected_meta,
+                Some(&expected_snapshot),
+                Some(&expected_presentation),
+                Some(&desired_snapshot),
+                None,
+                &desired_meta,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, SessionStoreError::Io { .. }));
+        assert_eq!(native_artifact_bytes(&mgr, "s1"), before);
+    }
+
+    #[test]
+    fn legacy_import_rollback_restores_corrupt_sidecar_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut legacy = SessionMeta::new("s1", "/p", 1);
+        legacy.owner = StorageOwner::Legacy;
+        mgr.write_meta(&legacy).unwrap();
+        let corrupt_snapshot = b"corrupt snapshot";
+        let corrupt_presentation = b"corrupt presentation";
+        std::fs::write(mgr.snapshot_path("s1").unwrap(), corrupt_snapshot).unwrap();
+        std::fs::write(mgr.presentation_path("s1").unwrap(), corrupt_presentation).unwrap();
+        let mut native = legacy.clone();
+        native.owner = StorageOwner::Native;
+        mgr.fail_commit_write(CommitArtifact::Meta, CommitFaultTiming::AfterReplace);
+
+        let error = mgr
+            .commit_native_import(
+                &lease,
+                Some(&snap(&["replacement"])),
+                Some(&PresentationFile::default()),
+                &native,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, SessionStoreError::Io { .. }));
+        assert_eq!(
+            std::fs::read(mgr.snapshot_path("s1").unwrap()).unwrap(),
+            corrupt_snapshot
+        );
+        assert_eq!(
+            std::fs::read(mgr.presentation_path("s1").unwrap()).unwrap(),
+            corrupt_presentation
+        );
+        assert_eq!(mgr.read_meta("s1").unwrap(), legacy);
+    }
+
+    #[test]
+    fn native_import_idempotency_never_replaces_different_native_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        let original_snapshot = snap(&["original"]);
+        let original_presentation = PresentationFile::default();
+        mgr.commit_native_import(
+            &lease,
+            Some(&original_snapshot),
+            Some(&original_presentation),
+            &meta,
+        )
+        .unwrap();
+        let before = native_artifact_bytes(&mgr, "s1");
+        let replacement_presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![presentation_entry(DisplayAnchor::AtStart, "replacement")],
+        };
+
+        let error = mgr
+            .commit_native_import(
+                &lease,
+                Some(&snap(&["replacement"])),
+                Some(&replacement_presentation),
+                &meta,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, SessionStoreError::OwnershipConflict { .. }));
+        assert_eq!(native_artifact_bytes(&mgr, "s1"), before);
+    }
+
+    #[test]
     fn owner_legacy_rejects_normal_native_writers_but_import_commit_can_cut_over() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = SessionManager::with_root(dir.path());
@@ -2696,6 +3784,7 @@ mod tests {
             "name": "AI title",
             "user_renamed": false,
             "ai_named": true,
+            "owner": "native",
             "working_dir": "/p",
             "created_at": 1,
             "updated_at": 2,
@@ -2737,7 +3826,9 @@ mod tests {
     fn rename_sets_name_and_flag() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = SessionManager::with_root(dir.path());
-        mgr.write_meta(&SessionMeta::new("s1", "/p", 1)).unwrap();
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.write_meta(&meta).unwrap();
         mgr.rename("s1", "My Session").unwrap();
         let m = mgr.read_meta("s1").unwrap();
         assert_eq!(m.name, "My Session");
@@ -2987,12 +4078,659 @@ mod tests {
         next_meta.message_count = 1;
         let next_presentation = PresentationFile::default();
 
-        mgr.commit_native_runtime_mutation(&lease, &next_snapshot, &next_presentation, &next_meta)
+        let receipt = mgr
+            .commit_native_runtime_mutation(&lease, &next_snapshot, |_, meta, presentation| {
+                *meta = next_meta.clone();
+                *presentation = next_presentation.clone();
+                Ok("committed")
+            })
             .unwrap();
 
+        assert_eq!(receipt, "committed");
         assert_eq!(mgr.load_snapshot("s1").unwrap(), next_snapshot);
         assert_eq!(mgr.read_presentation("s1").unwrap(), next_presentation);
         assert_eq!(mgr.read_meta("s1").unwrap(), next_meta);
+    }
+
+    #[test]
+    fn invalid_runtime_mutation_writes_none_of_the_three_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        let before_snapshot = snap(&["before"]);
+        let before_presentation = PresentationFile::default();
+        let lease = mgr.acquire_lease("s1").unwrap();
+        mgr.commit_native_import(
+            &lease,
+            Some(&before_snapshot),
+            Some(&before_presentation),
+            &meta,
+        )
+        .unwrap();
+
+        let result = mgr.commit_native_runtime_mutation(
+            &lease,
+            &snap(&["must not be published"]),
+            |_, meta, presentation| {
+                meta.id = "different-session".into();
+                presentation.entries.push(PresentationEntry {
+                    anchor: DisplayAnchor::AtStart,
+                    role: PresentationRole::Assistant,
+                    text: "must not be published".into(),
+                });
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SessionStoreError::Corrupt {
+                kind: "session meta",
+                ..
+            })
+        ));
+        assert_eq!(mgr.load_snapshot("s1").unwrap(), before_snapshot);
+        assert_eq!(mgr.read_presentation("s1").unwrap(), before_presentation);
+        assert_eq!(mgr.read_meta("s1").unwrap(), meta);
+    }
+
+    #[test]
+    fn runtime_mutation_rejects_incomplete_native_aggregate_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        let before_snapshot = snap(&["before"]);
+        mgr.write_meta(&meta).unwrap();
+        mgr.save_snapshot("s1", &before_snapshot).unwrap();
+        let lease = mgr.acquire_lease("s1").unwrap();
+
+        let result = mgr.commit_native_runtime_mutation(
+            &lease,
+            &snap(&["must not be published"]),
+            |_, meta, _presentation| {
+                meta.updated_at = 2;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(mgr.load_snapshot("s1").unwrap(), before_snapshot);
+        assert_eq!(mgr.read_meta("s1").unwrap(), meta);
+        assert!(!mgr.presentation_path("s1").unwrap().exists());
+    }
+
+    #[test]
+    fn runtime_mutation_rolls_back_all_preimages_after_presentation_replacement_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut meta = SessionMeta::new("s1", "/before", 1);
+        meta.owner = StorageOwner::Native;
+        let snapshot = snap(&["before"]);
+        let presentation = PresentationFile::default();
+        mgr.commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+            .unwrap();
+        let before = native_artifact_bytes(&mgr, "s1");
+        mgr.fail_commit_write(
+            CommitArtifact::Presentation,
+            CommitFaultTiming::AfterReplace,
+        );
+
+        let error = mgr
+            .commit_native_runtime_mutation(&lease, &snap(&["after"]), |_, meta, presentation| {
+                meta.working_dir = "/after".into();
+                presentation
+                    .entries
+                    .push(presentation_entry(DisplayAnchor::AtStart, "after"));
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, SessionStoreError::Io { .. }));
+        assert_eq!(native_artifact_bytes(&mgr, "s1"), before);
+    }
+
+    #[test]
+    fn runtime_mutation_rolls_back_all_preimages_after_meta_replacement_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut meta = SessionMeta::new("s1", "/before", 1);
+        meta.owner = StorageOwner::Native;
+        let snapshot = snap(&["before"]);
+        let presentation = PresentationFile::default();
+        mgr.commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+            .unwrap();
+        mgr.take_commit_write_log();
+        let before = native_artifact_bytes(&mgr, "s1");
+        mgr.fail_commit_write(CommitArtifact::Meta, CommitFaultTiming::AfterReplace);
+
+        let error = mgr
+            .commit_native_runtime_mutation(&lease, &snap(&["after"]), |_, meta, presentation| {
+                meta.working_dir = "/after".into();
+                presentation
+                    .entries
+                    .push(presentation_entry(DisplayAnchor::AtStart, "after"));
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, SessionStoreError::Io { .. }));
+        assert_eq!(native_artifact_bytes(&mgr, "s1"), before);
+        assert_eq!(
+            mgr.take_commit_write_log(),
+            vec![
+                CommitArtifact::Snapshot,
+                CommitArtifact::Presentation,
+                CommitArtifact::Meta,
+                CommitArtifact::Meta,
+                CommitArtifact::Presentation,
+                CommitArtifact::Snapshot,
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_mutation_reports_uncertain_commit_when_rollback_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut meta = SessionMeta::new("s1", "/before", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snap(&["before"])),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        mgr.fail_commit_write(
+            CommitArtifact::Presentation,
+            CommitFaultTiming::AfterReplace,
+        );
+        mgr.fail_commit_write(
+            CommitArtifact::Presentation,
+            CommitFaultTiming::BeforeReplace,
+        );
+
+        let error = mgr
+            .commit_native_runtime_mutation(&lease, &snap(&["after"]), |_, meta, presentation| {
+                meta.working_dir = "/after".into();
+                presentation
+                    .entries
+                    .push(presentation_entry(DisplayAnchor::AtStart, "after"));
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionStoreError::UncertainCommit {
+                ref rollback_errors,
+                ..
+            } if !rollback_errors.is_empty()
+        ));
+    }
+
+    #[test]
+    fn runtime_mutation_does_not_rewrite_unchanged_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut meta = SessionMeta::new("s1", "/before", 1);
+        meta.owner = StorageOwner::Native;
+        let snapshot = snap(&["same"]);
+        mgr.commit_native_import(
+            &lease,
+            Some(&snapshot),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        mgr.take_commit_write_log();
+
+        mgr.commit_native_runtime_mutation(&lease, &snapshot, |_, meta, _presentation| {
+            meta.updated_at = 2;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(mgr.take_commit_write_log(), vec![CommitArtifact::Meta]);
+    }
+
+    #[test]
+    fn snapshot_write_and_native_aggregate_load_wait_for_meta_lock() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(SessionManager::with_root(dir.path()));
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snap(&["before"])),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+
+        let (lock_entered_tx, lock_entered_rx) = mpsc::channel();
+        let (release_lock_tx, release_lock_rx) = mpsc::channel();
+        let lock_mgr = Arc::clone(&mgr);
+        let lock_thread = std::thread::spawn(move || {
+            lock_mgr
+                .with_meta_lock("s1", || {
+                    lock_entered_tx.send(()).unwrap();
+                    release_lock_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        lock_entered_rx.recv().unwrap();
+
+        let (save_started_tx, save_started_rx) = mpsc::channel();
+        let (save_done_tx, save_done_rx) = mpsc::channel();
+        let save_mgr = Arc::clone(&mgr);
+        let save_thread = std::thread::spawn(move || {
+            save_started_tx.send(()).unwrap();
+            let result = save_mgr.save_snapshot("s1", &snap(&["after"]));
+            save_done_tx.send(result).unwrap();
+        });
+        save_started_rx.recv().unwrap();
+        assert!(matches!(
+            save_done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        let (load_started_tx, load_started_rx) = mpsc::channel();
+        let (load_done_tx, load_done_rx) = mpsc::channel();
+        let load_mgr = Arc::clone(&mgr);
+        let load_thread = std::thread::spawn(move || {
+            load_started_tx.send(()).unwrap();
+            let result = load_mgr.load_native_session("s1");
+            load_done_tx.send(result).unwrap();
+        });
+        load_started_rx.recv().unwrap();
+        assert!(matches!(
+            load_done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        release_lock_tx.send(()).unwrap();
+        lock_thread.join().unwrap();
+        save_done_rx.recv().unwrap().unwrap();
+        load_done_rx.recv().unwrap().unwrap();
+        save_thread.join().unwrap();
+        load_thread.join().unwrap();
+    }
+
+    #[test]
+    fn update_meta_returns_fresh_state_decision_without_overwriting_user_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.write_meta(&meta).unwrap();
+        mgr.rename("s1", "User title").unwrap();
+
+        let renamed = mgr
+            .update_meta("s1", |meta| {
+                if meta.user_renamed || meta.ai_named {
+                    false
+                } else {
+                    meta.name = "AI title".into();
+                    meta.ai_named = true;
+                    true
+                }
+            })
+            .unwrap();
+
+        assert!(!renamed);
+        let meta = mgr.read_meta("s1").unwrap();
+        assert_eq!(meta.name, "User title");
+        assert!(meta.user_renamed);
+        assert!(!meta.ai_named);
+    }
+
+    #[test]
+    fn update_meta_cannot_change_storage_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.write_meta(&meta).unwrap();
+
+        assert!(matches!(
+            mgr.update_meta("s1", |meta| meta.owner = StorageOwner::Legacy),
+            Err(SessionStoreError::OwnershipConflict {
+                owner: StorageOwner::Legacy,
+                ..
+            })
+        ));
+        assert_eq!(mgr.read_meta("s1").unwrap(), meta);
+    }
+
+    #[test]
+    fn stale_sidecar_repair_does_not_overwrite_concurrent_native_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        let snapshot = snap(&["native"]);
+        let presentation = PresentationFile::default();
+        let lease = mgr.acquire_lease("s1").unwrap();
+        mgr.commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+            .unwrap();
+        let expected_meta = mgr.read_meta("s1").unwrap();
+        let expected_presentation = mgr.read_presentation("s1").unwrap();
+        let mut repaired_meta = expected_meta.clone();
+        repaired_meta.updated_at = 2;
+
+        mgr.rename("s1", "user rename").unwrap();
+        mgr.append_presentation_at_latest_valid_turn(
+            "s1",
+            &[(PresentationRole::User, "concurrent append".into())],
+        )
+        .unwrap();
+
+        let committed = mgr
+            .commit_native_sidecar_repair_if_unchanged(
+                &lease,
+                &expected_meta,
+                &snapshot,
+                &expected_presentation,
+                &repaired_meta,
+            )
+            .unwrap();
+
+        assert!(!committed);
+        assert_eq!(mgr.read_meta("s1").unwrap().name, "user rename");
+        assert_eq!(
+            mgr.read_presentation("s1").unwrap().entries[0].text,
+            "concurrent append"
+        );
+    }
+
+    #[test]
+    fn stale_sidecar_repair_does_not_commit_after_snapshot_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        let original_snapshot = snap(&["original"]);
+        let presentation = PresentationFile::default();
+        let lease = mgr.acquire_lease("s1").unwrap();
+        mgr.commit_native_import(&lease, Some(&original_snapshot), Some(&presentation), &meta)
+            .unwrap();
+        let mut repaired_meta = meta.clone();
+        repaired_meta.updated_at = 2;
+
+        mgr.save_snapshot("s1", &snap(&["concurrent"])).unwrap();
+
+        let committed = mgr
+            .commit_native_sidecar_repair_if_unchanged(
+                &lease,
+                &meta,
+                &original_snapshot,
+                &presentation,
+                &repaired_meta,
+            )
+            .unwrap();
+
+        assert!(!committed);
+        assert_eq!(mgr.read_meta("s1").unwrap(), meta);
+    }
+
+    #[test]
+    fn native_sidecar_repair_writes_only_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        let presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![presentation_entry(DisplayAnchor::AtStart, "keep")],
+        };
+        let snapshot = snap(&["native"]);
+        mgr.commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+            .unwrap();
+        let presentation_bytes = std::fs::read(mgr.presentation_path("s1").unwrap()).unwrap();
+        let mut repaired_meta = meta.clone();
+        repaired_meta.updated_at = 2;
+
+        assert!(mgr
+            .commit_native_sidecar_repair_if_unchanged(
+                &lease,
+                &meta,
+                &snapshot,
+                &presentation,
+                &repaired_meta,
+            )
+            .unwrap());
+
+        assert_eq!(mgr.read_meta("s1").unwrap(), repaired_meta);
+        assert_eq!(
+            std::fs::read(mgr.presentation_path("s1").unwrap()).unwrap(),
+            presentation_bytes
+        );
+    }
+
+    #[test]
+    fn legacy_import_intent_is_durable_before_sidecar_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut intent = SessionMeta::new("s1", "/legacy", 1);
+        intent.owner = StorageOwner::Legacy;
+        let mut invalid_intent = intent.clone();
+        invalid_intent.import_info = Some(ImportInfo {
+            legacy_schema: "legacy".into(),
+            source_sha256: "0".repeat(64),
+            importer_version: 1,
+            kind: ImportKind::Full,
+        });
+
+        assert!(matches!(
+            mgr.begin_legacy_import(&lease, &invalid_intent),
+            Err(SessionStoreError::Corrupt {
+                kind: "session import",
+                ..
+            })
+        ));
+        assert!(!mgr.meta_path("s1").unwrap().exists());
+
+        mgr.begin_legacy_import(&lease, &intent).unwrap();
+
+        assert_eq!(mgr.read_meta("s1").unwrap(), intent);
+        assert!(!mgr.snapshot_path("s1").unwrap().exists());
+        assert!(!mgr.presentation_path("s1").unwrap().exists());
+    }
+
+    #[test]
+    fn legacy_import_intent_refuses_to_replace_native_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut native = SessionMeta::new("s1", "/native", 1);
+        native.owner = StorageOwner::Native;
+        mgr.write_meta(&native).unwrap();
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut intent = SessionMeta::new("s1", "/legacy", 2);
+        intent.owner = StorageOwner::Legacy;
+
+        assert!(matches!(
+            mgr.begin_legacy_import(&lease, &intent),
+            Err(SessionStoreError::OwnershipConflict {
+                owner: StorageOwner::Native,
+                ..
+            })
+        ));
+        assert_eq!(mgr.read_meta("s1").unwrap(), native);
+    }
+
+    #[test]
+    fn legacy_import_intent_cas_refuses_to_downgrade_native_aggregate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let snapshot = snap(&["native"]);
+        let presentation = PresentationFile::default();
+        let mut native = SessionMeta::new("s1", "/native", 1);
+        native.owner = StorageOwner::Native;
+        mgr.commit_native_import(&lease, Some(&snapshot), Some(&presentation), &native)
+            .unwrap();
+        let original_meta = std::fs::read(mgr.meta_path("s1").unwrap()).unwrap();
+        let original_snapshot = std::fs::read(mgr.snapshot_path("s1").unwrap()).unwrap();
+        let original_presentation = std::fs::read(mgr.presentation_path("s1").unwrap()).unwrap();
+        let mut intent = native.clone();
+        intent.owner = StorageOwner::Legacy;
+
+        assert!(matches!(
+            mgr.begin_legacy_import_if_unchanged(
+                &lease,
+                Some(&native),
+                Some(&snapshot),
+                Some(&presentation),
+                &intent,
+            ),
+            Err(SessionStoreError::OwnershipConflict {
+                owner: StorageOwner::Native,
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(mgr.meta_path("s1").unwrap()).unwrap(),
+            original_meta
+        );
+        assert_eq!(
+            std::fs::read(mgr.snapshot_path("s1").unwrap()).unwrap(),
+            original_snapshot
+        );
+        assert_eq!(
+            std::fs::read(mgr.presentation_path("s1").unwrap()).unwrap(),
+            original_presentation
+        );
+    }
+
+    #[test]
+    fn legacy_import_intent_refuses_unconfirmed_without_expected_state_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let original = SessionMeta::new("s1", "/native", 1);
+        mgr.write_meta(&original).unwrap();
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut intent = original.clone();
+        intent.owner = StorageOwner::Legacy;
+
+        mgr.rename("s1", "concurrent rename").unwrap();
+
+        assert!(matches!(
+            mgr.begin_legacy_import(&lease, &intent),
+            Err(SessionStoreError::OwnershipConflict {
+                owner: StorageOwner::Unconfirmed,
+                ..
+            })
+        ));
+        assert_eq!(mgr.read_meta("s1").unwrap().name, "concurrent rename");
+    }
+
+    #[test]
+    fn legacy_import_intent_cas_preserves_concurrent_unconfirmed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let original = SessionMeta::new("s1", "/native", 1);
+        mgr.write_meta(&original).unwrap();
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut stale_intent = original.clone();
+        stale_intent.owner = StorageOwner::Legacy;
+
+        mgr.rename("s1", "concurrent rename").unwrap();
+
+        assert!(!mgr
+            .begin_legacy_import_if_unchanged(&lease, Some(&original), None, None, &stale_intent,)
+            .unwrap());
+        let renamed = mgr.read_meta("s1").unwrap();
+        assert_eq!(renamed.name, "concurrent rename");
+        let mut fresh_intent = renamed.clone();
+        fresh_intent.owner = StorageOwner::Legacy;
+        assert!(mgr
+            .begin_legacy_import_if_unchanged(&lease, Some(&renamed), None, None, &fresh_intent,)
+            .unwrap());
+        assert_eq!(mgr.read_meta("s1").unwrap(), fresh_intent);
+    }
+
+    #[test]
+    fn catalog_presentation_append_selects_latest_valid_turn_under_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 3;
+        meta.turn_stats = vec![
+            TurnStat {
+                after_message: 2,
+                position_valid: true,
+                turn_id: 7,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 1,
+                total_tokens: 1,
+                errored: false,
+                used_tokens: 1,
+                ctx_window: 10,
+            },
+            TurnStat {
+                after_message: 99,
+                position_valid: false,
+                turn_id: 8,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 1,
+                total_tokens: 1,
+                errored: false,
+                used_tokens: 1,
+                ctx_window: 10,
+            },
+        ];
+        mgr.write_meta(&meta).unwrap();
+        mgr.write_presentation("s1", &PresentationFile::default())
+            .unwrap();
+
+        let count = mgr
+            .append_presentation_at_latest_valid_turn(
+                "s1",
+                &[(PresentationRole::Assistant, "note".into())],
+            )
+            .unwrap();
+
+        assert_eq!(count, 4);
+        assert_eq!(
+            mgr.read_presentation("s1").unwrap().entries[0].anchor,
+            DisplayAnchor::AfterTurn { turn_id: 7 }
+        );
+    }
+
+    #[test]
+    fn catalog_presentation_append_rejects_missing_native_presentation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.write_meta(&meta).unwrap();
+
+        let error = mgr
+            .append_presentation_at_latest_valid_turn(
+                "s1",
+                &[(PresentationRole::Assistant, "note".into())],
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!mgr.presentation_path("s1").unwrap().exists());
     }
 
     #[test]

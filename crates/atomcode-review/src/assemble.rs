@@ -146,6 +146,9 @@ pub fn build_review_agent_with_cancel(
         )))
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout);
+    if let Some(policy) = cfg.tool_loop_policy {
+        builder = builder.tool_loop_policy(policy);
+    }
     // Round fuse is opt-in: only bound rounds when the caller asked for it (keeps a bare
     // CLI run unbounded; engineering callers pass `--max-rounds`). When bounded, also mount
     // the round-budget pressure hook so the reviewer LANDS findings before the fuse trips
@@ -302,8 +305,8 @@ mod tests {
         assert!(findings[0].title.contains("unchecked unwrap"));
     }
 
-    /// Never terminates on its own: every round emits another tool call. Only `max_rounds`
-    /// can stop it — guards that the review path actually wires the round fuse through.
+    /// Never terminates on its own: every round emits the same no-progress tool call.
+    /// A low explicit `max_rounds` must fire before the exact-loop guard.
     struct LoopingProvider;
     #[async_trait]
     impl LlmProvider for LoopingProvider {
@@ -340,6 +343,35 @@ mod tests {
             outcome.stop,
             atomcode_kernel::event::StopReason::MaxRounds,
             "endless tool calls must be capped by max_rounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_no_progress_loop_is_stopped_when_rounds_are_unbounded() {
+        let (agent, _report) = build_review_agent_with(&cfg(), Arc::new(LoopingProvider));
+        let outcome = agent
+            .run_to_completion("Review this diff:\n+ x", AutoRespond::AllowAll)
+            .await;
+        assert_eq!(
+            outcome.stop,
+            atomcode_kernel::event::StopReason::ToolLoopDetected,
+            "unbounded rounds must not permit an exact unchanged tool loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_guard_can_be_disabled_for_an_intentional_repetition_policy() {
+        let mut c = cfg();
+        c.max_rounds = Some(5);
+        c.tool_loop_policy = None;
+        let (agent, _report) = build_review_agent_with(&c, Arc::new(LoopingProvider));
+        let outcome = agent
+            .run_to_completion("Repeat this probe intentionally", AutoRespond::AllowAll)
+            .await;
+        assert_eq!(
+            outcome.stop,
+            atomcode_kernel::event::StopReason::MaxRounds,
+            "disabling the exact guard must leave the caller's coarse cap authoritative"
         );
     }
 

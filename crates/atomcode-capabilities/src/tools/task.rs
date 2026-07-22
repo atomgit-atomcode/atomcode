@@ -3,7 +3,7 @@
 //! 选子工具集。子 agent 跑在独立内核会话里,结果用 <task_result> 包回。
 
 use async_trait::async_trait;
-use atomcode_kernel::agent::{Agent, AutoRespond, Outcome};
+use atomcode_kernel::agent::{Agent, AutoRespond, Outcome, ToolLoopPolicy};
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
@@ -107,9 +107,7 @@ fn workers_missing_scope(tasks: &[SubTask]) -> Vec<usize> {
     tasks
         .iter()
         .enumerate()
-        .filter(|(_, t)| {
-            t.subagent_type == "worker" && t.scope.iter().all(|s| s.trim().is_empty())
-        })
+        .filter(|(_, t)| t.subagent_type == "worker" && t.scope.iter().all(|s| s.trim().is_empty()))
         .map(|(i, _)| i + 1)
         .collect()
 }
@@ -143,7 +141,9 @@ impl WorkerScopeGate {
                 }
             }
         }
-        let globs = builder.build().unwrap_or_else(|_| globset::GlobSet::empty());
+        let globs = builder
+            .build()
+            .unwrap_or_else(|_| globset::GlobSet::empty());
         Self {
             working_dir: working_dir.to_path_buf(),
             globs,
@@ -181,8 +181,8 @@ impl WorkerScopeGate {
                 }
             }
             "search_replace" => {
-                let value =
-                    serde_json::from_str::<serde_json::Value>(args_json).unwrap_or(serde_json::Value::Null);
+                let value = serde_json::from_str::<serde_json::Value>(args_json)
+                    .unwrap_or(serde_json::Value::Null);
                 match value.get("path").and_then(|x| x.as_str()) {
                     None => Some(format!(
                         "worker search_replace has no `path`, which would rewrite the whole tree; \
@@ -235,9 +235,9 @@ impl WorkerScopeGate {
     /// whole directory must declare it recursively: `src/auth/**`.
     fn dir_in_scope(&self, rel_dir: &str) -> bool {
         let rd = Path::new(rel_dir);
-        self.dir_prefixes.iter().any(|p| {
-            p.as_os_str().is_empty() || rd == p.as_path() || rd.starts_with(p)
-        })
+        self.dir_prefixes
+            .iter()
+            .any(|p| p.as_os_str().is_empty() || rd == p.as_path() || rd.starts_with(p))
     }
 }
 
@@ -310,6 +310,8 @@ pub struct TaskTool {
     make_worker_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     max_concurrent: usize,
     subtask_timeout: std::time::Duration,
+    max_rounds: Option<u32>,
+    tool_loop_policy: Option<ToolLoopPolicy>,
 }
 
 impl TaskTool {
@@ -326,6 +328,8 @@ impl TaskTool {
             make_worker_tools: Box::new(make_worker_tools),
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             subtask_timeout: DEFAULT_SUBTASK_TIMEOUT,
+            max_rounds: Some(super::DEFAULT_CHILD_MAX_ROUNDS),
+            tool_loop_policy: Some(ToolLoopPolicy::default()),
         }
     }
 
@@ -338,6 +342,20 @@ impl TaskTool {
 
     pub fn with_max_concurrent(mut self, n: usize) -> Self {
         self.max_concurrent = n.max(1);
+        self
+    }
+
+    /// Override the per-child model-round high-water mark. `0` disables this cap;
+    /// the exact no-progress policy is configured independently.
+    pub fn with_max_rounds(mut self, n: u32) -> Self {
+        self.max_rounds = (n != 0).then_some(n);
+        self
+    }
+
+    /// Use the embedding product's exact no-progress policy. `None` disables it
+    /// for intentional repeated operations; the independent round/timeout caps remain.
+    pub fn with_tool_loop_policy(mut self, policy: Option<ToolLoopPolicy>) -> Self {
+        self.tool_loop_policy = policy;
         self
     }
 }
@@ -446,6 +464,8 @@ parallel workers NON-OVERLAPPING scopes."
 
         let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
         let timeout_dur = self.subtask_timeout;
+        let max_rounds = self.max_rounds;
+        let tool_loop_policy = self.tool_loop_policy;
         let mut set = tokio::task::JoinSet::new();
         // Live progress: the whole batch would otherwise be a black box until every subtask
         // finishes. Emit a header + per-subtask start/done so the driver renders them live.
@@ -508,6 +528,12 @@ parallel workers NON-OVERLAPPING scopes."
                     .persona(persona)
                     .working_dir(wd.clone())
                     .cancel_token(child_cancel);
+                if let Some(policy) = tool_loop_policy {
+                    builder = builder.tool_loop_policy(policy);
+                }
+                if let Some(max_rounds) = max_rounds {
+                    builder = builder.max_rounds(max_rounds);
+                }
                 // The child runs AutoRespond::AllowAll (no human in its loop), so the parent's
                 // prompting gates wouldn't protect it. Hard-deny sensitive-path ops for every
                 // child (#1); additionally confine a `worker`'s WRITES to its declared scope.
@@ -865,6 +891,24 @@ mod tests {
     #[test]
     fn name_is_task() {
         assert_eq!(dummy().name(), "task");
+    }
+
+    #[test]
+    fn child_round_limit_is_configurable_and_zero_means_unbounded() {
+        assert_eq!(dummy().max_rounds, Some(200));
+        assert_eq!(dummy().with_max_rounds(500).max_rounds, Some(500));
+        assert_eq!(dummy().with_max_rounds(0).max_rounds, None);
+    }
+
+    #[test]
+    fn child_exact_loop_policy_can_be_inherited_or_disabled() {
+        assert_eq!(dummy().tool_loop_policy, Some(ToolLoopPolicy::default()));
+        assert_eq!(dummy().with_tool_loop_policy(None).tool_loop_policy, None);
+        let custom = ToolLoopPolicy::new(10, 12).unwrap();
+        assert_eq!(
+            dummy().with_tool_loop_policy(Some(custom)).tool_loop_policy,
+            Some(custom)
+        );
     }
 
     #[test]
@@ -1317,7 +1361,7 @@ mod tests {
         // Recursive dir globs grant a search_replace root at their literal dir.
         assert_eq!(p("src/auth/**"), Some("src/auth".into()));
         assert_eq!(p("**"), Some(String::new())); // whole tree
-        // Non-recursive scopes cover only specific files → NO search_replace root.
+                                                  // Non-recursive scopes cover only specific files → NO search_replace root.
         assert_eq!(p("src/**/x.rs"), None); // matches only x.rs files, not whole dirs
         assert_eq!(p("src/*.rs"), None);
         assert_eq!(p("*.rs"), None);
@@ -1330,7 +1374,10 @@ mod tests {
     fn worker_scope_gate_confines_writes_but_not_reads() {
         use super::WorkerScopeGate;
         use std::path::Path;
-        let g = WorkerScopeGate::new(&["src/auth/**".into(), "Cargo.toml".into()], Path::new("/w"));
+        let g = WorkerScopeGate::new(
+            &["src/auth/**".into(), "Cargo.toml".into()],
+            Path::new("/w"),
+        );
 
         // in-scope write → allowed
         assert!(g
@@ -1354,9 +1401,13 @@ mod tests {
         assert!(g
             .violation("read_file", r#"{"file_path":"src/db/schema.rs"}"#)
             .is_none());
-        assert!(g.violation("grep", r#"{"pattern":"x","path":"src/db"}"#).is_none());
+        assert!(g
+            .violation("grep", r#"{"pattern":"x","path":"src/db"}"#)
+            .is_none());
         // bash is never gated (dispatch-trust; design §6)
-        assert!(g.violation("bash", r#"{"command":"rm -rf src/db"}"#).is_none());
+        assert!(g
+            .violation("bash", r#"{"command":"rm -rf src/db"}"#)
+            .is_none());
         // write with no usable file_path fails CLOSED (denied), not allowed through
         assert!(g.violation("write_file", r#"{"content":"x"}"#).is_some());
         assert!(g.violation("edit_file", r#"{"file_path":null}"#).is_some());
@@ -1368,7 +1419,9 @@ mod tests {
         use std::path::Path;
         let g = WorkerScopeGate::new(&["**".into()], Path::new("/w"));
         // `**` allows anything INSIDE the workspace
-        assert!(g.violation("write_file", r#"{"file_path":"anything/here.rs"}"#).is_none());
+        assert!(g
+            .violation("write_file", r#"{"file_path":"anything/here.rs"}"#)
+            .is_none());
         // ...but a `..` escape is denied even under `**`
         assert!(g
             .violation("write_file", r#"{"file_path":"../outside.rs"}"#)
@@ -1378,7 +1431,9 @@ mod tests {
             .violation("write_file", r#"{"file_path":"/etc/passwd"}"#)
             .is_some());
         // an absolute path INSIDE the working dir is normalized + allowed
-        assert!(g.violation("write_file", r#"{"file_path":"/w/in.rs"}"#).is_none());
+        assert!(g
+            .violation("write_file", r#"{"file_path":"/w/in.rs"}"#)
+            .is_none());
     }
 
     #[test]
@@ -1401,29 +1456,42 @@ mod tests {
         let deny = g
             .violation("search_replace", r#"{"pattern":"x","replacement":"y"}"#)
             .expect("whole-tree search_replace denied");
-        assert!(deny.contains("whole tree") || deny.contains("path"), "{deny}");
+        assert!(
+            deny.contains("whole tree") || deny.contains("path"),
+            "{deny}"
+        );
         // root escaping the workspace → denied
-        assert!(g.violation("search_replace", r#"{"path":"../outside"}"#).is_some());
+        assert!(g
+            .violation("search_replace", r#"{"path":"../outside"}"#)
+            .is_some());
 
         // Regression: a NON-recursive glob scope must NOT grant a wide search_replace root.
         // `["*.rs"]` (root-level .rs files) must not let search_replace rewrite the whole tree,
         // and `["src/*.rs"]` must not let it rewrite all of src/.
         let g_root = WorkerScopeGate::new(&["*.rs".into()], Path::new("/w"));
         assert!(
-            g_root.violation("search_replace", r#"{"path":"src/db"}"#).is_some(),
+            g_root
+                .violation("search_replace", r#"{"path":"src/db"}"#)
+                .is_some(),
             "*.rs scope must not grant a search_replace root under src/"
         );
         assert!(
-            g_root.violation("search_replace", r#"{"path":"."}"#).is_some(),
+            g_root
+                .violation("search_replace", r#"{"path":"."}"#)
+                .is_some(),
             "*.rs scope must not grant a whole-tree search_replace root"
         );
         let g_srcrs = WorkerScopeGate::new(&["src/*.rs".into()], Path::new("/w"));
         assert!(
-            g_srcrs.violation("search_replace", r#"{"path":"src/db"}"#).is_some(),
+            g_srcrs
+                .violation("search_replace", r#"{"path":"src/db"}"#)
+                .is_some(),
             "src/*.rs scope must not grant a search_replace root over src/db"
         );
         // ...but a single-file write still matches the file glob (unchanged).
-        assert!(g_srcrs.violation("edit_file", r#"{"file_path":"src/main.rs"}"#).is_none());
+        assert!(g_srcrs
+            .violation("edit_file", r#"{"file_path":"src/main.rs"}"#)
+            .is_none());
     }
 
     #[test]

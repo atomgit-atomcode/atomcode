@@ -18,7 +18,8 @@ use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
 
 use super::{
-    now_ms, PresentationFile, SessionLease, SessionManager, SessionMeta, StorageOwner, TurnStat,
+    now_ms, PresentationFile, SessionLease, SessionManager, SessionMeta, SessionStoreError,
+    TurnStat,
 };
 
 /// Per-turn accumulation (reset each turn): duration, round/tool counts, and the final
@@ -33,6 +34,31 @@ struct TurnAccum {
     ctx_window: u32,
 }
 
+/// One-shot signal from the persistence hook to its owning runtime. A normal
+/// I/O failure whose rollback completed stays best-effort; an uncertain commit
+/// means the on-disk aggregate can no longer be trusted and must fail-close.
+#[derive(Clone, Default)]
+pub struct SnapshotPersistenceStatus {
+    uncertain_commit: Arc<Mutex<Option<String>>>,
+}
+
+impl SnapshotPersistenceStatus {
+    #[doc(hidden)]
+    pub fn report_uncertain_commit(&self, message: impl Into<String>) {
+        *self
+            .uncertain_commit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(message.into());
+    }
+
+    pub fn take_uncertain_commit(&self) -> Option<String> {
+        self.uncertain_commit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
 /// Saves `<id>.snapshot` (the compacted working set) + updates `<id>.meta` each turn.
 pub struct SnapshotHook {
     mgr: Arc<SessionManager>,
@@ -40,6 +66,7 @@ pub struct SnapshotHook {
     working_dir: String,
     lease: Option<SessionLease>,
     accum: Mutex<TurnAccum>,
+    persistence_status: SnapshotPersistenceStatus,
 }
 
 impl SnapshotHook {
@@ -54,6 +81,7 @@ impl SnapshotHook {
             working_dir: working_dir.into(),
             lease: None,
             accum: Mutex::new(TurnAccum::default()),
+            persistence_status: SnapshotPersistenceStatus::default(),
         }
     }
 
@@ -64,6 +92,22 @@ impl SnapshotHook {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, TurnAccum> {
         self.accum.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn persistence_status(&self) -> SnapshotPersistenceStatus {
+        self.persistence_status.clone()
+    }
+
+    fn record_persistence_error(&self, error: &SessionStoreError) {
+        if error.is_uncertain_commit() {
+            self.persistence_status
+                .report_uncertain_commit(error.to_string());
+        }
+    }
+
+    fn compaction_error(&self, error: SessionStoreError) -> CompactionCheckpointError {
+        self.record_persistence_error(&error);
+        CompactionCheckpointError::new(error.to_string())
     }
 }
 
@@ -105,9 +149,7 @@ fn reindex_compacted_sidecars(
     let surviving_turn_ids: std::collections::BTreeSet<_> = meta
         .turn_stats
         .iter()
-        .filter_map(|stat| {
-            (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
-        })
+        .filter_map(|stat| (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id))
         .collect();
     presentation.retain_turns(&surviving_turn_ids);
     meta.message_count = u32::try_from(after.messages.len()).unwrap_or(u32::MAX);
@@ -118,26 +160,17 @@ fn reindex_compacted_sidecars(
 impl CompactionCheckpoint for SnapshotHook {
     fn save(&self, snapshot: &SessionSnapshot) -> Result<(), CompactionCheckpointError> {
         if let Some(lease) = &self.lease {
-            let old_snapshot = self
-                .mgr
-                .load_snapshot(&self.session_id)
-                .map_err(|error| CompactionCheckpointError::new(error.to_string()))?;
-            let mut meta = self
-                .mgr
-                .read_meta(&self.session_id)
-                .map_err(|error| CompactionCheckpointError::new(error.to_string()))?;
-            let mut presentation = match self.mgr.read_presentation(&self.session_id) {
-                Ok(presentation) => presentation,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    PresentationFile::default()
-                }
-                Err(error) => return Err(CompactionCheckpointError::new(error.to_string())),
-            };
-            reindex_compacted_sidecars(&old_snapshot, snapshot, &mut meta, &mut presentation);
             return self
                 .mgr
-                .commit_native_runtime_mutation(lease, snapshot, &presentation, &meta)
-                .map_err(|error| CompactionCheckpointError::new(error.to_string()));
+                .commit_native_runtime_mutation(
+                    lease,
+                    snapshot,
+                    |current_snapshot, meta, presentation| {
+                        reindex_compacted_sidecars(current_snapshot, snapshot, meta, presentation);
+                        Ok(())
+                    },
+                )
+                .map_err(|error| self.compaction_error(error));
         }
         self.mgr
             .save_snapshot(&self.session_id, snapshot)
@@ -220,30 +253,14 @@ impl LifecycleHooks for SnapshotHook {
             });
         };
         let result = if let Some(lease) = &self.lease {
-            let mut meta = match self.mgr.read_meta(&self.session_id) {
-                Ok(meta) => meta,
-                Err(error) => {
-                    eprintln!("[SnapshotHook] read_meta failed: {error}");
-                    return;
-                }
-            };
-            if meta.owner != StorageOwner::Native {
-                eprintln!("[SnapshotHook] terminal rejected non-native owner");
-                return;
-            }
-            update_meta(&mut meta);
-            let presentation = match self.mgr.read_presentation(&self.session_id) {
-                Ok(presentation) => presentation,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    PresentationFile::default()
-                }
-                Err(error) => {
-                    eprintln!("[SnapshotHook] read_presentation failed: {error}");
-                    return;
-                }
-            };
-            self.mgr
-                .commit_native_runtime_mutation(lease, &snap, &presentation, &meta)
+            self.mgr.commit_native_runtime_mutation(
+                lease,
+                &snap,
+                |_current_snapshot, meta, _presentation| {
+                    update_meta(meta);
+                    Ok(())
+                },
+            )
         } else {
             if let Err(error) = self.mgr.save_snapshot(&self.session_id, &snap) {
                 eprintln!("[SnapshotHook] save_snapshot failed: {error}");
@@ -253,6 +270,7 @@ impl LifecycleHooks for SnapshotHook {
                 .update_meta_or_insert(&self.session_id, fresh, update_meta)
         };
         if let Err(error) = result {
+            self.record_persistence_error(&error);
             eprintln!("[SnapshotHook] update_meta failed: {error}");
         }
     }
@@ -261,6 +279,7 @@ impl LifecycleHooks for SnapshotHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::StorageOwner;
     use atomcode_kernel::message::{Message, MessageMeta};
     use atomcode_kernel::stream::TokenUsage;
 
@@ -359,6 +378,117 @@ mod tests {
         let presentation = manager.read_presentation(id).unwrap();
         assert_eq!(presentation.entries.len(), 1);
         assert_eq!(presentation.entries[0].text, "keep");
+    }
+
+    #[test]
+    fn leased_compaction_reindexes_from_the_snapshot_read_under_the_manager_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::with_root(dir.path()));
+        let id = "compact-current-snapshot";
+        let before = SessionSnapshot::new(vec![
+            Message::user("u1"),
+            Message::assistant("a1", Vec::new()),
+            Message::user("u2"),
+            Message::assistant("a2", Vec::new()),
+        ]);
+        let concurrent = SessionSnapshot::new(vec![
+            Message::user("u1"),
+            Message::assistant("a1", Vec::new()),
+            Message::user("u2"),
+            Message::assistant("a2", Vec::new()),
+            Message::user("u3"),
+            Message::assistant("a3", Vec::new()),
+        ]);
+        let compacted = SessionSnapshot::new(vec![
+            Message::user("summary"),
+            Message::user("u3"),
+            Message::assistant("a3", Vec::new()),
+        ]);
+        let stat = |after_message, turn_id| TurnStat {
+            after_message,
+            position_valid: true,
+            turn_id,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 10,
+        };
+        let mut meta = SessionMeta::new(id, "/p", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 4;
+        meta.turn_count = 3;
+        meta.turn_stats = vec![stat(2, 1), stat(4, 2), stat(6, 3)];
+        let lease = manager.acquire_lease(id).unwrap();
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&before),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+
+        // Hold the metadata lock after the concurrent writer has read the old
+        // aggregate. The compaction can read the old snapshot outside the lock,
+        // but must reindex from the writer's committed snapshot once it acquires
+        // the lock itself.
+        let pause = manager.pause_next_meta_read();
+        let writer_manager = manager.clone();
+        let writer_lease = lease.clone();
+        let writer = std::thread::spawn(move || {
+            writer_manager.commit_native_runtime_mutation(
+                &writer_lease,
+                &concurrent,
+                |_current_snapshot, _meta, _presentation| Ok(()),
+            )
+        });
+        pause.wait_until_read();
+
+        let hook = SnapshotHook::new(manager.clone(), id, "/p").with_lease(lease);
+        let (done_tx, done_rx) = mpsc::channel();
+        let compact = std::thread::spawn(move || {
+            let result = CompactionCheckpoint::save(&hook, &compacted);
+            let _ = done_tx.send(result);
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(1)).is_err(),
+            "compaction must wait for the concurrent native mutation"
+        );
+        pause.resume();
+        writer.join().unwrap().unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        compact.join().unwrap();
+
+        let stats = manager.read_meta(id).unwrap().turn_stats;
+        assert_eq!(stats.len(), 2);
+        assert_eq!((stats[0].turn_id, stats[0].after_message), (2, 1));
+        assert_eq!((stats[1].turn_id, stats[1].after_message), (3, 3));
+    }
+
+    #[test]
+    fn uncertain_compaction_commit_is_reported_once() {
+        let (hook, _manager, _dir) = hook("uncertain-turn");
+        let error = hook.compaction_error(crate::session::SessionStoreError::UncertainCommit {
+            id: "uncertain-turn".into(),
+            commit_error: "meta replacement failed".into(),
+            rollback_errors: vec!["snapshot rollback failed".into()],
+        });
+
+        let status = hook.persistence_status();
+        assert!(error.to_string().contains("rollback was incomplete"));
+        assert!(status
+            .take_uncertain_commit()
+            .is_some_and(|message| message.contains("rollback was incomplete")));
+        assert_eq!(status.take_uncertain_commit(), None);
     }
 
     fn resp(tool_calls: usize, used: u32) -> Message {
@@ -627,20 +757,73 @@ mod tests {
         assert_eq!(meta.turn_count, 2);
     }
 
+    #[tokio::test]
+    async fn leased_turn_complete_preserves_prior_rename_and_presentation_append() {
+        use crate::session::{DisplayAnchor, PresentationEntry, PresentationRole};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(SessionManager::with_root(dir.path()));
+        let id = "leased-prior-sidecars";
+        let mut meta = SessionMeta::new(id, "/proj", 1);
+        meta.owner = StorageOwner::Native;
+        let lease = mgr.acquire_lease(id).unwrap();
+        mgr.commit_native_import(
+            &lease,
+            Some(&SessionSnapshot::from_conversation(&convo_with(1))),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let hook = SnapshotHook::new(mgr.clone(), id, "/proj").with_lease(lease);
+
+        mgr.rename(id, "User title").unwrap();
+        mgr.append_presentation(
+            id,
+            PresentationEntry {
+                anchor: DisplayAnchor::AtStart,
+                role: PresentationRole::Assistant,
+                text: "prior append".into(),
+            },
+        )
+        .unwrap();
+        hook.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
+            .await;
+
+        let meta = mgr.read_meta(id).unwrap();
+        assert_eq!(meta.name, "User title");
+        assert!(meta.user_renamed);
+        assert_eq!(meta.turn_count, 1);
+        let presentation = mgr.read_presentation(id).unwrap();
+        assert_eq!(presentation.entries.len(), 1);
+        assert_eq!(presentation.entries[0].text, "prior append");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_rename_and_turn_complete_preserve_both_updates() {
+        use crate::session::{DisplayAnchor, PresentationEntry, PresentationRole};
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let (hook, mgr, _d) = hook("concurrent-meta");
-        mgr.write_meta(&SessionMeta::new("concurrent-meta", "/proj", 1))
-            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(SessionManager::with_root(dir.path()));
+        let id = "concurrent-meta";
+        let mut meta = SessionMeta::new(id, "/proj", 1);
+        meta.owner = StorageOwner::Native;
+        let lease = mgr.acquire_lease(id).unwrap();
+        mgr.commit_native_import(
+            &lease,
+            Some(&SessionSnapshot::from_conversation(&convo_with(1))),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let hook = SnapshotHook::new(mgr.clone(), id, "/proj").with_lease(lease);
         hook.user_prompt_submit(&mut "go".to_string())
             .await
             .unwrap();
 
-        // Pause turn-complete after it has read the old title. Without a lock, rename
-        // completes next and the stale turn write then silently restores the old title.
+        // Pause turn-complete after its fresh locked read. Both sidecar RMWs must
+        // wait, then apply to the committed turn instead of being overwritten by it.
         let pause = mgr.pause_next_meta_read();
         let turn = tokio::spawn(async move {
             hook.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
@@ -651,23 +834,46 @@ mod tests {
         let rename_mgr = mgr.clone();
         let (renamed_tx, renamed_rx) = mpsc::channel();
         let rename = std::thread::spawn(move || {
-            let result = rename_mgr.rename("concurrent-meta", "User title");
+            let result = rename_mgr.rename(id, "User title");
             let _ = renamed_tx.send(());
             result
         });
+        let append_mgr = mgr.clone();
+        let (appended_tx, appended_rx) = mpsc::channel();
+        let append = std::thread::spawn(move || {
+            let result = append_mgr.append_presentation(
+                id,
+                PresentationEntry {
+                    anchor: DisplayAnchor::AtStart,
+                    role: PresentationRole::Assistant,
+                    text: "concurrent append".into(),
+                },
+            );
+            let _ = appended_tx.send(());
+            result
+        });
         let rename_waited = renamed_rx.recv_timeout(Duration::from_secs(1)).is_err();
+        let append_waited = appended_rx.recv_timeout(Duration::from_secs(1)).is_err();
         pause.resume();
 
         turn.await.unwrap();
         rename.join().unwrap().unwrap();
+        append.join().unwrap().unwrap();
         assert!(
             rename_waited,
             "rename must wait for the turn meta update lock"
         );
-        let meta = mgr.read_meta("concurrent-meta").unwrap();
+        assert!(
+            append_waited,
+            "presentation append must wait for the turn sidecar update lock"
+        );
+        let meta = mgr.read_meta(id).unwrap();
         assert_eq!(meta.name, "User title");
         assert!(meta.user_renamed);
         assert_eq!(meta.turn_count, 1);
         assert_eq!(meta.turn_stats.len(), 1);
+        let presentation = mgr.read_presentation(id).unwrap();
+        assert_eq!(presentation.entries.len(), 1);
+        assert_eq!(presentation.entries[0].text, "concurrent append");
     }
 }

@@ -3034,7 +3034,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .map(|i| {
                 let ans = meta.answered.get(i).copied().unwrap_or(false);
                 if unicode {
-                    if ans { "\u{2713}" } else { "\u{25cb}" }
+                    if ans {
+                        "\u{2713}"
+                    } else {
+                        "\u{25cb}"
+                    }
                 } else if ans {
                     "x"
                 } else {
@@ -3043,23 +3047,34 @@ impl<W: Write + Send> RetainedRenderer<W> {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        let nav_idx = if meta.on_submit { meta.total } else { meta.index };
+        let nav_idx = if meta.on_submit {
+            meta.total
+        } else {
+            meta.index
+        };
         let nav = format!("\u{95ee}\u{9898} {}/{}  {}", nav_idx, meta.total, markers); // 问题
         push_line(&mut out, &nav, &self.style_bold(Role::Plan));
         out.push(Vec::new()); // blank
 
         if meta.on_submit {
             let answered = meta.answered.iter().filter(|a| **a).count();
-            let marker = if unicode { "\u{276f} \u{2714} " } else { "> + " }; // ❯ ✔
+            let marker = if unicode {
+                "\u{276f} \u{2714} "
+            } else {
+                "> + "
+            }; // ❯ ✔
             let label = if unicode {
                 "\u{63d0}\u{4ea4}\u{5168}\u{90e8}"
             } else {
                 "Submit all"
             }; // 提交全部
-            let submit = format!("{marker}{label} ({answered}/{} \u{5df2}\u{7b54})", meta.total); // 已答
+            let submit = format!(
+                "{marker}{label} ({answered}/{} \u{5df2}\u{7b54})",
+                meta.total
+            ); // 已答
             push_line(&mut out, &submit, &self.style_bold(Role::Plan));
             out.push(Vec::new()); // blank
-            // Enter 提交 · Tab/Shift+Tab 切换问题 · Esc 放弃
+                                  // Enter 提交 · Tab/Shift+Tab 切换问题 · Esc 放弃
             let hint = "Enter \u{63d0}\u{4ea4} \u{00b7} Tab/Shift+Tab \u{5207}\u{6362}\u{95ee}\u{9898} \u{00b7} Esc \u{653e}\u{5f03}";
             push_line(&mut out, hint, &hint_style);
         } else {
@@ -6064,7 +6079,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     let prev_mark_kind = self.message_marks.last().map(|m| m.kind);
                     self.mark_message(crate::render::MarkKind::Assistant);
                     self.last_mark_was_assistant = true;
-                    if let Some(crate::render::MarkKind::ToolCall | crate::render::MarkKind::ToolResult) = prev_mark_kind {
+                    if let Some(
+                        crate::render::MarkKind::ToolCall | crate::render::MarkKind::ToolResult,
+                    ) = prev_mark_kind
+                    {
                         let tail_blank = self
                             .body_lines
                             .last()
@@ -13311,8 +13329,8 @@ mod tests {
 
     #[test]
     fn user_input_batch_navigator_and_parity() {
-        use atomcode_capabilities::tools::request_user_input::UserInputMode;
         use crate::render::{UserInputBatchMeta, UserInputPanelView};
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
         let (r, _buf) = new_capturing(80, 24);
 
         let base = |batch| UserInputPanelView {
@@ -14138,13 +14156,18 @@ mod tests {
         });
         r.render(UiLine::AssistantText("今天长沙的天气情况如下：\n".into()));
 
-        let lines: Vec<String> = r.body_lines
+        let lines: Vec<String> = r
+            .body_lines
             .iter()
             .map(|row| row.iter().map(|c| c.ch).collect::<String>())
             .collect();
 
         // There should be a blank spacer line at index 2 (between ToolResult at index 1 and AssistantText at index 3)
-        assert!(lines.len() >= 4, "Expected at least 4 lines, got {:?}", lines);
+        assert!(
+            lines.len() >= 4,
+            "Expected at least 4 lines, got {:?}",
+            lines
+        );
         assert!(
             lines[2].trim().is_empty(),
             "Expected line 2 to be blank, got {:?}",

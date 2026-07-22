@@ -25,6 +25,7 @@ use atomcode_capabilities::codeintel::register_codeintel_tools;
 use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry};
 use atomcode_capabilities::memory::MemoryHook;
 use atomcode_capabilities::provider::model_suggests_vision;
+use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
     PresentationFile, RecallTool, SessionContextHook, SessionLease, SessionManager, SessionMeta,
     SnapshotHook, StatusReminderHook, StorageOwner, TranscriptHook,
@@ -57,13 +58,13 @@ pub enum SessionMode {
     /// Allocate a fresh session id (uuid v4) and persist from turn 1.
     #[default]
     Fresh,
-    /// Resume the given session id: load its `.snapshot`, continue its `.jsonl`.
-    /// `prepare` errors if the snapshot cannot be read (the caller listed it, so a
-    /// missing/corrupt file is a real failure, not a silent fresh start).
+    /// Resume the given session id from its complete native aggregate. `prepare`
+    /// errors unless metadata, snapshot, and presentation are all present and the
+    /// metadata owner is `Native`; compatibility callers must import first.
     Resume(String),
-    /// Bind an externally-owned session id to an already-loaded snapshot. This is
-    /// used while the TUI session store is being migrated, preserving gateway
-    /// affinity without a second disk lookup or a fresh runtime id.
+    /// Bind an externally-loaded snapshot after proving it exactly matches the
+    /// complete native aggregate. Compatibility drivers must import first; this
+    /// variant cannot create or repair persistent session state.
     ExternalSnapshot {
         id: String,
         snapshot: SessionSnapshot,
@@ -128,7 +129,7 @@ pub struct SessionBinding {
     /// Active-runtime ownership. Clones share the same OS lock and release it
     /// only when the last runtime generation drops.
     pub(crate) lease: SessionLease,
-    /// Loaded snapshot on [`SessionMode::Resume`]; `None` on fresh.
+    /// Canonical snapshot on resume/external binding; `None` on fresh.
     pub resume: Option<SessionSnapshot>,
     /// Fresh metadata prepared in memory but not yet catalog-visible. CodingRuntime
     /// publishes it only after the complete candidate graph has assembled.
@@ -148,6 +149,7 @@ pub struct CodingParts {
     /// The same session snapshot writer used by `SnapshotHook`, exposed through
     /// the kernel's manual-compaction checkpoint seam.
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
+    snapshot_persistence_status: Option<SnapshotPersistenceStatus>,
     pub session: Option<SessionBinding>,
     /// Runtime-owned resume for sessionless drivers during an in-process reassembly.
     /// Persistent sessions reload their canonical snapshot through `SessionBinding` instead.
@@ -201,9 +203,9 @@ pub struct CodingParts {
 }
 
 /// Phase 1 — gather + connect everything the agent needs (async: MCP connect,
-/// snapshot load, skill-dir scans). Errors only on a broken EXPLICIT request
-/// (`SessionMode::Resume` whose snapshot can't be read); everything optional
-/// degrades gracefully (no `.mcp.json` → no MCP tools; empty skill dirs → none).
+/// snapshot load, skill-dir scans). Errors only on a broken EXPLICIT persistent
+/// session request whose native aggregate is invalid; everything optional degrades
+/// gracefully (no `.mcp.json` → no MCP tools; empty skill dirs → none).
 pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Result<CodingParts> {
     prepare_with_plugin_hooks(cfg, opts, Vec::new()).await
 }
@@ -274,22 +276,25 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // so the reviewer reuses the host's correctly-built — possibly signed — provider.
     let review_provider: Option<SharedReviewProvider> = if opts.review {
         let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
-        registry.register(Arc::new(ReviewTool::new(
-            slot.clone(),
-            ReviewToolConfig {
-                model: cfg.model.clone(),
-                context_window: cfg.context_window,
-                stream_timeout: cfg.stream_timeout,
-                request_timeout: cfg
-                    .request_timeout
-                    .unwrap_or_else(|| std::time::Duration::from_secs(300)),
-                max_commits_without_confirmation: 20,
-                max_files_without_confirmation: 40,
-                max_changed_lines_without_confirmation: 4_000,
-                max_diff_bytes_without_confirmation: 256 * 1024,
-                rules_dir: None,
-            },
-        )));
+        registry.register(Arc::new(
+            ReviewTool::new(
+                slot.clone(),
+                ReviewToolConfig {
+                    model: cfg.model.clone(),
+                    context_window: cfg.context_window,
+                    stream_timeout: cfg.stream_timeout,
+                    request_timeout: cfg
+                        .request_timeout
+                        .unwrap_or_else(|| std::time::Duration::from_secs(300)),
+                    max_commits_without_confirmation: 20,
+                    max_files_without_confirmation: 40,
+                    max_changed_lines_without_confirmation: 4_000,
+                    max_diff_bytes_without_confirmation: 256 * 1024,
+                    rules_dir: None,
+                },
+            )
+            .with_tool_loop_policy(cfg.tool_loop_policy),
+        ));
         names.push("code_review".into());
         Some(slot)
     } else {
@@ -376,9 +381,12 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .as_ref()
                 .map(|c| c.subagent.clone())
                 .unwrap_or_default();
-            let (max_concurrent, subtask_timeout) = subagent_runtime_knobs(
+            let (max_concurrent, subtask_timeout, max_rounds) = subagent_runtime_knobs(
                 &subagent_cfg,
                 std::env::var("ATOMCODE_SUBAGENT_TIMEOUT").ok().as_deref(),
+                std::env::var("ATOMCODE_SUBAGENT_MAX_ROUNDS")
+                    .ok()
+                    .as_deref(),
             );
             registry.register(Arc::new(
                 TaskTool::new(
@@ -388,7 +396,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                     make_worker_tools,
                 )
                 .with_max_concurrent(max_concurrent)
-                .with_subtask_timeout(subtask_timeout),
+                .with_subtask_timeout(subtask_timeout)
+                .with_max_rounds(max_rounds)
+                .with_tool_loop_policy(cfg.tool_loop_policy),
             ));
             names.push("task".to_string());
             Some(slot)
@@ -461,33 +471,41 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         SessionMode::Resume(id) => {
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
             let lease = session_lease(&manager, id, reuse_lease.as_ref())?;
-            match manager.load_snapshot(id) {
-                Ok(snap) => {
-                    // A version-mismatched snapshot must FAIL here, not fall through
-                    // to the kernel's empty-start seam — that would silently fresh-
-                    // start under the SAME session id and corrupt on-disk state.
-                    check_snapshot_version(&snap)?;
-                    Some(SessionBinding {
-                        id: id.clone(),
-                        manager,
-                        lease,
-                        resume: Some(snap),
-                        staged_fresh: None,
-                    })
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(e.into()),
-                Err(e) => return Err(e.into()),
-            }
+            // Resume is a native-only boundary. Legacy/unconfirmed data must first
+            // converge through a driver importer; accepting a lone snapshot here
+            // would bypass ownership and manufacture an incomplete native session.
+            let loaded = manager.load_native_session(id).map_err(io::Error::from)?;
+            // A version-mismatched snapshot must FAIL here, not fall through to the
+            // kernel's empty-start seam — that would silently fresh-start under the
+            // SAME session id and corrupt on-disk state.
+            check_snapshot_version(&loaded.snapshot)?;
+            Some(SessionBinding {
+                id: id.clone(),
+                manager,
+                lease,
+                resume: Some(loaded.snapshot),
+                staged_fresh: None,
+            })
         }
         SessionMode::ExternalSnapshot { id, snapshot } => {
             check_snapshot_version(snapshot)?;
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
             let lease = session_lease(&manager, id, reuse_lease.as_ref())?;
+            let loaded = manager.load_native_session(id).map_err(io::Error::from)?;
+            check_snapshot_version(&loaded.snapshot)?;
+            if loaded.snapshot != *snapshot {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "external snapshot for session {id:?} does not match the canonical native snapshot"
+                    ),
+                ));
+            }
             Some(SessionBinding {
                 id: id.clone(),
                 manager,
                 lease,
-                resume: Some(snapshot.clone()),
+                resume: Some(loaded.snapshot),
                 staged_fresh: None,
             })
         }
@@ -518,6 +536,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     //    keep it last: any earlier hook's continuation outranks the cadence nudge.
     let mut hooks: Vec<Arc<dyn LifecycleHooks>> = Vec::new();
     let mut compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>> = None;
+    let mut snapshot_persistence_status = None;
     // Env / project-instructions / git context — unconditional (v1 parity: always present).
     hooks.push(Arc::new(SessionContextHook::new(&cfg.working_dir)));
     if opts.memory {
@@ -534,6 +553,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         let wd = cfg.working_dir.to_string_lossy().into_owned();
         let snapshot_hook =
             Arc::new(SnapshotHook::new(b.manager.clone(), &b.id, &wd).with_lease(b.lease.clone()));
+        snapshot_persistence_status = Some(snapshot_hook.persistence_status());
         compaction_checkpoint = Some(snapshot_hook.clone());
         hooks.push(snapshot_hook);
         hooks.push(Arc::new(TranscriptHook::new(b.manager.clone(), &b.id)));
@@ -568,8 +588,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // recency is high. Gated to deepseek (model_needs_firm_execution) + a non-empty skill
     // catalog (never nudge use_skill when no skills are installed). No-op otherwise.
     hooks.push(Arc::new(crate::skill_first::SkillFirstHook::new(
-        &cfg.model,
-        has_skills,
+        &cfg.model, has_skills,
     )));
     // NOTE: the `RateLimitHook` is NOT built here. It gates CodingPlan-specific 429
     // messaging on `cfg.base_url` being the gateway, so — like the turn-level
@@ -631,6 +650,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         approval: Arc::new(ApprovalMiddleware::in_memory()),
         hooks,
         compaction_checkpoint,
+        snapshot_persistence_status,
         session,
         runtime_resume: None,
         mcp_registry,
@@ -683,6 +703,24 @@ fn session_lease(
 }
 
 impl CodingParts {
+    pub(crate) fn take_snapshot_persistence_uncertain(&self) -> Option<String> {
+        self.snapshot_persistence_status
+            .as_ref()
+            .and_then(SnapshotPersistenceStatus::take_uncertain_commit)
+    }
+
+    pub(crate) fn snapshot_persistence_status(&self) -> Option<SnapshotPersistenceStatus> {
+        self.snapshot_persistence_status.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn report_snapshot_persistence_uncertain(&mut self, message: impl Into<String>) {
+        self.snapshot_persistence_status
+            .as_ref()
+            .expect("persistent test parts must have a snapshot status")
+            .report_uncertain_commit(message);
+    }
+
     /// Make a prepared fresh session durable and catalog-visible. This is the
     /// session transition's persistence commit point; preparation and assembly
     /// deliberately leave the catalog untouched.
@@ -722,6 +760,10 @@ impl CodingParts {
     /// Preserve the exact current conversation across a sessionless provider reassembly.
     pub(crate) fn set_runtime_resume(&mut self, snapshot: SessionSnapshot) {
         self.runtime_resume = Some(snapshot);
+    }
+
+    pub(crate) fn runtime_resume_snapshot(&self) -> Option<SessionSnapshot> {
+        self.runtime_resume.clone()
     }
     /// Mount the full toolset (fresh `MountedTools` per call — it is not `Clone`;
     /// the underlying tools are shared `Arc`s).
@@ -764,8 +806,8 @@ impl CodingParts {
 ///   (continuing would silently fresh-start the SAME session id and corrupt its
 ///   transcript/snapshot — the exact "silent fresh start" the Resume contract
 ///   forbids);
-/// - nothing-persisted-yet (`NotFound`) is NOT an error: a fresh session's first
-///   assemble starts empty by design.
+/// - only an explicitly staged fresh session may have no aggregate yet; every
+///   resume/reassemble requires metadata, snapshot, and presentation together.
 ///
 /// CONCURRENCY CONTRACT: at most ONE live agent per `CodingParts` — await the old
 /// `AgentHandle.task` (after `Shutdown`) before re-assembling. The session hooks
@@ -788,16 +830,18 @@ pub fn assemble(
             &cfg.model,
         ))));
 
-    // Session-bound: reload the LATEST snapshot (turn 1 of a fresh session: none
-    // yet → NotFound → start empty). Anything else unreadable is a real failure.
+    // Session-bound: reload the complete canonical aggregate. Only a fresh
+    // runtime intentionally staged in memory is allowed to assemble before its
+    // first aggregate publication.
     if let Some(b) = &mut parts.session {
-        match b.manager.load_snapshot(&b.id) {
-            Ok(mut snap) => {
+        match b.manager.load_native_session(&b.id) {
+            Ok(loaded) => {
+                let mut snap = loaded.snapshot;
                 check_snapshot_version(&snap)?;
                 reconcile_coding_persona(&mut snap, &cfg.model);
                 b.resume = Some(snap);
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound && b.staged_fresh.is_some() => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -1006,16 +1050,19 @@ pub fn assemble(
         .max_continuations(cfg.max_continuations)
         // Ctrl-C semantics: false = UNDO (default), true = PRESERVE the interrupted turn.
         .keep_interrupted_context(cfg.keep_interrupted_context);
+    if let Some(policy) = cfg.tool_loop_policy {
+        builder = builder.tool_loop_policy(policy);
+    }
+    // Coarse round-cap backstop: the repetition guards catch exact loops quickly, while this
+    // also bounds varying-call runaways. `0` leaves the neutral kernel fuse unwired.
+    if cfg.max_rounds != 0 {
+        builder = builder.max_rounds(cfg.max_rounds);
+    }
     // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
     // answered (interactive — a present human must not be auto-denied). The kernel defaults
     // to unbounded when `.request_timeout` is never set, so None = park.
     if let Some(d) = cfg.request_timeout {
         builder = builder.request_timeout(d);
-    }
-    // Coarse round-cap backstop (the kernel's repetition fuse is the fast path for
-    // identical loops; this bounds VARYING-call runaways). `0` = unbounded → not wired.
-    if cfg.max_rounds > 0 {
-        builder = builder.max_rounds(cfg.max_rounds);
     }
     for h in &parts.hooks {
         builder = builder.hook(h.clone());
@@ -1039,7 +1086,8 @@ pub fn assemble(
         if let Some(snap) = &b.resume {
             builder = builder.resume(snap.clone());
         }
-    } else if let Some(snapshot) = parts.runtime_resume.take() {
+    } else if let Some(mut snapshot) = parts.runtime_resume.as_ref().cloned() {
+        reconcile_coding_persona(&mut snapshot, &cfg.model);
         builder = builder.resume(snapshot);
     }
     // Ensure the repo's `atomcode` project label after a successful `git push` to a
@@ -1115,15 +1163,18 @@ fn check_snapshot_version(snap: &SessionSnapshot) -> io::Result<()> {
 pub fn subagent_enabled_from_env(var: Option<&str>) -> bool {
     match var {
         None => true,
-        Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
     }
 }
 
 /// Resolve the `task` subagent tool's runtime knobs from the `[subagent]` config section,
 /// with the `ATOMCODE_SUBAGENT_TIMEOUT` env var OVERRIDING the config `timeout_secs` base
 /// (mirroring how `ATOMCODE_SUBAGENT` / `ATOMCODE_TODO` env switches override their config).
-/// Returns `(max_concurrent, per_subtask_timeout)`. Pure/testable; the caller wires the
-/// result into `TaskTool::with_max_concurrent` / `with_subtask_timeout`.
+/// Returns `(max_concurrent, per_subtask_timeout, per_subtask_max_rounds)`. `0` rounds
+/// intentionally means unbounded and does not alter the separately inherited exact policy.
 ///
 /// Footgun guards (a misconfigured section must not wedge the tool): at least 1 worker, and
 /// at least 30s per subtask. `timeout_env` unset / empty / non-numeric / `0` falls back to the
@@ -1132,16 +1183,21 @@ pub fn subagent_enabled_from_env(var: Option<&str>) -> bool {
 pub fn subagent_runtime_knobs(
     cfg: &atomcode_config::config::SubAgentConfig,
     timeout_env: Option<&str>,
-) -> (usize, std::time::Duration) {
+    max_rounds_env: Option<&str>,
+) -> (usize, std::time::Duration, u32) {
     const MIN_TIMEOUT_SECS: u64 = 30;
     let timeout_secs = timeout_env
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&s| s > 0)
         .unwrap_or(cfg.timeout_secs)
         .max(MIN_TIMEOUT_SECS);
+    let max_rounds = max_rounds_env
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(cfg.max_rounds);
     (
         cfg.max_concurrent.max(1),
         std::time::Duration::from_secs(timeout_secs),
+        max_rounds,
     )
 }
 
@@ -1176,24 +1232,26 @@ mod tests {
             ..SubAgentConfig::default()
         };
         // env unset → the config `[subagent]` values drive both knobs.
-        let (mc, to) = subagent_runtime_knobs(&cfg, None);
+        let (mc, to, rounds) = subagent_runtime_knobs(&cfg, None, None);
         assert_eq!(mc, 5);
         assert_eq!(to, Duration::from_secs(600));
+        assert_eq!(rounds, 200);
         // env set → overrides ONLY the timeout; max_concurrent still comes from config.
-        let (mc, to) = subagent_runtime_knobs(&cfg, Some("  1200 "));
+        let (mc, to, rounds) = subagent_runtime_knobs(&cfg, Some("  1200 "), None);
         assert_eq!(mc, 5, "env timeout override must not touch max_concurrent");
         assert_eq!(to, Duration::from_secs(1200));
+        assert_eq!(rounds, 200, "env timeout must not touch max_rounds");
         // env empty / non-numeric / 0 → fall back to the config timeout base.
         assert_eq!(
-            subagent_runtime_knobs(&cfg, Some("")).1,
+            subagent_runtime_knobs(&cfg, Some(""), None).1,
             Duration::from_secs(600)
         );
         assert_eq!(
-            subagent_runtime_knobs(&cfg, Some("abc")).1,
+            subagent_runtime_knobs(&cfg, Some("abc"), None).1,
             Duration::from_secs(600)
         );
         assert_eq!(
-            subagent_runtime_knobs(&cfg, Some("0")).1,
+            subagent_runtime_knobs(&cfg, Some("0"), None).1,
             Duration::from_secs(600)
         );
     }
@@ -1210,12 +1268,12 @@ mod tests {
             timeout_secs: 5,
             ..SubAgentConfig::default()
         };
-        let (mc, to) = subagent_runtime_knobs(&tiny, None);
+        let (mc, to, _) = subagent_runtime_knobs(&tiny, None, None);
         assert_eq!(mc, 1, "max_concurrent floored to 1");
         assert_eq!(to, Duration::from_secs(30), "config timeout floored to 30s");
         // An env override below the floor is floored too.
         assert_eq!(
-            subagent_runtime_knobs(&SubAgentConfig::default(), Some("5")).1,
+            subagent_runtime_knobs(&SubAgentConfig::default(), Some("5"), None).1,
             Duration::from_secs(30)
         );
     }
@@ -1228,13 +1286,32 @@ mod tests {
         // Wiring config must NOT silently change the shipped `task` defaults for opt-in users:
         // default config still yields 3 concurrent workers and a 900s (15 min) per-subtask
         // timeout — the same values the tool used before it read config.
-        let (mc, to) = subagent_runtime_knobs(&SubAgentConfig::default(), None);
+        let (mc, to, rounds) = subagent_runtime_knobs(&SubAgentConfig::default(), None, None);
         assert_eq!(mc, 3, "default max_concurrent unchanged");
         assert_eq!(
             to,
             Duration::from_secs(900),
             "default per-subtask timeout unchanged"
         );
+        assert_eq!(rounds, 200, "default child round high-water unchanged");
+    }
+
+    #[test]
+    fn subagent_round_limit_supports_override_and_explicit_unbounded() {
+        use super::subagent_runtime_knobs;
+        use atomcode_config::config::SubAgentConfig;
+        let cfg = SubAgentConfig {
+            max_rounds: 350,
+            ..SubAgentConfig::default()
+        };
+        assert_eq!(subagent_runtime_knobs(&cfg, None, None).2, 350);
+        assert_eq!(subagent_runtime_knobs(&cfg, None, Some(" 500 ")).2, 500);
+        assert_eq!(
+            subagent_runtime_knobs(&cfg, None, Some("0")).2,
+            0,
+            "zero is an intentional unbounded override"
+        );
+        assert_eq!(subagent_runtime_knobs(&cfg, None, Some("bad")).2, 350);
     }
 
     #[test]
@@ -1319,6 +1396,238 @@ mod tests {
             review: false,
             rate_limit_source: None,
         }
+    }
+
+    async fn resume_prepare_error(cfg: &CodingAgentConfig, id: &str) -> io::Error {
+        let mut opts = io_free_opts();
+        opts.session = SessionMode::Resume(id.to_string());
+        match prepare(cfg, opts).await {
+            Ok(_) => panic!("resume must reject invalid native aggregate for {id}"),
+            Err(error) => error,
+        }
+    }
+
+    fn session_store_error(
+        error: &io::Error,
+    ) -> &atomcode_capabilities::session::SessionStoreError {
+        error
+            .get_ref()
+            .and_then(|source| {
+                source.downcast_ref::<atomcode_capabilities::session::SessionStoreError>()
+            })
+            .expect("prepare error must preserve the session store cause")
+    }
+
+    fn persist_native_session(
+        manager: &SessionManager,
+        id: &str,
+        working_dir: &std::path::Path,
+        snapshot: &SessionSnapshot,
+    ) {
+        let lease = manager.acquire_lease(id).unwrap();
+        let mut meta = SessionMeta::new(id, working_dir.to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = u32::try_from(snapshot.messages.len()).unwrap();
+        manager
+            .commit_native_import(
+                &lease,
+                Some(snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+    }
+
+    async fn external_snapshot_prepare_error(
+        cfg: &CodingAgentConfig,
+        id: &str,
+        snapshot: SessionSnapshot,
+    ) -> io::Error {
+        let mut opts = io_free_opts();
+        opts.session = SessionMode::ExternalSnapshot {
+            id: id.to_string(),
+            snapshot,
+        };
+        match prepare(cfg, opts).await {
+            Ok(_) => panic!("external snapshot must reject invalid native aggregate for {id}"),
+            Err(error) => error,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn resume_requires_a_complete_native_session_aggregate() {
+        use atomcode_capabilities::session::SessionStoreError;
+
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let manager = SessionManager::for_project(project.path());
+        let snapshot = SessionSnapshot::new(vec![Message::user("persisted")]);
+        let presentation = PresentationFile::default();
+
+        manager.save_snapshot("missing-meta", &snapshot).unwrap();
+        manager
+            .write_presentation("missing-meta", &presentation)
+            .unwrap();
+        let error = resume_prepare_error(&cfg, "missing-meta").await;
+        assert!(matches!(
+            session_store_error(&error),
+            SessionStoreError::NotFound { path }
+                if path == &manager.meta_path("missing-meta").unwrap()
+        ));
+
+        let mut missing_snapshot =
+            SessionMeta::new("missing-snapshot", project.path().to_string_lossy(), 1);
+        missing_snapshot.owner = StorageOwner::Native;
+        manager.write_meta(&missing_snapshot).unwrap();
+        manager
+            .write_presentation("missing-snapshot", &presentation)
+            .unwrap();
+        let error = resume_prepare_error(&cfg, "missing-snapshot").await;
+        assert!(matches!(
+            session_store_error(&error),
+            SessionStoreError::NotFound { path }
+                if path == &manager.snapshot_path("missing-snapshot").unwrap()
+        ));
+
+        let mut missing_presentation =
+            SessionMeta::new("missing-presentation", project.path().to_string_lossy(), 1);
+        missing_presentation.owner = StorageOwner::Native;
+        manager.write_meta(&missing_presentation).unwrap();
+        manager
+            .save_snapshot("missing-presentation", &snapshot)
+            .unwrap();
+        let error = resume_prepare_error(&cfg, "missing-presentation").await;
+        assert!(matches!(
+            session_store_error(&error),
+            SessionStoreError::NotFound { path }
+                if path == &manager.presentation_path("missing-presentation").unwrap()
+        ));
+
+        for (id, owner) in [
+            ("unconfirmed-owner", StorageOwner::Unconfirmed),
+            ("legacy-owner", StorageOwner::Legacy),
+        ] {
+            manager.save_snapshot(id, &snapshot).unwrap();
+            manager.write_presentation(id, &presentation).unwrap();
+            let mut meta = SessionMeta::new(id, project.path().to_string_lossy(), 1);
+            meta.owner = owner.clone();
+            manager.write_meta(&meta).unwrap();
+
+            let error = resume_prepare_error(&cfg, id).await;
+            assert!(matches!(
+                session_store_error(&error),
+                SessionStoreError::OwnershipConflict {
+                    id: actual_id,
+                    owner: actual_owner,
+                    operation: "load native session",
+                } if actual_id == id && actual_owner == &owner
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_bound_reassemble_rejects_an_incomplete_native_aggregate() {
+        use atomcode_capabilities::session::SessionStoreError;
+
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let manager = SessionManager::for_project(project.path());
+        let id = "incomplete-reassemble";
+        let snapshot = SessionSnapshot::new(vec![Message::user("persisted")]);
+        persist_native_session(&manager, id, project.path(), &snapshot);
+
+        let mut opts = io_free_opts();
+        opts.session = SessionMode::Resume(id.into());
+        let mut parts = prepare(&cfg, opts).await.unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+        drop(assemble(&mut parts, &cfg, provider.clone()).unwrap());
+        std::fs::remove_file(manager.presentation_path(id).unwrap()).unwrap();
+
+        let error = match assemble(&mut parts, &cfg, provider) {
+            Ok(_) => panic!("reassemble must reject an incomplete native aggregate"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            session_store_error(&error),
+            SessionStoreError::NotFound { path }
+                if path == &manager.presentation_path(id).unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn external_snapshot_requires_a_complete_native_session_aggregate() {
+        use atomcode_capabilities::session::SessionStoreError;
+
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let manager = SessionManager::for_project(project.path());
+
+        let error = external_snapshot_prepare_error(
+            &cfg,
+            "missing-native",
+            SessionSnapshot::new(vec![Message::user("external")]),
+        )
+        .await;
+        assert!(matches!(
+            session_store_error(&error),
+            SessionStoreError::NotFound { path }
+                if path == &manager.meta_path("missing-native").unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn external_snapshot_must_match_the_canonical_native_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let manager = SessionManager::for_project(project.path());
+        let id = "divergent-external";
+        let canonical = SessionSnapshot::new(vec![Message::user("canonical")]);
+        persist_native_session(&manager, id, project.path(), &canonical);
+
+        let error = external_snapshot_prepare_error(
+            &cfg,
+            id,
+            SessionSnapshot::new(vec![Message::user("stale external")]),
+        )
+        .await;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error
+            .to_string()
+            .contains("does not match the canonical native snapshot"));
+        assert_eq!(manager.load_snapshot(id).unwrap(), canonical);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn external_snapshot_accepts_a_matching_complete_native_aggregate() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let manager = SessionManager::for_project(project.path());
+        let id = "matching-external";
+        let canonical = SessionSnapshot::new(vec![Message::user("canonical")]);
+        persist_native_session(&manager, id, project.path(), &canonical);
+
+        let mut opts = io_free_opts();
+        opts.session = SessionMode::ExternalSnapshot {
+            id: id.into(),
+            snapshot: canonical.clone(),
+        };
+        let parts = prepare(&cfg, opts).await.unwrap();
+        assert_eq!(parts.session.unwrap().resume.as_ref(), Some(&canonical));
     }
 
     #[tokio::test]
@@ -1418,6 +1727,8 @@ mod tests {
         std::env::set_var("ATOMCODE_HOME", home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let snapshot = SessionSnapshot::new(vec![Message::user("persisted")]);
+        let manager = SessionManager::for_project(project.path());
+        persist_native_session(&manager, "same-session", project.path(), &snapshot);
         let opts = || {
             let mut opts = io_free_opts();
             opts.session = SessionMode::ExternalSnapshot {

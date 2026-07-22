@@ -16,6 +16,18 @@ export interface ImageInput {
   missing?: boolean;
 }
 
+export type ChatStopReason =
+  | 'stopped'
+  | 'max_rounds'
+  | 'max_continuations'
+  | 'repeat_loop'
+  | 'tool_loop_detected'
+  | 'provider_error'
+  | 'timeout'
+  | 'cancelled'
+  | 'prompt_rejected'
+  | 'rate_limited';
+
 export interface SkillInfo {
   name: string;
   description: string;
@@ -41,7 +53,7 @@ export type ChatEvent =
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'warning'; message: string }
   | { type: 'rate_limited'; message: string; retry_after_seconds?: number; attempt?: number; max_attempts?: number }
-  | { type: 'done'; tokens: number; tool_calls: number; session_id?: string }
+  | { type: 'done'; tokens: number; tool_calls: number; session_id?: string; stop_reason?: ChatStopReason; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string };
 
@@ -315,7 +327,7 @@ export interface ChatStreamCallbacks {
   onArtifactEnd: (id: string) => void;
   onWarning: (message: string) => void;
   onRateLimited: (event: { message: string; retryAfterSeconds?: number; attempt?: number; maxAttempts?: number }) => void;
-  onDone: (tokens: number, toolCalls: number, sessionId?: string) => void;
+  onDone: (tokens: number, toolCalls: number, sessionId?: string, stopReason?: ChatStopReason, message?: string) => void;
   onStopped: () => void;
   onError: (message: string) => void;
 }

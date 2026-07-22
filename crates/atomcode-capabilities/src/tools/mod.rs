@@ -28,6 +28,11 @@ use atomcode_kernel::tool::{ToolRegistry, ToolResult};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Last-resort per-turn high-water mark for composed child agents. Products can
+/// override it, including `0` for unbounded; exact no-progress loops are handled
+/// separately by the result-aware tool-loop policy.
+const DEFAULT_CHILD_MAX_ROUNDS: u32 = 200;
+
 pub mod approval;
 pub mod ast_grep;
 /// AtomGit REST tools (repo / pr / issue). Opt-in `atomgit` feature.

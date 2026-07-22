@@ -648,9 +648,9 @@ export function InputArea() {
           {state.tokenCount && <span className="footer-tokens">{formatTokenCount(state.tokenCount.total, t)}</span>}
           <ModeSelector placement="up" onOpen={() => setShowSlash(false)} />
           <ModelSelector placement="up" onOpen={() => setShowSlash(false)} />
-          {state.isGenerating ? (
+          {state.isGenerating || state.recoveryLocked ? (
             <>
-              {hasText && (
+              {state.isGenerating && !state.recoveryLocked && hasText && (
                 <button className="btn-send" onClick={handleSend} disabled={state.approvalModePending} title={t('input.queueMessage')}>
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
                     <line x1="12" y1="19" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" />
