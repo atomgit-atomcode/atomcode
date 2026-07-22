@@ -20,6 +20,14 @@ _Avoid_: LiveSession, conversation owner
 Live View Hub 与一个确定的 runtime generation、session 和 working directory 之间的唯一关联。
 _Avoid_: Best-effort attachment, implicit reuse
 
+**Session Transition**:
+由 Coding Runtime 原子提交 session identity、working directory、generation 和 catalog visibility 的可等待替换操作；请求已接收不代表切换已提交。
+_Avoid_: Fire-and-forget session command, optimistic session reset
+
+**View Projection**:
+Live View 在 Runtime 终态之后派生的会话、目录和展示状态，不是运行时状态的第二所有者。
+_Avoid_: Driver-owned session state, optimistic projection
+
 **Committed Snapshot**:
 Coding Runtime 在明确生命周期边界产生的、可恢复的完整会话状态。
 _Avoid_: Transcript, display history

@@ -130,6 +130,9 @@ pub struct SessionBinding {
     pub(crate) lease: SessionLease,
     /// Loaded snapshot on [`SessionMode::Resume`]; `None` on fresh.
     pub resume: Option<SessionSnapshot>,
+    /// Fresh metadata prepared in memory but not yet catalog-visible. CodingRuntime
+    /// publishes it only after the complete candidate graph has assembled.
+    staged_fresh: Option<SessionMeta>,
 }
 
 /// Everything `assemble` composes — and everything a respawn must REUSE so state
@@ -216,7 +219,7 @@ pub async fn prepare_with_plugin_hooks(
     opts: PrepareOptions,
     plugin_cc_hooks: Vec<HookConfig>,
 ) -> io::Result<CodingParts> {
-    prepare_with_plugin_hooks_reusing_lease(cfg, opts, plugin_cc_hooks, None).await
+    prepare_with_plugin_hooks_reusing_lease(cfg, opts, plugin_cc_hooks, None, false).await
 }
 
 async fn prepare_with_plugin_hooks_reusing_lease(
@@ -224,6 +227,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     opts: PrepareOptions,
     plugin_cc_hooks: Vec<HookConfig>,
     reuse_lease: Option<SessionLease>,
+    stage_fresh: bool,
 ) -> io::Result<CodingParts> {
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
@@ -425,19 +429,22 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             let now = atomcode_capabilities::session::now_ms();
             let mut meta = SessionMeta::new(&id, cfg.working_dir.to_string_lossy().as_ref(), now);
             meta.owner = StorageOwner::Native;
-            manager
-                .commit_native_import(
-                    &lease,
-                    Some(&SessionSnapshot::new(Vec::new())),
-                    Some(&PresentationFile::default()),
-                    &meta,
-                )
-                .map_err(io::Error::from)?;
+            if !stage_fresh {
+                manager
+                    .commit_native_import(
+                        &lease,
+                        Some(&SessionSnapshot::new(Vec::new())),
+                        Some(&PresentationFile::default()),
+                        &meta,
+                    )
+                    .map_err(io::Error::from)?;
+            }
             Some(SessionBinding {
                 id,
                 manager,
                 lease,
                 resume: None,
+                staged_fresh: stage_fresh.then_some(meta),
             })
         }
         SessionMode::Resume(id) => {
@@ -454,6 +461,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                         manager,
                         lease,
                         resume: Some(snap),
+                        staged_fresh: None,
                     })
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(e.into()),
@@ -469,6 +477,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 manager,
                 lease,
                 resume: Some(snapshot.clone()),
+                staged_fresh: None,
             })
         }
     };
@@ -630,7 +639,7 @@ pub async fn prepare_with_plugin_hook_source(
     opts: PrepareOptions,
     source: &dyn PluginHookSource,
 ) -> io::Result<CodingParts> {
-    prepare_with_plugin_hook_source_reusing_lease(cfg, opts, source, None).await
+    prepare_with_plugin_hook_source_reusing_lease(cfg, opts, source, None, false).await
 }
 
 pub(crate) async fn prepare_with_plugin_hook_source_reusing_lease(
@@ -638,11 +647,12 @@ pub(crate) async fn prepare_with_plugin_hook_source_reusing_lease(
     opts: PrepareOptions,
     source: &dyn PluginHookSource,
     reuse_lease: Option<SessionLease>,
+    stage_fresh: bool,
 ) -> io::Result<CodingParts> {
     let hooks = source
         .load()
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
-    prepare_with_plugin_hooks_reusing_lease(cfg, opts, hooks, reuse_lease).await
+    prepare_with_plugin_hooks_reusing_lease(cfg, opts, hooks, reuse_lease, stage_fresh).await
 }
 
 fn session_lease(
@@ -662,6 +672,29 @@ fn session_lease(
 }
 
 impl CodingParts {
+    /// Make a prepared fresh session durable and catalog-visible. This is the
+    /// session transition's persistence commit point; preparation and assembly
+    /// deliberately leave the catalog untouched.
+    pub(crate) fn publish_staged_session(&mut self) -> io::Result<()> {
+        let Some(binding) = self.session.as_mut() else {
+            return Ok(());
+        };
+        let Some(meta) = binding.staged_fresh.as_ref() else {
+            return Ok(());
+        };
+        binding
+            .manager
+            .commit_native_import(
+                &binding.lease,
+                Some(&SessionSnapshot::new(Vec::new())),
+                Some(&PresentationFile::default()),
+                meta,
+            )
+            .map_err(io::Error::from)?;
+        binding.staged_fresh = None;
+        Ok(())
+    }
+
     /// Carry session-scoped runtime decisions across a capability-graph rebuild.
     /// Fresh/resume/project switches deliberately keep their newly prepared stores.
     pub(crate) fn inherit_runtime_continuity(&mut self, previous: &CodingParts) {
@@ -1267,6 +1300,30 @@ mod tests {
 
         let ephemeral = prepare(&cfg, io_free_opts()).await.unwrap();
         assert!(ephemeral.compaction_checkpoint.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn runtime_prepare_keeps_fresh_session_staged_until_publish() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let mut opts = io_free_opts();
+        opts.session = SessionMode::Fresh;
+
+        let mut parts = prepare_with_plugin_hooks_reusing_lease(&cfg, opts, Vec::new(), None, true)
+            .await
+            .unwrap();
+        let binding = parts.session.as_ref().unwrap();
+        assert!(binding.manager.read_meta(&binding.id).is_err());
+
+        parts.publish_staged_session().unwrap();
+        let binding = parts.session.as_ref().unwrap();
+        assert_eq!(
+            binding.manager.read_meta(&binding.id).unwrap().owner,
+            StorageOwner::Native
+        );
     }
 
     #[tokio::test]

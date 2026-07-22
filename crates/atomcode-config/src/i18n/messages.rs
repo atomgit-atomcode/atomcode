@@ -524,6 +524,13 @@ pub enum Msg<'a> {
     CmdSwitchedPlanMode,
     CmdSwitchedBuildMode,
     CmdNewSession,
+    CmdSessionTransitionPending,
+    CmdSessionTransitionFailed {
+        error: &'a str,
+    },
+    CmdCapabilityReloadFailed {
+        error: &'a str,
+    },
     CmdNoProviders,
     CmdNoSessions,
     CmdUnknownCommand {

@@ -119,7 +119,7 @@ impl Drop for ScopedApprovalModeForTest {
     }
 }
 
-/// 同步 daemon 的项目视图状态；运行时切换由 `DriverCommand::ChangeDirectory` 负责。
+/// 同步 daemon 的项目视图状态；运行时切换由 CodingRuntime 的可等待接口负责。
 pub fn live_set_working_dir(dir: std::path::PathBuf) {
     let dir = crate::normalize_working_dir_case(dir);
 

@@ -32,7 +32,17 @@ pub enum RuntimeEventPayload {
 
 #[derive(Clone, Debug)]
 pub enum DriverEvent {
-    LocalShellFinished { output: String, failed: bool },
+    LocalShellFinished {
+        output: String,
+        failed: bool,
+    },
+    SessionTransitionFinished {
+        operation: atomcode_coding::ReconfigureKind,
+        result: Result<atomcode_coding::SessionChanged, atomcode_coding::RuntimeError>,
+    },
+    CapabilitiesReloadFinished {
+        result: Result<atomcode_coding::SessionChanged, atomcode_coding::RuntimeError>,
+    },
 }
 
 pub fn spawn_event_forwarder(

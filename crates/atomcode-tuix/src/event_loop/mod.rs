@@ -850,6 +850,55 @@ pub(crate) struct PendingSessionResume {
     pub project_bucket: String,
     pub session: Session,
     pub working_dir: PathBuf,
+    pub committed: Option<atomcode_coding::SessionChanged>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingSessionTransition {
+    pub operation: atomcode_coding::ReconfigureKind,
+    pub requested_working_dir: PathBuf,
+    pub committed: Option<atomcode_coding::SessionChanged>,
+    pub effect: SessionTransitionEffect,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) enum SessionTransitionEffect {
+    #[default]
+    None,
+    EnterWorktree {
+        original_dir: PathBuf,
+    },
+    LeaveWorktree {
+        original_dir: PathBuf,
+        branch: Option<String>,
+    },
+    CleanupCurrentWorktree {
+        manager_dir: PathBuf,
+        target_dir: PathBuf,
+        branch: String,
+        force: bool,
+    },
+}
+
+impl SessionTransitionEffect {
+    pub(crate) fn commit_marker(&self, marker: &mut Option<PathBuf>) {
+        match self {
+            Self::EnterWorktree { original_dir } => *marker = Some(original_dir.clone()),
+            Self::LeaveWorktree { .. } | Self::CleanupCurrentWorktree { .. } => *marker = None,
+            Self::None => {}
+        }
+    }
+}
+
+fn commit_pending_projection<T, E>(
+    pending: &mut Option<T>,
+    project: impl FnOnce(&T) -> Result<(), E>,
+) -> Result<Option<T>, E> {
+    let Some(value) = pending.as_ref() else {
+        return Ok(None);
+    };
+    project(value)?;
+    Ok(pending.take())
 }
 
 fn session_resume_matches(
@@ -862,9 +911,24 @@ fn session_resume_matches(
             == pending.project_bucket
 }
 
+fn session_transition_matches(
+    pending: &PendingSessionTransition,
+    operation: atomcode_coding::ReconfigureKind,
+    changed: &atomcode_coding::SessionChanged,
+) -> bool {
+    let requested = atomcode_capabilities::pathnorm::canonicalize(&pending.requested_working_dir)
+        .unwrap_or_else(|_| pending.requested_working_dir.clone());
+    pending.operation == operation
+        && atomcode_capabilities::session::SessionManager::project_hash(&requested)
+            == atomcode_capabilities::session::SessionManager::project_hash(&changed.working_dir)
+}
+
 #[cfg(test)]
 mod session_resume_tests {
-    use super::{session_resume_matches, PendingSessionResume};
+    use super::{
+        commit_pending_projection, session_resume_matches, PendingSessionResume,
+        SessionTransitionEffect,
+    };
     use crate::session::Session;
     use std::path::PathBuf;
 
@@ -874,10 +938,12 @@ mod session_resume_tests {
         let mut session = Session::default_session(working_dir.clone());
         session.id = "target-session".into();
         let pending = PendingSessionResume {
-            project_bucket:
-                atomcode_capabilities::session::SessionManager::project_hash(&working_dir),
+            project_bucket: atomcode_capabilities::session::SessionManager::project_hash(
+                &working_dir,
+            ),
             session,
             working_dir: working_dir.clone(),
+            committed: None,
         };
         let exact = atomcode_coding::SessionChanged {
             generation: atomcode_coding::RuntimeGeneration(1),
@@ -892,6 +958,38 @@ mod session_resume_tests {
             ..exact
         };
         assert!(!session_resume_matches(&pending, &wrong_directory));
+    }
+
+    #[test]
+    fn projection_failure_keeps_pending_operation_for_retry() {
+        let mut pending = Some("transition");
+        let result = commit_pending_projection(&mut pending, |_| Err::<(), _>("hub unavailable"));
+
+        assert_eq!(result, Err("hub unavailable"));
+        assert_eq!(pending, Some("transition"));
+
+        commit_pending_projection(&mut pending, |_| Ok::<(), &str>(())).unwrap();
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn worktree_marker_changes_only_when_transition_commits() {
+        let original = PathBuf::from("/repo");
+        let mut marker = None;
+        let enter = SessionTransitionEffect::EnterWorktree {
+            original_dir: original.clone(),
+        };
+
+        assert_eq!(marker, None);
+        enter.commit_marker(&mut marker);
+        assert_eq!(marker, Some(original.clone()));
+
+        let leave = SessionTransitionEffect::LeaveWorktree {
+            original_dir: original,
+            branch: Some("feature".into()),
+        };
+        leave.commit_marker(&mut marker);
+        assert_eq!(marker, None);
     }
 }
 
@@ -919,6 +1017,7 @@ pub struct DeferredRuntimeControl {
 enum RuntimeUiAvailability {
     Starting,
     Available,
+    Reconfiguring,
     AwaitingProvider,
     Failed,
     Stopped,
@@ -931,10 +1030,10 @@ fn runtime_ui_availability(phase: atomcode_coding::RuntimePhase) -> RuntimeUiAva
         atomcode_coding::RuntimePhase::ShuttingDown | atomcode_coding::RuntimePhase::Stopped => {
             RuntimeUiAvailability::Stopped
         }
+        atomcode_coding::RuntimePhase::Reconfiguring => RuntimeUiAvailability::Reconfiguring,
         atomcode_coding::RuntimePhase::Ready
         | atomcode_coding::RuntimePhase::InTurn
-        | atomcode_coding::RuntimePhase::WaitingApproval
-        | atomcode_coding::RuntimePhase::Reconfiguring => RuntimeUiAvailability::Available,
+        | atomcode_coding::RuntimePhase::WaitingApproval => RuntimeUiAvailability::Available,
     }
 }
 
@@ -952,25 +1051,28 @@ fn runtime_ui_availability(phase: atomcode_coding::RuntimePhase) -> RuntimeUiAva
 /// right behavior is to hold the prompt and let the existing type-ahead drain
 /// send it once the runtime reaches `Available` — not to lose it.
 ///
-/// Only the local foreground runtime enters these transient states; the live
-/// (webui bridge) path manages readiness separately, so it is never held here.
+/// Local bootstrap readiness is owned by the local facade. Reconfiguration is
+/// different: it is an authoritative CodingRuntime phase shared by local and
+/// live submissions, so both paths must hold until the replacement commits.
 /// Fatal states (`Failed` / `Stopped`) still surface the error.
 fn hold_submit_until_ready(live: bool, availability: RuntimeUiAvailability) -> bool {
-    !live
-        && matches!(
-            availability,
-            RuntimeUiAvailability::AwaitingProvider | RuntimeUiAvailability::Starting
-        )
+    availability == RuntimeUiAvailability::Reconfiguring
+        || (!live
+            && matches!(
+                availability,
+                RuntimeUiAvailability::AwaitingProvider | RuntimeUiAvailability::Starting
+            ))
 }
 
 /// Guard for the type-ahead drain: a queued message must only be replayed when
 /// the local foreground runtime is actually `Available`. Without this, a
 /// foreground event arriving while the runtime is still `AwaitingProvider` /
 /// `Starting` (i.e. before recovery completes) would pop a held message and
-/// submit it into a not-ready runtime, dropping it. Never blocks the live path
-/// (its `ctx.runtime` availability is unrelated to live submit readiness).
+/// submit it into a not-ready runtime, dropping it. The live path has separate
+/// bootstrap readiness, but it shares the runtime's reconfiguration boundary.
 fn drain_blocked_until_ready(live: bool, availability: RuntimeUiAvailability) -> bool {
-    !live && !matches!(availability, RuntimeUiAvailability::Available)
+    availability == RuntimeUiAvailability::Reconfiguring
+        || (!live && !matches!(availability, RuntimeUiAvailability::Available))
 }
 
 #[cfg(test)]
@@ -985,7 +1087,14 @@ mod submit_hold_tests {
             false,
             RuntimeUiAvailability::AwaitingProvider
         ));
-        assert!(hold_submit_until_ready(false, RuntimeUiAvailability::Starting));
+        assert!(hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::Starting
+        ));
+        assert!(hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::Reconfiguring
+        ));
 
         // Fatal / normal states: never hold — either it would submit fine
         // (Available) or recovery isn't coming (Failed/Stopped) so the error
@@ -994,12 +1103,18 @@ mod submit_hold_tests {
             false,
             RuntimeUiAvailability::Available
         ));
-        assert!(!hold_submit_until_ready(false, RuntimeUiAvailability::Failed));
-        assert!(!hold_submit_until_ready(false, RuntimeUiAvailability::Stopped));
+        assert!(!hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::Failed
+        ));
+        assert!(!hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::Stopped
+        ));
     }
 
     #[test]
-    fn never_holds_on_the_live_path() {
+    fn live_path_only_holds_authoritative_reconfiguration() {
         // The live (webui bridge) runtime manages readiness separately; its
         // ctx.runtime availability is unrelated to live submit readiness, so we
         // must never divert a live submit into the type-ahead queue.
@@ -1012,6 +1127,10 @@ mod submit_hold_tests {
         ] {
             assert!(!hold_submit_until_ready(true, availability));
         }
+        assert!(hold_submit_until_ready(
+            true,
+            RuntimeUiAvailability::Reconfiguring
+        ));
     }
 
     #[test]
@@ -1031,15 +1150,22 @@ mod submit_hold_tests {
             false,
             RuntimeUiAvailability::Starting
         ));
-        assert!(drain_blocked_until_ready(false, RuntimeUiAvailability::Failed));
+        assert!(drain_blocked_until_ready(
+            false,
+            RuntimeUiAvailability::Failed
+        ));
         assert!(drain_blocked_until_ready(
             false,
             RuntimeUiAvailability::Stopped
         ));
+        assert!(drain_blocked_until_ready(
+            false,
+            RuntimeUiAvailability::Reconfiguring
+        ));
     }
 
     #[test]
-    fn drain_never_blocked_on_the_live_path() {
+    fn live_drain_only_blocks_authoritative_reconfiguration() {
         // Live type-ahead readiness is not derived from ctx.runtime availability,
         // so the guard must never block a live drain regardless of the local
         // runtime phase.
@@ -1052,6 +1178,10 @@ mod submit_hold_tests {
         ] {
             assert!(!drain_blocked_until_ready(true, availability));
         }
+        assert!(drain_blocked_until_ready(
+            true,
+            RuntimeUiAvailability::Reconfiguring
+        ));
     }
 }
 
@@ -1064,7 +1194,6 @@ fn command_allowed_while_starting(command: &atomcode_coding::DriverCommand) -> b
             | DriverCommand::QueueLocalContext(_)
             | DriverCommand::ReloadProvider(_)
             | DriverCommand::DeactivateProvider(_)
-            | DriverCommand::ReloadCapabilities
             | DriverCommand::StopGoal
             | DriverCommand::StopLoop
             | DriverCommand::Shutdown
@@ -1108,6 +1237,19 @@ enum ReadyRuntimeRequest {
         id: String,
         working_dir: PathBuf,
         lease: atomcode_capabilities::session::SessionLease,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    FreshSession {
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    ChangeDirectory {
+        directory: PathBuf,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    ReloadCapabilities {
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
@@ -1184,7 +1326,10 @@ impl ReadyRuntimeControl {
             | ReadyRuntimeRequest::Undo { .. }
             | ReadyRuntimeRequest::ContextStats { .. }
             | ReadyRuntimeRequest::RestoreSnapshot { .. }
-            | ReadyRuntimeRequest::ResumeSession { .. } => matches!(
+            | ReadyRuntimeRequest::ResumeSession { .. }
+            | ReadyRuntimeRequest::FreshSession { .. }
+            | ReadyRuntimeRequest::ChangeDirectory { .. }
+            | ReadyRuntimeRequest::ReloadCapabilities { .. } => matches!(
                 phase,
                 atomcode_coding::RuntimePhase::Ready
                     | atomcode_coding::RuntimePhase::InTurn
@@ -1293,6 +1438,49 @@ impl ReadyRuntimeControl {
                         runtime_id,
                         CodingRuntimeEvent::SessionResumeFinished(result),
                     );
+                }
+                ReadyRuntimeRequest::FreshSession {
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.fresh_session().await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::SessionTransitionFinished {
+                                operation: atomcode_coding::ReconfigureKind::FreshSession,
+                                result,
+                            },
+                        ),
+                    });
+                }
+                ReadyRuntimeRequest::ChangeDirectory {
+                    directory,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.change_directory(directory).await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::SessionTransitionFinished {
+                                operation: atomcode_coding::ReconfigureKind::ChangeDirectory,
+                                result,
+                            },
+                        ),
+                    });
+                }
+                ReadyRuntimeRequest::ReloadCapabilities {
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.reload_capabilities().await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::CapabilitiesReloadFinished { result },
+                        ),
+                    });
                 }
                 ReadyRuntimeRequest::ReloadProvider {
                     next,
@@ -1588,6 +1776,113 @@ impl RuntimeControl {
         }
     }
 
+    pub fn fresh_session(
+        &self,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::FreshSession {
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                let handle = match &*deferred.state.borrow() {
+                    atomcode_coding::DeferredRuntimeState::Ready(handle) => handle.clone(),
+                    atomcode_coding::DeferredRuntimeState::Starting
+                    | atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                        return Err(atomcode_coding::RuntimeUnavailable);
+                    }
+                };
+                tokio::spawn(async move {
+                    let result = handle.fresh_session().await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::SessionTransitionFinished {
+                                operation: atomcode_coding::ReconfigureKind::FreshSession,
+                                result,
+                            },
+                        ),
+                    });
+                });
+                Ok(())
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn change_directory(
+        &self,
+        directory: PathBuf,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ChangeDirectory {
+                directory,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                let handle = match &*deferred.state.borrow() {
+                    atomcode_coding::DeferredRuntimeState::Ready(handle) => handle.clone(),
+                    atomcode_coding::DeferredRuntimeState::Starting
+                    | atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                        return Err(atomcode_coding::RuntimeUnavailable);
+                    }
+                };
+                tokio::spawn(async move {
+                    let result = handle.change_directory(directory).await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::SessionTransitionFinished {
+                                operation: atomcode_coding::ReconfigureKind::ChangeDirectory,
+                                result,
+                            },
+                        ),
+                    });
+                });
+                Ok(())
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn reload_capabilities(
+        &self,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ReloadCapabilities {
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                let handle = match &*deferred.state.borrow() {
+                    atomcode_coding::DeferredRuntimeState::Ready(handle) => handle.clone(),
+                    atomcode_coding::DeferredRuntimeState::Starting
+                    | atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                        return Err(atomcode_coding::RuntimeUnavailable);
+                    }
+                };
+                tokio::spawn(async move {
+                    let result = handle.reload_capabilities().await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::CapabilitiesReloadFinished { result },
+                        ),
+                    });
+                });
+                Ok(())
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
     pub fn reload_provider(
         &self,
         next: atomcode_coding::CodingAgentConfig,
@@ -1714,6 +2009,50 @@ mod local_restore_scope_tests {
         assert!(matches!(
             owner.recv().await,
             Some(CodingRuntimeControl::Snapshot { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn fresh_session_reports_completion_only_after_runtime_terminal() {
+        let (handle, mut owner) = coding_runtime_control_channel();
+        let runtime = RuntimeControl::from(handle);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<bg_runtime::RuntimeEvent>();
+        let runtime_id = RuntimeId::new(7);
+
+        runtime
+            .fresh_session(runtime_id, event_tx)
+            .expect("fresh request accepted");
+        let request = owner.recv().await.expect("runtime reprepare request");
+        assert!(matches!(request, CodingRuntimeControl::Reprepare { .. }));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), event_rx.recv())
+                .await
+                .is_err(),
+            "the driver must not project success before the runtime terminal"
+        );
+
+        let changed = atomcode_coding::SessionChanged {
+            generation: atomcode_coding::RuntimeGeneration(1),
+            session_id: Some("fresh-session".into()),
+            working_dir: std::path::PathBuf::from("/project"),
+        };
+        if let CodingRuntimeControl::Reprepare { done, .. } = request {
+            done.send(Ok(changed.clone())).unwrap();
+        } else {
+            unreachable!("checked above");
+        }
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(bg_runtime::RuntimeEvent {
+                runtime_id: received_id,
+                event: bg_runtime::RuntimeEventPayload::Driver(
+                    bg_runtime::DriverEvent::SessionTransitionFinished {
+                        operation: atomcode_coding::ReconfigureKind::FreshSession,
+                        result: Ok(result),
+                    },
+                ),
+            }) if received_id == runtime_id && result == changed
         ));
     }
 
@@ -2074,6 +2413,18 @@ pub struct LoopCtx {
     /// Exact picker selection waiting for CodingRuntime's resume terminal.
     /// UI/session projections are committed only after this operation succeeds.
     pub(crate) pending_session_resume: Option<PendingSessionResume>,
+    /// Fresh-session and directory transitions accepted by CodingRuntime but
+    /// not yet committed. The input buffer remains authoritative while this is set.
+    pub(crate) pending_session_transition: Option<PendingSessionTransition>,
+    /// A runtime-owned session terminal whose TUI/live projection has not yet
+    /// committed. Input remains blocked and retries this exact identity.
+    pub(crate) pending_external_session_projection: Option<atomcode_coding::SessionChanged>,
+    /// Capability rebuild is also an awaitable runtime replacement. While it
+    /// is pending, prompts remain buffered instead of racing Reconfiguring.
+    pub(crate) pending_capability_reload: bool,
+    /// Successful capability terminal waiting for the live binding generation
+    /// and snapshot projection to commit.
+    pub(crate) pending_capability_projection: Option<atomcode_coding::SessionChanged>,
     /// Cached "clipboard currently holds an image" flag, with a short TTL
     /// so the right-aligned `Image in clipboard · ctrl+v to paste` hint
     /// stays current without thrashing the system clipboard on every
@@ -8423,6 +8774,31 @@ fn handle_idle_key(
             }
         }
         BufferResult::Commit(line) => {
+            if ctx.pending_session_transition.is_some()
+                || ctx.pending_session_resume.is_some()
+                || ctx.pending_external_session_projection.is_some()
+                || ctx.pending_capability_reload
+            {
+                if let Err(error) = retry_pending_session_projections(&mut app.state, renderer, ctx)
+                {
+                    renderer.render(UiLine::Error(error));
+                    renderer.flush();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    return Ok(());
+                }
+            }
+            if ctx.pending_session_transition.is_some()
+                || ctx.pending_session_resume.is_some()
+                || ctx.pending_external_session_projection.is_some()
+                || ctx.pending_capability_reload
+            {
+                renderer.render(UiLine::Warning(
+                    crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
+                ));
+                renderer.flush();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
             renderer.render(UiLine::ClearTransient);
             app.buf.text.clear();
             app.buf.cursor = 0;
@@ -9227,6 +9603,25 @@ fn redraw_after_slash(
 /// whether) to surface the warnings — the TUI gates them behind verbose
 /// mode (Ctrl+O) and always shows a `N loaded / M skipped` summary on
 /// /plugin install. Non-summary callers can ignore both values.
+pub(crate) fn request_capability_reload(ctx: &mut LoopCtx) -> Result<(), String> {
+    if ctx.pending_session_transition.is_some()
+        || ctx.pending_session_resume.is_some()
+        || ctx.pending_capability_reload
+    {
+        return Err(crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned());
+    }
+    ctx.runtime
+        .reload_capabilities(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
+        .map_err(|error| {
+            crate::i18n::t(crate::i18n::Msg::CmdCapabilityReloadFailed {
+                error: &error.to_string(),
+            })
+            .into_owned()
+        })?;
+    ctx.pending_capability_reload = true;
+    Ok(())
+}
+
 pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
     let mut loaded = 0usize;
     let mut warnings = Vec::new();
@@ -9238,9 +9633,9 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
     // Hook executor lives on the agent loop. Send a one-shot rebuild signal
     // so plugin-contributed hooks (especially UserPromptSubmit) fire on the
     // next user message rather than waiting for /cd or restart.
-    let _ = ctx
-        .runtime
-        .dispatch(atomcode_coding::DriverCommand::ReloadCapabilities);
+    if let Err(error) = request_capability_reload(ctx) {
+        warnings.push(error);
+    }
     (loaded, warnings)
 }
 
@@ -12270,6 +12665,17 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::WorkingDirectoryChanged(directory) => {
+                    if ctx
+                        .pending_session_transition
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.operation == atomcode_coding::ReconfigureKind::ChangeDirectory
+                        })
+                    {
+                        // The correlated transition terminal commits cwd + session as one
+                        // projection. Do not expose a half-switched directory meanwhile.
+                        return;
+                    }
                     handle_agent_event(
                         AgentEvent::WorkingDirChanged(directory),
                         state,
@@ -12284,7 +12690,7 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::SessionChanged(changed) => {
-                    if let Some(session_id) = changed.session_id {
+                    if let Some(session_id) = changed.session_id.clone() {
                         if ctx.pending_session_resume.as_ref().is_some_and(|pending| {
                             pending.session.id == session_id
                                 && pending.working_dir == changed.working_dir
@@ -12293,13 +12699,22 @@ fn handle_runtime_event(
                             // the exact catalog projection used by the picker.
                             return;
                         }
-                        apply_native_session_changed(
+                        if ctx.pending_session_transition.is_some() || ctx.pending_capability_reload
+                        {
+                            // Fresh/cd completion owns the atomic projection commit.
+                            return;
+                        }
+                        if let Err(error) = apply_native_session_changed(
                             session_id,
-                            changed.working_dir,
+                            changed.working_dir.clone(),
                             state,
                             renderer,
                             ctx,
-                        );
+                        ) {
+                            ctx.pending_external_session_projection = Some(changed);
+                            renderer.render(UiLine::Error(error));
+                            renderer.flush();
+                        }
                     }
                     return;
                 }
@@ -12478,33 +12893,34 @@ fn handle_runtime_event(
                             renderer.flush();
                         }
                         Ok(changed) => {
-                            let pending = ctx.pending_session_resume.take();
-                            let matches = pending
+                            let matches = ctx
+                                .pending_session_resume
                                 .as_ref()
                                 .is_some_and(|pending| session_resume_matches(pending, &changed));
                             if matches {
-                                let pending = pending.expect("checked above");
-                                commit_native_session_changed(
-                                    pending.session,
-                                    changed.working_dir,
-                                    state,
-                                    renderer,
-                                    ctx,
-                                );
+                                ctx.pending_session_resume
+                                    .as_mut()
+                                    .expect("checked above")
+                                    .committed = Some(changed);
+                                if let Err(error) =
+                                    retry_pending_session_projections(state, renderer, ctx)
+                                {
+                                    renderer.render(UiLine::Error(error));
+                                    renderer.flush();
+                                }
                             } else {
+                                ctx.pending_session_resume = None;
                                 renderer.render(UiLine::Error(
                                     "session resume returned an unexpected identity; following the runtime owner"
                                         .into(),
                                 ));
                                 renderer.flush();
-                                if let Some(session_id) = changed.session_id {
-                                    apply_native_session_changed(
-                                        session_id,
-                                        changed.working_dir,
-                                        state,
-                                        renderer,
-                                        ctx,
-                                    );
+                                ctx.pending_external_session_projection = Some(changed);
+                                if let Err(error) =
+                                    retry_pending_session_projections(state, renderer, ctx)
+                                {
+                                    renderer.render(UiLine::Error(error));
+                                    renderer.flush();
                                 }
                             }
                         }
@@ -12607,6 +13023,70 @@ fn handle_runtime_event(
             }
             renderer.flush();
         }
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionTransitionFinished { operation, result },
+        ) => match result {
+            Err(error) => {
+                ctx.pending_session_transition = None;
+                let message = error.to_string();
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionFailed {
+                        error: &message,
+                    })
+                    .into_owned(),
+                ));
+                renderer.flush();
+            }
+            Ok(changed) => {
+                if !ctx
+                    .pending_session_transition
+                    .as_ref()
+                    .is_some_and(|pending| session_transition_matches(pending, operation, &changed))
+                {
+                    ctx.pending_session_transition = None;
+                    renderer.render(UiLine::Error(
+                            "session switch returned an unexpected identity; following the runtime owner"
+                                .into(),
+                        ));
+                    renderer.flush();
+                    ctx.pending_external_session_projection = Some(changed);
+                } else {
+                    ctx.pending_session_transition
+                        .as_mut()
+                        .expect("checked above")
+                        .committed = Some(changed);
+                }
+                if let Err(error) = retry_pending_session_projections(state, renderer, ctx) {
+                    renderer.render(UiLine::Error(error));
+                    renderer.flush();
+                }
+            }
+        },
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::CapabilitiesReloadFinished { result },
+        ) => {
+            match result {
+                Err(error) => {
+                    ctx.pending_capability_reload = false;
+                    ctx.pending_capability_projection = None;
+                    let message = error.to_string();
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::CmdCapabilityReloadFailed {
+                            error: &message,
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                Ok(changed) => {
+                    ctx.pending_capability_projection = Some(changed);
+                    if let Err(error) = retry_pending_session_projections(state, renderer, ctx) {
+                        renderer.render(UiLine::Error(error));
+                        renderer.flush();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -12638,15 +13118,132 @@ fn publish_live_runtime_event(
     }
 }
 
+fn retry_pending_session_projections(
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+) -> Result<(), String> {
+    if ctx
+        .pending_session_resume
+        .as_ref()
+        .is_some_and(|pending| pending.committed.is_some())
+    {
+        let mut pending = ctx.pending_session_resume.take();
+        let result = commit_pending_projection(&mut pending, |pending| {
+            let changed = pending
+                .committed
+                .as_ref()
+                .expect("checked committed resume above");
+            commit_native_session_changed(
+                pending.session.clone(),
+                changed.working_dir.clone(),
+                state,
+                renderer,
+                ctx,
+            )
+        });
+        ctx.pending_session_resume = pending;
+        result?;
+    }
+
+    if ctx
+        .pending_session_transition
+        .as_ref()
+        .is_some_and(|pending| pending.committed.is_some())
+    {
+        let mut pending = ctx.pending_session_transition.take();
+        let committed = commit_pending_projection(&mut pending, |pending| {
+            let changed = pending
+                .committed
+                .as_ref()
+                .expect("checked committed transition above");
+            let session_id = changed
+                .session_id
+                .clone()
+                .ok_or_else(|| "session switch completed without a session identity".to_string())?;
+            apply_native_session_changed(
+                session_id,
+                changed.working_dir.clone(),
+                state,
+                renderer,
+                ctx,
+            )
+        });
+        ctx.pending_session_transition = pending;
+        if let Some(committed) = committed? {
+            commands::complete_session_transition_effect(committed.effect, ctx, renderer);
+        }
+    }
+
+    if ctx.pending_external_session_projection.is_some() {
+        let mut pending = ctx.pending_external_session_projection.take();
+        let result = commit_pending_projection(&mut pending, |changed| {
+            let session_id = changed
+                .session_id
+                .clone()
+                .ok_or_else(|| "session switch completed without a session identity".to_string())?;
+            apply_native_session_changed(
+                session_id,
+                changed.working_dir.clone(),
+                state,
+                renderer,
+                ctx,
+            )
+        });
+        ctx.pending_external_session_projection = pending;
+        result?;
+    }
+
+    if ctx.pending_capability_projection.is_some() {
+        let mut pending = ctx.pending_capability_projection.take();
+        let committed = commit_pending_projection(&mut pending, |changed| {
+            commit_live_capability_projection(changed, ctx)
+        });
+        ctx.pending_capability_projection = pending;
+        if committed?.is_some() {
+            ctx.pending_capability_reload = false;
+        }
+    }
+
+    Ok(())
+}
+
+fn commit_live_capability_projection(
+    changed: &atomcode_coding::SessionChanged,
+    ctx: &mut LoopCtx,
+) -> Result<(), String> {
+    if changed.session_id.as_deref() != Some(ctx.current_session.id.as_str())
+        || changed.working_dir != ctx.working_dir
+    {
+        return Err("capability reload returned an unexpected session identity".into());
+    }
+    let Some(binding) = ctx.live_binding.clone() else {
+        return Ok(());
+    };
+    let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
+        &ctx.current_session.to_conversation_snapshot(),
+    );
+    ctx.live_binding = Some(
+        atomcode_daemon::native_live::commit_runtime_snapshot(
+            &binding,
+            ctx.current_session.id.to_string(),
+            ctx.working_dir.clone(),
+            snapshot,
+        )
+        .map_err(|error| format!("Failed to update live capability snapshot: {error:?}"))?,
+    );
+    Ok(())
+}
+
 fn apply_native_session_changed(
     session_id: String,
     working_dir: PathBuf,
     state: &mut UiState,
     renderer: &mut dyn Renderer,
     ctx: &mut LoopCtx,
-) {
+) -> Result<(), String> {
     if ctx.current_session.id == session_id {
-        return;
+        return Ok(());
     }
     let project_bucket = atomcode_capabilities::session::SessionManager::project_hash(&working_dir);
     let session = match atomcode_daemon::legacy_convert::load_catalog_session_view_in_project(
@@ -12655,31 +13252,17 @@ fn apply_native_session_changed(
     ) {
         Ok(Some(session)) => match Session::from_catalog_view(session) {
             Ok(session) => session,
-            Err(error) => {
-                renderer.render(UiLine::Error(format!(
-                    "Failed to decode session {session_id}: {error}"
-                )));
-                renderer.flush();
-                return;
-            }
+            Err(error) => return Err(format!("Failed to decode session {session_id}: {error}")),
         },
         Ok(None) => {
-            renderer.render(UiLine::Error(format!(
+            return Err(format!(
                 "Session {session_id} disappeared after runtime switch"
-            )));
-            renderer.flush();
-            return;
+            ))
         }
-        Err(error) => {
-            renderer.render(UiLine::Error(format!(
-                "Failed to resolve session {session_id}: {error}"
-            )));
-            renderer.flush();
-            return;
-        }
+        Err(error) => return Err(format!("Failed to resolve session {session_id}: {error}")),
     };
 
-    commit_native_session_changed(session, working_dir, state, renderer, ctx);
+    commit_native_session_changed(session, working_dir, state, renderer, ctx)
 }
 
 fn commit_native_session_changed(
@@ -12688,13 +13271,31 @@ fn commit_native_session_changed(
     state: &mut UiState,
     renderer: &mut dyn Renderer,
     ctx: &mut LoopCtx,
-) {
+) -> Result<(), String> {
     let session_id = session.id.clone();
+    let next_live_binding = if let Some(binding) = ctx.live_binding.clone() {
+        let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
+            &session.to_conversation_snapshot(),
+        );
+        Some(
+            atomcode_daemon::native_live::commit_runtime_snapshot(
+                &binding,
+                session_id.clone(),
+                working_dir.clone(),
+                snapshot,
+            )
+            .map_err(|error| format!("Failed to update live session snapshot: {error:?}"))?,
+        )
+    } else {
+        None
+    };
+
     if ctx.working_dir != working_dir {
         ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, working_dir.clone()));
         ctx.file_index.reset(working_dir.clone());
         commands::push_recent_dir(&mut ctx.recent_dirs, working_dir.clone());
         commands::save_recent_dirs(&ctx.recent_dirs);
+        atomcode_daemon::live_set_working_dir(working_dir.clone());
     }
     ctx.current_session_id = Some(session_id.clone());
     ctx.loop_ctrl = None;
@@ -12716,6 +13317,9 @@ fn commit_native_session_changed(
     ctx.current_session = session;
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
+    if let Some(binding) = next_live_binding {
+        ctx.live_binding = Some(binding);
+    }
 
     renderer.begin_sync();
     renderer.reset();
@@ -12733,26 +13337,7 @@ fn commit_native_session_changed(
     }
     renderer.flush();
     renderer.end_sync();
-
-    if let Some(binding) = ctx.live_binding.clone() {
-        let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
-            &ctx.current_session.to_conversation_snapshot(),
-        );
-        match atomcode_daemon::native_live::commit_runtime_snapshot(
-            &binding,
-            session_id,
-            working_dir,
-            snapshot,
-        ) {
-            Ok(binding) => ctx.live_binding = Some(binding),
-            Err(error) => {
-                renderer.render(UiLine::Error(format!(
-                    "Failed to update live session snapshot: {error:?}"
-                )));
-                renderer.flush();
-            }
-        }
-    }
+    Ok(())
 }
 
 fn truncate_local_shell_output(mut output: String) -> String {
@@ -14173,7 +14758,7 @@ fn handle_agent_event(
         }
         AgentEvent::WorkingDirChanged(new_dir) => {
             // Fires when a tool (change_dir / bash cd) or
-            // `DriverCommand::ChangeDirectory` mutated the shared cwd. Sync the footer's view so the status row
+            // CodingRuntime changed the shared cwd. Sync the footer's view so the status row
             // reflects the new directory on the next redraw (spinner tick if
             // streaming, idle redraw after turn complete). Without this the
             // footer is stuck on the old path until the user types `/cd` or
@@ -14192,15 +14777,17 @@ fn handle_agent_event(
         }
         AgentEvent::ProjectSwitched(new_dir) => {
             // A webui /cd switched the project directory (delivered via the
-            // bound native runtime in sync mode). Follow it: change cwd like
-            // `/cd` (updates working_dir + @-file index + recent dirs +
-            // tells the running agent), THEN open a fresh session in the new
-            // dir like `/session`. Distinct from WorkingDirChanged (agent's own
-            // `cd`, conversation preserved). No-op when already there to avoid
-            // resetting on a redundant broadcast.
+            // bound native runtime in sync mode). ChangeDirectory already means
+            // "fresh session in the target directory" at the runtime boundary;
+            // issuing a second FreshSession here would race two replacements.
             if ctx.working_dir != new_dir {
-                commands::apply_cd(ctx, new_dir.clone());
-                commands::reset_to_new_session(ctx, state, renderer);
+                match commands::apply_cd(ctx, new_dir) {
+                    Ok(_) => renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
+                    )),
+                    Err(error) => renderer.render(UiLine::Error(error)),
+                }
+                renderer.flush();
             }
         }
         AgentEvent::RemoteSlashCommand(line) => {

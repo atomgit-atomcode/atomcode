@@ -3654,8 +3654,8 @@ fn merge_configured_mcp_statuses(
 
 async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
     // Prefer the per-project `/chat` registry when it exists; otherwise report
-    // the daemon registry. Live runtime capability changes are requested through
-    // DriverCommand::ReloadCapabilities and reported on the live event stream.
+    // the daemon registry. Live runtime capability changes use the awaitable
+    // CodingRuntime boundary and are reported on the live event stream.
     let working_dir = state.project.read().await.working_dir.clone();
     let registry = if let Some(reg) = state
         .mcp_cache

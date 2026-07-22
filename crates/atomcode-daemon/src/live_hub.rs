@@ -390,11 +390,14 @@ impl LiveViewHub {
     }
 
     pub async fn reload_capabilities(&self) -> Result<atomcode_coding::SessionChanged, HubError> {
-        self.bound_handle()?
-            .1
+        let (binding, handle) = self.bound_handle()?;
+        let changed = handle
             .reload_capabilities()
             .await
-            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+        self.commit_changed_snapshot(&binding, &handle, &changed)
+            .await?;
+        Ok(changed)
     }
 
     pub fn publish_command_output(&self, text: String) -> Result<(), HubError> {

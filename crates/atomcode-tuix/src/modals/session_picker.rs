@@ -360,6 +360,7 @@ impl Modal for SessionPicker {
                         project_bucket,
                         session,
                         working_dir,
+                        committed: None,
                     });
                     Ok(())
                 })();

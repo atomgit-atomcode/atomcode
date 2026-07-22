@@ -789,6 +789,10 @@ pub async fn run(
         file_index: crate::event_loop::file_index::FileIndex::new(file_index_root),
         current_session_id: None,
         pending_session_resume: None,
+        pending_session_transition: None,
+        pending_external_session_projection: None,
+        pending_capability_reload: false,
+        pending_capability_projection: None,
         clipboard_check: std::sync::Arc::new(std::sync::Mutex::new(
             crate::event_loop::ClipboardCheckState::default(),
         )),

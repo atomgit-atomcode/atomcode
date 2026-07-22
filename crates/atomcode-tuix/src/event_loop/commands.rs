@@ -352,26 +352,6 @@ impl Renderer for CaptureRenderer<'_> {
 /// （二维码、浏览器地址、同步提示），对手机端没有意义甚至是噪音。
 const MIRROR_EXCLUDED: &[&str] = &["app", "webui", "sync", "login", "logout"];
 
-/// TUI 本地切换会话后，原子替换 hub 的 committed snapshot 并通知其他视图。
-pub(crate) fn sync_local_session_switch(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
-    let Some(binding) = ctx.live_binding.clone() else {
-        return;
-    };
-    let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
-        &ctx.current_session.to_conversation_snapshot(),
-    );
-    match atomcode_daemon::native_live::replace_snapshot(
-        &binding,
-        ctx.current_session.id.to_string(),
-        ctx.working_dir.clone(),
-        snapshot,
-    ) {
-        Ok(binding) => ctx.live_binding = Some(binding),
-        Err(error) => renderer.render(UiLine::Error(format!("同步会话切换失败：{error:?}"))),
-    }
-    renderer.flush();
-}
-
 /// 提交一条「由斜杠命令合成的用户回合」（如 /skills、/review、/guide、自定义命令展开的
 /// 模板）到当前生效的对话引擎。
 ///
@@ -2084,13 +2064,12 @@ fn execute_slash_command_impl(
             }
             let new_dir = resolve_cd(arg, &ctx.working_dir, ctx.previous_dir.as_deref());
             match new_dir {
-                Ok(path) => {
-                    apply_cd(ctx, path.clone());
-                    let p = path.display().to_string();
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::DirChanged { path: &p }).into_owned(),
-                    ));
-                }
+                Ok(path) => match apply_cd(ctx, path) {
+                    Ok(_) => renderer.render(UiLine::CommandOutput(
+                        t(Msg::CmdSessionTransitionPending).into_owned(),
+                    )),
+                    Err(error) => renderer.render(UiLine::Error(error)),
+                },
                 Err(e) => {
                     renderer.render(UiLine::Error(e));
                 }
@@ -2590,9 +2569,9 @@ fn execute_slash_command_impl(
                     // The driver registry above feeds the palette; CodingRuntime binds its own
                     // MCP set at prepare time. Re-prepare the current session so the reloaded
                     // servers are re-mounted together with skills and hooks.
-                    ctx.runtime
-                        .dispatch(atomcode_coding::DriverCommand::ReloadCapabilities)
-                        .ok();
+                    if let Err(error) = super::request_capability_reload(ctx) {
+                        renderer.render(UiLine::Error(error));
+                    }
 
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::McpClearedReconnecting { removed }).into_owned(),
@@ -3669,9 +3648,6 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             };
             match mgr.create(branch, &base) {
                 Ok(wt) => {
-                    // Save original dir before switching
-                    ctx.worktree_original_dir = Some(ctx.working_dir.clone());
-                    apply_cd(ctx, wt.path.clone());
                     let path_str = wt.path.display().to_string();
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::WorktreeCreated {
@@ -3681,6 +3657,17 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                         })
                         .into_owned(),
                     ));
+                    let original = ctx.working_dir.clone();
+                    match apply_cd_with_effect(
+                        ctx,
+                        wt.path.clone(),
+                        crate::event_loop::SessionTransitionEffect::EnterWorktree {
+                            original_dir: original,
+                        },
+                    ) {
+                        Ok(_) => {}
+                        Err(error) => renderer.render(UiLine::Error(error)),
+                    }
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(
@@ -3752,17 +3739,20 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             renderer.flush();
         }
         Some("done") => {
-            if let Some(original) = ctx.worktree_original_dir.take() {
+            if let Some(original) = ctx.worktree_original_dir.clone() {
                 let current_branch = detect_current_branch(&ctx.working_dir);
-                apply_cd(ctx, original.clone());
-                let path_str = original.display().to_string();
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::WorktreeDoneBack { path: &path_str }).into_owned(),
-                ));
-                if let Some(branch) = current_branch {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::WorktreeDoneMergeHint { branch: &branch }).into_owned(),
-                    ));
+                match apply_cd_with_effect(
+                    ctx,
+                    original.clone(),
+                    crate::event_loop::SessionTransitionEffect::LeaveWorktree {
+                        original_dir: original,
+                        branch: current_branch,
+                    },
+                ) {
+                    Ok(_) => renderer.render(UiLine::CommandOutput(
+                        t(Msg::CmdSessionTransitionPending).into_owned(),
+                    )),
+                    Err(error) => renderer.render(UiLine::Error(error)),
                 }
             } else {
                 renderer.render(UiLine::CommandOutput(
@@ -3809,27 +3799,34 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 .unwrap_or_else(|_| None)
                 .unwrap_or_else(|| mgr.worktree_path(branch));
             let removing_current = paths_same(&cleanup_path, &ctx.working_dir);
+            if removing_current {
+                let target = ctx
+                    .worktree_original_dir
+                    .clone()
+                    .unwrap_or_else(|| mgr.repo_root().to_path_buf());
+                match apply_cd_with_effect(
+                    ctx,
+                    target.clone(),
+                    crate::event_loop::SessionTransitionEffect::CleanupCurrentWorktree {
+                        manager_dir: mgr.repo_root().to_path_buf(),
+                        target_dir: target,
+                        branch: branch.to_string(),
+                        force,
+                    },
+                ) {
+                    Ok(_) => renderer.render(UiLine::CommandOutput(
+                        t(Msg::CmdSessionTransitionPending).into_owned(),
+                    )),
+                    Err(error) => renderer.render(UiLine::Error(error)),
+                }
+                renderer.flush();
+                return Ok(());
+            }
             match mgr.remove(branch, force) {
                 Ok(()) => {
-                    let switched_to = if removing_current {
-                        let target = ctx
-                            .worktree_original_dir
-                            .take()
-                            .unwrap_or_else(|| mgr.repo_root().to_path_buf());
-                        apply_cd(ctx, target.clone());
-                        Some(target)
-                    } else {
-                        None
-                    };
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::WorktreeCleaned { branch }).into_owned(),
                     ));
-                    if let Some(target) = switched_to {
-                        let path_str = target.display().to_string();
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::WorktreeCleanedSwitched { path: &path_str }).into_owned(),
-                        ));
-                    }
                 }
                 Err(e) => {
                     let err_msg = format!("{:#}", e);
@@ -3856,6 +3853,68 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
         }
     }
     Ok(())
+}
+
+pub(crate) fn complete_session_transition_effect(
+    effect: crate::event_loop::SessionTransitionEffect,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+) {
+    use crate::event_loop::SessionTransitionEffect;
+    use crate::git::worktree::WorktreeManager;
+
+    effect.commit_marker(&mut ctx.worktree_original_dir);
+    match effect {
+        SessionTransitionEffect::None | SessionTransitionEffect::EnterWorktree { .. } => {}
+        SessionTransitionEffect::LeaveWorktree {
+            original_dir,
+            branch,
+        } => {
+            let path = original_dir.display().to_string();
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::WorktreeDoneBack { path: &path }).into_owned(),
+            ));
+            if let Some(branch) = branch {
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::WorktreeDoneMergeHint { branch: &branch }).into_owned(),
+                ));
+            }
+        }
+        SessionTransitionEffect::CleanupCurrentWorktree {
+            manager_dir,
+            target_dir,
+            branch,
+            force,
+        } => match WorktreeManager::from_dir(manager_dir)
+            .and_then(|manager| manager.remove(&branch, force))
+        {
+            Ok(()) => {
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::WorktreeCleaned { branch: &branch }).into_owned(),
+                ));
+                let path = target_dir.display().to_string();
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::WorktreeCleanedSwitched { path: &path }).into_owned(),
+                ));
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                if !force
+                    && (message.contains("untracked")
+                        || message.contains("modified")
+                        || message.contains("changes"))
+                {
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::WorktreeCleanupUncommitted { branch: &branch }).into_owned(),
+                    ));
+                } else {
+                    renderer.render(UiLine::Error(
+                        t(Msg::WorktreeCleanupFailed { error: &message }).into_owned(),
+                    ));
+                }
+            }
+        },
+    }
 }
 
 /// Detect the current branch name in a directory.
@@ -4370,72 +4429,64 @@ pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> O
     }
 }
 
-/// Drop the current conversation and start a brand-new session in the current
-/// `ctx.working_dir`: tell the agent to clear history, reset token/context UI
-/// state, make a fresh `Session`, rebind telemetry, and redraw the welcome
-/// screen so it behaves like a fresh launch.
-///
-/// Shared by the `/session` command and the webui-driven project switch
-/// (`AgentEvent::ProjectSwitched`). For the project-switch case, call
-/// `apply_cd` FIRST so `ctx.working_dir` is the new dir before the new
-/// `Session` is bound to it.
+/// Ask CodingRuntime to atomically replace the current session. The runtime
+/// terminal owns the UI/session projection commit; this function deliberately
+/// does not clear the current screen or bind a locally invented session.
 pub(crate) fn reset_to_new_session(
     ctx: &mut LoopCtx,
     state: &mut UiState,
     renderer: &mut dyn Renderer,
 ) {
-    ctx.runtime
-        .dispatch(atomcode_coding::DriverCommand::FreshSession)
-        .ok();
+    if ctx.pending_session_transition.is_some()
+        || ctx.pending_session_resume.is_some()
+        || ctx.pending_capability_reload
+    {
+        renderer.render(UiLine::Warning(
+            t(Msg::CmdSessionTransitionPending).into_owned(),
+        ));
+        renderer.flush();
+        return;
+    }
     // /clear and /session must also halt any active /loop (both self-paced
-    // core and fixed-interval TUI controller).  stop_active_loop sends its
-    // own ClearLoop which is harmless to duplicate — it arrives after
-    // ClearConversation and is idempotent on the core side.
+    // runtime and fixed-interval TUI controller).
     stop_active_loop(state, ctx);
-    ctx.current_session_id = None;
-    state.total_tokens = 0;
-    state.prompt_tokens = 0;
-    state.completion_tokens = 0;
-    state.cached_tokens = 0;
-    state.last_context = None;
-    state.pending_context_render = None;
-    state.thinking_idx = 0;
-    state.on_turn_complete();
-    state.active_todos = None;
-    crate::event_loop::sync_todo_titles(state); // drop prior session's titles
-    state.approval_panel = None;
-    // New session = new session file on disk. Old session (already saved at its
-    // last TurnComplete) stays on disk so it can still be `/resume`d; we just
-    // stop writing into it.
-    ctx.current_session = Session::default_session(ctx.working_dir.clone());
-    ctx.bg_manager
-        .set_foreground_session(ctx.current_session.clone());
-    // Bind telemetry + agent session id to the new session's UUID (the
-    // ClearConversation above intentionally leaves the id alone; this is the
-    // single source of truth).
-    bind_telemetry_to_session(ctx, &ctx.current_session);
-    // `reset()` wipes the terminal AND the renderer's cached footer/stream
-    // state, so the next Welcome renders against a known (row 1, col 1) anchor.
-    // Wrap the wipe + welcome re-render in one DECSET 2026 envelope so capable
-    // hosts show no intermediate blank frame (same anti-flicker as `/resume`).
-    renderer.begin_sync();
-    renderer.reset();
-    let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-    renderer.render(UiLine::Welcome {
-        model: ctx.model_name.clone(),
-        working_dir: dir_display,
-    });
-    renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
-    renderer.end_sync();
-    // 同步模式：把新会话的 committed snapshot 发布给其他视图。
-    sync_local_session_switch(ctx, renderer);
+    match ctx
+        .runtime
+        .fresh_session(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
+    {
+        Ok(()) => {
+            ctx.pending_session_transition = Some(crate::event_loop::PendingSessionTransition {
+                operation: atomcode_coding::ReconfigureKind::FreshSession,
+                requested_working_dir: ctx.working_dir.clone(),
+                committed: None,
+                effect: crate::event_loop::SessionTransitionEffect::None,
+            });
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::CmdSessionTransitionPending).into_owned(),
+            ));
+        }
+        Err(error) => renderer.render(UiLine::Error(
+            t(Msg::CmdSessionTransitionFailed {
+                error: &error.to_string(),
+            })
+            .into_owned(),
+        )),
+    }
+    renderer.flush();
 }
 
-/// Commit a new working-directory choice: notify the agent, update cwd +
-/// previous_dir on the shared context, push the new entry into the
-/// recent-dirs ring, and persist. Shared by the `/cd <path>` arm and the
-/// DirPicker modal's Enter handler so both paths keep state coherent.
-pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
+/// Start an atomic fresh-session transition into a new working directory.
+/// The correlated runtime terminal performs the projection commit; callers
+/// must not update cwd, recent directories, or live state optimistically.
+pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) -> Result<PathBuf, String> {
+    apply_cd_with_effect(ctx, path, crate::event_loop::SessionTransitionEffect::None)
+}
+
+fn apply_cd_with_effect(
+    ctx: &mut LoopCtx,
+    path: PathBuf,
+    effect: crate::event_loop::SessionTransitionEffect,
+) -> Result<PathBuf, String> {
     // Normalize the funnel: `resolve_cd` strips the Windows `\\?\` verbatim prefix,
     // but the dir-picker's recent-list branch and the webui `ProjectSwitched` event
     // reach here WITHOUT going through it, carrying a canonicalized `\\?\C:\…` path
@@ -4443,20 +4494,31 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     // runtime value). Strip here so `working_dir`, `recent_dirs`, the `ChangeDirectory`
     // command, and the webui sync all store the plain form regardless of caller.
     let path = atomcode_capabilities::pathnorm::strip_verbatim_path(&path);
+    if ctx.pending_session_transition.is_some()
+        || ctx.pending_session_resume.is_some()
+        || ctx.pending_capability_reload
+    {
+        return Err(t(Msg::CmdSessionTransitionPending).into_owned());
+    }
     ctx.runtime
-        .dispatch(atomcode_coding::DriverCommand::ChangeDirectory(
+        .change_directory(
             path.clone(),
-        ))
-        .ok();
-    ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, path.clone()));
-    // Re-index the @-mention file index for the new working directory.
-    // Without this, the popup continues showing files from the original
-    // startup directory after the user runs `/cd`.
-    ctx.file_index.reset(path.clone());
-    // 同步 daemon 项目视图；Coding Runtime 仍是运行时目录的唯一所有者。
-    atomcode_daemon::live_set_working_dir(path.clone());
-    push_recent_dir(&mut ctx.recent_dirs, path);
-    save_recent_dirs(&ctx.recent_dirs);
+            ctx.foreground_runtime_id,
+            ctx.runtime_event_tx.clone(),
+        )
+        .map_err(|error| {
+            t(Msg::CmdSessionTransitionFailed {
+                error: &error.to_string(),
+            })
+            .into_owned()
+        })?;
+    ctx.pending_session_transition = Some(crate::event_loop::PendingSessionTransition {
+        operation: atomcode_coding::ReconfigureKind::ChangeDirectory,
+        requested_working_dir: path.clone(),
+        committed: None,
+        effect,
+    });
+    Ok(path)
 }
 
 /// Move `new` to the front of `dirs`, dedup, and cap at `MAX_RECENT_DIRS`.
@@ -4535,7 +4597,7 @@ pub(crate) fn resolve_cd(
     // On Windows `canonicalize` returns a `\\?\` verbatim / extended-length path.
     // Strip it here at the SOURCE so every downstream sink carries the plain
     // `C:\…` form: the "已切换到 …" confirmation (uses this value directly), the
-    // stored `working_dir`, the `DriverCommand::ChangeDirectory` sent to the runtime, the
+    // stored `working_dir`, the change-directory request sent to the runtime, the
     // webui footer sync (`live_set_working_dir`), and `recent_dirs.txt`. Only the
     // status-row `collapse_home` stripped before, so those other sites leaked the
     // raw `\\?\C:\Users\hao\atomcode`. Mirrors the daemon's `change_dir`, which

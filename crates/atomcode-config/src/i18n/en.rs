@@ -435,6 +435,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Switched to Build mode (full execution).\n".into(),
         Msg::CmdNewSession =>
             "  New session started.\n".into(),
+        Msg::CmdSessionTransitionPending =>
+            "  Runtime is reconfiguring; your input is preserved until it is ready.\n".into(),
+        Msg::CmdSessionTransitionFailed { error } =>
+            format!("Session switch failed; the previous session is still active: {error}").into(),
+        Msg::CmdCapabilityReloadFailed { error } =>
+            format!("Runtime capability reload failed; the previous runtime is still active: {error}").into(),
         Msg::CmdNoProviders =>
             "  No providers configured.\n".into(),
         Msg::CmdNoSessions =>

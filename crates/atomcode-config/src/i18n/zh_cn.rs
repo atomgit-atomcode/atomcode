@@ -421,6 +421,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  已切换到 Build 模式（完整执行）。\n".into(),
         Msg::CmdNewSession =>
             "  新会话已开始。\n".into(),
+        Msg::CmdSessionTransitionPending =>
+            "  Runtime 正在重配置；就绪前会保留当前输入。\n".into(),
+        Msg::CmdSessionTransitionFailed { error } =>
+            format!("会话切换失败，原会话仍可用：{error}").into(),
+        Msg::CmdCapabilityReloadFailed { error } =>
+            format!("Runtime 能力重载失败，原 Runtime 仍可用：{error}").into(),
         Msg::CmdNoProviders =>
             "  未配置任何 Provider。\n".into(),
         Msg::CmdNoSessions =>

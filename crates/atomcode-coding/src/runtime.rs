@@ -288,10 +288,6 @@ pub enum DriverCommand {
     DeactivateProvider(ProviderUnavailableReason),
     UndoToPrompt(Option<usize>),
     RefreshContextStats,
-    FreshSession,
-    ReloadCapabilities,
-    ResumeSession(String),
-    ChangeDirectory(std::path::PathBuf),
     RestoreSnapshot(SessionSnapshot),
     RestoreSnapshotCorrelated {
         snapshot: SessionSnapshot,
@@ -906,38 +902,6 @@ impl CodingRuntimeHandle {
             DriverCommand::UndoToPrompt(_) | DriverCommand::RefreshContextStats => {
                 unreachable!("handled before control conversion")
             }
-            DriverCommand::FreshSession => {
-                let (done, _result) = oneshot::channel();
-                CodingRuntimeControl::Reprepare {
-                    generation,
-                    target: ReprepareTarget::Fresh,
-                    done,
-                }
-            }
-            DriverCommand::ReloadCapabilities => {
-                let (done, _result) = oneshot::channel();
-                CodingRuntimeControl::Reprepare {
-                    generation,
-                    target: ReprepareTarget::Reload,
-                    done,
-                }
-            }
-            DriverCommand::ResumeSession(id) => {
-                let (done, _result) = oneshot::channel();
-                CodingRuntimeControl::Reprepare {
-                    generation,
-                    target: ReprepareTarget::Resume(id),
-                    done,
-                }
-            }
-            DriverCommand::ChangeDirectory(directory) => {
-                let (done, _result) = oneshot::channel();
-                CodingRuntimeControl::Reprepare {
-                    generation,
-                    target: ReprepareTarget::ChangeDirectory(directory),
-                    done,
-                }
-            }
             DriverCommand::RestoreSnapshot(snapshot) => {
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::RestoreSnapshot {
@@ -1342,6 +1306,7 @@ impl CodingRuntime {
             prepare.clone(),
             plugin_hooks.as_ref(),
             session_lease,
+            true,
         )
         .await
         .map_err(runtime_start_prepare_error)?;
@@ -1379,6 +1344,9 @@ impl CodingRuntime {
                 }
             }
         };
+        parts
+            .publish_staged_session()
+            .map_err(runtime_start_prepare_error)?;
 
         let (handle, controls) = coding_runtime_control_channel();
         let (raw_event_tx, _raw_events) = mpsc::unbounded_channel();
@@ -2960,6 +2928,21 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         };
                         let operation = input.operation;
+                        let reuses_current_session = runtime
+                            .parts
+                            .session
+                            .as_ref()
+                            .zip(match &input.prepare.session {
+                                crate::SessionMode::Resume(id)
+                                | crate::SessionMode::ExternalSnapshot { id, .. } => Some(id),
+                                crate::SessionMode::Fresh | crate::SessionMode::Disabled => None,
+                            })
+                            .is_some_and(|(current, target)| current.id == *target);
+                        if active_turn.is_some() && reuses_current_session {
+                            resources = Some(runtime);
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
                         let previous_phase = runtime_status(
                             controls.state.load(Ordering::Acquire),
                         )
@@ -2982,6 +2965,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             input.prepare.clone(),
                             runtime.plugin_hooks.as_ref(),
                             reuse_lease,
+                            true,
                         )
                         .await;
                         let mut candidate = match candidate_parts {
@@ -3026,6 +3010,56 @@ fn spawn_runtime_owner_with_optional_agent(
                             );
                         }
 
+                        // Complete every fallible candidate build step before disturbing the
+                        // current agent. A failed fresh/resume/cd transition must leave the
+                        // previous runtime executable; rebuilding it as a rollback can fail for
+                        // reasons (notably authentication) unrelated to the accepted operation.
+                        let replacement = match assemble_runtime_resources(&mut candidate) {
+                            Ok(replacement) => replacement,
+                            Err(candidate_error) => {
+                                let cleanup_error =
+                                    discard_uncommitted_session(operation, &candidate).err();
+                                controls.state.store(
+                                    runtime_phase_state(generation, previous_phase),
+                                    Ordering::Release,
+                                );
+                                resources = Some(runtime);
+                                let candidate_error = match cleanup_error {
+                                    Some(cleanup_error) => {
+                                        format!("{candidate_error}; {cleanup_error}")
+                                    }
+                                    None => candidate_error,
+                                };
+                                let _ = done.send(Err(RuntimeError::ReconfigureFailed(
+                                    candidate_error,
+                                )));
+                                continue;
+                            }
+                        };
+
+                        // Persistence is the transition's irrevocable commit point. Publish
+                        // only after the complete replacement has assembled, while the old
+                        // agent is still executable if this final fallible write fails.
+                        if let Err(publish_error) = candidate.parts.publish_staged_session() {
+                            let cleanup_error =
+                                discard_uncommitted_session(operation, &candidate).err();
+                            controls.state.store(
+                                runtime_phase_state(generation, previous_phase),
+                                Ordering::Release,
+                            );
+                            resources = Some(runtime);
+                            let publish_error = match cleanup_error {
+                                Some(cleanup_error) => {
+                                    format!("{publish_error}; {cleanup_error}")
+                                }
+                                None => publish_error.to_string(),
+                            };
+                            let _ = done.send(Err(RuntimeError::ReconfigureFailed(
+                                publish_error,
+                            )));
+                            continue;
+                        }
+
                         let controller_interrupted = cancel_controllers_and_finish_held(
                             &mut goal,
                             &mut loop_state,
@@ -3066,80 +3100,36 @@ fn spawn_runtime_owner_with_optional_agent(
                             &runtime_event_tx,
                         );
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
-                        let candidate_result = assemble_runtime_resources(&mut candidate)
-                            .map(|agent| (candidate, agent));
-
-                        match candidate_result {
-                            Ok((candidate, replacement)) => {
-                                runtime = candidate;
-                                agent = Some(replacement);
-                                generation = generation.wrapping_add(1);
-                                event_generation.store(generation, Ordering::Release);
-                                agent_available = true;
-                                observed_tokens = None;
-                                snapshot_in_flight = false;
-                                compaction_suspended = false;
-                                if matches!(
-                                    operation,
-                                    ReconfigureKind::FreshSession
-                                        | ReconfigureKind::ChangeDirectory
-                                ) {
-                                    ai_name_attempted = false;
-                                }
-                                let changed = session_changed(generation, &runtime);
-                                let cwd = runtime.config.working_dir.clone();
-                                resources = Some(runtime);
-                                controls.state.store(
-                                    runtime_phase_state(generation, RuntimePhase::Ready),
-                                    Ordering::Release,
-                                );
-                                let _ = runtime_event_tx.send(
-                                    CodingRuntimeEvent::SessionChanged(changed.clone()),
-                                );
-                                if operation == ReconfigureKind::ChangeDirectory {
-                                    let _ = runtime_event_tx.send(
-                                        CodingRuntimeEvent::WorkingDirectoryChanged(cwd),
-                                    );
-                                }
-                                let _ = runtime_event_tx.send(
-                                    CodingRuntimeEvent::Reconfigured { operation },
-                                );
-                                let _ = done.send(Ok(changed));
-                            }
-                            Err(candidate_error) => {
-                                match assemble_runtime_resources(&mut runtime) {
-                                    Ok(rollback) => {
-                                        agent = Some(rollback);
-                                        agent_available = true;
-                                        controls.state.store(
-                                            runtime_phase_state(generation, RuntimePhase::Ready),
-                                            Ordering::Release,
-                                        );
-                                    }
-                                    Err(rollback_error) => {
-                                        agent = None;
-                                        agent_available = false;
-                                        controls.state.store(
-                                            runtime_phase_state(generation, RuntimePhase::Failed),
-                                            Ordering::Release,
-                                        );
-                                        let _ = runtime_event_tx.send(
-                                            CodingRuntimeEvent::Agent(AgentEvent::Error {
-                                                message: format!(
-                                                    "reprepare rollback failed: {rollback_error}"
-                                                ),
-                                                http_status: None,
-                                                code: None,
-                                            }),
-                                        );
-                                    }
-                                }
-                                resources = Some(runtime);
-                                let _ = done.send(Err(RuntimeError::ReconfigureFailed(
-                                    candidate_error,
-                                )));
-                            }
+                        runtime = candidate;
+                        agent = Some(replacement);
+                        generation = generation.wrapping_add(1);
+                        event_generation.store(generation, Ordering::Release);
+                        agent_available = true;
+                        observed_tokens = None;
+                        snapshot_in_flight = false;
+                        compaction_suspended = false;
+                        if matches!(
+                            operation,
+                            ReconfigureKind::FreshSession | ReconfigureKind::ChangeDirectory
+                        ) {
+                            ai_name_attempted = false;
                         }
+                        let changed = session_changed(generation, &runtime);
+                        let cwd = runtime.config.working_dir.clone();
+                        resources = Some(runtime);
+                        controls.state.store(
+                            runtime_phase_state(generation, RuntimePhase::Ready),
+                            Ordering::Release,
+                        );
+                        let _ = runtime_event_tx
+                            .send(CodingRuntimeEvent::SessionChanged(changed.clone()));
+                        if operation == ReconfigureKind::ChangeDirectory {
+                            let _ = runtime_event_tx
+                                .send(CodingRuntimeEvent::WorkingDirectoryChanged(cwd));
+                        }
+                        let _ = runtime_event_tx
+                            .send(CodingRuntimeEvent::Reconfigured { operation });
+                        let _ = done.send(Ok(changed));
                     }
                     Some(CodingRuntimeControl::ApplyUndo {
                         generation: request_generation,
@@ -4161,6 +4151,27 @@ fn matching_session_lease(
         .map(|binding| binding.lease.clone())
 }
 
+fn discard_uncommitted_session(
+    operation: ReconfigureKind,
+    candidate: &RuntimeResources,
+) -> Result<(), String> {
+    if !matches!(
+        operation,
+        ReconfigureKind::FreshSession | ReconfigureKind::ChangeDirectory
+    ) {
+        return Ok(());
+    }
+    let Some(binding) = candidate.parts.session.as_ref() else {
+        return Ok(());
+    };
+    binding.manager.delete(&binding.lease).map_err(|error| {
+        format!(
+            "failed to discard uncommitted session {}: {error}",
+            binding.id
+        )
+    })
+}
+
 fn session_in_use_id(error: &io::Error) -> Option<String> {
     match error
         .get_ref()
@@ -4661,6 +4672,16 @@ mod tests {
         fail: std::sync::atomic::AtomicBool,
     }
 
+    struct FailAfterFirstBuildFactory {
+        builds: std::sync::atomic::AtomicUsize,
+    }
+
+    struct BlockAndFailSecondBuildFactory {
+        builds: std::sync::atomic::AtomicUsize,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    }
+
     impl CodingProviderFactory for RecoverableAuthFactory {
         fn build(
             &self,
@@ -4676,6 +4697,49 @@ mod tests {
                     vec![],
                 )))
             }
+        }
+    }
+
+    impl CodingProviderFactory for FailAfterFirstBuildFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            if self.builds.fetch_add(1, Ordering::AcqRel) == 0 {
+                Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![
+                    vec![
+                        atomcode_kernel::stream::StreamEvent::TextDelta("answer".into()),
+                        atomcode_kernel::stream::StreamEvent::Done { truncated: false },
+                    ],
+                ])))
+            } else {
+                Err(crate::ProviderBuildError::Adapter(
+                    "candidate provider failed".into(),
+                ))
+            }
+        }
+    }
+
+    impl CodingProviderFactory for BlockAndFailSecondBuildFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            if self.builds.fetch_add(1, Ordering::AcqRel) == 0 {
+                return Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![
+                    vec![
+                        atomcode_kernel::stream::StreamEvent::TextDelta("answer".into()),
+                        atomcode_kernel::stream::StreamEvent::Done { truncated: false },
+                    ],
+                ])));
+            }
+            self.entered.wait();
+            self.release.wait();
+            Err(crate::ProviderBuildError::Adapter(
+                "blocked candidate failed".into(),
+            ))
         }
     }
 
@@ -6541,6 +6605,60 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn same_session_capability_reload_rejects_an_active_turn() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let (agent, mut kernel_commands, _kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        let CodingRuntimeStart {
+            agent: config,
+            mut prepare,
+            provider_factory,
+            plugin_hooks,
+            ..
+        } = native_start(false);
+        prepare.session = crate::SessionMode::Fresh;
+        let parts =
+            prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
+                .await
+                .unwrap();
+        let resources = RuntimeResources {
+            config,
+            prepare,
+            provider_factory,
+            plugin_hooks,
+            parts,
+            wakeup_tx,
+            loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
+        };
+        let _adapter = spawn_runtime_owner_with_protocol(
+            agent,
+            controls,
+            runtime_tx,
+            true,
+            true,
+            None,
+            Some(resources),
+            Some(wakeup_rx),
+        );
+
+        handle.submit(UserInput::from("active")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        assert_eq!(handle.reload_capabilities().await, Err(RuntimeError::Busy));
+        assert_eq!(handle.status().phase, RuntimePhase::InTurn);
+        assert!(runtime_events.try_recv().is_err());
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn native_approval_is_correlated_and_shutdown_fails_it_closed() {
         let (agent, mut kernel_commands, kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
@@ -6672,6 +6790,79 @@ mod tests {
         assert_eq!(changed.generation, RuntimeGeneration(1));
         assert!(changed.session_id.as_ref().is_some_and(|id| !id.is_empty()));
         assert_eq!(runtime.handle.status().generation, 1);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn failed_fresh_candidate_keeps_previous_runtime_ready() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let factory = Arc::new(FailAfterFirstBuildFactory {
+            builds: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.provider_factory = factory.clone();
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        assert!(manager.list().is_empty());
+
+        assert!(matches!(
+            runtime.handle.fresh_session().await,
+            Err(RuntimeError::ReconfigureFailed(message))
+                if message.contains("candidate provider failed")
+        ));
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        assert_eq!(factory.builds.load(Ordering::Acquire), 2);
+        assert!(
+            manager.list().is_empty(),
+            "a failed candidate must not leave a visible catalog session"
+        );
+
+        runtime
+            .handle
+            .submit(UserInput::from("old runtime still works"))
+            .await
+            .unwrap();
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(atomcode_home)]
+    async fn fresh_candidate_is_not_catalog_visible_while_provider_builds() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let factory = Arc::new(BlockAndFailSecondBuildFactory {
+            builds: std::sync::atomic::AtomicUsize::new(0),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.provider_factory = factory;
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        let handle = runtime.handle.clone();
+        let transition = tokio::spawn(async move { handle.fresh_session().await });
+
+        entered.wait();
+        assert!(
+            manager.list().is_empty(),
+            "a candidate is not committed while its provider graph is still fallible"
+        );
+        release.wait();
+        assert!(matches!(
+            transition.await.unwrap(),
+            Err(RuntimeError::ReconfigureFailed(message))
+                if message.contains("blocked candidate failed")
+        ));
+        assert!(manager.list().is_empty());
+
         runtime.handle.shutdown().await.unwrap();
     }
 
@@ -7026,4 +7217,5 @@ mod tests {
             .iter()
             .any(|message| message.text.contains("anchored summary")));
     }
+
 }
