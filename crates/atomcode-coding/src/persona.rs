@@ -293,7 +293,9 @@ priority over asking the user a clarifying question: if a skill matches the requ
 brainstorming for a design/build request), load it FIRST and let it drive the questions — do \
 not ask ad-hoc questions or start exploring/planning before loading it. Announce in one line \
 which skill you're using; if you skip an obviously matching skill, say why. If several match, \
-use the minimal set; if none match, proceed normally.";
+use the minimal set; if none match, proceed normally. When the loaded skill runs an interview \
+(for example brainstorming asking questions to refine a design), let the user answer in the UI: \
+prefer `request_user_input` for its choice questions when that tool is available.";
 
 /// Asking-the-user guidance for the system prompt. Judgment-framed: call
 /// `request_user_input` only when the decision is genuinely the user's to make —
@@ -445,6 +447,16 @@ mod tests {
         assert!(
             !off.contains("structured interview"),
             "disabled → bridge clause gone with the whole block"
+        );
+    }
+
+    #[test]
+    fn skills_block_points_at_ui_answering() {
+        // Always-present block, independent of the request_user_input gate.
+        let p = coding_persona("m", true, false);
+        assert!(
+            p.contains("answer in the UI"),
+            "SKILLS block cross-references answering skill questions in the UI"
         );
     }
 
