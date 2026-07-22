@@ -669,6 +669,10 @@ pub struct UiState {
     /// question is pending. Set in the `Request` handler, cleared on resolve /
     /// turn-end / session reset. Mirrors `approval_panel`.
     pub user_input_panel: Option<UserInputPanel>,
+    /// A multi-question `request_user_input` batch is pending (mutually exclusive with
+    /// `user_input_panel`). Set in the `Request` handler when the payload carries a
+    /// `questions` array; cleared alongside `user_input_panel` on resolve.
+    pub user_input_batch: Option<UserInputBatch>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
     /// When the current turn started. Set by on_submit, cleared on
@@ -941,6 +945,7 @@ impl UiState {
             prior_spinner_label: None,
             approval_panel: None,
             user_input_panel: None,
+            user_input_batch: None,
             thinking_idx: 0,
             turn_started_at: None,
             phase_started_at: None,
@@ -1251,6 +1256,7 @@ impl UiState {
         // path or session switch), ensure the panel is not left stale.
         self.approval_panel = None;
         self.user_input_panel = None;
+        self.user_input_batch = None;
         self.steer_pending = 0;
     }
 
@@ -1269,6 +1275,7 @@ impl UiState {
         self.subagent_activity = None;
         self.approval_panel = None;
         self.user_input_panel = None;
+        self.user_input_batch = None;
         self.steer_pending = 0;
         // The todo panel is per-session, not per-turn: it survives turn
         // termination (mirrors on_turn_complete). Clearing it here nuked the
@@ -1306,6 +1313,7 @@ impl UiState {
         self.turn_saw_reasoning = false;
         self.approval_panel = None;
         self.user_input_panel = None;
+        self.user_input_batch = None;
         self.steer_pending = 0;
         // The todo panel is per-session, not per-turn: it survives turn
         // termination (mirrors on_turn_complete). Clearing it here nuked the
@@ -1487,6 +1495,7 @@ impl UiState {
     /// `Request` handler does not swap `spinner_label` when the panel opens.
     pub fn on_user_input_resolved(&mut self) {
         self.user_input_panel = None;
+        self.user_input_batch = None;
         self.phase = UiPhase::Streaming;
     }
 

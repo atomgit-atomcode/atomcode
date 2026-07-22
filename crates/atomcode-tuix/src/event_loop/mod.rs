@@ -10937,6 +10937,11 @@ fn handle_user_input_key(
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     use atomcode_capabilities::tools::request_user_input::UserInputMode;
+    // A multi-question batch is handled by its own self-contained handler (keeps the
+    // single-question path below untouched → N==1 behavior is literally unchanged).
+    if app.state.user_input_batch.is_some() {
+        return handle_user_input_batch_key(app, ctx, renderer, code, modifiers);
+    }
     let Some(panel) = app.state.user_input_panel.as_ref() else {
         return Ok(());
     };
@@ -11075,6 +11080,174 @@ fn handle_user_input_key(
     }
     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     Ok(())
+}
+
+/// Key handling for a multi-question `request_user_input` batch. Tab/Shift+Tab move
+/// between questions (and the Submit stop); within a question the keys mirror the
+/// single-question handler on the current panel; Enter on the Submit stop delivers
+/// the whole batch; Esc / Ctrl+C decline every question.
+fn handle_user_input_batch_key(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> Result<()> {
+    use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputResponse};
+    use crossterm::event::KeyModifiers;
+    let Some(batch) = app.state.user_input_batch.as_ref() else {
+        return Ok(());
+    };
+    let id = batch.request_id;
+    let n = batch.questions.len();
+
+    // Ctrl+C: decline the whole batch, then cancel the running turn.
+    if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+        app.state.on_user_input_resolved();
+        deliver_user_input_batch(ctx, id, vec![UserInputResponse::declined(); n]);
+        cancel_active_turn(ctx);
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+    // Esc: decline the whole batch (partial-submit philosophy — the user opts out).
+    if code == KeyCode::Esc {
+        app.state.on_user_input_resolved();
+        deliver_user_input_batch(ctx, id, vec![UserInputResponse::declined(); n]);
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+    // Tab / Shift+Tab: move between questions (cycling through the Submit stop).
+    if code == KeyCode::Tab {
+        if let Some(b) = app.state.user_input_batch.as_mut() {
+            b.next_question();
+        }
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+    if code == KeyCode::BackTab {
+        if let Some(b) = app.state.user_input_batch.as_mut() {
+            b.prev_question();
+        }
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    // On the Submit stop: Enter delivers all answers (untouched → declined).
+    if batch.on_submit_stop() {
+        if code == KeyCode::Enter {
+            let resps = batch.build_batch_response();
+            app.state.on_user_input_resolved();
+            deliver_user_input_batch(ctx, id, resps);
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        }
+        return Ok(()); // other keys are no-ops on the Submit stop
+    }
+
+    // On a question: operate on the current panel (mirrors the single-question keys).
+    let cur = batch.current;
+    let mode = batch.questions[cur].mode.clone();
+
+    // Enter: toggle a concrete multiple-mode option; otherwise advance to the next stop.
+    if code == KeyCode::Enter {
+        if let Some(b) = app.state.user_input_batch.as_mut() {
+            let p = &mut b.questions[cur];
+            if matches!(mode, UserInputMode::Multiple) && !p.is_submit_row() && !p.is_other_row() {
+                p.toggle();
+            } else {
+                b.next_question();
+            }
+        }
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    match (mode, code) {
+        (UserInputMode::Text, KeyCode::Char(c)) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur]
+                .text
+                .push(c);
+        }
+        (UserInputMode::Text, KeyCode::Backspace) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur]
+                .text
+                .pop();
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Up) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_up();
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Down) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_down();
+        }
+        // Number keys 1..9: select the Nth navigable row (concrete options, then "Other").
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(c))
+            if c.is_ascii_digit()
+                && c != '0'
+                && !app.state.user_input_batch.as_ref().unwrap().questions[cur].is_other_row() =>
+        {
+            let p = &mut app.state.user_input_batch.as_mut().unwrap().questions[cur];
+            let idx = (c as usize) - ('1' as usize);
+            if idx <= p.other_index() {
+                if idx == p.other_index() {
+                    p.cursor = p.other_index();
+                } else {
+                    match p.mode {
+                        UserInputMode::Multiple => p.toggle_index(idx),
+                        _ => p.cursor = idx,
+                    }
+                }
+            }
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Backspace) => {
+            let p = &mut app.state.user_input_batch.as_mut().unwrap().questions[cur];
+            if p.is_other_row() {
+                p.pop_custom();
+            }
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(' ')) => {
+            let p = &mut app.state.user_input_batch.as_mut().unwrap().questions[cur];
+            if p.is_submit_row() {
+                return Ok(());
+            } else if p.is_other_row() {
+                p.push_custom(' ');
+            } else {
+                p.toggle();
+            }
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(c)) => {
+            let p = &mut app.state.user_input_batch.as_mut().unwrap().questions[cur];
+            if p.is_other_row() {
+                p.push_custom(c);
+            } else {
+                return Ok(());
+            }
+        }
+        _ => return Ok(()),
+    }
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    Ok(())
+}
+
+/// Deliver a batched multi-question answer: responds `{ "responses": [...] }` over the
+/// same seam as [`deliver_user_input`].
+fn deliver_user_input_batch(
+    ctx: &mut LoopCtx,
+    id: u64,
+    resps: Vec<atomcode_capabilities::tools::request_user_input::UserInputResponse>,
+) {
+    let value = serde_json::json!({ "responses": resps });
+    if ctx.pending_runtime_request_id == Some(id) {
+        ctx.pending_runtime_request_id = None;
+    }
+    if ctx.live_binding.is_some() {
+        if let Err(error) = atomcode_daemon::native_live::respond(id, value) {
+            crate::tuix_trace!("LIVE", "user-input batch response failed: {error:?}");
+        }
+    } else if let Err(error) = ctx
+        .runtime
+        .dispatch(atomcode_coding::DriverCommand::Respond { id, value })
+    {
+        crate::tuix_trace!("LIVE", "user-input batch response failed: {error:?}");
+    }
 }
 
 /// Render one streamed upgrade event. Mutates the percent tracker so
@@ -11918,6 +12091,37 @@ fn handle_runtime_event(
                         ApprovalRequest, APPROVAL_KIND,
                     };
                     if request.kind == REQUEST_USER_INPUT_KIND {
+                        // Batch form: a non-empty `questions` array. Handled before the
+                        // single path so a multi-question request never hits the flat parse.
+                        if let Some(qs) = request
+                            .payload
+                            .get("questions")
+                            .and_then(serde_json::Value::as_array)
+                        {
+                            let reqs: Vec<UserInputRequest> = qs
+                                .iter()
+                                .filter_map(|q| {
+                                    serde_json::from_value::<UserInputRequest>(q.clone()).ok()
+                                })
+                                .collect();
+                            if reqs.is_empty() {
+                                deliver_user_input(ctx, request.id, UserInputResponse::declined());
+                                return;
+                            }
+                            if user_input_should_auto_skip(state.agent_mode) {
+                                deliver_user_input_batch(
+                                    ctx,
+                                    request.id,
+                                    vec![UserInputResponse::declined(); reqs.len()],
+                                );
+                                return;
+                            }
+                            state.user_input_batch =
+                                Some(crate::state::UserInputBatch::new(request.id, &reqs));
+                            state.phase = UiPhase::UserInput;
+                            redraw_idle_plain(buf, state, ctx, renderer);
+                            return;
+                        }
                         if user_input_should_auto_skip(state.agent_mode) {
                             deliver_user_input(ctx, request.id, UserInputResponse::declined());
                             return;
@@ -15077,10 +15281,16 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             options: p.options.iter().map(|o| o.label.clone()).collect(),
             selected: p.selected,
         });
-    let user_input = state
-        .user_input_panel
-        .as_ref()
-        .map(|p| crate::render::UserInputPanelView {
+    // A pending batch takes precedence over a single panel (mutually exclusive in
+    // practice). The view carries the CURRENT question's fields plus batch navigator
+    // metadata; on the Submit stop the panel fields are a placeholder (the renderer
+    // draws the submit screen and ignores them).
+    let user_input = if let Some(b) = state.user_input_batch.as_ref() {
+        let total = b.questions.len();
+        let idx = b.current.min(total.saturating_sub(1));
+        let p = &b.questions[idx];
+        let answered = (0..total).map(|i| b.is_answered(i)).collect();
+        Some(crate::render::UserInputPanelView {
             header: p.header.clone(),
             question: p.question.clone(),
             mode: p.mode.clone(),
@@ -15089,8 +15299,29 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             checked: p.checked.clone(),
             text: p.text.clone(),
             custom_text: p.custom_text.clone(),
-            batch: None,
-        });
+            batch: Some(crate::render::UserInputBatchMeta {
+                total,
+                index: b.current + 1,
+                answered,
+                on_submit: b.on_submit_stop(),
+            }),
+        })
+    } else {
+        state
+            .user_input_panel
+            .as_ref()
+            .map(|p| crate::render::UserInputPanelView {
+                header: p.header.clone(),
+                question: p.question.clone(),
+                mode: p.mode.clone(),
+                options: p.options.clone(),
+                cursor: p.cursor,
+                checked: p.checked.clone(),
+                text: p.text.clone(),
+                custom_text: p.custom_text.clone(),
+                batch: None,
+            })
+    };
     crate::render::StatusLine {
         model,
         cwd,
