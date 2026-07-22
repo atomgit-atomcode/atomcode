@@ -802,6 +802,19 @@ export async function postLivePermission(
   return resp.json();
 }
 
+export interface UserInputQuestion {
+  header: string;
+  question: string;
+  mode: 'single' | 'multiple' | 'text';
+  options: { label: string; description?: string }[];
+}
+
+export interface UserInputResponseBody {
+  declined: boolean;
+  selected: string[];
+  text: string | null;
+}
+
 export interface UserInputRequestEvent {
   type: 'user_input_request';
   request_id: number;
@@ -809,14 +822,16 @@ export interface UserInputRequestEvent {
   question: string;
   mode: 'single' | 'multiple' | 'text';
   options: { label: string; description?: string }[];
+  /// Present for a multi-question batch; the webui steps through these and posts
+  /// one batched answer. Omitted for a single question (use the flat fields above).
+  questions?: UserInputQuestion[];
 }
 
-export async function postLiveUserInput(body: {
-  request_id: number;
-  declined: boolean;
-  selected: string[];
-  text: string | null;
-}): Promise<{ accepted: boolean }> {
+export async function postLiveUserInput(
+  body:
+    | ({ request_id: number } & UserInputResponseBody)
+    | { request_id: number; responses: UserInputResponseBody[] },
+): Promise<{ accepted: boolean }> {
   const resp = await fetch('/live/user-input', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
