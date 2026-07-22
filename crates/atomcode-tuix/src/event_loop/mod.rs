@@ -11520,18 +11520,16 @@ fn handle_user_input_key(
         {
             if let Some(p) = app.state.user_input_panel.as_mut() {
                 let idx = (c as usize) - ('1' as usize);
-                if idx <= p.other_index() {
-                    if idx == p.other_index() {
-                        // Number key for the Other row: move cursor to it (focus for
-                        // typing). Inclusion is text-derived, not toggled by a number key.
-                        p.cursor = p.other_index();
-                    } else {
-                        match p.mode {
-                            UserInputMode::Multiple => p.toggle_index(idx),
-                            // Single: cursor-as-radio — move to it (this IS selecting it).
-                            _ => p.cursor = idx,
-                        }
+                if idx < p.options.len() {
+                    match p.mode {
+                        UserInputMode::Multiple => p.toggle_index(idx),
+                        // Single: cursor-as-radio — move to it (this IS selecting it).
+                        _ => p.cursor = idx,
                     }
+                } else if idx == p.other_index() && p.custom {
+                    // Number key for the Other row (only when offered): move cursor to it
+                    // (focus for typing). Inclusion is text-derived, not toggled by a number.
+                    p.cursor = p.other_index();
                 }
             }
         }
@@ -11679,15 +11677,13 @@ fn handle_user_input_batch_key(
         {
             let p = &mut app.state.user_input_batch.as_mut().unwrap().questions[cur];
             let idx = (c as usize) - ('1' as usize);
-            if idx <= p.other_index() {
-                if idx == p.other_index() {
-                    p.cursor = p.other_index();
-                } else {
-                    match p.mode {
-                        UserInputMode::Multiple => p.toggle_index(idx),
-                        _ => p.cursor = idx,
-                    }
+            if idx < p.options.len() {
+                match p.mode {
+                    UserInputMode::Multiple => p.toggle_index(idx),
+                    _ => p.cursor = idx,
                 }
+            } else if idx == p.other_index() && p.custom {
+                p.cursor = p.other_index();
             }
         }
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Backspace) => {
