@@ -1520,11 +1520,15 @@ async fn run() -> Result<i32> {
             .await?;
     // TUI replay remains a presentation projection during S4; runtime resume above
     // has already converged and loaded the native snapshot under one lease.
-    let session_to_continue = resume_session_id
-        .as_deref()
-        .map(atomcode_daemon::legacy_convert::find_catalog_session_view)
-        .transpose()?
-        .flatten()
+    let resume_project_bucket =
+        atomcode_capabilities::session::SessionManager::project_hash(&working_dir);
+    let session_to_continue = match resume_session_id.as_deref() {
+        Some(id) => atomcode_daemon::legacy_convert::load_catalog_session_view_in_project(
+            &resume_project_bucket,
+            id,
+        )?,
+        None => None,
+    }
         .map(atomcode_tuix::session::Session::from_catalog_view)
         .transpose()?;
     let (mut native_headless_runtime, mut native_tui_runtime) = if is_headless {

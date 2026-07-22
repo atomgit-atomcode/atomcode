@@ -64,7 +64,7 @@ impl From<atomcode_capabilities::session::LoadedSession> for CatalogSessionView 
     }
 }
 
-pub const IMPORTER_VERSION: u32 = 1;
+pub const IMPORTER_VERSION: u32 = 2;
 pub const LEGACY_SCHEMA: &str = "core-session-json";
 
 /// Frozen reader for the retired core session JSON schema. Keeping this DTO
@@ -131,16 +131,35 @@ pub enum ImportStatus {
 pub enum ImportDiagnostic {
     LegacyChangedAfterCutover,
     RepairedLegacyTurnBoundaries { dropped_turn_stats: usize },
+    RepairedMetadataOnlyTurnPositions { repaired_turn_stats: usize },
+    MetadataOnlyTurnPositionsUnresolved,
 }
 
 fn report_import_diagnostic(session_id: &str, diagnostic: Option<ImportDiagnostic>) {
-    if let Some(ImportDiagnostic::RepairedLegacyTurnBoundaries { dropped_turn_stats }) = diagnostic
-    {
-        tracing::warn!(
-            session_id,
-            dropped_turn_stats,
-            "repaired malformed legacy turn boundaries during import"
-        );
+    match diagnostic {
+        Some(ImportDiagnostic::RepairedLegacyTurnBoundaries { dropped_turn_stats }) => {
+            tracing::warn!(
+                session_id,
+                dropped_turn_stats,
+                "repaired malformed legacy turn boundaries during import"
+            );
+        }
+        Some(ImportDiagnostic::RepairedMetadataOnlyTurnPositions {
+            repaired_turn_stats,
+        }) => {
+            tracing::warn!(
+                session_id,
+                repaired_turn_stats,
+                "marked importer v1 metadata-only turn positions as accounting-only"
+            );
+        }
+        Some(ImportDiagnostic::MetadataOnlyTurnPositionsUnresolved) => {
+            tracing::warn!(
+                session_id,
+                "could not identify importer v1 metadata-only turn positions; preserving metadata"
+            );
+        }
+        _ => {}
     }
 }
 
@@ -333,6 +352,7 @@ fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedL
         });
         turn_stats.push(TurnStat {
             after_message: stat.after_message,
+            position_valid: true,
             turn_id,
             round_count: checked_u32(stat.turn_count, "turn_count")?,
             tool_call_count: checked_u32(stat.tool_call_count, "tool_call_count")?,
@@ -487,19 +507,45 @@ pub fn converge_session(
     let legacy_bytes = optional_store(manager.read_legacy_bytes(id))?;
 
     if existing_meta.as_ref().map(|meta| &meta.owner) == Some(&StorageOwner::Native) {
-        let meta = existing_meta.expect("checked above");
+        let mut meta = existing_meta.expect("checked above");
         let snapshot = existing_snapshot.ok_or_else(|| {
             anyhow::anyhow!("owner=native session {id:?} is missing its snapshot")
         })?;
         let presentation = existing_presentation.ok_or_else(|| {
             anyhow::anyhow!("owner=native session {id:?} is missing presentation")
         })?;
-        let diagnostic = match (legacy_bytes.as_deref(), meta.import_info.as_ref()) {
+        let mut diagnostic = match (legacy_bytes.as_deref(), meta.import_info.as_ref()) {
             (Some(bytes), Some(info)) if sha256_hex(bytes) != info.source_sha256 => {
                 Some(ImportDiagnostic::LegacyChangedAfterCutover)
             }
             _ => None,
         };
+        if diagnostic.is_none() {
+            if let Some(bytes) = legacy_bytes.as_deref() {
+                diagnostic = match repair_v1_metadata_only_turn_positions(bytes, &mut meta) {
+                    Ok(diagnostic) => diagnostic,
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = id,
+                            error = %error,
+                            "could not inspect importer v1 metadata-only turn positions; preserving metadata"
+                        );
+                        Some(ImportDiagnostic::MetadataOnlyTurnPositionsUnresolved)
+                    }
+                };
+                if matches!(
+                    diagnostic,
+                    Some(ImportDiagnostic::RepairedMetadataOnlyTurnPositions { .. })
+                ) {
+                    manager.commit_native_import(lease, None, None, &meta)?;
+                }
+            } else if meta.import_info.as_ref().is_some_and(|info| {
+                info.kind == ImportKind::MetadataOnly && info.importer_version < IMPORTER_VERSION
+            }) {
+                diagnostic = Some(ImportDiagnostic::MetadataOnlyTurnPositionsUnresolved);
+            }
+        }
+        report_import_diagnostic(id, diagnostic);
         return Ok(ImportOutcome {
             status: ImportStatus::AlreadyNative,
             diagnostic,
@@ -576,6 +622,9 @@ pub fn converge_session(
         && (meta.turn_stats.is_empty() || meta.turn_stats.iter().any(|stat| stat.turn_id == 0))
     {
         meta.turn_stats = converted.meta.turn_stats.clone();
+        for stat in &mut meta.turn_stats {
+            stat.position_valid = false;
+        }
         meta.turn_count = converted.meta.turn_count;
     }
     let previous_turn_counter = snapshot.turn_counter;
@@ -656,16 +705,6 @@ fn catalog_for_project_in_root(
         }
     }
     Ok(entries)
-}
-
-pub fn find_catalog_session_view(query: &str) -> anyhow::Result<Option<CatalogSessionView>> {
-    let scan = SessionManager::scan_all();
-    report_catalog_diagnostics(&scan.diagnostics);
-    let entry = scan.find(query)?;
-    if entry.is_none() {
-        reject_matching_catalog_diagnostic(&scan.diagnostics, query)?;
-    }
-    entry.as_ref().map(load_catalog_session_view).transpose()
 }
 
 pub fn load_catalog_session_view(
@@ -816,21 +855,47 @@ fn load_catalog_session_view_in_root(
     Ok(convert_legacy_session(&legacy)?.into())
 }
 
-pub fn rename_catalog_session(query: &str, new_name: &str) -> anyhow::Result<String> {
-    rename_catalog_session_inner(query, new_name, false)?
-        .ok_or_else(|| anyhow::anyhow!("session {query:?} rejected a user rename unexpectedly"))
-}
-
-pub fn apply_ai_catalog_name(query: &str, new_name: &str) -> anyhow::Result<bool> {
-    Ok(rename_catalog_session_inner(query, new_name, true)?.is_some())
-}
-
 pub fn rename_catalog_session_in_project(
     project_bucket: &str,
     id: &str,
     new_name: &str,
 ) -> anyhow::Result<String> {
-    let scan = SessionManager::scan_all();
+    rename_catalog_session_in_project_root(
+        &SessionManager::sessions_root(),
+        project_bucket,
+        id,
+        new_name,
+        false,
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!("session {project_bucket}/{id} rejected a user rename unexpectedly")
+    })
+}
+
+pub fn apply_ai_catalog_name_in_project(
+    project_bucket: &str,
+    id: &str,
+    new_name: &str,
+) -> anyhow::Result<bool> {
+    Ok(rename_catalog_session_in_project_root(
+        &SessionManager::sessions_root(),
+        project_bucket,
+        id,
+        new_name,
+        true,
+    )?
+    .is_some())
+}
+
+fn rename_catalog_session_in_project_root(
+    sessions_root: &std::path::Path,
+    project_bucket: &str,
+    id: &str,
+    new_name: &str,
+    ai: bool,
+) -> anyhow::Result<Option<String>> {
+    validate_project_bucket(project_bucket)?;
+    let scan = SessionManager::scan_catalog(sessions_root);
     report_catalog_diagnostics(&scan.diagnostics);
     let entry = scan
         .entries
@@ -847,9 +912,7 @@ pub fn rename_catalog_session_in_project(
                 .err()
                 .unwrap_or_else(|| anyhow::anyhow!("session {project_bucket}/{id} not found"))
         })?;
-    rename_catalog_entry_inner(entry, new_name, false)?.ok_or_else(|| {
-        anyhow::anyhow!("session {project_bucket}/{id} rejected a user rename unexpectedly")
-    })
+    rename_catalog_entry_in_root(sessions_root, entry, new_name, ai)
 }
 
 /// Delete every persisted representation of a session under the same active-session
@@ -947,7 +1010,9 @@ fn append_catalog_presentation_in_root(
     };
     let anchor = meta
         .turn_stats
-        .last()
+        .iter()
+        .rev()
+        .find(|stat| stat.position_valid && stat.turn_id != 0)
         .map(
             |stat| atomcode_capabilities::session::DisplayAnchor::AfterTurn {
                 turn_id: stat.turn_id,
@@ -986,21 +1051,6 @@ fn validate_project_bucket(project_bucket: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn rename_catalog_session_inner(
-    query: &str,
-    new_name: &str,
-    ai: bool,
-) -> anyhow::Result<Option<String>> {
-    let scan = SessionManager::scan_all();
-    report_catalog_diagnostics(&scan.diagnostics);
-    let entry = scan.find(query)?.ok_or_else(|| {
-        reject_matching_catalog_diagnostic(&scan.diagnostics, query)
-            .err()
-            .unwrap_or_else(|| anyhow::anyhow!("session {query:?} not found"))
-    })?;
-    rename_catalog_entry_inner(&entry, new_name, ai)
-}
-
 fn report_catalog_diagnostics(diagnostics: &[atomcode_capabilities::session::CatalogDiagnostic]) {
     for diagnostic in diagnostics {
         tracing::warn!(
@@ -1034,14 +1084,6 @@ fn catalog_diagnostic_session_id(path: &std::path::Path) -> Option<&str> {
     [".ui.json", ".snapshot", ".meta", ".jsonl", ".json"]
         .into_iter()
         .find_map(|suffix| name.strip_suffix(suffix))
-}
-
-fn rename_catalog_entry_inner(
-    entry: &atomcode_capabilities::session::CatalogEntry,
-    new_name: &str,
-    ai: bool,
-) -> anyhow::Result<Option<String>> {
-    rename_catalog_entry_in_root(&SessionManager::sessions_root(), entry, new_name, ai)
 }
 
 fn rename_catalog_entry_in_root(
@@ -1126,6 +1168,82 @@ fn rebase_converted_turn_ids(
         .checked_add(base)
         .ok_or_else(|| anyhow::anyhow!("snapshot turn counter overflow"))?;
     Ok(())
+}
+
+fn repair_v1_metadata_only_turn_positions(
+    legacy_bytes: &[u8],
+    meta: &mut SessionMeta,
+) -> anyhow::Result<Option<ImportDiagnostic>> {
+    let Some(info) = meta.import_info.as_ref() else {
+        return Ok(None);
+    };
+    if info.kind != ImportKind::MetadataOnly || info.importer_version >= IMPORTER_VERSION {
+        return Ok(None);
+    }
+    let legacy: LegacySession = serde_json::from_slice(legacy_bytes)
+        .map_err(|error| anyhow::anyhow!("invalid legacy session {:?}: {error}", meta.id))?;
+    if legacy.id != meta.id {
+        anyhow::bail!(
+            "legacy filename id {:?} does not match stored id {:?}",
+            meta.id,
+            legacy.id
+        )
+    }
+    let (converted, _) = convert_legacy_session_with_diagnostic(&legacy)?;
+    let expected = converted.meta.turn_stats;
+    if expected.is_empty() {
+        if let Some(info) = &mut meta.import_info {
+            info.importer_version = IMPORTER_VERSION;
+        }
+        return Ok(Some(
+            ImportDiagnostic::RepairedMetadataOnlyTurnPositions {
+                repaired_turn_stats: 0,
+            },
+        ));
+    }
+
+    let mut matched_start = None;
+    for (start, window) in meta.turn_stats.windows(expected.len()).enumerate() {
+        let Some(turn_id_offset) = window[0].turn_id.checked_sub(expected[0].turn_id) else {
+            continue;
+        };
+        let matches = window.iter().zip(&expected).all(|(stored, legacy)| {
+            legacy.turn_id.checked_add(turn_id_offset) == Some(stored.turn_id)
+                && stored.after_message == legacy.after_message
+                && stored.round_count == legacy.round_count
+                && stored.tool_call_count == legacy.tool_call_count
+                && stored.duration_ms == legacy.duration_ms
+                && stored.total_tokens == legacy.total_tokens
+                && stored.errored == legacy.errored
+                && stored.used_tokens == legacy.used_tokens
+                && stored.ctx_window == legacy.ctx_window
+        });
+        if !matches {
+            continue;
+        }
+        if matched_start.replace(start).is_some() {
+            return Ok(Some(
+                ImportDiagnostic::MetadataOnlyTurnPositionsUnresolved,
+            ));
+        }
+    }
+    let Some(start) = matched_start else {
+        return Ok(Some(
+            ImportDiagnostic::MetadataOnlyTurnPositionsUnresolved,
+        ));
+    };
+    let end = start + expected.len();
+    for stat in &mut meta.turn_stats[start..end] {
+        stat.position_valid = false;
+    }
+    if let Some(info) = &mut meta.import_info {
+        info.importer_version = IMPORTER_VERSION;
+    }
+    Ok(Some(
+        ImportDiagnostic::RepairedMetadataOnlyTurnPositions {
+            repaired_turn_stats: expected.len(),
+        },
+    ))
 }
 
 fn seconds_to_millis(seconds: u64, field: &str) -> anyhow::Result<i64> {
@@ -1517,7 +1635,89 @@ mod tests {
         assert_eq!(imported.snapshot.cache_epoch, native.cache_epoch);
         assert_eq!(imported.snapshot.request_counter, native.request_counter);
         assert_eq!(imported.snapshot.turn_counter, 2);
+        assert!(!imported.meta.turn_stats.is_empty());
+        assert!(imported
+            .meta
+            .turn_stats
+            .iter()
+            .all(|stat| !stat.position_valid));
         assert_eq!(manager.load_snapshot(id).unwrap(), imported.snapshot);
+    }
+
+    #[test]
+    fn importer_v1_metadata_only_positions_are_repaired_without_losing_stats() {
+        use atomcode_capabilities::session::{
+            ImportInfo, ImportKind, PresentationFile, SessionManager, StorageOwner,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let legacy_bytes =
+            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
+        let converted = convert_legacy_session(&legacy).unwrap();
+        let id = legacy.id.as_str();
+        let mut snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            KernelMessage::user("native wins"),
+        ]);
+        snapshot.turn_counter = converted.snapshot.turn_counter;
+        let mut meta = converted.meta;
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        meta.import_info = Some(ImportInfo {
+            legacy_schema: LEGACY_SCHEMA.into(),
+            source_sha256: sha256_hex(legacy_bytes),
+            importer_version: 1,
+            kind: ImportKind::MetadataOnly,
+        });
+        let imported_stat_count = meta.turn_stats.len();
+        meta.turn_stats.push(TurnStat {
+            after_message: 1,
+            position_valid: true,
+            turn_id: snapshot.turn_counter + 1,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 17,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 128,
+        });
+        assert!(meta.turn_stats.iter().all(|stat| stat.position_valid));
+        let expected_tokens: u32 = meta.turn_stats.iter().map(|stat| stat.total_tokens).sum();
+        let lease = manager.acquire_lease(id).unwrap();
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        std::fs::write(manager.legacy_path(id).unwrap(), legacy_bytes).unwrap();
+
+        let repaired = converge_session(&manager, &lease).unwrap();
+
+        assert_eq!(repaired.status, ImportStatus::AlreadyNative);
+        assert_eq!(repaired.snapshot, snapshot);
+        assert_eq!(
+            repaired
+                .meta
+                .turn_stats
+                .iter()
+                .map(|stat| stat.total_tokens)
+                .sum::<u32>(),
+            expected_tokens
+        );
+        assert!(repaired.meta.turn_stats[..imported_stat_count]
+            .iter()
+            .all(|stat| !stat.position_valid));
+        assert!(repaired.meta.turn_stats[imported_stat_count].position_valid);
+        assert_eq!(
+            repaired.meta.import_info.as_ref().unwrap().importer_version,
+            2
+        );
+        assert_eq!(manager.read_meta(id).unwrap(), repaired.meta);
     }
 
     #[test]
@@ -1648,6 +1848,76 @@ mod tests {
         assert_eq!(renamed.name, "chosen");
         assert!(renamed.user_renamed);
         assert!(!renamed.ai_named);
+    }
+
+    #[test]
+    fn project_scoped_rename_ignores_duplicate_id_in_other_bucket() {
+        use atomcode_capabilities::session::{PresentationFile, SessionManager, SessionMeta};
+
+        let dir = tempfile::tempdir().unwrap();
+        let id = "duplicate-id";
+        let first_bucket = "1111111111111111";
+        let second_bucket = "2222222222222222";
+        for (bucket, name) in [(first_bucket, "first"), (second_bucket, "second")] {
+            let manager = SessionManager::with_root(dir.path().join(bucket));
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+                KernelMessage::user(name),
+            ]);
+            let mut meta = SessionMeta::new(id, format!("/{name}"), 1);
+            meta.name = name.into();
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+        }
+
+        let old = rename_catalog_session_in_project_root(
+            dir.path(),
+            first_bucket,
+            id,
+            "chosen",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(old.as_deref(), Some("first"));
+        assert_eq!(
+            SessionManager::with_root(dir.path().join(first_bucket))
+                .read_meta(id)
+                .unwrap()
+                .name,
+            "chosen"
+        );
+        assert_eq!(
+            SessionManager::with_root(dir.path().join(second_bucket))
+                .read_meta(id)
+                .unwrap()
+                .name,
+            "second"
+        );
+
+        let applied = rename_catalog_session_in_project_root(
+            dir.path(),
+            second_bucket,
+            id,
+            "ai name",
+            true,
+        )
+        .unwrap();
+        assert_eq!(applied.as_deref(), Some("second"));
+        let second = SessionManager::with_root(dir.path().join(second_bucket))
+            .read_meta(id)
+            .unwrap();
+        assert_eq!(second.name, "ai name");
+        assert!(second.ai_named);
+        assert!(!second.user_renamed);
     }
 
     #[test]
@@ -1980,6 +2250,7 @@ mod tests {
         meta.message_count = 1;
         meta.turn_stats.push(TurnStat {
             after_message: 1,
+            position_valid: true,
             turn_id: 7,
             round_count: 1,
             tool_call_count: 0,

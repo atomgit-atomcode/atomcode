@@ -237,13 +237,15 @@ fn exec_native_undo(mut session: NativeCommandSession, arg: &str) -> anyhow::Res
         .loaded
         .meta
         .turn_stats
-        .retain(|stat| stat.after_message <= message_count);
+        .retain(|stat| !stat.position_valid || stat.after_message <= message_count);
     let surviving_turn_ids: std::collections::BTreeSet<_> = session
         .loaded
         .meta
         .turn_stats
         .iter()
-        .filter_map(|stat| (stat.turn_id != 0).then_some(stat.turn_id))
+        .filter_map(|stat| {
+            (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
+        })
         .collect();
     session
         .loaded
@@ -279,6 +281,9 @@ fn commit_native_compaction(
     } = mutation
     {
         session.loaded.meta.turn_stats.retain_mut(|stat| {
+            if !stat.position_valid {
+                return true;
+            }
             if stat.after_message > old_start && stat.after_message < old_end {
                 false
             } else {
@@ -295,7 +300,9 @@ fn commit_native_compaction(
         .meta
         .turn_stats
         .iter()
-        .filter_map(|stat| (stat.turn_id != 0).then_some(stat.turn_id))
+        .filter_map(|stat| {
+            (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
+        })
         .collect();
     session
         .loaded
@@ -848,10 +855,23 @@ mod tests {
         let mut meta = NativeSessionMeta::new(id, "/p", 1);
         meta.owner = StorageOwner::Native;
         meta.message_count = 4;
-        meta.turn_count = 2;
+        meta.turn_count = 3;
         meta.turn_stats = vec![
             TurnStat {
+                after_message: 99,
+                position_valid: false,
+                turn_id: 99,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 1,
+                total_tokens: 10,
+                errored: false,
+                used_tokens: 1,
+                ctx_window: 10,
+            },
+            TurnStat {
                 after_message: 2,
+                position_valid: true,
                 turn_id: 1,
                 round_count: 1,
                 tool_call_count: 0,
@@ -863,6 +883,7 @@ mod tests {
             },
             TurnStat {
                 after_message: 4,
+                position_valid: true,
                 turn_id: 2,
                 round_count: 1,
                 tool_call_count: 0,
@@ -909,7 +930,10 @@ mod tests {
         assert!(matches!(result, CommandResult::Undo { undone: 1 }));
         let manager = NativeSessionManager::with_root(dir.path());
         assert_eq!(manager.load_snapshot(id).unwrap().messages.len(), 2);
-        assert_eq!(manager.read_meta(id).unwrap().turn_count, 1);
+        let meta = manager.read_meta(id).unwrap();
+        assert_eq!(meta.turn_count, 2);
+        assert!(!meta.turn_stats[0].position_valid);
+        assert_eq!(meta.turn_stats[0].total_tokens, 10);
         let presentation = manager.read_presentation(id).unwrap();
         assert_eq!(presentation.entries.len(), 1);
         assert_eq!(presentation.entries[0].text, "keep");
@@ -937,6 +961,7 @@ mod tests {
         manager.save_snapshot(id, &snapshot).unwrap();
         let stat = |after_message, turn_id| TurnStat {
             after_message,
+            position_valid: true,
             turn_id,
             round_count: 1,
             tool_call_count: 0,
@@ -1045,6 +1070,7 @@ mod tests {
         let mut meta = NativeSessionMeta::new("cost", "/tmp/cost-test", 1);
         meta.turn_stats.push(TurnStat {
             after_message: 2,
+            position_valid: true,
             turn_id: 1,
             round_count: 1,
             tool_call_count: 0,
@@ -1056,6 +1082,7 @@ mod tests {
         });
         meta.turn_stats.push(TurnStat {
             after_message: 4,
+            position_valid: true,
             turn_id: 2,
             round_count: 1,
             tool_call_count: 0,

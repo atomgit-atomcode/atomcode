@@ -15,6 +15,7 @@ pub struct DisplayMessage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnStat {
     pub after_message: usize,
+    pub position_valid: bool,
     pub turn_count: usize,
     pub tool_call_count: usize,
     pub duration_ms: u64,
@@ -28,6 +29,7 @@ impl From<atomcode_capabilities::session::TurnStat> for TurnStat {
     fn from(stat: atomcode_capabilities::session::TurnStat) -> Self {
         Self {
             after_message: stat.after_message,
+            position_valid: stat.position_valid,
             turn_count: stat.round_count as usize,
             tool_call_count: stat.tool_call_count as usize,
             duration_ms: stat.duration_ms,
@@ -125,7 +127,7 @@ impl TuiSession {
                     .meta
                     .turn_stats
                     .iter()
-                    .find(|stat| stat.turn_id == turn_id)
+                    .find(|stat| stat.position_valid && stat.turn_id == turn_id)
                     .map(|stat| stat.after_message)
                     .ok_or_else(|| {
                         anyhow::anyhow!("presentation references missing turn id {turn_id}")

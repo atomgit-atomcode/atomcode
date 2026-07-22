@@ -1436,13 +1436,12 @@ fn execute_slash_command_impl(
                 renderer.render(UiLine::Error(err));
                 renderer.flush();
             } else {
-                let old_name = ctx.current_session.name.clone();
                 let new_name = arg.trim().to_string();
-                match atomcode_daemon::legacy_convert::rename_catalog_session(
-                    ctx.current_session.id.as_str(),
-                    &new_name,
-                ) {
-                    Ok(_) => {
+                let project_bucket = atomcode_capabilities::session::SessionManager::project_hash(
+                    &ctx.current_session.working_dir,
+                );
+                match perform_session_rename(&project_bucket, &ctx.current_session.id, &new_name) {
+                    Ok((old_name, _)) => {
                         ctx.current_session.rename(new_name.clone());
                         ctx.bg_manager
                             .set_foreground_session(ctx.current_session.clone());

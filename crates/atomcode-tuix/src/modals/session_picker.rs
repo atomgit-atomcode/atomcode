@@ -642,7 +642,10 @@ pub(crate) fn replay_session(
     for (i, m) in session.messages.iter().enumerate() {
         if is_real_user_message(m) {
             if seen_user {
-                let stat = session.turn_stats.iter().find(|s| s.after_message == i);
+                let stat = session
+                    .turn_stats
+                    .iter()
+                    .find(|s| s.position_valid && s.after_message == i);
                 renderer.render(UiLine::TurnSeparator {
                     label: turn_divider_label(stat),
                 });
@@ -718,7 +721,7 @@ pub(crate) fn replay_session(
     if let Some(stat) = session
         .turn_stats
         .iter()
-        .find(|s| s.after_message == session.messages.len())
+        .find(|s| s.position_valid && s.after_message == session.messages.len())
     {
         renderer.render(UiLine::TurnSeparator {
             label: turn_divider_label(Some(stat)),
@@ -784,6 +787,7 @@ mod tests {
     fn turn_divider_label_renders_stats_or_plain_rule() {
         let s = TurnStat {
             after_message: 4,
+            position_valid: true,
             turn_count: 3,
             tool_call_count: 5,
             duration_ms: 6800,
@@ -1244,5 +1248,63 @@ mod tests {
             "resume wrapper separators only; synthetic user must not add a turn divider"
         );
         assert_eq!(state.last_assistant_response, "first reply\n\nsecond reply");
+    }
+
+    #[test]
+    fn replay_ignores_accounting_only_turn_positions() {
+        use atomcode_core::conversation::message::{Message, Role};
+
+        #[derive(Default)]
+        struct Rec {
+            lines: Vec<UiLine>,
+        }
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.lines.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {}
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        let mut session = Session::new(PathBuf::from("/tmp/x"));
+        session.messages = vec![
+            Message::new(Role::User, "q1"),
+            Message::new(Role::Assistant, "a1"),
+            Message::new(Role::User, "q2"),
+            Message::new(Role::Assistant, "a2"),
+        ];
+        session.turn_stats.push(TurnStat {
+            after_message: 2,
+            position_valid: false,
+            turn_count: 9,
+            tool_call_count: 9,
+            duration_ms: 9,
+            total_tokens: 987_654,
+            errored: false,
+            used_tokens: 9,
+            ctx_window: 9,
+        });
+
+        let mut state = UiState::with_unicode(true);
+        let mut rec = Rec::default();
+        replay_session(&mut rec, &mut state, &session, false);
+
+        let labels: Vec<&str> = rec
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                UiLine::TurnSeparator { label } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.iter().all(|label| !label.contains("987")),
+            "accounting-only stat leaked into replay divider: {labels:?}"
+        );
     }
 }

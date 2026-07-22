@@ -4268,11 +4268,13 @@ fn persist_runtime_undo(
     };
     let mut meta = original_meta.clone();
     meta.turn_stats
-        .retain(|stat| stat.after_message <= snapshot.messages.len());
+        .retain(|stat| !stat.position_valid || stat.after_message <= snapshot.messages.len());
     let surviving_turn_ids: BTreeSet<_> = meta
         .turn_stats
         .iter()
-        .filter_map(|stat| (stat.turn_id != 0).then_some(stat.turn_id))
+        .filter_map(|stat| {
+            (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
+        })
         .collect();
     let mut presentation = original_presentation.clone();
     presentation.retain_turns(&surviving_turn_ids);

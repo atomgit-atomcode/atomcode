@@ -458,6 +458,11 @@ pub struct TurnStat {
     /// metadata/readers; native ownership and pruning decisions use `turn_id`.
     #[serde(default)]
     pub after_message: usize,
+    /// Whether `after_message` belongs to the authoritative native snapshot's
+    /// coordinate space. Metadata-only legacy imports retain accounting data but
+    /// set this false because their offsets came from a different message history.
+    #[serde(default = "default_true")]
+    pub position_valid: bool,
     /// Stable kernel turn identity. `0` means an old meta that predates S1d and must
     /// be converted by the compatibility importer before native cutover.
     #[serde(default)]
@@ -479,6 +484,10 @@ pub struct TurnStat {
     /// Model context-window size paired with `used_tokens`.
     #[serde(default)]
     pub ctx_window: u32,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// The per-project session store at `$ATOMCODE_HOME/sessions/<project_hash>/`.
@@ -2328,6 +2337,7 @@ mod tests {
         let mut meta = SessionMeta::new("s1", "/p", 1);
         let stat = |turn_id, after_message| TurnStat {
             after_message,
+            position_valid: true,
             turn_id,
             round_count: 1,
             tool_call_count: 0,
@@ -2528,6 +2538,7 @@ mod tests {
 
         assert_eq!(rewritten["ai_named"], false);
         assert_eq!(rewritten["turn_stats"][0]["round_count"], 0);
+        assert_eq!(rewritten["turn_stats"][0]["position_valid"], true);
         assert_eq!(rewritten["turn_stats"][0]["used_tokens"], 0);
         assert_eq!(rewritten["turn_stats"][0]["ctx_window"], 0);
         assert_eq!(meta.turn_stats[0].turn_id, 0);

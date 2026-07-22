@@ -1807,7 +1807,7 @@ fn merge_catalog_session_messages_for_display(
                 .meta
                 .turn_stats
                 .iter()
-                .find(|stat| stat.turn_id == turn_id)
+                .find(|stat| stat.position_valid && stat.turn_id == turn_id)
                 .map(|stat| stat.after_message)
                 .ok_or_else(|| {
                     anyhow::anyhow!("presentation references missing turn id {turn_id}")

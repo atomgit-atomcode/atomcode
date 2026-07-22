@@ -89,6 +89,9 @@ fn reindex_compacted_sidecars(
         let old_end = before.messages.len().saturating_sub(suffix);
         let new_end = after.messages.len().saturating_sub(suffix);
         meta.turn_stats.retain_mut(|stat| {
+            if !stat.position_valid {
+                return true;
+            }
             if stat.after_message > prefix && stat.after_message < old_end {
                 false
             } else {
@@ -102,7 +105,9 @@ fn reindex_compacted_sidecars(
     let surviving_turn_ids: std::collections::BTreeSet<_> = meta
         .turn_stats
         .iter()
-        .filter_map(|stat| (stat.turn_id != 0).then_some(stat.turn_id))
+        .filter_map(|stat| {
+            (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
+        })
         .collect();
     presentation.retain_turns(&surviving_turn_ids);
     meta.message_count = u32::try_from(after.messages.len()).unwrap_or(u32::MAX);
@@ -203,6 +208,7 @@ impl LifecycleHooks for SnapshotHook {
                 .retain(|s| s.turn_id != 0 || s.after_message <= msg_count);
             meta.turn_stats.push(TurnStat {
                 after_message: msg_count,
+                position_valid: true,
                 turn_id: ctx.turn_id,
                 round_count,
                 tool_call_count,
@@ -300,6 +306,7 @@ mod tests {
         manager.save_snapshot(id, &before).unwrap();
         let stat = |after_message, turn_id| TurnStat {
             after_message,
+            position_valid: true,
             turn_id,
             round_count: 1,
             tool_call_count: 0,

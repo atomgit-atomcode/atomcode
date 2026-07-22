@@ -554,6 +554,8 @@ pub(crate) async fn run_chat_turn_v2(
     };
     let prefix = crate::legacy_convert::snapshot_to_kernel(&prefix);
     let naming_session_id = session_id.clone();
+    let naming_project_bucket =
+        atomcode_capabilities::session::SessionManager::project_hash(&runtime_cfg.working_dir);
     let (runtime, _coding_cfg) = match crate::start_native_runtime_with_session(
         runtime_cfg,
         atomcode_coding::SessionMode::ExternalSnapshot {
@@ -690,8 +692,11 @@ pub(crate) async fn run_chat_turn_v2(
                 let _ = runtime_event_tx.send(event);
             }
             CodingRuntimeEvent::SessionNameSuggested { name } => {
-                if let Err(error) =
-                    crate::legacy_convert::apply_ai_catalog_name(&naming_session_id, &name)
+                if let Err(error) = crate::legacy_convert::apply_ai_catalog_name_in_project(
+                    &naming_project_bucket,
+                    &naming_session_id,
+                    &name,
+                )
                 {
                     let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
                         "session naming failed: {error}"

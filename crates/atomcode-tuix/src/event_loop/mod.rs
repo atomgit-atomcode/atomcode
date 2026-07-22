@@ -14526,6 +14526,7 @@ fn handle_agent_event(
                 .turn_stats
                 .push(crate::session::TurnStat {
                     after_message: snapshot.messages.len(),
+                    position_valid: true,
                     turn_count,
                     tool_call_count,
                     duration_ms: duration.as_millis() as u64,
@@ -15385,7 +15386,11 @@ fn apply_ai_session_name(ctx: &mut LoopCtx, name: String, renderer: &mut dyn Ren
     ) {
         return;
     }
-    match atomcode_daemon::legacy_convert::apply_ai_catalog_name(
+    let project_bucket = atomcode_capabilities::session::SessionManager::project_hash(
+        &ctx.current_session.working_dir,
+    );
+    match atomcode_daemon::legacy_convert::apply_ai_catalog_name_in_project(
+        &project_bucket,
         ctx.current_session.id.as_str(),
         &name,
     ) {
