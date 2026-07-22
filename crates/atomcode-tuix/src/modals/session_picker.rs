@@ -403,20 +403,25 @@ impl Modal for SessionPicker {
 pub(crate) const HEADER_ROWS: usize = 4;
 
 fn build_menu_payload(p: &SessionPicker, project: &str) -> MenuPayload {
-    // Title row: 1-based position in the CURRENT filtered list, total sessions
-    // in the project (constant), and the project name.
-    let total = p.sessions.len();
-    let pos = if p.filtered.is_empty() {
-        0
+    // Title row: when the search box is focused, show just the bare heading
+    // ("恢复会话" / "Resume session") without position/total/project, so the
+    // user isn't distracted by the count while typing.
+    let title = if p.search_focused {
+        crate::i18n::t(crate::i18n::Msg::SessionPickerTitleBare).into_owned()
     } else {
-        p.selected + 1
+        let total = p.sessions.len();
+        let pos = if p.filtered.is_empty() {
+            0
+        } else {
+            p.selected + 1
+        };
+        crate::i18n::t(crate::i18n::Msg::SessionPickerTitle {
+            n: pos,
+            total,
+            project,
+        })
+        .into_owned()
     };
-    let title = crate::i18n::t(crate::i18n::Msg::SessionPickerTitle {
-        n: pos,
-        total,
-        project,
-    })
-    .into_owned();
     let hint = crate::i18n::t(crate::i18n::Msg::SessionPickerHint).into_owned();
 
     // Header chrome: title, blank, search query, blank.
@@ -431,11 +436,14 @@ fn build_menu_payload(p: &SessionPicker, project: &str) -> MenuPayload {
     // selectable, so `selected` points past the list (never highlights it).
     if p.filtered.is_empty() {
         let label = if p.sessions.is_empty() {
-            "(no sessions in this project yet)".to_string()
+            crate::i18n::t(crate::i18n::Msg::SessionPickerEmptyProject).into_owned()
         } else if p.query.is_empty() {
-            "(no sessions match)".to_string()
+            crate::i18n::t(crate::i18n::Msg::SessionPickerEmptyFilter).into_owned()
         } else {
-            format!("(no sessions match \"{}\" — Backspace to clear)", p.query)
+            crate::i18n::t(crate::i18n::Msg::SessionPickerEmptyFilterQuery {
+                query: &p.query,
+            })
+            .into_owned()
         };
         items.push((label, String::new()));
         items.push((format!("— {} —", hint), String::new()));

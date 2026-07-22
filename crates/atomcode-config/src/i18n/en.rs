@@ -365,6 +365,14 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "↑↓ move · Enter open · Ctrl+D delete · Type to search · Esc cancel".into(),
         Msg::SessionPickerTitle { n, total, project } =>
             format!("Resume session ({n}/{total} · {project})").into(),
+        Msg::SessionPickerTitleBare =>
+            "Resume session".into(),
+        Msg::SessionPickerEmptyProject =>
+            "(no sessions in this project yet)".into(),
+        Msg::SessionPickerEmptyFilter =>
+            "(no sessions match)".into(),
+        Msg::SessionPickerEmptyFilterQuery { query } =>
+            format!("(no sessions match \"{query}\" — Backspace to clear)").into(),
         Msg::SessionDeleted { name } =>
             format!("\"{name}\" deleted").into(),
         Msg::SessionDeleteConfirm { name } =>

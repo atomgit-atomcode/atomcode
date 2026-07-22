@@ -436,6 +436,17 @@ pub enum Msg<'a> {
         total: usize,
         project: &'a str,
     },
+    /// Bare title of the `/resume` picker when the search box is focused —
+    /// no position / total / project suffix, just the heading.
+    SessionPickerTitleBare,
+    /// Hint shown when the project has no sessions at all.
+    SessionPickerEmptyProject,
+    /// Hint shown when the filter matches no sessions (empty query).
+    SessionPickerEmptyFilter,
+    /// Hint shown when the filter matches no sessions for a specific query.
+    SessionPickerEmptyFilterQuery {
+        query: &'a str,
+    },
     SessionRenameEditing {
         buffer: &'a str,
     },

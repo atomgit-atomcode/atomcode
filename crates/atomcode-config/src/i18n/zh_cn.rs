@@ -348,9 +348,17 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SessionNoneSelected =>
             "未选中会话".into(),
         Msg::SessionPickerHint =>
-            "↑↓ 移动 · Enter 打开 · Ctrl+D 删除 · 输入以搜索 · Esc 取消".into(),
+            "↑↓ 移动 · Enter 打开 · Ctrl+D 删除 · 输入内容搜索 · Esc 取消".into(),
         Msg::SessionPickerTitle { n, total, project } =>
             format!("恢复会话（{n}/{total} · {project}）").into(),
+        Msg::SessionPickerTitleBare =>
+            "恢复会话".into(),
+        Msg::SessionPickerEmptyProject =>
+            "（此项目暂无会话）".into(),
+        Msg::SessionPickerEmptyFilter =>
+            "（无匹配会话）".into(),
+        Msg::SessionPickerEmptyFilterQuery { query } =>
+            format!("（无匹配 \"{query}\" — Backspace 清除）").into(),
         Msg::SessionDeleted { name } =>
             format!("「{name}」已删除").into(),
         Msg::SessionDeleteConfirm { name } =>
