@@ -10783,6 +10783,7 @@ mod user_input_key_tests {
                         description: None,
                     },
                 ],
+                custom: true,
             },
         )
     }
@@ -11158,6 +11159,7 @@ mod user_input_key_tests {
                     description: None,
                 },
             ],
+            custom: true,
         };
         let p_multi = UserInputPanel::new(1, &req);
         // last_row for multiple = options.len()+1 = 3
@@ -11185,6 +11187,7 @@ mod user_input_key_tests {
                         description: None,
                     },
                 ],
+                custom: true,
             }
         };
         let mut ps = UserInputPanel::new(2, &req_single);
