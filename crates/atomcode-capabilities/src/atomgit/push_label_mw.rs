@@ -14,7 +14,10 @@ use atomcode_kernel::tool::{Tool, ToolCall, ToolResult};
 use super::remote::{detect_push_target, PushTarget};
 use super::{AtomgitClient, AtomgitConfig, StaticTokenProvider};
 
-/// True when the bash args' `command` is a `git push` invocation.
+/// True when the bash args' `command` runs a `git push` — including a `git push` buried in a
+/// compound `cd … && git add … && git push` chain or prefixed with a `GIT_SSH_COMMAND=…` env var,
+/// which weak models emit constantly. Delegates the quote-/compound-aware parsing to the shared
+/// bash command scanner so this stays in lockstep with the destructive-fs gate.
 fn is_git_push(arguments: &str) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments) else {
         return false;
@@ -22,8 +25,7 @@ fn is_git_push(arguments: &str) -> bool {
     let Some(cmd) = v.get("command").and_then(|c| c.as_str()) else {
         return false;
     };
-    let mut it = cmd.split_whitespace();
-    matches!((it.next(), it.next()), (Some("git"), Some("push")))
+    crate::tools::bash_workspace_gate::command_invokes_git_subcommand(cmd, "push")
 }
 
 pub struct GitPushLabelMiddleware {
@@ -130,5 +132,36 @@ mod tests {
         assert!(!is_git_push(r#"{"command":"echo git push"}"#));
         assert!(!is_git_push(r#"{"command":"git status"}"#));
         assert!(!is_git_push(r#"not json"#));
+    }
+
+    #[test]
+    fn detects_git_push_inside_compound_commands() {
+        // Weak models routinely chain `cd && add && commit && push` into ONE bash call, and
+        // prefix the push with a `GIT_SSH_COMMAND=...` env var. Both must still be recognized.
+        assert!(is_git_push(
+            r#"{"command":"cd ~/repo && git add -A && git commit -m x && git push origin main"}"#
+        ));
+        assert!(is_git_push(
+            r#"{"command":"GIT_SSH_COMMAND=\"ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=accept-new\" git push origin main"}"#
+        ));
+        assert!(is_git_push(
+            r#"{"command":"cd ~/repo && GIT_SSH_COMMAND=\"ssh -i k\" git push origin main 2>&1 | tail -4"}"#
+        ));
+        // git global option (`-c key=val`) before the subcommand.
+        assert!(is_git_push(r#"{"command":"git -c http.sslVerify=false push"}"#));
+    }
+
+    #[test]
+    fn rejects_non_push_compound_and_quoted_push() {
+        // Compound with add + commit but NO push must not fire.
+        assert!(!is_git_push(
+            r#"{"command":"cd ~/repo && git add -A && git commit -m msg"}"#
+        ));
+        // `git push` living inside a quoted argument (e.g. a commit message) is not a push.
+        assert!(!is_git_push(
+            r#"{"command":"git commit -m \"remember to git push later\""}"#
+        ));
+        // `echo` inside a compound is still not a push.
+        assert!(!is_git_push(r#"{"command":"cd ~/repo && echo git push"}"#));
     }
 }
