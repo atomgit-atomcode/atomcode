@@ -220,6 +220,12 @@ impl WorkerScopeGate {
 
     /// Whether a working-dir-relative DIRECTORY is within scope: it equals or lives under any
     /// scope's literal dir prefix. An empty prefix (scope like `**`) covers the whole tree.
+    ///
+    /// NOTE the deliberate asymmetry with single-file writes: a bare-dir scope like `src/auth`
+    /// confines a `search_replace` root here (its prefix IS `src/auth`), but does NOT let
+    /// `edit_file`/`write_file` touch `src/auth/foo.rs` — the globset needs `src/auth/**` to
+    /// match sub-files. This errs safe (single-file writes are the stricter path); a worker
+    /// wanting both should declare `src/auth/**`.
     fn dir_in_scope(&self, rel_dir: &str) -> bool {
         let rd = Path::new(rel_dir);
         self.dir_prefixes.iter().any(|p| {
