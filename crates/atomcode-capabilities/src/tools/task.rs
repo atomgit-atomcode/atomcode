@@ -15,6 +15,7 @@ use atomcode_kernel::tool::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_MAX_CONCURRENT: usize = 3;
@@ -59,6 +60,162 @@ impl ToolMiddleware for DenySensitivePaths {
             ));
         }
         BeforeOutcome::Proceed
+    }
+}
+
+/// The literal directory prefix of a glob: the leading path segments before the first
+/// segment that contains a glob metacharacter. `src/auth/**` → `src/auth`; `**` → ``;
+/// `Cargo.toml` → `Cargo.toml`. Used to test a `search_replace` DIR root against a scope
+/// (globset's `src/auth/**` does NOT match the bare dir `src/auth`).
+fn literal_dir_prefix(glob: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in glob.split('/') {
+        if seg.contains(['*', '?', '[', ']', '{', '}']) {
+            break;
+        }
+        out.push(seg);
+    }
+    out.join("/")
+}
+
+/// Lexically collapse `.` / `..` WITHOUT touching the filesystem (targets may be new files
+/// that don't exist yet). A `..` at the root is absorbed, so an escape normalizes to a path
+/// that will fail the working-dir `strip_prefix` below → denied.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Confines a `worker` subagent's WRITE tools to its declared `scope`. Mirrors
+/// [`DenySensitivePaths`]: a hard deny (the child runs `AutoRespond::AllowAll`, so a prompt
+/// would self-approve). ONLY the write tools are gated — reads are unrestricted (a worker
+/// often reads elsewhere for context) and `bash` retains dispatch-level trust (design §6).
+struct WorkerScopeGate {
+    working_dir: PathBuf,
+    /// Compiled globs for single-file targets (`edit_file` / `write_file` `file_path`).
+    globs: globset::GlobSet,
+    /// Literal directory prefix of each scope, for `search_replace` DIR roots.
+    dir_prefixes: Vec<PathBuf>,
+    /// Human-readable scope list for deny messages.
+    display: String,
+}
+
+impl WorkerScopeGate {
+    fn new(scopes: &[String], working_dir: &Path) -> Self {
+        let mut builder = globset::GlobSetBuilder::new();
+        for s in scopes {
+            if let Ok(g) = globset::GlobBuilder::new(s).literal_separator(true).build() {
+                builder.add(g);
+            }
+        }
+        let globs = builder.build().unwrap_or_else(|_| globset::GlobSet::empty());
+        let dir_prefixes = scopes
+            .iter()
+            .map(|s| PathBuf::from(literal_dir_prefix(s)))
+            .collect();
+        Self {
+            working_dir: working_dir.to_path_buf(),
+            globs,
+            dir_prefixes,
+            display: scopes.join(", "),
+        }
+    }
+
+    /// `None` = allow; `Some(reason)` = deny. Non-write tools (reads, `bash`, anything else)
+    /// always return `None`.
+    fn violation(&self, tool: &str, args_json: &str) -> Option<String> {
+        match tool {
+            "edit_file" | "write_file" => {
+                let raw = serde_json::from_str::<serde_json::Value>(args_json)
+                    .ok()?
+                    .get("file_path")?
+                    .as_str()?
+                    .to_string();
+                match self.workspace_relative(&raw) {
+                    None => Some(format!(
+                        "worker edit out of scope: {raw} is outside the working directory."
+                    )),
+                    Some(rel) if self.globs.is_match(&rel) => None,
+                    Some(rel) => Some(self.deny_out_of_scope(&rel)),
+                }
+            }
+            "search_replace" => {
+                let value =
+                    serde_json::from_str::<serde_json::Value>(args_json).unwrap_or(serde_json::Value::Null);
+                match value.get("path").and_then(|x| x.as_str()) {
+                    None => Some(format!(
+                        "worker search_replace has no `path`, which would rewrite the whole tree; \
+                         restrict `path` to within the declared scope [{}].",
+                        self.display
+                    )),
+                    Some(dir) => match self.workspace_relative(dir) {
+                        None => Some(format!(
+                            "worker edit out of scope: {dir} is outside the working directory."
+                        )),
+                        Some(rel_dir) if self.dir_in_scope(&rel_dir) => None,
+                        Some(rel_dir) => Some(self.deny_out_of_scope(&rel_dir)),
+                    },
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn deny_out_of_scope(&self, rel: &str) -> String {
+        format!(
+            "worker edit out of scope: {rel} is not within the declared scope [{}]. To change \
+             it, re-dispatch this worker with a wider scope that includes it.",
+            self.display
+        )
+    }
+
+    /// Resolve `raw` (absolute, or relative to the working dir) to a working-dir-relative,
+    /// `.`/`..`-collapsed path with `/` separators. `None` if it escapes the working dir
+    /// (absolute-outside, or `..` above the root) — such writes are denied.
+    fn workspace_relative(&self, raw: &str) -> Option<String> {
+        let joined = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            self.working_dir.join(raw)
+        };
+        let base = lexical_normalize(&self.working_dir);
+        let full = lexical_normalize(&joined);
+        full.strip_prefix(&base)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// Whether a working-dir-relative DIRECTORY is within scope: it equals or lives under any
+    /// scope's literal dir prefix. An empty prefix (scope like `**`) covers the whole tree.
+    fn dir_in_scope(&self, rel_dir: &str) -> bool {
+        let rd = Path::new(rel_dir);
+        self.dir_prefixes.iter().any(|p| {
+            p.as_os_str().is_empty() || rd == p.as_path() || rd.starts_with(p)
+        })
+    }
+}
+
+#[async_trait]
+impl ToolMiddleware for WorkerScopeGate {
+    async fn before(
+        &self,
+        call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        _rt: &RequestCtx,
+    ) -> BeforeOutcome {
+        match self.violation(&call.name, &call.arguments) {
+            Some(reason) => BeforeOutcome::deny(reason),
+            None => BeforeOutcome::Proceed,
+        }
     }
 }
 
@@ -1066,5 +1223,89 @@ mod tests {
             "test premise: raw control char must be invalid JSON"
         );
         assert!(matches!(dummy().risk(worker), RiskLevel::Risky));
+    }
+
+    #[test]
+    fn literal_dir_prefix_cuts_at_first_glob_segment() {
+        use super::literal_dir_prefix as p;
+        assert_eq!(p("src/auth/**"), "src/auth");
+        assert_eq!(p("src/**/x.rs"), "src");
+        assert_eq!(p("**"), "");
+        assert_eq!(p("Cargo.toml"), "Cargo.toml");
+    }
+
+    #[test]
+    fn worker_scope_gate_confines_writes_but_not_reads() {
+        use super::WorkerScopeGate;
+        use std::path::Path;
+        let g = WorkerScopeGate::new(&["src/auth/**".into(), "Cargo.toml".into()], Path::new("/w"));
+
+        // in-scope write → allowed
+        assert!(g
+            .violation("edit_file", r#"{"file_path":"src/auth/login.rs"}"#)
+            .is_none());
+        // in-scope NEW file (need not exist) → allowed
+        assert!(g
+            .violation("write_file", r#"{"file_path":"src/auth/new_mod.rs"}"#)
+            .is_none());
+        // exact-file scope → allowed
+        assert!(g
+            .violation("write_file", r#"{"file_path":"Cargo.toml"}"#)
+            .is_none());
+        // out-of-scope write → denied, message names the path + scope
+        let deny = g
+            .violation("edit_file", r#"{"file_path":"src/db/schema.rs"}"#)
+            .expect("out-of-scope write denied");
+        assert!(deny.contains("src/db/schema.rs"), "{deny}");
+        assert!(deny.contains("src/auth/**"), "{deny}");
+        // READS are never gated, even outside scope
+        assert!(g
+            .violation("read_file", r#"{"file_path":"src/db/schema.rs"}"#)
+            .is_none());
+        assert!(g.violation("grep", r#"{"pattern":"x","path":"src/db"}"#).is_none());
+        // bash is never gated (dispatch-trust; design §6)
+        assert!(g.violation("bash", r#"{"command":"rm -rf src/db"}"#).is_none());
+    }
+
+    #[test]
+    fn worker_scope_gate_denies_workspace_escape_and_absolute_outside() {
+        use super::WorkerScopeGate;
+        use std::path::Path;
+        let g = WorkerScopeGate::new(&["**".into()], Path::new("/w"));
+        // `**` allows anything INSIDE the workspace
+        assert!(g.violation("write_file", r#"{"file_path":"anything/here.rs"}"#).is_none());
+        // ...but a `..` escape is denied even under `**`
+        assert!(g
+            .violation("write_file", r#"{"file_path":"../outside.rs"}"#)
+            .is_some());
+        // ...and an absolute path outside the working dir is denied
+        assert!(g
+            .violation("write_file", r#"{"file_path":"/etc/passwd"}"#)
+            .is_some());
+        // an absolute path INSIDE the working dir is normalized + allowed
+        assert!(g.violation("write_file", r#"{"file_path":"/w/in.rs"}"#).is_none());
+    }
+
+    #[test]
+    fn worker_scope_gate_confines_search_replace_root() {
+        use super::WorkerScopeGate;
+        use std::path::Path;
+        let g = WorkerScopeGate::new(&["src/auth/**".into()], Path::new("/w"));
+        // root inside scope dir → allowed
+        assert!(g
+            .violation("search_replace", r#"{"path":"src/auth"}"#)
+            .is_none());
+        assert!(g
+            .violation("search_replace", r#"{"path":"src/auth/sub"}"#)
+            .is_none());
+        // root outside scope → denied
+        assert!(g
+            .violation("search_replace", r#"{"path":"src/db"}"#)
+            .is_some());
+        // NO path (whole-tree rewrite) → denied
+        let deny = g
+            .violation("search_replace", r#"{"pattern":"x","replacement":"y"}"#)
+            .expect("whole-tree search_replace denied");
+        assert!(deny.contains("whole tree") || deny.contains("path"), "{deny}");
     }
 }
