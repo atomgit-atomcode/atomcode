@@ -201,12 +201,25 @@ aggregation (wc, sort, uniq, awk, git log) the dedicated tools cannot do.";
 /// weak models (GLM / DeepSeek) follow soft guidance unreliably, so we restate the four
 /// behaviors that fail most in practice (silently deleting code/tests to clear an error,
 /// shipping unverified edits, offloading a doable task, giving up after one failure, and
-/// treating stale memory as current truth) as HARD rules. Deliberately NOT a "never stop /
+/// treating stale memory as current truth) as HARD rules. The leading SKILL/PROCESS FIRST
+/// bullet is intent-aware: without it this block's execute-now framing suppressed
+/// skill-triggering — DeepSeek treated a design/brainstorm request as "implement now" and
+/// dove into exploring/editing instead of loading the matching process skill (observed:
+/// brainstorming never fired on DeepSeek while GLM, which lacks this block, fired it fine).
+/// It orders "load the matching skill before executing" so the two directives stop fighting.
+/// Deliberately NOT a "never stop /
 /// keep going forever" block — that trades these failures for runaway loops and over-eager
 /// out-of-scope changes; the legitimate stop conditions (risky action / ambiguity / genuinely
 /// stuck) are kept explicit. `## SCOPE`-discipline is unchanged (already firm in `RULES`).
 /// Frozen per session → prompt-cache-stable.
 const FIRM_EXECUTION_DISCIPLINE: &str = "\n\n## EXECUTION DISCIPLINE (MANDATORY):\n\
+- SKILL/PROCESS FIRST: before you explore the codebase, plan, or edit, check whether the \
+request matches an installed skill's description, or is a design / brainstorming / planning / \
+'help me figure out' intent where code should NOT be written yet. If so, your decisive first \
+action is to call `use_skill` and let that skill drive — including asking the user questions — \
+NOT to start exploring or writing code. 'Act decisively' and 'FINISH THE JOB' below govern \
+IMPLEMENTATION work once the approach is set; they never mean skipping a matching skill or \
+jumping straight to code on a design/brainstorm request.\n\
 - FIX, DON'T HIDE: when a build, type-check, or test fails, find and fix the ROOT CAUSE. \
 NEVER delete, comment out, `#[ignore]` / skip, or weaken a test, type, assertion, error \
 path, or feature just to make the error or a red test disappear — that hides the bug, it \
@@ -447,6 +460,30 @@ mod tests {
         assert!(
             !off.contains("structured interview"),
             "disabled → bridge clause gone with the whole block"
+        );
+    }
+
+    #[test]
+    fn execution_discipline_orders_skill_before_executing_for_deepseek() {
+        // Root cause: DeepSeek's execute-now discipline block suppressed skill-triggering
+        // for design/brainstorm intents. The block must now order "load a matching skill
+        // FIRST" — but only where the block exists (DeepSeek), not for GLM/frontier.
+        let ds = coding_persona("deepseek-v4-flash", false, false);
+        assert!(
+            ds.contains("SKILL/PROCESS FIRST"),
+            "deepseek → execution block orders skill-first before executing"
+        );
+        // GLM gets FIRM_TOOL_DISCIPLINE but NOT FIRM_EXECUTION_DISCIPLINE, so the
+        // skill-first directive lives nowhere in its persona (GLM already fires skills).
+        let glm = coding_persona("glm-5.2", false, false);
+        assert!(
+            !glm.contains("SKILL/PROCESS FIRST"),
+            "glm → untouched (no execution block, already triggers skills)"
+        );
+        let frontier = coding_persona("m", false, false);
+        assert!(
+            !frontier.contains("SKILL/PROCESS FIRST"),
+            "frontier → untouched"
         );
     }
 
