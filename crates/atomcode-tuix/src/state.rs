@@ -630,6 +630,16 @@ pub struct UiState {
     pub turn_prompt_tokens: usize,
     pub turn_completion_tokens: usize,
     pub turn_cached_tokens: usize,
+    /// Chars of model OUTPUT streamed this turn — visible text + reasoning +
+    /// tool-call arguments — accumulated live from the delta events (unlike
+    /// `turn_completion_tokens`, which the provider only reports once per round,
+    /// so it can't tick during a long single generation). Drives the spinner's
+    /// `↑ N tokens` activity indicator (via [`turn_output_token_estimate`]) so a
+    /// multi-minute turn visibly proves it's alive rather than looking hung.
+    /// Counting tool-call args is the point: a turn that spends minutes emitting
+    /// one huge tool call (e.g. a giant script) would otherwise show no motion.
+    /// Reset at turn start/end.
+    pub turn_output_chars: usize,
     /// Whether the CURRENT turn has rendered any visible assistant text (a
     /// non-empty post-think-strip `TextDelta`). Reset at turn start/end. Read on
     /// `TurnComplete` to detect a turn that finished with NO visible answer —
@@ -937,6 +947,7 @@ impl UiState {
             turn_prompt_tokens: 0,
             turn_completion_tokens: 0,
             turn_cached_tokens: 0,
+            turn_output_chars: 0,
             turn_rendered_visible_text: false,
             turn_saw_reasoning: false,
             last_assistant_response: String::new(),
@@ -1143,6 +1154,15 @@ impl UiState {
             .or_else(|| self.turn_elapsed())
     }
 
+    /// Rough token estimate of this turn's streamed output, for the spinner's
+    /// `↑ N tokens` activity indicator. ~4 chars/token (the usual English
+    /// rule of thumb; only an at-a-glance liveness signal, not billing — the
+    /// authoritative per-turn count comes from `turn_completion_tokens` at
+    /// round end). Zero until the model starts emitting.
+    pub fn turn_output_token_estimate(&self) -> usize {
+        self.turn_output_chars / 4
+    }
+
     /// Stamp "the stream is alive" — called on submit and on every received
     /// foreground agent event. Resets the stall clock read by [`Self::stream_stalled`].
     pub fn note_stream_activity(&mut self) {
@@ -1213,6 +1233,7 @@ impl UiState {
         // blank-turn notice on TurnComplete).
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
+        self.turn_output_chars = 0;
         // Seed the stall clock so the first silent stretch is measured from submit,
         // not a stale stamp from the previous turn (which would flash the warning).
         self.last_stream_activity = Some(now);
@@ -1241,6 +1262,7 @@ impl UiState {
         self.turn_prompt_tokens = 0;
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
+        self.turn_output_chars = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         // Turn finished normally — no need to offer resubmit of the
@@ -1270,6 +1292,7 @@ impl UiState {
         self.turn_prompt_tokens = 0;
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
+        self.turn_output_chars = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
