@@ -6477,8 +6477,9 @@ mod tests {
             Some(AgentCommand::SendMessage { .. })
         ));
 
+        let missing_session_id = format!("missing-{}", uuid::Uuid::new_v4());
         assert!(matches!(
-            handle.resume_session("missing-session-id").await,
+            handle.resume_session(missing_session_id).await,
             Err(RuntimeError::ReconfigureFailed(_))
         ));
         assert_eq!(handle.status().phase, RuntimePhase::InTurn);
@@ -6763,7 +6764,8 @@ mod tests {
     async fn missing_resume_rolls_back_without_silent_fresh_session() {
         let mut runtime = CodingRuntime::start(native_start(false)).await.unwrap();
 
-        let result = runtime.handle.resume_session("missing-session-id").await;
+        let missing_session_id = format!("missing-{}", uuid::Uuid::new_v4());
+        let result = runtime.handle.resume_session(missing_session_id).await;
 
         assert!(matches!(result, Err(RuntimeError::ReconfigureFailed(_))));
         assert_eq!(

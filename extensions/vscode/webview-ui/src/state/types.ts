@@ -79,7 +79,7 @@ export interface SkillInfo {
   description: string;
 }
 
-export type ApprovalMode = 'build' | 'plan' | 'bypass';
+export type ApprovalMode = 'build' | 'plan' | 'bypass' | 'accept_edits';
 export type PermissionDecision = 'allow' | 'deny' | 'always_allow' | 'allow_persist';
 
 /** Tool call data (collapsed section in the UI) */

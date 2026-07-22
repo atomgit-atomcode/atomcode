@@ -1,4 +1,4 @@
-export type ApprovalMode = 'build' | 'plan' | 'bypass';
+export type ApprovalMode = 'build' | 'plan' | 'bypass' | 'accept_edits';
 
 // Chat
 export interface ChatRequest {
@@ -28,6 +28,7 @@ export interface ApprovalModeResponse {
 
 export type ChatEvent =
   | { type: 'runtime_info'; provider: string; model: string }
+  | { type: 'mode'; mode: ApprovalMode }
   | { type: 'text'; content: string }
   | { type: 'tool_batch'; calls: Array<{ id: string; name: string; arguments: string }> }
   | { type: 'tool_start'; id?: string; name: string; arguments: string }
@@ -301,6 +302,7 @@ export interface AppendSessionMessagesResponse {
 // Callbacks for SSE streaming
 export interface ChatStreamCallbacks {
   onRuntimeInfo?: (provider: string, model: string) => void;
+  onMode?: (mode: ApprovalMode) => void;
   onText: (content: string) => void;
   onToolBatch: (calls: Array<{ id: string; name: string; args: string }>) => void;
   onToolStart: (id: string | undefined, name: string, args: string) => void;

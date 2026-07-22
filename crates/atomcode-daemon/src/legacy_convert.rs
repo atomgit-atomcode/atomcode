@@ -64,7 +64,7 @@ impl From<atomcode_capabilities::session::LoadedSession> for CatalogSessionView 
     }
 }
 
-pub const IMPORTER_VERSION: u32 = 2;
+pub const IMPORTER_VERSION: u32 = 3;
 pub const LEGACY_SCHEMA: &str = "core-session-json";
 
 /// Frozen reader for the retired core session JSON schema. Keeping this DTO
@@ -130,9 +130,14 @@ pub enum ImportStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportDiagnostic {
     LegacyChangedAfterCutover,
-    RepairedLegacyTurnBoundaries { dropped_turn_stats: usize },
-    RepairedMetadataOnlyTurnPositions { repaired_turn_stats: usize },
-    MetadataOnlyTurnPositionsUnresolved,
+    RepairedLegacyTurnBoundaries {
+        dropped_turn_stats: usize,
+    },
+    RepairedMetadataOnlySidecars {
+        repaired_turn_stats: usize,
+        removed_presentation_entries: usize,
+    },
+    MetadataOnlySidecarsUnresolved,
 }
 
 fn report_import_diagnostic(session_id: &str, diagnostic: Option<ImportDiagnostic>) {
@@ -144,19 +149,21 @@ fn report_import_diagnostic(session_id: &str, diagnostic: Option<ImportDiagnosti
                 "repaired malformed legacy turn boundaries during import"
             );
         }
-        Some(ImportDiagnostic::RepairedMetadataOnlyTurnPositions {
+        Some(ImportDiagnostic::RepairedMetadataOnlySidecars {
             repaired_turn_stats,
+            removed_presentation_entries,
         }) => {
             tracing::warn!(
                 session_id,
                 repaired_turn_stats,
-                "marked importer v1 metadata-only turn positions as accounting-only"
+                removed_presentation_entries,
+                "repaired old metadata-only session sidecars"
             );
         }
-        Some(ImportDiagnostic::MetadataOnlyTurnPositionsUnresolved) => {
+        Some(ImportDiagnostic::MetadataOnlySidecarsUnresolved) => {
             tracing::warn!(
                 session_id,
-                "could not identify importer v1 metadata-only turn positions; preserving metadata"
+                "could not identify old metadata-only sidecars; preserving native data"
             );
         }
         _ => {}
@@ -511,7 +518,7 @@ pub fn converge_session(
         let snapshot = existing_snapshot.ok_or_else(|| {
             anyhow::anyhow!("owner=native session {id:?} is missing its snapshot")
         })?;
-        let presentation = existing_presentation.ok_or_else(|| {
+        let mut presentation = existing_presentation.ok_or_else(|| {
             anyhow::anyhow!("owner=native session {id:?} is missing presentation")
         })?;
         let mut diagnostic = match (legacy_bytes.as_deref(), meta.import_info.as_ref()) {
@@ -522,27 +529,37 @@ pub fn converge_session(
         };
         if diagnostic.is_none() {
             if let Some(bytes) = legacy_bytes.as_deref() {
-                diagnostic = match repair_v1_metadata_only_turn_positions(bytes, &mut meta) {
+                diagnostic = match repair_metadata_only_sidecars(
+                    bytes,
+                    &mut meta,
+                    &mut presentation,
+                ) {
                     Ok(diagnostic) => diagnostic,
                     Err(error) => {
                         tracing::warn!(
                             session_id = id,
                             error = %error,
-                            "could not inspect importer v1 metadata-only turn positions; preserving metadata"
+                            "could not inspect old metadata-only sidecars; preserving native data"
                         );
-                        Some(ImportDiagnostic::MetadataOnlyTurnPositionsUnresolved)
+                        Some(ImportDiagnostic::MetadataOnlySidecarsUnresolved)
                     }
                 };
-                if matches!(
-                    diagnostic,
-                    Some(ImportDiagnostic::RepairedMetadataOnlyTurnPositions { .. })
-                ) {
-                    manager.commit_native_import(lease, None, None, &meta)?;
+                if let Some(ImportDiagnostic::RepairedMetadataOnlySidecars {
+                    removed_presentation_entries,
+                    ..
+                }) = diagnostic.as_ref()
+                {
+                    manager.commit_native_import(
+                        lease,
+                        None,
+                        (*removed_presentation_entries != 0).then_some(&presentation),
+                        &meta,
+                    )?;
                 }
             } else if meta.import_info.as_ref().is_some_and(|info| {
                 info.kind == ImportKind::MetadataOnly && info.importer_version < IMPORTER_VERSION
             }) {
-                diagnostic = Some(ImportDiagnostic::MetadataOnlyTurnPositionsUnresolved);
+                diagnostic = Some(ImportDiagnostic::MetadataOnlySidecarsUnresolved);
             }
         }
         report_import_diagnostic(id, diagnostic);
@@ -645,9 +662,9 @@ pub fn converge_session(
         kind: kind.clone(),
     });
 
-    let preserve_presentation = existing_presentation.is_some() && !force_legacy;
-    let presentation = if preserve_presentation {
-        existing_presentation.expect("checked above")
+    let preserve_native_presentation = preserve_native_snapshot && existing_presentation.is_some();
+    let presentation = if preserve_native_snapshot {
+        existing_presentation.unwrap_or_default()
     } else {
         converted.presentation
     };
@@ -655,7 +672,7 @@ pub fn converge_session(
         lease,
         (!preserve_native_snapshot || snapshot.turn_counter != previous_turn_counter)
             .then_some(&snapshot),
-        (!preserve_presentation).then_some(&presentation),
+        (!preserve_native_presentation).then_some(&presentation),
         &meta,
     )?;
     report_import_diagnostic(id, diagnostic);
@@ -1170,9 +1187,10 @@ fn rebase_converted_turn_ids(
     Ok(())
 }
 
-fn repair_v1_metadata_only_turn_positions(
+fn repair_metadata_only_sidecars(
     legacy_bytes: &[u8],
     meta: &mut SessionMeta,
+    presentation: &mut PresentationFile,
 ) -> anyhow::Result<Option<ImportDiagnostic>> {
     let Some(info) = meta.import_info.as_ref() else {
         return Ok(None);
@@ -1189,25 +1207,26 @@ fn repair_v1_metadata_only_turn_positions(
             legacy.id
         )
     }
-    let (converted, _) = convert_legacy_session_with_diagnostic(&legacy)?;
-    let expected = converted.meta.turn_stats;
+    let (mut converted, _) = convert_legacy_session_with_diagnostic(&legacy)?;
+    let expected = &converted.meta.turn_stats;
     if expected.is_empty() {
+        let removed_presentation_entries =
+            remove_legacy_presentation_prefix(presentation, &converted.presentation);
         if let Some(info) = &mut meta.import_info {
             info.importer_version = IMPORTER_VERSION;
         }
-        return Ok(Some(
-            ImportDiagnostic::RepairedMetadataOnlyTurnPositions {
-                repaired_turn_stats: 0,
-            },
-        ));
+        return Ok(Some(ImportDiagnostic::RepairedMetadataOnlySidecars {
+            repaired_turn_stats: 0,
+            removed_presentation_entries,
+        }));
     }
 
-    let mut matched_start = None;
+    let mut matched = None;
     for (start, window) in meta.turn_stats.windows(expected.len()).enumerate() {
         let Some(turn_id_offset) = window[0].turn_id.checked_sub(expected[0].turn_id) else {
             continue;
         };
-        let matches = window.iter().zip(&expected).all(|(stored, legacy)| {
+        let matches = window.iter().zip(expected).all(|(stored, legacy)| {
             legacy.turn_id.checked_add(turn_id_offset) == Some(stored.turn_id)
                 && stored.after_message == legacy.after_message
                 && stored.round_count == legacy.round_count
@@ -1221,29 +1240,76 @@ fn repair_v1_metadata_only_turn_positions(
         if !matches {
             continue;
         }
-        if matched_start.replace(start).is_some() {
-            return Ok(Some(
-                ImportDiagnostic::MetadataOnlyTurnPositionsUnresolved,
-            ));
+        if matched.replace((start, turn_id_offset)).is_some() {
+            return Ok(Some(ImportDiagnostic::MetadataOnlySidecarsUnresolved));
         }
     }
-    let Some(start) = matched_start else {
-        return Ok(Some(
-            ImportDiagnostic::MetadataOnlyTurnPositionsUnresolved,
-        ));
+    let Some((start, turn_id_offset)) = matched else {
+        return Ok(Some(ImportDiagnostic::MetadataOnlySidecarsUnresolved));
     };
     let end = start + expected.len();
+    rebase_presentation_turn_ids(&mut converted.presentation, turn_id_offset)?;
+    let imported_turn_ids: std::collections::BTreeSet<_> = meta.turn_stats[start..end]
+        .iter()
+        .map(|stat| stat.turn_id)
+        .collect();
+    let presentation_has_imported_anchor = presentation.entries.iter().any(|entry| {
+        matches!(
+            entry.anchor,
+            atomcode_capabilities::session::DisplayAnchor::AfterTurn { turn_id }
+                if imported_turn_ids.contains(&turn_id)
+        )
+    });
+    let presentation_has_legacy_prefix = !converted.presentation.entries.is_empty()
+        && presentation
+            .entries
+            .starts_with(&converted.presentation.entries);
+    if presentation_has_imported_anchor && !presentation_has_legacy_prefix {
+        return Ok(Some(ImportDiagnostic::MetadataOnlySidecarsUnresolved));
+    }
+    let removed_presentation_entries =
+        remove_legacy_presentation_prefix(presentation, &converted.presentation);
     for stat in &mut meta.turn_stats[start..end] {
         stat.position_valid = false;
     }
     if let Some(info) = &mut meta.import_info {
         info.importer_version = IMPORTER_VERSION;
     }
-    Ok(Some(
-        ImportDiagnostic::RepairedMetadataOnlyTurnPositions {
-            repaired_turn_stats: expected.len(),
-        },
-    ))
+    Ok(Some(ImportDiagnostic::RepairedMetadataOnlySidecars {
+        repaired_turn_stats: expected.len(),
+        removed_presentation_entries,
+    }))
+}
+
+fn rebase_presentation_turn_ids(
+    presentation: &mut PresentationFile,
+    turn_id_offset: u64,
+) -> anyhow::Result<()> {
+    if turn_id_offset == 0 {
+        return Ok(());
+    }
+    for entry in &mut presentation.entries {
+        if let atomcode_capabilities::session::DisplayAnchor::AfterTurn { turn_id } =
+            &mut entry.anchor
+        {
+            *turn_id = turn_id
+                .checked_add(turn_id_offset)
+                .ok_or_else(|| anyhow::anyhow!("presentation turn id overflow"))?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_legacy_presentation_prefix(
+    presentation: &mut PresentationFile,
+    legacy: &PresentationFile,
+) -> usize {
+    if legacy.entries.is_empty() || !presentation.entries.starts_with(&legacy.entries) {
+        return 0;
+    }
+    let removed = legacy.entries.len();
+    presentation.entries.drain(..removed);
+    removed
 }
 
 fn seconds_to_millis(seconds: u64, field: &str) -> anyhow::Result<i64> {
@@ -1641,13 +1707,96 @@ mod tests {
             .turn_stats
             .iter()
             .all(|stat| !stat.position_valid));
+        assert!(
+            imported.presentation.entries.is_empty(),
+            "metadata-only import must not mix legacy presentation into the native snapshot"
+        );
+        assert!(manager.read_presentation(id).unwrap().entries.is_empty());
         assert_eq!(manager.load_snapshot(id).unwrap(), imported.snapshot);
     }
 
     #[test]
-    fn importer_v1_metadata_only_positions_are_repaired_without_losing_stats() {
+    fn full_legacy_import_replaces_an_orphan_presentation_from_an_incomplete_native_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let legacy_bytes =
+            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
+        let expected = convert_legacy_session(&legacy).unwrap().presentation;
+        let orphan = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![PresentationEntry {
+                anchor: DisplayAnchor::AtStart,
+                role: PresentationRole::Assistant,
+                text: "orphan native sidecar".into(),
+            }],
+        };
+        std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
+        std::fs::write(
+            manager.presentation_path(&legacy.id).unwrap(),
+            serde_json::to_vec(&orphan).unwrap(),
+        )
+        .unwrap();
+        let lease = manager.acquire_lease(&legacy.id).unwrap();
+
+        let imported = converge_session(&manager, &lease).unwrap();
+
+        assert_eq!(imported.status, ImportStatus::ImportedFull);
+        assert_eq!(imported.presentation, expected);
+        assert_eq!(manager.read_presentation(&legacy.id).unwrap(), expected);
+    }
+
+    #[test]
+    fn metadata_only_import_preserves_an_existing_native_presentation() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let legacy_bytes =
+            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
+        let native_snapshot =
+            atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
+                "native wins",
+            )]);
+        let native_presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![PresentationEntry {
+                anchor: DisplayAnchor::AtStart,
+                role: PresentationRole::Assistant,
+                text: "native preamble".into(),
+            }],
+        };
+        manager.save_snapshot(&legacy.id, &native_snapshot).unwrap();
+        manager
+            .write_meta(&SessionMeta::new(&legacy.id, "/native", 7))
+            .unwrap();
+        std::fs::write(
+            manager.presentation_path(&legacy.id).unwrap(),
+            serde_json::to_vec(&native_presentation).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
+        let lease = manager.acquire_lease(&legacy.id).unwrap();
+
+        let imported = converge_session(&manager, &lease).unwrap();
+
+        assert_eq!(imported.status, ImportStatus::ImportedMetadataOnly);
+        assert_eq!(imported.snapshot.messages, native_snapshot.messages);
+        assert_eq!(imported.snapshot.cache_epoch, native_snapshot.cache_epoch);
+        assert_eq!(
+            imported.snapshot.request_counter,
+            native_snapshot.request_counter
+        );
+        assert_eq!(imported.presentation, native_presentation);
+        assert_eq!(
+            manager.read_presentation(&legacy.id).unwrap(),
+            native_presentation
+        );
+    }
+
+    #[test]
+    fn importer_v1_metadata_only_sidecars_are_repaired_without_losing_stats() {
         use atomcode_capabilities::session::{
-            ImportInfo, ImportKind, PresentationFile, SessionManager, StorageOwner,
+            ImportInfo, ImportKind, SessionManager, StorageOwner,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -1655,12 +1804,15 @@ mod tests {
         let legacy_bytes =
             include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
-        let converted = convert_legacy_session(&legacy).unwrap();
+        let mut converted = convert_legacy_session(&legacy).unwrap();
+        rebase_converted_turn_ids(&mut converted, 5).unwrap();
         let id = legacy.id.as_str();
-        let mut snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
-            KernelMessage::user("native wins"),
-        ]);
+        let mut snapshot =
+            atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
+                "native wins",
+            )]);
         snapshot.turn_counter = converted.snapshot.turn_counter;
+        let mut legacy_presentation = converted.presentation.clone();
         let mut meta = converted.meta;
         meta.owner = StorageOwner::Native;
         meta.message_count = 1;
@@ -1683,16 +1835,21 @@ mod tests {
             used_tokens: 1,
             ctx_window: 128,
         });
+        let native_presentation = PresentationEntry {
+            anchor: DisplayAnchor::AfterTurn {
+                turn_id: snapshot.turn_counter + 1,
+            },
+            role: PresentationRole::Assistant,
+            text: "native tail".into(),
+        };
+        legacy_presentation
+            .entries
+            .push(native_presentation.clone());
         assert!(meta.turn_stats.iter().all(|stat| stat.position_valid));
         let expected_tokens: u32 = meta.turn_stats.iter().map(|stat| stat.total_tokens).sum();
         let lease = manager.acquire_lease(id).unwrap();
         manager
-            .commit_native_import(
-                &lease,
-                Some(&snapshot),
-                Some(&PresentationFile::default()),
-                &meta,
-            )
+            .commit_native_import(&lease, Some(&snapshot), Some(&legacy_presentation), &meta)
             .unwrap();
         std::fs::write(manager.legacy_path(id).unwrap(), legacy_bytes).unwrap();
 
@@ -1713,11 +1870,85 @@ mod tests {
             .iter()
             .all(|stat| !stat.position_valid));
         assert!(repaired.meta.turn_stats[imported_stat_count].position_valid);
+        assert_eq!(repaired.presentation.entries, vec![native_presentation]);
         assert_eq!(
             repaired.meta.import_info.as_ref().unwrap().importer_version,
-            2
+            IMPORTER_VERSION
         );
         assert_eq!(manager.read_meta(id).unwrap(), repaired.meta);
+        assert_eq!(
+            manager.read_presentation(id).unwrap(),
+            repaired.presentation
+        );
+
+        let repeated = converge_session(&manager, &lease).unwrap();
+        assert_eq!(repeated.diagnostic, None);
+        assert_eq!(repeated.meta, repaired.meta);
+        assert_eq!(repeated.presentation, repaired.presentation);
+    }
+
+    #[test]
+    fn importer_v2_metadata_only_sidecars_upgrade_together() {
+        let legacy_bytes =
+            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
+        let converted = convert_legacy_session(&legacy).unwrap();
+        let mut meta = converted.meta;
+        meta.owner = StorageOwner::Native;
+        meta.import_info = Some(ImportInfo {
+            legacy_schema: LEGACY_SCHEMA.into(),
+            source_sha256: sha256_hex(legacy_bytes),
+            importer_version: 2,
+            kind: ImportKind::MetadataOnly,
+        });
+        for stat in &mut meta.turn_stats {
+            stat.position_valid = false;
+        }
+        let expected_stat_count = meta.turn_stats.len();
+        let mut presentation = converted.presentation;
+
+        let diagnostic =
+            repair_metadata_only_sidecars(legacy_bytes, &mut meta, &mut presentation).unwrap();
+
+        assert_eq!(
+            diagnostic,
+            Some(ImportDiagnostic::RepairedMetadataOnlySidecars {
+                repaired_turn_stats: expected_stat_count,
+                removed_presentation_entries: 2,
+            })
+        );
+        assert!(presentation.entries.is_empty());
+        assert_eq!(meta.import_info.unwrap().importer_version, IMPORTER_VERSION);
+    }
+
+    #[test]
+    fn metadata_only_sidecar_repair_is_non_destructive_when_presentation_origin_is_ambiguous() {
+        let legacy_bytes =
+            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
+        let converted = convert_legacy_session(&legacy).unwrap();
+        let mut meta = converted.meta;
+        meta.owner = StorageOwner::Native;
+        meta.import_info = Some(ImportInfo {
+            legacy_schema: LEGACY_SCHEMA.into(),
+            source_sha256: sha256_hex(legacy_bytes),
+            importer_version: 1,
+            kind: ImportKind::MetadataOnly,
+        });
+        let original_meta = meta.clone();
+        let mut presentation = converted.presentation;
+        presentation.entries.remove(0);
+        let original_presentation = presentation.clone();
+
+        let diagnostic =
+            repair_metadata_only_sidecars(legacy_bytes, &mut meta, &mut presentation).unwrap();
+
+        assert_eq!(
+            diagnostic,
+            Some(ImportDiagnostic::MetadataOnlySidecarsUnresolved)
+        );
+        assert_eq!(meta, original_meta);
+        assert_eq!(presentation, original_presentation);
     }
 
     #[test]

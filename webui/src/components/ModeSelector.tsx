@@ -7,6 +7,7 @@ import { MsgKey } from '../i18n';
 // `bypass` (免审批) is a safety-consequential mode → styled with a warning accent.
 const MODE_OPTIONS: { val: ApprovalMode; label: MsgKey; desc: MsgKey }[] = [
   { val: 'build', label: 'mode.build', desc: 'mode.build.desc' },
+  { val: 'accept_edits', label: 'mode.accept_edits', desc: 'mode.accept_edits.desc' },
   { val: 'plan', label: 'mode.plan', desc: 'mode.plan.desc' },
   { val: 'bypass', label: 'mode.bypass', desc: 'mode.bypass.desc' },
 ];
