@@ -927,6 +927,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.onModelSelected?.(model);
         this._broadcastMessage({ type: 'runtimeInfo', provider, model });
       },
+      onMode: (mode) => {
+        if (!this._approvalModeState.pendingMode) {
+          this._approvalModeState = initApprovalModeState(mode);
+          this._broadcastMessage({ type: 'approvalMode', mode, pending: false });
+        }
+      },
       onText: (content) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;

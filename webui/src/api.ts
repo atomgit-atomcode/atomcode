@@ -597,7 +597,7 @@ export async function getSession(
 
 /** Approval mode: 'build' = interactive approval, 'plan' = read-only exploration,
  *  'bypass' = auto-approve everything (免审批). Mirrors the daemon `ApprovalMode`. */
-export type ApprovalMode = 'build' | 'plan' | 'bypass';
+export type ApprovalMode = 'build' | 'plan' | 'bypass' | 'accept_edits';
 
 export interface ApprovalModeResponse {
   ok: boolean;

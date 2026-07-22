@@ -11,6 +11,7 @@ mod tests {
     fn approval_mode_wire_strings_are_lowercase() {
         for (mode, wire) in [
             (ApprovalMode::Build, "build"),
+            (ApprovalMode::AcceptEdits, "accept_edits"),
             (ApprovalMode::Plan, "plan"),
             (ApprovalMode::Auto, "bypass"),
         ] {
