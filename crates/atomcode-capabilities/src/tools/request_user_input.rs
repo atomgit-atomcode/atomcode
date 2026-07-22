@@ -52,18 +52,92 @@ impl UserInputResponse {
     }
 }
 
-/// Parse raw tool args into a `UserInputRequest`. Rejects choice modes with no options.
-/// Returns a human message on failure (never panics).
-pub fn parse_args(args: &str) -> Result<UserInputRequest, String> {
-    let req: UserInputRequest = serde_json::from_str(args)
-        .map_err(|e| format!("invalid request_user_input arguments: {e}"))?;
+/// Max questions a single batch may pose.
+pub const MAX_QUESTIONS: usize = 4;
+
+fn validate_question(req: &UserInputRequest) -> Result<(), String> {
     if matches!(req.mode, UserInputMode::Single | UserInputMode::Multiple) && req.options.is_empty()
     {
         return Err(
             "request_user_input: single/multiple mode requires a non-empty `options` array".into(),
         );
     }
+    Ok(())
+}
+
+/// Parse raw tool args into a `UserInputRequest`. Rejects choice modes with no options.
+/// Returns a human message on failure (never panics).
+pub fn parse_args(args: &str) -> Result<UserInputRequest, String> {
+    let req: UserInputRequest = serde_json::from_str(args)
+        .map_err(|e| format!("invalid request_user_input arguments: {e}"))?;
+    validate_question(&req)?;
     Ok(req)
+}
+
+/// Parse args into 1..=`MAX_QUESTIONS` questions. Accepts a `{ "questions": [...] }`
+/// array (batch) or the flat single-question shape (legacy). The bool is `is_batch`
+/// — the caller uses it to pick the wire shape. Clamps a batch to `MAX_QUESTIONS`.
+pub fn parse_batch(args: &str) -> Result<(Vec<UserInputRequest>, bool), String> {
+    let val: serde_json::Value = serde_json::from_str(args)
+        .map_err(|e| format!("invalid request_user_input arguments: {e}"))?;
+    if let Some(qs) = val.get("questions").and_then(serde_json::Value::as_array) {
+        if qs.is_empty() {
+            return Err("request_user_input: `questions` must be a non-empty array".into());
+        }
+        let mut out = Vec::new();
+        for q in qs.iter().take(MAX_QUESTIONS) {
+            let req: UserInputRequest = serde_json::from_value(q.clone())
+                .map_err(|e| format!("invalid question in `questions`: {e}"))?;
+            validate_question(&req)?;
+            out.push(req);
+        }
+        Ok((out, true))
+    } else {
+        Ok((vec![parse_args(args)?], false))
+    }
+}
+
+/// Map one question's response to its answer clause (shared by single + batch).
+fn answer_clause(resp: &UserInputResponse) -> String {
+    if resp.declined {
+        return "No answer (declined).".to_string();
+    }
+    if let Some(t) = &resp.text {
+        return format!("User answered: {t:?}");
+    }
+    if resp.selected.is_empty() {
+        return "User selected nothing.".to_string();
+    }
+    let joined = resp
+        .selected
+        .iter()
+        .map(|s| format!("{s:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("User selected: {joined}")
+}
+
+/// Format a batch of answers, one line per question keyed by its `header`. When every
+/// question was declined, degrade to the same "no answer" guidance a single decline gives.
+pub fn format_batch_result(reqs: &[UserInputRequest], resps: &[UserInputResponse]) -> ToolResult {
+    if resps.len() >= reqs.len() && resps.iter().all(|r| r.declined) {
+        return ok_result(
+            "No answer was provided. Proceed with your own best judgment; only ask again if you \
+             are truly blocked.",
+        );
+    }
+    let lines: Vec<String> = reqs
+        .iter()
+        .enumerate()
+        .map(|(i, req)| {
+            let clause = resps
+                .get(i)
+                .map(answer_clause)
+                .unwrap_or_else(|| "No answer (declined).".to_string());
+            format!("Q{} ({}): {}", i + 1, req.header, clause)
+        })
+        .collect();
+    ok_result(lines.join("\n"))
 }
 
 fn err_result(msg: impl Into<String>) -> ToolResult {
@@ -121,16 +195,18 @@ impl Tool for RequestUserInputTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the user ONE structured question and wait for their answer before continuing. \
-         Use ONLY for a decision that is genuinely the user's to make — a preference, a \
+        "Ask the user structured question(s) and wait for their answer before continuing. \
+         Use ONLY for decisions that are genuinely the user's to make — a preference, a \
          confirmation, a choice between approaches — NOT for anything you can decide, look \
-         up, or verify yourself. `mode`: \"single\" (pick one), \"multiple\" (pick any), or \
-         \"text\" (free-form). Provide a non-empty `options` array for single/multiple. Keep \
+         up, or verify yourself. For ONE question, set `header`, `question`, `mode` \
+         (\"single\"=pick one, \"multiple\"=pick any, \"text\"=free-form) and `options` \
+         (non-empty for single/multiple). To ask up to 4 related questions answered in ONE \
+         interaction, pass a `questions` array of those same objects instead. Keep each \
          `header` short (a few words)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
+        let question = serde_json::json!({
             "type": "object",
             "required": ["header", "question", "mode"],
             "properties": {
@@ -150,26 +226,55 @@ impl Tool for RequestUserInputTool {
                     }
                 }
             }
+        });
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "header": question["properties"]["header"],
+                "question": question["properties"]["question"],
+                "mode": question["properties"]["mode"],
+                "options": question["properties"]["options"],
+                "questions": {
+                    "type": "array",
+                    "description": "Up to 4 questions answered in one interaction. Provide EITHER top-level header/question/mode/options for a single question, OR this array.",
+                    "maxItems": 4,
+                    "items": question
+                }
+            }
         })
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let req = match parse_args(args) {
-            Ok(r) => r,
+        let (reqs, is_batch) = match parse_batch(args) {
+            Ok(x) => x,
             Err(e) => return err_result(e),
         };
-        let payload = match serde_json::to_value(&req) {
-            Ok(v) => v,
-            Err(e) => return err_result(format!("request_user_input: serialize failed: {e}")),
-        };
+        if !is_batch {
+            // Legacy single-question path — wire + result unchanged.
+            let payload = match serde_json::to_value(&reqs[0]) {
+                Ok(v) => v,
+                Err(e) => return err_result(format!("request_user_input: serialize failed: {e}")),
+            };
+            let resp_val = ctx.request(REQUEST_USER_INPUT_KIND, payload).await;
+            if resp_val.is_null() {
+                return null_result();
+            }
+            return match serde_json::from_value::<UserInputResponse>(resp_val) {
+                Ok(resp) => format_result(&resp),
+                Err(_) => format_result(&UserInputResponse::declined()),
+            };
+        }
+        // Batch path.
+        let payload = serde_json::json!({ "questions": reqs });
         let resp_val = ctx.request(REQUEST_USER_INPUT_KIND, payload).await;
         if resp_val.is_null() {
             return null_result();
         }
-        match serde_json::from_value::<UserInputResponse>(resp_val) {
-            Ok(resp) => format_result(&resp),
-            Err(_) => format_result(&UserInputResponse::declined()),
-        }
+        let resps: Vec<UserInputResponse> = resp_val
+            .get("responses")
+            .and_then(|r| serde_json::from_value::<Vec<UserInputResponse>>(r.clone()).ok())
+            .unwrap_or_default();
+        format_batch_result(&reqs, &resps)
     }
 }
 
@@ -253,6 +358,83 @@ mod tests {
             "No answer was provided. Proceed with your own best judgment; only ask again if you \
              are truly blocked.",
         );
+    }
+
+    #[test]
+    fn parse_batch_reads_questions_array_and_clamps_to_four() {
+        let args = r#"{"questions":[
+            {"header":"A","question":"Q1?","mode":"single","options":[{"label":"x"}]},
+            {"header":"B","question":"Q2?","mode":"text"},
+            {"header":"C","question":"Q3?","mode":"text"},
+            {"header":"D","question":"Q4?","mode":"text"},
+            {"header":"E","question":"Q5?","mode":"text"}
+        ]}"#;
+        let (reqs, is_batch) = parse_batch(args).unwrap();
+        assert!(is_batch);
+        assert_eq!(reqs.len(), 4, "clamped to MAX_QUESTIONS");
+        assert_eq!(reqs[0].header, "A");
+    }
+
+    #[test]
+    fn parse_batch_falls_back_to_single_legacy_shape() {
+        let (reqs, is_batch) =
+            parse_batch(r#"{"header":"H","question":"Q?","mode":"text"}"#).unwrap();
+        assert!(!is_batch);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].mode, UserInputMode::Text);
+    }
+
+    #[test]
+    fn parse_batch_validates_each_question_options() {
+        let args = r#"{"questions":[{"header":"A","question":"Q?","mode":"single","options":[]}]}"#;
+        assert!(parse_batch(args).is_err(), "choice question needs options");
+    }
+
+    #[test]
+    fn format_batch_keys_each_line_by_header_and_declines_untouched() {
+        let reqs = vec![
+            UserInputRequest {
+                header: "Auth".into(),
+                question: "?".into(),
+                mode: UserInputMode::Single,
+                options: vec![UserInputOption {
+                    label: "OAuth".into(),
+                    description: None,
+                }],
+            },
+            UserInputRequest {
+                header: "Note".into(),
+                question: "?".into(),
+                mode: UserInputMode::Text,
+                options: vec![],
+            },
+        ];
+        let resps = vec![
+            UserInputResponse {
+                declined: false,
+                selected: vec!["OAuth".into()],
+                text: None,
+            },
+            UserInputResponse::declined(),
+        ];
+        let out = format_batch_result(&reqs, &resps).content;
+        assert_eq!(
+            out,
+            "Q1 (Auth): User selected: \"OAuth\"\nQ2 (Note): No answer (declined)."
+        );
+    }
+
+    #[test]
+    fn format_batch_all_declined_is_the_single_no_answer_guidance() {
+        let reqs = vec![UserInputRequest {
+            header: "A".into(),
+            question: "?".into(),
+            mode: UserInputMode::Text,
+            options: vec![],
+        }];
+        let out = format_batch_result(&reqs, &[UserInputResponse::declined()]);
+        assert!(!out.is_error);
+        assert!(out.content.starts_with("No answer was provided."));
     }
 
     #[test]
