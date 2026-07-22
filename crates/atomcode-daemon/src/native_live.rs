@@ -219,7 +219,17 @@ pub fn replace_snapshot(
     working_dir: PathBuf,
     snapshot: SessionSnapshot,
 ) -> Result<LiveBinding, HubError> {
-    hub().replace_snapshot(binding, session_id, working_dir, snapshot)
+    let next = hub().replace_snapshot(binding, session_id, working_dir, snapshot)?;
+    let mut embedded = EMBEDDED_BINDING
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if embedded
+        .as_ref()
+        .is_some_and(|current| current.id == binding.id)
+    {
+        *embedded = Some(next.clone());
+    }
+    Ok(next)
 }
 
 pub fn commit_runtime_snapshot(
@@ -228,7 +238,17 @@ pub fn commit_runtime_snapshot(
     working_dir: PathBuf,
     snapshot: SessionSnapshot,
 ) -> Result<LiveBinding, HubError> {
-    hub().commit_runtime_snapshot(binding, session_id, working_dir, snapshot)
+    let next = hub().commit_runtime_snapshot(binding, session_id, working_dir, snapshot)?;
+    let mut embedded = EMBEDDED_BINDING
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if embedded
+        .as_ref()
+        .is_some_and(|current| current.id == binding.id)
+    {
+        *embedded = Some(next.clone());
+    }
+    Ok(next)
 }
 
 fn load_snapshot(working_dir: &Path, session_id: &str) -> Result<SessionSnapshot, String> {
