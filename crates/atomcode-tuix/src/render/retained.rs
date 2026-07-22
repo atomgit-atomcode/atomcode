@@ -2866,6 +2866,97 @@ impl<W: Write + Send> RetainedRenderer<W> {
         out
     }
 
+    /// Batch-aware wrapper over [`Self::build_user_input_rows`]. A standalone question
+    /// (`view.batch` is `None` or `total <= 1`) delegates unchanged (byte-identical).
+    /// A multi-question batch prepends a `问题 i/N` navigator (with ✓/○ per-question
+    /// markers) and appends a Tab hint, or renders a Submit screen on the Submit stop.
+    /// `user_input_panel_view_row_count` MUST equal this length.
+    fn build_user_input_panel_view(
+        &self,
+        view: &crate::render::UserInputPanelView,
+        rule_width: usize,
+        screen_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        let meta = match &view.batch {
+            Some(m) if m.total > 1 => m,
+            _ => return self.build_user_input_rows(view, rule_width, screen_width),
+        };
+        let unicode = self.caps.unicode_symbols;
+        let mut out: Vec<Vec<Cell>> = Vec::new();
+        let push_line = |out: &mut Vec<Vec<Cell>>, text: &str, style: &CellStyle| {
+            let raw = crate::glyph::downgrade_glyphs(text, unicode);
+            let body = crate::width::truncate_with_ellipsis(
+                &scrub_controls(&raw),
+                rule_width.saturating_sub(2),
+            );
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", style);
+            push_str_cells(&mut row, &body, style);
+            out.push(row);
+        };
+        let hint_style = if crate::highlight::theme::is_light_for_render() {
+            self.style_for(Role::Muted)
+        } else {
+            self.style_faint(Role::Muted)
+        };
+        // Navigator: "问题 i/N  ✓ ○ ○" (per-question answered markers).
+        let markers: String = (0..meta.total)
+            .map(|i| {
+                let ans = meta.answered.get(i).copied().unwrap_or(false);
+                if unicode {
+                    if ans { "\u{2713}" } else { "\u{25cb}" }
+                } else if ans {
+                    "x"
+                } else {
+                    "o"
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let nav_idx = if meta.on_submit { meta.total } else { meta.index };
+        let nav = format!("\u{95ee}\u{9898} {}/{}  {}", nav_idx, meta.total, markers); // 问题
+        push_line(&mut out, &nav, &self.style_bold(Role::Plan));
+        out.push(Vec::new()); // blank
+
+        if meta.on_submit {
+            let answered = meta.answered.iter().filter(|a| **a).count();
+            let marker = if unicode { "\u{276f} \u{2714} " } else { "> + " }; // ❯ ✔
+            let label = if unicode {
+                "\u{63d0}\u{4ea4}\u{5168}\u{90e8}"
+            } else {
+                "Submit all"
+            }; // 提交全部
+            let submit = format!("{marker}{label} ({answered}/{} \u{5df2}\u{7b54})", meta.total); // 已答
+            push_line(&mut out, &submit, &self.style_bold(Role::Plan));
+            out.push(Vec::new()); // blank
+            // Enter 提交 · Tab/Shift+Tab 切换问题 · Esc 放弃
+            let hint = "Enter \u{63d0}\u{4ea4} \u{00b7} Tab/Shift+Tab \u{5207}\u{6362}\u{95ee}\u{9898} \u{00b7} Esc \u{653e}\u{5f03}";
+            push_line(&mut out, hint, &hint_style);
+        } else {
+            // The current question's own rows (header/question/options/Other/hint).
+            out.extend(self.build_user_input_rows(view, rule_width, screen_width));
+            // Tab 切换问题 · 到提交行 Enter 交全部
+            let hint = "Tab/Shift+Tab \u{5207}\u{6362}\u{95ee}\u{9898} \u{00b7} \u{5230}\u{63d0}\u{4ea4}\u{884c} Enter \u{4ea4}\u{5168}\u{90e8}";
+            push_line(&mut out, hint, &hint_style);
+        }
+        out
+    }
+
+    /// Row count matching [`Self::build_user_input_panel_view`].
+    fn user_input_panel_view_row_count(&self, view: &crate::render::UserInputPanelView) -> usize {
+        match &view.batch {
+            Some(m) if m.total > 1 => {
+                if m.on_submit {
+                    5 // nav + blank + submit + blank + hint
+                } else {
+                    // nav + blank + <single-question rows> + tab hint
+                    self.user_input_panel_row_count(view) + 3
+                }
+            }
+            _ => self.user_input_panel_row_count(view),
+        }
+    }
+
     /// Paint the full footer into `self.screen`. Layout (top to bottom):
     ///
     ///   rows 0..T:   todo panel (T = todo_rows, a standing view above input)
@@ -3286,7 +3377,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let approval_cells: Vec<Vec<Cell>> = if let Some(p) = status_clone.approval.as_ref() {
             self.build_approval_rows(p, rule_width, w)
         } else if let Some(p) = status_clone.user_input.as_ref() {
-            self.build_user_input_rows(p, rule_width, w)
+            self.build_user_input_panel_view(p, rule_width, w)
         } else {
             Vec::new()
         };
@@ -3756,7 +3847,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if let Some(p) = self.status.approval.as_ref() {
             self.approval_panel_row_count(p)
         } else if let Some(p) = self.status.user_input.as_ref() {
-            self.user_input_panel_row_count(p)
+            self.user_input_panel_view_row_count(p)
         } else {
             0
         }
@@ -12798,6 +12889,7 @@ mod tests {
                 checked: vec![false, false, false],
                 text: String::new(),
                 custom_text: String::new(),
+                batch: None,
             };
             // Row count: header + blank + question + blank
             //   + opt1 label + opt1 desc + opt2 label (no desc)
@@ -12882,6 +12974,7 @@ mod tests {
                 checked: vec![true, false, true],
                 text: String::new(),
                 custom_text: "Zig".into(),
+                batch: None,
             };
             assert_eq!(
                 r.build_user_input_rows(&view, 78, 80).len(),
@@ -12946,6 +13039,7 @@ mod tests {
                 checked: vec![],
                 text: "atomcode".into(),
                 custom_text: String::new(),
+                batch: None,
             };
             // header + blank + question + blank + input + hint = 6.
             assert_eq!(r.user_input_panel_row_count(&view), 6, "text panel rows");
@@ -12974,6 +13068,71 @@ mod tests {
                 "text input row\n{dump}"
             );
         }
+    }
+
+    #[test]
+    fn user_input_batch_navigator_and_parity() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        use crate::render::{UserInputBatchMeta, UserInputPanelView};
+        let (r, _buf) = new_capturing(80, 24);
+
+        let base = |batch| UserInputPanelView {
+            header: "Auth".into(),
+            question: "Which auth?".into(),
+            mode: UserInputMode::Single,
+            options: vec![("OAuth".into(), None), ("Token".into(), None)],
+            cursor: 0,
+            checked: vec![false, false, false],
+            text: String::new(),
+            custom_text: String::new(),
+            batch,
+        };
+
+        // N==1 parity: batch None and batch Some(total=1) both equal the single renderer.
+        let single = base(None);
+        let single_rows = r.build_user_input_rows(&single, 78, 80).len();
+        assert_eq!(r.user_input_panel_view_row_count(&single), single_rows);
+        let one = base(Some(UserInputBatchMeta {
+            total: 1,
+            index: 1,
+            answered: vec![false],
+            on_submit: false,
+        }));
+        assert_eq!(
+            r.build_user_input_panel_view(&one, 78, 80).len(),
+            single_rows,
+            "total==1 delegates to the single renderer"
+        );
+
+        // N==2 on a question: navigator + blank + single rows + tab hint.
+        let q = base(Some(UserInputBatchMeta {
+            total: 2,
+            index: 1,
+            answered: vec![false, false],
+            on_submit: false,
+        }));
+        let q_rows = r.build_user_input_panel_view(&q, 78, 80);
+        assert_eq!(
+            q_rows.len(),
+            r.user_input_panel_view_row_count(&q),
+            "row_count invariant (question)"
+        );
+        assert_eq!(q_rows.len(), single_rows + 3);
+
+        // Submit stop: exactly 5 rows (nav + blank + submit + blank + hint).
+        let sub = base(Some(UserInputBatchMeta {
+            total: 2,
+            index: 2,
+            answered: vec![true, false],
+            on_submit: true,
+        }));
+        let sub_rows = r.build_user_input_panel_view(&sub, 78, 80);
+        assert_eq!(
+            sub_rows.len(),
+            r.user_input_panel_view_row_count(&sub),
+            "row_count invariant (submit)"
+        );
+        assert_eq!(sub_rows.len(), 5);
     }
 
     /// Step 1: option rows carry `1. ` / `2. ` / `3. ` numeric prefixes, the

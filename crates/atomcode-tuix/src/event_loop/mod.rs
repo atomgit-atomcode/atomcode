@@ -15089,6 +15089,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             checked: p.checked.clone(),
             text: p.text.clone(),
             custom_text: p.custom_text.clone(),
+            batch: None,
         });
     crate::render::StatusLine {
         model,

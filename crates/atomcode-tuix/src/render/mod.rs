@@ -588,6 +588,24 @@ pub struct UserInputPanelView {
     pub text: String,
     /// "Other" free-text row buffer for single/multiple mode.
     pub custom_text: String,
+    /// Batch navigator context. `None` = a standalone single question (rendered
+    /// byte-identically to before, no chrome). `Some` = this is one question inside
+    /// a multi-question batch, so the renderer adds a `Question i/N` navigator and a
+    /// Tab hint (or a Submit screen when `on_submit`).
+    pub batch: Option<UserInputBatchMeta>,
+}
+
+/// Navigator context for a question rendered as part of a multi-question batch.
+#[derive(Debug, Clone)]
+pub struct UserInputBatchMeta {
+    /// Total questions in the batch.
+    pub total: usize,
+    /// 1-based index of the current question (for the `Question i/N` navigator).
+    pub index: usize,
+    /// Per-question answered flags (for the ✓/○ markers), length `total`.
+    pub answered: Vec<bool>,
+    /// The cursor is on the Submit stop (render the submit screen, not a question).
+    pub on_submit: bool,
 }
 
 /// Progress of the active todo list, rendered as the multi-line footer todo
