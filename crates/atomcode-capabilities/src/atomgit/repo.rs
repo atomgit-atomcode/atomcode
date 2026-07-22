@@ -98,9 +98,15 @@ impl AtomgitClient {
             .map(crate::atomgit::models::project_labels_from_json))
     }
 
-    /// Replace the repo's `project_labels` wholesale.
+    /// Replace the repo's project labels wholesale.
+    ///
+    /// READ/WRITE FIELD ASYMMETRY (AtomGit/gitcode): the repo GET response exposes the
+    /// labels as `project_labels` (see [`repo_labels`]), but the repo-edit PATCH only
+    /// accepts them under `tags` (`string[]`). Sending `project_labels` on the PATCH is
+    /// rejected with `400 "... at least one parameter must be provided"` because it is
+    /// not a recognized write parameter — so we WRITE `tags` while we READ `project_labels`.
     pub async fn repo_set_labels(&self, owner: &str, repo: &str, labels: &[String]) -> Result<(), String> {
-        let body = serde_json::json!({ "project_labels": labels });
+        let body = serde_json::json!({ "tags": labels });
         let _: crate::atomgit::models::Repo =
             self.patch_json(&format!("/repos/{owner}/{repo}"), &body).await?;
         Ok(())
@@ -271,9 +277,10 @@ mod label_tests {
             .respond_with(ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"name":"widget","project_labels":["rust"]})))
             .mount(&server).await;
-        // PATCH must receive the FULL merged list.
+        // PATCH must receive the FULL merged list under the WRITE field `tags` (NOT
+        // `project_labels`, which the repo-edit endpoint rejects with 400).
         Mock::given(method("PATCH")).and(path("/api/v5/repos/acme/widget"))
-            .and(body_json(serde_json::json!({"project_labels":["rust","atomcode"]})))
+            .and(body_json(serde_json::json!({"tags":["rust","atomcode"]})))
             .respond_with(ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"name":"widget"})))
             .mount(&server).await;
@@ -313,7 +320,7 @@ mod label_tests {
                 .set_body_json(serde_json::json!({"name":"widget","project_labels":[]})))
             .mount(&server).await;
         Mock::given(method("PATCH")).and(path("/api/v5/repos/acme/widget"))
-            .and(body_json(serde_json::json!({"project_labels":["atomcode"]})))
+            .and(body_json(serde_json::json!({"tags":["atomcode"]})))
             .respond_with(ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"name":"widget"})))
             .mount(&server).await;
