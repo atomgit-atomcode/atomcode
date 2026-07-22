@@ -23,7 +23,8 @@ use std::path::PathBuf;
 
 use super::{
     apply_persisted_config, bg_runtime, deactivate_runtime_provider_after_logout,
-    reload_runtime_provider, save_and_reload, LoopCtx,
+    provider_transition_pending, reload_persisted_config, request_context_stats_render,
+    save_and_reload, LoopCtx, PersistedConfigReload,
 };
 use crate::i18n::{t, Msg};
 use crate::modals::usage::{UsageData, UsageModal};
@@ -174,6 +175,25 @@ fn sync_bg_foreground(ctx: &mut LoopCtx) {
         },
         ctx.current_session.clone(),
     );
+}
+
+fn ensure_bg_foreground_switch_allowed(provider_transition: bool) -> Result<(), &'static str> {
+    if provider_transition {
+        Err("/bg cannot switch the foreground while a provider transition is in progress")
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bg_provider_transition_guard_tests {
+    use super::ensure_bg_foreground_switch_allowed;
+
+    #[test]
+    fn provider_transition_blocks_foreground_owner_switches() {
+        assert!(ensure_bg_foreground_switch_allowed(true).is_err());
+        assert!(ensure_bg_foreground_switch_allowed(false).is_ok());
+    }
 }
 
 // Historical note: there was a `const OAUTH_PROVIDER_NAME = "AtomGit"`
@@ -1278,7 +1298,7 @@ fn execute_slash_command_impl(
         "config" => {
             // Head: current active provider + config path so users know
             // which provider is talking and where to edit.
-            let config_path = Config::default_path().display().to_string();
+            let config_path = ctx.config_store.path().display().to_string();
             let mut txt = t(Msg::ConfigProviderLabel {
                 provider: &ctx.config.default_provider,
                 path: &config_path,
@@ -1308,37 +1328,20 @@ fn execute_slash_command_impl(
             renderer.flush();
         }
         "reload" => {
-            // Re-read ~/.atomcode/config.toml from disk and push it to the
-            // running daemon. Streaming-safe: the agent picks the new config
-            // up on the *next* turn; anything already in-flight finishes on
-            // the old config (ReloadConfig is queued behind the current
-            // AgentCommand stream, not a hot swap).
-            let path = Config::default_path();
-            match Config::load(&path) {
-                Ok(new_cfg) => {
-                    let new_default = new_cfg.default_provider.clone();
-                    let new_model = new_cfg
-                        .providers
-                        .get(&new_default)
-                        .map(|p| p.model.clone())
-                        .unwrap_or_else(|| new_default.clone());
-                    ctx.config = new_cfg.clone();
-                    ctx.model_name = new_model.clone();
-                    // Refresh the footer context window now (see model_picker
-                    // Enter handler) — no turn fires here either, so the cached
-                    // snapshot's denominator would otherwise stay on the old model.
+            match reload_persisted_config(ctx) {
+                Ok(PersistedConfigReload::Applied { provider, model }) => {
                     state.on_model_window_changed(ctx.config.default_context_window());
-                    reload_runtime_provider(ctx).ok();
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::CmdReloadDone {
-                            provider: &new_default,
-                            model: &new_model,
+                            provider: &provider,
+                            model: &model,
                         })
                         .into_owned(),
                     ));
                 }
+                Ok(PersistedConfigReload::Queued | PersistedConfigReload::Joined) => {}
                 Err(e) => {
-                    let msg = format!("{}", e);
+                    let msg = e.to_string();
                     renderer.render(UiLine::Error(
                         t(Msg::CmdReloadFailed { error: &msg }).into_owned(),
                     ));
@@ -1533,10 +1536,18 @@ fn execute_slash_command_impl(
             // in a turn, the next rich emission (at the next LLM call)
             // serves the render — still fresh, just a tick later.
             let show_prompt = arg.trim().eq_ignore_ascii_case("prompt");
-            state.pending_context_render = Some(show_prompt);
-            ctx.runtime
-                .refresh_context_stats(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
-                .ok();
+            if let Err(error) = request_context_stats_render(
+                &ctx.runtime,
+                ctx.foreground_runtime_id,
+                ctx.runtime_event_tx.clone(),
+                &mut state.pending_context_render,
+                show_prompt,
+            ) {
+                renderer.render(UiLine::Error(format!(
+                    "refresh context stats could not be started: {error}"
+                )));
+                renderer.flush();
+            }
         }
         "compact" => {
             let focus = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
@@ -2093,6 +2104,13 @@ fn execute_slash_command_impl(
                     )));
                 }
                 bg_runtime::BgCommand::BackgroundCurrent => {
+                    if let Err(error) =
+                        ensure_bg_foreground_switch_allowed(provider_transition_pending(ctx))
+                    {
+                        renderer.render(UiLine::Error(error.into()));
+                        renderer.flush();
+                        return Ok(());
+                    }
                     sync_bg_foreground(ctx);
                     if !ctx.bg_manager.has_capacity() {
                         renderer.render(UiLine::Error(
@@ -2157,6 +2175,13 @@ fn execute_slash_command_impl(
                     renderer.end_sync();
                 }
                 bg_runtime::BgCommand::Resume(slot) => {
+                    if let Err(error) =
+                        ensure_bg_foreground_switch_allowed(provider_transition_pending(ctx))
+                    {
+                        renderer.render(UiLine::Error(error.into()));
+                        renderer.flush();
+                        return Ok(());
+                    }
                     sync_bg_foreground(ctx);
                     let outcome = match ctx
                         .bg_manager
@@ -4293,7 +4318,7 @@ pub(super) fn build_status_text(ctx: &LoopCtx, proxy: Option<&str>) -> String {
     let body = t(Msg::StatusBody {
         model: &ctx.model_name,
         dir: &ctx.working_dir.display().to_string(),
-        config: &Config::default_path().display().to_string(),
+        config: &ctx.config_store.path().display().to_string(),
     })
     .into_owned();
     assemble_status(
@@ -4443,6 +4468,11 @@ pub(crate) fn reset_to_new_session(
     state: &mut UiState,
     renderer: &mut dyn Renderer,
 ) {
+    if provider_transition_pending(ctx) {
+        renderer.render(UiLine::Error(t(Msg::CmdProviderReloading).into_owned()));
+        renderer.flush();
+        return;
+    }
     if ctx.pending_session_transition.is_some()
         || ctx.pending_session_resume.is_some()
         || ctx.pending_capability_reload
@@ -4500,6 +4530,9 @@ fn apply_cd_with_effect(
     // runtime value). Strip here so `working_dir`, `recent_dirs`, the `ChangeDirectory`
     // command, and the webui sync all store the plain form regardless of caller.
     let path = atomcode_capabilities::pathnorm::strip_verbatim_path(&path);
+    if provider_transition_pending(ctx) {
+        return Err(t(Msg::CmdProviderReloading).into_owned());
+    }
     if ctx.pending_session_transition.is_some()
         || ctx.pending_session_resume.is_some()
         || ctx.pending_capability_reload

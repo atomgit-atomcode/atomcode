@@ -14,7 +14,8 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
 use crate::event_loop::{
-    build_status, format_tool_detail, perform_session_rename, summarise, Buffer, LoopCtx,
+    build_status, format_tool_detail, perform_session_rename, provider_transition_pending,
+    summarise, Buffer, LoopCtx,
 };
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
@@ -93,6 +94,28 @@ impl SessionPicker {
     fn chosen_session(&self) -> Option<&SessionMeta> {
         let index = *self.filtered.get(self.selected)?;
         self.sessions.get(index)
+    }
+
+    fn replay_selected_current_session(
+        &self,
+        current_session: &Session,
+        current_project_bucket: &str,
+        state: &mut UiState,
+        renderer: &mut dyn Renderer,
+    ) -> bool {
+        let is_current = self.chosen_session().is_some_and(|session| {
+            session.id == current_session.id && session.project_bucket == current_project_bucket
+        });
+        if !is_current {
+            return false;
+        }
+
+        // The runtime already owns this exact session and its lease. Replaying
+        // it is therefore a display-only operation: repaint the in-memory
+        // transcript and restore copy/context/todo projections without asking
+        // the runtime to reacquire the lease or publishing a session switch.
+        replay_session(renderer, state, current_session, true);
+        true
     }
 
     /// The static key-legend hint advertising the picker's actions
@@ -312,8 +335,22 @@ impl Modal for SessionPicker {
                     // Filter matched nothing — ignore Enter, stay open.
                     return Ok(ModalAction::Continue);
                 };
-                if selected.id == ctx.current_session.id {
+                let expected_bucket =
+                    atomcode_capabilities::session::SessionManager::project_hash(&ctx.working_dir);
+                if self.replay_selected_current_session(
+                    &ctx.current_session,
+                    &expected_bucket,
+                    state,
+                    renderer,
+                ) {
                     return Ok(ModalAction::Close);
+                }
+                if provider_transition_pending(ctx) {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+                    ));
+                    renderer.flush();
+                    return Ok(ModalAction::Continue);
                 }
                 if ctx.pending_session_resume.is_some() {
                     renderer.render(UiLine::Error(
@@ -327,10 +364,6 @@ impl Modal for SessionPicker {
                 }
 
                 let result = (|| -> anyhow::Result<()> {
-                    let expected_bucket =
-                        atomcode_capabilities::session::SessionManager::project_hash(
-                            &ctx.working_dir,
-                        );
                     if selected.project_bucket != expected_bucket {
                         anyhow::bail!(
                             "selected session moved from project bucket {} to {}",
@@ -416,7 +449,15 @@ impl Modal for SessionPicker {
     }
 
     fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
-        let payload = build_menu_payload(self);
+        let current_project_bucket =
+            atomcode_capabilities::session::SessionManager::project_hash(&ctx.working_dir);
+        let payload = build_menu_payload(
+            self,
+            Some((
+                ctx.current_session.id.as_str(),
+                current_project_bucket.as_str(),
+            )),
+        );
         let mut status = build_status(state, ctx);
         // Delete confirmation/result is the user's own active interaction — it
         // must always show, overriding any build_status warning. The static key
@@ -440,7 +481,7 @@ impl Modal for SessionPicker {
     }
 }
 
-fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
+fn build_menu_payload(p: &SessionPicker, current_session: Option<(&str, &str)>) -> MenuPayload {
     // Empty state: surface a hint row so the user can tell the filter is
     // active and which query is excluding everything (otherwise the menu
     // renders as blank space and looks like the modal hung).
@@ -470,7 +511,13 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
             let msgs = crate::i18n::t(crate::i18n::Msg::SessionMsgCount {
                 count: s.message_count,
             });
-            let desc = format!("{} · {}", msgs, humanize_age(s.updated_at));
+            let mut desc = format!("{} · {}", msgs, humanize_age(s.updated_at));
+            if current_session.is_some_and(|(id, project_bucket)| {
+                s.id == id && s.project_bucket == project_bucket
+            }) {
+                desc.push_str(" · ");
+                desc.push_str(&crate::i18n::t(crate::i18n::Msg::DirCurrent));
+            }
             // If in rename editing mode and this is the selected item, show the editing buffer
             if p.rename_editing && filter_idx == p.selected {
                 (
@@ -987,6 +1034,82 @@ mod tests {
     }
 
     #[test]
+    fn selecting_current_session_replays_the_ui_without_a_runtime_transition() {
+        use atomcode_core::conversation::message::{Message, Role};
+
+        #[derive(Default)]
+        struct Rec {
+            lines: Vec<UiLine>,
+            reset_count: usize,
+        }
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.lines.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {
+                self.reset_count += 1;
+            }
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        let mut current = Session::new(PathBuf::from("/tmp/x"));
+        current.id = "current-id".into();
+        current.name = "current session".into();
+        current.messages = vec![
+            Message::new(Role::User, "question"),
+            Message::new(Role::Assistant, "answer"),
+        ];
+        let mut selected = meta("current session", current.messages.len());
+        selected.id = current.id.clone();
+        let current_bucket =
+            atomcode_capabilities::session::SessionManager::project_hash(&current.working_dir);
+        selected.project_bucket = current_bucket.clone();
+        let picker = SessionPicker::open(vec![selected]);
+        let mut state = UiState::with_unicode(true);
+        let mut renderer = Rec::default();
+
+        assert!(picker.replay_selected_current_session(
+            &current,
+            &current_bucket,
+            &mut state,
+            &mut renderer,
+        ));
+
+        assert_eq!(
+            renderer.reset_count, 1,
+            "current replay must repaint scrollback"
+        );
+        assert!(
+            renderer.lines.iter().any(|line| matches!(
+                line,
+                UiLine::TurnSeparator { label } if label.contains("current session")
+            )),
+            "current replay must show the same resumed separator as another session"
+        );
+        assert_eq!(state.last_assistant_response, "answer");
+
+        let mut same_id_other_bucket = meta("duplicate", current.messages.len());
+        same_id_other_bucket.id = current.id.clone();
+        let other_picker = SessionPicker::open(vec![same_id_other_bucket]);
+        let mut other_renderer = Rec::default();
+        assert!(
+            !other_picker.replay_selected_current_session(
+                &current,
+                &current_bucket,
+                &mut state,
+                &mut other_renderer,
+            ),
+            "session identity is project bucket plus id, not id alone"
+        );
+        assert_eq!(other_renderer.reset_count, 0);
+    }
+
+    #[test]
     fn build_menu_payload_shows_hint_when_filter_matches_nothing() {
         // Regression: typing a query that excludes every session used to
         // render a blank menu (items.len() == 0), so the user couldn't
@@ -997,7 +1120,7 @@ mod tests {
         p.query = "zz".to_string();
         p.update_filter();
         assert_eq!(p.filtered.len(), 0);
-        let payload = build_menu_payload(&p);
+        let payload = build_menu_payload(&p, None);
         assert_eq!(
             payload.items.len(),
             1,
@@ -1015,8 +1138,32 @@ mod tests {
     #[test]
     fn build_menu_payload_shows_hint_when_no_sessions_at_all() {
         let p = SessionPicker::open(vec![]);
-        let payload = build_menu_payload(&p);
+        let payload = build_menu_payload(&p, None);
         assert_eq!(payload.items.len(), 1, "must show some empty-state hint");
+    }
+
+    #[test]
+    fn build_menu_payload_marks_the_current_session() {
+        let mut duplicate = meta("other", 3);
+        duplicate.id = "id-current".into();
+        duplicate.project_bucket = "fedcba9876543210".into();
+        let sessions = vec![meta("current", 2), duplicate];
+        let current_id = sessions[0].id.clone();
+        let current_bucket = sessions[0].project_bucket.clone();
+        let p = SessionPicker::open(sessions);
+
+        let payload = build_menu_payload(&p, Some((&current_id, &current_bucket)));
+
+        assert!(
+            payload.items[0].1.contains("current") || payload.items[0].1.contains("当前"),
+            "current session must be visible before Enter changes the screen: {:?}",
+            payload.items
+        );
+        assert!(
+            !payload.items[1].1.contains("current") && !payload.items[1].1.contains("当前"),
+            "only the active session may carry the current marker: {:?}",
+            payload.items
+        );
     }
 
     // On /resume, todowrite calls no longer render an inline block. Instead the
