@@ -38,6 +38,12 @@ pub struct CodingAgentConfig {
     pub request_timeout: Option<Duration>,
     /// Safety fuse: max edit-then-verify continuations per turn (kernel default is 50).
     pub max_continuations: u32,
+    /// Coarse safety fuse: max LLM tool-call ROUNDS per turn before the kernel force-stops
+    /// (`StopReason::MaxRounds`). Backstop for a model that loops with VARYING calls — the
+    /// kernel's built-in repetition fuse already catches byte-identical loops fast. Generous
+    /// (well above a normal turn's round count) so it never cuts legit long work; `0` =
+    /// unbounded (fuse not wired).
+    pub max_rounds: u32,
     /// Goal-mode round cap (0 = unbounded). Override via `ATOMCODE_GOAL_MAX_ROUNDS`.
     pub goal_max_rounds: u32,
     /// Goal-mode wall-clock cap in seconds (0 = unbounded). Override via
@@ -388,6 +394,7 @@ impl CodingAgentConfig {
             stream_timeout: default_stream_timeout(),
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
+            max_rounds: 200,
             goal_max_rounds: default_goal_max_rounds(),
             goal_max_duration_secs: default_goal_max_duration_secs(),
             loop_max_rounds: default_loop_max_rounds(),
@@ -419,6 +426,8 @@ mod tests {
         let c = CodingAgentConfig::new("k", "https://x/v1", "m", "/tmp");
         assert_eq!(c.goal_max_rounds, 200);
         assert_eq!(c.goal_max_duration_secs, 7200);
+        // Per-turn round-cap backstop: generous, well above a normal turn, but bounded.
+        assert_eq!(c.max_rounds, 200);
     }
 
     #[test]
@@ -552,6 +561,7 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("stream_timeout", &self.stream_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("max_continuations", &self.max_continuations)
+            .field("max_rounds", &self.max_rounds)
             .field("goal_max_rounds", &self.goal_max_rounds)
             .field("goal_max_duration_secs", &self.goal_max_duration_secs)
             .field("chat_options", &self.chat_options)

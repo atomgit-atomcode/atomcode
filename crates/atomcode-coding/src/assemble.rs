@@ -108,6 +108,10 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
     if let Some(d) = cfg.request_timeout {
         builder = builder.request_timeout(d);
     }
+    // Coarse round-cap backstop (kernel repetition fuse is the fast path). `0` = unbounded.
+    if cfg.max_rounds > 0 {
+        builder = builder.max_rounds(cfg.max_rounds);
+    }
     // Todo-list hook: injects the current todo list as a per-turn <system-reminder> so
     // the model always sees progress even after compaction. Gated on ATOMCODE_TODO env
     // (overrides config); cfg_value=true reflects the default-on config.ui.todo default.

@@ -1012,6 +1012,11 @@ pub fn assemble(
     if let Some(d) = cfg.request_timeout {
         builder = builder.request_timeout(d);
     }
+    // Coarse round-cap backstop (the kernel's repetition fuse is the fast path for
+    // identical loops; this bounds VARYING-call runaways). `0` = unbounded → not wired.
+    if cfg.max_rounds > 0 {
+        builder = builder.max_rounds(cfg.max_rounds);
+    }
     for h in &parts.hooks {
         builder = builder.hook(h.clone());
     }
