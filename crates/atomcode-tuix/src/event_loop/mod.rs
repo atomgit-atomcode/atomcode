@@ -9575,7 +9575,8 @@ mod streaming_slash_tests {
     fn readonly_reports_run_mid_stream() {
         // The reported request: check usage / relabel without waiting for the turn.
         // These render to scrollback (no modal) and don't touch the conversation.
-        for cmd in ["status", "cost", "diff"] {
+        // (`/usage` detects Streaming and renders text instead of its modal.)
+        for cmd in ["status", "cost", "diff", "usage"] {
             assert_eq!(
                 exec(&format!("/{cmd}")),
                 Some((cmd.to_string(), String::new())),
@@ -9593,8 +9594,6 @@ mod streaming_slash_tests {
 
     #[test]
     fn mutating_and_modal_commands_stay_blocked_mid_stream() {
-        // `/usage` opens a modal that fights the streaming redraw — not whitelisted.
-        assert_eq!(exec("/usage"), None);
         // Conversation-mutating / turn-boundary commands must still wait.
         for line in ["/clear", "/compact", "/new", "/resume", "/model gpt", "/undo", "/context"] {
             assert_eq!(exec(line), None, "line={line}");
@@ -10082,8 +10081,10 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
     // SCROLLBACK (never open an interactive modal, which the live streaming box would
     // paint over) and don't mutate the running conversation. This is the reported
     // request: rename the session or check usage without waiting for the turn to end.
-    //   /status, /cost, /diff — pure read-only reports (no args).
-    if matches!(cmd.to_ascii_lowercase().as_str(), "status" | "cost" | "diff")
+    //   /status, /cost, /diff, /usage — read-only reports (no args). `/usage` detects
+    //   the Streaming phase and renders a TEXT snapshot to scrollback instead of its
+    //   interactive modal (which the streaming redraws would paint over).
+    if matches!(cmd.to_ascii_lowercase().as_str(), "status" | "cost" | "diff" | "usage")
         && arg.trim().is_empty()
     {
         return Some((cmd.to_ascii_lowercase(), String::new()));
@@ -10096,9 +10097,6 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
     if cmd.eq_ignore_ascii_case("rename") && !arg.trim().is_empty() {
         return Some(("rename".to_string(), arg.trim().to_string()));
     }
-    // NOTE: `/usage` is deliberately NOT here — it opens an interactive modal, and the
-    // streaming redraws (`draw_spinner_now` on every token) repaint the footer over it.
-    // Serving usage mid-turn needs a scrollback TEXT variant, not the modal (separate change).
     None
 }
 
