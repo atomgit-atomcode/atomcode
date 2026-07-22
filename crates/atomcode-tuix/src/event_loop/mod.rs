@@ -9572,6 +9572,36 @@ mod streaming_slash_tests {
     }
 
     #[test]
+    fn readonly_reports_run_mid_stream() {
+        // The reported request: check usage / relabel without waiting for the turn.
+        // These render to scrollback (no modal) and don't touch the conversation.
+        for cmd in ["status", "cost", "diff"] {
+            assert_eq!(
+                exec(&format!("/{cmd}")),
+                Some((cmd.to_string(), String::new())),
+                "cmd={cmd}"
+            );
+        }
+        // `/rename <name>` runs mid-stream; a bare `/rename` (would only error) does not.
+        assert_eq!(
+            exec("/rename my session"),
+            Some(("rename".to_string(), "my session".to_string()))
+        );
+        assert_eq!(exec("/rename"), None);
+        assert_eq!(exec("/rename   "), None);
+    }
+
+    #[test]
+    fn mutating_and_modal_commands_stay_blocked_mid_stream() {
+        // `/usage` opens a modal that fights the streaming redraw — not whitelisted.
+        assert_eq!(exec("/usage"), None);
+        // Conversation-mutating / turn-boundary commands must still wait.
+        for line in ["/clear", "/compact", "/new", "/resume", "/model gpt", "/undo", "/context"] {
+            assert_eq!(exec(line), None, "line={line}");
+        }
+    }
+
+    #[test]
     fn quit_and_exit_run_mid_stream() {
         assert_eq!(exec("/quit"), Some(("quit".to_string(), String::new())));
         assert_eq!(exec("/exit"), Some(("exit".to_string(), String::new())));
@@ -10048,6 +10078,27 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
             return Some(("loop".to_string(), arg.trim().to_string()));
         }
     }
+    // READ-ONLY / METADATA commands that are SAFE mid-turn — they only render to
+    // SCROLLBACK (never open an interactive modal, which the live streaming box would
+    // paint over) and don't mutate the running conversation. This is the reported
+    // request: rename the session or check usage without waiting for the turn to end.
+    //   /status, /cost, /diff — pure read-only reports (no args).
+    if matches!(cmd.to_ascii_lowercase().as_str(), "status" | "cost" | "diff")
+        && arg.trim().is_empty()
+    {
+        return Some((cmd.to_ascii_lowercase(), String::new()));
+    }
+    //   /rename <name> — relabels the session in the catalog. Safe mid-turn: it sets
+    //   `user_renamed`, so a mid-turn AI auto-name suggestion from the running turn
+    //   can't clobber it, and the catalog write is independent of the turn's
+    //   conversation persistence. A bare `/rename` (no name) is NOT run — it would just
+    //   error, and errors mid-stream are noise.
+    if cmd.eq_ignore_ascii_case("rename") && !arg.trim().is_empty() {
+        return Some(("rename".to_string(), arg.trim().to_string()));
+    }
+    // NOTE: `/usage` is deliberately NOT here — it opens an interactive modal, and the
+    // streaming redraws (`draw_spinner_now` on every token) repaint the footer over it.
+    // Serving usage mid-turn needs a scrollback TEXT variant, not the modal (separate change).
     None
 }
 
@@ -10276,6 +10327,11 @@ fn handle_streaming_key(
             // TUI in Streaming, so without this a typed `/goal clear` could never
             // reach the runtime and the goal was uninterruptible by command.
             if let Some((cmd, arg)) = streaming_executable_slash(&line) {
+                // Read-only reports (status/cost/diff/rename) run WITHOUT disturbing the
+                // running turn: they render to scrollback, so the turn's live UI state
+                // (type-ahead queue, in-flight tools, thinking/reasoning buffers) must be
+                // preserved. Only the turn-ending commands (bg/quit) tear that state down.
+                let readonly = matches!(cmd.as_str(), "status" | "cost" | "diff" | "rename");
                 if matches!(cmd.as_str(), "quit" | "exit") {
                     cancel_active_turn(ctx);
                     clear_capturing_modal_on_cancel(app);
@@ -10289,13 +10345,27 @@ fn handle_streaming_key(
                     &mut app.active_modal,
                     &mut app.setup_pending,
                 )?;
-                app.message_queue.clear();
-                app.pending_tools.clear();
-                app.think.reset();
-                app.reasoning_buffer.clear();
+                if !readonly {
+                    app.message_queue.clear();
+                    app.pending_tools.clear();
+                    app.think.reset();
+                    app.reasoning_buffer.clear();
+                }
                 app.buf.text.clear();
                 app.buf.cursor = 0;
                 app.menu.selected = 0;
+                if readonly {
+                    // Restore the streaming footer/spinner beneath the report so the live
+                    // turn keeps animating (the report landed in scrollback above it).
+                    draw_spinner_now(
+                        &mut app.state,
+                        &app.buf,
+                        ctx,
+                        renderer,
+                        app.message_queue.len(),
+                        app.menu.selected,
+                    );
+                }
                 return Ok(());
             }
             let is_known_slash = parse_slash_line(&line)
