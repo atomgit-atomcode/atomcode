@@ -296,7 +296,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         None
     };
 
-    // `task` subagent tool (env-gated, default off). Configured fast/capable tiers use
+    // `task` subagent tool (env-gated, default ON; opt out with ATOMCODE_SUBAGENT=0). Configured fast/capable tiers use
     // runtime-owned provider cells; missing/same-as-host tiers reuse the host slot.
     // Child tools: read-only `explore` vs edit-capable `worker`.
     let subagent_provider: Option<SharedReviewProvider> =
@@ -1109,15 +1109,13 @@ fn check_snapshot_version(snap: &SessionSnapshot) -> io::Result<()> {
     Ok(())
 }
 
-/// env `ATOMCODE_SUBAGENT` gate: default OFF; `0`/`false`/`off`/empty (case-insensitive)
-/// = off, any other non-empty value = on. (Opposite default from `ATOMCODE_TODO`.)
+/// env `ATOMCODE_SUBAGENT` gate: default ON; only `0`/`false`/`off` (case-insensitive)
+/// disables — unset or any other value = on. (Now matches `ATOMCODE_TODO` /
+/// `ATOMCODE_MEMORY_TOOL`; opt out with `ATOMCODE_SUBAGENT=0`.)
 pub fn subagent_enabled_from_env(var: Option<&str>) -> bool {
     match var {
-        None => false,
-        Some(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "off"
-        ),
+        None => true,
+        Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
     }
 }
 
@@ -1155,14 +1153,16 @@ mod tests {
     #[test]
     fn subagent_env_gate() {
         use super::subagent_enabled_from_env as g;
-        assert!(!g(None));
-        assert!(!g(Some("0")));
-        assert!(!g(Some("false")));
-        assert!(!g(Some("off")));
-        assert!(!g(Some("")));
+        // Default ON: unset or any non-opt-out value enables.
+        assert!(g(None));
+        assert!(g(Some("")));
         assert!(g(Some("1")));
         assert!(g(Some("true")));
         assert!(g(Some("yes")));
+        // Only the explicit opt-out values disable.
+        assert!(!g(Some("0")));
+        assert!(!g(Some("false")));
+        assert!(!g(Some("off")));
     }
 
     #[test]

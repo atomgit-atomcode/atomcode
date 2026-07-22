@@ -69,12 +69,13 @@ impl Default for LoopConfig {
 /// `max_concurrent` and `timeout_secs` are the LIVE knobs: `coding::parts` reads them via
 /// `subagent_runtime_knobs` and wires them into `TaskTool` (with `ATOMCODE_SUBAGENT_TIMEOUT`
 /// overriding `timeout_secs`). The tool's master ON/OFF is the env gate `ATOMCODE_SUBAGENT`
-/// (default OFF) — NOT `enabled` here; `enabled`, `initial_turns`, and `max_turns` are
-/// vestigial from the retired `parallel_edit` dispatch path and are not currently consulted.
+/// (default ON, opt out with `ATOMCODE_SUBAGENT=0`) — NOT `enabled` here; `enabled`,
+/// `initial_turns`, and `max_turns` are vestigial from the retired `parallel_edit` dispatch
+/// path and are not currently consulted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SubAgentConfig {
-    /// Vestigial: the live master switch is the env gate `ATOMCODE_SUBAGENT` (default OFF),
+    /// Vestigial: the live master switch is the env gate `ATOMCODE_SUBAGENT` (default ON),
     /// not this field. Kept for config back-compat.
     pub enabled: bool,
     /// Vestigial (retired resilience path); not currently read.

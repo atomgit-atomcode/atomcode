@@ -44,8 +44,8 @@ pub(crate) fn request_user_input_switch_enabled() -> bool {
 /// Whether the `task` subagent tool is mounted — mirrors the tool-mount gate in
 /// [`crate::parts`] by delegating to the SAME `subagent_enabled_from_env` helper, so the
 /// system-prompt delegation guidance and the mounted tool can never disagree. Env
-/// `ATOMCODE_SUBAGENT`, default OFF (opposite of `ATOMCODE_TODO`): only advertise delegation
-/// when the tool actually exists, else the model calls a tool that isn't there.
+/// `ATOMCODE_SUBAGENT`, default ON (opt out with `=0`): only advertise delegation when the
+/// tool actually exists, else the model calls a tool that isn't there.
 pub(crate) fn subagent_delegation_enabled() -> bool {
     crate::parts::subagent_enabled_from_env(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref())
 }
@@ -149,8 +149,8 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     // Delegation guidance for the `task` subagent tool — surfaced in the system prompt (not
     // just the tool description) because weak main models (observed: GLM) under-weight tool
     // descriptions and so never delegate. MUST stay gated on the SAME condition as the
-    // `task` tool mount in `parts.rs` (`ATOMCODE_SUBAGENT`, default OFF): nudging the model
-    // toward an unmounted tool provokes a phantom tool call. `subagent_delegation_enabled()`
+    // `task` tool mount in `parts.rs` (`ATOMCODE_SUBAGENT`, default ON, opt out with `=0`):
+    // nudging the model toward an unmounted tool provokes a phantom tool call. `subagent_delegation_enabled()`
     // reuses the tool-mount's own gate helper so the two can't drift.
     if subagent_delegation_enabled() {
         p.push_str(SUBAGENT_DELEGATION);
@@ -1187,16 +1187,15 @@ mod tests {
         // The clause is appended IFF `subagent_delegation_enabled()` is true, which delegates
         // to the SAME `parts::subagent_enabled_from_env` gate the `task` tool-mount reads — so
         // guidance and tool can't disagree. Assert the persona advertises `task` EXACTLY when
-        // that gate is on (default OFF, so the env-unset persona every other test builds must
-        // not advertise it). Done without mutating the process-global env var — reading the
+        // that gate is on. Done without mutating the process-global env var — reading the
         // live gate keeps this correct under either setting while staying flake-free.
         assert_eq!(
             coding_persona("glm-5.2", true, false).contains("## DELEGATING WITH `task`"),
             subagent_delegation_enabled(),
             "persona advertises `task` exactly when its mount gate is on"
         );
-        // Gate parity with the tool mount: default OFF, on for any real value, off for 0/off.
-        assert!(!crate::parts::subagent_enabled_from_env(None));
+        // Gate parity with the tool mount: default ON (unset → on), off only for 0/false/off.
+        assert!(crate::parts::subagent_enabled_from_env(None));
         assert!(crate::parts::subagent_enabled_from_env(Some("1")));
         assert!(!crate::parts::subagent_enabled_from_env(Some("0")));
     }
