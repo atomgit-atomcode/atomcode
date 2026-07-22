@@ -112,16 +112,17 @@ struct WorkerScopeGate {
 impl WorkerScopeGate {
     fn new(scopes: &[String], working_dir: &Path) -> Self {
         let mut builder = globset::GlobSetBuilder::new();
+        let mut dir_prefixes = Vec::new();
         for s in scopes {
+            // Only scopes whose glob compiles participate — in BOTH the file-path globset and
+            // the search_replace dir-prefix list — so a malformed scope can't confine writes
+            // one way and allow them the other.
             if let Ok(g) = globset::GlobBuilder::new(s).literal_separator(true).build() {
                 builder.add(g);
+                dir_prefixes.push(PathBuf::from(literal_dir_prefix(s)));
             }
         }
         let globs = builder.build().unwrap_or_else(|_| globset::GlobSet::empty());
-        let dir_prefixes = scopes
-            .iter()
-            .map(|s| PathBuf::from(literal_dir_prefix(s)))
-            .collect();
         Self {
             working_dir: working_dir.to_path_buf(),
             globs,
@@ -135,11 +136,21 @@ impl WorkerScopeGate {
     fn violation(&self, tool: &str, args_json: &str) -> Option<String> {
         match tool {
             "edit_file" | "write_file" => {
-                let raw = serde_json::from_str::<serde_json::Value>(args_json)
-                    .ok()?
-                    .get("file_path")?
-                    .as_str()?
-                    .to_string();
+                let raw = match serde_json::from_str::<serde_json::Value>(args_json)
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| v.get("file_path"))
+                    .and_then(|x| x.as_str())
+                {
+                    Some(p) => p.to_string(),
+                    // Fail closed: a write tool with no usable `file_path` must not slip past
+                    // the gate (defense-in-depth; the tool itself also rejects it).
+                    None => {
+                        return Some(format!(
+                            "worker {tool} call has no usable `file_path`; cannot verify it is within scope."
+                        ))
+                    }
+                };
                 match self.workspace_relative(&raw) {
                     None => Some(format!(
                         "worker edit out of scope: {raw} is outside the working directory."
@@ -1265,6 +1276,9 @@ mod tests {
         assert!(g.violation("grep", r#"{"pattern":"x","path":"src/db"}"#).is_none());
         // bash is never gated (dispatch-trust; design §6)
         assert!(g.violation("bash", r#"{"command":"rm -rf src/db"}"#).is_none());
+        // write with no usable file_path fails CLOSED (denied), not allowed through
+        assert!(g.violation("write_file", r#"{"content":"x"}"#).is_some());
+        assert!(g.violation("edit_file", r#"{"file_path":null}"#).is_some());
     }
 
     #[test]
@@ -1307,5 +1321,7 @@ mod tests {
             .violation("search_replace", r#"{"pattern":"x","replacement":"y"}"#)
             .expect("whole-tree search_replace denied");
         assert!(deny.contains("whole tree") || deny.contains("path"), "{deny}");
+        // root escaping the workspace → denied
+        assert!(g.violation("search_replace", r#"{"path":"../outside"}"#).is_some());
     }
 }
