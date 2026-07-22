@@ -1529,7 +1529,9 @@ fn execute_slash_command_impl(
             // Mid-turn (Streaming): render a text snapshot to scrollback — the modal
             // fights the live streaming box. Idle: open the interactive modal.
             if matches!(state.phase, crate::state::UiPhase::Streaming) {
-                let text = fetch_usage_data()
+                // `false` = skip the heavier `usage()` round-trip (overview/models) the
+                // text snapshot doesn't render — one gateway call, not two, mid-stream.
+                let text = fetch_usage_data(false)
                     .map(|d| render_usage_text(&d))
                     .unwrap_or_else(|| t(Msg::UsageCodingPlanOnly).into_owned());
                 renderer.render(UiLine::CommandOutput(text));
@@ -4382,7 +4384,12 @@ pub(super) fn build_diff_text(ctx: &LoopCtx) -> Result<String, String> {
 /// user isn't logged into a CodingPlan account — the caller then shows
 /// `UsageCodingPlanOnly`. Shared by the interactive modal (`open_usage`) and the
 /// mid-turn text snapshot (`render_usage_text`).
-fn fetch_usage_data() -> Option<UsageData> {
+///
+/// `include_overview` gates the SECOND, heavier `usage()` round-trip that powers the
+/// modal's Overview/Models tabs. The mid-turn text snapshot renders only plan + window
+/// (from `status_v2`), so it passes `false` — otherwise it would pay for a network call
+/// it throws away, doubling the streaming freeze.
+fn fetch_usage_data(include_overview: bool) -> Option<UsageData> {
     tokio::task::block_in_place(|| {
         let client = atomcode_codingplan::client::Client::from_stored_auth().ok()?;
         let status = client.status_v2().ok();
@@ -4395,9 +4402,13 @@ fn fetch_usage_data() -> Option<UsageData> {
                 .cloned()
         });
         let plan = status.and_then(|s| s.codingplan_free);
-        let (usage, error) = match client.usage() {
-            Ok(u) => (Some(u), None),
-            Err(e) => (None, Some(format!("{e}"))),
+        let (usage, error) = if include_overview {
+            match client.usage() {
+                Ok(u) => (Some(u), None),
+                Err(e) => (None, Some(format!("{e}"))),
+            }
+        } else {
+            (None, None)
         };
         let overview = usage
             .as_ref()
@@ -4415,7 +4426,7 @@ fn fetch_usage_data() -> Option<UsageData> {
 /// `/usage` — open the CodingPlan usage modal (idle). Renders a notice when the user
 /// isn't on a CodingPlan account, otherwise pushes the modal into `active_modal`.
 fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Modal>>) {
-    match fetch_usage_data() {
+    match fetch_usage_data(true) {
         Some(data) => *active_modal = Some(Box::new(UsageModal::new(data))),
         None => {
             renderer.render(UiLine::CommandOutput(t(Msg::UsageCodingPlanOnly).into_owned()));
