@@ -175,6 +175,11 @@ impl TuiSession {
         self.cold_summaries = snapshot.cold_summaries;
     }
 
+    pub fn retain_turn_stats_after_undo(&mut self, message_count: usize) {
+        self.turn_stats
+            .retain(|stat| !stat.position_valid || stat.after_message <= message_count);
+    }
+
     pub fn touch(&mut self) {
         self.updated_at = atomcode_capabilities::session::now_ms();
     }
@@ -206,5 +211,29 @@ mod tests {
         let projected = SessionMeta::from(entry);
 
         assert_eq!(projected.project_bucket, "0123456789abcdef");
+    }
+
+    #[test]
+    fn undo_stat_pruning_preserves_accounting_only_history() {
+        let mut session = Session::new(PathBuf::from("/project"));
+        let stat = |after_message, position_valid, total_tokens| TurnStat {
+            after_message,
+            position_valid,
+            turn_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 10,
+        };
+        session.turn_stats = vec![stat(99, false, 100), stat(2, true, 20), stat(4, true, 40)];
+
+        session.retain_turn_stats_after_undo(2);
+
+        assert_eq!(session.turn_stats.len(), 2);
+        assert!(!session.turn_stats[0].position_valid);
+        assert_eq!(session.turn_stats[0].total_tokens, 100);
+        assert_eq!(session.turn_stats[1].after_message, 2);
     }
 }

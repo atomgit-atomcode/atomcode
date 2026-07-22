@@ -13418,9 +13418,7 @@ fn handle_undo_success(
     commands::stop_active_loop(state, ctx);
     ctx.current_session
         .update_from_conversation_snapshot(snapshot);
-    ctx.current_session
-        .turn_stats
-        .retain(|stat| stat.after_message <= new_len);
+    ctx.current_session.retain_turn_stats_after_undo(new_len);
     ctx.current_session.touch();
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
@@ -15386,9 +15384,7 @@ fn apply_ai_session_name(ctx: &mut LoopCtx, name: String, renderer: &mut dyn Ren
     ) {
         return;
     }
-    let project_bucket = atomcode_capabilities::session::SessionManager::project_hash(
-        &ctx.current_session.working_dir,
-    );
+    let project_bucket = commands::active_session_project_bucket(&ctx.working_dir);
     match atomcode_daemon::legacy_convert::apply_ai_catalog_name_in_project(
         &project_bucket,
         ctx.current_session.id.as_str(),

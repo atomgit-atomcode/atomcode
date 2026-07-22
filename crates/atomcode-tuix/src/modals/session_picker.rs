@@ -751,7 +751,9 @@ pub(crate) fn replay_session(
     // screen; `restore_context` no-ops only when there's nothing to show or clear.
     let (used, window) = session
         .turn_stats
-        .last()
+        .iter()
+        .rev()
+        .find(|stat| stat.position_valid)
         .map(|s| (s.used_tokens, s.ctx_window))
         .unwrap_or((0, 0));
     state.restore_context(used, window);
@@ -1279,6 +1281,17 @@ mod tests {
             Message::new(Role::Assistant, "a2"),
         ];
         session.turn_stats.push(TurnStat {
+            after_message: 4,
+            position_valid: true,
+            turn_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 77,
+            errored: false,
+            used_tokens: 77,
+            ctx_window: 100,
+        });
+        session.turn_stats.push(TurnStat {
             after_message: 2,
             position_valid: false,
             turn_count: 9,
@@ -1306,5 +1319,8 @@ mod tests {
             labels.iter().all(|label| !label.contains("987")),
             "accounting-only stat leaked into replay divider: {labels:?}"
         );
+        let context = state.last_context.as_ref().expect("valid context restored");
+        assert_eq!(context.sent_tokens, 77);
+        assert_eq!(context.ctx_window, 100);
     }
 }

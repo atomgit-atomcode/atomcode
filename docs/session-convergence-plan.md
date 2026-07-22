@@ -181,7 +181,8 @@ native cutover 时才调用下述状态机；调用前必须获取 session 排�
   │
   ├─ native snapshot + meta 完整、owner 未确认
   │    → native messages 保持权威
-  │    → 有 legacy 时只补齐缺失 metadata/presentation
+  │    → 有 legacy 时只补齐可独立迁移的 metadata
+  │    → presentation 必须与 native snapshot 同坐标；保留已有 native 文件，缺失时写空文件
   │    → 最后 commit owner=native，从此禁止 core writer
   │
   ├─ 只有 legacy JSON
@@ -787,7 +788,7 @@ catalog 文件健康诊断被显式报告；24 个结构损坏会话被 fail-clo
 | display message 最小 schema | 当前 legacy 形状是 `after_message + role + text`；目标 v1 为 `version + DisplayAnchor + role + text`，anchor 仅为 `AtStart/AfterTurn(turn_id)` |
 | native meta 补齐字段 | additive 增加 `ai_named`；turn stat 增加 `round_count/used_tokens/ctx_window`，保留现有 `tool_call_count/duration_ms/total_tokens/errored`；顶层 `turn_count` 语义不变 |
 | 同 session 并发写 | 可能；S1b 已用每 session advisory lock 解决 native meta rename/turn-complete 丢更新，但 core JSON、snapshot 与删除生命周期仍需单 writer 所有权或冲突语义 |
-| legacy/native 冲突 | 有效 native snapshot 永不被 legacy 覆盖；只允许补缺失 metadata/presentation，最后提交 `owner=native` 并按需写 `import_info` |
+| legacy/native 冲突 | 有效 native snapshot 永不被 legacy 覆盖；只允许补可独立迁移的 metadata。presentation 必须与 snapshot 同坐标：已有 native 文件则保留，缺失则写空文件，禁止导入 legacy presentation；最后提交 `owner=native` 并按需写 `import_info` |
 | session id 兼容 | 新建值继续使用 UUID；legacy 当前接受任意字符串，S1 校验必须允许安全文件名形式的历史非 UUID id，同时拒绝分隔符、`.`、`..` 和空值 |
 | fixture 下界 | `legacy_minimal.json` 省略所有现有 serde additive 字段，覆盖当前代码能推导出的最老可读结构；没有使用真实用户数据 |
 | 首个生产切换单元 | S3 先整体切 `list/latest/find-any`，不是只切一个 driver；CLI/TUI/daemon 同步切换并删除 core catalog 读调用点，避免会话集合分裂 |

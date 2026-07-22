@@ -230,6 +230,13 @@ pub fn perform_session_rename(
     Ok((old_name, new_name))
 }
 
+/// The active runtime directory identifies the physical session bucket. Persisted
+/// metadata is display data here: historical duplicates may carry a stale embedded
+/// `working_dir` and must never redirect a mutation to another bucket.
+pub(super) fn active_session_project_bucket(working_dir: &std::path::Path) -> String {
+    atomcode_capabilities::session::SessionManager::project_hash(working_dir)
+}
+
 /// Render the "Instruction files:" status block — the same one shown
 /// by `/status`, factored out so `/init` can also display it after
 /// writing `.atomcode.md` (so users see the new file appear under
@@ -1439,9 +1446,7 @@ fn execute_slash_command_impl(
                 renderer.flush();
             } else {
                 let new_name = arg.trim().to_string();
-                let project_bucket = atomcode_capabilities::session::SessionManager::project_hash(
-                    &ctx.current_session.working_dir,
-                );
+                let project_bucket = active_session_project_bucket(&ctx.working_dir);
                 match perform_session_rename(&project_bucket, &ctx.current_session.id, &new_name) {
                     Ok((old_name, _)) => {
                         ctx.current_session.rename(new_name.clone());
@@ -6427,6 +6432,23 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_session_bucket_uses_runtime_directory_not_embedded_metadata() {
+        let runtime_dir = PathBuf::from("/current/project");
+        let stale_meta_dir = PathBuf::from("/old/project");
+
+        let bucket = active_session_project_bucket(&runtime_dir);
+
+        assert_eq!(
+            bucket,
+            atomcode_capabilities::session::SessionManager::project_hash(&runtime_dir)
+        );
+        assert_ne!(
+            bucket,
+            atomcode_capabilities::session::SessionManager::project_hash(&stale_meta_dir)
+        );
+    }
 
     /// Create a subdir inside a tempdir and return both. Paths are
     /// canonicalized because `resolve_cd` canonicalizes its output, and
