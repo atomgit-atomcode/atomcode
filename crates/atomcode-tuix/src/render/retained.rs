@@ -6764,13 +6764,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_row(Vec::new());
             }
             UiLine::VisionPreprocessSuccess { msg, model } => {
-                // `{msg}  ` in default text style; `{model}` highlighted in
-                // bold Accent (cyan) so the VL model identity pops rather
-                // than reading as dim metadata — the user wants to see at a
-                // glance which model did the recognition. push_body_prefixed
-                // handles the two styles in a single visual line and
-                // continues onto wrapped rows with the prefix's display
-                // width as continuation pad.
+                // `{msg}  ` in default text style; `{model}` in bold only (no
+                // colour) so the VL model identity stands out from the notice
+                // text without the loud accent hue — the user requested just
+                // emphasis, not a themed colour. push_body_prefixed handles the
+                // two styles in a single visual line and continues onto wrapped
+                // rows with the prefix's display width as continuation pad.
                 //
                 // Trailing blank: without it the next event's row (e.g.
                 // `● Pondering…` spinner or assistant text) butts right
@@ -6778,7 +6777,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // too cramped. The blank lets the success line breathe
                 // as its own paragraph.
                 let default_style = CellStyle::default();
-                let model_style = self.style_bold(Role::Accent);
+                let model_style = CellStyle {
+                    fg: None,
+                    bold: true,
+                    reverse: false,
+                    faint: false,
+                    bg: None,
+                };
                 let prefix = format!("{msg}  ");
                 self.push_body_prefixed(&prefix, &default_style, &model, &model_style);
                 self.push_body_row(Vec::new());
