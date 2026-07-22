@@ -817,6 +817,10 @@ pub(crate) enum LiveWireEvent {
         question: String,
         mode: String,
         options: Vec<serde_json::Value>,
+        /// Present for a multi-question batch (each item is a `{header,question,mode,options}`
+        /// object). Omitted for a single question — the webui then uses the flat fields above.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        questions: Option<Vec<serde_json::Value>>,
     },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
@@ -978,6 +982,11 @@ impl NativeLiveWireProjector {
                             .and_then(serde_json::Value::as_array)
                             .cloned()
                             .unwrap_or_default(),
+                        questions: request
+                            .payload
+                            .get("questions")
+                            .and_then(serde_json::Value::as_array)
+                            .cloned(),
                     }
                 } else {
                     return None;
@@ -1751,11 +1760,16 @@ pub(crate) async fn live_permission(
 #[derive(serde::Deserialize)]
 pub(crate) struct UserInputAnswerReq {
     pub request_id: u64,
+    #[serde(default)]
     pub declined: bool,
     #[serde(default)]
     pub selected: Vec<String>,
     #[serde(default)]
     pub text: Option<String>,
+    /// Present for a multi-question batch: one response object per question. When set,
+    /// the daemon responds `{ "responses": [...] }`; otherwise the flat single shape.
+    #[serde(default)]
+    pub responses: Option<serde_json::Value>,
 }
 
 /// POST /live/user-input — Deliver the user's answer to a pending `request_user_input`
@@ -1768,11 +1782,15 @@ pub(crate) async fn live_user_input(
     State(_state): State<AppState>,
     Json(req): Json<UserInputAnswerReq>,
 ) -> impl IntoResponse {
-    let value = serde_json::json!({
-        "declined": req.declined,
-        "selected": req.selected,
-        "text": req.text,
-    });
+    // Batch answer (webui stepper) → `{ "responses": [...] }`; single → the flat shape.
+    let value = match req.responses {
+        Some(responses) => serde_json::json!({ "responses": responses }),
+        None => serde_json::json!({
+            "declined": req.declined,
+            "selected": req.selected,
+            "text": req.text,
+        }),
+    };
     let ok = crate::native_live::respond_confirmed(req.request_id, value)
         .await
         .is_ok();
