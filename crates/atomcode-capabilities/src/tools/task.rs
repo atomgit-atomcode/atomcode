@@ -95,6 +95,19 @@ fn lexical_normalize(p: &Path) -> PathBuf {
     out
 }
 
+/// 1-based indices of `worker` subtasks that declared no non-empty `scope`. A worker must
+/// declare its writable lane so the dispatch approval shows it and the gate can enforce it.
+fn workers_missing_scope(tasks: &[SubTask]) -> Vec<usize> {
+    tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            t.subagent_type == "worker" && t.scope.iter().all(|s| s.trim().is_empty())
+        })
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
 /// Confines a `worker` subagent's WRITE tools to its declared `scope`. Mirrors
 /// [`DenySensitivePaths`]: a hard deny (the child runs `AutoRespond::AllowAll`, so a prompt
 /// would self-approve). ONLY the write tools are gated — reads are unrestricted (a worker
@@ -251,6 +264,10 @@ struct SubTask {
     subagent_type: String,
     #[serde(default)]
     difficulty: String,
+    /// Worker-only: working-dir-relative globs the worker may WRITE within. Required for
+    /// `worker`; ignored for `explore` (read-only). Enforced by `WorkerScopeGate`.
+    #[serde(default)]
+    scope: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -312,7 +329,9 @@ each worker a TIGHTLY-specified task and non-overlapping file scopes when dispat
 several. Subagents run in parallel and cannot themselves dispatch. The WHOLE batch is \
 emitted as ONE JSON payload, so keep each `prompt` concise and dispatch in small batches \
 (a few at a time): many long prompts in one call can overflow the model's output and be \
-rejected as invalid JSON — prefer several smaller calls over one huge one."
+rejected as invalid JSON — prefer several smaller calls over one huge one. Each `worker` \
+MUST declare a `scope` (working-dir-relative globs) listing the files it may write; give \
+parallel workers NON-OVERLAPPING scopes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -327,7 +346,12 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
                             "description": {"type": "string", "description": "3-5 word label"},
                             "prompt": {"type": "string", "description": "The full subtask for the subagent"},
                             "subagent_type": {"type": "string", "enum": ["explore", "worker"]},
-                            "difficulty": {"type": "string", "enum": ["simple", "hard"]}
+                            "difficulty": {"type": "string", "enum": ["simple", "hard"]},
+                            "scope": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Worker-only, REQUIRED for worker: working-directory-relative globs the worker may write within (e.g. [\"src/auth/**\", \"Cargo.toml\"]). The worker can only write files inside this scope; reads are unrestricted. Ignored for explore."
+                            }
                         },
                         "required": ["description", "prompt", "subagent_type"]
                     }
@@ -368,6 +392,25 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
             return ToolResult {
                 call_id: String::new(),
                 content: "no tasks provided".into(),
+                is_error: true,
+                images: vec![],
+            };
+        }
+
+        let missing = workers_missing_scope(&parsed.tasks);
+        if !missing.is_empty() {
+            let idxs = missing
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return ToolResult {
+                call_id: String::new(),
+                content: format!(
+                    "worker subtask {idxs} declared no `scope`. Each worker must declare `scope` \
+                     (working-dir-relative globs, e.g. [\"src/auth/**\"]) — its writable file lane, \
+                     shown at approval time and enforced during the run. Add a scope and retry."
+                ),
                 is_error: true,
                 images: vec![],
             };
@@ -1323,5 +1366,24 @@ mod tests {
         assert!(deny.contains("whole tree") || deny.contains("path"), "{deny}");
         // root escaping the workspace → denied
         assert!(g.violation("search_replace", r#"{"path":"../outside"}"#).is_some());
+    }
+
+    #[test]
+    fn workers_missing_scope_flags_scopeless_workers_only() {
+        use super::{workers_missing_scope, SubTask};
+        let mk = |ty: &str, scope: Vec<&str>| SubTask {
+            description: "d".into(),
+            prompt: "p".into(),
+            subagent_type: ty.into(),
+            difficulty: String::new(),
+            scope: scope.into_iter().map(String::from).collect(),
+        };
+        let tasks = vec![
+            mk("worker", vec!["src/a/**"]), // #1 ok
+            mk("explore", vec![]),          // #2 explore — ignored even with no scope
+            mk("worker", vec![]),           // #3 missing → flagged
+            mk("worker", vec!["   "]),      // #4 whitespace-only → flagged
+        ];
+        assert_eq!(workers_missing_scope(&tasks), vec![3, 4]);
     }
 }
