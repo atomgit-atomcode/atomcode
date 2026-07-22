@@ -10327,11 +10327,14 @@ fn handle_streaming_key(
             // TUI in Streaming, so without this a typed `/goal clear` could never
             // reach the runtime and the goal was uninterruptible by command.
             if let Some((cmd, arg)) = streaming_executable_slash(&line) {
-                // Read-only reports (status/cost/diff/rename) run WITHOUT disturbing the
-                // running turn: they render to scrollback, so the turn's live UI state
-                // (type-ahead queue, in-flight tools, thinking/reasoning buffers) must be
-                // preserved. Only the turn-ending commands (bg/quit) tear that state down.
-                let readonly = matches!(cmd.as_str(), "status" | "cost" | "diff" | "rename");
+                // Only the TURN-ENDING commands (bg backgrounds it; quit/exit kill it;
+                // goal/loop halt the driver that owns the stream) tear down the turn's
+                // live UI state. Everything else the allowlist admits is a read-only
+                // report that renders to scrollback and MUST preserve that state (the
+                // type-ahead queue, in-flight tools, thinking/reasoning buffers). Framed
+                // as "read-only is the safe default" so a future allowlisted report can't
+                // silently corrupt a running turn by being forgotten in this list.
+                let readonly = !matches!(cmd.as_str(), "bg" | "quit" | "exit" | "goal" | "loop");
                 if matches!(cmd.as_str(), "quit" | "exit") {
                     cancel_active_turn(ctx);
                     clear_capturing_modal_on_cancel(app);
