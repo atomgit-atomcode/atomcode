@@ -309,6 +309,171 @@ impl UserInputPanel {
     }
 }
 
+/// A batch of 1..=4 questions answered in one interaction. Wraps per-question
+/// `UserInputPanel`s; `request_id` lives here (the panels' own `request_id` is unused
+/// in a batch). `current` ranges `0..questions.len()` (question panels) plus
+/// `questions.len()` (the Submit stop that `Tab` cycles to).
+pub struct UserInputBatch {
+    pub request_id: u64,
+    pub questions: Vec<UserInputPanel>,
+    pub current: usize,
+}
+
+impl UserInputBatch {
+    pub fn new(
+        request_id: u64,
+        reqs: &[atomcode_capabilities::tools::request_user_input::UserInputRequest],
+    ) -> Self {
+        let questions = reqs
+            .iter()
+            .map(|r| UserInputPanel::new(request_id, r))
+            .collect();
+        Self {
+            request_id,
+            questions,
+            current: 0,
+        }
+    }
+
+    /// More than one question → render the navigator + Tab/Submit chrome.
+    pub fn is_multi(&self) -> bool {
+        self.questions.len() > 1
+    }
+
+    /// The Submit stop index (one past the last question).
+    pub fn submit_stop(&self) -> usize {
+        self.questions.len()
+    }
+
+    pub fn on_submit_stop(&self) -> bool {
+        self.current == self.submit_stop()
+    }
+
+    /// `Tab`: next question, wrapping through the Submit stop back to the first.
+    pub fn next_question(&mut self) {
+        self.current = if self.current >= self.submit_stop() {
+            0
+        } else {
+            self.current + 1
+        };
+    }
+
+    /// `Shift+Tab`: previous question, wrapping to the Submit stop.
+    pub fn prev_question(&mut self) {
+        self.current = if self.current == 0 {
+            self.submit_stop()
+        } else {
+            self.current - 1
+        };
+    }
+
+    /// Whether question `i` has real content (used for the ✓/○ navigator marker).
+    pub fn is_answered(&self, i: usize) -> bool {
+        self.questions.get(i).is_some_and(Self::panel_answered)
+    }
+
+    /// One response per question, in order. A question with no real content becomes
+    /// `declined` (partial-submit semantics).
+    pub fn build_batch_response(
+        &self,
+    ) -> Vec<atomcode_capabilities::tools::request_user_input::UserInputResponse> {
+        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
+        self.questions
+            .iter()
+            .map(|p| {
+                if Self::panel_answered(p) {
+                    p.build_response().unwrap_or_else(UserInputResponse::declined)
+                } else {
+                    UserInputResponse::declined()
+                }
+            })
+            .collect()
+    }
+
+    /// A panel counts as answered when it builds a response with a non-empty selection
+    /// or non-blank text. (Text mode's `build_response` is always `Some`, possibly empty.)
+    fn panel_answered(p: &UserInputPanel) -> bool {
+        match p.build_response() {
+            Some(r) => {
+                !r.selected.is_empty()
+                    || r.text.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false)
+            }
+            None => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod user_input_batch_tests {
+    use super::*;
+    use atomcode_capabilities::tools::request_user_input::{
+        UserInputMode, UserInputOption, UserInputRequest,
+    };
+
+    fn text_q(h: &str) -> UserInputRequest {
+        UserInputRequest {
+            header: h.into(),
+            question: "?".into(),
+            mode: UserInputMode::Text,
+            options: vec![],
+        }
+    }
+    fn single_q(h: &str) -> UserInputRequest {
+        UserInputRequest {
+            header: h.into(),
+            question: "?".into(),
+            mode: UserInputMode::Single,
+            options: vec![UserInputOption {
+                label: "x".into(),
+                description: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn tab_wraps_through_submit_stop() {
+        let mut b = UserInputBatch::new(7, &[text_q("a"), text_q("b")]);
+        assert_eq!(b.current, 0);
+        assert_eq!(b.submit_stop(), 2);
+        b.next_question();
+        assert_eq!(b.current, 1);
+        b.next_question();
+        assert_eq!(b.current, 2); // submit stop
+        assert!(b.on_submit_stop());
+        b.next_question();
+        assert_eq!(b.current, 0); // wrap
+        b.prev_question();
+        assert_eq!(b.current, 2); // wrap back to submit stop
+    }
+
+    #[test]
+    fn build_batch_response_declines_untouched_questions() {
+        let mut b = UserInputBatch::new(1, &[single_q("a"), text_q("b")]);
+        // Answer q0 by selecting the concrete option under its cursor (cursor 0).
+        b.questions[0].select_current_option();
+        let resps = b.build_batch_response();
+        assert_eq!(resps.len(), 2);
+        assert!(!resps[0].declined, "answered question 0");
+        assert_eq!(resps[0].selected, vec!["x".to_string()]);
+        assert!(resps[1].declined, "untouched text question 1 → declined");
+    }
+
+    #[test]
+    fn is_answered_tracks_content() {
+        let mut b = UserInputBatch::new(1, &[text_q("a")]);
+        assert!(!b.is_answered(0), "empty text → not answered");
+        b.questions[0].text.push_str("hi");
+        assert!(b.is_answered(0));
+    }
+
+    #[test]
+    fn single_question_batch_is_not_multi() {
+        let b = UserInputBatch::new(1, &[text_q("only")]);
+        assert!(!b.is_multi());
+        assert_eq!(b.submit_stop(), 1);
+    }
+}
+
 /// How long the model may go silent before the spinner surfaces the "slow
 /// response · esc to cancel" hint. A mid-stream drop fails cleanly at the
 /// provider's idle watchdog (~120s), but that is silent dead-air; this reassures
