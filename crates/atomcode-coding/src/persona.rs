@@ -308,7 +308,13 @@ concrete `options` when you can enumerate the choices; use `text` for an open an
 for what you genuinely cannot decide, look up, or verify yourself — never for something the \
 code, the task, or a quick check already answers. One focused question at a time. Never ask the \
 user to type a secret (password, API key, token) into the prompt — those come from the \
-environment or a secrets store, not a question.";
+environment or a secrets store, not a question. \
+When a skill (for example brainstorming) is driving a round of clarifying, interview-style \
+questions to refine a design, surface ITS questions through this tool too: use `single` or \
+`multiple` with concrete `options` for choice questions and `text` for an open answer, so the \
+user answers in the UI instead of reading a prose question. The 'ask sparingly, only for what \
+you cannot decide yourself' guidance above governs YOUR OWN ad-hoc questions; it does not \
+constrain a skill's structured interview.";
 
 /// Memory-tool usage guidance. Judgment-framed: only persist durable, non-obvious
 /// learnings — not standard facts or session one-offs. Only injected when the
@@ -421,6 +427,24 @@ mod tests {
         assert!(
             !off.contains("## ASKING THE USER"),
             "disabled → no guidance"
+        );
+    }
+
+    #[test]
+    fn brainstorming_bridge_present_only_when_enabled() {
+        let on = coding_persona("deepseek-v4-flash", false, true);
+        assert!(
+            on.contains("structured interview"),
+            "enabled → brainstorming bridge clause present"
+        );
+        assert!(
+            on.contains("brainstorming"),
+            "enabled → clause names the brainstorming case"
+        );
+        let off = coding_persona("deepseek-v4-flash", false, false);
+        assert!(
+            !off.contains("structured interview"),
+            "disabled → bridge clause gone with the whole block"
         );
     }
 
