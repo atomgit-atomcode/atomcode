@@ -16002,6 +16002,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             checked: p.checked.clone(),
             text: p.text.clone(),
             custom_text: p.custom_text.clone(),
+            custom: p.custom,
             batch: Some(crate::render::UserInputBatchMeta {
                 total,
                 // 1-based current question; clamped so the Submit stop (current==total)
@@ -16025,6 +16026,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 checked: p.checked.clone(),
                 text: p.text.clone(),
                 custom_text: p.custom_text.clone(),
+                custom: p.custom,
                 batch: None,
             })
     };

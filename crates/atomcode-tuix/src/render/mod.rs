@@ -593,6 +593,8 @@ pub struct UserInputPanelView {
     pub text: String,
     /// "Other" free-text row buffer for single/multiple mode.
     pub custom_text: String,
+    /// Whether to render the "Other" free-text row (mirrors `UserInputPanel.custom`).
+    pub custom: bool,
     /// Batch navigator context. `None` = a standalone single question (rendered
     /// byte-identically to before, no chrome). `Some` = this is one question inside
     /// a multi-question batch, so the renderer adds a `Question i/N` navigator and a

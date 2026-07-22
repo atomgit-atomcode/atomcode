@@ -2620,11 +2620,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         n += 1;
                     }
                 }
-                // Custom-answer ("Other") row: 1 inline input line.
-                n += 1;
-                // Multiple: +1 for the Submit row.
-                if matches!(panel.mode, UserInputMode::Multiple) {
+                // Custom-answer ("Other") row: 1 inline input line — only when offered.
+                if panel.custom {
                     n += 1;
+                }
+                // Multiple: a blank spacer + the Submit row.
+                if matches!(panel.mode, UserInputMode::Multiple) {
+                    n += 2;
                 }
                 // blank + hint
                 n += 2;
@@ -2762,11 +2764,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     emit_option(&mut out, i, i + 1, label, desc.as_deref(), checked);
                 }
 
-                // Always-appended custom-answer row (index = options.len()): a
-                // ONE-LINE inline text input.  No "Other" label, no subtitle —
-                // the cursor indicator and typed text (or faint placeholder) are
-                // rendered directly on this row.
-                {
+                // The custom-answer ("Other") row (index = options.len()): a ONE-LINE
+                // inline text input. Offered only when `panel.custom` is true — no
+                // "Other" label, no subtitle; the cursor indicator and typed text (or
+                // faint placeholder) are rendered directly on this row.
+                if panel.custom {
                     let idx = other_index;
                     let number = other_index + 1;
                     let on_cursor = idx == panel.cursor;
@@ -2858,9 +2860,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     out.push(row);
                 }
 
-                // Multiple mode: a navigable Submit row after Other.
+                // Multiple mode: a blank spacer, then a navigable Submit row. The
+                // Submit index is after the concrete options, plus the Other row when
+                // it is offered.
                 if multiple {
-                    let submit_index = other_index + 1;
+                    blank_row(&mut out);
+                    let submit_index = panel.options.len() + panel.custom as usize;
                     let on_cursor = submit_index == panel.cursor;
                     let marker = if on_cursor {
                         if unicode {
@@ -2928,7 +2933,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         // Hint row: mode-appropriate guidance, muted + glyph-downgraded. N is the
         // number of navigable options INCLUDING the always-appended "Other".
-        let n = panel.options.len() + 1;
+        let n = panel.options.len() + panel.custom as usize;
         let single_hint = format!("\u{2191}\u{2193} move \u{00b7} 1-{n} select \u{00b7} Enter confirm \u{00b7} Esc cancel");
         // Multiple: Enter toggles rows, confirms only on the Submit row.
         let multiple_hint = format!("\u{2191}\u{2193} move \u{00b7} Space toggle \u{00b7} Enter \u{63d0}\u{4ea4}\u{884c}\u{786e}\u{8ba4} \u{00b7} Esc cancel");
