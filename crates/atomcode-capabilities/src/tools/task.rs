@@ -243,6 +243,21 @@ impl ToolMiddleware for WorkerScopeGate {
     }
 }
 
+/// The middleware stack for a subagent child: `DenySensitivePaths` for everyone, plus a
+/// `WorkerScopeGate` confining a `worker`'s writes to its `scope`. `explore` children mount
+/// only read tools, so they never need the gate.
+fn child_middlewares(
+    is_worker: bool,
+    scope: &[String],
+    working_dir: &Path,
+) -> Vec<Arc<dyn ToolMiddleware>> {
+    let mut mw: Vec<Arc<dyn ToolMiddleware>> = vec![Arc::new(DenySensitivePaths)];
+    if is_worker {
+        mw.push(Arc::new(WorkerScopeGate::new(scope, working_dir)));
+    }
+    mw
+}
+
 const EXPLORE_PERSONA: &str = "You are a READ-ONLY investigation subagent. Use read/search \
 tools to answer the assigned task about the codebase. You CANNOT edit files. When done, \
 stop with a concise findings report the parent agent can act on.";
@@ -426,6 +441,7 @@ parallel workers NON-OVERLAPPING scopes."
 
         for (idx, t) in parsed.tasks.into_iter().enumerate() {
             let is_worker = t.subagent_type == "worker";
+            let scope = t.scope.clone();
             let is_hard = t.difficulty == "hard";
             // Fresh provider + fresh tools per child (a session consumes its provider).
             let provider = if is_hard {
@@ -473,16 +489,19 @@ parallel workers NON-OVERLAPPING scopes."
                     &model,
                     &desc,
                 ));
-                let child = Agent::builder()
+                let mut builder = Agent::builder()
                     .provider(provider)
                     .tools(tools)
                     .persona(persona)
-                    .working_dir(wd)
-                    .cancel_token(child_cancel)
-                    // The child runs AutoRespond::AllowAll (no human in its loop), so the
-                    // parent's prompting sensitive-path gate wouldn't protect it. Hard-deny
-                    // sensitive-path file ops instead (#1).
-                    .middleware(Arc::new(DenySensitivePaths))
+                    .working_dir(wd.clone())
+                    .cancel_token(child_cancel);
+                // The child runs AutoRespond::AllowAll (no human in its loop), so the parent's
+                // prompting gates wouldn't protect it. Hard-deny sensitive-path ops for every
+                // child (#1); additionally confine a `worker`'s WRITES to its declared scope.
+                for mw in child_middlewares(is_worker, &scope, &wd) {
+                    builder = builder.middleware(mw);
+                }
+                let child = builder
                     // Funnel the child's live activity (thinking / current tool) up to the
                     // parent progress sink so the TUI spinner shows what this subtask is doing.
                     .hook(Arc::new(SubtaskProgressHook {
@@ -1385,5 +1404,18 @@ mod tests {
             mk("worker", vec!["   "]),      // #4 whitespace-only → flagged
         ];
         assert_eq!(workers_missing_scope(&tasks), vec![3, 4]);
+    }
+
+    #[test]
+    fn child_middlewares_add_the_scope_gate_only_for_workers() {
+        use super::child_middlewares;
+        use std::path::Path;
+        // explore: only DenySensitivePaths.
+        assert_eq!(child_middlewares(false, &[], Path::new("/w")).len(), 1);
+        // worker: DenySensitivePaths + WorkerScopeGate.
+        assert_eq!(
+            child_middlewares(true, &["src/**".into()], Path::new("/w")).len(),
+            2
+        );
     }
 }
