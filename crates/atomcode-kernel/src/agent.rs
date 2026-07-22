@@ -757,6 +757,13 @@ impl Agent {
     }
 }
 
+/// Which constructor a submitted prompt is pushed with. Internal to the session loop.
+#[derive(Clone, Copy, PartialEq)]
+enum PromptKind {
+    User,
+    Synthetic,
+}
+
 struct RunningAgent {
     provider: Arc<dyn LlmProvider>,
     tools: MountedTools,
@@ -1046,49 +1053,43 @@ impl RunningAgent {
                 }
                 AgentCommand::SendMessage { text, images } => {
                     let shutdown = self
-                        .process_send_message(&mut convo, &mut cmd_rx, &mut pending, text, images)
+                        .process_send_message(
+                            &mut convo,
+                            &mut cmd_rx,
+                            &mut pending,
+                            PromptKind::User,
+                            text,
+                            images,
+                        )
                         .await;
                     if shutdown {
                         break;
                     }
-                    // DRAIN queued mid-turn commands (FIFO) now that the turn is
-                    // done and `convo` is free. A queued Snapshot replies from the
-                    // now-current convo; a queued SendMessage runs a full turn (which
-                    // may itself enqueue more — hence the while-not-empty loop).
-                    let mut drained_shutdown = false;
-                    while let Some(queued) = pending.pop_front() {
-                        match queued {
-                            AgentCommand::Snapshot => {
-                                self.rt.emit(AgentEvent::Snapshot {
-                                    snapshot: self.capture_snapshot(&convo),
-                                });
-                            }
-                            AgentCommand::SendMessage { text, images } => {
-                                if self
-                                    .process_send_message(
-                                        &mut convo,
-                                        &mut cmd_rx,
-                                        &mut pending,
-                                        text,
-                                        images,
-                                    )
-                                    .await
-                                {
-                                    drained_shutdown = true;
-                                    break;
-                                }
-                            }
-                            // A mid-turn /compact runs HERE — the turn boundary, the
-                            // documented cache-safe trigger point.
-                            AgentCommand::Compact { focus } => {
-                                self.run_compaction(&mut convo, CompactTrigger::Manual { focus })
-                                    .await;
-                            }
-                            // Only Snapshot/SendMessage/Compact are ever enqueued.
-                            _ => {}
-                        }
+                    // DRAIN queued mid-turn commands (FIFO) now that the turn is done
+                    // and `convo` is free (see `drain_pending`).
+                    if self.drain_pending(&mut convo, &mut cmd_rx, &mut pending).await {
+                        break;
                     }
-                    if drained_shutdown {
+                }
+                // Host-injected synthetic prompt (goal-mode continuation). SAME path as
+                // SendMessage — user_prompt_submit hook, task-boundary compaction, turn,
+                // then FIFO drain — differing only in `PromptKind::Synthetic` (pushed via
+                // `Message::synthetic_user`) and always-empty images.
+                AgentCommand::SendSyntheticMessage { text } => {
+                    let shutdown = self
+                        .process_send_message(
+                            &mut convo,
+                            &mut cmd_rx,
+                            &mut pending,
+                            PromptKind::Synthetic,
+                            text,
+                            Vec::new(),
+                        )
+                        .await;
+                    if shutdown {
+                        break;
+                    }
+                    if self.drain_pending(&mut convo, &mut cmd_rx, &mut pending).await {
                         break;
                     }
                 }
@@ -1108,6 +1109,7 @@ impl RunningAgent {
         convo: &mut Conversation,
         cmd_rx: &mut UnboundedReceiver<AgentCommand>,
         pending: &mut std::collections::VecDeque<AgentCommand>,
+        kind: PromptKind,
         mut text: String,
         images: Vec<ImageContent>,
     ) -> bool {
@@ -1138,7 +1140,10 @@ impl RunningAgent {
         // separately restores the prompt to the input box for edit-and-resend).
         // Captured AFTER the pre-turn compaction above so it indexes current history.
         let rollback_len = convo.messages.len();
-        convo.push(Message::user_with_images(text, images));
+        convo.push(match kind {
+            PromptKind::User => Message::user_with_images(text, images),
+            PromptKind::Synthetic => Message::synthetic_user(text),
+        });
         // Per-turn cancellation token: Cancel fires it; run_turn polls it at the
         // stream, between tools, and inside execute. A CLONE also rides into each
         // ToolContext so cooperative tools can bail. SEAM 2: derived from the
@@ -1177,6 +1182,13 @@ impl RunningAgent {
                     Some(c @ AgentCommand::Snapshot) => {
                         pending.push_back(c);
                     }
+                    // A mid-turn synthetic prompt is QUEUED (FIFO) to run as its OWN
+                    // turn after this one — NOT folded into the current turn's steer
+                    // buffer (a goal-mode continuation is a distinct turn, and must
+                    // reach the model marked synthetic). Drained after the turn.
+                    Some(c @ AgentCommand::SendSyntheticMessage { .. }) => {
+                        pending.push_back(c);
+                    }
                     // Route a mid-turn SendMessage into the per-turn steer buffer
                     // instead of the pending deque: Task 2 drains it at each round
                     // boundary to fold the prompt into the CURRENT turn's next request
@@ -1207,6 +1219,62 @@ impl RunningAgent {
             });
         }
         shutdown
+    }
+
+    /// DRAIN the FIFO of commands that arrived MID-TURN (queued by the mid-turn
+    /// select in `process_send_message`) now that the turn is done and `convo` is
+    /// free. A queued `Snapshot` replies from the now-current convo; a queued
+    /// `SendMessage`/`SendSyntheticMessage` runs a full turn (which may itself
+    /// enqueue more — hence the while-not-empty loop); a queued `Compact` runs at
+    /// this turn boundary (the documented cache-safe trigger point). Returns `true`
+    /// iff a drained prompt observed a `Shutdown`/closed channel, so the caller must
+    /// tear down without draining further.
+    async fn drain_pending(
+        &self,
+        convo: &mut Conversation,
+        cmd_rx: &mut UnboundedReceiver<AgentCommand>,
+        pending: &mut std::collections::VecDeque<AgentCommand>,
+    ) -> bool {
+        while let Some(queued) = pending.pop_front() {
+            match queued {
+                AgentCommand::Snapshot => {
+                    self.rt.emit(AgentEvent::Snapshot {
+                        snapshot: self.capture_snapshot(convo),
+                    });
+                }
+                AgentCommand::SendMessage { text, images } => {
+                    if self
+                        .process_send_message(convo, cmd_rx, pending, PromptKind::User, text, images)
+                        .await
+                    {
+                        return true;
+                    }
+                }
+                AgentCommand::SendSyntheticMessage { text } => {
+                    if self
+                        .process_send_message(
+                            convo,
+                            cmd_rx,
+                            pending,
+                            PromptKind::Synthetic,
+                            text,
+                            Vec::new(),
+                        )
+                        .await
+                    {
+                        return true;
+                    }
+                }
+                // A mid-turn /compact runs HERE — the turn boundary, the documented
+                // cache-safe trigger point.
+                AgentCommand::Compact { focus } => {
+                    self.run_compaction(convo, CompactTrigger::Manual { focus }).await;
+                }
+                // Only Snapshot/SendMessage/SendSyntheticMessage/Compact are ever enqueued.
+                _ => {}
+            }
+        }
+        false
     }
 
     /// The single funnel for a turn's END: fire the `turn_complete` terminal hook
@@ -3887,5 +3955,171 @@ mod effective_input_limit_tests {
         // falls back to the raw window (old `est >= window` behavior). Never panics.
         assert_eq!(effective_input_limit(1_000, Some(16_384)), 1_000);
         assert_eq!(effective_input_limit(100, Some(16_384)), 100);
+    }
+}
+
+#[cfg(test)]
+mod synthetic_send_tests {
+    //! `AgentCommand::SendSyntheticMessage` — the host-injected (goal-mode)
+    //! continuation primitive. It shares SendMessage's WHOLE path (user_prompt_submit
+    //! hook, task-boundary compaction, mid-turn FIFO queueing); the ONLY difference is
+    //! the conversation message is pushed via `Message::synthetic_user`, so it never
+    //! anchors `sacred_floor` and a host can hide it from user-facing projections.
+    use super::*;
+    use crate::message::Role;
+    use crate::testkit::{
+        DeferredCommands, EchoTool, InjectCommandTool, MockProvider, RecordingProvider,
+        RewritePromptHook,
+    };
+    use crate::tool::{ToolCall, ToolRegistry};
+    use std::sync::Mutex;
+
+    // (1) A synthetic prompt runs the user_prompt_submit hook (rewrite applied) and is
+    //     stored as a SYNTHETIC user message.
+    #[tokio::test]
+    async fn synthetic_prompt_pushes_synthetic_user_and_runs_hook() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            StreamEvent::TextDelta("ok".into()),
+            StreamEvent::Done { truncated: false },
+        ]]));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .hooks(Arc::new(RewritePromptHook::new("rewrite", "!!", log.clone())))
+            .build()
+            .spawn();
+
+        handle
+            .commands
+            .send(AgentCommand::SendSyntheticMessage { text: "continue".into() })
+            .unwrap();
+        while let Some(ev) = handle.events.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+
+        // Inspect the stored conversation via Snapshot.
+        handle.commands.send(AgentCommand::Snapshot).unwrap();
+        let mut messages = Vec::new();
+        while let Some(ev) = handle.events.recv().await {
+            if let AgentEvent::Snapshot { snapshot } = ev {
+                messages = snapshot.messages;
+                break;
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+
+        // The hook OBSERVED the synthetic prompt (same path as SendMessage).
+        assert!(
+            log.lock().unwrap().iter().any(|n| n == "rewrite"),
+            "user_prompt_submit must run for a synthetic prompt"
+        );
+        // The stored prompt is a SYNTHETIC user message carrying the hook's rewrite.
+        let user = messages
+            .iter()
+            .find(|m| m.role == Role::User)
+            .expect("a user message must be stored");
+        assert!(user.synthetic, "a synthetic prompt must be stored as synthetic");
+        assert_eq!(user.text, "continue!!", "the hook's rewrite must land in storage");
+    }
+
+    // (2) A synthetic user message never anchors `sacred_floor`: only the FIRST REAL
+    //     user message does, so the floor extends THROUGH the real prompt.
+    #[test]
+    fn synthetic_prompt_never_becomes_sacred_anchor() {
+        let mut c = Conversation::new();
+        c.push(Message::system("persona")); // index 0
+        c.push(Message::synthetic_user("[goal-mode continuation]")); // index 1 — NOT anchor
+        c.push(Message::user("the real task")); // index 2 — the real anchor
+        // Floor = system + through the first REAL user (index 2) → count 3; the
+        // synthetic at index 1 does not pull the floor up short.
+        assert_eq!(c.sacred_floor(), 3);
+    }
+
+    // (3) A synthetic prompt injected MID-TURN is QUEUED (FIFO) and runs as its OWN
+    //     turn after the current one — its message reaches the provider, marked
+    //     synthetic. Mirrors the SendMessage mid-turn-queue proof.
+    #[tokio::test]
+    async fn synthetic_mid_turn_is_queued_fifo() {
+        let deferred: DeferredCommands = Arc::new(Mutex::new(None));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(InjectCommandTool::new(
+            deferred.clone(),
+            AgentCommand::SendSyntheticMessage { text: "SECOND-SYNTHETIC".into() },
+        )));
+
+        let provider = Arc::new(
+            RecordingProvider::new(vec![
+                // Turn 1, round 1: call `inject` (sends a mid-turn synthetic), end round.
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "i1".into(),
+                        name: "inject".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                // Turn 1, round 2: final answer → turn 1 completes.
+                vec![
+                    StreamEvent::TextDelta("first done".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+                // Turn 2 (the QUEUED synthetic): final answer → completes.
+                vec![
+                    StreamEvent::TextDelta("second done".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ])
+            .with_ctx_window(1000),
+        );
+        let calls = provider.calls();
+
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["echo", "inject"]))
+            .persona("neutral test agent")
+            .build()
+            .spawn();
+        *deferred.lock().unwrap() = Some(handle.commands.clone());
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage { text: "FIRST-PROMPT".into(), images: vec![] })
+            .unwrap();
+
+        // TWO TurnComplete events: turn 1, then the drained mid-turn synthetic's turn 2.
+        let mut completes = 0;
+        while let Some(ev) = handle.events.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete { .. }) {
+                completes += 1;
+                if completes == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(completes, 2, "the queued mid-turn synthetic must run its own turn");
+
+        // The queued synthetic entered history as a SYNTHETIC user message and reached
+        // the provider on turn 2 — proof it was not lost and kept its synthetic marker.
+        let reached_as_synthetic = {
+            let recorded = calls.lock().unwrap();
+            recorded
+                .last()
+                .unwrap()
+                .0
+                .iter()
+                .any(|m| m.role == Role::User && m.text == "SECOND-SYNTHETIC" && m.synthetic)
+        };
+        assert!(
+            reached_as_synthetic,
+            "the mid-turn-queued synthetic prompt must reach the provider in turn 2, marked synthetic"
+        );
+
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
     }
 }

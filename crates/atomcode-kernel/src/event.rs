@@ -51,6 +51,12 @@ pub enum AgentCommand {
         #[serde(default)]
         images: Vec<ImageContent>,
     },
+    /// Host-injected synthetic prompt (e.g. an automated goal-mode continuation).
+    /// Same execution path as `SendMessage` (user_prompt_submit hook, task-boundary
+    /// compaction, mid-turn FIFO queueing), but the conversation message is pushed
+    /// via `Message::synthetic_user`, so `sacred_floor` skips it and hosts can hide
+    /// it from user-facing projections.
+    SendSyntheticMessage { text: String },
     /// Answer a pending AgentEvent::Request, correlated by id.
     Respond {
         id: RequestId,
@@ -254,6 +260,27 @@ mod tests {
                 assert!(images.is_empty());
             }
             _ => panic!("expected SendMessage"),
+        }
+    }
+
+    #[test]
+    fn send_synthetic_message_serde_roundtrip() {
+        let cmd = AgentCommand::SendSyntheticMessage { text: "continue".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: AgentCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, AgentCommand::SendSyntheticMessage { text } if text == "continue"));
+    }
+
+    #[test]
+    fn send_message_wire_format_unchanged_by_synthetic_variant() {
+        // 旧 JSON 形态与 Rust 构造均不受新变体影响(additive API)。
+        let cmd: AgentCommand = serde_json::from_str(r#"{"SendMessage":{"text":"hi"}}"#).unwrap();
+        match cmd {
+            AgentCommand::SendMessage { text, images } => {
+                assert_eq!(text, "hi");
+                assert!(images.is_empty());
+            }
+            other => panic!("unexpected: {other:?}"),
         }
     }
 
