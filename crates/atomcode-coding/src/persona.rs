@@ -41,6 +41,15 @@ pub(crate) fn request_user_input_switch_enabled() -> bool {
     )
 }
 
+/// Whether the `task` subagent tool is mounted — mirrors the tool-mount gate in
+/// [`crate::parts`] by delegating to the SAME `subagent_enabled_from_env` helper, so the
+/// system-prompt delegation guidance and the mounted tool can never disagree. Env
+/// `ATOMCODE_SUBAGENT`, default OFF (opposite of `ATOMCODE_TODO`): only advertise delegation
+/// when the tool actually exists, else the model calls a tool that isn't there.
+pub(crate) fn subagent_delegation_enabled() -> bool {
+    crate::parts::subagent_enabled_from_env(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref())
+}
+
 /// Whether the `memory` tool is mounted (mirrors the registration gate in
 /// `register_coding_tools_with_vision`): env `ATOMCODE_MEMORY_TOOL` != 0/false/off.
 pub(crate) fn memory_tool_enabled() -> bool {
@@ -136,6 +145,15 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     }
     if memory_tool_enabled() {
         p.push_str(MEMORY_USAGE);
+    }
+    // Delegation guidance for the `task` subagent tool — surfaced in the system prompt (not
+    // just the tool description) because weak main models (observed: GLM) under-weight tool
+    // descriptions and so never delegate. MUST stay gated on the SAME condition as the
+    // `task` tool mount in `parts.rs` (`ATOMCODE_SUBAGENT`, default OFF): nudging the model
+    // toward an unmounted tool provokes a phantom tool call. `subagent_delegation_enabled()`
+    // reuses the tool-mount's own gate helper so the two can't drift.
+    if subagent_delegation_enabled() {
+        p.push_str(SUBAGENT_DELEGATION);
     }
     // Skill-trigger guidance — surfaced in the system prompt (not just the `use_skill`
     // tool description + the AVAILABLE SKILLS catalog's own guidance line) because weak
@@ -342,6 +360,25 @@ with the `memory` tool (`action:\"remember\"`). Do NOT record obvious facts, sta
 tool/language behavior, anything already in AGENTS.md, or session-specific one-offs. Keep \
 each entry to one concise line. This is a judgment call, not a requirement — only record \
 what a future session would genuinely benefit from.";
+
+/// Delegation-discipline guidance for the `task` subagent tool. Judgment-framed (when to
+/// delegate + hard rules for doing it well) — surfaced in the system prompt because a weak
+/// main model won't learn to delegate from the tool description alone. Only injected when the
+/// `task` tool is actually mounted (see the `subagent_delegation_enabled()` gate in
+/// `coding_persona`, which mirrors the tool-mount switch). The rules encode the two failure
+/// modes the design flagged: vague prompts drift the fast worker model, and parallel workers
+/// on overlapping files collide.
+const SUBAGENT_DELEGATION: &str = "\n\n## DELEGATING WITH `task`:\n\
+You can offload subtasks to isolated-context subagents with the `task` tool. Delegate work \
+that is parallelizable, mechanical, or pure read-only investigation; keep the cross-file \
+reasoning and the final decisions for yourself. Rules: (1) give each subtask a \
+TIGHTLY-specified prompt — exact files, exact change — because the fast worker model drifts \
+on vague instructions; (2) when dispatching several `worker` subtasks at once, give them \
+NON-OVERLAPPING file scopes so they cannot clobber each other; (3) use `explore` (read-only) \
+for 'where/how' investigation and `worker` for edits; mark a subtask `hard` only when it \
+genuinely needs the stronger, slower model — default to the fast model otherwise. After a \
+`worker` finishes, REVIEW its diff before continuing: you own the final result, not the \
+subagent.";
 
 const RULES: &str = "\
 Solve tasks efficiently, minimizing round-trips. Act decisively — go straight to tool calls or answers.
@@ -1094,6 +1131,47 @@ mod tests {
             "offline note must be appended: {p}"
         );
         reset_offline_verdict_for_test();
+    }
+
+    #[test]
+    fn subagent_delegation_clause_covers_the_delegation_rules() {
+        // Content lock (no global env — `ATOMCODE_SUBAGENT` also drives runtime assembly, so
+        // set_var'ing it here would race concurrent runtime tests and flake them). The clause
+        // must name the tool, both subagent types, the non-overlapping-scopes rule for
+        // parallel workers, and the review-the-diff discipline — the two failure modes the
+        // design flagged (vague prompts drift the fast worker; overlapping workers collide).
+        assert!(SUBAGENT_DELEGATION.contains("## DELEGATING WITH `task`"));
+        assert!(
+            SUBAGENT_DELEGATION.contains("NON-OVERLAPPING"),
+            "parallel workers must get non-overlapping file scopes"
+        );
+        assert!(
+            SUBAGENT_DELEGATION.contains("explore") && SUBAGENT_DELEGATION.contains("worker"),
+            "must name both subagent types"
+        );
+        assert!(
+            SUBAGENT_DELEGATION.contains("REVIEW its diff"),
+            "must direct the main agent to review a worker's diff"
+        );
+    }
+
+    #[test]
+    fn subagent_delegation_is_wired_into_the_persona_and_gated_by_its_mount_switch() {
+        // The clause is appended IFF `subagent_delegation_enabled()` is true, which delegates
+        // to the SAME `parts::subagent_enabled_from_env` gate the `task` tool-mount reads — so
+        // guidance and tool can't disagree. Assert the persona advertises `task` EXACTLY when
+        // that gate is on (default OFF, so the env-unset persona every other test builds must
+        // not advertise it). Done without mutating the process-global env var — reading the
+        // live gate keeps this correct under either setting while staying flake-free.
+        assert_eq!(
+            coding_persona("glm-5.2", true, false).contains("## DELEGATING WITH `task`"),
+            subagent_delegation_enabled(),
+            "persona advertises `task` exactly when its mount gate is on"
+        );
+        // Gate parity with the tool mount: default OFF, on for any real value, off for 0/off.
+        assert!(!crate::parts::subagent_enabled_from_env(None));
+        assert!(crate::parts::subagent_enabled_from_env(Some("1")));
+        assert!(!crate::parts::subagent_enabled_from_env(Some("0")));
     }
 
     #[test]
