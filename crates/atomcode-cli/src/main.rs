@@ -1202,13 +1202,34 @@ async fn run() -> Result<i32> {
                     mode: Some(SessionMode::Headless),
                     ..CurrentContext::current()
                 };
-                let outcome = CurrentContext::scope(scope_ctx, || async {
-                    telemetry.track(Event::OpenAtomcode {
-                        dangerously_skip_permissions: cli.dangerously_skip_permissions,
+                // Emit the open event inside the async task-local scope — this
+                // is a cheap, non-blocking mpsc send.
+                let dsp = cli.dangerously_skip_permissions;
+                let tel_for_event = telemetry.clone();
+                CurrentContext::scope(scope_ctx.clone(), || async move {
+                    tel_for_event.track(Event::OpenAtomcode {
+                        dangerously_skip_permissions: dsp,
                     });
-                    run_codingplan_core(Some(&telemetry))
                 })
                 .await;
+                // The OAuth + claim flow is fully synchronous and builds a
+                // `reqwest::blocking` client, which stands up its own tokio
+                // runtime. Running it directly on an async worker thread panics
+                // when that inner runtime is dropped ("Cannot drop a runtime in
+                // a context where blocking is not allowed"). Move it onto a
+                // dedicated blocking thread — the same convention the plugin
+                // bootstrap uses — and re-establish the telemetry task-local
+                // there, since spawn_blocking threads don't inherit it.
+                let outcome = {
+                    let telemetry = telemetry.clone();
+                    tokio::task::spawn_blocking(move || {
+                        CurrentContext::scope_blocking(scope_ctx, || {
+                            run_codingplan_core(Some(&telemetry))
+                        })
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("codingplan login task failed: {e}")))
+                };
                 match outcome {
                     Ok(report) => {
                         print!("{}", report);
