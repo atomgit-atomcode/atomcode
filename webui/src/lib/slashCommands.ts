@@ -19,7 +19,7 @@ export function parseSlashCommand(line: string): ParsedCommand | null {
   return { name, arg };
 }
 
-export type ApprovalMode = 'build' | 'plan' | 'bypass';
+export type ApprovalMode = 'build' | 'plan' | 'bypass' | 'accept_edits';
 
 /** Chat.tsx 注入的既有页面能力；命令 run() 只调用这些，不含自身业务逻辑。 */
 export interface SlashHandlers {

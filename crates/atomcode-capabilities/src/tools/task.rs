@@ -15,6 +15,7 @@ use atomcode_kernel::tool::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_MAX_CONCURRENT: usize = 3;
@@ -62,6 +63,201 @@ impl ToolMiddleware for DenySensitivePaths {
     }
 }
 
+/// The literal directory prefix of a glob: the leading path segments before the first
+/// segment that contains a glob metacharacter. `src/auth/**` → `src/auth`; `**` → ``;
+/// `Cargo.toml` → `Cargo.toml`. Used to test a `search_replace` DIR root against a scope
+/// (globset's `src/auth/**` does NOT match the bare dir `src/auth`).
+fn literal_dir_prefix(glob: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in glob.split('/') {
+        if seg.contains(['*', '?', '[', ']', '{', '}']) {
+            break;
+        }
+        out.push(seg);
+    }
+    out.join("/")
+}
+
+/// Lexically collapse `.` / `..` WITHOUT touching the filesystem (targets may be new files
+/// that don't exist yet). A `..` at the root is absorbed, so an escape normalizes to a path
+/// that will fail the working-dir `strip_prefix` below → denied.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// 1-based indices of `worker` subtasks that declared no non-empty `scope`. A worker must
+/// declare its writable lane so the dispatch approval shows it and the gate can enforce it.
+fn workers_missing_scope(tasks: &[SubTask]) -> Vec<usize> {
+    tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            t.subagent_type == "worker" && t.scope.iter().all(|s| s.trim().is_empty())
+        })
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+/// Confines a `worker` subagent's WRITE tools to its declared `scope`. Mirrors
+/// [`DenySensitivePaths`]: a hard deny (the child runs `AutoRespond::AllowAll`, so a prompt
+/// would self-approve). ONLY the write tools are gated — reads are unrestricted (a worker
+/// often reads elsewhere for context) and `bash` retains dispatch-level trust (design §6).
+struct WorkerScopeGate {
+    working_dir: PathBuf,
+    /// Compiled globs for single-file targets (`edit_file` / `write_file` `file_path`).
+    globs: globset::GlobSet,
+    /// Literal directory prefix of each scope, for `search_replace` DIR roots.
+    dir_prefixes: Vec<PathBuf>,
+    /// Human-readable scope list for deny messages.
+    display: String,
+}
+
+impl WorkerScopeGate {
+    fn new(scopes: &[String], working_dir: &Path) -> Self {
+        let mut builder = globset::GlobSetBuilder::new();
+        let mut dir_prefixes = Vec::new();
+        for s in scopes {
+            // Only scopes whose glob compiles participate — in BOTH the file-path globset and
+            // the search_replace dir-prefix list — so a malformed scope can't confine writes
+            // one way and allow them the other.
+            if let Ok(g) = globset::GlobBuilder::new(s).literal_separator(true).build() {
+                builder.add(g);
+                dir_prefixes.push(PathBuf::from(literal_dir_prefix(s)));
+            }
+        }
+        let globs = builder.build().unwrap_or_else(|_| globset::GlobSet::empty());
+        Self {
+            working_dir: working_dir.to_path_buf(),
+            globs,
+            dir_prefixes,
+            display: scopes.join(", "),
+        }
+    }
+
+    /// `None` = allow; `Some(reason)` = deny. Non-write tools (reads, `bash`, anything else)
+    /// always return `None`.
+    fn violation(&self, tool: &str, args_json: &str) -> Option<String> {
+        match tool {
+            "edit_file" | "write_file" => {
+                let raw = match serde_json::from_str::<serde_json::Value>(args_json)
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| v.get("file_path"))
+                    .and_then(|x| x.as_str())
+                {
+                    Some(p) => p.to_string(),
+                    // Fail closed: a write tool with no usable `file_path` must not slip past
+                    // the gate (defense-in-depth; the tool itself also rejects it).
+                    None => {
+                        return Some(format!(
+                            "worker {tool} call has no usable `file_path`; cannot verify it is within scope."
+                        ))
+                    }
+                };
+                match self.workspace_relative(&raw) {
+                    None => Some(format!(
+                        "worker edit out of scope: {raw} is outside the working directory."
+                    )),
+                    Some(rel) if self.globs.is_match(&rel) => None,
+                    Some(rel) => Some(self.deny_out_of_scope(&rel)),
+                }
+            }
+            "search_replace" => {
+                let value =
+                    serde_json::from_str::<serde_json::Value>(args_json).unwrap_or(serde_json::Value::Null);
+                match value.get("path").and_then(|x| x.as_str()) {
+                    None => Some(format!(
+                        "worker search_replace has no `path`, which would rewrite the whole tree; \
+                         restrict `path` to within the declared scope [{}].",
+                        self.display
+                    )),
+                    Some(dir) => match self.workspace_relative(dir) {
+                        None => Some(format!(
+                            "worker edit out of scope: {dir} is outside the working directory."
+                        )),
+                        Some(rel_dir) if self.dir_in_scope(&rel_dir) => None,
+                        Some(rel_dir) => Some(self.deny_out_of_scope(&rel_dir)),
+                    },
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn deny_out_of_scope(&self, rel: &str) -> String {
+        format!(
+            "worker edit out of scope: {rel} is not within the declared scope [{}]. To change \
+             it, re-dispatch this worker with a wider scope that includes it.",
+            self.display
+        )
+    }
+
+    /// Resolve `raw` (absolute, or relative to the working dir) to a working-dir-relative,
+    /// `.`/`..`-collapsed path with `/` separators. `None` if it escapes the working dir
+    /// (absolute-outside, or `..` above the root) — such writes are denied.
+    fn workspace_relative(&self, raw: &str) -> Option<String> {
+        let joined = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            self.working_dir.join(raw)
+        };
+        let base = lexical_normalize(&self.working_dir);
+        let full = lexical_normalize(&joined);
+        full.strip_prefix(&base)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// Whether a working-dir-relative DIRECTORY is within scope: it equals or lives under any
+    /// scope's literal dir prefix. An empty prefix (scope like `**`) covers the whole tree.
+    fn dir_in_scope(&self, rel_dir: &str) -> bool {
+        let rd = Path::new(rel_dir);
+        self.dir_prefixes.iter().any(|p| {
+            p.as_os_str().is_empty() || rd == p.as_path() || rd.starts_with(p)
+        })
+    }
+}
+
+#[async_trait]
+impl ToolMiddleware for WorkerScopeGate {
+    async fn before(
+        &self,
+        call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        _rt: &RequestCtx,
+    ) -> BeforeOutcome {
+        match self.violation(&call.name, &call.arguments) {
+            Some(reason) => BeforeOutcome::deny(reason),
+            None => BeforeOutcome::Proceed,
+        }
+    }
+}
+
+/// The middleware stack for a subagent child: `DenySensitivePaths` for everyone, plus a
+/// `WorkerScopeGate` confining a `worker`'s writes to its `scope`. `explore` children mount
+/// only read tools, so they never need the gate.
+fn child_middlewares(
+    is_worker: bool,
+    scope: &[String],
+    working_dir: &Path,
+) -> Vec<Arc<dyn ToolMiddleware>> {
+    let mut mw: Vec<Arc<dyn ToolMiddleware>> = vec![Arc::new(DenySensitivePaths)];
+    if is_worker {
+        mw.push(Arc::new(WorkerScopeGate::new(scope, working_dir)));
+    }
+    mw
+}
+
 const EXPLORE_PERSONA: &str = "You are a READ-ONLY investigation subagent. Use read/search \
 tools to answer the assigned task about the codebase. You CANNOT edit files. When done, \
 stop with a concise findings report the parent agent can act on.";
@@ -83,6 +279,10 @@ struct SubTask {
     subagent_type: String,
     #[serde(default)]
     difficulty: String,
+    /// Worker-only: working-dir-relative globs the worker may WRITE within. Required for
+    /// `worker`; ignored for `explore` (read-only). Enforced by `WorkerScopeGate`.
+    #[serde(default)]
+    scope: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -144,7 +344,9 @@ each worker a TIGHTLY-specified task and non-overlapping file scopes when dispat
 several. Subagents run in parallel and cannot themselves dispatch. The WHOLE batch is \
 emitted as ONE JSON payload, so keep each `prompt` concise and dispatch in small batches \
 (a few at a time): many long prompts in one call can overflow the model's output and be \
-rejected as invalid JSON — prefer several smaller calls over one huge one."
+rejected as invalid JSON — prefer several smaller calls over one huge one. Each `worker` \
+MUST declare a `scope` (working-dir-relative globs) listing the files it may write; give \
+parallel workers NON-OVERLAPPING scopes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -159,7 +361,12 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
                             "description": {"type": "string", "description": "3-5 word label"},
                             "prompt": {"type": "string", "description": "The full subtask for the subagent"},
                             "subagent_type": {"type": "string", "enum": ["explore", "worker"]},
-                            "difficulty": {"type": "string", "enum": ["simple", "hard"]}
+                            "difficulty": {"type": "string", "enum": ["simple", "hard"]},
+                            "scope": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Worker-only, REQUIRED for worker: working-directory-relative globs the worker may write within (e.g. [\"src/auth/**\", \"Cargo.toml\"]). The worker can only write files inside this scope; reads are unrestricted. Ignored for explore."
+                            }
                         },
                         "required": ["description", "prompt", "subagent_type"]
                     }
@@ -205,6 +412,25 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
             };
         }
 
+        let missing = workers_missing_scope(&parsed.tasks);
+        if !missing.is_empty() {
+            let idxs = missing
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return ToolResult {
+                call_id: String::new(),
+                content: format!(
+                    "worker subtask {idxs} declared no `scope`. Each worker must declare `scope` \
+                     (working-dir-relative globs, e.g. [\"src/auth/**\"]) — its writable file lane, \
+                     shown at approval time and enforced during the run. Add a scope and retry."
+                ),
+                is_error: true,
+                images: vec![],
+            };
+        }
+
         let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
         let timeout_dur = self.subtask_timeout;
         let mut set = tokio::task::JoinSet::new();
@@ -215,6 +441,7 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
 
         for (idx, t) in parsed.tasks.into_iter().enumerate() {
             let is_worker = t.subagent_type == "worker";
+            let scope = t.scope.clone();
             let is_hard = t.difficulty == "hard";
             // Fresh provider + fresh tools per child (a session consumes its provider).
             let provider = if is_hard {
@@ -262,16 +489,19 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
                     &model,
                     &desc,
                 ));
-                let child = Agent::builder()
+                let mut builder = Agent::builder()
                     .provider(provider)
                     .tools(tools)
                     .persona(persona)
-                    .working_dir(wd)
-                    .cancel_token(child_cancel)
-                    // The child runs AutoRespond::AllowAll (no human in its loop), so the
-                    // parent's prompting sensitive-path gate wouldn't protect it. Hard-deny
-                    // sensitive-path file ops instead (#1).
-                    .middleware(Arc::new(DenySensitivePaths))
+                    .working_dir(wd.clone())
+                    .cancel_token(child_cancel);
+                // The child runs AutoRespond::AllowAll (no human in its loop), so the parent's
+                // prompting gates wouldn't protect it. Hard-deny sensitive-path ops for every
+                // child (#1); additionally confine a `worker`'s WRITES to its declared scope.
+                for mw in child_middlewares(is_worker, &scope, &wd) {
+                    builder = builder.middleware(mw);
+                }
+                let child = builder
                     // Funnel the child's live activity (thinking / current tool) up to the
                     // parent progress sink so the TUI spinner shows what this subtask is doing.
                     .hook(Arc::new(SubtaskProgressHook {
@@ -1066,5 +1296,126 @@ mod tests {
             "test premise: raw control char must be invalid JSON"
         );
         assert!(matches!(dummy().risk(worker), RiskLevel::Risky));
+    }
+
+    #[test]
+    fn literal_dir_prefix_cuts_at_first_glob_segment() {
+        use super::literal_dir_prefix as p;
+        assert_eq!(p("src/auth/**"), "src/auth");
+        assert_eq!(p("src/**/x.rs"), "src");
+        assert_eq!(p("**"), "");
+        assert_eq!(p("Cargo.toml"), "Cargo.toml");
+    }
+
+    #[test]
+    fn worker_scope_gate_confines_writes_but_not_reads() {
+        use super::WorkerScopeGate;
+        use std::path::Path;
+        let g = WorkerScopeGate::new(&["src/auth/**".into(), "Cargo.toml".into()], Path::new("/w"));
+
+        // in-scope write → allowed
+        assert!(g
+            .violation("edit_file", r#"{"file_path":"src/auth/login.rs"}"#)
+            .is_none());
+        // in-scope NEW file (need not exist) → allowed
+        assert!(g
+            .violation("write_file", r#"{"file_path":"src/auth/new_mod.rs"}"#)
+            .is_none());
+        // exact-file scope → allowed
+        assert!(g
+            .violation("write_file", r#"{"file_path":"Cargo.toml"}"#)
+            .is_none());
+        // out-of-scope write → denied, message names the path + scope
+        let deny = g
+            .violation("edit_file", r#"{"file_path":"src/db/schema.rs"}"#)
+            .expect("out-of-scope write denied");
+        assert!(deny.contains("src/db/schema.rs"), "{deny}");
+        assert!(deny.contains("src/auth/**"), "{deny}");
+        // READS are never gated, even outside scope
+        assert!(g
+            .violation("read_file", r#"{"file_path":"src/db/schema.rs"}"#)
+            .is_none());
+        assert!(g.violation("grep", r#"{"pattern":"x","path":"src/db"}"#).is_none());
+        // bash is never gated (dispatch-trust; design §6)
+        assert!(g.violation("bash", r#"{"command":"rm -rf src/db"}"#).is_none());
+        // write with no usable file_path fails CLOSED (denied), not allowed through
+        assert!(g.violation("write_file", r#"{"content":"x"}"#).is_some());
+        assert!(g.violation("edit_file", r#"{"file_path":null}"#).is_some());
+    }
+
+    #[test]
+    fn worker_scope_gate_denies_workspace_escape_and_absolute_outside() {
+        use super::WorkerScopeGate;
+        use std::path::Path;
+        let g = WorkerScopeGate::new(&["**".into()], Path::new("/w"));
+        // `**` allows anything INSIDE the workspace
+        assert!(g.violation("write_file", r#"{"file_path":"anything/here.rs"}"#).is_none());
+        // ...but a `..` escape is denied even under `**`
+        assert!(g
+            .violation("write_file", r#"{"file_path":"../outside.rs"}"#)
+            .is_some());
+        // ...and an absolute path outside the working dir is denied
+        assert!(g
+            .violation("write_file", r#"{"file_path":"/etc/passwd"}"#)
+            .is_some());
+        // an absolute path INSIDE the working dir is normalized + allowed
+        assert!(g.violation("write_file", r#"{"file_path":"/w/in.rs"}"#).is_none());
+    }
+
+    #[test]
+    fn worker_scope_gate_confines_search_replace_root() {
+        use super::WorkerScopeGate;
+        use std::path::Path;
+        let g = WorkerScopeGate::new(&["src/auth/**".into()], Path::new("/w"));
+        // root inside scope dir → allowed
+        assert!(g
+            .violation("search_replace", r#"{"path":"src/auth"}"#)
+            .is_none());
+        assert!(g
+            .violation("search_replace", r#"{"path":"src/auth/sub"}"#)
+            .is_none());
+        // root outside scope → denied
+        assert!(g
+            .violation("search_replace", r#"{"path":"src/db"}"#)
+            .is_some());
+        // NO path (whole-tree rewrite) → denied
+        let deny = g
+            .violation("search_replace", r#"{"pattern":"x","replacement":"y"}"#)
+            .expect("whole-tree search_replace denied");
+        assert!(deny.contains("whole tree") || deny.contains("path"), "{deny}");
+        // root escaping the workspace → denied
+        assert!(g.violation("search_replace", r#"{"path":"../outside"}"#).is_some());
+    }
+
+    #[test]
+    fn workers_missing_scope_flags_scopeless_workers_only() {
+        use super::{workers_missing_scope, SubTask};
+        let mk = |ty: &str, scope: Vec<&str>| SubTask {
+            description: "d".into(),
+            prompt: "p".into(),
+            subagent_type: ty.into(),
+            difficulty: String::new(),
+            scope: scope.into_iter().map(String::from).collect(),
+        };
+        let tasks = vec![
+            mk("worker", vec!["src/a/**"]), // #1 ok
+            mk("explore", vec![]),          // #2 explore — ignored even with no scope
+            mk("worker", vec![]),           // #3 missing → flagged
+            mk("worker", vec!["   "]),      // #4 whitespace-only → flagged
+        ];
+        assert_eq!(workers_missing_scope(&tasks), vec![3, 4]);
+    }
+
+    #[test]
+    fn child_middlewares_add_the_scope_gate_only_for_workers() {
+        use super::child_middlewares;
+        use std::path::Path;
+        // explore: only DenySensitivePaths.
+        assert_eq!(child_middlewares(false, &[], Path::new("/w")).len(), 1);
+        // worker: DenySensitivePaths + WorkerScopeGate.
+        assert_eq!(
+            child_middlewares(true, &["src/**".into()], Path::new("/w")).len(),
+            2
+        );
     }
 }

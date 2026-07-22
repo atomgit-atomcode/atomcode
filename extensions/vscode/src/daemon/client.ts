@@ -506,6 +506,9 @@ export class DaemonClient {
       case 'runtime_info':
         callbacks.onRuntimeInfo?.(event.provider, event.model);
         break;
+      case 'mode':
+        callbacks.onMode?.(event.mode);
+        break;
       case 'text':
         callbacks.onText(event.content);
         break;

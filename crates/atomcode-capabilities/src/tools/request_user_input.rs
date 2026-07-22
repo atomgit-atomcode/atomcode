@@ -91,7 +91,12 @@ pub fn parse_batch(args: &str) -> Result<(Vec<UserInputRequest>, bool), String> 
             validate_question(&req)?;
             out.push(req);
         }
-        Ok((out, true))
+        // A 1-element `questions` array is NOT a batch: send it down the single-question
+        // wire so both drivers render the populated question. (A batch payload carries no
+        // top-level header/question, so a driver that picks the single card off `len==1`
+        // — e.g. the webui — would otherwise show an empty card.)
+        let is_batch = out.len() > 1;
+        Ok((out, is_batch))
     } else {
         Ok((vec![parse_args(args)?], false))
     }
@@ -373,6 +378,17 @@ mod tests {
         assert!(is_batch);
         assert_eq!(reqs.len(), 4, "clamped to MAX_QUESTIONS");
         assert_eq!(reqs[0].header, "A");
+    }
+
+    #[test]
+    fn parse_batch_single_element_questions_is_not_a_batch() {
+        // A 1-element `questions` array must go down the single wire (is_batch=false) so the
+        // flat populated payload reaches the driver — otherwise a batch payload has no
+        // top-level header/question and a length-based driver renders an empty card.
+        let (reqs, is_batch) =
+            parse_batch(r#"{"questions":[{"header":"H","question":"Q?","mode":"text"}]}"#).unwrap();
+        assert!(!is_batch, "one question is not a batch");
+        assert_eq!(reqs.len(), 1);
     }
 
     #[test]
