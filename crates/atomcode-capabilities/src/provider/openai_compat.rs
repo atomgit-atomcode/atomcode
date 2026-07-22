@@ -576,7 +576,7 @@ async fn open_stream(
                         .and_then(error_code);
                     return Err(ProviderError {
                         retryable: retry::is_retryable_status(code),
-                        message: format!("HTTP {code}: {detail}"),
+                        message: friendly_http_error(code, &detail),
                         http_status: Some(code),
                         code: provider_code,
                         retry_after_secs,
@@ -969,6 +969,30 @@ fn error_code(err: &serde_json::Value) -> Option<String> {
                 .filter(|s| !s.is_empty())
                 .map(String::from)
         })
+}
+
+/// Concise, human-friendly Chinese headline for common BILLING / AUTH failures,
+/// so an external-model error surfaces an ACTIONABLE reason instead of a bare
+/// `HTTP 402: Insufficient Balance` the user can't act on. Deliberately DROPS the
+/// provider's raw English detail for these well-known codes — the headline
+/// already says it, and this short form folds cleanly into the interrupted-turn
+/// summary line (`✗ 已中断：账户余额不足（HTTP 402）`). The raw response is still
+/// captured in telemetry for diagnosis.
+///
+/// 429 is intentionally excluded: it flows through the kernel's rate-limit path
+/// (`rate_limit_server_message`), which strips a literal `HTTP 429: ` prefix to
+/// recover the server's own message, so its wording is owned there — wrapping it
+/// here would both defeat that strip and double the `HTTP 429` in the pause line.
+/// Any other status keeps the original `HTTP {code}: {detail}` shape (the detail
+/// IS the only signal there).
+fn friendly_http_error(code: u16, detail: &str) -> String {
+    let headline = match code {
+        401 => "API key 未授权或已失效",
+        402 => "账户余额不足",
+        403 => "无访问权限或 API key 无效",
+        _ => return format!("HTTP {code}: {detail}"),
+    };
+    format!("{headline}（HTTP {code}）")
 }
 
 // ---------------------------------------------------------------------------
@@ -2337,6 +2361,24 @@ mod tests {
         );
         // Non-JSON / unknown shape → raw body (truncated).
         assert_eq!(extract_error_detail("plain text error"), "plain text error");
+    }
+
+    #[test]
+    fn friendly_http_error_wraps_billing_and_auth_codes() {
+        // 402 欠费: concise actionable headline + the code; raw English detail is
+        // dropped (redundant, and this short form folds into the summary line).
+        assert_eq!(
+            friendly_http_error(402, "Insufficient Balance"),
+            "账户余额不足（HTTP 402）"
+        );
+        // 403 权限 / 401 鉴权.
+        assert_eq!(friendly_http_error(403, "forbidden"), "无访问权限或 API key 无效（HTTP 403）");
+        assert!(friendly_http_error(401, "").contains("API key"));
+        // 429 is NOT wrapped (kernel rate-limit path owns it — must keep the
+        // literal `HTTP 429: ` prefix so `rate_limit_server_message` can strip it).
+        assert_eq!(friendly_http_error(429, "slow down"), "HTTP 429: slow down");
+        // Unknown/other codes keep the original shape (detail is the only signal).
+        assert_eq!(friendly_http_error(500, "boom"), "HTTP 500: boom");
     }
 
     #[test]

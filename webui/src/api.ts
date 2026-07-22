@@ -807,6 +807,8 @@ export interface UserInputQuestion {
   question: string;
   mode: 'single' | 'multiple' | 'text';
   options: { label: string; description?: string }[];
+  /** Offer the "type your own answer" row (single/multiple). Absent ⇒ true. */
+  custom?: boolean;
 }
 
 export interface UserInputResponseBody {
@@ -825,6 +827,8 @@ export interface UserInputRequestEvent {
   /// Present for a multi-question batch; the webui steps through these and posts
   /// one batched answer. Omitted for a single question (use the flat fields above).
   questions?: UserInputQuestion[];
+  /// Offer the "type your own answer" row for a single question. Absent ⇒ true.
+  custom?: boolean;
 }
 
 export async function postLiveUserInput(

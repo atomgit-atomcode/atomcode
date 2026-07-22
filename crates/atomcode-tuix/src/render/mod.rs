@@ -213,9 +213,9 @@ pub enum UiLine {
     ImageAttachment(usize),
     /// One-line success notice for vision-preprocessor OCR. Renders as
     /// `{msg}  {model}` where `msg` uses the default text style and
-    /// `model` is highlighted in bold Accent (cyan) so the VL model
-    /// identity pops — visually distinct from failure (yellow `! ...`)
-    /// and from arbitrary command output. `model` is the bare model name
+    /// `model` is bold only (no themed colour) so the VL model identity
+    /// stands out from the notice text without a loud accent hue — just
+    /// emphasis, per user request. `model` is the bare model name
     /// (vendor prefix stripped), not the `config.providers` key.
     /// The actual VL description is intentionally NOT shown in the UI;
     /// it still rides into conversation history for the main model.
@@ -397,6 +397,11 @@ pub enum MenuKind {
     Marketplace,
     /// Plugin manager details / scope selection screens: 1-line rendering per item, input box hidden
     PluginInfo,
+    /// `/resume` session picker: same chrome as `Plugin` (bordered search box,
+    /// hidden composer, title + bottom hint), but each session row is 2 lines —
+    /// row 1 = bright session title, row 2 = gray metadata. Mirrors `Plugin`
+    /// throughout the render loop EXCEPT the per-item leaf builder.
+    SessionList,
 }
 
 impl MenuKind {
@@ -409,7 +414,7 @@ impl MenuKind {
             MenuKind::Skill | MenuKind::TwoColumn { .. } => {
                 item_count.min((screen_height / 2).max(4))
             }
-            MenuKind::Plugin => {
+            MenuKind::Plugin | MenuKind::SessionList => {
                 let plugin_count = item_count.saturating_sub(3);
                 let max_plugins = (screen_height / 4).max(2);
                 let visible_plugins = plugin_count.min(max_plugins);
@@ -588,6 +593,8 @@ pub struct UserInputPanelView {
     pub text: String,
     /// "Other" free-text row buffer for single/multiple mode.
     pub custom_text: String,
+    /// Whether to render the "Other" free-text row (mirrors `UserInputPanel.custom`).
+    pub custom: bool,
     /// Batch navigator context. `None` = a standalone single question (rendered
     /// byte-identically to before, no chrome). `Some` = this is one question inside
     /// a multi-question batch, so the renderer adds a `Question i/N` navigator and a

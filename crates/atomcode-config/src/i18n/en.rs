@@ -362,7 +362,17 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SessionNoneSelected =>
             "No session selected".into(),
         Msg::SessionPickerHint =>
-            "Enter open · F2 rename · Ctrl+D delete".into(),
+            "↑↓ move · Enter open · Ctrl+D delete · Type to search · Esc cancel".into(),
+        Msg::SessionPickerTitle { n, total, project } =>
+            format!("Resume session ({n}/{total} · {project})").into(),
+        Msg::SessionPickerTitleBare =>
+            "Resume session".into(),
+        Msg::SessionPickerEmptyProject =>
+            "(no sessions in this project yet)".into(),
+        Msg::SessionPickerEmptyFilter =>
+            "(no sessions match)".into(),
+        Msg::SessionPickerEmptyFilterQuery { query } =>
+            format!("(no sessions match \"{query}\" — Backspace to clear)").into(),
         Msg::SessionDeleted { name } =>
             format!("\"{name}\" deleted").into(),
         Msg::SessionDeleteConfirm { name } =>
@@ -1011,8 +1021,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                 super::fmt_tokens(total_tokens),
                 cached_pct.map(|p| format!(" · {p}% cached")).unwrap_or_default(),
             ).into(),
-        Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✗ Stopped · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
+        Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens, reason } => {
+            let cause = reason.map(|r| format!(": {r}")).unwrap_or_default();
+            format!("✗ Stopped{cause} · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
+        }
         Msg::LoginQrHeader =>
             "  Sign in to AtomGit — scan the QR code with your WeChat:\n\n".into(),
         Msg::LoginUrlAfterQr =>

@@ -95,6 +95,9 @@ pub struct UserInputPanel {
     /// Free-text buffer for the always-appended "Other" row in single/multiple
     /// mode. Distinct from `text` (which is the standalone text-mode input).
     pub custom_text: String,
+    /// Whether the "Other" free-text row is offered (mirrors `UserInputRequest.custom`).
+    /// When false, the Other row does not exist — indices below account for its absence.
+    pub custom: bool,
 }
 
 impl UserInputPanel {
@@ -107,8 +110,9 @@ impl UserInputPanel {
             .iter()
             .map(|o| (o.label.clone(), o.description.clone()))
             .collect();
-        // One checkbox slot per concrete option PLUS the trailing "Other" row.
-        let checked = vec![false; options.len() + 1];
+        // One checkbox slot per concrete option PLUS the trailing "Other" row —
+        // but only when custom answers are offered.
+        let checked = vec![false; options.len() + r.custom as usize];
         Self {
             request_id,
             header: r.header.clone(),
@@ -119,35 +123,42 @@ impl UserInputPanel {
             checked,
             text: String::new(),
             custom_text: String::new(),
+            custom: r.custom,
         }
     }
     /// Index of the always-appended "Other" free-text row (`options.len()`).
     pub fn other_index(&self) -> usize {
         self.options.len()
     }
-    /// Index of the Submit row (multiple mode only: `options.len() + 1`).
-    /// Returns `None` for single mode (no submit row).
+    /// Index of the Submit row (multiple mode only). After the concrete options,
+    /// plus the "Other" row when `custom` is on. `None` for single mode.
     pub fn submit_index(&self) -> Option<usize> {
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
         if matches!(self.mode, UserInputMode::Multiple) {
-            Some(self.options.len() + 1)
+            Some(self.options.len() + self.custom as usize)
         } else {
             None
         }
     }
     /// Last navigable cursor index.
-    /// - Single: `options.len()` (the "Other" row is last; no submit row).
-    /// - Multiple: `options.len() + 1` (Submit row is last, after Other).
-    fn last_row(&self) -> usize {
+    /// - Multiple: the Submit row.
+    /// - Single/text: the "Other" row when `custom`, else the last concrete option.
+    pub(crate) fn last_row(&self) -> usize {
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
         match self.mode {
-            UserInputMode::Multiple => self.options.len() + 1,
-            _ => self.other_index(),
+            UserInputMode::Multiple => self.submit_index().unwrap(),
+            _ => {
+                if self.custom {
+                    self.other_index()
+                } else {
+                    self.options.len().saturating_sub(1)
+                }
+            }
         }
     }
     /// Whether `cursor` is on the always-appended "Other" free-text row.
     pub fn is_other_row(&self) -> bool {
-        self.cursor == self.other_index()
+        self.custom && self.cursor == self.other_index()
     }
     /// Whether `cursor` is on the Submit row (multiple mode only).
     pub fn is_submit_row(&self) -> bool {
@@ -404,6 +415,45 @@ impl UserInputBatch {
 }
 
 #[cfg(test)]
+mod user_input_custom_tests {
+    use super::*;
+    use atomcode_capabilities::tools::request_user_input::{
+        UserInputMode, UserInputOption, UserInputRequest,
+    };
+
+    fn req(mode: UserInputMode, custom: bool) -> UserInputRequest {
+        UserInputRequest {
+            header: "H".into(),
+            question: "Q?".into(),
+            mode,
+            options: vec![
+                UserInputOption { label: "A".into(), description: None },
+                UserInputOption { label: "B".into(), description: None },
+            ],
+            custom,
+        }
+    }
+
+    #[test]
+    fn single_last_row_gates_on_custom() {
+        let with = UserInputPanel::new(1, &req(UserInputMode::Single, true));
+        assert_eq!(with.last_row(), 2, "single, custom → Other row is last (idx 2)");
+        let without = UserInputPanel::new(1, &req(UserInputMode::Single, false));
+        assert_eq!(without.last_row(), 1, "single, no custom → last option (idx 1)");
+    }
+
+    #[test]
+    fn multiple_submit_index_and_checked_gate_on_custom() {
+        let with = UserInputPanel::new(1, &req(UserInputMode::Multiple, true));
+        assert_eq!(with.submit_index(), Some(3), "custom → other@2, submit@3");
+        assert_eq!(with.checked.len(), 3, "custom → Other checkbox slot present");
+        let without = UserInputPanel::new(1, &req(UserInputMode::Multiple, false));
+        assert_eq!(without.submit_index(), Some(2), "no custom → submit right after options@2");
+        assert_eq!(without.checked.len(), 2, "no custom → no Other checkbox slot");
+    }
+}
+
+#[cfg(test)]
 mod user_input_batch_tests {
     use super::*;
     use atomcode_capabilities::tools::request_user_input::{
@@ -416,6 +466,7 @@ mod user_input_batch_tests {
             question: "?".into(),
             mode: UserInputMode::Text,
             options: vec![],
+            custom: true,
         }
     }
     fn single_q(h: &str) -> UserInputRequest {
@@ -427,6 +478,7 @@ mod user_input_batch_tests {
                 label: "x".into(),
                 description: None,
             }],
+            custom: true,
         }
     }
 
@@ -661,6 +713,16 @@ pub struct UiState {
     /// Set on TurnComplete / TurnCancelled / Error to seal
     /// `last_assistant_response`; the next turn's first delta clears it.
     pub response_finalized: bool,
+    /// The failure reason (provider `Error` / `RateLimited`) captured for the
+    /// CURRENT turn, FOLDED into the errored `✗ 已中断：<reason>` summary. The
+    /// standalone red error line is rendered mid-turn (phase `Streaming`, spinner
+    /// active) and can be clobbered by the physical Streaming→Idle redraw on a real
+    /// terminal; the summary renders cleanly at Idle, so folding the reason into it
+    /// guarantees the user always sees WHY the turn stopped. Set by the Error /
+    /// RateLimited handlers; `take()`n when the errored summary renders, and reset
+    /// to `None` when a CLEAN summary renders (`turn_summary_label`) so a reason
+    /// from an error path that produced no summary can never fold into a later turn.
+    pub last_turn_error: Option<String>,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
     /// While waiting on a tool approval, holds the `"Running {Tool}"`
@@ -952,6 +1014,7 @@ impl UiState {
             turn_saw_reasoning: false,
             last_assistant_response: String::new(),
             response_finalized: false,
+            last_turn_error: None,
             prior_phase: None,
             prior_spinner_label: None,
             approval_panel: None,
@@ -2466,6 +2529,7 @@ mod tests {
                     description: None,
                 },
             ],
+            custom: true,
         };
         let mut p = UserInputPanel::new(7, &single_req);
         assert_eq!(p.request_id, 7);
@@ -2568,6 +2632,7 @@ mod tests {
                 question: "Q?".into(),
                 mode: UserInputMode::Text,
                 options: vec![],
+                custom: true,
             },
         ));
         s.phase = UiPhase::UserInput;

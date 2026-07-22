@@ -427,8 +427,26 @@ pub enum Msg<'a> {
     },
     SessionNoneSelected,
     /// Persistent footer hint in the `/resume` picker advertising the key
-    /// actions (open / rename / delete) so they're discoverable.
+    /// actions (open / delete / search) so they're discoverable.
     SessionPickerHint,
+    /// Title row of the `/resume` picker: current 1-based position in the
+    /// filtered list, total sessions in the project, and the project name.
+    SessionPickerTitle {
+        n: usize,
+        total: usize,
+        project: &'a str,
+    },
+    /// Bare title of the `/resume` picker when the search box is focused —
+    /// no position / total / project suffix, just the heading.
+    SessionPickerTitleBare,
+    /// Hint shown when the project has no sessions at all.
+    SessionPickerEmptyProject,
+    /// Hint shown when the filter matches no sessions (empty query).
+    SessionPickerEmptyFilter,
+    /// Hint shown when the filter matches no sessions for a specific query.
+    SessionPickerEmptyFilterQuery {
+        query: &'a str,
+    },
     SessionRenameEditing {
         buffer: &'a str,
     },
@@ -1315,6 +1333,11 @@ pub enum Msg<'a> {
         tool_call_count: usize,
         duration: &'a str,
         total_tokens: usize,
+        /// Short failure cause FOLDED into the separator (`✗ 已中断：<reason> · …`).
+        /// Bound to the always-visible summary because the standalone mid-turn
+        /// error line can be clobbered by a real terminal's Streaming→Idle redraw.
+        /// `None` on resume replay (the reason is live-only, not persisted).
+        reason: Option<&'a str>,
     },
 
     // ── OAuth login chrome (/login + /codingplan share these) ──

@@ -140,9 +140,9 @@ impl Tool for EditFileTool {
                     diff,
                 ));
             }
-            // Tier 2: block-anchor match (first+last line anchors, interior drift tolerated).
-            // Absorbs the "model got one interior line slightly wrong" case that otherwise
-            // sends a weak model reaching for `sed`. Unique + ≥half-match guarded.
+            // Tier 2: block-anchor match (first+last line anchors, ONE interior line's drift
+            // tolerated). Absorbs the "model got one interior line slightly wrong" case that
+            // otherwise sends a weak model reaching for `sed`. Unique + at-most-one-drift guarded.
             if let Some((anchor_result, _)) =
                 try_block_anchor_replace(&content, &a.old_string, &a.new_string)
             {
@@ -379,10 +379,11 @@ fn try_fuzzy_replace(
 ///
 /// Conservative guards so it can't clobber the wrong block: needs ≥ 3 lines; both
 /// anchors non-empty and ≥ 3 trimmed chars (so a bare `{`/`}` can't anchor); the window
-/// length equals the old block's; at least HALF the lines still match trimmed (a
-/// coincidental anchor hit on an unrelated block is rejected); and the anchored window
-/// must be UNIQUE (no `replace_all` at this tier — guessing which of several to rewrite
-/// is unsafe). Returns `None` on any miss so the caller falls back to the not-found error.
+/// length equals the old block's; ALL BUT AT MOST ONE line still matches trimmed (so a
+/// window that merely shares its first/last line with an unrelated region is rejected —
+/// a plain "≥ half" rule would degenerate to "anchors only" for n ≤ 4); and the anchored
+/// window must be UNIQUE (no `replace_all` at this tier — guessing which of several to
+/// rewrite is unsafe). Returns `None` on any miss so the caller falls back to not-found.
 fn try_block_anchor_replace(
     content: &str,
     old_string: &str,
@@ -405,12 +406,15 @@ fn try_block_anchor_replace(
     let mut i = 0;
     while i + n <= content_lines.len() {
         if content_lines[i].trim() == first && content_lines[i + n - 1].trim() == last {
-            // Require ≥ half the lines to still match (trimmed) at their position, so a
-            // block that merely shares first/last lines with an unrelated region is rejected.
+            // Require ALL BUT AT MOST ONE line to still match (trimmed) at its position.
+            // This matches the intent — the model got a SINGLE interior line slightly wrong —
+            // and (unlike a "≥ half" rule, which for n≤4 degenerates to "anchors only" and
+            // would ignore the interior) rejects a window that merely shares its first/last
+            // line with an unrelated region.
             let matched = (0..n)
                 .filter(|&k| content_lines[i + k].trim() == old_lines[k].trim())
                 .count();
-            if matched * 2 >= n {
+            if matched + 1 >= n {
                 matches.push(i);
             }
         }
@@ -818,6 +822,52 @@ mod tests {
             std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
             original,
             "file must be unchanged"
+        );
+    }
+
+    // Guard: at-most-ONE drifted line. A 4-line block whose BOTH interior lines differ
+    // (only the anchors match) must be REJECTED — a plain "≥ half" rule would have passed
+    // this (2/4), clobbering an unrelated region that happens to share first/last lines.
+    #[tokio::test]
+    async fn block_anchor_rejects_two_drifted_interior_lines() {
+        let d = tempfile::tempdir().unwrap();
+        let original = "region top\n\treal one\n\treal two\nregion bottom\n";
+        std::fs::write(d.path().join("a.txt"), original).unwrap();
+        let r = EditFileTool
+            .execute(
+                // first/last match; BOTH interior lines wrong → matched 2/4 → reject.
+                r#"{"file_path":"a.txt","old_string":"region top\nWRONG one\nWRONG two\nregion bottom","new_string":"region top\nX\nregion bottom"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "two drifted interior lines must be refused: {}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), original);
+    }
+
+    // Coverage: the OUTDENTED-line re-anchor path (`signed_relative < 0`) — a new line less
+    // indented than the block's anchor (e.g. a top-level call after an indented statement).
+    // The file uses tabs; the fuzzy tier matches and re-anchors, dropping indent for the
+    // outdented line.
+    #[tokio::test]
+    async fn reanchor_handles_outdented_new_line() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("f.rs"),
+            "fn f() {\n\tlet a = 1;\n\tlet b = 2;\n}\n",
+        )
+        .unwrap();
+        let r = EditFileTool
+            .execute(
+                // Model copied with spaces; new_string's 2nd line is OUTDENTED to column 0.
+                r#"{"file_path":"f.rs","old_string":"    let a = 1;\n    let b = 2;","new_string":"    let a = 1;\ndone();"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "outdented re-anchor must succeed: {}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("f.rs")).unwrap(),
+            "fn f() {\n\tlet a = 1;\ndone();\n}\n",
+            "the kept line stays tab-indented; the outdented line drops to column 0"
         );
     }
 

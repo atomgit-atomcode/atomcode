@@ -962,6 +962,40 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
+    /// The bold highlight colour for the selected `/resume` session (title text,
+    /// `▸` marker, and the search-box caret). Theme-aware per user request: cyan
+    /// on dark, magenta on light — both pop against their background without
+    /// needing a full reverse-video bar.
+    fn session_highlight_style(&self) -> CellStyle {
+        let r = if crate::highlight::theme::is_light_for_render() {
+            Role::Brand
+        } else {
+            Role::Accent
+        };
+        CellStyle {
+            fg: role(self.caps, r),
+            bold: true,
+            reverse: false,
+            faint: false,
+            bg: None,
+        }
+    }
+
+    /// Rendered row count for a `/resume` session item at menu index
+    /// `orig_idx` (>= HEADER_ROWS): 2 rows (title + metadata) for the first
+    /// session, 3 for the rest — the extra row is the leading blank spacer that
+    /// separates cards. This MUST stay in lockstep with the render loop's
+    /// `if orig_idx > HEADER_ROWS { push blank }`; both the paginator's
+    /// fit-loops and the footer `menu_rows` reservation call it so the three
+    /// height accountings never drift.
+    fn session_item_height(orig_idx: usize) -> usize {
+        if orig_idx == crate::modals::session_picker::HEADER_ROWS {
+            2
+        } else {
+            3
+        }
+    }
+
     fn max_menu_rows(&self, h: usize, default: usize) -> usize {
         self.menu
             .as_ref()
@@ -1724,11 +1758,27 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     format!("  {}", name)
                 }
             }
+            // SessionList only reaches `build_menu_row` for its header chrome
+            // (title row + blank separators + bottom hint); the 2-line session
+            // items are rendered by `build_session_menu_rows`. Indent the title
+            // and hint by PAD_COL so they line up with the search box's left
+            // edge (its `│` border also sits at PAD_COL). Blank separators stay
+            // empty so no stray trailing spaces leak out.
+            super::MenuKind::SessionList => {
+                if name.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}{}", " ".repeat(PAD_COL), name)
+                }
+            }
         };
 
         let is_plugin_mgr = matches!(
             kind,
-            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+            super::MenuKind::Plugin
+                | super::MenuKind::Marketplace
+                | super::MenuKind::PluginInfo
+                | super::MenuKind::SessionList
         );
         let mut style = if selected && !is_plugin_mgr {
             CellStyle {
@@ -1976,6 +2026,77 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         rows
+    }
+
+    /// Two-line renderer for a `/resume` session row. Simpler than
+    /// `build_plugin_menu_rows`: row 1 is an optional `▸ ` marker (Border when
+    /// selected, else spaces) + the session title in the terminal's default fg
+    /// (bold when selected) — NO `✓`, NO name padding, NO installed/scope suffix
+    /// logic (a session literally named "… (local)" must NOT get a check). Row 2
+    /// is the whole metadata string (`"12 messages · 1 week ago"`) indented four
+    /// spaces in the muted style.
+    fn build_session_menu_rows(
+        &self,
+        name: &str,
+        desc: &str,
+        selected: bool,
+        rule_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        // Selected title + marker use the theme-aware highlight colour (cyan on
+        // dark, magenta on light); unselected rows stay in the terminal default.
+        let name_style = if selected {
+            self.session_highlight_style()
+        } else {
+            CellStyle::default()
+        };
+
+        // Row 1: PAD_COL indent + marker + highlighted title. The leading
+        // PAD_COL puts the `▸` marker under the search box's `│` border (col 2),
+        // and the 2-col marker slot puts the title at col 4 — flush with the
+        // search box text and the metadata row below.
+        let mut row1 = Vec::new();
+        push_str_cells_sgr(&mut row1, &" ".repeat(PAD_COL), CellStyle::default());
+        if selected {
+            push_str_cells_sgr(&mut row1, "▸ ", self.session_highlight_style());
+        } else {
+            push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
+        }
+        push_str_cells_sgr(&mut row1, name, name_style.clone());
+
+        let content_w1 = PAD_COL + 2 + crate::width::display_width(name);
+        let right_pad1 = rule_width.saturating_sub(content_w1);
+        for _ in 0..right_pad1 {
+            row1.push(Cell {
+                ch: ' ',
+                width: 1,
+                style: CellStyle::default(),
+            });
+        }
+
+        // Row 2: gray metadata, indented four spaces.
+        let meta_style = self.style_for(Role::Muted);
+        let line_str = if desc.is_empty() {
+            String::new()
+        } else {
+            format!("    {}", desc)
+        };
+        let mut row2 = Vec::new();
+        push_str_cells_sgr(&mut row2, &line_str, meta_style.clone());
+        let content_w2 = crate::width::display_width(&line_str);
+        let right_pad2 = rule_width.saturating_sub(content_w2);
+        for _ in 0..right_pad2 {
+            row2.push(Cell {
+                ch: ' ',
+                width: 1,
+                style: if selected {
+                    meta_style.clone()
+                } else {
+                    CellStyle::default()
+                },
+            });
+        }
+
+        vec![row1, row2]
     }
 
     fn build_marketplace_menu_rows(
@@ -2537,11 +2658,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         n += 1;
                     }
                 }
-                // Custom-answer ("Other") row: 1 inline input line.
-                n += 1;
-                // Multiple: +1 for the Submit row.
-                if matches!(panel.mode, UserInputMode::Multiple) {
+                // Custom-answer ("Other") row: 1 inline input line — only when offered.
+                if panel.custom {
                     n += 1;
+                }
+                // Multiple: a blank spacer + the Submit row.
+                if matches!(panel.mode, UserInputMode::Multiple) {
+                    n += 2;
                 }
                 // blank + hint
                 n += 2;
@@ -2679,11 +2802,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     emit_option(&mut out, i, i + 1, label, desc.as_deref(), checked);
                 }
 
-                // Always-appended custom-answer row (index = options.len()): a
-                // ONE-LINE inline text input.  No "Other" label, no subtitle —
-                // the cursor indicator and typed text (or faint placeholder) are
-                // rendered directly on this row.
-                {
+                // The custom-answer ("Other") row (index = options.len()): a ONE-LINE
+                // inline text input. Offered only when `panel.custom` is true — no
+                // "Other" label, no subtitle; the cursor indicator and typed text (or
+                // faint placeholder) are rendered directly on this row.
+                if panel.custom {
                     let idx = other_index;
                     let number = other_index + 1;
                     let on_cursor = idx == panel.cursor;
@@ -2775,9 +2898,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     out.push(row);
                 }
 
-                // Multiple mode: a navigable Submit row after Other.
+                // Multiple mode: a blank spacer, then a navigable Submit row. The
+                // Submit index is after the concrete options, plus the Other row when
+                // it is offered.
                 if multiple {
-                    let submit_index = other_index + 1;
+                    blank_row(&mut out);
+                    let submit_index = panel.options.len() + panel.custom as usize;
                     let on_cursor = submit_index == panel.cursor;
                     let marker = if on_cursor {
                         if unicode {
@@ -2845,7 +2971,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         // Hint row: mode-appropriate guidance, muted + glyph-downgraded. N is the
         // number of navigable options INCLUDING the always-appended "Other".
-        let n = panel.options.len() + 1;
+        let n = panel.options.len() + panel.custom as usize;
         let single_hint = format!("\u{2191}\u{2193} move \u{00b7} 1-{n} select \u{00b7} Enter confirm \u{00b7} Esc cancel");
         // Multiple: Enter toggles rows, confirms only on the Submit row.
         let multiple_hint = format!("\u{2191}\u{2193} move \u{00b7} Space toggle \u{00b7} Enter \u{63d0}\u{4ea4}\u{884c}\u{786e}\u{8ba4} \u{00b7} Esc cancel");
@@ -3014,6 +3140,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Paginate menu using the kind-specific cap.
         let max_menu = self.max_menu_rows(h, 4);
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
+        // The `/resume` session list shares the plugin manager's chrome and
+        // layout (4-row header, bordered search box at idx 2, 2-line items from
+        // idx 4, bottom hint) — only the per-item leaf builder differs. Treat it
+        // as plugin-like everywhere layout math keys off `Plugin`.
+        let plugin_like = matches!(
+            menu_kind,
+            super::MenuKind::Plugin | super::MenuKind::SessionList
+        );
         let (menu_items, selected_in_view, actual_offset) = if let Some(m) = self.menu.as_ref() {
             let len = m.items.len();
             if len == 0 {
@@ -3023,12 +3157,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 super::MenuKind::Plugin
                     | super::MenuKind::Marketplace
                     | super::MenuKind::PluginInfo
+                    | super::MenuKind::SessionList
             ) {
-                let header_h = if menu_kind == super::MenuKind::Plugin {
-                    4
-                } else {
-                    2
-                };
+                let header_h = if plugin_like { 4 } else { 2 };
                 if len < header_h {
                     let sel = if m.selected < len {
                         Some(m.selected)
@@ -3041,20 +3172,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         && m.items[len - 1].0.starts_with('—')
                         && m.items[len - 1].0.ends_with('—');
                     let hint_h = if has_hint { 1 } else { 0 };
-                    let header_row_h = if menu_kind == super::MenuKind::Plugin {
-                        6
-                    } else {
-                        header_h
-                    };
+                    let header_row_h = if plugin_like { 6 } else { header_h };
                     let budget = max_menu.saturating_sub(header_row_h + hint_h);
                     let mut offset = header_h;
                     let mut end = offset;
                     let mut height_sum = 0;
                     while end < len - hint_h {
-                        let item_h = if menu_kind == super::MenuKind::Plugin
+                        let item_h = if menu_kind == super::MenuKind::SessionList
                             && end >= 4
                             && end < len - hint_h
                         {
+                            Self::session_item_height(end)
+                        } else if plugin_like && end >= 4 && end < len - hint_h {
                             self.plugin_item_height(&m.items[end].1, rule_width)
                         } else if menu_kind == super::MenuKind::Marketplace
                             && end >= 2
@@ -3086,10 +3215,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             let mut h_sum = 0;
                             end = offset;
                             while end < len - hint_h {
-                                let item_h = if menu_kind == super::MenuKind::Plugin
+                                let item_h = if menu_kind == super::MenuKind::SessionList
                                     && end >= 4
                                     && end < len - hint_h
                                 {
+                                    Self::session_item_height(end)
+                                } else if plugin_like && end >= 4 && end < len - hint_h {
                                     self.plugin_item_height(&m.items[end].1, rule_width)
                                 } else if menu_kind == super::MenuKind::Marketplace
                                     && end >= 2
@@ -3201,17 +3332,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 super::MenuKind::Plugin
                     | super::MenuKind::Marketplace
                     | super::MenuKind::PluginInfo
+                    | super::MenuKind::SessionList
             );
             let mut sum = menu_items
                 .iter()
                 .enumerate()
                 .map(|(i, _)| {
                     let orig_idx = if is_sticky {
-                        let header_h = if menu_kind == super::MenuKind::Plugin {
-                            4
-                        } else {
-                            2
-                        };
+                        let header_h = if plugin_like { 4 } else { 2 };
                         if i < header_h {
                             i
                         } else if has_hint_at_end && i == menu_items.len() - 1 {
@@ -3231,9 +3359,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         } else {
                             1
                         }
-                    } else if menu_kind == super::MenuKind::Plugin && orig_idx == 2 {
+                    } else if plugin_like && orig_idx == 2 {
                         3
-                    } else if menu_kind == super::MenuKind::Plugin
+                    } else if menu_kind == super::MenuKind::SessionList
+                        && orig_idx >= 4
+                        && orig_idx < m.items.len().saturating_sub(1)
+                    {
+                        // Session cards are 2 rows (first) / 3 rows (rest, incl.
+                        // the leading blank spacer). Metadata uses a single-space
+                        // `·` separator, so `plugin_item_height` would wrongly
+                        // return 2 here and this reservation would undercount the
+                        // footer height — overlapping the goal/status rows onto
+                        // the last card.
+                        Self::session_item_height(orig_idx)
+                    } else if plugin_like
                         && orig_idx >= 4
                         && orig_idx < m.items.len().saturating_sub(1)
                     {
@@ -3310,7 +3449,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let approval_active = self.approval_active();
         let hide_input_box = matches!(
             menu_kind,
-            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+            super::MenuKind::Plugin
+                | super::MenuKind::Marketplace
+                | super::MenuKind::PluginInfo
+                | super::MenuKind::SessionList
         );
         let is_add_url = hide_input_box
             && menu_kind == super::MenuKind::Marketplace
@@ -3391,19 +3533,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Vec::new()
         };
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
+        // `/resume` session list shares the plugin manager's chrome/layout.
+        let plugin_like = matches!(
+            menu_kind,
+            super::MenuKind::Plugin | super::MenuKind::SessionList
+        );
         let mut menu_cells: Vec<Vec<Cell>> = Vec::new();
         let final_len = self.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
         let is_sticky = matches!(
             menu_kind,
-            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+            super::MenuKind::Plugin
+                | super::MenuKind::Marketplace
+                | super::MenuKind::PluginInfo
+                | super::MenuKind::SessionList
         );
         for (i, (name, desc)) in menu_items.iter().enumerate() {
             let orig_idx = if is_sticky {
-                let header_h = if menu_kind == super::MenuKind::Plugin {
-                    4
-                } else {
-                    2
-                };
+                let header_h = if plugin_like { 4 } else { 2 };
                 if i < header_h {
                     i
                 } else if has_hint_at_end && i == menu_items.len() - 1 {
@@ -3435,7 +3581,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 } else {
                     menu_cells.push(Vec::new());
                 }
-            } else if menu_kind == super::MenuKind::Plugin && orig_idx == 2 {
+            } else if plugin_like && orig_idx == 2 {
                 let border_style = if selected {
                     self.style_bold(Role::Brand)
                 } else {
@@ -3480,11 +3626,28 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     style: CellStyle::default(),
                     width: 1,
                 });
-                if name.is_empty() {
+                // The `/resume` search box is focusable (Up from the first
+                // session lands here): when focused, show the live query plus a
+                // cursor caret and drop the placeholder, so the user can see
+                // that typing edits THIS field.
+                let box_focused = selected && menu_kind == super::MenuKind::SessionList;
+                if name.is_empty() && !box_focused {
                     let muted = self.style_for(Role::Muted);
-                    push_str_cells(&mut content_row, "Search plugins...", &muted);
+                    let placeholder = if menu_kind == super::MenuKind::SessionList {
+                        "Search sessions..."
+                    } else {
+                        "Search plugins..."
+                    };
+                    push_str_cells(&mut content_row, placeholder, &muted);
                 } else {
                     push_str_cells(&mut content_row, name, &CellStyle::default());
+                    if box_focused {
+                        content_row.push(Cell {
+                            ch: '▏',
+                            style: self.session_highlight_style(),
+                            width: 1,
+                        });
+                    }
                 }
                 let target_w = rule_width + PAD_COL;
                 let mut current_w = 0;
@@ -3537,6 +3700,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     });
                 }
                 menu_cells.push(bot_border);
+            } else if menu_kind == super::MenuKind::SessionList
+                && orig_idx >= 4
+                && orig_idx < final_len.saturating_sub(1)
+            {
+                // One blank line of breathing room BEFORE every session except
+                // the first, so entries read as separated cards (title+metadata
+                // tight together) rather than one dense block. `session_item_height`
+                // accounts for this spacer in all three height reservations.
+                if orig_idx > crate::modals::session_picker::HEADER_ROWS {
+                    menu_cells.push(Vec::new());
+                }
+                menu_cells.extend(self.build_session_menu_rows(name, desc, selected, rule_width));
             } else if menu_kind == super::MenuKind::Plugin
                 && orig_idx >= 4
                 && orig_idx < final_len.saturating_sub(1)
@@ -3745,12 +3920,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         let menu_top = attach_top + attachment_rows;
-        let is_search_box_focused = menu_kind == super::MenuKind::Plugin
-            && self
-                .menu
-                .as_ref()
-                .map(|m| m.selected == 2 && m.items.len() >= 3)
-                .unwrap_or(false);
+        let is_search_box_focused = matches!(
+            menu_kind,
+            super::MenuKind::Plugin | super::MenuKind::SessionList
+        ) && self
+            .menu
+            .as_ref()
+            .map(|m| m.selected == 2 && m.items.len() >= 3)
+            .unwrap_or(false);
         if is_add_url {
             let input_row_idx = menu_cells
                 .iter()
@@ -3957,7 +4134,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
         let hide_input_box = matches!(
             menu_kind,
-            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+            super::MenuKind::Plugin
+                | super::MenuKind::Marketplace
+                | super::MenuKind::PluginInfo
+                | super::MenuKind::SessionList
         );
         self.footer_total_rows(
             capped_middle,
@@ -4263,7 +4443,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
         let hide_input_box = matches!(
             menu_kind,
-            super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo
+            super::MenuKind::Plugin
+                | super::MenuKind::Marketplace
+                | super::MenuKind::PluginInfo
+                | super::MenuKind::SessionList
         );
         let has_trailing_empty = total > 0 && self.body_lines[total - 1].is_empty();
         let display_total = if hide_input_box && has_trailing_empty {
@@ -6581,13 +6764,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_row(Vec::new());
             }
             UiLine::VisionPreprocessSuccess { msg, model } => {
-                // `{msg}  ` in default text style; `{model}` highlighted in
-                // bold Accent (cyan) so the VL model identity pops rather
-                // than reading as dim metadata — the user wants to see at a
-                // glance which model did the recognition. push_body_prefixed
-                // handles the two styles in a single visual line and
-                // continues onto wrapped rows with the prefix's display
-                // width as continuation pad.
+                // `{msg}  ` in default text style; `{model}` in bold only (no
+                // colour) so the VL model identity stands out from the notice
+                // text without the loud accent hue — the user requested just
+                // emphasis, not a themed colour. push_body_prefixed handles the
+                // two styles in a single visual line and continues onto wrapped
+                // rows with the prefix's display width as continuation pad.
                 //
                 // Trailing blank: without it the next event's row (e.g.
                 // `● Pondering…` spinner or assistant text) butts right
@@ -6595,7 +6777,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // too cramped. The blank lets the success line breathe
                 // as its own paragraph.
                 let default_style = CellStyle::default();
-                let model_style = self.style_bold(Role::Accent);
+                let model_style = CellStyle {
+                    fg: None,
+                    bold: true,
+                    reverse: false,
+                    faint: false,
+                    bg: None,
+                };
                 let prefix = format!("{msg}  ");
                 self.push_body_prefixed(&prefix, &default_style, &model, &model_style);
                 self.push_body_row(Vec::new());
@@ -8195,6 +8383,45 @@ mod tests {
             any_reverse,
             "at least one cell of the pill must carry reverse-video style"
         );
+    }
+
+    #[test]
+    fn session_item_height_first_two_rest_three() {
+        // The first session (menu index HEADER_ROWS) is 2 rows; every later
+        // session is 3 (leading blank spacer). All three height accountings —
+        // the two paginator fit-loops and the footer `menu_rows` reservation —
+        // share this helper, so they can never disagree with the render loop.
+        let h0 = crate::modals::session_picker::HEADER_ROWS;
+        assert_eq!(RetainedRenderer::<CountingSink>::session_item_height(h0), 2);
+        assert_eq!(
+            RetainedRenderer::<CountingSink>::session_item_height(h0 + 1),
+            3
+        );
+        assert_eq!(
+            RetainedRenderer::<CountingSink>::session_item_height(h0 + 5),
+            3
+        );
+    }
+
+    #[test]
+    fn session_menu_row_aligns_marker_col2_title_col4() {
+        let (r, _counter) = new_counting(80, 24);
+        // Selected row: PAD_COL spaces, then `▸ `, then the title. So col 2 is
+        // the marker and col 4 is the first title glyph — flush with the search
+        // box's `│` border (col 2) and its text (col 4).
+        let rows = r.build_session_menu_rows("Xtitle", "9 msgs", true, 70);
+        let title = &rows[0];
+        assert_eq!(title[0].ch, ' ');
+        assert_eq!(title[1].ch, ' ');
+        assert_eq!(title[2].ch, '▸', "marker sits under the search box border");
+        assert_eq!(title[4].ch, 'X', "title starts at col 4 (search box text)");
+        // Metadata row is indented 4 spaces → also col 4, aligned with the title.
+        let meta = &rows[1];
+        assert_eq!(meta[4].ch, '9', "metadata aligns with the title at col 4");
+        // Unselected row: no marker, but the title still lands at col 4.
+        let rows_u = r.build_session_menu_rows("Xtitle", "9 msgs", false, 70);
+        assert_eq!(rows_u[0][2].ch, ' ', "no marker when unselected");
+        assert_eq!(rows_u[0][4].ch, 'X', "unselected title also at col 4");
     }
 
     /// `None` session_name keeps the top rule pristine — no reverse
@@ -12898,6 +13125,7 @@ mod tests {
                 checked: vec![false, false, false],
                 text: String::new(),
                 custom_text: String::new(),
+                custom: true,
                 batch: None,
             };
             // Row count: header + blank + question + blank
@@ -12983,6 +13211,7 @@ mod tests {
                 checked: vec![true, false, true],
                 text: String::new(),
                 custom_text: "Zig".into(),
+                custom: true,
                 batch: None,
             };
             assert_eq!(
@@ -13048,6 +13277,7 @@ mod tests {
                 checked: vec![],
                 text: "atomcode".into(),
                 custom_text: String::new(),
+                custom: true,
                 batch: None,
             };
             // header + blank + question + blank + input + hint = 6.
@@ -13094,6 +13324,7 @@ mod tests {
             checked: vec![false, false, false],
             text: String::new(),
             custom_text: String::new(),
+            custom: true,
             batch,
         };
 

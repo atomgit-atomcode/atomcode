@@ -1529,7 +1529,19 @@ fn execute_slash_command_impl(
             dispatch_undo(arg, state, ctx, renderer);
         }
         "usage" => {
-            open_usage(renderer, active_modal);
+            // Mid-turn (Streaming): render a text snapshot to scrollback — the modal
+            // fights the live streaming box. Idle: open the interactive modal.
+            if matches!(state.phase, crate::state::UiPhase::Streaming) {
+                // `false` = skip the heavier `usage()` round-trip (overview/models) the
+                // text snapshot doesn't render — one gateway call, not two, mid-stream.
+                let text = fetch_usage_data(false)
+                    .map(|d| render_usage_text(&d))
+                    .unwrap_or_else(|| t(Msg::UsageCodingPlanOnly).into_owned());
+                renderer.render(UiLine::CommandOutput(text));
+                renderer.flush();
+            } else {
+                open_usage(renderer, active_modal);
+            }
         }
         "cost" => {
             // Local session token cost (any model, incl. self-integrated) — as
@@ -4393,22 +4405,18 @@ pub(super) fn build_diff_text(ctx: &LoopCtx) -> Result<String, String> {
     }
 }
 
-/// `/usage` — open the CodingPlan usage modal.
+/// Fetch CodingPlan usage from the gateway (BLOCKING network call). `None` when the
+/// user isn't logged into a CodingPlan account — the caller then shows
+/// `UsageCodingPlanOnly`. Shared by the interactive modal (`open_usage`) and the
+/// mid-turn text snapshot (`render_usage_text`).
 ///
-/// Mirrors the `"model" =>` arm pattern: render a notice and return when the
-/// precondition isn't met, otherwise push the modal into `active_modal`.
-fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Modal>>) {
+/// `include_overview` gates the SECOND, heavier `usage()` round-trip that powers the
+/// modal's Overview/Models tabs. The mid-turn text snapshot renders only plan + window
+/// (from `status_v2`), so it passes `false` — otherwise it would pay for a network call
+/// it throws away, doubling the streaming freeze.
+fn fetch_usage_data(include_overview: bool) -> Option<UsageData> {
     tokio::task::block_in_place(|| {
-        let client = match atomcode_codingplan::client::Client::from_stored_auth() {
-            Ok(c) => c,
-            Err(_) => {
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::UsageCodingPlanOnly).into_owned(),
-                ));
-                renderer.flush();
-                return;
-            }
-        };
+        let client = atomcode_codingplan::client::Client::from_stored_auth().ok()?;
         let status = client.status_v2().ok();
         let window = status.as_ref().and_then(|s| {
             s.rate_limit_windows
@@ -4419,21 +4427,66 @@ fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Mod
                 .cloned()
         });
         let plan = status.and_then(|s| s.codingplan_free);
-        let (usage, error) = match client.usage() {
-            Ok(u) => (Some(u), None),
-            Err(e) => (None, Some(format!("{e}"))),
+        let (usage, error) = if include_overview {
+            match client.usage() {
+                Ok(u) => (Some(u), None),
+                Err(e) => (None, Some(format!("{e}"))),
+            }
+        } else {
+            (None, None)
         };
         let overview = usage
             .as_ref()
             .map(atomcode_codingplan::usage::compute_overview);
-        *active_modal = Some(Box::new(UsageModal::new(UsageData {
+        Some(UsageData {
             window,
             plan,
             usage,
             overview,
             error,
-        })));
+        })
     })
+}
+
+/// `/usage` — open the CodingPlan usage modal (idle). Renders a notice when the user
+/// isn't on a CodingPlan account, otherwise pushes the modal into `active_modal`.
+fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Modal>>) {
+    match fetch_usage_data(true) {
+        Some(data) => *active_modal = Some(Box::new(UsageModal::new(data))),
+        None => {
+            renderer.render(UiLine::CommandOutput(t(Msg::UsageCodingPlanOnly).into_owned()));
+            renderer.flush();
+        }
+    }
+}
+
+/// SCROLLBACK-text form of `/usage` for running it MID-TURN: the interactive modal
+/// would be repainted over by the live streaming box (`draw_spinner_now` on every
+/// token), so mid-stream we render a concise text snapshot instead — the plan line
+/// and the primary rate-limit window, reusing the exact i18n lines `/status` uses.
+/// (The modal's richer Overview/Models tabs stay modal-only, for the idle path.)
+fn render_usage_text(data: &UsageData) -> String {
+    let mut out = String::new();
+    if let Some(plan) = &data.plan {
+        out.push_str(&t(Msg::StatusCpLine {
+            plan: &plan.plan_name,
+            expires_at: &plan.expires_at,
+            remaining_days: plan.remaining_days,
+            total_days: plan.total_days,
+        }));
+    }
+    if let Some(w) = &data.window {
+        out.push_str(&t(Msg::StatusCpUsage {
+            usage: &w.usage_status_desc,
+            reset_at: &w.reset_at_display,
+            duration: &atomcode_codingplan::setup::format_duration_secs(w.seconds_until_reset),
+        }));
+    }
+    if out.is_empty() {
+        // Logged in but the gateway returned neither a plan nor a visible window.
+        out.push_str(&t(Msg::UsageCodingPlanOnly).into_owned());
+    }
+    out
 }
 
 /// `/cost` 的用量报告文本：本会话累计 token × 模型价目表。与 `/usage`（只查
@@ -6489,6 +6542,42 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_usage_text_composes_plan_and_window_lines() {
+        use atomcode_codingplan::types::{PlanInfo, RateLimitWindow};
+        // Build fixtures from JSON (serde defaults fill the fields we don't care about).
+        let plan: PlanInfo = serde_json::from_value(serde_json::json!({
+            "plan_name": "AtomPlan-Pro", "expires_at": "2026-12-31",
+            "remaining_days": 30, "total_days": 365
+        }))
+        .unwrap();
+        let window: RateLimitWindow = serde_json::from_value(serde_json::json!({
+            "usage_status_desc": "42% used", "reset_at_display": "12:00",
+            "seconds_until_reset": 3600, "window_hours": 5, "show_enable": 1
+        }))
+        .unwrap();
+        let data = UsageData {
+            window: Some(window),
+            plan: Some(plan),
+            usage: None,
+            overview: None,
+            error: None,
+        };
+        let text = render_usage_text(&data);
+        assert!(text.contains("AtomPlan-Pro"), "plan name present: {text}");
+        assert!(text.contains("42% used"), "window usage present: {text}");
+
+        // Logged in but empty gateway response → the CodingPlan-only notice, not blank.
+        let empty = UsageData {
+            window: None,
+            plan: None,
+            usage: None,
+            overview: None,
+            error: None,
+        };
+        assert!(!render_usage_text(&empty).is_empty(), "empty data must not render blank");
+    }
 
     #[test]
     fn active_session_bucket_uses_runtime_directory_not_embedded_metadata() {
