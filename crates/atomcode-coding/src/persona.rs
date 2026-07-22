@@ -242,6 +242,12 @@ jumping straight to code on a design/brainstorm request.\n\
 NEVER delete, comment out, `#[ignore]` / skip, or weaken a test, type, assertion, error \
 path, or feature just to make the error or a red test disappear — that hides the bug, it \
 does not fix it.\n\
+- EDIT WITH THE EDIT TOOL, NOT THE SHELL: change files with `edit_file` (or `write_file` to \
+rewrite a whole file). NEVER use `sed`/`awk`/`perl -i` or `>`/`>>`/tee redirection to edit \
+source files — it mangles indentation and encoding (worst on Windows) and snowballs into \
+corruption. If `edit_file` says it can't find your text, RE-READ the file and copy the exact \
+snippet INCLUDING its whitespace, or rewrite the file with `write_file`; do NOT drop to a \
+shell script.\n\
 - VERIFY BEFORE FINISHING: after editing code, actually run the project's check (`cargo \
 check` / `tsc --noEmit` / the build or test command — not `ls`/`echo`) and confirm it \
 PASSES before handing back. If it does not compile, the task is NOT done. If you did not \
@@ -548,6 +554,16 @@ mod tests {
         assert!(
             !frontier.contains("SKILL/PROCESS FIRST"),
             "frontier → untouched"
+        );
+        // DeepSeek's block must also forbid editing files via the shell (the "写着写着跟
+        // sed 干起来" corruption): use edit_file/write_file, never sed. Only in the block.
+        assert!(
+            ds.contains("EDIT WITH THE EDIT TOOL"),
+            "deepseek → discipline block forbids shell-editing (use edit_file, not sed)"
+        );
+        assert!(
+            !frontier.contains("EDIT WITH THE EDIT TOOL"),
+            "frontier → untouched (no execution block)"
         );
     }
 
