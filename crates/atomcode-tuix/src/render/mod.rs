@@ -213,8 +213,10 @@ pub enum UiLine {
     ImageAttachment(usize),
     /// One-line success notice for vision-preprocessor OCR. Renders as
     /// `{msg}  {model}` where `msg` uses the default text style and
-    /// `model` uses the Muted (gray) role — visually distinct from
-    /// failure (yellow `! ...`) and from arbitrary command output.
+    /// `model` is highlighted in bold Accent (cyan) so the VL model
+    /// identity pops — visually distinct from failure (yellow `! ...`)
+    /// and from arbitrary command output. `model` is the bare model name
+    /// (vendor prefix stripped), not the `config.providers` key.
     /// The actual VL description is intentionally NOT shown in the UI;
     /// it still rides into conversation history for the main model.
     VisionPreprocessSuccess {

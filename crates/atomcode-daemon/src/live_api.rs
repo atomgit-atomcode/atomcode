@@ -1230,11 +1230,11 @@ pub(crate) async fn preprocess_image_caption(
     use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
     match maybe_preprocess(config, active, message, images).await {
         PreprocessOutcome::Skipped => message.to_string(),
-        PreprocessOutcome::Replaced { text, vl_key } => {
+        PreprocessOutcome::Replaced { text, vl_model } => {
             if message.trim().is_empty() {
-                format!("[图片内容（由 {vl_key} 识别）]\n{text}")
+                format!("[图片内容（由 {vl_model} 识别）]\n{text}")
             } else {
-                format!("{message}\n\n[图片内容（由 {vl_key} 识别）]\n{text}")
+                format!("{message}\n\n[图片内容（由 {vl_model} 识别）]\n{text}")
             }
         }
         PreprocessOutcome::Failed { .. } => {

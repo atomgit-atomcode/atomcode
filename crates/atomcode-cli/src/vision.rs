@@ -94,21 +94,21 @@ fn apply_outcome(
 ) -> (UserInput, Option<VisionNotice>) {
     match outcome {
         PreprocessOutcome::Skipped => (UserInput { text, images }, None),
-        PreprocessOutcome::Replaced { text: vl, vl_key } => {
+        PreprocessOutcome::Replaced { text: vl, vl_model } => {
             // char_count is the VL description length — computed BEFORE merging
             // with the caption, so the toast reports the recognised content size.
             let char_count = vl.chars().count();
             let merged = if text.trim().is_empty() {
-                format!("[图片内容（由 {vl_key} 识别）]\n{vl}")
+                format!("[图片内容（由 {vl_model} 识别）]\n{vl}")
             } else {
-                format!("{text}\n\n[图片内容（由 {vl_key} 识别）]\n{vl}")
+                format!("{text}\n\n[图片内容（由 {vl_model} 识别）]\n{vl}")
             };
             (
                 UserInput {
                     text: merged,
                     images: Vec::new(),
                 },
-                Some(VisionNotice::Recognised { vl_key, char_count }),
+                Some(VisionNotice::Recognised { vl_model, char_count }),
             )
         }
         PreprocessOutcome::Failed { reason } => {
@@ -148,15 +148,15 @@ mod tests {
             vec![img()],
             PreprocessOutcome::Replaced {
                 text: "你好世界".to_string(), // 4 chars, 12 bytes
-                vl_key: "qwen-vl".to_string(),
+                vl_model: "qwen-vl".to_string(),
             },
         );
         assert!(input.images.is_empty(), "Replaced clears images for the model");
         assert!(input.text.contains("你好世界"), "VL text folded into caption");
         match notice {
-            Some(VisionNotice::Recognised { vl_key, char_count }) => {
+            Some(VisionNotice::Recognised { vl_model, char_count }) => {
                 assert_eq!(char_count, 4, "must be VL char count, not bytes/merged len");
-                assert_eq!(vl_key, "qwen-vl");
+                assert_eq!(vl_model, "qwen-vl");
             }
             other => panic!("expected Recognised, got {other:?}"),
         }

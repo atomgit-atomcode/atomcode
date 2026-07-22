@@ -11988,12 +11988,12 @@ fn handle_runtime_event(
                     renderer.flush();
                     return;
                 }
-                CodingRuntimeEvent::VisionPreprocessSuccess { vl_key, char_count } => {
+                CodingRuntimeEvent::VisionPreprocessSuccess { vl_model, char_count } => {
                     // Reuse the existing UiEvent handler so the "✓ VL recognised
                     // image, returned N chars · <model>" toast renders identically
                     // to the pre-bridge-retirement behavior.
                     handle_agent_event(
-                        AgentEvent::VisionPreprocessSuccess { vl_key, char_count },
+                        AgentEvent::VisionPreprocessSuccess { vl_model, char_count },
                         state,
                         think,
                         renderer,
@@ -13729,14 +13729,14 @@ fn handle_agent_event(
                 *slot = Some(msg);
             }
         }
-        AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
+        AgentEvent::VisionPreprocessSuccess { vl_model, char_count } => {
             // Format here (not in agent) so we can localize / restyle
             // without bumping the AgentEvent contract. Char count helps
             // users notice degenerate near-zero VL outputs that would
             // mislead the main model into "image failed" responses.
             let msg = crate::i18n::t(crate::i18n::Msg::VisionPreprocessSuccess { char_count })
                 .into_owned();
-            renderer.render(UiLine::VisionPreprocessSuccess { msg, model: vl_key });
+            renderer.render(UiLine::VisionPreprocessSuccess { msg, model: vl_model });
             renderer.flush();
         }
         AgentEvent::RestorePendingImages { images, markers } => {

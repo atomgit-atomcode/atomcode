@@ -6481,9 +6481,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_row(Vec::new());
             }
             UiLine::VisionPreprocessSuccess { msg, model } => {
-                // `{msg}  ` in default text style; `{model}` in Muted
-                // (gray) so the model identity reads as metadata, not
-                // as part of the success sentence. push_body_prefixed
+                // `{msg}  ` in default text style; `{model}` highlighted in
+                // bold Accent (cyan) so the VL model identity pops rather
+                // than reading as dim metadata — the user wants to see at a
+                // glance which model did the recognition. push_body_prefixed
                 // handles the two styles in a single visual line and
                 // continues onto wrapped rows with the prefix's display
                 // width as continuation pad.
@@ -6494,9 +6495,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // too cramped. The blank lets the success line breathe
                 // as its own paragraph.
                 let default_style = CellStyle::default();
-                let muted_style = self.style_for(Role::Muted);
+                let model_style = self.style_bold(Role::Accent);
                 let prefix = format!("{msg}  ");
-                self.push_body_prefixed(&prefix, &default_style, &model, &muted_style);
+                self.push_body_prefixed(&prefix, &default_style, &model, &model_style);
                 self.push_body_row(Vec::new());
             }
             UiLine::ModalOverlay {

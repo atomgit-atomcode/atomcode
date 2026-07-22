@@ -101,7 +101,7 @@ pub enum UiEvent {
         markers: Vec<usize>,
     },
     VisionPreprocessSuccess {
-        vl_key: String,
+        vl_model: String,
         char_count: usize,
     },
     SubAgentDispatchStart {

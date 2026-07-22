@@ -15,6 +15,18 @@ use crate::provider::{create_provider, model_name_suggests_vision, LlmProvider};
 use atomcode_config::config::Config;
 use futures::StreamExt;
 
+/// Human-facing display name for a VL model id: the bare model, with any
+/// vendor/namespace prefix stripped. Gateway model ids are commonly
+/// `vendor/model` (e.g. `Qwen/Qwen3-VL-8B-Instruct`); the user cares about
+/// the model, not the vendor, so we show only the segment after the last
+/// `/`. Ids without a `/` (e.g. `deepseek-v4-flash`) pass through unchanged.
+pub fn vl_model_display(model: &str) -> &str {
+    match model.rsplit_once('/') {
+        Some((_, tail)) if !tail.is_empty() => tail,
+        _ => model,
+    }
+}
+
 /// Outcome of a preprocessing attempt.
 #[derive(Debug, Clone)]
 pub enum PreprocessOutcome {
@@ -23,12 +35,14 @@ pub enum PreprocessOutcome {
     /// `(caption, images)` tuple unchanged.
     Skipped,
     /// VL call succeeded. `text` is the raw VL output (no wrapping);
-    /// `vl_key` is the provider key used (so the caller can show "by
-    /// {model}" in the splice wrapper). Caller is responsible for
-    /// splicing both into the user message — recommended shape:
-    /// `format!("{caption}\n\n[图片内容（由 {vl_key} 识别）]\n{text}")`
+    /// `vl_model` is the VL model's display name — the bare model id with
+    /// any vendor prefix stripped (e.g. `Qwen/Qwen3-VL-8B-Instruct` →
+    /// `Qwen3-VL-8B-Instruct`), NOT the `config.providers` key — so the
+    /// caller can show "by {model}" in the splice wrapper. Caller is
+    /// responsible for splicing both into the user message — recommended
+    /// shape: `format!("{caption}\n\n[图片内容（由 {vl_model} 识别）]\n{text}")`
     /// — and clearing the images vec.
-    Replaced { text: String, vl_key: String },
+    Replaced { text: String, vl_model: String },
     /// VL call failed (provider missing, network error, timeout, empty
     /// response). `reason` is intended for `AgentEvent::Warning`. Caller
     /// should append `"\n\n[图片识别失败]"` to the user message and clear
@@ -69,6 +83,11 @@ pub async fn maybe_preprocess(
             };
         }
     };
+
+    // Capture the model's display name before `vl_cfg` is moved into the
+    // blocking build below — this is what the "recognised" toast / splice
+    // wrapper shows, not the (often vendor-prefixed) config key.
+    let vl_model = vl_model_display(&vl_cfg.model).to_string();
 
     // Build a one-off VL provider. `create_provider` handles auth-token
     // loading (api_key=None) for the AtomGit gateway case, which may do blocking
@@ -192,7 +211,7 @@ pub async fn maybe_preprocess(
     } else {
         PreprocessOutcome::Replaced {
             text: trimmed.to_string(),
-            vl_key: vl_key.to_string(),
+            vl_model,
         }
     }
 }
@@ -204,6 +223,22 @@ mod tests {
 
     fn blank_config() -> Config {
         Config::default()
+    }
+
+    #[test]
+    fn vl_model_display_strips_vendor_prefix() {
+        assert_eq!(
+            vl_model_display("Qwen/Qwen3-VL-8B-Instruct"),
+            "Qwen3-VL-8B-Instruct"
+        );
+        // No vendor prefix — pass through unchanged.
+        assert_eq!(vl_model_display("deepseek-v4-flash"), "deepseek-v4-flash");
+        // Only the last segment matters if the id is deeply namespaced.
+        assert_eq!(vl_model_display("a/b/model-x"), "model-x");
+        // Trailing slash is degenerate — keep the whole string rather than
+        // showing an empty label.
+        assert_eq!(vl_model_display("vendor/"), "vendor/");
+        assert_eq!(vl_model_display(""), "");
     }
 
     fn sample_image() -> ImagePart {
@@ -369,12 +404,16 @@ mod tests {
         let result = maybe_preprocess(&cfg, &provider, "explain this", &[sample_image()]).await;
 
         match result {
-            PreprocessOutcome::Replaced { text, vl_key } => {
+            PreprocessOutcome::Replaced { text, vl_model } => {
                 assert_eq!(
                     text,
                     "Python stack trace showing ZeroDivisionError on line 42"
                 );
-                assert_eq!(vl_key, "vl", "Replaced must carry the configured key");
+                assert_eq!(
+                    vl_model, "Qwen3-VL-32B-Instruct",
+                    "Replaced must carry the VL model's display name (vendor prefix stripped), \
+                     not the config.providers key"
+                );
             }
             other => panic!("expected Replaced, got {other:?}"),
         }

@@ -43,7 +43,7 @@ pub enum CodingRuntimeEvent {
     Agent(AgentEvent),
     /// Vision (VL) preprocessing recognised the turn's image(s) — the driver
     /// renders a "✓ VL recognised image, returned N chars" status line.
-    VisionPreprocessSuccess { vl_key: String, char_count: usize },
+    VisionPreprocessSuccess { vl_model: String, char_count: usize },
     /// Vision (VL) preprocessing failed — the driver surfaces a warning and
     /// re-attaches the images it remembers from submit so the user can retry
     /// without re-pasting from the clipboard.
@@ -479,7 +479,7 @@ pub trait ImagePreprocessor: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VisionNotice {
     /// VL converted the image(s) to text — show the "recognised" toast.
-    Recognised { vl_key: String, char_count: usize },
+    Recognised { vl_model: String, char_count: usize },
     /// VL failed (images were cleared from the model request + a failure
     /// marker folded into the text) — the driver surfaces a warning and
     /// re-attaches the images it remembers from submit (the runtime doesn't
@@ -2440,10 +2440,10 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // BEFORE SendMessage so it renders right under the
                                 // user message, ahead of the assistant response.
                                 match notice {
-                                    Some(VisionNotice::Recognised { vl_key, char_count }) => {
+                                    Some(VisionNotice::Recognised { vl_model, char_count }) => {
                                         let _ = runtime_event_tx.send(
                                             CodingRuntimeEvent::VisionPreprocessSuccess {
-                                                vl_key,
+                                                vl_model,
                                                 char_count,
                                             },
                                         );
@@ -5832,7 +5832,7 @@ mod tests {
                     images: Vec::new(),
                 },
                 Some(VisionNotice::Recognised {
-                    vl_key: "vl".into(),
+                    vl_model: "vl".into(),
                     char_count: 3,
                 }),
             )
