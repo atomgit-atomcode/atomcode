@@ -9040,7 +9040,7 @@ fn handle_idle_key(
                 // already cached above from the raw form, so Ctrl+C edit
                 // restores the editable path, not the marker.
                 attach_typed_image_paths(app, ctx, &mut expanded, &mut images, &mut kept_markers);
-                {
+                if ctx.live_binding.is_none() {
                     // Echo the EXACT text the agent receives (`expanded`): the
                     // full pasted body with `[Pasted #N …]` placeholders expanded
                     // and typed image paths already rewritten to `[Image #N]`
@@ -10333,7 +10333,7 @@ fn handle_streaming_key(
                     q_markers.push(n);
                 }
             }
-            {
+            if ctx.live_binding.is_none() {
                 // Same as the idle submit path: echo the EXACT text queued for
                 // the agent (`expanded`) — the full pasted body, no
                 // `[Pasted #N …]` placeholder — while history keeps the folded
