@@ -15893,7 +15893,10 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             custom_text: p.custom_text.clone(),
             batch: Some(crate::render::UserInputBatchMeta {
                 total,
-                index: b.current + 1,
+                // 1-based current question; clamped so the Submit stop (current==total)
+                // never reports total+1 (the renderer ignores it there, but keep the
+                // contract honest).
+                index: (b.current + 1).min(total),
                 answered,
                 on_submit: b.on_submit_stop(),
             }),

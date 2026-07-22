@@ -36,10 +36,12 @@ impl CommandRegistry {
         // Built-in command names are all ASCII, so an ASCII
         // case-insensitive match is equivalent to a Unicode-correct
         // one here. `/SESSION` resolves to the same `session` entry
-        // as `/session`.
+        // as `/session`. Aliases resolve to their canonical command first,
+        // so `find("new")` returns the `session` entry (and its `needs_args`).
+        let canonical = canonical_command_name(name);
         self.commands
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .find(|c| c.name.eq_ignore_ascii_case(canonical))
             .copied()
     }
 
@@ -47,7 +49,7 @@ impl CommandRegistry {
         let prefix_lower = prefix.to_ascii_lowercase();
         self.commands
             .iter()
-            .filter(|c| !c.hidden && c.name.starts_with(prefix_lower.as_str()))
+            .filter(|c| !c.hidden && command_name_or_alias_has_prefix(c.name, &prefix_lower))
             .copied()
             .collect()
     }
@@ -72,6 +74,56 @@ impl CommandRegistry {
             ));
         }
         out
+    }
+}
+
+/// Alias → canonical built-in command name.
+///
+/// Unlike a hidden duplicate `Command` entry (the old `exit`/`quit` style), an
+/// alias is NOT a separate registry row: it shares the canonical command's
+/// single entry, is searchable by its own prefix in the slash menu, resolves to
+/// the canonical name on dispatch, and renders as `canonical (alias)` — one
+/// annotated row, not two. Add a pair here to give any command an alias.
+const COMMAND_ALIASES: &[(&str, &str)] = &[
+    // `/new` is a memorable alias for `/session` (start a fresh session).
+    ("new", "session"),
+];
+
+/// Resolve an alias to its canonical command name (ASCII case-insensitive).
+/// Returns the input unchanged when it is not a known alias — so it is safe to
+/// call on every command name before dispatch.
+pub fn canonical_command_name(name: &str) -> &str {
+    COMMAND_ALIASES
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
+        .map(|(_, canonical)| *canonical)
+        .unwrap_or(name)
+}
+
+/// The aliases that resolve to `canonical`, in table order.
+fn aliases_for(canonical: &str) -> impl Iterator<Item = &'static str> + '_ {
+    COMMAND_ALIASES
+        .iter()
+        .filter(move |(_, c)| c.eq_ignore_ascii_case(canonical))
+        .map(|(alias, _)| *alias)
+}
+
+/// True when `prefix_lower` (already lowercased) is a prefix of the command
+/// name OR of any of its aliases. Lets `/ne` surface the `session` command
+/// while `session` stays a single entry.
+fn command_name_or_alias_has_prefix(name: &str, prefix_lower: &str) -> bool {
+    name.starts_with(prefix_lower) || aliases_for(name).any(|a| a.starts_with(prefix_lower))
+}
+
+/// Slash-menu display label for a command: `session (new)` when it has
+/// aliases, else just the name. The renderer uses this so an alias shows as one
+/// annotated row; the stored item name stays canonical for insert/dispatch.
+pub fn command_display_name(canonical: &str) -> String {
+    let joined = aliases_for(canonical).collect::<Vec<_>>().join(", ");
+    if joined.is_empty() {
+        canonical.to_string()
+    } else {
+        format!("{canonical} ({joined})")
     }
 }
 
@@ -349,6 +401,58 @@ mod tests {
         let reg = CommandRegistry::builtin();
         assert!(reg.find("quit").is_some());
         assert!(reg.find("nonexistent").is_none());
+    }
+
+    #[test]
+    fn canonical_name_resolves_aliases_case_insensitively() {
+        assert_eq!(canonical_command_name("new"), "session");
+        assert_eq!(canonical_command_name("NEW"), "session");
+        // Non-alias names pass through unchanged.
+        assert_eq!(canonical_command_name("session"), "session");
+        assert_eq!(canonical_command_name("model"), "model");
+        assert_eq!(canonical_command_name("nonexistent"), "nonexistent");
+    }
+
+    #[test]
+    fn display_name_annotates_aliased_commands_only() {
+        assert_eq!(command_display_name("session"), "session (new)");
+        // Commands without aliases render as their bare name.
+        assert_eq!(command_display_name("model"), "model");
+        assert_eq!(command_display_name("resume"), "resume");
+    }
+
+    #[test]
+    fn find_resolves_alias_to_canonical_command() {
+        let reg = CommandRegistry::builtin();
+        let via_alias = reg.find("new").expect("/new must resolve to /session");
+        assert_eq!(via_alias.name, "session");
+        // The alias inherits the canonical command's args behavior.
+        assert_eq!(via_alias.needs_args, reg.find("session").unwrap().needs_args);
+    }
+
+    #[test]
+    fn matching_prefix_finds_command_by_alias_prefix_as_single_row() {
+        let reg = CommandRegistry::builtin();
+        // Typing the alias prefix surfaces the canonical command...
+        for prefix in ["n", "ne", "new"] {
+            let hits = reg.matching_prefix(prefix);
+            let sessions: Vec<_> = hits.iter().filter(|c| c.name == "session").collect();
+            assert_eq!(
+                sessions.len(),
+                1,
+                "prefix {prefix:?} must surface `session` exactly once (no duplicate row)"
+            );
+        }
+        // ...and typing the canonical prefix still works.
+        assert!(reg
+            .matching_prefix("sess")
+            .iter()
+            .any(|c| c.name == "session"));
+        // A prefix matching neither name nor alias yields nothing for session.
+        assert!(!reg
+            .matching_prefix("zzz")
+            .iter()
+            .any(|c| c.name == "session"));
     }
 
     #[test]

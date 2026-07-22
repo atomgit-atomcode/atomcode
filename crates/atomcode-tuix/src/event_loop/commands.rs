@@ -977,9 +977,11 @@ fn execute_slash_command_impl(
     // Built-in commands are all lowercase ASCII; normalise the user's
     // input so `/SESSION`, `/Session`, `/sEssIon` all hit the same arm
     // as `/session`. `arg` is left untouched — paths / URLs are
-    // case-sensitive in general.
+    // case-sensitive in general. Aliases (e.g. `/new`) then resolve to their
+    // canonical command name here, so `/new` hits the `session` arm without a
+    // dedicated match arm — add the alias to COMMAND_ALIASES only.
     let cmd_lower = cmd.to_ascii_lowercase();
-    let cmd = cmd_lower.as_str();
+    let cmd = crate::commands::canonical_command_name(&cmd_lower);
 
     // Emit use_command telemetry before dispatch so the event fires
     // regardless of whether the command succeeds or errors out.

@@ -1626,9 +1626,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 // pushed two cells to the right of their ASCII
                 // neighbours. UnicodeWidthStr knows CJK glyphs are
                 // 2 cells; compute and append spaces explicitly.
-                let name_width = unicode_width::UnicodeWidthStr::width(name);
+                // Annotate aliased commands as one row: `/session (new)`.
+                // The stored item name stays canonical (`session`) for
+                // insert/dispatch; only the visible label carries the alias.
+                let display = crate::commands::command_display_name(name);
+                let name_width = unicode_width::UnicodeWidthStr::width(display.as_str());
                 let pad = 12usize.saturating_sub(name_width);
-                let padded = format!("{}{}", name, " ".repeat(pad));
+                let padded = format!("{}{}", display, " ".repeat(pad));
                 if selected {
                     format!("▸ /{}  {}", padded, desc)
                 } else {
@@ -2933,10 +2937,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let hint = "Enter \u{63d0}\u{4ea4} \u{00b7} Tab/Shift+Tab \u{5207}\u{6362}\u{95ee}\u{9898} \u{00b7} Esc \u{653e}\u{5f03}";
             push_line(&mut out, hint, &hint_style);
         } else {
-            // The current question's own rows (header/question/options/Other/hint).
-            out.extend(self.build_user_input_rows(view, rule_width, screen_width));
-            // Tab 切换问题 · 到提交行 Enter 交全部
-            let hint = "Tab/Shift+Tab \u{5207}\u{6362}\u{95ee}\u{9898} \u{00b7} \u{5230}\u{63d0}\u{4ea4}\u{884c} Enter \u{4ea4}\u{5168}\u{90e8}";
+            // The current question's own rows. Drop its trailing hint row — the single
+            // hint ("Enter confirm · Esc cancel") is misleading inside a batch (Enter
+            // advances; submitting is a separate stop) — and replace it with one accurate
+            // batch hint.
+            let mut q = self.build_user_input_rows(view, rule_width, screen_width);
+            q.pop(); // the per-question hint (always the last row of build_user_input_rows)
+            out.extend(q);
+            // 作答 · Tab/Shift+Tab 切换问题 · 到提交行 Enter 交全部 · Esc 放弃
+            let hint = "\u{4f5c}\u{7b54} \u{00b7} Tab/Shift+Tab \u{5207}\u{6362}\u{95ee}\u{9898} \u{00b7} \u{5230}\u{63d0}\u{4ea4}\u{884c} Enter \u{4ea4}\u{5168}\u{90e8} \u{00b7} Esc \u{653e}\u{5f03}";
             push_line(&mut out, hint, &hint_style);
         }
         out
@@ -2949,8 +2958,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 if m.on_submit {
                     5 // nav + blank + submit + blank + hint
                 } else {
-                    // nav + blank + <single-question rows> + tab hint
-                    self.user_input_panel_row_count(view) + 3
+                    // nav + blank + <single-question rows minus its own hint> + batch hint
+                    self.user_input_panel_row_count(view) + 2
                 }
             }
             _ => self.user_input_panel_row_count(view),
@@ -13117,7 +13126,8 @@ mod tests {
             r.user_input_panel_view_row_count(&q),
             "row_count invariant (question)"
         );
-        assert_eq!(q_rows.len(), single_rows + 3);
+        // nav + blank + (single rows minus its own hint) + one batch hint = single + 2.
+        assert_eq!(q_rows.len(), single_rows + 2);
 
         // Submit stop: exactly 5 rows (nav + blank + submit + blank + hint).
         let sub = base(Some(UserInputBatchMeta {
