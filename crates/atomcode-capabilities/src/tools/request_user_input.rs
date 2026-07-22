@@ -25,6 +25,10 @@ pub struct UserInputOption {
     pub description: Option<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UserInputRequest {
     pub header: String,
@@ -32,6 +36,11 @@ pub struct UserInputRequest {
     pub mode: UserInputMode,
     #[serde(default)]
     pub options: Vec<UserInputOption>,
+    /// Whether the auto "type your own answer" free-text row is offered
+    /// (single/multiple). Default true (absent ⇒ true) — backward compatible.
+    /// Set false when `options` are exhaustive.
+    #[serde(default = "default_true")]
+    pub custom: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -206,7 +215,10 @@ impl Tool for RequestUserInputTool {
          up, or verify yourself. For ONE question, set `header`, `question`, `mode` \
          (\"single\"=pick one, \"multiple\"=pick any, \"text\"=free-form) and `options` \
          (non-empty for single/multiple). To ask up to 4 related questions answered in ONE \
-         interaction, pass a `questions` array of those same objects instead. Keep each \
+         interaction, pass a `questions` array of those same objects instead. A free-text \
+         \"type your own answer\" row is added automatically for single/multiple unless you set \
+         `custom` to false — so do NOT add your own \"Other\"/catch-all option; set \
+         `custom:false` when your options already cover every case. Keep each \
          `header` short (a few words)."
     }
 
@@ -229,7 +241,8 @@ impl Tool for RequestUserInputTool {
                             "description": {"type": "string"}
                         }
                     }
-                }
+                },
+                "custom": {"type": "boolean", "description": "Offer a free-text 'type your own answer' row (default true). Set false when your options are exhaustive."}
             }
         });
         serde_json::json!({
@@ -417,12 +430,14 @@ mod tests {
                     label: "OAuth".into(),
                     description: None,
                 }],
+                custom: true,
             },
             UserInputRequest {
                 header: "Note".into(),
                 question: "?".into(),
                 mode: UserInputMode::Text,
                 options: vec![],
+                custom: true,
             },
         ];
         let resps = vec![
@@ -447,10 +462,25 @@ mod tests {
             question: "?".into(),
             mode: UserInputMode::Text,
             options: vec![],
+            custom: true,
         }];
         let out = format_batch_result(&reqs, &[UserInputResponse::declined()]);
         assert!(!out.is_error);
         assert!(out.content.starts_with("No answer was provided."));
+    }
+
+    #[test]
+    fn parse_custom_defaults_true_and_reads_false() {
+        let r = parse_args(
+            r#"{"header":"H","question":"Q?","mode":"single","options":[{"label":"A"}]}"#,
+        )
+        .unwrap();
+        assert!(r.custom, "custom absent → defaults true");
+        let r2 = parse_args(
+            r#"{"header":"H","question":"Q?","mode":"single","options":[{"label":"A"}],"custom":false}"#,
+        )
+        .unwrap();
+        assert!(!r2.custom, "custom:false parsed");
     }
 
     #[test]
@@ -463,6 +493,7 @@ mod tests {
                 label: "A".into(),
                 description: None,
             }],
+            custom: true,
         };
         assert_eq!(
             serde_json::from_str::<UserInputRequest>(&serde_json::to_string(&req).unwrap())
