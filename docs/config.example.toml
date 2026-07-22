@@ -229,7 +229,7 @@ enabled = true
 initial_turns = 4
 max_turns = 12
 max_concurrent = 3
-timeout_secs = 300
+timeout_secs = 900
 
 # =============================================================================
 # LSP（语言服务器协议）
