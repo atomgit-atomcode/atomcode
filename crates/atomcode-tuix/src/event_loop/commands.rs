@@ -1770,11 +1770,28 @@ fn execute_slash_command_impl(
             // remote/phone view omits it. Order is owned by `assemble_status`.
             let proxy = format!("  Proxy:  {}\n", ctx.config.network.proxy.summary());
             let txt = build_status_text(ctx, Some(&proxy));
-            renderer.render(UiLine::CommandOutput(txt));
-            renderer.flush();
+            if matches!(state.phase, crate::state::UiPhase::Streaming) && !ctx.is_plain_renderer {
+                // Mid-turn: keep the report in the footer snapshot below the input
+                // box (like `/usage` and `/cost`) instead of injecting it into
+                // conversation scrollback, where live tool output would interleave
+                // with it. Drop any live `/usage` panel so its tab keys don't steer
+                // a report that's no longer on screen.
+                state.footer_usage = None;
+                state.footer_command_output = Some(txt);
+            } else {
+                renderer.render(UiLine::CommandOutput(txt));
+                renderer.flush();
+            }
         }
         "diff" => {
-            if ctx.is_plain_renderer || !matches!(state.phase, crate::state::UiPhase::Idle) {
+            if matches!(state.phase, crate::state::UiPhase::Streaming) && !ctx.is_plain_renderer {
+                // Mid-turn: footer snapshot, not scrollback (see `/status`). The
+                // error text folds into the same snapshot so a failed diff still
+                // reports below the input box.
+                state.footer_usage = None;
+                state.footer_command_output =
+                    Some(build_diff_stat_text(ctx).unwrap_or_else(|e| e));
+            } else if ctx.is_plain_renderer || !matches!(state.phase, crate::state::UiPhase::Idle) {
                 match build_diff_stat_text(ctx) {
                     Ok(text) => renderer.render(UiLine::CommandOutput(text)),
                     Err(error) => renderer.render(UiLine::Error(error)),

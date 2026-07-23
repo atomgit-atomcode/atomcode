@@ -8810,9 +8810,12 @@ fn handle_input(
                     other => deferred.push(other),
                 }
             }
-            if app.active_modal.is_some() {
-                renderer.clear_screen();
-            }
+            // NOTE: do NOT `clear_screen()` here when a modal is open — that
+            // calls `reset()`, which drops `body_log`, so the `on_resize` reflow
+            // below would replay an empty transcript and wipe the conversation
+            // ("从大屏到小屏之后就会丢失上面的内容", seen with /view & /diff).
+            // `on_resize` already fully wipes+reflows the terminal and drops the
+            // stale modal overlay itself (so #1158 duplication stays fixed).
             renderer.on_resize(cols, rows);
             // A resize invalidates any open modal's cached overlay
             // geometry (it was built for the old size). Rebuild it now so
@@ -11460,10 +11463,11 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
     // READ-ONLY / METADATA commands that are SAFE mid-turn — they don't mutate
     // the running conversation. This is the reported
     // request: rename the session or check usage without waiting for the turn to end.
-    //   /status, /diff — read-only scrollback reports (no args).
-    //   /cost, /usage — transient footer reports below the input box; Esc dismisses
-    //   the report without cancelling the live turn. `/usage` avoids its interactive
-    //   modal here because streaming redraws would paint over that overlay.
+    //   /status, /diff, /cost, /usage — transient footer reports below the input box;
+    //   Esc dismisses the report without cancelling the live turn. Mid-turn they land
+    //   in the footer snapshot, not conversation scrollback, so live tool output can't
+    //   interleave with them. `/usage` avoids its interactive modal here because
+    //   streaming redraws would paint over that overlay.
     if matches!(
         cmd.to_ascii_lowercase().as_str(),
         "status" | "cost" | "diff" | "usage"
@@ -11875,8 +11879,10 @@ fn handle_streaming_key(
                 app.menu.selected = 0;
                 if readonly {
                     // Restore the streaming footer/spinner after executing the report.
-                    // `/usage` and `/cost` are carried in the footer snapshot itself;
-                    // `/status` and `/diff` land in scrollback above it.
+                    // Mid-turn read-only reports (`/usage`, `/cost`, `/status`, `/diff`)
+                    // are all carried in the footer snapshot itself, below the input
+                    // box — they must not enter conversation scrollback, where live
+                    // tool output would interleave with them.
                     draw_spinner_now(
                         &mut app.state,
                         &app.buf,

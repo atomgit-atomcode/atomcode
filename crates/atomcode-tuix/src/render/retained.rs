@@ -7472,6 +7472,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if cols == self.screen.width() && rows == self.screen.height() {
             return;
         }
+        // Drop any cached `/diff` / `/view` modal overlay: it was laid out for the
+        // OLD geometry, so letting `paint_frame` below re-stamp it would ghost the
+        // panel at a stale position (issue #1158 — "modal duplicated on resize").
+        // The event-loop resize handler rebuilds it fresh via `m.draw()` right
+        // after this returns. Crucially we clear ONLY the overlay here, not the
+        // whole screen: the handler used to call `clear_screen()` (= `reset()`,
+        // which also drops `body_log`) for this, so the `reflow_body_to_current_width`
+        // below replayed an EMPTY log and the entire transcript was lost on any
+        // resize while a panel was open ("从大屏到小屏后上面的内容丢失").
+        self.modal_overlay = None;
+        self.diff_overlay_active = false;
         // Diagnostic (opt-in via ATOMCODE_TUIX_LOG): trace each resize phase
         // BEFORE the corresponding console write, so a conhost fastfail during
         // a window drag still leaves the killing phase as the last RSZ line.
@@ -17072,6 +17083,71 @@ mod tests {
                 out
             );
         }
+    }
+
+    #[test]
+    fn on_resize_with_modal_overlay_preserves_transcript_and_drops_stale_overlay() {
+        // Regression: resizing while a `/view` or `/diff` panel is open must NOT
+        // wipe the conversation ("从大屏到小屏之后就会丢失上面的内容"). The
+        // event-loop resize handler used to call `clear_screen()` (= `reset()`,
+        // which drops `body_log`) before `on_resize()`, so the reflow replayed an
+        // EMPTY log and the whole transcript vanished. The fix removes that
+        // `clear_screen()` and has `on_resize` drop only its stale modal overlay
+        // (the caller rebuilds it via `m.draw()`), preserving `body_log` so the
+        // reflow rebuilds the transcript.
+        let (mut r, buf) = new_capturing(60, 20);
+        for i in 0..5 {
+            r.render(UiLine::AssistantText(format!("transcript line {i}\n")));
+        }
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        // Open a `/diff`-style panel (sets `modal_overlay` + `diff_overlay_active`).
+        let title =
+            DiffPanelRow::new(vec![DiffPanelSpan::new("Diff", DiffPanelTone::Default).bold()]);
+        let panel_rows = vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
+            "a.rs",
+            DiffPanelTone::Default,
+        )])];
+        r.render(UiLine::DiffPanel {
+            title,
+            rows: panel_rows,
+            footer: "Esc close".into(),
+            win_width: 60,
+            win_height: 15,
+        });
+        r.flush_deferred();
+        assert!(r.modal_overlay.is_some(), "panel should install an overlay");
+        let logged = r.body_log.len();
+        assert!(logged > 0, "transcript must be logged before resize: {logged}");
+        buf.lock().unwrap().clear();
+
+        // Shrink the terminal while the panel is open.
+        r.on_resize(60, 12);
+
+        // Root-cause guard: the transcript log survives (the old `clear_screen()`
+        // path would have emptied it → 0).
+        assert!(
+            r.body_log.len() >= logged,
+            "resize must preserve the transcript log (was {logged}, now {})",
+            r.body_log.len()
+        );
+        // …and the reflow re-emitted it into the shrunk viewport.
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        assert!(
+            out.contains("transcript line 4"),
+            "reflow must repaint the transcript after resize: {out:?}"
+        );
+        // Stale overlay dropped so `on_resize` can't stamp it at the old geometry
+        // (the #1158 duplication); the caller's `m.draw()` rebuilds it fresh.
+        assert!(
+            r.modal_overlay.is_none(),
+            "resize must drop the stale modal overlay so it isn't painted twice"
+        );
     }
 
     /// Regression for the reasoning-text SGR-in-cells corruption: when
