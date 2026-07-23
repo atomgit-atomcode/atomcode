@@ -360,8 +360,10 @@ use it for a single quick edit, a one-off command, or a purely informational / c
 /// (see `coding_persona`) — degrades gracefully when no skills are installed.
 const SKILLS_USAGE: &str = "\n\n## SKILLS:\n\
 If a task clearly matches an installed skill's description — not only when the user names the \
-skill — you MUST load it with `use_skill` and follow it BEFORE doing the work. Installed skills \
-are listed under the '=== AVAILABLE SKILLS ===' section of this system prompt. This takes \
+skill — you MUST load it with `use_skill` and follow it BEFORE doing the work. When any skills \
+are installed, they are listed under the '=== AVAILABLE SKILLS ===' section of this system \
+prompt; if that section is absent, none are installed — proceed normally without `use_skill`. \
+This takes \
 priority over asking the user a clarifying question: if a skill matches the request (e.g. \
 brainstorming for a design/build request), load it FIRST and let it drive the questions — do \
 not ask ad-hoc questions or start exploring/planning before loading it. Announce in one line \
@@ -773,6 +775,13 @@ mod tests {
             "skill-trigger guidance always present"
         );
         assert!(p.contains("use_skill"), "names the skill-loading tool");
+        // The block is injected unconditionally (weak-model reinforcement), so it must NOT
+        // assert skills exist — an empty catalog has no '=== AVAILABLE SKILLS ===' section.
+        // The wording is conditional and tells the model an absent section means none installed.
+        assert!(
+            p.contains("if that section is absent, none are installed"),
+            "SKILLS guidance must handle the empty-catalog case, not falsely claim skills exist"
+        );
         // Anti-bypass: a matching skill must win over an ad-hoc clarifying question
         // (the observed failure: request_user_input pre-empted brainstorming).
         assert!(
