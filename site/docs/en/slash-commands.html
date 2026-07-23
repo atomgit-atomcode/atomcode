@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -100,12 +102,12 @@
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/view &lt;filepath&gt;</code></td><td>Open a read-only overlay to view a file's content (supports arrow keys, PageUp/Down, g/G to jump to top/bottom)</td></tr>
+          <tr><td><code>/view</code> · <code>/view &lt;filepath&gt;</code></td><td>Open a read-only file viewer. With <strong>no argument</strong>, a fuzzy files-only picker opens (type to filter; a path-like query such as <code>~/…</code> or <code>./…</code> can open a file <em>outside</em> the project). With a path, it opens that file directly. Scroll with arrows / PageUp-Down / Home-End (or <kbd>g</kbd>/<kbd>G</kbd> to jump to top/bottom); <kbd>Esc</kbd> backs out, <kbd>Ctrl+C</kbd> exits</td></tr>
           <tr><td><code>/undo</code> · <code>/undo N</code></td><td>Roll conversation memory back to before the last turn (or turn N) and restore that prompt into the input box; rewinds memory only — does not revert files on disk</td></tr>
-          <tr><td><code>/diff</code></td><td>Show the git diff of uncommitted changes in the working directory</td></tr>
+          <tr><td><code>/diff</code></td><td>Show the git diff of uncommitted changes in the working directory (the file list shows up to 5 rows at a time with a "more files" scroll indicator)</td></tr>
           <tr><td><code>/review</code></td><td>Code review the current changes: <code>/review</code> reviews uncommitted changes, <code>/review staged</code> the staged diff, <code>/review &lt;base&gt;</code> against a base ref</td></tr>
           <tr><td><code>/paste</code></td><td>Attach an image from the clipboard (Windows fallback for when <code>Ctrl+V</code> is captured by the terminal)</td></tr>
-          <tr><td><code>/cost</code></td><td>Show output tokens for the current session. APIs without usage reporting are estimated automatically</td></tr>
+          <tr><td><code>/cost</code></td><td>Local token cost for the current session — works with any model (including self-integrated ones); APIs without usage reporting are estimated. Distinct from <code>/usage</code>, which queries the CodingPlan gateway for your plan quota</td></tr>
           <tr><td><code>/context</code></td><td>Show this turn's context budget breakdown: system prompt, tool defs, cold-zone compaction, total messages, and context-window usage</td></tr>
           <tr><td><code>/compact</code></td><td>Compact history: summarise earlier messages to free up context budget</td></tr>
           <tr><td><code>/clear</code></td><td>Clear the current session's messages (working directory and model are kept)</td></tr>
@@ -113,11 +115,16 @@
           <tr><td><code>/background &lt;task&gt;</code></td><td>Dispatch a task to an isolated background agent (read-only-leaning tool subset) without polluting the main conversation. Useful for "go check X on the side" sort of light exploration. See <a href="./sessions.html#bg">Background sessions</a></td></tr>
           <tr><td><code>/worktree &lt;subcommand&gt;</code></td><td>Git worktree isolation: <code>create</code> a new branch with its own worktree, <code>list</code> existing worktrees, <code>done</code> squash worktree changes back to the main branch, <code>cleanup</code> remove finished worktrees</td></tr>
           <tr><td><code>/issue</code></td><td>Interactive wizard: file a new issue against the AtomGit repository for the current git repo (requires OAuth login; cwd must be a clone of an atomgit.com repository)</td></tr>
-          <tr><td><code>/todo</code></td><td>Reprint the current todo list — derived from the session transcript (locates the most recent <code>todowrite</code> tool call and re-renders it), with "in-progress / done" status markers. The list is stateless (nothing extra is written to disk); the model maintains it during long tasks and you can run this anytime to check progress</td></tr>
+          <tr><td><code>/todo</code> · <code>/todo add &lt;task&gt;</code> · <code>/todo clear</code></td><td>Reprint the current todo list — derived from the session transcript (locates the most recent <code>todowrite</code> tool call and re-renders it), with "in-progress / done" status markers. <code>/todo add &lt;task&gt;</code> appends a task deterministically (no model round-trip); <code>/todo clear</code> empties the list. The list is stateless (nothing extra is written to disk); the model maintains it during long tasks and you can run this anytime to check progress</td></tr>
           <tr><td><code>/copy</code></td><td>Copy a code block from the last reply to the clipboard: <code>/copy</code> copies the only block, <code>/copy N</code> the N-th, <code>/copy all</code> every code block, <code>/copy msg</code> the whole reply as raw markdown</td></tr>
           <tr><td><code>/save</code></td><td>Export the current conversation to a markdown file: <code>/save</code> uses an auto-generated filename, <code>/save &lt;filename&gt;</code> a name you choose</td></tr>
         </tbody>
       </table>
+
+      <div class="callout callout-info">
+        <strong>Read-only reports run mid-turn</strong>
+        <p>You don't have to wait for a turn to finish to check on things: <code>/status</code>, <code>/diff</code>, <code>/cost</code>, <code>/usage</code>, and <code>/rename</code> run even while the agent is streaming. They render as a transient panel below the input box (press <kbd>Esc</kbd> to dismiss) without interrupting the running turn. <code>/usage</code> mid-turn is also tab-switchable across its Current / Overview / Models views.</p>
+      </div>
 
       <h2>Conversation modes &amp; thinking</h2>
       <table>

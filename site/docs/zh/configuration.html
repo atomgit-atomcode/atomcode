@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -158,6 +160,26 @@ api_key = "ANTHROPIC_API_KEY" # 自动从环境变量 ANTHROPIC_API_KEY 中读�
         <strong>为什么默认 64K 而不是 128K?</strong>
         <p>即便模型官方声称支持 128K+,其有效注意力窗口通常要小得多,过大上下文反而会触发"迷失在中段"的问题,并且阻止 AtomCode 的上下文压缩策略生效。64K 是经验上最稳的默认值,若你确定模型表现良好,可自行上调。</p>
       </div>
+
+      <h2>网络与代理</h2>
+      <p>AtomCode 默认跟随系统代理配置,因此在公司代理后也能开箱即用。行为在 <code>[network.proxy]</code> 下配置:</p>
+      <pre><code>[network.proxy]
+mode = "follow_system"    # 默认 —— 采用环境变量 + 系统代理
+# mode = "default_proxy"  # 使用下面显式的 http/https/all
+# mode = "no_proxy"       # 强制直连
+# http  = "http://127.0.0.1:7890"
+# https = "http://127.0.0.1:7890"
+# all   = "socks5://127.0.0.1:1080"
+# no_proxy = "localhost,127.0.0.1,.internal"</code></pre>
+      <table>
+        <thead><tr><th>mode</th><th>行为</th></tr></thead>
+        <tbody>
+          <tr><td><code>follow_system</code>(默认)</td><td>采用 <code>HTTP_PROXY</code> / <code>HTTPS_PROXY</code> / <code>ALL_PROXY</code> / <code>NO_PROXY</code>;未设置的部分回退到操作系统的系统代理(Windows 注册表 / macOS <code>scutil --proxy</code>)。</td></tr>
+          <tr><td><code>default_proxy</code></td><td>使用本段里显式的 <code>http</code> / <code>https</code> / <code>all</code> / <code>no_proxy</code> 值。</td></tr>
+          <tr><td><code>no_proxy</code></td><td>强制直连,忽略环境变量与系统代理。</td></tr>
+        </tbody>
+      </table>
+      <p>IPv6 代理主机会自动加方括号(<code>::1</code> → <code>http://[::1]:8080</code>)。若登录时连接失败或超时,错误信息会指向你的代理 / 网络设置,便于区分是代理问题还是凭据错误。</p>
 
       <h2>常见 provider 配置示例</h2>
 

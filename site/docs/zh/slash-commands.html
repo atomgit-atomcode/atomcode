@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -100,12 +102,12 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/view &lt;文件路径&gt;</code></td><td>以只读浮层打开文件内容（支持方向键翻页、PageUp/Down、g/G 跳转到首/末行）</td></tr>
+          <tr><td><code>/view</code> · <code>/view &lt;文件路径&gt;</code></td><td>打开只读文件查看器。<strong>不带参数</strong>时打开一个模糊「仅文件」选择器(输入即筛选;像 <code>~/…</code> 或 <code>./…</code> 这类路径式查询还能打开项目<em>之外</em>的文件)。带路径则直接打开该文件。方向键 / PageUp-Down / Home-End(或 <kbd>g</kbd>/<kbd>G</kbd> 跳到首/末行)滚动;<kbd>Esc</kbd> 退回,<kbd>Ctrl+C</kbd> 退出</td></tr>
           <tr><td><code>/undo</code> · <code>/undo N</code></td><td>把对话记忆回退到上一轮(或第 N 轮)之前,并把那一轮的 prompt 还原回输入框;只回退记忆,不恢复磁盘文件</td></tr>
-          <tr><td><code>/diff</code></td><td>显示当前工作目录未提交改动的 git diff</td></tr>
+          <tr><td><code>/diff</code></td><td>显示当前工作目录未提交改动的 git diff(文件列表一次最多显示 5 行,并带「更多文件」滚动提示)</td></tr>
           <tr><td><code>/review</code></td><td>对当前改动做代码审查:<code>/review</code> 审查未提交改动,<code>/review staged</code> 审查暂存区,<code>/review &lt;base&gt;</code> 对比某个基准 ref</td></tr>
           <tr><td><code>/paste</code></td><td>从剪贴板粘贴图片(Windows 下 <code>Ctrl+V</code> 被终端拦截时的备用入口)</td></tr>
-          <tr><td><code>/cost</code></td><td>展示当前会话输出 token 数。不支持 usage 报告的 API 会自动估算</td></tr>
+          <tr><td><code>/cost</code></td><td>当前会话的本地 token 花费 —— 适用于任意模型(含自接入模型);不支持 usage 报告的 API 会自动估算。与 <code>/usage</code> 不同,后者查询的是 CodingPlan 网关的套餐额度</td></tr>
           <tr><td><code>/context</code></td><td>显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用</td></tr>
           <tr><td><code>/compact</code></td><td>压缩历史消息,把早期对话压缩成摘要以腾出上下文预算</td></tr>
           <tr><td><code>/clear</code></td><td>清空当前会话的消息(保留工作目录和模型)</td></tr>
@@ -113,11 +115,16 @@
           <tr><td><code>/background &lt;任务&gt;</code></td><td>把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于"顺手让它去查一下 X"这类轻探索。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
           <tr><td><code>/worktree &lt;子命令&gt;</code></td><td>Git worktree 隔离:<code>create</code> 在新分支上拉一份独立 worktree、<code>list</code> 查看现有 worktree、<code>done</code> 把 worktree 改动 squash 回主分支、<code>cleanup</code> 清理已完成的 worktree</td></tr>
           <tr><td><code>/issue</code></td><td>交互式向导:在当前 git 仓库对应的 AtomGit 仓库创建一个新 issue(需先 OAuth 登录,cwd 必须是 atomgit.com 仓库的 clone)</td></tr>
-          <tr><td><code>/todo</code></td><td>重新打印当前待办清单 —— 从会话记录里派生(定位最近一次 <code>todowrite</code> 工具调用并重渲染),带「进行中 / 已完成」状态标记。清单是无状态派生的,不额外落盘;模型执行长任务时会自己维护它,你也可以随时用此命令查看进度</td></tr>
+          <tr><td><code>/todo</code> · <code>/todo add &lt;任务&gt;</code> · <code>/todo clear</code></td><td>重新打印当前待办清单 —— 从会话记录里派生(定位最近一次 <code>todowrite</code> 工具调用并重渲染),带「进行中 / 已完成」状态标记。<code>/todo add &lt;任务&gt;</code> 确定性地追加一条任务(不走模型);<code>/todo clear</code> 清空清单。清单是无状态派生的,不额外落盘;模型执行长任务时会自己维护它,你也可以随时用此命令查看进度</td></tr>
           <tr><td><code>/copy</code></td><td>把上一条回复里的代码块复制到剪贴板:<code>/copy</code> 复制唯一代码块、<code>/copy N</code> 复制第 N 个、<code>/copy all</code> 复制全部代码块、<code>/copy msg</code> 复制整条回复的 markdown 原文</td></tr>
           <tr><td><code>/save</code></td><td>把当前会话导出成 markdown 文件:<code>/save</code> 用自动生成的文件名,<code>/save &lt;文件名&gt;</code> 指定文件名</td></tr>
         </tbody>
       </table>
+
+      <div class="callout callout-info">
+        <strong>只读报告可在回合中运行</strong>
+        <p>不必等回合结束就能查看状态:<code>/status</code>、<code>/diff</code>、<code>/cost</code>、<code>/usage</code>、<code>/rename</code> 在 agent 流式输出时也能运行。它们以输入框下方的临时面板呈现(按 <kbd>Esc</kbd> 关闭),不打断进行中的回合。<code>/usage</code> 在回合中还能在 Current / Overview / Models 视图间按 Tab 切换。</p>
+      </div>
 
       <h2>对话模式与思考</h2>
       <table>

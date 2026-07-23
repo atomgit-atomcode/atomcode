@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -104,6 +106,7 @@
       </ul>
       <p>如果同一个 server 同时写了 <code>command</code> 和 <code>url</code>,当前实现会优先按 stdio(<code>command</code>)处理;为避免歧义,对外配置请不要双写。</p>
       <p>字符串里支持 <code>${VAR}</code> 与 <code>${VAR:-默认值}</code> 的环境变量展开;敏感令牌不要写死,放到环境变量里。<code>disabled: true</code> 可临时关掉某个 server 而不删条目。</p>
+      <p><code>.mcp.json</code> 还支持 <strong>JSONC 注释</strong> —— <code>//</code> 行注释和 <code>/* */</code> 块注释 —— 可以给某个 server 加说明或临时注释掉而不必删除。字符串值内部的注释符号(比如 URL 里的 <code>//</code>)会被原样保留。</p>
 
       <h3>stdio 示例(本地子进程)</h3>
       <pre><code>{
@@ -196,6 +199,15 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
         <p>把 MCP 工具返回的内容当作不可信数据处理,<strong>不要</strong>让它升级成系统指令。一个返回结果带「请忽略之前的指示」的 MCP server,模型不应该照办。</p>
       </div>
 
+      <h2>项目信任(.mcp.json)</h2>
+      <p>定义在<strong>项目级</strong> <code>.mcp.json</code> 里的 server <strong>在你信任该项目前都是不受信任的</strong>。一个刚 clone 下来、自带 <code>.mcp.json</code> 的仓库不会在你机器上自动拉起子进程 —— 它的项目级 server 会被挡在连接循环之外(fail-closed),你会看到一条 <em>blocked-untrusted</em> 提示列出它们。用户全局 server(<code>~/.atomcode/mcp.json</code>)不受影响。</p>
+      <p>信任按项目目录记录,存于 <code>~/.atomcode/mcp_trust.json</code>:</p>
+      <ul>
+        <li><code>/mcp trust</code> —— 信任当前项目;它的 <code>.mcp.json</code> server 立即连接(隐式跑一次 <code>/mcp reload</code>)。</li>
+        <li><code>/mcp untrust</code> —— 撤销信任;该项目的 MCP tools 立刻移除。</li>
+      </ul>
+      <p>在 <a href="./webui.html">Web UI</a> 里,一个 <strong>信任项目</strong> 按钮通过 <code>POST /live/mcp/trust</code> 做同样的事,MCP 状态会显示哪些 server 已连接、哪些被挡下。</p>
+
       <h2>斜杠命令</h2>
       <table>
         <thead>
@@ -205,6 +217,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
           <tr><td><code>/mcp</code></td><td>列出<strong>已成功连接</strong>的 server 及状态(失败的 server 不在列表里,只在会话区有红色错误行)</td></tr>
           <tr><td><code>/mcp tools &lt;server&gt;</code></td><td>异步列出某个 server 实际暴露的远端 tools</td></tr>
           <tr><td><code>/mcp reload</code></td><td>重新读取 <code>.mcp.json</code> / <code>~/.atomcode/mcp.json</code> 并后台重连启用中的 server</td></tr>
+          <tr><td><code>/mcp trust</code> / <code>/mcp untrust</code></td><td>信任(或取消信任)当前项目,使其 <code>.mcp.json</code> server 可以连接</td></tr>
         </tbody>
       </table>
 

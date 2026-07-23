@@ -1,15 +1,15 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Project Instructions · AtomCode Docs</title>
-<meta name="description" content="Pin per-project conventions and preferences in .atomcode.md so AtomCode follows them automatically.">
+<title>交互提问 · AtomCode 文档</title>
+<meta name="description" content="AtomCode 会在真正需要抉择时停下来，向你提一个结构化问题——单选、多选或自由文本。">
 <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
 <link rel="stylesheet" href="../docs.css">
 <script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
 </head>
-<body data-page="project-instructions">
+<body data-page="interactive-questions">
 
 <header class="dhdr" id="dhdr">
   <a class="dhdr-logo" href="../../index.html">
@@ -75,79 +75,65 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Project Instructions</h1>
-      <p class="lede">Drop a <code>.atomcode.md</code> in your project root to pin tech-stack details, conventions, and preferences. AtomCode injects it into the system prompt at startup, so you don't have to repeat the rules every conversation.</p>
+<h1>交互提问</h1>
+      <p class="lede">在真正需要抉择的岔路口——需求含糊、两种可行方案二选一——AtomCode 会停下来向你提一个结构化问题，而不是替你猜。你就地作答，它拿到你的选择后继续。该能力由 <code>request_user_input</code> 工具驱动，<strong>默认开启</strong>。</p>
 
-      <h2>Why bother</h2>
-      <p>A typical scenario: your team uses the Composition API exclusively — Options API is banned. Every time you ask AtomCode to write a new component, you have to remind it. With <code>.atomcode.md</code>, that preference rides along on every conversation automatically.</p>
-
-      <h2>File location</h2>
-      <ul>
-        <li>Default path: <code>.atomcode.md</code> at the project root</li>
-        <li>AtomCode walks upwards from the current working directory until it finds the file, or hits <code>$HOME</code></li>
-        <li>If the file doesn't exist, no related content appears in the system prompt</li>
-      </ul>
-
-      <h2>Example</h2>
-      <pre><code># Project Instructions
-
-This is a Vue 3 + TypeScript project using Pinia for state,
-Tailwind for styles, and Vitest for unit tests.
-
-## Conventions
-
-- Components must use `&lt;script setup lang="ts"&gt;` Composition API
-- Only Tailwind for styling — no inline style attributes, no standalone .css files
-- All API calls go through `src/services/*`; never fetch directly in components
-- State lives in Pinia stores — components keep no derived global state
-
-## Commands
-
-- Dev: `pnpm dev`
-- Typecheck: `pnpm typecheck`
-- Tests: `pnpm test`
-- Build: `pnpm build`
-
-## Notes
-
-- Do not modify `src/generated/*` — it's auto-generated from OpenAPI
-- Test coverage must stay above 80%; new modules must ship with unit tests</code></pre>
-
-      <h2>Tips for writing .atomcode.md</h2>
-      <ul>
-        <li><strong>Only write what's different from the norm</strong> — the model already knows generic best practices; don't repeat them here.</li>
-        <li><strong>Prefer commands over descriptions</strong> — "run tests with <code>pnpm test</code>", not "please run the unit tests".</li>
-        <li><strong>Use imperatives</strong> — "Use X", "Don't Y" — avoid hedge words like "suggest", "if possible".</li>
-        <li><strong>List forbidden zones</strong> — call out files / directories that must not be touched. The model is highly compliant.</li>
-        <li><strong>Keep it short</strong> — every line costs tokens; 30-80 lines is usually plenty.</li>
-      </ul>
-
-      <div class="callout callout-tip">
-        <strong>Tip</strong>
-        <p>If you have repetitive workflows (e.g. the same set of commands every bug fix), don't bloat <code>.atomcode.md</code> — write a <a href="./skills.html">Skill</a> instead. It's clearer and more reusable.</p>
+      <div class="callout callout-info">
+        <strong>它不是权限审批</strong>
+        <p><a href="./approvals.html">权限审批</a>问的是「能不能<em>执行某个工具</em>」（跑命令、改文件）；交互提问问的是「<em>你怎么决定</em>」——偏好，或在几种做法之间选一个。两者面板不同、按键不同、含义不同。拒答一个问题从不算错误；拒绝一次审批则会拦下该工具。</p>
       </div>
 
-      <h2>Relationship to AGENTS.md / CLAUDE.md / GEMINI.md</h2>
-      <p>AtomCode natively supports <code>AGENTS.md</code>, the <a href="https://agents.md/">open standard</a> for AI coding agent context. If you have a project that already uses <code>AGENTS.md</code>, AtomCode will pick it up automatically — no extra setup needed. The lookup order is:</p>
-      <ol>
-        <li><code>.atomcode.md</code></li>
-        <li><code>ATOMCODE.md</code></li>
-        <li><code>AGENTS.md</code></li>
-        <li><code>CLAUDE.md</code> / <code>claude.md</code></li>
-      </ol>
-      <p>First match wins. If you also use Claude Code or Gemini CLI in the same project, they each have their own instruction files:</p>
-      <ul>
-        <li>AtomCode &rarr; <code>.atomcode.md</code> or <code>AGENTS.md</code></li>
-        <li>Claude Code &rarr; <code>CLAUDE.md</code></li>
-        <li>Gemini CLI &rarr; <code>GEMINI.md</code></li>
-      </ul>
-      <p>These don't conflict. By using <code>AGENTS.md</code>, you can share the same instruction file across multiple AI coding tools that follow the open standard.</p>
+      <h2>三种提问类型</h2>
+      <table>
+        <thead>
+          <tr><th>类型</th><th>行为</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>single 单选</strong></td><td>单选列表——只选一项，按 <kbd>Enter</kbd> 立即提交。</td></tr>
+          <tr><td><strong>multiple 多选</strong></td><td>复选框——任意多选，再到 <strong>Submit（提交）</strong>行确认。</td></tr>
+          <tr><td><strong>text 文本</strong></td><td>自由文本作答，无选项。</td></tr>
+        </tbody>
+      </table>
+      <p>单选和多选还会额外提供一行 <strong>“Other——自己输入答案”</strong>，让你不被限死在给定选项里。只有当模型判定选项已穷尽时才会隐藏该行。</p>
 
-      <h2>Next steps</h2>
-      <ul>
-        <li><a href="./skills.html">Skills</a> — abstract reusable workflows into commands</li>
-      </ul>
+      <h2>在终端里作答</h2>
+      <table>
+        <thead>
+          <tr><th>按键</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td>在选项（以及 Other / Submit 行）间移动</td></tr>
+          <tr><td><kbd>1</kbd>–<kbd>9</kbd></td><td>跳到（单选）或切换（多选）第 N 个选项</td></tr>
+          <tr><td><kbd>Space</kbd></td><td>切换当前复选框（多选）；在编辑 Other 行时输入空格</td></tr>
+          <tr><td><kbd>Enter</kbd></td><td>单选：提交高亮项 · 多选：在 Submit 行提交 · 文本：提交输入内容</td></tr>
+          <tr><td>输入 / <kbd>Backspace</kbd></td><td>编辑 Other 行或自由文本答案</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>拒答——AtomCode 会按自己的最佳判断继续</td></tr>
+          <tr><td><kbd>Ctrl+C</kbd></td><td>拒答 <em>并</em> 取消当前回合</td></tr>
+        </tbody>
+      </table>
+      <p>单选题一键即可作答（高亮后按 <kbd>Enter</kbd>）；多选题用 <kbd>Enter</kbd>/<kbd>Space</kbd> 勾选各行，只有激活专门的 <strong>Submit</strong> 行才真正提交。</p>
 
+      <h2>一次问多个问题</h2>
+      <p>当同一个抉择点上有不止一个要问的，AtomCode 会把它们（最多四个）合并进一个面板，而不是反复打断你。用 <kbd>Tab</kbd> 在各题间切换，逐一作答，再一次性提交。只有一个问题时的渲染与以前完全一致。</p>
+
+      <h2>在 Web UI 中</h2>
+      <p>同样的问题会在 <a href="./webui.html">Web UI</a> 里以 <strong>UserInputCard</strong> 卡片出现：单选按钮、复选框或文本框，以及同样的可选自由文本行。多题会变成一个小步进器——用 <kbd>→</kbd> / <kbd>←</kbd> 按钮前后翻题，最后一个 <strong>Submit</strong> 一次性提交全部答案，<strong>Skip</strong> 则拒答。答案通过实时 SSE 通道回传，所以从浏览器发起的回合会像终端一样暂停、再继续。</p>
+
+      <h2>关闭该功能</h2>
+      <p>该功能默认开启。若要关闭，启动前设置环境变量：</p>
+      <pre><code>ATOMCODE_REQUEST_USER_INPUT=0 atomcode</code></pre>
+      <p><code>0</code>、<code>false</code>、<code>off</code> 或空值任一都会关闭；不设置（或其它值）则保持开启。关闭后，AtomCode 不再提问，始终按自己的最佳判断继续。</p>
+      <div class="callout callout-info">
+        <strong>Bypass 模式自动跳过提问</strong>
+        <p>在 <strong>Bypass / 免审批</strong> 模式下，面板会被自动跳过，AtomCode 不等待直接继续。<strong>Build</strong>、<strong>Plan</strong>、<strong>Accept Edits</strong> 模式都会正常展示问题。</p>
+      </div>
+
+      <h2>相关</h2>
+      <ul>
+        <li><a href="./approvals.html">权限审批</a> —— 独立的权限门控系统</li>
+        <li><a href="./webui.html">WebUI 界面</a> —— 审批模式与浏览器体验</li>
+        <li><a href="./configuration.html">配置文件</a> —— 环境变量与设置</li>
+      </ul>
     <footer class="dftr">
       <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
       <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>

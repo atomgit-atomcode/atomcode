@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -116,6 +118,20 @@
         <li><code>/sync off</code> — leave sync and return to a standalone session.</li>
       </ul>
       <p>This makes "start in the terminal, watch progress on a phone / tablet" — or several people watching the same agent session — possible.</p>
+
+      <h2>Approval modes</h2>
+      <p>A pill in the bottom bar sets how the agent's actions are gated — the browser mirror of the terminal's approval modes. The default is <strong>Build</strong>.</p>
+      <table>
+        <thead><tr><th>Mode</th><th>Behaviour</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Build</strong> (default)</td><td>Interactive — every file edit and command asks for approval before it runs.</td></tr>
+          <tr><td><strong>Accept Edits</strong></td><td>File edits are auto-approved; commands still ask.</td></tr>
+          <tr><td><strong>Plan</strong></td><td>Read-only exploration — write and execute tools are blocked so the agent proposes a plan first.</td></tr>
+          <tr><td><strong>Bypass</strong> (免审批)</td><td>⚠ Auto-approves everything, including edits and commands. Use with care.</td></tr>
+        </tbody>
+      </table>
+      <p>The mode is process-wide and broadcast over the live channel, so switching it in one tab updates every connected view. It is not written to your config — it resets to <strong>Build</strong> on restart.</p>
+      <p>When the agent needs a decision from you mid-task, an <strong>interactive question</strong> card appears (single choice, multiple choice, or free text) and the turn pauses until you answer. See <a href="./interactive-questions.html">Interactive Questions</a> for the full behaviour.</p>
 
       <h2>Remote access</h2>
       <p>Want to open the webui from a phone without exposing it publicly? Use a 蒲公英 (Oray PGY) virtual LAN: bind the server to the virtual IP with <code>/webui --host &lt;virtual IP&gt;</code>, then scan the QR in the Remote Access panel. Full walkthrough in <a href="./webui-remote-access.html">Remote Access</a>.</p>

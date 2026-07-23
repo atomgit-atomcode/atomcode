@@ -1,15 +1,15 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Project Instructions · AtomCode Docs</title>
-<meta name="description" content="Pin per-project conventions and preferences in .atomcode.md so AtomCode follows them automatically.">
+<title>子代理 · AtomCode 文档</title>
+<meta name="description" content="通过 task 工具把可并行、机械或只读的子任务委派给短生命周期子代理，并强制写入范围。">
 <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
 <link rel="stylesheet" href="../docs.css">
 <script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
 </head>
-<body data-page="project-instructions">
+<body data-page="subagents">
 
 <header class="dhdr" id="dhdr">
   <a class="dhdr-logo" href="../../index.html">
@@ -75,79 +75,65 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Project Instructions</h1>
-      <p class="lede">Drop a <code>.atomcode.md</code> in your project root to pin tech-stack details, conventions, and preferences. AtomCode injects it into the system prompt at startup, so you don't have to repeat the rules every conversation.</p>
+<h1>子代理</h1>
+      <p class="lede">当一个任务能被干净地切分——可并行的编辑、机械重复的改动、或只读的调查——主代理可以通过 <code>task</code> 工具把子任务交给短生命周期的<strong>子代理</strong>。每个子代理在自己独立的上下文里运行；跨文件的推理和最终结果仍由主代理掌控。<code>task</code> 工具<strong>默认开启</strong>。</p>
 
-      <h2>Why bother</h2>
-      <p>A typical scenario: your team uses the Composition API exclusively — Options API is banned. Every time you ask AtomCode to write a new component, you have to remind it. With <code>.atomcode.md</code>, that preference rides along on every conversation automatically.</p>
+      <h2>两种子代理</h2>
+      <table>
+        <thead>
+          <tr><th>类型</th><th>能做什么</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>explore 探索</strong></td><td>只读调查——读取、搜索代码库来回答「在哪 / 怎么做」，返回结论。<strong>不能改文件。</strong></td></tr>
+          <tr><td><strong>worker 执行</strong></td><td>执行一个被精确指定的改动。可自由读取，但<em>写入</em>被限制在声明的 <code>scope</code> 范围内。</td></tr>
+        </tbody>
+      </table>
 
-      <h2>File location</h2>
+      <h2>它们如何运行</h2>
       <ul>
-        <li>Default path: <code>.atomcode.md</code> at the project root</li>
-        <li>AtomCode walks upwards from the current working directory until it finds the file, or hits <code>$HOME</code></li>
-        <li>If the file doesn't exist, no related content appears in the system prompt</li>
+        <li>子代理并行运行，同时最多 <code>max_concurrent</code> 个，各自独立上下文。</li>
+        <li>每个子任务带一个难度：<code>simple</code> 路由到你的<strong>快速</strong>模型，<code>hard</code> 路由到<strong>能力更强</strong>的模型——依据你所配置各 provider 的 <code>capable_model</code> 档位来选。只有单个 provider 时，子代理使用当前模型。</li>
+        <li>主代理在继续前会审阅每个结果——子代理提议，主代理定夺。</li>
       </ul>
 
-      <h2>Example</h2>
-      <pre><code># Project Instructions
-
-This is a Vue 3 + TypeScript project using Pinia for state,
-Tailwind for styles, and Vitest for unit tests.
-
-## Conventions
-
-- Components must use `&lt;script setup lang="ts"&gt;` Composition API
-- Only Tailwind for styling — no inline style attributes, no standalone .css files
-- All API calls go through `src/services/*`; never fetch directly in components
-- State lives in Pinia stores — components keep no derived global state
-
-## Commands
-
-- Dev: `pnpm dev`
-- Typecheck: `pnpm typecheck`
-- Tests: `pnpm test`
-- Build: `pnpm build`
-
-## Notes
-
-- Do not modify `src/generated/*` — it's auto-generated from OpenAPI
-- Test coverage must stay above 80%; new modules must ship with unit tests</code></pre>
-
-      <h2>Tips for writing .atomcode.md</h2>
+      <h2>Worker 范围与安全</h2>
+      <p><code>worker</code> 子任务<strong>必须</strong>声明一个 <code>scope</code>：一组相对工作目录、允许写入的 glob，例如 <code>["src/auth/**", "Cargo.toml"]</code>。这是强制的，不是建议：</p>
       <ul>
-        <li><strong>Only write what's different from the norm</strong> — the model already knows generic best practices; don't repeat them here.</li>
-        <li><strong>Prefer commands over descriptions</strong> — "run tests with <code>pnpm test</code>", not "please run the unit tests".</li>
-        <li><strong>Use imperatives</strong> — "Use X", "Don't Y" — avoid hedge words like "suggest", "if possible".</li>
-        <li><strong>List forbidden zones</strong> — call out files / directories that must not be touched. The model is highly compliant.</li>
-        <li><strong>Keep it short</strong> — every line costs tokens; 30-80 lines is usually plenty.</li>
+        <li>范围之外的写入（<code>edit_file</code>、<code>write_file</code>、<code>search_replace</code>）会被 WorkerScopeGate <strong>直接拒绝</strong>——不弹审批。</li>
+        <li>读取和 <code>bash</code> 不受范围限制。</li>
+        <li>只要一次派发里含有 <code>worker</code>，就被视为 <strong>Risky</strong> 操作，会先走<a href="./approvals.html">审批</a>并展示各自的范围。</li>
+        <li>多个 worker 同时跑时，给它们互不重叠的范围，避免相互覆盖。</li>
       </ul>
 
-      <div class="callout callout-tip">
-        <strong>Tip</strong>
-        <p>If you have repetitive workflows (e.g. the same set of commands every bug fix), don't bloat <code>.atomcode.md</code> — write a <a href="./skills.html">Skill</a> instead. It's clearer and more reusable.</p>
-      </div>
+      <h2>配置</h2>
+      <p>在 <code>~/.atomcode/config.toml</code> 中调整子代理池：</p>
+      <pre><code>[subagent]
+max_concurrent = 3     # 同时并行的子代理数（最小 1）
+timeout_secs   = 900   # 每个子任务的墙钟超时，秒（最小 30）
+max_rounds     = 200   # 每个子任务的模型轮次上限（0 = 不限）</code></pre>
+      <table>
+        <thead>
+          <tr><th>键</th><th>默认</th><th>含义</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>max_concurrent</code></td><td>3</td><td>并行运行的子代理数</td></tr>
+          <tr><td><code>timeout_secs</code></td><td>900</td><td>每个子任务的墙钟超时（下限 30 秒）</td></tr>
+          <tr><td><code>max_rounds</code></td><td>200</td><td>每个子任务的模型轮次上限；<code>0</code> = 不限</td></tr>
+        </tbody>
+      </table>
+      <p>环境变量覆盖：<code>ATOMCODE_SUBAGENT_TIMEOUT</code> 和 <code>ATOMCODE_SUBAGENT_MAX_ROUNDS</code> 优先于配置值。</p>
 
-      <h2>Relationship to AGENTS.md / CLAUDE.md / GEMINI.md</h2>
-      <p>AtomCode natively supports <code>AGENTS.md</code>, the <a href="https://agents.md/">open standard</a> for AI coding agent context. If you have a project that already uses <code>AGENTS.md</code>, AtomCode will pick it up automatically — no extra setup needed. The lookup order is:</p>
-      <ol>
-        <li><code>.atomcode.md</code></li>
-        <li><code>ATOMCODE.md</code></li>
-        <li><code>AGENTS.md</code></li>
-        <li><code>CLAUDE.md</code> / <code>claude.md</code></li>
-      </ol>
-      <p>First match wins. If you also use Claude Code or Gemini CLI in the same project, they each have their own instruction files:</p>
+      <h2>关闭该功能</h2>
+      <p><code>task</code> 工具默认开启。若要彻底移除它，设置：</p>
+      <pre><code>ATOMCODE_SUBAGENT=0 atomcode</code></pre>
+      <p><code>0</code>、<code>false</code>、<code>off</code> 任一都会关闭；不设置（或其它值）则保持开启。</p>
+
+      <h2>相关</h2>
       <ul>
-        <li>AtomCode &rarr; <code>.atomcode.md</code> or <code>AGENTS.md</code></li>
-        <li>Claude Code &rarr; <code>CLAUDE.md</code></li>
-        <li>Gemini CLI &rarr; <code>GEMINI.md</code></li>
+        <li><a href="./tools.html">内置工具</a> —— 子代理可用的工具</li>
+        <li><a href="./approvals.html">权限审批</a> —— 为什么 worker 派发会请求审批</li>
+        <li><a href="./configuration.html">配置文件</a> —— 完整的 <code>config.toml</code> 参考</li>
       </ul>
-      <p>These don't conflict. By using <code>AGENTS.md</code>, you can share the same instruction file across multiple AI coding tools that follow the open standard.</p>
-
-      <h2>Next steps</h2>
-      <ul>
-        <li><a href="./skills.html">Skills</a> — abstract reusable workflows into commands</li>
-      </ul>
-
     <footer class="dftr">
       <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
       <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
