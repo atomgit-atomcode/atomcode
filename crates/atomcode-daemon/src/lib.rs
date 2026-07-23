@@ -3764,7 +3764,7 @@ async fn process_chat_request(
 /// This function is self-contained — it does NOT touch any TUI code path.
 pub(crate) fn build_api_system_prompt(
     working_dir: &PathBuf,
-    _config: &Config,
+    config: &Config,
     provider_config: &atomcode_config::config::provider::ProviderConfig,
     skill_registry: &Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
 ) -> String {
@@ -3802,6 +3802,7 @@ pub(crate) fn build_api_system_prompt(
     // Git commit attribution (Co-Authored-By trailer).
     prompt.push_str(&format!(
         "\n=== GIT COMMITS ===\n\
+         {}\n\
          When you create a git commit on the user's behalf, end the commit \
          message with this trailer (preceded by a blank line):\n\
          \n\
@@ -3811,6 +3812,9 @@ pub(crate) fn build_api_system_prompt(
          preserved verbatim. Skip this trailer for `git commit --amend` \
          and `git revert` (those operate on existing commits whose \
          attribution shouldn't change).\n",
+        atomcode_coding::commit_language_guidance(Some(
+            atomcode_config::i18n::resolve_initial_locale(None, config.language),
+        )),
         model_display
     ));
 
@@ -6756,5 +6760,16 @@ mod channel_mode_tests {
             "daemon prompt must NOT carry the offline block when online: {prompt}"
         );
         reset_offline_verdict_for_test();
+    }
+
+    #[test]
+    fn build_api_system_prompt_uses_configured_commit_language() {
+        let (wd, mut cfg, pcfg, sr) = minimal_build_api_system_prompt_fixture();
+        cfg.language = Some(atomcode_config::locale::Locale::ZhCn);
+
+        let prompt = build_api_system_prompt(&wd, &cfg, &pcfg, &sr);
+
+        assert!(prompt.contains("subject and body in Simplified Chinese"));
+        assert!(prompt.contains("Conventional Commit types/scopes"));
     }
 }

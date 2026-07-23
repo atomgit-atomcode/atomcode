@@ -482,6 +482,10 @@ pub(crate) fn chat_runtime_config(
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         model: p.map(|p| p.model.clone()).unwrap_or_default(),
+        preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
+            None,
+            config.language,
+        )),
         provider_name: provider_name.to_string(),
         working_dir: working_dir.to_path_buf(),
         context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),

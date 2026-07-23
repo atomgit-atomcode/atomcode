@@ -438,7 +438,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/upgrade` | Upgrade atomcode to latest (subcommand: `rollback`) |
 | `/setup` | First run: install the recommended skill and run it |
 | `/welcome` | Re-run the onboarding wizard |
-| `/language` | Switch display language |
+| `/language` | Switch display and default Git commit-message language |
 | `/issue` | Report a bug / request a feature (interactive wizard) |
 | `/guide <question>` | Ask atomcode-guide how to use AtomCode |
 | `/keys` | Show keyboard shortcuts |

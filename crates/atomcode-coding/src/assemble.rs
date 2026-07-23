@@ -2,7 +2,7 @@
 
 use crate::config::CodingAgentConfig;
 use crate::discipline::VerifyCadenceHook;
-use crate::persona::coding_persona;
+use crate::persona::coding_persona_with_language;
 use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
 use atomcode_capabilities::provider::{
     model_suggests_vision, OpenAiCompatConfig, OpenAiCompatProvider,
@@ -68,8 +68,9 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(mount_coding_tools(model_suggests_vision(&cfg.model)))
-        .persona(coding_persona(
+        .persona(coding_persona_with_language(
             &cfg.model,
+            cfg.preferred_language,
             todo_enabled,
             crate::persona::request_user_input_switch_enabled(),
         ))

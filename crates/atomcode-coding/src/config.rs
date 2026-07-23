@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use atomcode_config::locale::Locale;
 use atomcode_kernel::agent::ToolLoopPolicy;
 
 /// Everything [`build_coding_agent`](crate::build_coding_agent) needs: provider
@@ -17,6 +18,9 @@ pub struct CodingAgentConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// Preferred language for natural-language commit subjects and bodies.
+    /// `None` means follow the current conversation language.
+    pub preferred_language: Option<Locale>,
     /// Stable config/provider registry key exposed to drivers. This is distinct
     /// from `provider_type`, which selects the adapter implementation.
     pub provider_name: String,
@@ -133,6 +137,7 @@ pub struct CodingRuntimeConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    pub preferred_language: Option<Locale>,
     pub provider_name: String,
     pub working_dir: PathBuf,
     pub context_window: u32,
@@ -182,6 +187,10 @@ impl CodingRuntimeConfig {
             model: provider
                 .map(|provider| provider.model.clone())
                 .unwrap_or_default(),
+            preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
+                None,
+                config.language,
+            )),
             provider_name,
             working_dir: working_dir.to_path_buf(),
             context_window: provider
@@ -223,6 +232,7 @@ impl CodingRuntimeConfig {
             &self.working_dir,
         );
         config.context_window = self.context_window;
+        config.preferred_language = self.preferred_language;
         config.provider_name = self.provider_name.clone();
         config.chat_options.max_tokens = self.max_tokens;
         config.telemetry = self.telemetry.clone();
@@ -448,6 +458,7 @@ impl CodingAgentConfig {
             base_url: base_url.into(),
             provider_name: model.clone(),
             model,
+            preferred_language: None,
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
@@ -487,6 +498,26 @@ mod tests {
         assert_eq!(c.max_rounds, 200);
         assert_eq!(c.goal_max_rounds, 200);
         assert_eq!(c.goal_max_duration_secs, 7200);
+    }
+
+    #[test]
+    fn runtime_config_passes_preferred_language_to_agent() {
+        let mut source = atomcode_config::config::Config::default();
+        source.language = Some(Locale::ZhCn);
+        let runtime = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+
+        assert_eq!(runtime.preferred_language, Some(Locale::ZhCn));
+        assert_eq!(
+            runtime.agent_config().preferred_language,
+            Some(Locale::ZhCn)
+        );
     }
 
     #[test]

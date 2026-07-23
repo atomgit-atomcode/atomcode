@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use super::{
     apply_persisted_config, bg_runtime, deactivate_runtime_provider_after_logout,
     provider_transition_pending, reload_persisted_config, request_context_stats_render,
-    save_and_reload, LoopCtx, PersistedConfigReload,
+    save_and_reload, save_language_and_reload, LoopCtx, PersistedConfigReload,
 };
 use crate::i18n::{t, Msg};
 use crate::modals::usage::{UsageData, UsageModal};
@@ -1639,32 +1639,7 @@ fn execute_slash_command_impl(
             } else {
                 match arg.parse::<atomcode_config::locale::Locale>() {
                     Ok(locale) => {
-                        crate::i18n::set_locale(locale);
-                        ctx.config.language = Some(locale);
-                        match ctx.config_store.update(|config| {
-                            config.language = Some(locale);
-                            Ok(())
-                        }) {
-                            Ok(commit) => {
-                                ctx.observed_config_revision = Some(commit.snapshot.revision)
-                            }
-                            Err(e) => eprintln!("[language] failed to save config: {e}"),
-                        }
-                        // Display label matches the picker's option list
-                        // so /language en and /language zh both echo a
-                        // human-readable name, not just the locale code.
-                        let label = match locale {
-                            atomcode_config::locale::Locale::En => "English",
-                            atomcode_config::locale::Locale::ZhCn => "简体中文",
-                        };
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::LanguageSwitched {
-                                label,
-                                locale: &locale.to_string(),
-                            })
-                            .into_owned(),
-                        ));
-                        renderer.flush();
+                        save_language_and_reload(ctx, locale, renderer);
                     }
                     Err(_) => {
                         let msg = t(Msg::ErrUnsupportedLocale { input: arg });

@@ -433,7 +433,7 @@ atomcode --prompt-file task.md
 | `/upgrade` | 升级 atomcode 到最新版（子命令：`rollback`） |
 | `/setup` | 首次运行：安装推荐 skill 并执行 |
 | `/welcome` | 重新运行引导向导 |
-| `/language` | 切换显示语言 |
+| `/language` | 切换显示语言及默认 Git 提交消息语言 |
 | `/issue` | 反馈 bug / 提交功能需求（交互式向导） |
 | `/guide <问题>` | 向 atomcode-guide 询问使用方式 |
 | `/keys` | 查看键盘快捷键 |

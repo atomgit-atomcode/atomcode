@@ -89,17 +89,21 @@ fn reload_runtime_provider_from(
     ctx: &LoopCtx,
     source: &Config,
 ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
-    let config = atomcode_coding::CodingRuntimeConfig::from_config(
+    let mut config = atomcode_coding::CodingRuntimeConfig::from_config(
         source,
         &ctx.working_dir,
         None,
         Some(ctx.telemetry.clone()),
         ctx.dangerously_skip_permissions,
         true,
-    )
-    .agent_config();
+    );
+    // Preserve a process-level CLI language override for ordinary provider reloads.
+    // A changed config language (from `/language` or external reload) intentionally wins.
+    if source.language == ctx.config.language {
+        config.preferred_language = Some(crate::i18n::current_locale());
+    }
     ctx.runtime.reload_provider(
-        config,
+        config.agent_config(),
         ctx.foreground_runtime_id,
         ctx.runtime_event_tx.clone(),
     )
@@ -7660,7 +7664,9 @@ fn should_reload_provider(
     }
     let recovering_atomgit_auth =
         requires_atomgit_auth && runtime_availability == RuntimeUiAvailability::AwaitingProvider;
+    let prompt_language_changed = current.language != desired.language;
     recovering_atomgit_auth
+        || prompt_language_changed
         || (mode == crate::ProviderSelectionMode::FollowGlobalDefault
             && !current
                 .providers
@@ -7733,6 +7739,17 @@ fn commit_desired_config(
     })
 }
 
+fn commit_language_without_reload(
+    store: &ConfigStore,
+    observed_revision: Option<&ConfigRevision>,
+    current: &Config,
+    locale: atomcode_config::locale::Locale,
+) -> Result<DesiredConfigCommit, anyhow::Error> {
+    let mut desired = current.clone();
+    desired.language = Some(locale);
+    commit_desired_config(store, observed_revision, &desired, false)
+}
+
 fn observed_revision_for_write(
     observed: Option<&ConfigRevision>,
 ) -> Result<ConfigRevision, anyhow::Error> {
@@ -7798,6 +7815,22 @@ mod external_config_tests {
             crate::ProviderSelectionMode::Pinned,
             &config("model-a", false),
             &config("model-b", false),
+            RuntimeUiAvailability::Available,
+            true,
+        ));
+    }
+
+    #[test]
+    fn language_change_reloads_prompt_even_for_pinned_provider() {
+        let mut current = config("model-a", false);
+        current.language = Some(atomcode_config::locale::Locale::En);
+        let mut desired = current.clone();
+        desired.language = Some(atomcode_config::locale::Locale::ZhCn);
+
+        assert!(should_reload_provider(
+            crate::ProviderSelectionMode::Pinned,
+            &current,
+            &desired,
             RuntimeUiAvailability::Available,
             true,
         ));
@@ -7877,6 +7910,27 @@ mod external_config_tests {
         let persisted = store.read().unwrap();
         assert_eq!(persisted.config.providers["main"].model, "external-model");
         assert_eq!(persisted.revision, external.snapshot.revision);
+    }
+
+    #[test]
+    fn same_language_confirmation_rejects_a_stale_disk_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        let mut english = config("runtime-model", false);
+        english.language = Some(atomcode_config::locale::Locale::En);
+        let observed = store.replace(&english).unwrap();
+        let mut chinese = english.clone();
+        chinese.language = Some(atomcode_config::locale::Locale::ZhCn);
+        let external = store.replace(&chinese).unwrap();
+
+        assert!(commit_language_without_reload(
+            &store,
+            Some(&observed.snapshot.revision),
+            &english,
+            atomcode_config::locale::Locale::En,
+        )
+        .is_err());
+        assert_eq!(store.read().unwrap().revision, external.snapshot.revision);
     }
 
     #[test]
@@ -8336,6 +8390,12 @@ fn reconcile_persisted_config(
         auth_available,
     ) {
         let (provider, model) = resolved_provider_and_model(&desired);
+        if ctx.config.language != desired.language {
+            crate::i18n::set_locale(atomcode_config::i18n::resolve_initial_locale(
+                None,
+                desired.language,
+            ));
+        }
         ctx.config = desired;
         ctx.model_name = model.clone();
         atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
@@ -11212,6 +11272,58 @@ pub(crate) fn save_and_reload(
             false
         }
     }
+}
+
+pub(crate) fn save_language_and_reload(
+    ctx: &mut LoopCtx,
+    locale: atomcode_config::locale::Locale,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    if ctx.config.language == Some(locale) && crate::i18n::current_locale() == locale {
+        if provider_transition_pending(ctx) {
+            renderer.render(UiLine::Error(
+                crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+            ));
+            renderer.flush();
+            return false;
+        }
+        let commit = match commit_language_without_reload(
+            &ctx.config_store,
+            ctx.observed_config_revision.as_ref(),
+            &ctx.config,
+            locale,
+        ) {
+            Ok(committed) => committed.commit,
+            Err(error) => {
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
+                        error: &error.to_string(),
+                    })
+                    .into_owned(),
+                ));
+                renderer.flush();
+                return false;
+            }
+        };
+        ctx.observed_config_revision = Some(commit.snapshot.revision);
+        let label = match locale {
+            atomcode_config::locale::Locale::En => "English",
+            atomcode_config::locale::Locale::ZhCn => "简体中文",
+        };
+        renderer.render(UiLine::CommandOutput(
+            crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
+                label,
+                locale: &locale.to_string(),
+            })
+            .into_owned(),
+        ));
+        renderer.flush();
+        return true;
+    }
+
+    let mut desired = ctx.config.clone();
+    desired.language = Some(locale);
+    save_and_reload(ctx, desired, renderer, String::new(), false)
 }
 
 /// Switch only this `CodingRuntime`. The shared `config.toml` default remains a
@@ -15119,8 +15231,16 @@ fn handle_runtime_event(
                         selection_mode_after_success,
                         ..
                     } = pending;
+                    let previous_language = ctx.config.language;
                     let (provider, model) = resolved_provider_and_model(&desired_config);
                     ctx.config = desired_config;
+                    let language_changed = previous_language != ctx.config.language;
+                    if language_changed {
+                        crate::i18n::set_locale(atomcode_config::i18n::resolve_initial_locale(
+                            None,
+                            ctx.config.language,
+                        ));
+                    }
                     if let Some(mode) = selection_mode_after_success {
                         ctx.provider_selection_mode = mode;
                     }
@@ -15156,7 +15276,21 @@ fn handle_runtime_event(
                                 .into_owned(),
                         ));
                     } else {
-                        if let Some(announcement) = announce {
+                        if language_changed {
+                            let locale = crate::i18n::current_locale();
+                            let label = match locale {
+                                atomcode_config::locale::Locale::En => "English",
+                                atomcode_config::locale::Locale::ZhCn => "简体中文",
+                            };
+                            renderer.render(UiLine::CommandOutput(
+                                crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
+                                    label,
+                                    locale: &locale.to_string(),
+                                })
+                                .into_owned(),
+                            ));
+                        }
+                        if let Some(announcement) = announce.filter(|value| !value.is_empty()) {
                             renderer.render(UiLine::CommandOutput(announcement));
                         }
                         if manual_reload_announce {

@@ -84,7 +84,39 @@ pub fn offline_environment_block() -> String {
     s
 }
 
+pub fn commit_language_guidance(language: Option<atomcode_config::locale::Locale>) -> &'static str {
+    use atomcode_config::locale::Locale;
+
+    match language {
+        Some(Locale::ZhCn) => {
+            "Write the natural-language parts of the commit subject and body in Simplified Chinese. \
+Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
+or project commit-message rule takes precedence."
+        }
+        Some(Locale::En) => {
+            "Write the natural-language parts of the commit subject and body in English. \
+Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
+or project commit-message rule takes precedence."
+        }
+        None => {
+            "Match the natural-language parts of the commit message to the user's current conversation language. \
+Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
+or project commit-message rule takes precedence."
+        }
+    }
+}
+
 pub fn coding_persona(model: &str, todo_enabled: bool, request_user_input_enabled: bool) -> String {
+    coding_persona_with_language(model, None, todo_enabled, request_user_input_enabled)
+}
+
+pub fn coding_persona_with_language(
+    model: &str,
+    preferred_language: Option<atomcode_config::locale::Locale>,
+    todo_enabled: bool,
+    request_user_input_enabled: bool,
+) -> String {
+    let commit_language = commit_language_guidance(preferred_language);
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
     let mut p = format!(
         "You are AtomCode, an AI coding agent by AtomGit running the {model} model. \
@@ -99,6 +131,7 @@ instruction or remembered preference conflicts with a default below, follow the 
 and remembered preferences are NOT secondary to these defaults. (Exception: the safety, approval, and \
 destructive-action gates are not overridable by a project file.)\n{RULES}\n\n\
 ## GIT COMMITS:\n\
+{commit_language}\n\
 When you create a git commit on the user's behalf, end the commit message with this \
 trailer (preceded by a blank line) — use a HEREDOC for `git commit -m` so the blank line \
 is preserved verbatim:\n\
@@ -988,6 +1021,28 @@ mod tests {
             cfg!(windows),
             "PLATFORM section iff windows"
         );
+    }
+
+    #[test]
+    fn persona_defaults_commit_message_to_conversation_language() {
+        let p = coding_persona("m", true, false);
+        assert!(
+            p.contains("Match the natural-language parts of the commit message to the user's current conversation language"),
+            "commit guidance must cover the subject and body, not only the trailer"
+        );
+    }
+
+    #[test]
+    fn persona_uses_configured_commit_language_without_translating_protocol_tokens() {
+        use atomcode_config::locale::Locale;
+
+        let zh = coding_persona_with_language("m", Some(Locale::ZhCn), true, false);
+        assert!(zh.contains("subject and body in Simplified Chinese"));
+        assert!(zh.contains("Conventional Commit types/scopes"));
+
+        let en = coding_persona_with_language("m", Some(Locale::En), true, false);
+        assert!(en.contains("subject and body in English"));
+        assert!(en.contains("code identifiers, and trailers unchanged"));
     }
 
     #[test]

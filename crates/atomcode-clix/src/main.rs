@@ -701,9 +701,17 @@ pub(crate) struct ProviderEntry {
 #[derive(Deserialize, Default)]
 struct FileConfig {
     #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
     default_provider: Option<String>,
     #[serde(default)]
     providers: HashMap<String, ProviderEntry>,
+}
+
+#[derive(Default)]
+pub(crate) struct ConfigSelection {
+    pub(crate) provider: Option<ProviderEntry>,
+    pub(crate) language: Option<atomcode_config::locale::Locale>,
 }
 
 /// Parse a config.toml string into the subset we need (ignoring unrelated keys).
@@ -715,6 +723,16 @@ fn parse_file_config(toml_str: &str) -> Result<FileConfig> {
 fn pick_provider(fc: &FileConfig, override_name: Option<&str>) -> Option<ProviderEntry> {
     let name = override_name.or(fc.default_provider.as_deref())?;
     fc.providers.get(name).cloned()
+}
+
+fn select_config(fc: &FileConfig, provider: Option<&str>) -> ConfigSelection {
+    ConfigSelection {
+        provider: pick_provider(fc, provider),
+        language: fc
+            .language
+            .as_deref()
+            .and_then(|language| language.parse().ok()),
+    }
 }
 
 /// `~/.atomcode/config.toml` (honors $ATOMCODE_HOME, else $HOME / %USERPROFILE%).
@@ -732,21 +750,21 @@ fn resolve_context_window(flag: Option<u32>, entry: Option<u32>) -> u32 {
     flag.or(entry).unwrap_or(128_000)
 }
 
-/// Load the selected provider entry from the config file.
-/// - default path absent → `Ok(None)` (flags/env can still supply everything);
+/// Load the top-level language and selected provider from the config file.
+/// - default path absent → an empty selection (flags/env can still supply everything);
 /// - explicit `--config` path unreadable → `Err` (the user pointed at it);
 /// - file present but MALFORMED → `Err` (don't silently fall through to a confusing
 ///   "missing base URL" later);
-/// - file parses but has no matching provider → `Ok(None)`.
-pub(crate) fn load_provider_entry(
+/// - file parses but has no matching provider → preserve the language with no provider.
+pub(crate) fn load_config_selection(
     config_override: Option<&Path>,
     provider: Option<&str>,
-) -> Result<Option<ProviderEntry>> {
+) -> Result<ConfigSelection> {
     let (path, explicit) = match config_override {
         Some(p) => (p.to_path_buf(), true),
         None => match default_config_path() {
             Some(p) => (p, false),
-            None => return Ok(None),
+            None => return Ok(ConfigSelection::default()),
         },
     };
     let text = match std::fs::read_to_string(&path) {
@@ -755,11 +773,18 @@ pub(crate) fn load_provider_entry(
             return Err(anyhow::Error::new(e))
                 .with_context(|| format!("cannot read config file: {}", path.display()))
         }
-        Err(_) => return Ok(None), // default path simply absent — fine
+        Err(_) => return Ok(ConfigSelection::default()), // default path simply absent — fine
     };
     let fc = parse_file_config(&text)
         .with_context(|| format!("malformed config file: {}", path.display()))?;
-    Ok(pick_provider(&fc, provider))
+    Ok(select_config(&fc, provider))
+}
+
+pub(crate) fn load_provider_entry(
+    config_override: Option<&Path>,
+    provider: Option<&str>,
+) -> Result<Option<ProviderEntry>> {
+    Ok(load_config_selection(config_override, provider)?.provider)
 }
 
 /// Resolve the diff to review from the chosen source. Precedence: `--diff-file` (any
@@ -1389,6 +1414,36 @@ base_url = "https://openrouter.ai/api/v1"
                 .unwrap();
         assert!(pick_provider(&fc, None).is_none());
         assert!(pick_provider(&fc, Some("x")).is_some());
+    }
+
+    #[test]
+    fn selected_config_carries_top_level_language() {
+        let fc = parse_file_config(
+            "language = \"zh\"\ndefault_provider = \"x\"\n[providers.x]\nmodel=\"m\"\nbase_url=\"u\"\n",
+        )
+        .unwrap();
+        let selected = select_config(&fc, None);
+
+        assert_eq!(
+            selected.language,
+            Some(atomcode_config::locale::Locale::ZhCn)
+        );
+        assert!(selected.provider.is_some());
+    }
+
+    #[test]
+    fn coding_config_keeps_top_level_language_without_a_provider() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("config.toml");
+        std::fs::write(&path, "language = \"zh\"\n").unwrap();
+
+        let selected = load_config_selection(Some(&path), None).unwrap();
+
+        assert!(selected.provider.is_none());
+        assert_eq!(
+            selected.language,
+            Some(atomcode_config::locale::Locale::ZhCn)
+        );
     }
 
     #[test]

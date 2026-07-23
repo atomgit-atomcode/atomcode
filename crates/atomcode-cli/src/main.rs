@@ -2014,14 +2014,17 @@ fn runtime_config_from(
     dangerously_skip_permissions: bool,
     interactive: bool,
 ) -> atomcode_coding::CodingRuntimeConfig {
-    atomcode_coding::CodingRuntimeConfig::from_config(
+    let mut runtime = atomcode_coding::CodingRuntimeConfig::from_config(
         config,
         working_dir,
         provider_override,
         telemetry,
         dangerously_skip_permissions,
         interactive,
-    )
+    );
+    // The process locale has already resolved CLI `--lang` > config > env.
+    runtime.preferred_language = Some(atomcode_tuix::i18n::current_locale());
+    runtime
 }
 
 async fn spawn_native_cli_runtime(

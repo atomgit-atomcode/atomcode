@@ -114,8 +114,8 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     let dir = args.dir.canonicalize().context("working dir not found")?;
 
     // Provider creds: flag > env > config.toml (same resolution as `review`).
-    let entry = crate::load_provider_entry(args.config.as_deref(), args.provider.as_deref())?;
-    let entry = entry.as_ref();
+    let selected = crate::load_config_selection(args.config.as_deref(), args.provider.as_deref())?;
+    let entry = selected.provider.as_ref();
     let base_url = crate::first_nonempty([
         args.base_url.clone(),
         crate::env("ATOMCODE_BASE_URL"),
@@ -150,6 +150,7 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     .unwrap_or_default();
 
     let mut cfg = CodingAgentConfig::new(api_key, base_url, &model, &dir);
+    cfg.preferred_language = selected.language;
     cfg.context_window = entry.and_then(|e| e.context_window).unwrap_or(128_000);
     cfg.stream_timeout = std::time::Duration::from_secs(args.stream_timeout);
     // Telemetry: the full host-loop instrumentation (turn-level TelemetryHook + tool

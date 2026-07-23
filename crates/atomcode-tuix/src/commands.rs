@@ -187,7 +187,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "help",    desc: "Show this help", needs_args: false, hidden: false },
     Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true, hidden: false },
     Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false, hidden: false },
-    Command { name: "language", desc: "Switch display language", needs_args: false, hidden: false },
+    Command { name: "language", desc: "Switch display and commit language", needs_args: false, hidden: false },
     Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false, hidden: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false, hidden: false },
     Command { name: "exit",    desc: "Exit AtomCode", needs_args: false, hidden: false },

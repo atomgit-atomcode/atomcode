@@ -48,7 +48,9 @@ use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
 
 use crate::config::CodingAgentConfig;
 use crate::discipline::VerifyCadenceHook;
+#[cfg(test)]
 use crate::persona::coding_persona;
+use crate::persona::coding_persona_with_language;
 use crate::plugin_hooks::PluginHookSource;
 use crate::rate_limit::RateLimitWindowSource;
 
@@ -1109,7 +1111,7 @@ pub fn assemble(
             Ok(loaded) => {
                 let mut snap = loaded.snapshot;
                 check_snapshot_version(&snap)?;
-                reconcile_coding_persona(&mut snap, &cfg.model);
+                reconcile_coding_persona(&mut snap, cfg);
                 b.resume = Some(snap);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound && b.staged_fresh.is_some() => {}
@@ -1189,8 +1191,9 @@ pub fn assemble(
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())
-        .persona(coding_persona(
+        .persona(coding_persona_with_language(
             &cfg.model,
+            cfg.preferred_language,
             crate::persona::todo_switch_enabled(),
             crate::persona::request_user_input_switch_enabled(),
         ));
@@ -1358,7 +1361,7 @@ pub fn assemble(
             builder = builder.resume(snap.clone());
         }
     } else if let Some(mut snapshot) = parts.runtime_resume.as_ref().cloned() {
-        reconcile_coding_persona(&mut snapshot, &cfg.model);
+        reconcile_coding_persona(&mut snapshot, cfg);
         builder = builder.resume(snapshot);
     }
     // Ensure the repo's `atomcode` project label after a successful `git push` to a
@@ -1388,9 +1391,10 @@ fn persona_model(text: &str) -> Option<&str> {
 /// Legacy drivers persist conversation history without the separately supplied
 /// system prompt. A v2 resume must restore that prompt, while a model switch must
 /// replace the old model identity instead of retaining or duplicating it.
-fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, model: &str) {
-    let persona = coding_persona(
-        model,
+fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, cfg: &CodingAgentConfig) {
+    let persona = coding_persona_with_language(
+        &cfg.model,
+        cfg.preferred_language,
         crate::persona::todo_switch_enabled(),
         crate::persona::request_user_input_switch_enabled(),
     );
@@ -1406,6 +1410,16 @@ fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, model: &str) {
         .find(|message| is_persona(message))
         .and_then(|message| persona_model(&message.text))
         .map(str::to_owned);
+    let retained_model_change = if previous_model.as_deref() == Some(cfg.model.as_str()) {
+        snapshot
+            .messages
+            .iter()
+            .rev()
+            .find(|message| is_model_change(message))
+            .cloned()
+    } else {
+        None
+    };
     let already_current = snapshot
         .messages
         .first()
@@ -1429,10 +1443,13 @@ fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, model: &str) {
         .messages
         .retain(|message| !is_persona(message) && !is_model_change(message));
     snapshot.messages.insert(0, Message::system(persona));
-    if let Some(previous_model) = previous_model.filter(|previous| previous != model) {
+    if let Some(previous_model) = previous_model.filter(|previous| previous != &cfg.model) {
         snapshot.messages.push(Message::system(format!(
-            "{MODEL_CHANGE_CONTEXT_PREFIX}\nThe active model changed from {previous_model} to {model}. From this point onward, {model} is the current model. Treat any earlier assistant claim about its model identity as historical context, not the current runtime identity."
+            "{MODEL_CHANGE_CONTEXT_PREFIX}\nThe active model changed from {previous_model} to {model}. From this point onward, {model} is the current model. Treat any earlier assistant claim about its model identity as historical context, not the current runtime identity.",
+            model = cfg.model
         )));
+    } else if let Some(model_change) = retained_model_change {
+        snapshot.messages.push(model_change);
     }
     snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
 }
@@ -1504,6 +1521,10 @@ pub fn subagent_runtime_knobs(
 mod tests {
     use super::*;
     use crate::config::CodingAgentConfig;
+
+    fn agent_config(model: &str) -> CodingAgentConfig {
+        CodingAgentConfig::new("", "", model, ".")
+    }
 
     struct TestMcpTool;
 
@@ -1647,7 +1668,7 @@ mod tests {
     fn resume_adds_persona_before_legacy_session_context() {
         let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
 
-        reconcile_coding_persona(&mut snapshot, "deepseek-v4-flash");
+        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"));
 
         assert!(snapshot.messages[0]
             .text
@@ -1673,7 +1694,7 @@ mod tests {
             Message::system("SESSION CONTEXT"),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, "deepseek-v4-flash");
+        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"));
 
         let personas = snapshot
             .messages
@@ -1716,8 +1737,8 @@ mod tests {
             Message::assistant("I am model-a", vec![]),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, "model-b");
-        reconcile_coding_persona(&mut snapshot, "model-c");
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"));
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"));
 
         let transitions: Vec<_> = snapshot
             .messages
@@ -1749,10 +1770,73 @@ mod tests {
             Message::system("SESSION CONTEXT"),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, "deepseek-v4-flash");
+        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"));
 
         assert_eq!(snapshot.messages[0].text, persona);
         assert_eq!(snapshot.cache_epoch, 0);
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn language_switch_refreshes_persona_without_model_change_boundary() {
+        use atomcode_config::locale::Locale;
+
+        atomcode_config::config::offline::reset_offline_verdict_for_test();
+        let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        let mut snapshot = SessionSnapshot::new(vec![Message::system(
+            crate::persona::coding_persona_with_language(
+                "model-a",
+                Some(Locale::En),
+                crate::persona::todo_switch_enabled(),
+                crate::persona::request_user_input_switch_enabled(),
+            ),
+        )]);
+        let mut cfg = agent_config("model-a");
+        cfg.preferred_language = Some(Locale::ZhCn);
+
+        reconcile_coding_persona(&mut snapshot, &cfg);
+
+        assert!(snapshot.messages[0]
+            .text
+            .contains("subject and body in Simplified Chinese"));
+        assert!(!snapshot
+            .messages
+            .iter()
+            .any(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)));
+        assert_eq!(snapshot.cache_epoch, 1);
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn language_switch_preserves_existing_model_change_boundary() {
+        use atomcode_config::locale::Locale;
+
+        atomcode_config::config::offline::reset_offline_verdict_for_test();
+        let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        let mut snapshot = SessionSnapshot::new(vec![
+            Message::system(coding_persona(
+                "model-a",
+                crate::persona::todo_switch_enabled(),
+                crate::persona::request_user_input_switch_enabled(),
+            )),
+            Message::assistant("I am model-a", vec![]),
+        ]);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"));
+        let transition = snapshot.messages.last().cloned().unwrap();
+        let mut cfg = agent_config("model-b");
+        cfg.preferred_language = Some(Locale::ZhCn);
+
+        reconcile_coding_persona(&mut snapshot, &cfg);
+
+        assert_eq!(snapshot.messages.last(), Some(&transition));
+        assert_eq!(
+            snapshot
+                .messages
+                .iter()
+                .filter(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

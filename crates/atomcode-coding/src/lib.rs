@@ -71,7 +71,7 @@ pub use parts::{
     assemble, prepare, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,
     subagent_enabled_from_env, CodingParts, PrepareOptions, SessionBinding, SessionMode,
 };
-pub use persona::coding_persona;
+pub use persona::{coding_persona, coding_persona_with_language, commit_language_guidance};
 pub use plan_mode::PlanModeGate;
 pub use plugin_hooks::{PluginHookSource, StaticPluginHookSource};
 pub use provider_factory::{
