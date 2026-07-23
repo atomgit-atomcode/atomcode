@@ -805,6 +805,7 @@ pub async fn run(
         is_admin,
         pending_guide_topic: None,
         live_binding: None,
+        live_observation_task: None,
         app_relay_child: None,
         reasoning_effort: None,
         transient_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),

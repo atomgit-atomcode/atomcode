@@ -482,11 +482,15 @@ pub(crate) fn attach_live_runtime(
             }
         }
     });
+    // 取消旧 observation 转发任务，避免多次 /app 连接后转发重复
+    if let Some(old_task) = ctx.live_observation_task.take() {
+        old_task.abort();
+    }
     if let Ok(live_join) = atomcode_daemon::native_live::join() {
         let mut receiver = live_join.receiver;
         let event_tx = ctx.runtime_event_tx.clone();
         let runtime_id = ctx.foreground_runtime_id;
-        tokio::spawn(async move {
+        ctx.live_observation_task = Some(tokio::spawn(async move {
             while let Ok(observation) = receiver.recv().await {
                 if let atomcode_daemon::live_hub::LiveViewEvent::InputAccepted(input) =
                     observation.event
@@ -504,7 +508,7 @@ pub(crate) fn attach_live_runtime(
                     }
                 }
             }
-        });
+        }));
     }
     renderer.render(UiLine::CommandOutput(
         "已共享当前会话（与浏览器实时互通）".to_string(),
@@ -513,6 +517,10 @@ pub(crate) fn attach_live_runtime(
 }
 
 fn detach_live_runtime(ctx: &mut LoopCtx) -> Result<bool, String> {
+    // 取消 observation 转发任务
+    if let Some(task) = ctx.live_observation_task.take() {
+        task.abort();
+    }
     detach_live_binding_with(&mut ctx.live_binding, |binding| {
         atomcode_daemon::native_live::unregister_embedded_runtime(binding)
     })

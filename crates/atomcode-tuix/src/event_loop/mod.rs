@@ -2993,6 +2993,9 @@ pub struct LoopCtx {
     pub clipboard_check: std::sync::Arc<std::sync::Mutex<ClipboardCheckState>>,
     /// Bound live-view identity when web/app views share the foreground runtime.
     pub live_binding: Option<atomcode_daemon::live_hub::LiveBinding>,
+    /// 实时观察转发任务（将 hub 的 InputAccepted 转发为 UserEcho 给 TUI 事件循环）。
+    /// 每次 /app 连接时重新创建，旧任务自动取消，避免重复转发导致消息重复。
+    pub live_observation_task: Option<tokio::task::JoinHandle<()>>,
     /// `/app` 拉起的 relay-client 子进程。`kill_on_drop(true)`，所以 TUI 退出或
     /// `/app stop` 时随之清理，不留僵尸进程。None=未开启 App 远程访问。
     pub app_relay_child: Option<tokio::process::Child>,
