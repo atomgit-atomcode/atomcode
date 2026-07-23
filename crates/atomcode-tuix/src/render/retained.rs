@@ -7778,20 +7778,34 @@ fn truncate_body_str(body_str: &str, max_cols: usize) -> String {
 /// there's no time/queue metadata yet.
 fn spinner_meta_suffix(label: &str) -> &str {
     const EFFORT_MARK: &str = " · thinking with ";
+    // The metadata that trails the base label comes in two shapes: a ` · …`
+    // run (queue / fold) and the trailing phase-clock group, which
+    // `format_spinner_label` wraps in ONE pair of parens opening with ` (`
+    // (`… (3s · ↑ 1.93K tokens)`). The forwarded suffix must begin at
+    // whichever boundary comes first so the parens stay balanced on a bash
+    // row (`Running (3s · ↑ 1.93K tokens)`). Keying off the ` · ` alone split
+    // the group on the separator INSIDE the parens, dropping the `(3s` and
+    // leaving a dangling `)` (reported: `Running · ↑ 1.93K tokens)`).
+    let meta_start = |from: usize| -> Option<usize> {
+        let dot = label[from..].find(" · ").map(|i| from + i);
+        let paren = label[from..].find(" (").map(|i| from + i);
+        match (dot, paren) {
+            (Some(d), Some(p)) => Some(d.min(p)),
+            (d, None) => d,
+            (None, p) => p,
+        }
+    };
     if let Some(start) = label.find(EFFORT_MARK) {
-        // Effort is the first metadata segment; it runs until the next ` · `
-        // (the queue/elapsed run) or end-of-string. Everything from that next
-        // separator on is the time/queue metadata to forward. Scanning from
-        // past the fixed marker lands inside the ASCII effort value, so the
-        // next ` · ` is unambiguously the following segment.
+        // Effort is the first metadata segment (a tool "isn't thinking", so
+        // splice it out). It runs until the next boundary — a ` · ` queue run
+        // or the ` (` clock group. Scanning past the fixed marker lands inside
+        // the ASCII effort value, so the next boundary is unambiguously the
+        // following segment.
         let scan_from = start + EFFORT_MARK.len();
-        return label[scan_from..]
-            .find(" · ")
-            .map(|rel| &label[scan_from + rel..])
-            .unwrap_or("");
+        return meta_start(scan_from).map(|i| &label[i..]).unwrap_or("");
     }
-    // No effort hint: metadata begins at the first ` · ` after the base.
-    label.find(" · ").map(|i| &label[i..]).unwrap_or("")
+    // No effort hint: metadata begins at the first ` · ` or ` (` after the base.
+    meta_start(0).map(|i| &label[i..]).unwrap_or("")
 }
 
 #[cfg(test)]
@@ -9768,6 +9782,39 @@ mod tests {
         assert_eq!(
             spinner_meta_suffix("Running Bash… · thinking with high effort"),
             ""
+        );
+    }
+
+    #[test]
+    fn spinner_meta_suffix_keeps_parenthesized_elapsed_group_intact() {
+        // `format_spinner_label` now wraps the phase clock + live token counter
+        // in ONE parenthesized group: `Pondering… (3s · ↑ 1.93K tokens)`. The
+        // forwarded suffix must include the opening `(` so a bash row reads
+        // `Running (3s · ↑ 1.93K tokens)`. Keying off the ` · ` INSIDE the
+        // parens dropped `(3s` and left a dangling `)` (reported bug:
+        // `Running · ↑ 1.93K tokens)`).
+        assert_eq!(
+            spinner_meta_suffix("Pondering… (3s · ↑ 1.93K tokens)"),
+            " (3s · ↑ 1.93K tokens)"
+        );
+        // tokens == 0 → elapsed-only parens, still balanced.
+        assert_eq!(spinner_meta_suffix("Pondering… (3s)"), " (3s)");
+        // Queue segment precedes the parenthesized group — forward both.
+        assert_eq!(
+            spinner_meta_suffix("Pondering… · 2 queued (3s · ↑ 1.93K tokens)"),
+            " · 2 queued (3s · ↑ 1.93K tokens)"
+        );
+        // Effort leads (a tool "isn't thinking") → spliced out, parens kept whole.
+        assert_eq!(
+            spinner_meta_suffix("Cogitating… · thinking with high effort (3s · ↑ 1.93K tokens)"),
+            " (3s · ↑ 1.93K tokens)"
+        );
+        // Effort + queue before the parens → keep queue and the whole group.
+        assert_eq!(
+            spinner_meta_suffix(
+                "Cogitating… · thinking with max effort · 2 queued (3s · ↑ 1.93K tokens)"
+            ),
+            " · 2 queued (3s · ↑ 1.93K tokens)"
         );
     }
 
