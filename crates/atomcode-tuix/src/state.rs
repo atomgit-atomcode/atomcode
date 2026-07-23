@@ -711,6 +711,13 @@ pub struct UiState {
     /// appending their multi-line report to conversation scrollback. Cleared
     /// explicitly by Esc; the Esc press is consumed before turn cancellation.
     pub footer_command_output: Option<String>,
+    /// Live `/usage` panel state backing [`footer_command_output`] while a turn
+    /// is streaming. The interactive modal can't install mid-turn (live token
+    /// redraws own the footer), so tab switching re-renders the active tab from
+    /// this into `footer_command_output`. `Some` only for streaming `/usage`;
+    /// `/cost` and idle `/usage` leave it `None`. Cleared wherever
+    /// `footer_command_output` is.
+    pub footer_usage: Option<crate::modals::usage::UsageModal>,
     /// Per-turn token tallies (reset at turn end). Feed the footer's billable
     /// token count + cache-hit annotation via [`turn_token_summary`]; kept
     /// separate from the session-cumulative `*_tokens` above.
@@ -1041,6 +1048,7 @@ impl UiState {
             completion_tokens: 0,
             cached_tokens: 0,
             footer_command_output: None,
+            footer_usage: None,
             turn_prompt_tokens: 0,
             turn_completion_tokens: 0,
             turn_cached_tokens: 0,
@@ -1378,6 +1386,10 @@ impl UiState {
         self.user_input_panel = None;
         self.user_input_batch = None;
         self.steer_pending = 0;
+        // The interactive `/usage` tab panel is streaming-only. Drop it (but keep
+        // the rendered text) so its tab keys can't bleed into idle or across into
+        // the next streaming turn; a fresh `/usage` re-arms it.
+        self.footer_usage = None;
     }
 
     pub fn on_turn_cancelled(&mut self) {
@@ -1398,6 +1410,9 @@ impl UiState {
         self.user_input_panel = None;
         self.user_input_batch = None;
         self.steer_pending = 0;
+        // Streaming-only `/usage` tab panel — drop it on cancel too (mirrors
+        // on_turn_complete); the rendered text stays until Esc.
+        self.footer_usage = None;
         // The todo panel is per-session, not per-turn: it survives turn
         // termination (mirrors on_turn_complete). Clearing it here nuked the
         // plan, and a "继续" turn only sends incremental todowrite updates that
@@ -1412,6 +1427,7 @@ impl UiState {
     /// `/cost` from the previous foreground session visible.
     pub fn on_session_replaced(&mut self) {
         self.footer_command_output = None;
+        self.footer_usage = None;
     }
 
     /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting
@@ -2028,6 +2044,40 @@ mod tests {
             s.footer_command_output.is_none(),
             "a new foreground session must not inherit the old report"
         );
+    }
+
+    fn sample_usage_panel() -> crate::modals::usage::UsageModal {
+        crate::modals::usage::UsageModal::new(crate::modals::usage::UsageData {
+            window: None,
+            plan: None,
+            usage: None,
+            overview: None,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn turn_terminal_drops_live_usage_panel_but_keeps_the_text() {
+        // The interactive `/usage` panel is a streaming-only affordance. When the
+        // turn ends it must degrade to the static footer text (the report stays
+        // visible until Esc), so its tab keys can't leak into — or bleed across
+        // into the next streaming turn from — the idle phase.
+        for terminal in [UiState::on_turn_complete, UiState::on_turn_cancelled] {
+            let mut s = UiState::new();
+            s.footer_command_output = Some("usage report".into());
+            s.footer_usage = Some(sample_usage_panel());
+
+            terminal(&mut s);
+
+            assert!(
+                s.footer_usage.is_none(),
+                "turn end must drop the interactive panel"
+            );
+            assert!(
+                s.footer_command_output.is_some(),
+                "but the rendered report text stays until Esc"
+            );
+        }
     }
 
     /// Regression for the cross-turn `[Image #N]` ambiguity: the marker

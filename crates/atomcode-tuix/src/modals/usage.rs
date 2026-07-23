@@ -75,6 +75,22 @@ impl UsageModal {
         };
     }
 
+    /// Map a tab-navigation key to a tab switch. The single authority for the
+    /// nav key set, shared by the interactive modal ([`handle_key`]) and the
+    /// streaming footer report so the two surfaces can never drift. Returns
+    /// `true` when the key was a nav key (and thus consumed).
+    ///
+    /// [`handle_key`]: Modal::handle_key
+    pub(crate) fn handle_tab_nav(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Tab | KeyCode::Right => self.next_tab(),
+            KeyCode::BackTab | KeyCode::Left => self.prev_tab(),
+            KeyCode::Char(c @ '1'..='3') => self.select_tab(c),
+            _ => return false,
+        }
+        true
+    }
+
     /// Build the tab bar string (active = bold, inactive = dim/muted).
     fn tab_bar(&self) -> String {
         // Palette-independent active/inactive contrast — see modals::tab_chip
@@ -196,23 +212,43 @@ impl UsageModal {
         rows
     }
 
-    /// Theme-aware snapshot of the tab bar and Current tab for non-interactive surfaces.
+    /// Theme-aware, colour-preserving snapshot of the tab bar + the ACTIVE tab.
     ///
-    /// Streaming `/usage` cannot install the interactive modal because live
-    /// token redraws own the footer. Reusing these rows keeps its headings,
-    /// progress bars, plan status, and palette identical to the modal. The
-    /// three tab labels remain visible to preserve the modal's information
-    /// hierarchy; Overview/Models bodies remain modal-only because streaming
-    /// input cannot safely operate those tabs.
-    pub(crate) fn current_snapshot_text(&self) -> String {
+    /// Streaming `/usage` can't install the interactive modal (live token
+    /// redraws own the footer), so tab switching mid-stream re-renders this
+    /// snapshot into the footer instead. It reuses the modal's exact rows so
+    /// headings, progress bars, plan status, heatmap, and palette match. Unlike
+    /// [`active_tab_text`] (clipboard, ANSI-stripped) it keeps colour so the
+    /// footer's bars/heatmap render, and it follows `self.tab` across all three
+    /// tabs. `models_rows` needs the terminal caps, hence the parameters.
+    ///
+    /// [`active_tab_text`]: Self::active_tab_text
+    pub(crate) fn active_snapshot_text(&self, caps_colors: bool, caps_unicode: bool) -> String {
         let mut lines = vec![self.tab_bar(), String::new()];
         lines.extend(
-            self.current_rows()
+            self.active_tab_lines(caps_colors, caps_unicode)
                 .into_iter()
-                .map(|(line, _)| line)
                 .skip_while(String::is_empty),
         );
         lines.join("\n")
+    }
+
+    /// The active tab's body lines with colour intact — the single tab-body
+    /// dispatch shared by the colour-keeping [`active_snapshot_text`] and the
+    /// ANSI-stripped [`active_tab_text`].
+    ///
+    /// [`active_snapshot_text`]: Self::active_snapshot_text
+    /// [`active_tab_text`]: Self::active_tab_text
+    fn active_tab_lines(&self, caps_colors: bool, caps_unicode: bool) -> Vec<String> {
+        match self.tab {
+            Tab::Current => self.current_rows().into_iter().map(|(l, _)| l).collect(),
+            Tab::Overview => self.overview_lines(),
+            Tab::Models => self
+                .models_rows(caps_colors, caps_unicode)
+                .into_iter()
+                .map(|(l, _)| l)
+                .collect(),
+        }
     }
 
     /// Build Overview tab rows — calendar heatmap + stats block.
@@ -687,24 +723,11 @@ impl UsageModal {
 
     /// Build a plain-text snapshot of the active tab suitable for clipboard copy.
     fn active_tab_text(&self, caps_colors: bool, caps_unicode: bool) -> String {
-        let rows: Vec<String> = match self.tab {
-            Tab::Current => self
-                .current_rows()
-                .into_iter()
-                .map(|(l, _)| Self::strip_ansi(&l))
-                .collect(),
-            Tab::Overview => self
-                .overview_lines()
-                .into_iter()
-                .map(|l| Self::strip_ansi(&l))
-                .collect(),
-            Tab::Models => self
-                .models_rows(caps_colors, caps_unicode)
-                .into_iter()
-                .map(|(l, _)| Self::strip_ansi(&l))
-                .collect(),
-        };
-        rows.join("\n")
+        self.active_tab_lines(caps_colors, caps_unicode)
+            .iter()
+            .map(|l| Self::strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -726,13 +749,11 @@ impl Modal for UsageModal {
             self.draw(buf, state, ctx, renderer);
             return Ok(ModalAction::Continue);
         }
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(ModalAction::Close),
-            KeyCode::Tab | KeyCode::Right => self.next_tab(),
-            KeyCode::BackTab | KeyCode::Left => self.prev_tab(),
-            KeyCode::Char(c @ '1'..='3') => self.select_tab(c),
-            _ => {}
+        if let KeyCode::Esc | KeyCode::Char('q') = code {
+            return Ok(ModalAction::Close);
         }
+        // Tab / ←→ / 1-3 switch tabs; other keys are no-ops here.
+        self.handle_tab_nav(code);
         let _ = mods;
         // Clear any copy notice on any other keypress
         self.copy_notice = None;
@@ -925,6 +946,23 @@ mod tests {
     }
 
     #[test]
+    fn handle_tab_nav_switches_on_nav_keys_and_ignores_others() {
+        let mut m = empty_modal();
+        assert!(m.handle_tab_nav(KeyCode::Tab));
+        assert_eq!(m.tab, Tab::Overview);
+        assert!(m.handle_tab_nav(KeyCode::Right));
+        assert_eq!(m.tab, Tab::Models);
+        assert!(m.handle_tab_nav(KeyCode::Left));
+        assert_eq!(m.tab, Tab::Overview);
+        assert!(m.handle_tab_nav(KeyCode::Char('3')));
+        assert_eq!(m.tab, Tab::Models);
+        // Non-nav keys are not consumed — the caller keeps them for other uses.
+        assert!(!m.handle_tab_nav(KeyCode::Char('x')));
+        assert!(!m.handle_tab_nav(KeyCode::Esc));
+        assert_eq!(m.tab, Tab::Models);
+    }
+
+    #[test]
     fn hms_formats_correctly() {
         assert_eq!(UsageModal::hms(0), "00:00:00");
         assert_eq!(UsageModal::hms(3661), "01:01:01");
@@ -1069,7 +1107,8 @@ mod tests {
 
     #[test]
     fn streaming_snapshot_keeps_all_three_tab_labels() {
-        let text = sample_modal().current_snapshot_text();
+        // Default tab is Current; sample_modal has no window → "unavailable".
+        let text = sample_modal().active_snapshot_text(true, true);
 
         assert!(text.contains(t(Msg::UsageTabCurrent).as_ref()));
         assert!(text.contains(t(Msg::UsageTabOverview).as_ref()));
@@ -1077,6 +1116,59 @@ mod tests {
         assert!(
             text.contains(t(Msg::UsageWindowUnavailable).as_ref()),
             "snapshot should still render the Current body"
+        );
+    }
+
+    #[test]
+    fn active_snapshot_text_always_keeps_all_three_tab_labels() {
+        // The tab bar must render on every tab so the footer snapshot preserves
+        // the modal's information hierarchy while streaming.
+        for tab in [Tab::Current, Tab::Overview, Tab::Models] {
+            let mut m = sample_modal();
+            m.tab = tab;
+            let text = m.active_snapshot_text(true, true);
+            assert!(text.contains(t(Msg::UsageTabCurrent).as_ref()));
+            assert!(text.contains(t(Msg::UsageTabOverview).as_ref()));
+            assert!(text.contains(t(Msg::UsageTabModels).as_ref()));
+        }
+    }
+
+    #[test]
+    fn active_snapshot_text_renders_models_tab_body() {
+        // Switching to the Models tab mid-stream must surface the models body
+        // (model names), not the Current body.
+        let mut m = sample_modal();
+        m.tab = Tab::Models;
+        let text = m.active_snapshot_text(true, true);
+        assert!(
+            text.contains("deepseek-v4-flash"),
+            "Models tab snapshot must contain model names; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn active_snapshot_text_renders_overview_tab_body() {
+        // Switching to the Overview tab mid-stream must surface the overview
+        // body (favorite model), not the Current body.
+        let mut m = sample_modal();
+        m.tab = Tab::Overview;
+        let text = m.active_snapshot_text(true, true);
+        assert!(
+            text.contains("GLM-5.2"),
+            "Overview tab snapshot must contain overview stats; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn active_snapshot_text_keeps_ansi_color() {
+        // Unlike the clipboard variant, the footer snapshot must keep ANSI so
+        // the progress bars / heatmap render in colour below the input box.
+        let mut m = sample_modal();
+        m.tab = Tab::Overview;
+        let text = m.active_snapshot_text(true, true);
+        assert!(
+            text.contains('\x1b'),
+            "footer snapshot must retain ANSI colour codes; got:\n{text}"
         );
     }
 

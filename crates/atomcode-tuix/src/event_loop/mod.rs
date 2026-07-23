@@ -3687,6 +3687,148 @@ mod buffer_tests {
         );
     }
 
+    fn empty_usage_panel() -> crate::modals::usage::UsageModal {
+        crate::modals::usage::UsageModal::new(crate::modals::usage::UsageData {
+            window: None,
+            plan: None,
+            usage: None,
+            overview: None,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn footer_usage_tab_key_switches_tab_and_refreshes_report() {
+        use crate::modals::usage::Tab;
+        let mut state = UiState::new();
+        state.phase = UiPhase::Streaming;
+        state.footer_usage = Some(empty_usage_panel());
+        state.footer_command_output = Some("stale".into());
+
+        // Tab advances to the next tab and re-renders the footer snapshot.
+        // (buffer_empty = true: the user isn't composing a queued message.)
+        assert!(handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Tab,
+            true,
+            true,
+            true
+        ));
+        assert_eq!(state.footer_usage.as_ref().unwrap().tab, Tab::Overview);
+        assert_ne!(
+            state.footer_command_output.as_deref(),
+            Some("stale"),
+            "footer must be re-rendered from the newly active tab"
+        );
+
+        // BackTab / arrows also steer the same panel.
+        assert!(handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Right,
+            true,
+            true,
+            true
+        ));
+        assert_eq!(state.footer_usage.as_ref().unwrap().tab, Tab::Models);
+        assert!(handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::BackTab,
+            true,
+            true,
+            true
+        ));
+        assert_eq!(state.footer_usage.as_ref().unwrap().tab, Tab::Overview);
+    }
+
+    #[test]
+    fn footer_usage_tab_key_never_steals_character_keys() {
+        use crate::modals::usage::Tab;
+        let mut state = UiState::new();
+        state.phase = UiPhase::Streaming;
+        state.footer_usage = Some(empty_usage_panel());
+
+        // Even on an empty buffer, a digit is message text: it must start a queued
+        // message ("3 retries"), NOT jump to the Models tab. Digit tab-jump stays
+        // modal-only; the streaming footer only owns pure navigation keys.
+        assert!(!handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Char('3'),
+            true,
+            true,
+            true
+        ));
+        assert!(!handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Char('x'),
+            true,
+            true,
+            true
+        ));
+        assert_eq!(
+            state.footer_usage.as_ref().unwrap().tab,
+            Tab::Current,
+            "character keys must never switch tabs"
+        );
+    }
+
+    #[test]
+    fn footer_usage_tab_key_yields_to_type_ahead_composition() {
+        use crate::modals::usage::Tab;
+        let mut state = UiState::new();
+        state.phase = UiPhase::Streaming;
+        state.footer_usage = Some(empty_usage_panel());
+
+        // buffer_empty = false: the user is typing a queued message. Even the nav
+        // keys must edit the buffer (cursor movement / agent-mode Tab), NOT steer
+        // the report.
+        assert!(!handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Tab,
+            false,
+            true,
+            true
+        ));
+        assert!(!handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Left,
+            false,
+            true,
+            true
+        ));
+        assert_eq!(
+            state.footer_usage.as_ref().unwrap().tab,
+            Tab::Current,
+            "composing must not switch tabs"
+        );
+    }
+
+    #[test]
+    fn footer_usage_tab_key_noop_without_panel() {
+        let mut state = UiState::new();
+        // `/cost` shows a report but installs no panel — tab keys must fall through.
+        state.footer_command_output = Some("cost report".into());
+        assert!(!handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Tab,
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn dismiss_footer_report_clears_usage_panel() {
+        let mut state = UiState::new();
+        state.footer_command_output = Some("usage report".into());
+        state.footer_usage = Some(empty_usage_panel());
+
+        assert!(dismiss_footer_command_output(&mut state));
+        assert!(
+            state.footer_usage.is_none(),
+            "dismissing the report must drop the panel so stale tab keys are inert"
+        );
+    }
+
     #[test]
     fn spinner_label_never_shows_stall_hint() {
         // The "· esc to cancel" stall hint was removed by request: even a model
@@ -6219,7 +6361,46 @@ fn intercept_empty_bare_esc(
 /// this before their normal Esc action; `true` means the key was fully handled
 /// and must not reach turn cancellation or double-Esc undo.
 fn dismiss_footer_command_output(state: &mut UiState) -> bool {
+    // Drop the panel alongside the text so a stale tab key can't steer a
+    // report that's no longer on screen.
+    state.footer_usage = None;
     state.footer_command_output.take().is_some()
+}
+
+/// Steer the streaming `/usage` footer report between its tabs. The interactive
+/// modal can't install mid-turn (live token redraws own the footer), so the
+/// report re-renders the newly active tab into `footer_command_output` in
+/// place. Returns `true` when the key was a tab-navigation key AND a panel is
+/// present — the caller must then repaint and consume the key so it never
+/// reaches turn cancellation. Any other key (or no panel) returns `false` and
+/// falls through untouched.
+///
+/// Two gates keep this from stealing message input:
+///  - Character keys (digits, letters) are NEVER stolen — a queued message may
+///    start with a digit ("3 retries"), so digit tab-jump stays modal-only and
+///    the streaming footer owns only pure navigation keys (Tab/BackTab/←/→).
+///  - `buffer_empty`: while composing a queued (type-ahead) message even those
+///    nav keys belong to the draft (cursor movement, agent-mode Tab), so the
+///    report only owns them when the input box is empty.
+fn handle_footer_usage_tab_key(
+    state: &mut UiState,
+    code: KeyCode,
+    buffer_empty: bool,
+    caps_colors: bool,
+    caps_unicode: bool,
+) -> bool {
+    if !buffer_empty || matches!(code, KeyCode::Char(_)) {
+        return false;
+    }
+    let Some(panel) = state.footer_usage.as_mut() else {
+        return false;
+    };
+    if panel.handle_tab_nav(code) {
+        state.footer_command_output = Some(panel.active_snapshot_text(caps_colors, caps_unicode));
+        true
+    } else {
+        false
+    }
 }
 
 /// Grace period after a quit request before the force-exit watchdog fires. The
@@ -11454,6 +11635,28 @@ fn handle_streaming_key(
         return Ok(());
     }
 
+    // A live `/usage` report owns the navigation keys: Tab/←→ cycle between its
+    // Current/Overview/Models tabs, re-rendering in place. Consume before
+    // cancellation so switching tabs can never stop the turn. Only when the
+    // input box is empty — a queued draft keeps its own keys (digits included).
+    if handle_footer_usage_tab_key(
+        &mut app.state,
+        code,
+        app.buf.text.is_empty(),
+        ctx.caps.colors,
+        ctx.caps.unicode_symbols,
+    ) {
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+        return Ok(());
+    }
+
     // A visible read-only report owns the first bare Esc. Dismiss it and
     // consume the key before the cancellation path below so inspecting
     // `/usage` or `/cost` can never make Esc stop the running response.
@@ -15727,6 +15930,11 @@ fn handle_coding_runtime_event(
                 state.compaction_forced_streaming = false;
                 state.phase = UiPhase::Idle;
                 state.spinner_label.clear();
+                // This Streaming→Idle path bypasses on_turn_complete/cancelled, so
+                // drop the interactive `/usage` panel here too — otherwise a panel
+                // armed during a forced-streaming compaction would bleed its tab
+                // keys into the next real streaming turn.
+                state.footer_usage = None;
             }
         }
         CodingRuntimeEvent::ProviderUnavailable { reason, .. } => {

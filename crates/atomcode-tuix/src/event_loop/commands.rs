@@ -1777,12 +1777,26 @@ fn execute_slash_command_impl(
             // and Esc dismisses it without cancelling the running turn.
             // Idle: open the interactive modal.
             if matches!(state.phase, crate::state::UiPhase::Streaming) {
-                // `false` = skip the heavier `usage()` round-trip (overview/models) the
-                // text snapshot doesn't render — one gateway call, not two, mid-stream.
-                let text = fetch_usage_data(false)
-                    .map(|d| render_usage_text(&d))
-                    .unwrap_or_else(|| t(Msg::UsageCodingPlanOnly).into_owned());
-                state.footer_command_output = Some(text);
+                // Fetch the FULL dataset (overview + models) so the footer report
+                // is tab-switchable mid-stream — the interactive modal can't
+                // install here (live token redraws own the footer), so we stash
+                // the panel and re-render its active tab in place on each tab
+                // key. Two gateway calls, once per `/usage`; switching tabs is
+                // then purely local.
+                match fetch_usage_data() {
+                    Some(data) => {
+                        let panel = UsageModal::new(data);
+                        state.footer_command_output = Some(
+                            panel.active_snapshot_text(ctx.caps.colors, ctx.caps.unicode_symbols),
+                        );
+                        state.footer_usage = Some(panel);
+                    }
+                    None => {
+                        state.footer_command_output =
+                            Some(t(Msg::UsageCodingPlanOnly).into_owned());
+                        state.footer_usage = None;
+                    }
+                }
             } else {
                 open_usage(renderer, active_modal);
             }
@@ -1797,6 +1811,9 @@ fn execute_slash_command_impl(
                 state.cached_tokens,
             );
             if matches!(state.phase, crate::state::UiPhase::Streaming) {
+                // `/cost` is a static report — drop any live `/usage` panel so
+                // tab keys don't steer a report that's no longer on screen.
+                state.footer_usage = None;
                 state.footer_command_output = Some(text);
             } else {
                 renderer.render(UiLine::CommandOutput(text));
@@ -4739,13 +4756,11 @@ pub(super) fn build_diff_stat_text(ctx: &LoopCtx) -> Result<String, String> {
 /// Fetch CodingPlan usage from the gateway (BLOCKING network call). `None` when the
 /// user isn't logged into a CodingPlan account — the caller then shows
 /// `UsageCodingPlanOnly`. Shared by the interactive modal (`open_usage`) and the
-/// mid-turn text snapshot (`render_usage_text`).
+/// mid-turn footer report; both now render all three tabs.
 ///
-/// `include_overview` gates the SECOND, heavier `usage()` round-trip that powers the
-/// modal's Overview/Models tabs. The mid-turn text snapshot renders only plan + window
-/// (from `status_v2`), so it passes `false` — otherwise it would pay for a network call
-/// it throws away, doubling the streaming freeze.
-fn fetch_usage_data(include_overview: bool) -> Option<UsageData> {
+/// Two round-trips: `status_v2` (plan + window) and the heavier `usage()` that powers
+/// the Overview/Models tabs.
+fn fetch_usage_data() -> Option<UsageData> {
     tokio::task::block_in_place(|| {
         let client = atomcode_codingplan::client::Client::from_stored_auth().ok()?;
         let status = client.status_v2().ok();
@@ -4758,13 +4773,9 @@ fn fetch_usage_data(include_overview: bool) -> Option<UsageData> {
                 .cloned()
         });
         let plan = status.and_then(|s| s.codingplan_free);
-        let (usage, error) = if include_overview {
-            match client.usage() {
-                Ok(u) => (Some(u), None),
-                Err(e) => (None, Some(format!("{e}"))),
-            }
-        } else {
-            (None, None)
+        let (usage, error) = match client.usage() {
+            Ok(u) => (Some(u), None),
+            Err(e) => (None, Some(format!("{e}"))),
         };
         let overview = usage
             .as_ref()
@@ -4782,7 +4793,7 @@ fn fetch_usage_data(include_overview: bool) -> Option<UsageData> {
 /// `/usage` — open the CodingPlan usage modal (idle). Renders a notice when the user
 /// isn't on a CodingPlan account, otherwise pushes the modal into `active_modal`.
 fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Modal>>) {
-    match fetch_usage_data(true) {
+    match fetch_usage_data() {
         Some(data) => *active_modal = Some(Box::new(UsageModal::new(data))),
         None => {
             renderer.render(UiLine::CommandOutput(
@@ -4790,29 +4801,6 @@ fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Mod
             ));
             renderer.flush();
         }
-    }
-}
-
-/// Non-interactive Current-tab snapshot for running `/usage` MID-TURN.
-///
-/// The interactive modal would be repainted over by the live streaming box
-/// (`draw_spinner_now` on every token), so the footer reuses the modal's exact
-/// Current-tab rows instead. Overview/Models remain modal-only because tabs
-/// cannot safely own input while a turn is streaming.
-fn render_usage_text(data: &UsageData) -> String {
-    let out = UsageModal::new(UsageData {
-        window: data.window.clone(),
-        plan: data.plan.clone(),
-        usage: None,
-        overview: None,
-        error: data.error.clone(),
-    })
-    .current_snapshot_text();
-    if out.is_empty() {
-        // Logged in but the gateway returned neither a plan nor a visible window.
-        t(Msg::UsageCodingPlanOnly).into_owned()
-    } else {
-        out
     }
 }
 
@@ -6873,7 +6861,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_usage_text_composes_plan_and_window_lines() {
+    fn streaming_usage_snapshot_composes_plan_and_window_lines() {
         use atomcode_codingplan::types::{PlanInfo, RateLimitWindow};
         // Build fixtures from JSON (serde defaults fill the fields we don't care about).
         let plan: PlanInfo = serde_json::from_value(serde_json::json!({
@@ -6894,7 +6882,8 @@ mod tests {
             overview: None,
             error: None,
         };
-        let text = render_usage_text(&data);
+        // The streaming footer report renders the active (default: Current) tab.
+        let text = UsageModal::new(data).active_snapshot_text(true, true);
         assert!(text.contains("AtomPlan-Pro"), "plan name present: {text}");
         assert!(text.contains("42.0%"), "window progress present: {text}");
         assert!(
@@ -6902,7 +6891,8 @@ mod tests {
             "streaming snapshot must preserve modal colors and emphasis: {text:?}"
         );
 
-        // Logged in but empty gateway response → the CodingPlan-only notice, not blank.
+        // Logged in but empty gateway response → still non-blank (tab bar + the
+        // Current tab's "unavailable" body), never a bare footer.
         let empty = UsageData {
             window: None,
             plan: None,
@@ -6911,7 +6901,9 @@ mod tests {
             error: None,
         };
         assert!(
-            !render_usage_text(&empty).is_empty(),
+            !UsageModal::new(empty)
+                .active_snapshot_text(true, true)
+                .is_empty(),
             "empty data must not render blank"
         );
     }
