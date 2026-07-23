@@ -72,7 +72,7 @@ impl Palette {
     /// under a tool-batch header rendered almost invisible. Splitting
     /// MUTED into light/dark variants and switching via
     /// `is_light_for_render` recovers readable contrast on both.
-    pub const MUTED_DARK: Color = Color::White; // SGR 37
+    pub const MUTED_DARK: Color = Color::Grey; // SGR 37
 
     /// Back-compat alias — same value as `MUTED_LIGHT` so old call sites
     /// that pre-date the dark-mode split keep compiling. New code should
@@ -271,6 +271,7 @@ mod tests {
 
     #[test]
     fn muted_switches_with_theme() {
+        let _theme = md_theme::test_lock();
         // Take the theme lock so we don't race other theme-switching
         // tests in the highlight module — `MODE` is a process-wide
         // AtomicU8 and parallel test runs would interleave reads.
@@ -314,6 +315,7 @@ mod tests {
 
     #[test]
     fn warning_switches_with_theme() {
+        let _theme = md_theme::test_lock();
         // The `!` advisory colour must track the palette: bright yellow (SGR 93)
         // is near-invisible on white, so light theme uses dark yellow (SGR 33).
         use crate::highlight::theme as md_theme;
@@ -332,6 +334,7 @@ mod tests {
 
     #[test]
     fn shell_mode_uses_brand_purple_and_switches_with_theme() {
+        let _theme = md_theme::test_lock();
         // The `!` shell-mode accent is atomcode's brand PURPLE (#7c3aed family),
         // NOT the reddish `Brand` magenta. Because `AnsiValue` is fixed (doesn't
         // track the terminal palette), a light-theme-safe deeper purple is used
@@ -347,7 +350,11 @@ mod tests {
         );
         // Distinct shades, else the split is pointless; and never the red magenta.
         assert_ne!(Palette::SHELL_LIGHT, Palette::SHELL_DARK);
-        assert_ne!(Palette::SHELL_DARK, Palette::BRAND, "shell must not be the red brand magenta");
+        assert_ne!(
+            Palette::SHELL_DARK,
+            Palette::BRAND,
+            "shell must not be the red brand magenta"
+        );
         md_theme::set_theme_mode(false); // restore default
     }
 
@@ -361,6 +368,7 @@ mod tests {
 
     #[test]
     fn diff_colors_soften_on_light_theme() {
+        let _theme = md_theme::test_lock();
         md_theme::set_theme_mode(true); // light
         assert_eq!(diff_add_for_current_theme(), Color::DarkGreen);
         assert_eq!(diff_remove_for_current_theme(), Color::DarkRed);

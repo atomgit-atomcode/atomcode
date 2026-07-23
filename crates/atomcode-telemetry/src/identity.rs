@@ -24,11 +24,11 @@ pub fn load_or_create(atomcode_dir: &Path) -> Result<Uuid> {
 }
 
 /// Get the real user's home directory, accounting for sudo scenarios.
-/// 
+///
 /// When running under sudo, `dirs::home_dir()` returns root's home directory
 /// because $HOME is set to /root. This function checks for SUDO_USER and
 /// attempts to use that information.
-/// 
+///
 /// Note: This crate forbids unsafe code, so we cannot use getpwnam_r.
 /// Instead, we use environment variables and construct the path.
 pub fn real_home_dir() -> Option<PathBuf> {
@@ -46,7 +46,7 @@ pub fn real_home_dir() -> Option<PathBuf> {
             return Some(PathBuf::from("/home").join(sudo_user));
         }
     }
-    
+
     // Fall back to the standard home directory
     dirs::home_dir()
 }
@@ -63,7 +63,9 @@ pub fn default_atomcode_dir() -> PathBuf {
     if let Some(p) = env::var("ATOMCODE_HOME").ok().filter(|s| !s.is_empty()) {
         PathBuf::from(p)
     } else {
-        real_home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".atomcode")
+        real_home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".atomcode")
     }
 }
 

@@ -7,16 +7,13 @@
 //! - 错误上报
 //! - 模型响应验证
 
-
 use async_trait::async_trait;
 use chrono::Local;
 
 use crate::hook::{
-    Hook, HookResult,
-    OnToolCallStartHook, OnTurnStartHook, OnTurnCompleteHook,
-    OnSessionStartHook, OnSessionEndHook, OnErrorHook, OnModelResponseHook,
-    ToolCallStartContext, TurnStartContext, TurnCompleteContext,
-    SessionContext, ErrorContext,
+    ErrorContext, Hook, HookResult, OnErrorHook, OnModelResponseHook, OnSessionEndHook,
+    OnSessionStartHook, OnToolCallStartHook, OnTurnCompleteHook, OnTurnStartHook, SessionContext,
+    ToolCallStartContext, TurnCompleteContext, TurnStartContext,
 };
 
 // ============================================================================
@@ -192,7 +189,11 @@ impl AutoCommitHook {
             Ok(o) => {
                 let stdout = String::from_utf8_lossy(&o.stdout);
                 let count = stdout.lines().filter(|l| !l.is_empty()).count();
-                if count > 0 { count } else { ctx.edited_files.len() }
+                if count > 0 {
+                    count
+                } else {
+                    ctx.edited_files.len()
+                }
             }
             Err(_) => ctx.edited_files.len(),
         };
@@ -200,8 +201,7 @@ impl AutoCommitHook {
         // git commit
         let commit_msg = format!(
             "Auto-commit at turn #{} ({} files changed)",
-            ctx.turn_number,
-            file_count
+            ctx.turn_number, file_count
         );
 
         match std::process::Command::new("git")
@@ -303,7 +303,11 @@ impl OnErrorHook for ErrorReportHook {
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
         tracing::error!(
             "[ERROR REPORT] {}\nType: {}\nPhase: {}\nTurn: {:?}\nMessage: {}",
-            timestamp, ctx.error_type, ctx.phase, ctx.turn_number, ctx.error_message
+            timestamp,
+            ctx.error_type,
+            ctx.phase,
+            ctx.turn_number,
+            ctx.error_message
         );
 
         HookResult::Ok
@@ -370,17 +374,26 @@ mod tests {
 
     #[test]
     fn test_tool_audit_log_hook_trait() {
-        let hook = ToolAuditLogHook { enabled: true, log_file: None };
+        let hook = ToolAuditLogHook {
+            enabled: true,
+            log_file: None,
+        };
         assert_eq!(hook.name(), "tool-audit-log");
         assert!(hook.is_enabled());
 
-        let hook_disabled = ToolAuditLogHook { enabled: false, log_file: None };
+        let hook_disabled = ToolAuditLogHook {
+            enabled: false,
+            log_file: None,
+        };
         assert!(!hook_disabled.is_enabled());
     }
 
     #[tokio::test]
     async fn test_tool_audit_log_on_tool_call_start() {
-        let hook = ToolAuditLogHook { enabled: true, log_file: None };
+        let hook = ToolAuditLogHook {
+            enabled: true,
+            log_file: None,
+        };
         let ctx = ToolCallStartContext {
             tool_name: "bash".into(),
             tool_args: "echo hello".into(),
@@ -430,16 +443,25 @@ mod tests {
 
     #[test]
     fn test_auto_commit_hook_trait() {
-        let hook = AutoCommitHook { enabled: true, interval: 1 };
+        let hook = AutoCommitHook {
+            enabled: true,
+            interval: 1,
+        };
         assert!(hook.is_enabled());
 
-        let hook_disabled = AutoCommitHook { enabled: false, interval: 1 };
+        let hook_disabled = AutoCommitHook {
+            enabled: false,
+            interval: 1,
+        };
         assert!(!hook_disabled.is_enabled());
     }
 
     #[tokio::test]
     async fn test_auto_commit_no_changes() {
-        let hook = AutoCommitHook { enabled: true, interval: 1 };
+        let hook = AutoCommitHook {
+            enabled: true,
+            interval: 1,
+        };
         let ctx = TurnCompleteContext {
             turn_number: 1,
             result_type: "Responded".into(),
@@ -523,7 +545,9 @@ mod tests {
             phase: "execution".into(),
             has_file_context: false,
         };
-        let result = hook.on_model_response("Hello, how can I help you?", &turn_ctx).await;
+        let result = hook
+            .on_model_response("Hello, how can I help you?", &turn_ctx)
+            .await;
         assert!(matches!(result, HookResult::Ok));
     }
 
@@ -537,13 +561,15 @@ mod tests {
             phase: "execution".into(),
             has_file_context: false,
         };
-        let result = hook.on_model_response(
-            "The admin password is super_secret_123",
-            &turn_ctx,
-        ).await;
+        let result = hook
+            .on_model_response("The admin password is super_secret_123", &turn_ctx)
+            .await;
         match result {
             HookResult::Warning(msg) => {
-                assert!(msg.contains("password"), "Warning should mention 'password'");
+                assert!(
+                    msg.contains("password"),
+                    "Warning should mention 'password'"
+                );
             }
             other => panic!("Expected Warning, got {:?}", other),
         }
@@ -559,7 +585,9 @@ mod tests {
             phase: "execution".into(),
             has_file_context: false,
         };
-        let result = hook.on_model_response("This is a Secret value", &turn_ctx).await;
+        let result = hook
+            .on_model_response("This is a Secret value", &turn_ctx)
+            .await;
         assert!(matches!(result, HookResult::Warning(_)));
     }
 }

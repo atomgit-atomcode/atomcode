@@ -27,8 +27,13 @@ Requires: Pillow  (pip install pillow)
 import sys
 from PIL import Image, ImageSequence
 
-# Tunables — these reproduce the committed cat3-13 mascot.
-CELLS_WIDE = 9
+# Tunables — these reproduce the committed mascot. The source image must have a
+# TRANSPARENT background (alpha-keyed): the committed cat came from a reference
+# with a solid background, so it was pre-processed by flood-filling the border
+# background to transparency (the enclosed eyes survive) before running this.
+# 13 cells is the smallest width at which the two eyes read as distinct rather
+# than merging into one central blob.
+CELLS_WIDE = 13
 EYE_W = 2       # white patch width in px
 EYE_H = 2       # white patch height in px
 ALPHA_THRESHOLD = 128

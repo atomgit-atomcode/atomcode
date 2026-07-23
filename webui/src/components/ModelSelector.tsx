@@ -11,7 +11,15 @@ const EFFORT_OPTIONS: { val: string | null; key: MsgKey }[] = [
   { val: 'max', key: 'effort.max' },
 ];
 
-export function ModelSelector({ value, onChange }: { value: string | null; onChange: (p: string) => void }) {
+export function ModelSelector({
+  value,
+  onChange,
+  onDefaultChange,
+}: {
+  value: string | null;
+  onChange: (p: string) => void;
+  onDefaultChange?: (p: string) => void;
+}) {
   const t = useT();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [open, setOpen] = useState(false);
@@ -21,7 +29,29 @@ export function ModelSelector({ value, onChange }: { value: string | null; onCha
   const [effortOverride, setEffortOverride] = useState<string | null | undefined>(undefined);
   const ref = useRef<HTMLDivElement>(null);
   const effortRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { getModels().then(setModels).catch(() => {}); }, []);
+  useEffect(() => {
+    let active = true;
+    const refresh = () => {
+      getModels().then((next) => {
+        if (active) {
+          setModels(next);
+          const defaultModel = next.find((model) => model.is_default) ?? next[0];
+          if (defaultModel) onDefaultChange?.(defaultModel.provider);
+        }
+      }).catch(() => {});
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 2_000);
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') refresh();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [onDefaultChange]);
   useEffect(() => {
     if (!open && !effortOpen) return;
     const h = (e: MouseEvent) => {
@@ -42,11 +72,15 @@ export function ModelSelector({ value, onChange }: { value: string | null; onCha
     return t(o.key);
   };
   const selectEffort = (v: string | null) => {
+    const previous = effort;
     setEffortOverride(v);
     setEffortOpen(false);
-    // Persists to the provider config → applies on the next turn (live and
-    // /chat both re-read config), so no sync-mode gate is needed.
-    if (current) void postLiveReasoningEffort(v, current.provider);
+    if (current) {
+      void postLiveReasoningEffort(v, current.provider).catch((error) => {
+        setEffortOverride(previous);
+        console.error('Failed to update reasoning effort', error);
+      });
+    }
   };
   // 同名模型可能来自多个 Provider（如两个 deepseek-v4-flash）。仅在模型名重复时
   // 附上 Provider 标识以区分，唯一的模型名保持简洁。

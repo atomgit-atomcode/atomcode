@@ -53,7 +53,11 @@ impl Tool for GlobTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => return err(format!("glob: invalid arguments: {e}. Expected {{\"pattern\":\"<glob>\"}}.")),
+            Err(e) => {
+                return err(format!(
+                    "glob: invalid arguments: {e}. Expected {{\"pattern\":\"<glob>\"}}."
+                ))
+            }
         };
         // Models routinely paste an absolute path straight into `pattern` (e.g.
         // `G:/VR2024/keystore/*`) with no `path` base. Without honoring that, the walk
@@ -69,10 +73,18 @@ impl Tool for GlobTool {
         };
         match tokio::fs::metadata(&base).await {
             Ok(m) if m.is_dir() => {}
-            _ => return err(format!("glob: base directory does not exist: {}", crate::pathnorm::to_display(&base))),
+            _ => {
+                return err(format!(
+                    "glob: base directory does not exist: {}",
+                    crate::pathnorm::to_display(&base)
+                ))
+            }
         }
 
-        let matcher = match GlobBuilder::new(&match_pattern).literal_separator(true).build() {
+        let matcher = match GlobBuilder::new(&match_pattern)
+            .literal_separator(true)
+            .build()
+        {
             Ok(g) => g.compile_matcher(),
             Err(e) => return err(format!("glob: invalid pattern '{}': {e}", a.pattern)),
         };
@@ -160,7 +172,11 @@ fn split_absolute_base(pattern: &str) -> Option<(PathBuf, String)> {
     // A trailing separator (a pasted directory path) leaves no remainder — list the
     // directory's direct children rather than building an empty matcher that matches
     // nothing (which would falsely report "No files matching").
-    let rest = if rest.is_empty() { "*".to_string() } else { rest };
+    let rest = if rest.is_empty() {
+        "*".to_string()
+    } else {
+        rest
+    };
     Some((base, rest))
 }
 
@@ -211,7 +227,12 @@ mod tests {
     }
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        }
     }
 
     #[tokio::test]
@@ -221,7 +242,9 @@ mod tests {
         std::fs::write(d.path().join("src/a.rs"), "").unwrap();
         std::fs::write(d.path().join("src/sub/b.rs"), "").unwrap();
         std::fs::write(d.path().join("src/c.txt"), "").unwrap();
-        let r = GlobTool.execute(r#"{"pattern":"**/*.rs"}"#, &ctx(d.path())).await;
+        let r = GlobTool
+            .execute(r#"{"pattern":"**/*.rs"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("src/a.rs"), "{}", r.content);
         assert!(r.content.contains("src/sub/b.rs"), "{}", r.content);
@@ -234,16 +257,24 @@ mod tests {
         std::fs::create_dir_all(d.path().join("src")).unwrap();
         std::fs::write(d.path().join("top.rs"), "").unwrap();
         std::fs::write(d.path().join("src/deep.rs"), "").unwrap();
-        let r = GlobTool.execute(r#"{"pattern":"*.rs"}"#, &ctx(d.path())).await;
+        let r = GlobTool
+            .execute(r#"{"pattern":"*.rs"}"#, &ctx(d.path()))
+            .await;
         assert!(r.content.contains("top.rs"), "{}", r.content);
-        assert!(!r.content.contains("deep.rs"), "* must not cross /: {}", r.content);
+        assert!(
+            !r.content.contains("deep.rs"),
+            "* must not cross /: {}",
+            r.content
+        );
     }
 
     #[tokio::test]
     async fn no_match_reports_cleanly() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "").unwrap();
-        let r = GlobTool.execute(r#"{"pattern":"**/*.zig"}"#, &ctx(d.path())).await;
+        let r = GlobTool
+            .execute(r#"{"pattern":"**/*.zig"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("No files matching"), "{}", r.content);
     }
@@ -298,7 +329,9 @@ mod tests {
         std::fs::create_dir_all(d.path().join("target")).unwrap();
         std::fs::write(d.path().join("target/x.rs"), "").unwrap();
         std::fs::write(d.path().join("keep.rs"), "").unwrap();
-        let r = GlobTool.execute(r#"{"pattern":"**/*.rs"}"#, &ctx(d.path())).await;
+        let r = GlobTool
+            .execute(r#"{"pattern":"**/*.rs"}"#, &ctx(d.path()))
+            .await;
         assert!(r.content.contains("keep.rs"), "{}", r.content);
         assert!(!r.content.contains("target/x.rs"), "{}", r.content);
     }

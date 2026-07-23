@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.0</span>
+    <span class="dhdr-ver">v5.0.1</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -116,7 +118,7 @@ context_window = 64000</code></pre>
         </thead>
         <tbody>
           <tr><td><code>type</code></td><td>string</td><td>是</td><td>provider 协议类型,目前支持 <code>openai</code>、<code>claude</code>、<code>ollama</code></td></tr>
-          <tr><td><code>api_key</code></td><td>string?</td><td>视情况</td><td>API Key。<code>ollama</code> 可不填。OAuth 登录的 provider 不含此字段,token 从 <code>~/.atomcode/auth.toml</code> 自动读取</td></tr>
+          <tr><td><code>api_key</code></td><td>string?</td><td>视情况</td><td>API Key。支持明文密钥、环境变量语法（如 <code>$MY_KEY</code> 或 <code>${MY_KEY:-default}</code>）、环境变量名（如 <code>MY_KEY</code>），或留空自动回退标准环境变量（如 <code>OPENAI_API_KEY</code> / <code>ANTHROPIC_API_KEY</code>）。<code>ollama</code> 可不填。OAuth 登录的 provider 不含此字段，token 从 <code>~/.atomcode/auth.toml</code> 自动读取</td></tr>
           <tr><td><code>model</code></td><td>string</td><td>是</td><td>模型名,比如 <code>deepseek-chat</code>、<code>gpt-4o</code>、<code>claude-sonnet-4-6</code></td></tr>
           <tr><td><code>base_url</code></td><td>string</td><td>是</td><td>API 基地址,需指向实际接口。例:<code>https://api.deepseek.com/v1</code>、<code>http://localhost:11434</code></td></tr>
           <tr><td><code>context_window</code></td><td>integer</td><td>否</td><td>模型上下文窗口(tokens),默认 64000。<code>ollama</code> 默认 8000</td></tr>
@@ -126,10 +128,58 @@ context_window = 64000</code></pre>
         </tbody>
       </table>
 
+      <h2>环境变量与 API Key 动态解析</h2>
+      <p>为避免在配置文件中明文保存敏感密钥，并方便与其他开发工具共用环境变量，AtomCode 支持在 <code>config.toml</code> 中灵活使用环境变量：</p>
+      <ul>
+        <li><strong>环境变量语法展开 (<code>$VAR</code> / <code>${VAR}</code>)</strong>：
+          <pre><code>[providers.my_openai]
+type = "openai"
+model = "gpt-4o"
+api_key = "$MY_OPENAI_KEY" # 或 "${MY_OPENAI_KEY}"
+base_url = "https://api.openai.com/v1"</code></pre>
+          支持带默认值的表达式（例：<code>api_key = "${MY_KEY:-sk-fallback}"</code>）。
+        </li>
+        <li><strong>直接填写环境变量名</strong>：
+          <pre><code>[providers.my_claude]
+type = "claude"
+model = "claude-sonnet-4-6"
+api_key = "ANTHROPIC_API_KEY" # 自动从环境变量 ANTHROPIC_API_KEY 中读取</code></pre>
+        </li>
+        <li><strong>留空自动回退标准环境变量</strong>：当未配置或留空 <code>api_key</code> 时，系统会自动寻找对应 <code>type</code> 的标准环境变量：
+          <ul>
+            <li><code>openai</code> / <code>openai-compat</code>：读取 <code>OPENAI_API_KEY</code></li>
+            <li><code>claude</code> / <code>anthropic</code>：读取 <code>ANTHROPIC_API_KEY</code></li>
+            <li><code>ollama</code>：读取 <code>OLLAMA_API_KEY</code></li>
+            <li>通用后备：读取 <code>ATOMCODE_API_KEY</code></li>
+          </ul>
+        </li>
+      </ul>
+      <p>注：配置文件中的 <code>$VAR</code> 语法由 AtomCode 程序内部解析，在 Windows、macOS 和 Linux 上保持统一写法。</p>
+
       <div class="callout callout-info">
         <strong>为什么默认 64K 而不是 128K?</strong>
         <p>即便模型官方声称支持 128K+,其有效注意力窗口通常要小得多,过大上下文反而会触发"迷失在中段"的问题,并且阻止 AtomCode 的上下文压缩策略生效。64K 是经验上最稳的默认值,若你确定模型表现良好,可自行上调。</p>
       </div>
+
+      <h2>网络与代理</h2>
+      <p>AtomCode 默认跟随系统代理配置,因此在公司代理后也能开箱即用。行为在 <code>[network.proxy]</code> 下配置:</p>
+      <pre><code>[network.proxy]
+mode = "follow_system"    # 默认 —— 采用环境变量 + 系统代理
+# mode = "default_proxy"  # 使用下面显式的 http/https/all
+# mode = "no_proxy"       # 强制直连
+# http  = "http://127.0.0.1:7890"
+# https = "http://127.0.0.1:7890"
+# all   = "socks5://127.0.0.1:1080"
+# no_proxy = "localhost,127.0.0.1,.internal"</code></pre>
+      <table>
+        <thead><tr><th>mode</th><th>行为</th></tr></thead>
+        <tbody>
+          <tr><td><code>follow_system</code>(默认)</td><td>采用 <code>HTTP_PROXY</code> / <code>HTTPS_PROXY</code> / <code>ALL_PROXY</code> / <code>NO_PROXY</code>;未设置的部分回退到操作系统的系统代理(Windows 注册表 / macOS <code>scutil --proxy</code>)。</td></tr>
+          <tr><td><code>default_proxy</code></td><td>使用本段里显式的 <code>http</code> / <code>https</code> / <code>all</code> / <code>no_proxy</code> 值。</td></tr>
+          <tr><td><code>no_proxy</code></td><td>强制直连,忽略环境变量与系统代理。</td></tr>
+        </tbody>
+      </table>
+      <p>IPv6 代理主机会自动加方括号(<code>::1</code> → <code>http://[::1]:8080</code>)。若登录时连接失败或超时,错误信息会指向你的代理 / 网络设置,便于区分是代理问题还是凭据错误。</p>
 
       <h2>常见 provider 配置示例</h2>
 
@@ -208,7 +258,7 @@ base_url = "https://api.deepseek.com/v1"
 type = "ollama"
 model = "qwen2.5:14b"
 base_url = "http://localhost:11434"</code></pre>
-      <p>在 TUI 中可以用 <code>/provider</code> 在这些条目之间切换,用 <code>/model</code> 只切换当前 provider 下的模型。命令行启动时也支持一次性覆盖:</p>
+      <p>在 TUI 中用 <code>/provider</code> 管理 provider 条目。用 <code>/model</code> 切换当前会话，并把所选条目保存为后续新会话的默认值；其他已经打开的会话不变。命令行启动时也支持一次性覆盖:</p>
       <pre><code>atomcode --provider deepseek --model deepseek-reasoner</code></pre>
 
       <h2 id="vision-preprocessor">视觉预处理器</h2>

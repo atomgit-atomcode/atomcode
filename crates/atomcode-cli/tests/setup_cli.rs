@@ -26,5 +26,8 @@ fn setup_succeeds_in_empty_dir() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let ok = stdout.contains("Setup 完成") || stdout.contains("Setup complete");
-    assert!(ok, "stdout did not contain a setup-success marker:\n{stdout}");
+    assert!(
+        ok,
+        "stdout did not contain a setup-success marker:\n{stdout}"
+    );
 }

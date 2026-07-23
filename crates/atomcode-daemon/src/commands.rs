@@ -5,9 +5,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::AppState;
+use atomcode_capabilities::session::{
+    LoadedSession, SessionLease as NativeSessionLease, SessionManager as NativeSessionManager,
+    SessionMeta as NativeSessionMeta, SessionStoreError,
+};
 use atomcode_config::config::memory::MemoryStore;
-use atomcode_core::conversation::{Conversation, ConversationSnapshot};
-use atomcode_core::session::{Session, SessionId, SessionManager};
+use atomcode_core::conversation::Conversation;
 
 struct KernelSummaryProvider {
     inner: Arc<dyn atomcode_core::provider::LlmProvider>,
@@ -33,7 +36,10 @@ impl atomcode_kernel::provider::LlmProvider for KernelSummaryProvider {
         futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
         atomcode_kernel::stream::ProviderError,
     > {
-        let messages: Vec<_> = messages.iter().map(message_to_core).collect();
+        let messages: Vec<_> = messages
+            .iter()
+            .map(crate::legacy_convert::message_to_core)
+            .collect();
         let stream = self.inner.chat_stream(&messages, None).map_err(|error| {
             atomcode_kernel::stream::ProviderError {
                 message: error.to_string(),
@@ -66,342 +72,6 @@ impl atomcode_kernel::provider::LlmProvider for KernelSummaryProvider {
             })
             .boxed())
     }
-}
-
-fn message_to_kernel(
-    message: &atomcode_core::conversation::message::Message,
-) -> atomcode_kernel::message::Message {
-    use atomcode_core::conversation::message::{MessageContent, Role};
-    use atomcode_kernel::message::{ImageContent, Message, Role as KernelRole};
-    let mut converted = match &message.content {
-        MessageContent::Text(text) => {
-            let mut output = Message::user(text.clone());
-            output.role = match message.role {
-                Role::System => KernelRole::System,
-                Role::User => KernelRole::User,
-                Role::Assistant => KernelRole::Assistant,
-                Role::Tool => KernelRole::Tool,
-            };
-            output
-        }
-        MessageContent::AssistantWithToolCalls {
-            text,
-            tool_calls,
-            reasoning_content,
-            thinking_blocks,
-        } => {
-            let calls = tool_calls.iter().map(|call| atomcode_kernel::tool::ToolCall {
-                id: call.id.clone(), name: call.name.clone(), arguments: call.arguments.clone(),
-            }).collect();
-            let mut output = Message::assistant(text.clone().unwrap_or_default(), calls);
-            output.reasoning = reasoning_content.clone();
-            output.reasoning_blocks = thinking_blocks
-                .iter()
-                .map(|block| atomcode_kernel::message::ReasoningBlock {
-                    text: block.text.clone(),
-                    opaque: Some(block.signature.clone()),
-                    provider: Some("anthropic".into()),
-                })
-                .collect();
-            output
-        }
-        MessageContent::ToolResult(result) =>
-            Message::tool_result(result.call_id.clone(), result.output.clone(), !result.success),
-        MessageContent::ToolResultRef(result) =>
-            Message::tool_result(result.call_id.clone(), result.summary.clone(), !result.success),
-        MessageContent::MultiPart { text, images } => Message::user_with_images(
-            text.clone().unwrap_or_default(),
-            images.iter().map(|image| ImageContent {
-                media_type: image.media_type.clone(), data: image.data.clone(),
-            }).collect(),
-        ),
-    };
-    converted.synthetic = message.synthetic;
-    converted.internal_origin = message.internal_origin.clone();
-    converted
-}
-
-pub(crate) fn message_to_core(
-    message: &atomcode_kernel::message::Message,
-) -> atomcode_core::conversation::message::Message {
-    use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
-    use atomcode_kernel::message::Role as KernelRole;
-    let role = match message.role {
-        KernelRole::System => Role::System,
-        KernelRole::User => Role::User,
-        KernelRole::Assistant => Role::Assistant,
-        KernelRole::Tool => Role::Tool,
-    };
-    let content = if message.role == KernelRole::Tool {
-        MessageContent::ToolResult(atomcode_core::tool::ToolResult {
-            call_id: message.tool_call_id.clone().unwrap_or_default(),
-            output: message.text.clone(), success: !message.is_error,
-        })
-    } else if !message.tool_calls.is_empty() {
-        MessageContent::AssistantWithToolCalls {
-            text: (!message.text.is_empty()).then(|| message.text.clone()),
-            tool_calls: message.tool_calls.iter().map(|call| atomcode_core::tool::ToolCall {
-                id: call.id.clone(), name: call.name.clone(), arguments: call.arguments.clone(),
-            }).collect(),
-            reasoning_content: message.reasoning.clone(),
-            thinking_blocks: message
-                .reasoning_blocks
-                .iter()
-                .map(|block| atomcode_core::conversation::message::ThinkingBlock {
-                    text: block.text.clone(),
-                    signature: block.opaque.clone().unwrap_or_default(),
-                })
-                .collect(),
-        }
-    } else if !message.images.is_empty() {
-        MessageContent::MultiPart {
-            text: (!message.text.is_empty()).then(|| message.text.clone()),
-            images: message.images.iter().map(|image| ImagePart {
-                media_type: image.media_type.clone(), data: image.data.clone(),
-            }).collect(),
-        }
-    } else {
-        MessageContent::Text(message.text.clone())
-    };
-    Message { role, content, synthetic: message.synthetic, internal_origin: message.internal_origin.clone() }
-}
-
-fn legacy_cold_summary_message(
-    summary: &str,
-) -> atomcode_core::conversation::message::Message {
-    use atomcode_core::conversation::{
-        message::{Message, Role},
-        LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
-    };
-
-    let mut message = Message::new(
-        Role::User,
-        format!("{LEGACY_COLD_SUMMARY_PREFIX}{summary}"),
-    );
-    message.synthetic = true;
-    message.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.into());
-    message
-}
-
-fn split_legacy_cold_summary_messages(
-    messages: Vec<atomcode_core::conversation::message::Message>,
-) -> ConversationSnapshot {
-    use atomcode_core::conversation::{
-        LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
-    };
-
-    let mut recent = Vec::with_capacity(messages.len());
-    let mut cold_summaries = Vec::new();
-    for message in messages {
-        if message.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN) {
-            if let Some(summary) = message
-                .text()
-                .and_then(|text| text.strip_prefix(LEGACY_COLD_SUMMARY_PREFIX))
-            {
-                cold_summaries.push(summary.to_string());
-                continue;
-            }
-        }
-        recent.push(message);
-    }
-    ConversationSnapshot {
-        messages: recent,
-        cold_summaries,
-    }
-}
-
-fn is_legacy_cold_summary_message(message: &atomcode_kernel::message::Message) -> bool {
-    use atomcode_core::conversation::{
-        LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
-    };
-
-    message.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
-        && message.text.starts_with(LEGACY_COLD_SUMMARY_PREFIX)
-}
-
-fn adjust_compaction_mutation_for_cold_summaries(
-    mutation: atomcode_coding::runtime::SnapshotCompactionMutation,
-    before: &[atomcode_kernel::message::Message],
-    after: &[atomcode_kernel::message::Message],
-) -> atomcode_coding::runtime::SnapshotCompactionMutation {
-    use atomcode_coding::runtime::SnapshotCompactionMutation;
-
-    let SnapshotCompactionMutation::Replace {
-        old_start,
-        old_end,
-        new_end,
-    } = mutation
-    else {
-        return mutation;
-    };
-    let visible_before = |end: usize| {
-        before
-            .iter()
-            .take(end)
-            .filter(|message| !is_legacy_cold_summary_message(message))
-            .count()
-    };
-    let visible_after = after
-        .iter()
-        .take(new_end)
-        .filter(|message| !is_legacy_cold_summary_message(message))
-        .count();
-    SnapshotCompactionMutation::Replace {
-        old_start: visible_before(old_start),
-        old_end: visible_before(old_end),
-        new_end: visible_after,
-    }
-}
-
-fn update_core_message_text(
-    message: &mut atomcode_core::conversation::message::Message,
-    compacted: &atomcode_kernel::message::Message,
-) {
-    use atomcode_core::conversation::message::MessageContent;
-    match &mut message.content {
-        MessageContent::Text(text) => *text = compacted.text.clone(),
-        MessageContent::AssistantWithToolCalls { text, reasoning_content, .. } => {
-            *text = (!compacted.text.is_empty()).then(|| compacted.text.clone());
-            *reasoning_content = compacted.reasoning.clone();
-        }
-        MessageContent::ToolResult(result) => result.output = compacted.text.clone(),
-        MessageContent::ToolResultRef(result) => result.summary = compacted.text.clone(),
-        MessageContent::MultiPart { text, .. } => {
-            *text = (!compacted.text.is_empty()).then(|| compacted.text.clone());
-        }
-    }
-    message.synthetic = compacted.synthetic;
-    message.internal_origin = compacted.internal_origin.clone();
-}
-
-fn merge_compacted_messages(
-    original: Vec<atomcode_core::conversation::message::Message>,
-    before: &[atomcode_kernel::message::Message],
-    after: &[atomcode_kernel::message::Message],
-    mutation: atomcode_coding::runtime::SnapshotCompactionMutation,
-) -> Vec<atomcode_core::conversation::message::Message> {
-    use atomcode_coding::runtime::SnapshotCompactionMutation;
-
-    match mutation {
-        SnapshotCompactionMutation::Noop => original,
-        SnapshotCompactionMutation::RewriteOnly => {
-            let common = original.len().min(after.len());
-            let mut merged = Vec::with_capacity(after.len());
-            for (index, mut message) in original.into_iter().take(common).enumerate() {
-                if before.get(index) != after.get(index) {
-                    update_core_message_text(&mut message, &after[index]);
-                }
-                merged.push(message);
-            }
-            merged.extend(after[common..].iter().map(message_to_core));
-            merged
-        }
-        SnapshotCompactionMutation::Replace { old_start, old_end, new_end } => {
-            let mut original = original;
-            let suffix = original.split_off(old_end.min(original.len()));
-            original.truncate(old_start.min(original.len()));
-            original.extend(
-                after[old_start.min(after.len())..new_end.min(after.len())]
-                    .iter()
-                    .map(message_to_core),
-            );
-            original.extend(suffix);
-            original
-        }
-    }
-}
-
-/// 撤销会话最后若干轮（arg 空 = 最后一轮；否则回退到第 arg 个用户提示之前——对齐 TUI /undo）。
-/// 就地修改 session.messages / cold_summaries / display_messages / turn_stats，
-/// 返回被移除的提示数。纯内存，无磁盘/env 依赖。
-pub(crate) fn apply_undo(session: &mut Session, arg: &str) -> usize {
-    let snapshot = ConversationSnapshot {
-        messages: std::mem::take(&mut session.messages),
-        cold_summaries: session.cold_summaries.clone(),
-    };
-    let mut conv = Conversation::from_snapshot(snapshot);
-    let available = conv.prompt_count();
-    if available == 0 {
-        let s = conv.snapshot();
-        session.messages = s.messages;
-        return 0;
-    }
-    let target = arg.trim().parse::<usize>().ok().unwrap_or(available);
-    let before = conv.prompt_count();
-    conv.undo_to_prompt(target);
-    let after = conv.prompt_count();
-    let s = conv.snapshot();
-    session.messages = s.messages;
-    session.cold_summaries = s.cold_summaries;
-    let undone = before.saturating_sub(after);
-    if undone > 0 {
-        // Prune display_messages and turn_stats that reference removed turns.
-        prune_orphaned_display(session);
-    }
-    undone
-}
-
-/// 会话 messages 变短后，裁掉锚点越界的 UI 附加消息与轮次统计，避免被撤销/压缩掉的
-/// 回合的通知重现、上下文表尺读到过期 turn_stat。
-fn prune_orphaned_display(session: &mut Session) {
-    let n = session.messages.len();
-    session.display_messages.retain(|d| d.after_message <= n);
-    session.turn_stats.retain(|t| t.after_message <= n);
-}
-
-/// Re-index UI anchors after kernel compaction replaces one contiguous old span
-/// `[old_start, old_end)` with `[old_start, new_end)` (normally one summary).
-fn reindex_after_compaction(
-    session: &mut Session,
-    old_start: usize,
-    old_end: usize,
-    new_end: usize,
-) {
-    session.display_messages.retain_mut(|d| {
-        if d.after_message <= old_start {
-            true
-        } else if d.after_message < old_end {
-            false
-        } else {
-            d.after_message = new_end + d.after_message.saturating_sub(old_end);
-            true
-        }
-    });
-    session.turn_stats.retain_mut(|t| {
-        if t.after_message > old_start && t.after_message < old_end {
-            false
-        } else {
-            if t.after_message >= old_end {
-                t.after_message = new_end + t.after_message.saturating_sub(old_end);
-            }
-            true
-        }
-    });
-}
-
-fn reindex_after_snapshot_compaction(
-    session: &mut Session,
-    mutation: atomcode_coding::runtime::SnapshotCompactionMutation,
-) {
-    if let atomcode_coding::runtime::SnapshotCompactionMutation::Replace {
-        old_start,
-        old_end,
-        new_end,
-    } = mutation
-    {
-        reindex_after_compaction(session, old_start, old_end, new_end);
-    }
-}
-
-/// 保存到与加载时相同的桶：若有 project_hash 则写 project_hash 桶，否则按 working_dir 桶。
-/// 与 load_command_session 严格对称，防止 undo/compact 写入不同桶产生幽灵副本。
-fn save_command_session(session: &mut Session, project_hash: Option<&str>) -> anyhow::Result<()> {
-    session.touch();
-    match project_hash {
-        Some(hash) => crate::save_session_to_hash(hash, session)?,
-        None => SessionManager::new(&session.working_dir).save(session)?,
-    }
-    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -463,6 +133,7 @@ pub(crate) enum CommandResult {
         model: String,
         working_dir: String,
         config_path: String,
+        text: String,
     },
     Config {
         path: String,
@@ -489,17 +160,223 @@ pub(crate) struct TodoItemJson {
     pub content: String,
 }
 
-/// 按会话真实桶加载：优先 project_hash（跨 /cd 稳定），否则回退到 working_dir。
-fn load_command_session(
+struct NativeCommandSession {
+    manager: NativeSessionManager,
+    lease: NativeSessionLease,
+    loaded: LoadedSession,
+}
+
+fn command_project_bucket(
     working_dir: &std::path::Path,
     project_hash: Option<&str>,
-    session_id: &SessionId,
-) -> anyhow::Result<Session> {
-    if let Some(hash) = project_hash {
-        Ok(crate::load_session(hash, session_id.as_str())?)
-    } else {
-        Ok(SessionManager::new(working_dir).load(session_id)?)
+) -> anyhow::Result<String> {
+    let bucket = project_hash
+        .map(str::to_owned)
+        .unwrap_or_else(|| NativeSessionManager::project_hash(working_dir));
+    if bucket.len() != 16 || !bucket.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid project session bucket")
     }
+    Ok(bucket)
+}
+
+fn load_native_command_session(
+    working_dir: &std::path::Path,
+    project_hash: Option<&str>,
+    id: &str,
+) -> anyhow::Result<Option<NativeCommandSession>> {
+    let bucket = command_project_bucket(working_dir, project_hash)?;
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(bucket));
+    let has_existing = [
+        manager.meta_path(id)?,
+        manager.snapshot_path(id)?,
+        manager.legacy_path(id)?,
+    ]
+    .iter()
+    .any(|path| path.exists());
+    if !has_existing {
+        return Ok(None);
+    }
+    let lease = manager.acquire_lease(id)?;
+    crate::legacy_convert::converge_session(&manager, &lease)?;
+    let loaded = manager.load_native_session(id)?;
+    Ok(Some(NativeCommandSession {
+        manager,
+        lease,
+        loaded,
+    }))
+}
+
+fn load_command_session_view(
+    working_dir: &std::path::Path,
+    project_hash: Option<&str>,
+    id: &str,
+) -> anyhow::Result<crate::legacy_convert::CatalogSessionView> {
+    let bucket = command_project_bucket(working_dir, project_hash)?;
+    crate::legacy_convert::load_catalog_session_view_in_project(&bucket, id)?
+        .ok_or_else(|| anyhow::anyhow!("session {id:?} not found"))
+}
+
+fn exec_native_undo(session: NativeCommandSession, arg: &str) -> anyhow::Result<CommandResult> {
+    let expected_snapshot = session.loaded.snapshot;
+    let available = expected_snapshot
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == atomcode_kernel::message::Role::User && !message.synthetic
+        })
+        .count();
+    if available == 0 {
+        return Ok(CommandResult::Undo { undone: 0 });
+    }
+    let target = arg.trim().parse::<usize>().ok();
+    let undo = atomcode_coding::runtime::undo_snapshot_to_prompt(&expected_snapshot, target)?;
+    let message_count = undo.snapshot.messages.len();
+    let persisted_message_count = u32::try_from(message_count)?;
+    session.manager.commit_native_runtime_mutation(
+        &session.lease,
+        &undo.snapshot,
+        move |current_snapshot, meta, presentation| {
+            if current_snapshot != &expected_snapshot {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session mutation",
+                    message: "session snapshot changed while preparing undo".into(),
+                });
+            }
+            meta.turn_stats
+                .retain(|stat| !stat.position_valid || stat.after_message <= message_count);
+            let surviving_turn_ids: std::collections::BTreeSet<_> = meta
+                .turn_stats
+                .iter()
+                .filter_map(|stat| {
+                    (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
+                })
+                .collect();
+            presentation.retain_turns(&surviving_turn_ids);
+            meta.message_count = persisted_message_count;
+            meta.turn_count =
+                u32::try_from(meta.turn_stats.len()).map_err(|_| SessionStoreError::TooLarge {
+                    kind: "session turn stats",
+                    limit: u32::MAX as usize,
+                    actual: meta.turn_stats.len(),
+                })?;
+            meta.updated_at = atomcode_capabilities::session::now_ms();
+            Ok(())
+        },
+    )?;
+    Ok(CommandResult::Undo {
+        undone: undo
+            .prompts_before
+            .saturating_sub(undo.target_n.saturating_sub(1)),
+    })
+}
+
+fn commit_native_compaction(
+    session: NativeCommandSession,
+    messages: Vec<atomcode_kernel::message::Message>,
+    mutation: atomcode_coding::runtime::SnapshotCompactionMutation,
+) -> anyhow::Result<()> {
+    use atomcode_coding::runtime::SnapshotCompactionMutation;
+
+    let expected_snapshot = session.loaded.snapshot;
+    let mut snapshot = expected_snapshot.clone();
+    snapshot.messages = messages;
+    let message_count = snapshot.messages.len();
+    let persisted_message_count = u32::try_from(message_count)?;
+    session.manager.commit_native_runtime_mutation(
+        &session.lease,
+        &snapshot,
+        move |current_snapshot, meta, presentation| {
+            if current_snapshot != &expected_snapshot {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session mutation",
+                    message: "session snapshot changed while preparing compaction".into(),
+                });
+            }
+            if let SnapshotCompactionMutation::Replace {
+                old_start,
+                old_end,
+                new_end,
+            } = mutation
+            {
+                meta.turn_stats.retain_mut(|stat| {
+                    if !stat.position_valid {
+                        return true;
+                    }
+                    if stat.after_message > old_start && stat.after_message < old_end {
+                        false
+                    } else {
+                        if stat.after_message >= old_end {
+                            stat.after_message =
+                                new_end + stat.after_message.saturating_sub(old_end);
+                        }
+                        true
+                    }
+                });
+            }
+            let surviving_turn_ids: std::collections::BTreeSet<_> = meta
+                .turn_stats
+                .iter()
+                .filter_map(|stat| {
+                    (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id)
+                })
+                .collect();
+            presentation.retain_turns(&surviving_turn_ids);
+            meta.message_count = persisted_message_count;
+            meta.turn_count =
+                u32::try_from(meta.turn_stats.len()).map_err(|_| SessionStoreError::TooLarge {
+                    kind: "session turn stats",
+                    limit: u32::MAX as usize,
+                    actual: meta.turn_stats.len(),
+                })?;
+            meta.updated_at = atomcode_capabilities::session::now_ms();
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+async fn exec_native_compact(
+    state: &AppState,
+    working_dir: &std::path::Path,
+    provider_name: Option<&str>,
+    arg: &str,
+    session: NativeCommandSession,
+) -> anyhow::Result<CommandResult> {
+    let config =
+        atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())?;
+    let selected_provider = provider_name.unwrap_or(&config.default_provider);
+    let context_window = config
+        .providers
+        .get(selected_provider)
+        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", selected_provider))?
+        .context_window as u32;
+    let parts = crate::live_api::build_turn_parts(
+        working_dir,
+        provider_name,
+        &state.mcp_cache,
+        state.telemetry.clone(),
+    )
+    .await?;
+    let provider = Arc::new(KernelSummaryProvider {
+        inner: parts.provider,
+        context_window,
+    });
+    let compacted = atomcode_coding::runtime::compact_snapshot(
+        session.loaded.snapshot.messages.clone(),
+        provider,
+        (!arg.trim().is_empty()).then(|| arg.trim().to_string()),
+    )
+    .await;
+    if compacted.outcome.committed {
+        commit_native_compaction(session, compacted.messages, compacted.mutation)?;
+    }
+    Ok(CommandResult::Compact {
+        applied: compacted.outcome.committed,
+        removed_messages: compacted.outcome.removed_messages,
+        before_tokens: compacted.outcome.estimated_tokens_before,
+        after_tokens: compacted.outcome.estimated_tokens_after,
+    })
 }
 
 fn exec_undo(
@@ -509,13 +386,9 @@ fn exec_undo(
     project_hash: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for undo"))?;
-    let session_id = SessionId::from_string(sid.to_string());
-    let mut session = load_command_session(working_dir, project_hash, &session_id)?;
-    let undone = apply_undo(&mut session, arg);
-    if undone > 0 {
-        save_command_session(&mut session, project_hash)?;
-    }
-    Ok(CommandResult::Undo { undone })
+    let native = load_native_command_session(working_dir, project_hash, sid)?
+        .ok_or_else(|| anyhow::anyhow!("session {sid:?} not found"))?;
+    exec_native_undo(native, arg)
 }
 
 async fn exec_context(
@@ -526,8 +399,7 @@ async fn exec_context(
     provider: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for context"))?;
-    let session_id = SessionId::from_string(sid.to_string());
-    let session = load_command_session(working_dir, project_hash, &session_id)?;
+    let session = load_command_session_view(working_dir, project_hash, sid)?;
     let parts = crate::live_api::build_turn_parts(
         working_dir,
         provider,
@@ -535,14 +407,11 @@ async fn exec_context(
         state.telemetry.clone(),
     )
     .await?;
-    let conv = Conversation::from_snapshot(ConversationSnapshot {
-        messages: session.messages.clone(),
-        cold_summaries: session.cold_summaries.clone(),
-    });
+    let conv =
+        Conversation::from_snapshot(crate::legacy_convert::snapshot_to_core(&session.snapshot));
     let (msgs, _) = parts.ctx.build_messages(&conv, &parts.system_prompt, "");
-    let s =
-        atomcode_core::agent::compute_rich_context_stats(&conv, &msgs, &parts.tools, &*parts.ctx)
-            .await;
+    let s = atomcode_core::ctx::compute_rich_context_stats(&conv, &msgs, &parts.tools, &*parts.ctx)
+        .await;
     Ok(CommandResult::Context {
         system_tokens: s.system_tokens,
         sent_tokens: s.sent_tokens,
@@ -607,73 +476,13 @@ async fn exec_compact(
     arg: &str,
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for compact"))?;
-    let session_id = SessionId::from_string(sid.to_string());
-    let mut session = load_command_session(working_dir, project_hash, &session_id)?;
-    let config = atomcode_config::config::Config::load(
-        &atomcode_config::config::Config::default_path(),
-    )?;
-    let provider_name = provider.unwrap_or(&config.default_provider);
-    let context_window = config
-        .providers
-        .get(provider_name)
-        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_name))?
-        .context_window as u32;
-    let parts = crate::live_api::build_turn_parts(
-        working_dir,
-        provider,
-        &state.mcp_cache,
-        state.telemetry.clone(),
-    )
-    .await?;
-
-    let provider = Arc::new(KernelSummaryProvider {
-        inner: parts.provider,
-        context_window,
-    });
-    let mut original_messages: Vec<_> = std::mem::take(&mut session.cold_summaries)
-        .into_iter()
-        .map(|summary| legacy_cold_summary_message(&summary))
-        .collect();
-    original_messages.append(&mut session.messages);
-    let messages: Vec<_> = original_messages
-        .iter()
-        .map(message_to_kernel)
-        .collect();
-    let before_messages = messages.clone();
-    let compacted = atomcode_coding::runtime::compact_snapshot(
-        messages,
-        provider,
-        (!arg.trim().is_empty()).then(|| arg.trim().to_string()),
-    )
-    .await;
-    let adjusted_mutation = adjust_compaction_mutation_for_cold_summaries(
-        compacted.mutation,
-        &before_messages,
-        &compacted.messages,
-    );
-    let merged = merge_compacted_messages(
-        original_messages,
-        &before_messages,
-        &compacted.messages,
-        compacted.mutation,
-    );
-    let snapshot = split_legacy_cold_summary_messages(merged);
-    session.update_from_conversation_snapshot(snapshot);
-    if compacted.outcome.committed {
-        reindex_after_snapshot_compaction(&mut session, adjusted_mutation);
-        save_command_session(&mut session, project_hash)?;
-    }
-
-    Ok(CommandResult::Compact {
-        applied: compacted.outcome.committed,
-        removed_messages: compacted.outcome.removed_messages,
-        before_tokens: compacted.outcome.estimated_tokens_before,
-        after_tokens: compacted.outcome.estimated_tokens_after,
-    })
+    let native = load_native_command_session(working_dir, project_hash, sid)?
+        .ok_or_else(|| anyhow::anyhow!("session {sid:?} not found"))?;
+    exec_native_compact(state, working_dir, provider, arg, native).await
 }
 
 fn exec_whoami() -> anyhow::Result<CommandResult> {
-    match atomcode_core::auth::get_stored_auth() {
+    match atomcode_auth::get_stored_auth() {
         Some(auth) => Ok(CommandResult::Whoami {
             logged_in: true,
             username: Some(auth.user.username),
@@ -713,10 +522,151 @@ fn exec_diff(working_dir: &std::path::Path) -> anyhow::Result<CommandResult> {
     Ok(CommandResult::Diff { stat })
 }
 
+fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
+    use atomcode_config::config::instructions::LayeredInstructions;
+    use atomcode_config::i18n::{t, Msg};
+    let instructions = LayeredInstructions::load(working_dir);
+    let mut out = t(Msg::StatusInstructionFilesHeader).into_owned();
+    for (level, path) in instructions.status_lines() {
+        match path {
+            Some(p) => out.push_str(&t(Msg::StatusInstructionPresent {
+                path: &p.display().to_string(),
+                label: level.label(),
+            })),
+            None => out.push_str(&t(Msg::StatusInstructionMissing {
+                label: level.label(),
+            })),
+        }
+    }
+    out
+}
+
+fn render_login_line(user: Option<&str>) -> String {
+    use atomcode_config::i18n::{t, Msg};
+    match user {
+        Some(u) => t(Msg::StatusLoginLoggedIn { user: u }).into_owned(),
+        None => t(Msg::StatusLoginNotSignedIn).into_owned(),
+    }
+}
+
+fn format_login_identity(name: Option<&str>, username: &str) -> String {
+    match name
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && *n != username)
+    {
+        Some(n) => format!("{n}({username})"),
+        None => username.to_string(),
+    }
+}
+
+fn render_login_line_from_stored_auth() -> String {
+    match atomcode_auth::get_stored_auth() {
+        Some(a) => {
+            let identity = format_login_identity(a.user.name.as_deref(), &a.user.username);
+            render_login_line(Some(&identity))
+        }
+        None => render_login_line(None),
+    }
+}
+
+fn render_cp_auth_error(e: &anyhow::Error, fallback: impl FnOnce() -> String) -> String {
+    use atomcode_codingplan::is_auth_expired;
+    use atomcode_config::i18n::{t, Msg};
+    if is_auth_expired(e) {
+        t(Msg::StatusCpAuthExpired).into_owned()
+    } else {
+        fallback()
+    }
+}
+
+fn render_codingplan_status_for_status_cmd() -> String {
+    tokio::task::block_in_place(|| {
+        use atomcode_codingplan::setup::format_duration_secs;
+        use atomcode_codingplan::Client;
+        use atomcode_config::i18n::{t, Msg};
+
+        let client = match Client::from_stored_auth() {
+            Ok(c) => c,
+            Err(e) => return render_cp_auth_error(&e, || t(Msg::StatusCpNotSignedIn).into_owned()),
+        };
+        let status = match client.status_v2() {
+            Ok(s) => s,
+            Err(e) => {
+                return render_cp_auth_error(&e, || {
+                    t(Msg::StatusCpFetchFailed {
+                        error: &format!("{:#}", e),
+                    })
+                    .into_owned()
+                })
+            }
+        };
+        let plan = match &status.codingplan_free {
+            Some(p) => p,
+            None => {
+                return t(Msg::StatusCpNoActive).into_owned();
+            }
+        };
+
+        let mut out = t(Msg::StatusCpLine {
+            plan: &plan.plan_name,
+            expires_at: &plan.expires_at,
+            remaining_days: plan.remaining_days,
+            total_days: plan.total_days,
+        })
+        .into_owned();
+        if !status.rate_limit_windows.is_empty() {
+            for w in status
+                .rate_limit_windows
+                .iter()
+                .filter(|w| w.show_enable == 1)
+            {
+                out.push_str(&t(Msg::StatusCpUsage {
+                    usage: &w.usage_status_desc,
+                    reset_at: &w.reset_at_display,
+                    duration: &format_duration_secs(w.seconds_until_reset),
+                }));
+            }
+        } else if status.window_quota_exhausted {
+            if let Some(hint) = &status.window_quota_hint {
+                out.push_str(&t(Msg::StatusCpWindowHint { hint }));
+            } else {
+                out.push_str(&t(Msg::StatusCpWindowExhausted));
+            }
+        } else if let Some(u) = &status.current_usage {
+            out.push_str(&t(Msg::StatusCpUsage {
+                usage: &u.display_desc(),
+                reset_at: &u.reset_at_display,
+                duration: &format_duration_secs(u.seconds_until_reset),
+            }));
+        }
+        out
+    })
+}
+
+fn assemble_status(
+    login: &str,
+    body: &str,
+    codingplan: &str,
+    proxy: &str,
+    instructions: &str,
+) -> String {
+    let mut txt = String::with_capacity(
+        login.len() + body.len() + codingplan.len() + proxy.len() + instructions.len() + 16,
+    );
+    txt.push_str(login);
+    txt.push_str(body);
+    txt.push_str(codingplan);
+    txt.push_str(proxy);
+    txt.push('\n');
+    txt.push_str(instructions);
+    txt
+}
+
 fn exec_status(
     working_dir: &std::path::Path,
     provider: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
+    use atomcode_config::i18n::{t, Msg};
     let config_path = atomcode_config::config::Config::default_path();
     let config = atomcode_config::config::Config::load(&config_path).ok();
     let provider_name = provider
@@ -728,7 +678,28 @@ fn exec_status(
         .and_then(|c| c.providers.get(&provider_name))
         .map(|p| p.model.clone())
         .unwrap_or_default();
-    let auth = atomcode_core::auth::get_stored_auth();
+    let auth = atomcode_auth::get_stored_auth();
+
+    let body = t(Msg::StatusBody {
+        model: &model,
+        dir: &working_dir.display().to_string(),
+        config: &config_path.display().to_string(),
+    })
+    .into_owned();
+    let proxy_summary = config
+        .as_ref()
+        .map(|c| c.network.proxy.summary())
+        .unwrap_or_else(|| "follow_system".to_string());
+    let proxy_line = format!("  Proxy:  {}\n", proxy_summary);
+
+    let text = assemble_status(
+        &render_login_line_from_stored_auth(),
+        &body,
+        &render_codingplan_status_for_status_cmd(),
+        &proxy_line,
+        &render_instruction_status_block(working_dir),
+    );
+
     Ok(CommandResult::Status {
         logged_in: auth.is_some(),
         username: auth.map(|a| a.user.username),
@@ -736,6 +707,7 @@ fn exec_status(
         model,
         working_dir: working_dir.display().to_string(),
         config_path: config_path.display().to_string(),
+        text,
     })
 }
 
@@ -745,19 +717,23 @@ fn exec_cost(
     session_id: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for cost"))?;
-    let session = load_command_session(
-        working_dir,
-        project_hash,
-        &SessionId::from_string(sid.to_string()),
-    )?;
-    // TurnStat.total_tokens stores the per-turn token count (reset to 0 at turn start,
-    // accumulated during the turn, saved at TurnComplete). Summing gives session total.
-    let total_tokens: usize = session.turn_stats.iter().map(|t| t.total_tokens).sum();
-    let turn_count = session.turn_stats.len();
+    let session = load_command_session_view(working_dir, project_hash, sid)?;
+    let (total_tokens, turn_count) = session_cost(&session.meta);
     Ok(CommandResult::Cost {
         total_tokens,
         turn_count,
     })
+}
+
+fn session_cost(meta: &NativeSessionMeta) -> (usize, usize) {
+    // TurnStat.total_tokens stores the per-turn token count (reset to 0 at turn start,
+    // accumulated during the turn, saved at TurnComplete). Summing gives session total.
+    let total_tokens = meta
+        .turn_stats
+        .iter()
+        .map(|t| t.total_tokens as usize)
+        .sum();
+    (total_tokens, meta.turn_stats.len())
 }
 
 fn exec_todo(
@@ -766,31 +742,29 @@ fn exec_todo(
     session_id: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for todo"))?;
-    let session = load_command_session(
-        working_dir,
-        project_hash,
-        &SessionId::from_string(sid.to_string()),
-    )?;
+    let session = load_command_session_view(working_dir, project_hash, sid)?;
 
-    // `derive_current_todos` takes kernel messages, but `reduce_todos` folds a message-agnostic
-    // `(tool_name, args)` stream — so we map core messages to that and fold via the CANONICAL
-    // reducer (baseline = last full-list plan, then apply every `{action}` update after it).
-    // This shows CURRENT statuses in `/todo`, matching the merged `todowrite` tool + the TUI.
+    Ok(CommandResult::Todo {
+        items: todo_items_from_messages(&session.snapshot.messages),
+    })
+}
+
+fn todo_items_from_messages(messages: &[atomcode_kernel::message::Message]) -> Vec<TodoItemJson> {
+    // Fold the kernel-native tool-call stream via the canonical reducer. This shows CURRENT
+    // statuses in `/todo`, matching the merged `todowrite` tool + the TUI.
     use atomcode_capabilities::tools::todo::{reduce_todos, TodoStatus};
-    use atomcode_core::conversation::message::MessageContent;
-
-    let calls: Vec<(&str, &str)> = session
-        .messages
+    let calls: Vec<(&str, &str)> = messages
         .iter()
-        .filter_map(|m| match &m.content {
-            MessageContent::AssistantWithToolCalls { tool_calls, .. } => Some(tool_calls),
-            _ => None,
+        .flat_map(|message| {
+            message
+                .tool_calls
+                .iter()
+                .map(|call| (call.name.as_str(), call.arguments.as_str()))
         })
-        .flat_map(|tcs| tcs.iter().map(|c| (c.name.as_str(), c.arguments.as_str())))
         .collect();
     let todos = reduce_todos(calls);
 
-    let items = todos
+    todos
         .into_iter()
         .map(|t| TodoItemJson {
             status: match t.status {
@@ -801,9 +775,7 @@ fn exec_todo(
             .to_string(),
             content: t.content,
         })
-        .collect();
-
-    Ok(CommandResult::Todo { items })
+        .collect()
 }
 
 pub(crate) async fn run_command(
@@ -876,215 +848,243 @@ pub(crate) async fn run_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomcode_capabilities::session::PresentationFile;
+    use atomcode_capabilities::session::{StorageOwner, TurnStat};
     use atomcode_config::config::memory::MemoryStore;
-    use atomcode_core::conversation::message::{Message, Role};
-    use atomcode_core::session::{DisplayMessage, TurnStat};
-
-    fn session_with_turns(n: usize) -> Session {
-        let mut s = Session::new(std::path::PathBuf::from("/tmp/plan2-test"));
-        for i in 0..n {
-            s.messages.push(Message::new(Role::User, &format!("q{i}")));
-            s.messages
-                .push(Message::new(Role::Assistant, &format!("a{i}")));
-        }
-        s
-    }
 
     #[test]
-    fn compact_persistence_conversion_preserves_tool_pair() {
-        let assistant = Message {
-            role: Role::Assistant,
-            content: atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
-                text: Some("checking".into()),
-                tool_calls: vec![atomcode_core::tool::ToolCall {
-                    id: "call-1".into(),
-                    name: "read_file".into(),
-                    arguments: "{\"path\":\"a.rs\"}".into(),
-                }],
-                reasoning_content: Some("reason".into()),
-                thinking_blocks: vec![
-                    atomcode_core::conversation::message::ThinkingBlock {
-                        text: "thinking".into(),
-                        signature: "signature".into(),
-                    },
-                ],
+    fn native_undo_preserves_updates_after_session_load() {
+        use atomcode_capabilities::session::{
+            DisplayAnchor, PresentationEntry, PresentationRole, TurnStat,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = NativeSessionManager::with_root(dir.path());
+        let id = "native-undo";
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            atomcode_kernel::message::Message::user("first"),
+            atomcode_kernel::message::Message::assistant("one", Vec::new()),
+            atomcode_kernel::message::Message::user("second"),
+            atomcode_kernel::message::Message::assistant("two", Vec::new()),
+        ]);
+        manager.save_snapshot(id, &snapshot).unwrap();
+        let mut meta = NativeSessionMeta::new(id, "/p", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 4;
+        meta.turn_count = 3;
+        meta.turn_stats = vec![
+            TurnStat {
+                after_message: 99,
+                position_valid: false,
+                turn_id: 99,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 1,
+                total_tokens: 10,
+                errored: false,
+                used_tokens: 1,
+                ctx_window: 10,
             },
-            synthetic: false,
-            internal_origin: None,
-        };
-        let result = Message {
-            role: Role::Tool,
-            content: atomcode_core::conversation::message::MessageContent::ToolResult(
-                atomcode_core::tool::ToolResult {
-                    call_id: "call-1".into(),
-                    output: "file body".into(),
-                    success: true,
+            TurnStat {
+                after_message: 2,
+                position_valid: true,
+                turn_id: 1,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 1,
+                total_tokens: 1,
+                errored: false,
+                used_tokens: 1,
+                ctx_window: 10,
+            },
+            TurnStat {
+                after_message: 4,
+                position_valid: true,
+                turn_id: 2,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 1,
+                total_tokens: 1,
+                errored: false,
+                used_tokens: 1,
+                ctx_window: 10,
+            },
+        ];
+        manager.write_meta(&meta).unwrap();
+        let presentation = PresentationFile {
+            v: atomcode_capabilities::session::presentation::PRESENTATION_VERSION,
+            entries: vec![
+                PresentationEntry {
+                    anchor: DisplayAnchor::AfterTurn { turn_id: 1 },
+                    role: PresentationRole::Assistant,
+                    text: "keep".into(),
                 },
-            ),
-            synthetic: false,
-            internal_origin: None,
+                PresentationEntry {
+                    anchor: DisplayAnchor::AfterTurn { turn_id: 2 },
+                    role: PresentationRole::Assistant,
+                    text: "drop".into(),
+                },
+            ],
+        };
+        manager.write_presentation(id, &presentation).unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        let loaded = LoadedSession {
+            snapshot,
+            meta,
+            presentation,
         };
 
-        let assistant_roundtrip = message_to_core(&message_to_kernel(&assistant));
-        let result_roundtrip = message_to_core(&message_to_kernel(&result));
+        manager.rename(id, "renamed after load").unwrap();
+        manager
+            .append_presentation(
+                id,
+                PresentationEntry {
+                    anchor: DisplayAnchor::AfterTurn { turn_id: 1 },
+                    role: PresentationRole::Assistant,
+                    text: "late keep".into(),
+                },
+            )
+            .unwrap();
 
-        match assistant_roundtrip.content {
-            atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
-                tool_calls,
-                reasoning_content,
-                thinking_blocks,
-                ..
-            } => {
-                assert_eq!(tool_calls[0].id, "call-1");
-                assert_eq!(tool_calls[0].name, "read_file");
-                assert_eq!(reasoning_content.as_deref(), Some("reason"));
-                assert_eq!(thinking_blocks[0].signature, "signature");
-            }
-            _ => panic!("assistant tool call shape was not preserved"),
-        }
-        match result_roundtrip.content {
-            atomcode_core::conversation::message::MessageContent::ToolResult(result) => {
-                assert_eq!(result.call_id, "call-1");
-                assert_eq!(result.output, "file body");
-                assert!(result.success);
-            }
-            _ => panic!("tool result shape was not preserved"),
-        }
+        let result = exec_native_undo(
+            NativeCommandSession {
+                manager: NativeSessionManager::with_root(dir.path()),
+                lease,
+                loaded,
+            },
+            "",
+        )
+        .unwrap();
+
+        assert!(matches!(result, CommandResult::Undo { undone: 1 }));
+        let manager = NativeSessionManager::with_root(dir.path());
+        assert_eq!(manager.load_snapshot(id).unwrap().messages.len(), 2);
+        let meta = manager.read_meta(id).unwrap();
+        assert_eq!(meta.turn_count, 2);
+        assert!(!meta.turn_stats[0].position_valid);
+        assert_eq!(meta.turn_stats[0].total_tokens, 10);
+        assert_eq!(meta.name, "renamed after load");
+        assert!(meta.user_renamed);
+        let presentation = manager.read_presentation(id).unwrap();
+        assert_eq!(presentation.entries.len(), 2);
+        assert_eq!(presentation.entries[0].text, "keep");
+        assert_eq!(presentation.entries[1].text, "late keep");
+        assert!(presentation
+            .entries
+            .iter()
+            .all(|entry| entry.text != "drop"));
     }
 
     #[test]
-    fn cold_summaries_survive_conversion_and_do_not_shift_ui_anchor_indexes() {
+    fn native_compaction_preserves_updates_and_prunes_removed_turn_anchors() {
+        use atomcode_capabilities::session::{
+            DisplayAnchor, PresentationEntry, PresentationRole, TurnStat,
+        };
         use atomcode_coding::runtime::SnapshotCompactionMutation;
 
-        let mut core_before = vec![
-            legacy_cold_summary_message("cold one"),
-            legacy_cold_summary_message("cold two"),
-        ];
-        core_before.extend([
-            Message::new(Role::User, "u1"),
-            Message::new(Role::Assistant, "a1"),
-            Message::new(Role::User, "u2"),
-            Message::new(Role::Assistant, "a2"),
+        let dir = tempfile::tempdir().unwrap();
+        let manager = NativeSessionManager::with_root(dir.path());
+        let id = "native-compact";
+        let mut snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            atomcode_kernel::message::Message::user("u1"),
+            atomcode_kernel::message::Message::assistant("a1", Vec::new()),
+            atomcode_kernel::message::Message::user("u2"),
+            atomcode_kernel::message::Message::assistant("a2", Vec::new()),
+            atomcode_kernel::message::Message::user("u3"),
+            atomcode_kernel::message::Message::assistant("a3", Vec::new()),
         ]);
-        let before: Vec<_> = core_before.iter().map(message_to_kernel).collect();
-        let mut after = vec![atomcode_kernel::message::Message::user("summary")];
-        after.extend(before[4..].iter().cloned());
+        snapshot.turn_counter = 8;
+        manager.save_snapshot(id, &snapshot).unwrap();
+        let stat = |after_message, turn_id| TurnStat {
+            after_message,
+            position_valid: true,
+            turn_id,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 10,
+        };
+        let mut meta = NativeSessionMeta::new(id, "/p", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 6;
+        meta.turn_count = 3;
+        meta.turn_stats = vec![stat(2, 1), stat(4, 2), stat(6, 3)];
+        manager.write_meta(&meta).unwrap();
+        let presentation = PresentationFile {
+            v: atomcode_capabilities::session::presentation::PRESENTATION_VERSION,
+            entries: vec![
+                PresentationEntry {
+                    anchor: DisplayAnchor::AfterTurn { turn_id: 1 },
+                    role: PresentationRole::Assistant,
+                    text: "removed".into(),
+                },
+                PresentationEntry {
+                    anchor: DisplayAnchor::AfterTurn { turn_id: 2 },
+                    role: PresentationRole::Assistant,
+                    text: "kept".into(),
+                },
+            ],
+        };
+        manager.write_presentation(id, &presentation).unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        let loaded = LoadedSession {
+            snapshot,
+            meta,
+            presentation,
+        };
 
-        let adjusted = adjust_compaction_mutation_for_cold_summaries(
+        manager.rename(id, "renamed after load").unwrap();
+        manager
+            .append_presentation(
+                id,
+                PresentationEntry {
+                    anchor: DisplayAnchor::AfterTurn { turn_id: 2 },
+                    role: PresentationRole::Assistant,
+                    text: "late kept".into(),
+                },
+            )
+            .unwrap();
+
+        commit_native_compaction(
+            NativeCommandSession {
+                manager: NativeSessionManager::with_root(dir.path()),
+                lease,
+                loaded,
+            },
+            vec![
+                atomcode_kernel::message::Message::user("summary"),
+                atomcode_kernel::message::Message::user("u3"),
+                atomcode_kernel::message::Message::assistant("a3", Vec::new()),
+            ],
             SnapshotCompactionMutation::Replace {
                 old_start: 0,
                 old_end: 4,
                 new_end: 1,
             },
-            &before,
-            &after,
-        );
-        assert_eq!(
-            adjusted,
-            SnapshotCompactionMutation::Replace {
-                old_start: 0,
-                old_end: 2,
-                new_end: 1,
-            }
-        );
+        )
+        .unwrap();
 
-        let split = split_legacy_cold_summary_messages(core_before);
-        assert_eq!(split.cold_summaries, vec!["cold one", "cold two"]);
-        assert_eq!(split.messages.len(), 4);
-    }
-
-    #[test]
-    fn compact_rewrite_preserves_core_only_message_fields() {
-        use atomcode_core::conversation::message::{MessageContent, ThinkingBlock};
-        use atomcode_core::tool::result_store::ToolResultRef;
-
-        let assistant = Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: Some("checking".into()),
-                tool_calls: vec![atomcode_core::tool::ToolCall {
-                    id: "call-1".into(),
-                    name: "bash".into(),
-                    arguments: "{}".into(),
-                }],
-                reasoning_content: Some("reason".into()),
-                thinking_blocks: vec![ThinkingBlock {
-                    text: "private reasoning".into(),
-                    signature: "opaque-signature".into(),
-                }],
-            },
-            synthetic: false,
-            internal_origin: None,
-        };
-        let tool_ref = Message {
-            role: Role::Tool,
-            content: MessageContent::ToolResultRef(ToolResultRef {
-                call_id: "call-1".into(),
-                hash: "content-hash".into(),
-                summary: "large output".into(),
-                byte_size: 42_000,
-                success: true,
-            }),
-            synthetic: false,
-            internal_origin: None,
-        };
-        let original = vec![assistant, tool_ref];
-        let before: Vec<_> = original.iter().map(message_to_kernel).collect();
-        let mut after = before.clone();
-        after[0].text = "updated assistant text".into();
-        after[1].text = "[bash output compacted]".into();
-
-        let merged = merge_compacted_messages(
-            original,
-            &before,
-            &after,
-            atomcode_coding::runtime::SnapshotCompactionMutation::RewriteOnly,
-        );
-
-        match &merged[0].content {
-            MessageContent::AssistantWithToolCalls { text, thinking_blocks, .. } => {
-                assert_eq!(text.as_deref(), Some("updated assistant text"));
-                assert_eq!(thinking_blocks[0].signature, "opaque-signature");
-            }
-            _ => panic!("assistant shape changed"),
-        }
-        match &merged[1].content {
-            MessageContent::ToolResultRef(result) => {
-                assert_eq!(result.summary, "[bash output compacted]");
-                assert_eq!(result.hash, "content-hash");
-                assert_eq!(result.byte_size, 42_000);
-            }
-            _ => panic!("tool result reference was downgraded"),
-        }
-    }
-
-    #[test]
-    fn undo_no_arg_removes_last_turn() {
-        let mut s = session_with_turns(3);
-        let removed = apply_undo(&mut s, "");
-        assert_eq!(removed, 1);
-        // 3 用户提示 → 剩 2；每轮 user+assistant，剩 2 轮 = 4 条消息。
-        let users = s
-            .messages
+        let manager = NativeSessionManager::with_root(dir.path());
+        let snapshot = manager.load_snapshot(id).unwrap();
+        assert_eq!(snapshot.messages.len(), 3);
+        assert_eq!(snapshot.turn_counter, 8);
+        let meta = manager.read_meta(id).unwrap();
+        assert_eq!(meta.turn_count, 2);
+        assert_eq!(meta.turn_stats[0].after_message, 1);
+        assert_eq!(meta.turn_stats[1].after_message, 3);
+        assert_eq!(meta.name, "renamed after load");
+        assert!(meta.user_renamed);
+        let presentation = manager.read_presentation(id).unwrap();
+        assert_eq!(presentation.entries.len(), 2);
+        assert_eq!(presentation.entries[0].text, "kept");
+        assert_eq!(presentation.entries[1].text, "late kept");
+        assert!(presentation
+            .entries
             .iter()
-            .filter(|m| matches!(m.role, Role::User))
-            .count();
-        assert_eq!(users, 2);
-    }
-
-    #[test]
-    fn undo_to_prompt_1_removes_all() {
-        let mut s = session_with_turns(3);
-        let removed = apply_undo(&mut s, "1");
-        assert_eq!(removed, 3);
-        assert!(s.messages.is_empty());
-    }
-
-    #[test]
-    fn undo_on_empty_session_is_noop() {
-        let mut s = session_with_turns(0);
-        assert_eq!(apply_undo(&mut s, ""), 0);
-        assert!(s.messages.is_empty());
+            .all(|entry| entry.text != "removed"));
     }
 
     #[test]
@@ -1122,93 +1122,13 @@ mod tests {
     }
 
     #[test]
-    fn reindex_after_compaction_preserves_prefix_and_shifts_suffix() {
-        let mut s = session_with_turns(0);
-        // after_message=0: "before the first message" — always kept.
-        s.display_messages.push(DisplayMessage {
-            after_message: 0,
-            message: Message::new(Role::Assistant, "preamble"),
-        });
-        // after_message=2: within the drained range (<=3) — should be dropped.
-        s.display_messages.push(DisplayMessage {
-            after_message: 2,
-            message: Message::new(Role::Assistant, "drained"),
-        });
-        // after_message=5: survivor — shifts to 5-3=2.
-        s.display_messages.push(DisplayMessage {
-            after_message: 5,
-            message: Message::new(Role::Assistant, "keep"),
-        });
-        // turn_stat at 2: drained (<=3) — dropped.
-        s.turn_stats.push(TurnStat {
-            after_message: 2,
-            turn_count: 1,
-            tool_call_count: 0,
-            duration_ms: 50,
-            total_tokens: 5,
-            errored: false,
-            used_tokens: 0,
-            ctx_window: 0,
-        });
-        // turn_stat at 6: survivor — shifts to 6-3=3.
-        s.turn_stats.push(TurnStat {
-            after_message: 6,
-            turn_count: 1,
-            tool_call_count: 0,
-            duration_ms: 50,
-            total_tokens: 5,
-            errored: false,
-            used_tokens: 0,
-            ctx_window: 0,
-        });
-        // Replace old messages [1, 4) with one summary at [1, 2).
-        reindex_after_compaction(&mut s, 1, 4, 2);
-        assert_eq!(s.display_messages.len(), 2);
-        assert_eq!(s.display_messages[0].after_message, 0);
-        assert_eq!(s.display_messages[1].after_message, 3);
-        assert_eq!(s.turn_stats.len(), 1);
-        assert_eq!(s.turn_stats[0].after_message, 4);
-    }
-
-    #[test]
-    fn rewrite_only_compaction_preserves_all_ui_anchors() {
-        let mut s = session_with_turns(3);
-        s.display_messages.push(DisplayMessage {
-            after_message: 2,
-            message: Message::new(Role::Assistant, "first rewrite boundary"),
-        });
-        s.display_messages.push(DisplayMessage {
-            after_message: 5,
-            message: Message::new(Role::Assistant, "between rewrites"),
-        });
-        s.turn_stats.push(TurnStat {
-            after_message: 4,
-            turn_count: 2,
-            tool_call_count: 1,
-            duration_ms: 50,
-            total_tokens: 5,
-            errored: false,
-            used_tokens: 0,
-            ctx_window: 0,
-        });
-
-        reindex_after_snapshot_compaction(
-            &mut s,
-            atomcode_coding::runtime::SnapshotCompactionMutation::RewriteOnly,
-        );
-
-        assert_eq!(s.display_messages.len(), 2);
-        assert_eq!(s.display_messages[0].after_message, 2);
-        assert_eq!(s.display_messages[1].after_message, 5);
-        assert_eq!(s.turn_stats[0].after_message, 4);
-    }
-
-    #[test]
     fn cost_sums_turn_stats_tokens() {
-        let mut s = Session::new(std::path::PathBuf::from("/tmp/cost-test"));
-        s.turn_stats.push(TurnStat {
+        let mut meta = NativeSessionMeta::new("cost", "/tmp/cost-test", 1);
+        meta.turn_stats.push(TurnStat {
             after_message: 2,
-            turn_count: 1,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 1,
             tool_call_count: 0,
             duration_ms: 100,
             total_tokens: 100,
@@ -1216,9 +1136,11 @@ mod tests {
             used_tokens: 0,
             ctx_window: 0,
         });
-        s.turn_stats.push(TurnStat {
+        meta.turn_stats.push(TurnStat {
             after_message: 4,
-            turn_count: 1,
+            position_valid: true,
+            turn_id: 2,
+            round_count: 1,
             tool_call_count: 0,
             duration_ms: 120,
             total_tokens: 250,
@@ -1226,52 +1148,23 @@ mod tests {
             used_tokens: 0,
             ctx_window: 0,
         });
-        let total: usize = s.turn_stats.iter().map(|t| t.total_tokens).sum();
-        assert_eq!(total, 350);
-        assert_eq!(s.turn_stats.len(), 2);
+        assert_eq!(session_cost(&meta), (350, 2));
     }
 
     #[test]
     fn todo_derives_from_last_todowrite_call() {
-        use atomcode_core::conversation::message::{MessageContent, Role};
-        use atomcode_core::tool::ToolCall;
+        use atomcode_kernel::tool::ToolCall;
 
         let args = r#"{"todos":[{"content":"写测试","status":"in_progress"},{"content":"提交","status":"pending"}]}"#;
-        let mut s = Session::new(std::path::PathBuf::from("/tmp/todo-test"));
-        s.messages.push(Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: "call1".into(),
-                    name: "todowrite".into(),
-                    arguments: args.into(),
-                }],
-                reasoning_content: None,
-                thinking_blocks: vec![],
-            },
-            synthetic: false,
-            internal_origin: None,
-        });
-
-        // Inline the same derivation logic as exec_todo (core Message ≠ kernel Message).
-        use atomcode_capabilities::tools::todo::parse_todos;
-        let todos = s
-            .messages
-            .iter()
-            .rev()
-            .find_map(|m| {
-                if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-                    tool_calls
-                        .iter()
-                        .rev()
-                        .filter(|c| c.name == "todowrite")
-                        .find_map(|c| parse_todos(&c.arguments).ok())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+        let messages = vec![atomcode_kernel::message::Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "call1".into(),
+                name: "todowrite".into(),
+                arguments: args.into(),
+            }],
+        )];
+        let todos = todo_items_from_messages(&messages);
 
         assert_eq!(todos.len(), 2);
         assert_eq!(todos[0].content, "写测试");
@@ -1280,25 +1173,7 @@ mod tests {
 
     #[test]
     fn todo_empty_session_returns_empty() {
-        use atomcode_capabilities::tools::todo::parse_todos;
-        use atomcode_core::conversation::message::MessageContent;
-        let s = Session::new(std::path::PathBuf::from("/tmp/todo-empty-test"));
-        let todos: Vec<_> = s
-            .messages
-            .iter()
-            .rev()
-            .find_map(|m| {
-                if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-                    tool_calls
-                        .iter()
-                        .rev()
-                        .filter(|c| c.name == "todowrite")
-                        .find_map(|c| parse_todos(&c.arguments).ok())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+        let todos = todo_items_from_messages(&[]);
         assert!(todos.is_empty());
     }
 
@@ -1327,83 +1202,5 @@ mod tests {
             CommandResult::Diff { stat } => assert!(stat.contains("a.txt"), "stat was: {stat}"),
             _ => panic!("wrong variant"),
         }
-    }
-
-    #[test]
-    fn undo_prunes_display_messages_and_turn_stats() {
-        // 3 turns = 6 messages. After undo 1 turn → 4 messages remain.
-        // display_messages/turn_stats anchored at <=4 survive; >4 are pruned.
-        let mut s = session_with_turns(3);
-        // Anchored at message 2 (inside surviving turns) — should survive.
-        s.display_messages.push(DisplayMessage {
-            after_message: 2,
-            message: Message::new(Role::Assistant, "keep"),
-        });
-        // Anchored at message 6 (inside the removed turn) — should be pruned.
-        s.display_messages.push(DisplayMessage {
-            after_message: 6,
-            message: Message::new(Role::Assistant, "drop"),
-        });
-        s.turn_stats.push(TurnStat {
-            after_message: 4,
-            turn_count: 1,
-            tool_call_count: 0,
-            duration_ms: 100,
-            total_tokens: 10,
-            errored: false,
-            used_tokens: 0,
-            ctx_window: 0,
-        });
-        s.turn_stats.push(TurnStat {
-            after_message: 6,
-            turn_count: 1,
-            tool_call_count: 0,
-            duration_ms: 100,
-            total_tokens: 10,
-            errored: false,
-            used_tokens: 0,
-            ctx_window: 0,
-        });
-        let removed = apply_undo(&mut s, ""); // undo last 1 turn → 4 messages remain
-        assert_eq!(removed, 1);
-        assert_eq!(s.messages.len(), 4);
-        // display_messages: after_message=2 survives, after_message=6 is pruned.
-        assert_eq!(s.display_messages.len(), 1);
-        assert_eq!(s.display_messages[0].after_message, 2);
-        // turn_stats: after_message=4 survives, after_message=6 is pruned.
-        assert_eq!(s.turn_stats.len(), 1);
-        assert_eq!(s.turn_stats[0].after_message, 4);
-    }
-
-    /// Verify save_session_to_hash / load_session bucket symmetry:
-    /// writing to a project-hash bucket and reading it back returns the same session.
-    #[test]
-    fn save_session_to_hash_roundtrip() {
-        // Shared process-global env lock so ATOMCODE_HOME mutations don't race
-        // the other daemon test modules in the same test binary.
-        let _guard = crate::atomcode_home_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var("ATOMCODE_HOME").ok();
-        std::env::set_var("ATOMCODE_HOME", dir.path());
-
-        let result = std::panic::catch_unwind(|| {
-            let session = session_with_turns(2);
-            let hash = "deadbeef";
-
-            crate::save_session_to_hash(hash, &session).expect("save_session_to_hash");
-
-            let loaded = crate::load_session(hash, session.id.as_str()).expect("load_session");
-            assert_eq!(loaded.id.as_str(), session.id.as_str());
-            assert_eq!(loaded.messages.len(), session.messages.len());
-        });
-
-        match &prev {
-            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
-            None => std::env::remove_var("ATOMCODE_HOME"),
-        }
-
-        result.expect("round-trip test panicked");
     }
 }

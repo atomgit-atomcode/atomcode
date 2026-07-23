@@ -314,10 +314,7 @@ impl SelfDeleteStrategy for PlatformSelfDelete {
         // reported in gitcode.com/atomgit_atomcode/atomcode/issues/352.
         // CREATE_NO_WINDOW prevents the console window from appearing at all
         // (DETACHED_PROCESS does NOT reliably hide the window on Win10).
-        let cmd_arg = format!(
-            "timeout /t 2 /nobreak >nul & rmdir /S /Q \"{}\"",
-            dir_str
-        );
+        let cmd_arg = format!("timeout /t 2 /nobreak >nul & rmdir /S /Q \"{}\"", dir_str);
         Command::new("cmd")
             .args(["/C", &cmd_arg])
             .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)

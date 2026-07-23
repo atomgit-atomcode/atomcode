@@ -26,15 +26,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod context;
 pub mod instructions;
 pub mod manager;
+pub mod presentation;
 pub mod recall;
 pub mod snapshot;
 pub mod status_reminder;
 pub mod transcript;
 pub use context::SessionContextHook;
-pub use status_reminder::StatusReminderHook;
-pub use manager::{SessionManager, SessionMeta, TurnStat};
+pub use manager::{
+    CatalogDiagnostic, CatalogDiagnosticKind, CatalogEntry, CatalogLocation, CatalogPresence,
+    CatalogScan, ImportInfo, ImportKind, LoadedSession, SessionLease, SessionManager, SessionMeta,
+    SessionResult, SessionStoreError, StorageOwner, TurnStat,
+};
+pub use presentation::{
+    anchor_from_legacy_position, DisplayAnchor, LegacyTurnBoundary, PresentationEntry,
+    PresentationFile, PresentationRole,
+};
 pub use recall::{KeywordIndex, RecallIndex, RecallTool};
 pub use snapshot::SnapshotHook;
+pub use status_reminder::StatusReminderHook;
 pub use transcript::{ToolRecord, TranscriptHook, TurnRecord, UsageRecord};
 
 /// Current wall-clock as epoch MILLISECONDS, UTC. The single L1 time source the

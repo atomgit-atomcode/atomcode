@@ -66,7 +66,11 @@ impl Tool for ChangeDirTool {
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => return err(format!("change_dir: invalid arguments: {e}. Expected {{\"path\":\"<dir>\"}}.")),
+            Err(e) => {
+                return err(format!(
+                    "change_dir: invalid arguments: {e}. Expected {{\"path\":\"<dir>\"}}."
+                ))
+            }
         };
         if a.path.trim().is_empty() {
             return err("change_dir: `path` must be non-empty.");
@@ -74,14 +78,27 @@ impl Tool for ChangeDirTool {
         // Resolve relative to the CURRENT shared cwd (the source of truth).
         let current = self.cwd.read().map(|g| g.clone()).unwrap_or_default();
         let raw = Path::new(&a.path);
-        let target = if raw.is_absolute() { raw.to_path_buf() } else { current.join(raw) };
+        let target = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            current.join(raw)
+        };
 
         let meta = match std::fs::metadata(&target) {
             Ok(m) => m,
-            Err(_) => return err(format!("change_dir: no such directory: {} (resolved to {})", a.path, crate::pathnorm::to_display(&target))),
+            Err(_) => {
+                return err(format!(
+                    "change_dir: no such directory: {} (resolved to {})",
+                    a.path,
+                    crate::pathnorm::to_display(&target)
+                ))
+            }
         };
         if !meta.is_dir() {
-            return err(format!("change_dir: not a directory: {}", crate::pathnorm::to_display(&target)));
+            return err(format!(
+                "change_dir: not a directory: {}",
+                crate::pathnorm::to_display(&target)
+            ));
         }
         // Canonicalize so later by-path lookups are stable (symlink / `..` normalized).
         // pathnorm::canonicalize strips the Windows `\\?\` prefix so the stored cwd
@@ -91,7 +108,10 @@ impl Tool for ChangeDirTool {
             Ok(mut g) => *g = canon.clone(),
             Err(_) => return err("change_dir: working-dir lock poisoned"),
         }
-        ok(format!("Working directory changed to {}", crate::pathnorm::to_display(&canon)))
+        ok(format!(
+            "Working directory changed to {}",
+            crate::pathnorm::to_display(&canon)
+        ))
     }
 }
 
@@ -105,6 +125,7 @@ mod tests {
             working_dir: dir.to_path_buf(),
             cancel: CancellationToken::new(),
             progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
         }
     }
 
@@ -129,7 +150,12 @@ mod tests {
         let root = std::fs::canonicalize(d.path()).unwrap();
         let cwd = Arc::new(RwLock::new(PathBuf::from("/")));
         let tool = ChangeDirTool::new(cwd.clone());
-        let r = tool.execute(&format!("{{\"path\":{:?}}}", root.to_string_lossy()), &ctx(&root)).await;
+        let r = tool
+            .execute(
+                &format!("{{\"path\":{:?}}}", root.to_string_lossy()),
+                &ctx(&root),
+            )
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert_eq!(*cwd.read().unwrap(), root);
     }
@@ -174,7 +200,9 @@ mod tests {
     #[tokio::test]
     async fn empty_path_errors() {
         let cwd = Arc::new(RwLock::new(PathBuf::from(".")));
-        let r = ChangeDirTool::new(cwd).execute(r#"{"path":""}"#, &ctx(Path::new("."))).await;
+        let r = ChangeDirTool::new(cwd)
+            .execute(r#"{"path":""}"#, &ctx(Path::new(".")))
+            .await;
         assert!(r.is_error);
         assert!(r.content.contains("non-empty"), "{}", r.content);
     }

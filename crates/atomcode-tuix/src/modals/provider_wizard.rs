@@ -13,7 +13,9 @@ use atomcode_config::config::provider::ProviderConfig;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{build_status, save_and_reload, Buffer, LoopCtx};
+use crate::event_loop::{
+    build_status, save_and_reload, set_default_provider_and_reload, Buffer, LoopCtx,
+};
 use crate::input::key_action::classify;
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
@@ -136,8 +138,7 @@ impl DraftProvider {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-
-}
+        }
     }
 }
 
@@ -175,7 +176,10 @@ fn handle_key(
     if matches!(code, KeyCode::Esc) {
         buf.text.clear();
         buf.cursor = 0;
-        push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderWizardCancelled));
+        push(
+            renderer,
+            &crate::i18n::t(crate::i18n::Msg::ProviderWizardCancelled),
+        );
         return Ok(ModalAction::Close);
     }
 
@@ -225,7 +229,10 @@ fn handle_key(
                             *wizard = new;
                         }
                         "edit" | "delete" | "set-default" if providers.is_empty() => {
-                            push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderNoProviders));
+                            push(
+                                renderer,
+                                &crate::i18n::t(crate::i18n::Msg::ProviderNoProviders),
+                            );
                             return Ok(ModalAction::Close);
                         }
                         "edit" => {
@@ -320,7 +327,10 @@ fn handle_key(
                 }
                 KeyCode::Enter => {
                     let target = providers[selected].clone();
-                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDeleteConfirm { name: &target }));
+                    push(
+                        renderer,
+                        &crate::i18n::t(crate::i18n::Msg::ProviderDeleteConfirm { name: &target }),
+                    );
                     *wizard = ProviderWizard::DeleteConfirm { target };
                     redraw(buf, state, ctx, wizard, renderer);
                     return Ok(ModalAction::Continue);
@@ -348,13 +358,15 @@ fn handle_key(
                 }
                 KeyCode::Enter => {
                     let chosen = providers[selected].clone();
-                    ctx.config.default_provider = chosen.clone();
-                    if let Some(p) = ctx.config.providers.get(&chosen) {
-                        ctx.model_name = p.model.clone();
+                    if set_default_provider_and_reload(ctx, &chosen, renderer) {
+                        return Ok(ModalAction::Close);
                     }
-                    save_and_reload(ctx, renderer);
-                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDefaultSet { name: &chosen }));
-                    return Ok(ModalAction::Close);
+                    *wizard = ProviderWizard::SetDefaultPick {
+                        providers,
+                        selected,
+                    };
+                    redraw(buf, state, ctx, wizard, renderer);
+                    return Ok(ModalAction::Continue);
                 }
                 _ => {}
             }
@@ -369,30 +381,45 @@ fn handle_key(
         ProviderWizard::DeleteConfirm { target } => {
             match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    ctx.config.providers.remove(&target);
+                    let mut desired = ctx.config.clone();
+                    desired.providers.remove(&target);
                     // If we just dropped the default, fall back to any
                     // remaining provider or blank.
-                    if ctx.config.default_provider == target {
-                        ctx.config.default_provider = ctx
-                            .config
-                            .providers
-                            .keys()
-                            .next()
-                            .cloned()
-                            .unwrap_or_default();
+                    if desired.default_provider == target {
+                        desired.default_provider =
+                            desired.providers.keys().next().cloned().unwrap_or_default();
                     }
-                    save_and_reload(ctx, renderer);
-                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDeleted { name: &target }));
+                    if save_and_reload(
+                        ctx,
+                        desired,
+                        renderer,
+                        crate::i18n::t(crate::i18n::Msg::ProviderDeleted { name: &target })
+                            .into_owned(),
+                        true,
+                    ) {
+                        return Ok(ModalAction::Close);
+                    }
+                    *wizard = ProviderWizard::DeleteConfirm { target };
+                    redraw(buf, state, ctx, wizard, renderer);
+                    return Ok(ModalAction::Continue);
                 }
                 _ => {
-                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDeleteKept));
+                    push(
+                        renderer,
+                        &crate::i18n::t(crate::i18n::Msg::ProviderDeleteKept),
+                    );
+                    Ok(ModalAction::Close)
                 }
             }
-            Ok(ModalAction::Close)
         }
 
         // ── Text-input states: Enter submits, chars edit buf, others pass through Buffer. ──
-        ProviderWizard::Add { step, mut draft, plan, idx } => {
+        ProviderWizard::Add {
+            step,
+            mut draft,
+            plan,
+            idx,
+        } => {
             if matches!(code, KeyCode::Enter) {
                 // Expand any folded `[Pasted #N …]` placeholder so the
                 // Template step parses the real pasted content.
@@ -418,7 +445,9 @@ fn handle_key(
                                 idx: 0,
                             };
                             if let ProviderWizard::Add { step, draft, .. } = &new {
-                                show_add_step_prompt(*step, draft, 0, 0, buf, state, ctx, &new, renderer);
+                                show_add_step_prompt(
+                                    *step, draft, 0, 0, buf, state, ctx, &new, renderer,
+                                );
                             }
                             *wizard = new;
                             return Ok(ModalAction::Continue);
@@ -431,8 +460,15 @@ fn handle_key(
                                 idx: 0,
                             };
                             show_add_step_prompt(
-                                WizardStep::Template, &DraftProvider::default(), 0, 0,
-                                buf, state, ctx, &new, renderer,
+                                WizardStep::Template,
+                                &DraftProvider::default(),
+                                0,
+                                0,
+                                buf,
+                                state,
+                                ctx,
+                                &new,
+                                renderer,
                             );
                             *wizard = new;
                             return Ok(ModalAction::Continue);
@@ -444,9 +480,16 @@ fn handle_key(
                     let plan = import_plan(&draft);
                     let total = plan.len();
                     let first = plan[0];
-                    let new = ProviderWizard::Add { step: first, draft, plan, idx: 0 };
+                    let new = ProviderWizard::Add {
+                        step: first,
+                        draft,
+                        plan,
+                        idx: 0,
+                    };
                     if let ProviderWizard::Add { step, draft, .. } = &new {
-                        show_add_step_prompt(*step, draft, 0, total, buf, state, ctx, &new, renderer);
+                        show_add_step_prompt(
+                            *step, draft, 0, total, buf, state, ctx, &new, renderer,
+                        );
                     }
                     *wizard = new;
                     return Ok(ModalAction::Continue);
@@ -456,7 +499,10 @@ fn handle_key(
                 if matches!(step, WizardStep::BaseUrl) {
                     let url = answer.trim();
                     if url.is_empty() {
-                        push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderBaseUrlEmpty));
+                        push(
+                            renderer,
+                            &crate::i18n::t(crate::i18n::Msg::ProviderBaseUrlEmpty),
+                        );
                         let new = ProviderWizard::Add {
                             step: WizardStep::BaseUrl,
                             draft,
@@ -464,7 +510,9 @@ fn handle_key(
                             idx: 0,
                         };
                         if let ProviderWizard::Add { step, draft, .. } = &new {
-                            show_add_step_prompt(*step, draft, 0, 0, buf, state, ctx, &new, renderer);
+                            show_add_step_prompt(
+                                *step, draft, 0, 0, buf, state, ctx, &new, renderer,
+                            );
                         }
                         *wizard = new;
                         return Ok(ModalAction::Continue);
@@ -472,14 +520,23 @@ fn handle_key(
                     let ptype = apply_manual_base_url(&mut draft, url, &ctx.config.providers);
                     push(
                         renderer,
-                        &crate::i18n::t(crate::i18n::Msg::ProviderTypeInferred { type_name: ptype }),
+                        &crate::i18n::t(crate::i18n::Msg::ProviderTypeInferred {
+                            type_name: ptype,
+                        }),
                     );
                     let plan = import_plan(&draft);
                     let total = plan.len();
                     let first = plan[0];
-                    let new = ProviderWizard::Add { step: first, draft, plan, idx: 0 };
+                    let new = ProviderWizard::Add {
+                        step: first,
+                        draft,
+                        plan,
+                        idx: 0,
+                    };
                     if let ProviderWizard::Add { step, draft, .. } = &new {
-                        show_add_step_prompt(*step, draft, 0, total, buf, state, ctx, &new, renderer);
+                        show_add_step_prompt(
+                            *step, draft, 0, total, buf, state, ctx, &new, renderer,
+                        );
                     }
                     *wizard = new;
                     return Ok(ModalAction::Continue);
@@ -489,9 +546,16 @@ fn handle_key(
                 match store_step(&mut draft, step, &answer, &ctx.config.providers, renderer) {
                     StepOutcome::Retry => {
                         let total = plan.len();
-                        let new = ProviderWizard::Add { step, draft, plan, idx };
+                        let new = ProviderWizard::Add {
+                            step,
+                            draft,
+                            plan,
+                            idx,
+                        };
                         if let ProviderWizard::Add { step, draft, .. } = &new {
-                            show_add_step_prompt(*step, draft, idx, total, buf, state, ctx, &new, renderer);
+                            show_add_step_prompt(
+                                *step, draft, idx, total, buf, state, ctx, &new, renderer,
+                            );
                         }
                         *wizard = new;
                         return Ok(ModalAction::Continue);
@@ -504,25 +568,49 @@ fn handle_key(
                             // without an extra /model step.
                             let name = draft.name.clone();
                             let model = draft.model.clone();
-                            let cfg = draft.into_config();
-                            ctx.config.providers.insert(name.clone(), cfg);
-                            ctx.config.default_provider = name.clone();
-                            ctx.model_name = model.clone();
-                            save_and_reload(ctx, renderer);
-                            push(
+                            let cfg = draft.clone().into_config();
+                            let mut desired = ctx.config.clone();
+                            desired.providers.insert(name.clone(), cfg);
+                            desired.default_provider = name.clone();
+                            if save_and_reload(
+                                ctx,
+                                desired,
                                 renderer,
-                                &crate::i18n::t(crate::i18n::Msg::ProviderAdded { name: &name, model: &model }),
-                            );
-                            return Ok(ModalAction::Close);
+                                crate::i18n::t(crate::i18n::Msg::ProviderAdded {
+                                    name: &name,
+                                    model: &model,
+                                })
+                                .into_owned(),
+                                true,
+                            ) {
+                                return Ok(ModalAction::Close);
+                            }
+                            buf.text = answer;
+                            buf.cursor = buf.text.len();
+                            *wizard = ProviderWizard::Add {
+                                step,
+                                draft,
+                                plan,
+                                idx,
+                            };
+                            redraw(buf, state, ctx, wizard, renderer);
+                            return Ok(ModalAction::Continue);
                         }
                         let next = plan[next_idx];
                         if matches!(next, WizardStep::Name) {
                             ensure_name_default(&mut draft, &ctx.config.providers);
                         }
                         let total = plan.len();
-                        let new = ProviderWizard::Add { step: next, draft, plan, idx: next_idx };
+                        let new = ProviderWizard::Add {
+                            step: next,
+                            draft,
+                            plan,
+                            idx: next_idx,
+                        };
                         if let ProviderWizard::Add { step, draft, .. } = &new {
-                            show_add_step_prompt(*step, draft, next_idx, total, buf, state, ctx, &new, renderer);
+                            show_add_step_prompt(
+                                *step, draft, next_idx, total, buf, state, ctx, &new, renderer,
+                            );
                         }
                         *wizard = new;
                         return Ok(ModalAction::Continue);
@@ -531,7 +619,12 @@ fn handle_key(
             }
             // Forward other keys to the buffer so typing / editing works.
             forward_to_buffer(code, _mods, buf, state, ctx);
-            *wizard = ProviderWizard::Add { step, draft, plan, idx };
+            *wizard = ProviderWizard::Add {
+                step,
+                draft,
+                plan,
+                idx,
+            };
             redraw(buf, state, ctx, wizard, renderer);
             Ok(ModalAction::Continue)
         }
@@ -570,12 +663,29 @@ fn handle_key(
                     }
                     None => {
                         // Commit edit: merge draft onto existing provider.
-                        if let Some(existing) = ctx.config.providers.get_mut(&target) {
+                        let mut desired = ctx.config.clone();
+                        if let Some(existing) = desired.providers.get_mut(&target) {
                             draft.apply_onto(existing);
                         }
-                        save_and_reload(ctx, renderer);
-                        push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &target }));
-                        return Ok(ModalAction::Close);
+                        if save_and_reload(
+                            ctx,
+                            desired,
+                            renderer,
+                            crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &target })
+                                .into_owned(),
+                            false,
+                        ) {
+                            return Ok(ModalAction::Close);
+                        }
+                        buf.text = answer;
+                        buf.cursor = buf.text.len();
+                        *wizard = ProviderWizard::Edit {
+                            target,
+                            step,
+                            draft,
+                        };
+                        redraw(buf, state, ctx, wizard, renderer);
+                        return Ok(ModalAction::Continue);
                     }
                 }
             }
@@ -604,17 +714,25 @@ fn redraw(
     let menu = match wizard {
         ProviderWizard::MainMenu { selected } => Some(MenuPayload {
             items: vec![
-                (crate::i18n::t(crate::i18n::Msg::ProviderMenuAdd).into_owned(),
-                 crate::i18n::t(crate::i18n::Msg::ProviderMenuAddDesc).into_owned()),
-                (crate::i18n::t(crate::i18n::Msg::ProviderMenuEdit).into_owned(),
-                 crate::i18n::t(crate::i18n::Msg::ProviderMenuEditDesc).into_owned()),
-                (crate::i18n::t(crate::i18n::Msg::ProviderMenuDelete).into_owned(),
-                 crate::i18n::t(crate::i18n::Msg::ProviderMenuDeleteDesc).into_owned()),
-                (crate::i18n::t(crate::i18n::Msg::ProviderMenuSetDefault).into_owned(),
-                 crate::i18n::t(crate::i18n::Msg::ProviderMenuSetDefaultDesc).into_owned()),
+                (
+                    crate::i18n::t(crate::i18n::Msg::ProviderMenuAdd).into_owned(),
+                    crate::i18n::t(crate::i18n::Msg::ProviderMenuAddDesc).into_owned(),
+                ),
+                (
+                    crate::i18n::t(crate::i18n::Msg::ProviderMenuEdit).into_owned(),
+                    crate::i18n::t(crate::i18n::Msg::ProviderMenuEditDesc).into_owned(),
+                ),
+                (
+                    crate::i18n::t(crate::i18n::Msg::ProviderMenuDelete).into_owned(),
+                    crate::i18n::t(crate::i18n::Msg::ProviderMenuDeleteDesc).into_owned(),
+                ),
+                (
+                    crate::i18n::t(crate::i18n::Msg::ProviderMenuSetDefault).into_owned(),
+                    crate::i18n::t(crate::i18n::Msg::ProviderMenuSetDefaultDesc).into_owned(),
+                ),
             ],
             selected: *selected,
-            kind: crate::render::MenuKind::SlashCommand,
+            kind: crate::render::MenuKind::Action,
         }),
         ProviderWizard::EditPick {
             providers,
@@ -643,7 +761,7 @@ fn redraw(
             Some(MenuPayload {
                 items,
                 selected: *selected,
-            kind: crate::render::MenuKind::SlashCommand,
+                kind: crate::render::MenuKind::SlashCommand,
             })
         }
         // Q&A steps: plain input box, no overlay menu.
@@ -677,9 +795,10 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
         (WizardStep::Template, _) => t(Msg::ProviderImportPrompt).into_owned(),
         (WizardStep::Name, _) => t(Msg::ProviderStepName).into_owned(),
         (WizardStep::ProviderType, None) => t(Msg::ProviderStepType).into_owned(),
-        (WizardStep::ProviderType, Some(p)) => {
-            t(Msg::ProviderStepTypeWithHint { current: &p.provider_type }).into_owned()
-        }
+        (WizardStep::ProviderType, Some(p)) => t(Msg::ProviderStepTypeWithHint {
+            current: &p.provider_type,
+        })
+        .into_owned(),
         (WizardStep::BaseUrl, None) => t(Msg::ProviderStepBaseUrl).into_owned(),
         (WizardStep::BaseUrl, Some(p)) => {
             let default_hint = t(Msg::ProviderDefaultHint);
@@ -696,8 +815,9 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
             t(Msg::ProviderStepApiKeyWithHint { hint: &hint }).into_owned()
         }
         (WizardStep::Model, None) => t(Msg::ProviderStepModel).into_owned(),
-        (WizardStep::Model, Some(p)) =>
-            t(Msg::ProviderStepModelWithHint { current: &p.model }).into_owned(),
+        (WizardStep::Model, Some(p)) => {
+            t(Msg::ProviderStepModelWithHint { current: &p.model }).into_owned()
+        }
         (WizardStep::ContextWindow, None) => {
             use atomcode_config::config::provider::default_context_window_for;
             // No provider_type here (Add uses show_add_step_prompt); fall back
@@ -707,8 +827,10 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
             })
             .into_owned()
         }
-        (WizardStep::ContextWindow, Some(p)) =>
-            t(Msg::ProviderStepContextWindowWithHint { current: p.context_window }).into_owned(),
+        (WizardStep::ContextWindow, Some(p)) => t(Msg::ProviderStepContextWindowWithHint {
+            current: p.context_window,
+        })
+        .into_owned(),
     }
 }
 
@@ -730,7 +852,10 @@ fn show_add_step_prompt(
     use crate::i18n::{t, Msg};
     let body = match step {
         WizardStep::Template => t(Msg::ProviderImportPrompt).into_owned(),
-        WizardStep::Name => t(Msg::ProviderStepNameDefault { default: &draft.name }).into_owned(),
+        WizardStep::Name => t(Msg::ProviderStepNameDefault {
+            default: &draft.name,
+        })
+        .into_owned(),
         WizardStep::ContextWindow => {
             use atomcode_config::config::provider::default_context_window_for;
             t(Msg::ProviderStepContextWindow {
@@ -743,7 +868,10 @@ fn show_add_step_prompt(
     if matches!(step, WizardStep::Template) || total == 0 {
         push(renderer, &body);
     } else {
-        let progress = t(Msg::ProviderStepProgress { current: idx + 1, total });
+        let progress = t(Msg::ProviderStepProgress {
+            current: idx + 1,
+            total,
+        });
         push(renderer, &format!("{progress} {body}"));
     }
     redraw(buf, state, ctx, wizard, renderer);
@@ -812,7 +940,11 @@ fn resolve_template(
         .filter(|n| !n.trim().is_empty())
         .unwrap_or_else(|| derive_name(&draft.base_url, ptype, |n| existing.contains_key(n)));
     draft.name = dedupe_name(&base, |n| existing.contains_key(n));
-    let model_disp = if draft.model.is_empty() { "?" } else { &draft.model };
+    let model_disp = if draft.model.is_empty() {
+        "?"
+    } else {
+        &draft.model
+    };
     push(
         renderer,
         &t(Msg::ProviderImportParsed {
@@ -913,7 +1045,10 @@ fn store_step(
         WizardStep::ApiKey => draft.api_key = ans.to_string(),
         WizardStep::Model => {
             if ans.is_empty() {
-                push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderModelEmpty));
+                push(
+                    renderer,
+                    &crate::i18n::t(crate::i18n::Msg::ProviderModelEmpty),
+                );
                 return StepOutcome::Retry;
             }
             draft.model = ans.to_string();
@@ -1192,7 +1327,10 @@ fn is_placeholder(value: &str) -> bool {
     if lower.contains("your") && lower.contains("key") {
         return true;
     }
-    if matches!(lower.as_str(), "api_key" | "apikey" | "placeholder" | "token") {
+    if matches!(
+        lower.as_str(),
+        "api_key" | "apikey" | "placeholder" | "token"
+    ) {
         return true;
     }
     // A run of filler chars like `sk-xxxx` or `****`.
@@ -1269,7 +1407,13 @@ fn dedupe_name(base: &str, is_taken: impl Fn(&str) -> bool) -> String {
 
 /// Route a keystroke into `Buffer::apply` so text-input wizard steps
 /// support the usual editing shortcuts (Backspace / Left / Right / etc).
-fn forward_to_buffer(code: KeyCode, modifiers: KeyModifiers, buf: &mut Buffer, state: &mut UiState, ctx: &LoopCtx) {
+fn forward_to_buffer(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    buf: &mut Buffer,
+    state: &mut UiState,
+    ctx: &LoopCtx,
+) {
     let action = classify(code, modifiers);
     let _ = buf.apply(action, ctx.history.entries(), &ctx.commands);
     crate::event_loop::sync_recalled_attachments(state, buf, ctx.history.entries());
@@ -1286,7 +1430,10 @@ mod tests {
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.7-max","messages":[{"role":"user","content":"你好"}]}'"#;
         let p = parse_template(input);
-        assert_eq!(p.url.as_deref(), Some("https://taotoken.net/api/v1/chat/completions"));
+        assert_eq!(
+            p.url.as_deref(),
+            Some("https://taotoken.net/api/v1/chat/completions")
+        );
         assert_eq!(p.api_key.as_deref(), Some("<API_KEY>"));
         assert_eq!(p.model.as_deref(), Some("qwen3.7-max"));
     }
@@ -1298,7 +1445,10 @@ mod tests {
   -H "anthropic-version: 2023-06-01" \
   -d '{"model":"claude-opus-4","max_tokens":1024}'"#;
         let p = parse_template(input);
-        assert_eq!(p.url.as_deref(), Some("https://api.anthropic.com/v1/messages"));
+        assert_eq!(
+            p.url.as_deref(),
+            Some("https://api.anthropic.com/v1/messages")
+        );
         assert_eq!(p.api_key.as_deref(), Some("sk-ant-123"));
         assert_eq!(p.model.as_deref(), Some("claude-opus-4"));
     }
@@ -1317,14 +1467,18 @@ chunks = query({
     "stream": True,
 })"#;
         let p = parse_template(input);
-        assert_eq!(p.url.as_deref(), Some("https://api-ai.gitcode.com/v1/chat/completions"));
+        assert_eq!(
+            p.url.as_deref(),
+            Some("https://api-ai.gitcode.com/v1/chat/completions")
+        );
         assert_eq!(p.api_key.as_deref(), Some("MWtoCL7zchAZpQGssV6uDdRE"));
         assert_eq!(p.model.as_deref(), Some("deepseek-ai/DeepSeek-R1"));
     }
 
     #[test]
     fn parse_template_json_block() {
-        let input = r#"{"type":"openai","base_url":"https://x.ai/v1","api_key":"sk-1","model":"grok-2"}"#;
+        let input =
+            r#"{"type":"openai","base_url":"https://x.ai/v1","api_key":"sk-1","model":"grok-2"}"#;
         let p = parse_template(input);
         assert_eq!(p.url.as_deref(), Some("https://x.ai/v1"));
         assert_eq!(p.api_key.as_deref(), Some("sk-1"));
@@ -1351,7 +1505,10 @@ chunks = query({
 
     #[test]
     fn normalize_base_url_openai_keeps_plain() {
-        assert_eq!(normalize_base_url("https://x.ai/v1", "openai"), "https://x.ai/v1");
+        assert_eq!(
+            normalize_base_url("https://x.ai/v1", "openai"),
+            "https://x.ai/v1"
+        );
     }
 
     #[test]
@@ -1417,12 +1574,20 @@ chunks = query({
         assert_eq!(outcome, TemplateOutcome::Import);
         assert_eq!(d.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(d.model, "stepfun/step-3.7-flash");
-        assert!(d.api_key.is_empty(), "shell-var key must be dropped, got {:?}", d.api_key);
+        assert!(
+            d.api_key.is_empty(),
+            "shell-var key must be dropped, got {:?}",
+            d.api_key
+        );
         assert_eq!(d.name, "openrouter");
         // Only gap is the key → plan asks ApiKey then Name.
         assert_eq!(
             import_plan(&d),
-            vec![WizardStep::ApiKey, WizardStep::ContextWindow, WizardStep::Name]
+            vec![
+                WizardStep::ApiKey,
+                WizardStep::ContextWindow,
+                WizardStep::Name
+            ]
         );
     }
 
@@ -1453,35 +1618,56 @@ chunks = query({
 
     #[test]
     fn derive_name_strips_api_prefix_and_tld() {
-        assert_eq!(derive_name("https://api.deepseek.com/v1", "openai", |_| false), "deepseek");
+        assert_eq!(
+            derive_name("https://api.deepseek.com/v1", "openai", |_| false),
+            "deepseek"
+        );
     }
 
     #[test]
     fn derive_name_handles_cn_tld() {
-        assert_eq!(derive_name("https://api.moonshot.cn/v1", "openai", |_| false), "moonshot");
+        assert_eq!(
+            derive_name("https://api.moonshot.cn/v1", "openai", |_| false),
+            "moonshot"
+        );
     }
 
     #[test]
     fn derive_name_handles_no_api_prefix() {
-        assert_eq!(derive_name("https://openrouter.ai/api/v1", "openai", |_| false), "openrouter");
+        assert_eq!(
+            derive_name("https://openrouter.ai/api/v1", "openai", |_| false),
+            "openrouter"
+        );
     }
 
     #[test]
     fn derive_name_prefers_registrable_domain_over_subdomain() {
         // api-ai.gitcode.com → gitcode (not "api-ai")
-        assert_eq!(derive_name("https://api-ai.gitcode.com/v1", "openai", |_| false), "gitcode");
-        assert_eq!(derive_name("https://www.openrouter.ai/api/v1", "openai", |_| false), "openrouter");
+        assert_eq!(
+            derive_name("https://api-ai.gitcode.com/v1", "openai", |_| false),
+            "gitcode"
+        );
+        assert_eq!(
+            derive_name("https://www.openrouter.ai/api/v1", "openai", |_| false),
+            "openrouter"
+        );
     }
 
     #[test]
     fn derive_name_handles_multi_part_tld() {
         // example.com.cn → example (hop over the generic `com`)
-        assert_eq!(derive_name("https://api.example.com.cn/v1", "openai", |_| false), "example");
+        assert_eq!(
+            derive_name("https://api.example.com.cn/v1", "openai", |_| false),
+            "example"
+        );
     }
 
     #[test]
     fn derive_name_falls_back_to_type_for_localhost() {
-        assert_eq!(derive_name("http://localhost:11434", "ollama", |_| false), "ollama");
+        assert_eq!(
+            derive_name("http://localhost:11434", "ollama", |_| false),
+            "ollama"
+        );
     }
 
     #[test]
@@ -1515,8 +1701,8 @@ chunks = query({
         assert_eq!(d.base_url, "https://api.anthropic.com");
         assert_eq!(d.provider_type, "claude");
         assert_eq!(d.name, "anthropic"); // derived from host
-        // Manual entry never supplies key/model, so both are asked, then the
-        // context window, then Name.
+                                         // Manual entry never supplies key/model, so both are asked, then the
+                                         // context window, then Name.
         assert_eq!(
             import_plan(&d),
             vec![
@@ -1548,7 +1734,11 @@ chunks = query({
         // model already filled → skip it, keep context window before Name.
         assert_eq!(
             import_plan(&draft_filled("openai", "", "gpt-4o")),
-            vec![WizardStep::ApiKey, WizardStep::ContextWindow, WizardStep::Name]
+            vec![
+                WizardStep::ApiKey,
+                WizardStep::ContextWindow,
+                WizardStep::Name
+            ]
         );
     }
 
@@ -1575,7 +1765,13 @@ chunks = query({
         // Valid → stored.
         let mut d = draft_filled("openai", "sk", "gpt-4o");
         assert_eq!(
-            store_step(&mut d, WizardStep::ContextWindow, "64000", &existing, &mut sink),
+            store_step(
+                &mut d,
+                WizardStep::ContextWindow,
+                "64000",
+                &existing,
+                &mut sink
+            ),
             StepOutcome::Ok
         );
         assert_eq!(d.context_window, Some(64_000));
@@ -1589,7 +1785,13 @@ chunks = query({
         // Garbage → Retry, unchanged.
         let mut d3 = draft_filled("openai", "sk", "gpt-4o");
         assert_eq!(
-            store_step(&mut d3, WizardStep::ContextWindow, "banana", &existing, &mut sink),
+            store_step(
+                &mut d3,
+                WizardStep::ContextWindow,
+                "banana",
+                &existing,
+                &mut sink
+            ),
             StepOutcome::Retry
         );
         assert_eq!(d3.context_window, None);
@@ -1603,11 +1805,15 @@ chunks = query({
         assert_eq!(d.into_config().context_window, 64_000);
         // None → provider-type default (ollama = 8000, openai = 128000).
         assert_eq!(
-            draft_filled("ollama", "", "llama3").into_config().context_window,
+            draft_filled("ollama", "", "llama3")
+                .into_config()
+                .context_window,
             8_000
         );
         assert_eq!(
-            draft_filled("openai", "sk", "gpt-4o").into_config().context_window,
+            draft_filled("openai", "sk", "gpt-4o")
+                .into_config()
+                .context_window,
             128_000
         );
     }
@@ -1687,7 +1893,11 @@ chunks = query({
         assert_eq!(d.name, "taotoken");
         assert_eq!(
             import_plan(&d),
-            vec![WizardStep::ApiKey, WizardStep::ContextWindow, WizardStep::Name]
+            vec![
+                WizardStep::ApiKey,
+                WizardStep::ContextWindow,
+                WizardStep::Name
+            ]
         );
     }
 
@@ -1708,7 +1918,8 @@ chunks = query({
     #[test]
     fn derive_name_suffixes_until_free() {
         assert_eq!(
-            derive_name("https://api.deepseek.com/v1", "openai", |n| n == "deepseek" || n == "deepseek-2"),
+            derive_name("https://api.deepseek.com/v1", "openai", |n| n == "deepseek"
+                || n == "deepseek-2"),
             "deepseek-3"
         );
     }

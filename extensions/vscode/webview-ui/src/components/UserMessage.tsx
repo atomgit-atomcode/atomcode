@@ -1,22 +1,57 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useEffect, useRef } from 'react';
 import { ChatMessage } from '../state/types';
 import { useT } from '../i18n';
+import { highlightPlainText } from '../utils/search';
 
 interface UserMessageProps {
   message: ChatMessage;
   className?: string;
+  searchQuery?: string;
+  isCurrentMatch?: boolean;
 }
 
-export function UserMessage({ message, className = '' }: UserMessageProps) {
+export function UserMessage({ message, className = '', searchQuery, isCurrentMatch }: UserMessageProps) {
   const [expanded, setExpanded] = useState(false);
   const t = useT();
+  const textRef = useRef<HTMLDivElement>(null);
   const shouldCollapse = useMemo(() => {
     const lineCount = message.text.split('\n').length;
     return message.text.length > 1200 || lineCount > 18;
   }, [message.text]);
 
+  // Auto-expand when this message is the current search match, so the
+  // highlighted keyword is visible even in collapsed bubbles.
+  useEffect(() => {
+    if (isCurrentMatch && shouldCollapse) {
+      setExpanded(true);
+    }
+  }, [isCurrentMatch, shouldCollapse]);
+
+  // Scroll the active match into view. Deferred to the next frame so the
+  // expand state has flushed to the DOM (overflow: hidden can otherwise
+  // prevent the keyword from being scrolled into the visible area).
+  useEffect(() => {
+    if (!isCurrentMatch) return;
+    const raf = requestAnimationFrame(() => {
+      const el = textRef.current;
+      if (!el) return;
+      const mark = el.querySelector('mark.search-highlight');
+      if (mark) {
+        mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      } else {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [isCurrentMatch, searchQuery, expanded]);
+
+  const textHtml = useMemo(
+    () => (searchQuery && searchQuery.trim() ? highlightPlainText(message.text, searchQuery) : undefined),
+    [message.text, searchQuery],
+  );
+
   return (
-    <div className={`user-message-wrapper${message.queued ? ' is-queued' : ''}${className}`}>
+    <div className={`user-message-wrapper${message.queued ? ' is-queued' : ''}${className}${isCurrentMatch ? ' search-current' : ''}`}>
       <div className="user-message-bubble">
         {message.queued && <div className="user-message-status">{t('user.queued')}</div>}
         {message.contextFiles && message.contextFiles.length > 0 && (
@@ -55,7 +90,11 @@ export function UserMessage({ message, className = '' }: UserMessageProps) {
           </div>
         )}
         <div className={`user-message-text${shouldCollapse && !expanded ? ' is-collapsed' : ''}`}>
-          <div className="user-message-plain-text">{message.text}</div>
+          <div ref={textRef} className="user-message-plain-text">
+            {textHtml
+              ? <span dangerouslySetInnerHTML={{ __html: textHtml }} />
+              : message.text}
+          </div>
         </div>
         {shouldCollapse && (
           <button

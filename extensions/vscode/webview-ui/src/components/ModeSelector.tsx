@@ -5,8 +5,9 @@ import { MsgKey, useT } from '../i18n';
 
 const OPTIONS: Array<{ value: ApprovalMode; labelKey: MsgKey; descKey: MsgKey }> = [
   { value: 'build', labelKey: 'mode.build', descKey: 'mode.buildDesc' },
+  { value: 'accept_edits', labelKey: 'mode.acceptEdits', descKey: 'mode.acceptEditsDesc' },
+  { value: 'bypass', labelKey: 'mode.auto', descKey: 'mode.autoDesc' },
   { value: 'plan', labelKey: 'mode.plan', descKey: 'mode.planDesc' },
-  { value: 'bypass', labelKey: 'mode.bypass', descKey: 'mode.bypassDesc' },
 ];
 
 export function ModeSelector({ placement = 'up', onOpen }: { placement?: 'up' | 'down'; onOpen?: () => void }) {

@@ -8,10 +8,10 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
-use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
 use crate::tool::{ToolCall, ToolDef};
+use atomcode_config::config::provider::ProviderConfig;
 
 use super::LlmProvider;
 
@@ -34,7 +34,7 @@ impl ClaudeProvider {
         let thinking_enabled = config.thinking_enabled.unwrap_or(false);
         let thinking_budget = config.thinking_budget.unwrap_or(10_000);
         Ok(Self {
-            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify),
+            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify)?,
             api_key,
             model: config.model.clone(),
             base_url: config

@@ -3,13 +3,13 @@
 //! Spec: docs/superpowers/specs/2026-05-08-uninstall-design.md
 //! Plan: docs/superpowers/plans/2026-05-08-uninstall-feature.md
 
-use atomcode_updater::current_exe_path;
 use super::{
     actions::{PlatformSelfDelete, SelfDeleteStrategy},
     paths::atomcode_dir,
     scan::scan,
     Decisions, ExecuteContext, Group, Outcome,
 };
+use atomcode_updater::current_exe_path;
 
 pub struct Args {
     pub yes: bool,
@@ -79,8 +79,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let ctx = build_context(&plan)?;
 
     let strategy: Box<dyn SelfDeleteStrategy> = Box::new(PlatformSelfDelete);
-    let outcome =
-        super::execute(&plan, final_decisions, strategy.as_ref(), Some(ctx))?;
+    let outcome = super::execute(&plan, final_decisions, strategy.as_ref(), Some(ctx))?;
     print_summary(&outcome);
 
     if !outcome.failed.is_empty() {
@@ -178,12 +177,7 @@ fn print_plan(plan: &super::scan::Plan, decisions: Decisions) {
     );
 }
 
-fn print_group(
-    plan: &super::scan::Plan,
-    g: Group,
-    label: &str,
-    will_remove: bool,
-) {
+fn print_group(plan: &super::scan::Plan, g: Group, label: &str, will_remove: bool) {
     let items: Vec<_> = plan.items.iter().filter(|i| i.group == g).collect();
     if items.is_empty() {
         return;

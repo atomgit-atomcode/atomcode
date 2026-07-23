@@ -6,10 +6,10 @@
 //! [`super::for_provider`] lands here.
 
 use super::CtxBuilder;
-use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::Message;
 use crate::conversation::{ContextStats, Conversation};
 use crate::tool::ToolResult;
+use atomcode_config::config::provider::ProviderConfig;
 
 /// Fallback strategy — matches legacy behavior byte-for-byte.
 #[derive(Debug, Clone)]
@@ -102,8 +102,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-
-}
+        }
     }
 
     #[test]

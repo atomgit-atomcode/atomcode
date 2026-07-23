@@ -8,10 +8,10 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
-use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
+use atomcode_config::config::provider::ProviderConfig;
 
 use super::LlmProvider;
 
@@ -24,7 +24,7 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     pub fn new(config: &ProviderConfig) -> Result<Self> {
         Ok(Self {
-            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify),
+            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify)?,
             model: config.model.clone(),
             base_url: config
                 .base_url
@@ -143,14 +143,17 @@ impl LlmProvider for OllamaProvider {
         // Pass tool definitions to Ollama (supported since v0.3+)
         if let Some(tool_defs) = tools {
             if !tool_defs.is_empty() {
-                body["tools"] = json!(tool_defs.iter().map(|td| json!({
-                    "type": "function",
-                    "function": {
-                        "name": td.name,
-                        "description": td.description,
-                        "parameters": td.parameters,
-                    }
-                })).collect::<Vec<_>>());
+                body["tools"] = json!(tool_defs
+                    .iter()
+                    .map(|td| json!({
+                        "type": "function",
+                        "function": {
+                            "name": td.name,
+                            "description": td.description,
+                            "parameters": td.parameters,
+                        }
+                    }))
+                    .collect::<Vec<_>>());
             }
         }
 
@@ -247,7 +250,7 @@ impl LlmProvider for OllamaProvider {
                                             id: call_id,
                                             name: tc.function.name.clone(),
                                             arguments: args,
-                                        }
+                                        },
                                     )));
                                 }
                             }

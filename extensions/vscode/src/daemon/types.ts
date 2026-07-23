@@ -1,4 +1,4 @@
-export type ApprovalMode = 'build' | 'plan' | 'bypass';
+export type ApprovalMode = 'build' | 'plan' | 'bypass' | 'accept_edits';
 
 // Chat
 export interface ChatRequest {
@@ -16,6 +16,18 @@ export interface ImageInput {
   missing?: boolean;
 }
 
+export type ChatStopReason =
+  | 'stopped'
+  | 'max_rounds'
+  | 'max_continuations'
+  | 'repeat_loop'
+  | 'tool_loop_detected'
+  | 'provider_error'
+  | 'timeout'
+  | 'cancelled'
+  | 'prompt_rejected'
+  | 'rate_limited';
+
 export interface SkillInfo {
   name: string;
   description: string;
@@ -27,6 +39,8 @@ export interface ApprovalModeResponse {
 }
 
 export type ChatEvent =
+  | { type: 'runtime_info'; provider: string; model: string }
+  | { type: 'mode'; mode: ApprovalMode }
   | { type: 'text'; content: string }
   | { type: 'tool_batch'; calls: Array<{ id: string; name: string; arguments: string }> }
   | { type: 'tool_start'; id?: string; name: string; arguments: string }
@@ -39,7 +53,7 @@ export type ChatEvent =
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'warning'; message: string }
   | { type: 'rate_limited'; message: string; retry_after_seconds?: number; attempt?: number; max_attempts?: number }
-  | { type: 'done'; tokens: number; tool_calls: number; session_id?: string }
+  | { type: 'done'; tokens: number; tool_calls: number; session_id?: string; stop_reason?: ChatStopReason; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string };
 
@@ -55,6 +69,7 @@ export interface HealthResponse {
   status: string;
   version: string;
   service: string;
+  instance_id?: string;
 }
 
 // Project
@@ -98,6 +113,7 @@ export interface UserInfo {
 
 export interface AuthStatusResponse {
   logged_in: boolean;
+  expired: boolean;
   auth_path: string;
   user: UserInfo | null;
   token: {
@@ -112,11 +128,15 @@ export interface LoginStartResponse {
   login_id: string;
   url: string;
   expires_in_seconds: number;
+  daemon_instance_id?: string;
 }
 
 export interface LoginPollResponse {
-  status: 'pending' | 'authorized';
+  status: 'pending' | 'authorized' | 'expired' | 'cancelled' | 'failed';
   user: UserInfo | null;
+  code?: string;
+  message?: string;
+  retry_after_ms?: number;
 }
 
 export interface ProviderInfo {
@@ -125,6 +145,7 @@ export interface ProviderInfo {
   model: string;
   base_url?: string;
   has_api_key: boolean;
+  requires_login?: boolean;
   is_default: boolean;
   context_window: number;
   max_tokens?: number;
@@ -292,6 +313,8 @@ export interface AppendSessionMessagesResponse {
 
 // Callbacks for SSE streaming
 export interface ChatStreamCallbacks {
+  onRuntimeInfo?: (provider: string, model: string) => void;
+  onMode?: (mode: ApprovalMode) => void;
   onText: (content: string) => void;
   onToolBatch: (calls: Array<{ id: string; name: string; args: string }>) => void;
   onToolStart: (id: string | undefined, name: string, args: string) => void;
@@ -304,7 +327,7 @@ export interface ChatStreamCallbacks {
   onArtifactEnd: (id: string) => void;
   onWarning: (message: string) => void;
   onRateLimited: (event: { message: string; retryAfterSeconds?: number; attempt?: number; maxAttempts?: number }) => void;
-  onDone: (tokens: number, toolCalls: number, sessionId?: string) => void;
+  onDone: (tokens: number, toolCalls: number, sessionId?: string, stopReason?: ChatStopReason, message?: string) => void;
   onStopped: () => void;
   onError: (message: string) => void;
 }

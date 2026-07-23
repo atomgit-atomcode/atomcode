@@ -37,7 +37,10 @@ pub fn resolve_tier_keys(config: &Config, host_model: &str) -> Option<(String, S
         return None;
     }
     ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
-    Some((ranked.first().unwrap().0.clone(), ranked.last().unwrap().0.clone()))
+    Some((
+        ranked.first().unwrap().0.clone(),
+        ranked.last().unwrap().0.clone(),
+    ))
 }
 
 #[cfg(test)]
@@ -71,7 +74,8 @@ mod tests {
     #[test]
     fn routes_by_capable_rank_when_host_participates() {
         let mut c = Config::default();
-        c.providers.insert("p-ds".into(), pc("deepseek-v4-flash", Some(0)));
+        c.providers
+            .insert("p-ds".into(), pc("deepseek-v4-flash", Some(0)));
         c.providers.insert("p-glm".into(), pc("GLM-5.2", Some(1)));
         c.default_provider = "p-glm".into();
         // host = GLM (participates, highest rank) ⇒ fast = deepseek (min), capable = GLM (max).
@@ -86,8 +90,10 @@ mod tests {
         // Host is a self-configured model (no capable_model) even though AtomGit models WITH
         // capable_model are also present ⇒ None (subagent uses the current model).
         let mut c = Config::default();
-        c.providers.insert("mine".into(), pc("my-local-model", None));
-        c.providers.insert("p-ds".into(), pc("deepseek-v4-flash", Some(0)));
+        c.providers
+            .insert("mine".into(), pc("my-local-model", None));
+        c.providers
+            .insert("p-ds".into(), pc("deepseek-v4-flash", Some(0)));
         c.providers.insert("p-glm".into(), pc("GLM-5.2", Some(1)));
         c.default_provider = "mine".into();
         assert_eq!(resolve_tier_keys(&c, "my-local-model"), None);

@@ -21,14 +21,14 @@ default = []
 distro-pm = ["atomcode-updater/distro-pm", "atomcode-tuix/distro-pm"]
 
 [dependencies]
+async-trait = "0.1"
 atomcode-core = { path = "../atomcode-core" }
+atomcode-codingplan = { path = "../atomcode-codingplan" }
 # Config system (leaf crate, extracted from core) — used directly, not via the
 # transitional atomcode_core::config re-export shim.
 atomcode-config = { path = "../atomcode-config" }
 # Self-update mechanics (leaf crate, extracted from core).
 atomcode-updater = { path = "../atomcode-updater" }
-# Engine v2: the new stack presented through the legacy channel protocol.
-atomcode-bridge = { path = "../atomcode-bridge" }
 atomcode-tuix = { path = "../atomcode-tuix" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 atomcode-daemon = { path = "../atomcode-daemon" }
@@ -38,8 +38,9 @@ atomcode-daemon = { path = "../atomcode-daemon" }
 # here (acp is cross-platform); it also covers the unix-only `::askpass` helper below.
 agent-client-protocol = { workspace = true }
 atomcode-kernel = { path = "../atomcode-kernel" }
-atomcode-coding = { path = "../atomcode-coding" }
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify"] }
+atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit"] }
+atomcode-auth = { path = "../atomcode-auth" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
@@ -53,6 +54,11 @@ serde_json = "1"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 is-terminal = "0.4"
+# File-only tracing subscriber (see `init_file_logging`). The workspace emits 110+
+# `tracing::` diagnostics (e.g. `atomcode-label:` from the git-push label middleware)
+# but installed NO subscriber, so they all went to the no-op dispatcher. This wires
+# them to `<config_dir>/logs/atomcode.log`, filtered by RUST_LOG.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Process scan for the uninstall flow (detect running atomcode instances).
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 

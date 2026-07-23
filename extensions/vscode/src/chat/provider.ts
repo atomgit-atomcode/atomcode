@@ -1,10 +1,12 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { DaemonClient } from '../daemon/client';
+import { classifyAuthDisplayState } from '../auth/status';
+import { DaemonClient, DaemonHttpError } from '../daemon/client';
 import {
   AuthStatusResponse,
   ChatRequest,
+  ChatStopReason,
   CodingPlanSetupResponse,
   ConfigResponse,
   CreateProviderRequest,
@@ -36,6 +38,23 @@ type PanelSessionInfo = {
   workingDir?: string;
   messages?: MessageInfo[];
   messagesPromise?: Promise<MessageInfo[] | undefined>;
+};
+
+type SessionTerminal = (
+  | { type: 'done'; tokens: number; toolCalls: number; sessionId?: string; stopReason?: ChatStopReason; message?: string }
+  | { type: 'stopped' }
+  | { type: 'error'; message: string }
+) & { generation: number };
+
+type PendingPanelMessage = {
+  message: any;
+  generation?: number;
+};
+
+type PanelHistoryLoad = {
+  sessionId: string;
+  projectHash: string;
+  promise: Promise<MessageInfo[] | undefined>;
 };
 
 type SessionMetaLike = SessionMeta & {
@@ -91,13 +110,25 @@ export function mergeSessionsForDisplay(
 interface SessionRuntime {
   abortController?: AbortController;
   isGenerating: boolean;
+  streamGeneration?: number;
   queuedMessages: QueuedChatMessage[];
   projectHash?: string;
-  errorMessage?: string;
+  terminalSeen?: boolean;
+  terminal?: SessionTerminal;
+  recoveryLocked?: boolean;
+  messages?: MessageInfo[];
   eventBuffer: Array<{
     type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolProgress' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'warning' | 'rateLimited' | 'tokens';
     data: any;
   }>;
+}
+
+interface StreamReplayCursor {
+  sessionId?: string;
+  streamGeneration: number;
+  replayedEvents: number;
+  historyGeneration?: number;
+  terminalGeneration?: number;
 }
 
 function isDestructivePermissionTool(toolName: string): boolean {
@@ -122,23 +153,55 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'atomcode.chatView';
   private _view?: vscode.WebviewView;
   private _panels = new Map<string, vscode.WebviewPanel>();
+  private _webviewPanels = new Map<vscode.Webview, vscode.WebviewPanel>();
+  private _sessionBindingPromises = new Map<vscode.Webview, Promise<string | undefined>>();
+  private _panelHistoryLoads = new WeakMap<vscode.WebviewPanel, PanelHistoryLoad>();
   private _panelSessions = new Map<string, PanelSessionInfo>();
   private _panelReady = new Map<string, boolean>();
   private _activeSessionId?: string;
   private _focusedPanelId?: string;
   private _sessionRuntimes = new Map<string, SessionRuntime>();
-  private _pendingMessages = new Map<string, any[]>();
+  private _pendingMessages = new Map<string, PendingPanelMessage[]>();
   private _loginId?: string;
-  private _loginPoll?: ReturnType<typeof setInterval>;
+  private _loginGeneration = 0;
+  private _loginInFlight = false;
   private _loginStartedFromCommand = false;
   private _workspacePathCache?: { root: string; builtAt: number; items: WorkspacePathItem[] };
   private _approvalModeState: ApprovalModeState = initApprovalModeState('build');
   public onModelSelected?: (model: string) => void;
 
+  private _settingsWatcher?: vscode.Disposable;
+  private _atomCodeConfigWatcher?: vscode.FileSystemWatcher;
+  private _atomCodeAuthWatcher?: vscode.FileSystemWatcher;
+  private _watchedConfigPath?: string;
+  private _watchedAuthPath?: string;
+  private _setupRefreshTimer?: NodeJS.Timeout;
+  private _setupStateGeneration = 0;
+
   constructor(
     private readonly _extensionUri: vscode.Uri,
     private readonly _client: DaemonClient,
-  ) {}
+  ) {
+    // Apply a chat-font config change LIVE (set the CSS var in the DOM) instead of rebuilding
+    // the webview HTML — a rebuild would reset the active chat. Initial load is handled by the
+    // `{{fontStyle}}` injection in `_getHtml`.
+    this._settingsWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
+      if (
+        e.affectsConfiguration('atomcode.chat.fontFamily') ||
+        e.affectsConfiguration('chatEditor.fontFamily')
+      ) {
+        this._broadcastChromeFont();
+      }
+    });
+  }
+
+  private _broadcastChromeFont() {
+    const msg = { type: 'chromeFont', value: resolveChatFontFamily() ?? null };
+    this._view?.webview.postMessage(msg);
+    for (const webview of this._webviewPanels.keys()) {
+      webview.postMessage(msg);
+    }
+  }
 
   private async _loadSessionsForDisplay(): Promise<LoadedSessionsForDisplay> {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -159,11 +222,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     const globalSessions = await this._client.listSessions() as SessionMetaLike[];
-    return { sessions: globalSessions };
+    if (!workspaceFolder) return { sessions: globalSessions };
+
+    // Older daemons may not expose the scoped endpoint. Their global fallback
+    // is still usable, but must not leak sessions from unrelated workspaces
+    // into the current sidebar.
+    const resolvedWorkspace = path.resolve(workspaceFolder);
+    const currentProjectSessions = globalSessions.filter((session) =>
+      session.working_dir
+        ? path.resolve(session.working_dir) === resolvedWorkspace
+        : false
+    );
+    return {
+      sessions: currentProjectSessions,
+      currentProjectHash: currentProjectSessions.find((session) => session.project_hash)?.project_hash,
+      workspaceFolder,
+    };
   }
 
   public dispose() {
-    this._clearLoginPoll();
+    this._setupStateGeneration += 1;
+    this._loginGeneration += 1;
+    const loginId = this._loginId;
+    this._loginId = undefined;
+    if (loginId) void this._client.cancelLogin(loginId).catch(() => undefined);
+    this._settingsWatcher?.dispose();
+    this._atomCodeConfigWatcher?.dispose();
+    this._atomCodeAuthWatcher?.dispose();
+    if (this._setupRefreshTimer) clearTimeout(this._setupRefreshTimer);
   }
 
   private _findAtomCodeTabGroup(): vscode.ViewColumn | undefined {
@@ -183,6 +269,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (existing) {
         existing.reveal();
         this._focusedPanelId = sessionId;
+        this._activeSessionId = sessionId;
         return;
       }
     }
@@ -207,47 +294,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       light: vscode.Uri.joinPath(this._extensionUri, 'resources', 'icon.svg'),
       dark: vscode.Uri.joinPath(this._extensionUri, 'resources', 'icon.svg'),
     };
-    panel.webview.html = this._getHtml(panel.webview, 'tab');
-    this._setupWebviewMessageHandler(panel.webview, 'tab');
+    const webview = panel.webview;
+    this._webviewPanels.set(webview, panel);
 
     // Track the panel — required for message routing, size check, and lookup
     if (sessionId) {
       this._panels.set(sessionId, panel);
       this._focusedPanelId = sessionId;
+      this._activeSessionId = sessionId;
     }
+
+    // Bind the ready listener only after the panel/session indexes exist, but
+    // before assigning HTML. The webview may boot quickly enough to emit its
+    // one-shot ready event as soon as the document is installed.
+    this._setupWebviewMessageHandler(webview, 'tab');
+    webview.html = this._getHtml(webview, 'tab');
 
     // When user switches to this tab in VS Code, sync sidebar selection
     panel.onDidChangeViewState((e) => {
       if (e.webviewPanel.active) {
+        void this._sendSetupState(webview);
         const activeSid = this._findSessionIdByPanel(panel);
         if (activeSid) {
           this._focusedPanelId = activeSid;
           const info = this._panelSessions.get(activeSid);
-          this._broadcastMessage({ type: 'sessionSelected', sessionId: activeSid, projectHash: info?.projectHash });
+          this._selectSession(activeSid, info?.projectHash);
         }
       }
     });
 
     panel.onDidDispose(() => {
-      const disposedSid = this._findSessionIdByPanel(panel);
-      if (disposedSid) {
-        this._panels.delete(disposedSid);
-        this._panelReady.delete(disposedSid);
-        this._panelSessions.delete(disposedSid);
-        if (this._focusedPanelId === disposedSid) {
-          this._focusedPanelId = undefined;
-        }
-        // Only clean up runtime if no other panel uses this session
-        const stillInUse = Array.from(this._panelSessions.values())
-          .some(s => s.sessionId === disposedSid);
-        if (!stillInUse) {
-          const rt = this._sessionRuntimes.get(disposedSid);
-          if (rt?.isGenerating) {
-            rt.abortController?.abort();
-            void this._client.stopGeneration(disposedSid).catch(() => undefined);
-          }
-        }
-      }
+      this._handlePanelDisposed(panel, webview);
     });
   }
 
@@ -256,6 +333,101 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (p === panel) return sid;
     }
     return undefined;
+  }
+
+  private _sessionIdForWebview(webview: vscode.Webview): string | undefined {
+    const panel = this._webviewPanels.get(webview);
+    return panel ? this._findSessionIdByPanel(panel) : undefined;
+  }
+
+  private _handlePanelDisposed(panel: vscode.WebviewPanel, webview: vscode.Webview) {
+    const disposedSid = this._findSessionIdByPanel(panel);
+    this._webviewPanels.delete(webview);
+    this._sessionBindingPromises.delete(webview);
+    this._panelHistoryLoads.delete(panel);
+    if (!disposedSid) return;
+
+    const rt = this._sessionRuntimes.get(disposedSid);
+    this._panels.delete(disposedSid);
+    this._panelReady.delete(disposedSid);
+    this._pendingMessages.delete(disposedSid);
+    this._panelSessions.delete(disposedSid);
+    if (this._focusedPanelId === disposedSid) {
+      this._focusedPanelId = undefined;
+    }
+
+    if (rt) rt.queuedMessages = [];
+    if (rt?.isGenerating || rt?.recoveryLocked) {
+      rt.terminalSeen = true;
+      rt.isGenerating = false;
+      rt.recoveryLocked = true;
+      rt.terminal = { type: 'stopped', generation: rt.streamGeneration ?? 0 };
+      rt.abortController?.abort();
+      rt.abortController = undefined;
+      const generation = rt.streamGeneration ?? 0;
+      void this._client.stopGeneration(disposedSid).then((result) => {
+        if (!result.success) throw new Error(result.message || 'stop request failed');
+        const current = this._sessionRuntimes.get(disposedSid);
+        if (current?.streamGeneration === generation) current.recoveryLocked = false;
+      }).catch(() => {
+        const current = this._sessionRuntimes.get(disposedSid);
+        if (current?.streamGeneration === generation) current.recoveryLocked = true;
+      });
+    }
+  }
+
+  private _selectSession(sessionId?: string, projectHash?: string) {
+    this._activeSessionId = sessionId;
+    const message = { type: 'sessionSelected', sessionId, projectHash };
+    if (sessionId) {
+      this._postOrQueueToPanel(sessionId, message);
+    } else {
+      this._view?.webview.postMessage(message);
+    }
+  }
+
+  private async _ensureSessionForWebview(webview: vscode.Webview): Promise<string | undefined> {
+    const bound = this._sessionIdForWebview(webview);
+    if (bound) return bound;
+
+    const inFlight = this._sessionBindingPromises.get(webview);
+    if (inFlight) return inFlight;
+
+    const binding = (async () => {
+      const panel = this._webviewPanels.get(webview);
+      if (!panel) return undefined;
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const session = await this._client.createSession(undefined, workspaceFolder);
+      if (this._webviewPanels.get(webview) !== panel) return undefined;
+
+      const rt = this._getRuntime(session.id);
+      rt.projectHash = session.project_hash;
+      this._panels.set(session.id, panel);
+      this._panelReady.set(session.id, true);
+      this._panelSessions.set(session.id, {
+        sessionId: session.id,
+        projectHash: session.project_hash,
+        workingDir: session.working_dir,
+      });
+      this._focusedPanelId = session.id;
+      this._selectSession(session.id, session.project_hash);
+      await this._refreshSessions();
+      if (
+        this._webviewPanels.get(webview) !== panel
+        || this._sessionIdForWebview(webview) !== session.id
+      ) {
+        return undefined;
+      }
+      return session.id;
+    })();
+    this._sessionBindingPromises.set(webview, binding);
+    try {
+      return await binding;
+    } finally {
+      if (this._sessionBindingPromises.get(webview) === binding) {
+        this._sessionBindingPromises.delete(webview);
+      }
+    }
   }
 
   public async openInSidebar() {
@@ -278,62 +450,146 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await new Promise(resolve => setTimeout(resolve, 500));
   }
 
+  private _loadPanelHistory(
+    panel: vscode.WebviewPanel,
+    sessionId: string,
+    projectHash: string,
+  ): Promise<MessageInfo[] | undefined> {
+    const currentLoad = this._panelHistoryLoads.get(panel);
+    if (
+      currentLoad?.sessionId === sessionId
+      && currentLoad.projectHash === projectHash
+      && this._panels.get(sessionId) === panel
+    ) {
+      return currentLoad.promise;
+    }
+
+    const startGeneration = this._sessionRuntimes.get(sessionId)?.streamGeneration ?? 0;
+    let promise!: Promise<MessageInfo[] | undefined>;
+    promise = this._client.getSession(projectHash, sessionId)
+      .then((detail) => {
+        const activeLoad = this._panelHistoryLoads.get(panel);
+        const runtime = this._sessionRuntimes.get(sessionId);
+        if (
+          activeLoad?.promise !== promise
+          || this._panels.get(sessionId) !== panel
+          || (runtime?.streamGeneration ?? 0) !== startGeneration
+          || runtime?.isGenerating
+        ) {
+          return undefined;
+        }
+
+        const info = this._panelSessions.get(sessionId);
+        if (
+          info?.messagesPromise !== promise
+          || (info.projectHash && info.projectHash !== projectHash)
+        ) {
+          return undefined;
+        }
+
+        const messages = detail.messages;
+        this._panelSessions.set(sessionId, {
+          ...info,
+          sessionId,
+          projectHash,
+          messages,
+          messagesPromise: undefined,
+        });
+        const targetRuntime = this._getRuntime(sessionId);
+        targetRuntime.projectHash = projectHash;
+        targetRuntime.messages = messages;
+        this._postOrQueueToPanel(sessionId, {
+          type: 'sessionMessages',
+          messages,
+          terminal: this._terminalForWebview(targetRuntime.terminal),
+        }, targetRuntime.streamGeneration ?? 0);
+        return messages;
+      })
+      .finally(() => {
+        if (this._panelHistoryLoads.get(panel)?.promise === promise) {
+          this._panelHistoryLoads.delete(panel);
+        }
+        const info = this._panelSessions.get(sessionId);
+        if (info?.messagesPromise === promise) {
+          this._panelSessions.set(sessionId, {
+            ...info,
+            messagesPromise: undefined,
+          });
+        }
+      });
+
+    this._panelHistoryLoads.set(panel, { sessionId, projectHash, promise });
+    const info = this._panelSessions.get(sessionId);
+    this._panelSessions.set(sessionId, {
+      ...info,
+      sessionId,
+      projectHash,
+      messages: info?.projectHash === projectHash ? info.messages : undefined,
+      messagesPromise: promise,
+    });
+    return promise;
+  }
+
+  private async _restorePanelHistory(
+    panel: vscode.WebviewPanel,
+    sessionId: string,
+    projectHash?: string,
+  ): Promise<void> {
+    try {
+      const resolvedProjectHash = await this._resolveSessionProjectHash(sessionId, projectHash);
+      if (!resolvedProjectHash) return;
+      if (this._panels.get(sessionId) !== panel) return;
+      await this._loadPanelHistory(panel, sessionId, resolvedProjectHash);
+    } catch {
+      // Keep the restored tab retryable. A later session-list click carries an
+      // explicit project hash and re-enters the same guarded loader.
+    }
+  }
+
   public setupPanelForRestore(panel: vscode.WebviewPanel, sessionId?: string, projectHash?: string) {
-    panel.webview.options = {
+    const webview = panel.webview;
+    webview.options = {
       enableScripts: true,
       localResourceRoots: [
         vscode.Uri.joinPath(this._extensionUri, 'webview'),
         vscode.Uri.joinPath(this._extensionUri, 'node_modules', 'highlight.js'),
       ],
     };
-    panel.webview.html = this._getHtml(panel.webview, 'tab');
     panel.iconPath = {
       light: vscode.Uri.joinPath(this._extensionUri, 'resources', 'icon.svg'),
       dark: vscode.Uri.joinPath(this._extensionUri, 'resources', 'icon.svg'),
     };
-    this._setupWebviewMessageHandler(panel.webview, 'tab');
+    this._webviewPanels.set(webview, panel);
 
     // Track the panel
     if (sessionId) {
       this._panels.set(sessionId, panel);
     }
 
-    if (sessionId && projectHash) {
-      const messagesPromise = this._client.getSession(projectHash, sessionId)
-        .then(detail => detail?.messages)
-        .catch(() => undefined);
-      this._panelSessions.set(sessionId, { sessionId, projectHash, messagesPromise });
-      messagesPromise.then(messages => {
-        const info = this._panelSessions.get(sessionId);
-        if (info) {
-          info.messages = messages;
-          info.messagesPromise = undefined;
-        }
-      });
+    if (sessionId) {
+      void this._restorePanelHistory(panel, sessionId, projectHash);
     }
+
+    // Complete the restored session binding before the document can emit
+    // `ready`, otherwise initial history can be requested without an owner.
+    this._setupWebviewMessageHandler(webview, 'tab');
+    webview.html = this._getHtml(webview, 'tab');
 
     // When user switches to this tab in VS Code, sync sidebar selection
     panel.onDidChangeViewState((e) => {
       if (e.webviewPanel.active) {
+        void this._sendSetupState(webview);
         const activeSid = this._findSessionIdByPanel(panel);
         if (activeSid) {
           this._focusedPanelId = activeSid;
           const info = this._panelSessions.get(activeSid);
-          this._broadcastMessage({ type: 'sessionSelected', sessionId: activeSid, projectHash: info?.projectHash });
+          this._selectSession(activeSid, info?.projectHash);
         }
       }
     });
 
     panel.onDidDispose(() => {
-      const disposedSid = this._findSessionIdByPanel(panel);
-      if (disposedSid) {
-        this._panels.delete(disposedSid);
-        this._panelReady.delete(disposedSid);
-        this._panelSessions.delete(disposedSid);
-        if (this._focusedPanelId === disposedSid) {
-          this._focusedPanelId = undefined;
-        }
-      }
+      this._handlePanelDisposed(panel, webview);
     });
   }
 
@@ -351,38 +607,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.onDidChangeVisibility(() => {
       vscode.commands.executeCommand('setContext', 'atomcode.chatFocused', webviewView.visible);
+      if (webviewView.visible) void this._sendSetupState(webviewView.webview);
     });
   }
 
   private _setupWebviewMessageHandler(webview: vscode.Webview, mode: WebviewMode) {
     webview.onDidReceiveMessage(async (msg) => {
       switch (msg.type) {
-        case 'send':
+        case 'send': {
+          const targetSessionId = mode === 'tab'
+            ? (this._sessionIdForWebview(webview) ?? await this._ensureSessionForWebview(webview))
+            : msg.sessionId;
+          if (mode === 'tab' && !targetSessionId) break;
           await this._handleSend(
             msg.text,
             msg.context,
             msg.images,
             msg.clientMessageId,
-            msg.sessionId,
+            targetSessionId,
             msg.approvalMode,
+            mode === 'tab' ? webview : undefined,
           );
           break;
+        }
         case 'stop':
-          this.stopGeneration();
+          this.stopGeneration(
+            mode === 'tab' ? this._sessionIdForWebview(webview) : msg.sessionId,
+          );
           break;
         case 'newConversation':
           await this.newConversation();
           break;
         case 'ready':
-          this._markPanelReady(webview);
-          await this._sendInitialState(webview, mode);
-          // Flush any messages queued before the webview was ready
+          this._markPanelNotReady(webview);
           {
-            let sid: string | undefined;
-            for (const [s, panel] of this._panels) {
-              if (panel.webview === webview) { sid = s; break; }
-            }
-            if (sid) this._flushPendingMessages(sid);
+            const replayCursor = await this._sendInitialState(webview, mode);
+            this._finishPanelReadyReplay(webview, replayCursor);
           }
           break;
         case 'selectModel':
@@ -477,12 +737,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'copyCode':
           vscode.env.clipboard.writeText(msg.code);
           break;
-        case 'quickAction':
-          await this._handleQuickAction(msg.action);
+        case 'quickAction': {
+          const targetSessionId = mode === 'tab'
+            ? (this._sessionIdForWebview(webview) ?? await this._ensureSessionForWebview(webview))
+            : msg.sessionId;
+          if (mode === 'tab' && !targetSessionId) break;
+          await this._handleQuickAction(
+            msg.action,
+            targetSessionId,
+            mode === 'tab' ? webview : undefined,
+          );
           break;
-        case 'slashCommand':
-          await this._handleSlashCommand(msg.command);
+        }
+        case 'slashCommand': {
+          const targetSessionId = mode === 'tab'
+            ? (this._sessionIdForWebview(webview) ?? await this._ensureSessionForWebview(webview))
+            : msg.sessionId;
+          if (mode === 'tab' && !targetSessionId) break;
+          await this._handleSlashCommand(
+            msg.command,
+            targetSessionId,
+            mode === 'tab' ? webview : undefined,
+          );
           break;
+        }
         case 'getSkills':
           try {
             const skills = await this._client.listSkills();
@@ -700,7 +978,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.stopGeneration();
       }
       await this._ensureSession(sid);
-      this._postMessage({ type: 'clearChat' });
+      this._postMessageForSession(sid, { type: 'clearChat' });
     }
 
     this._postOrQueueToPanel(sid!, { type: 'userMessage', text });
@@ -747,35 +1025,56 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     try {
       session = await this._client.createSession(undefined, workspaceFolder);
     } catch {
-      this._broadcastMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
+      this._selectSession(undefined, undefined);
       return;
     }
     sessionId = session.id;
     projectHash = session.project_hash;
     this._getRuntime(sessionId).projectHash = session.project_hash;
+    this._activeSessionId = sessionId;
 
     // Open new tab for the new session
     this._panelSessions.set(sessionId, { sessionId, projectHash, workingDir: session.working_dir });
     this.openInTab(sessionId);
 
-    // Notify all panels + sidebar about the new active session
-    this._broadcastMessage({ type: 'sessionSelected', sessionId, projectHash });
+    this._selectSession(sessionId, projectHash);
     await this._refreshSessions();
   }
 
-  public stopGeneration() {
-    const sid = this._focusedPanelId;
+  public stopGeneration(sessionId?: string) {
+    const sid = sessionId ?? this._focusedPanelId;
     if (!sid) return;
     const rt = this._sessionRuntimes.get(sid);
-    if (!rt?.isGenerating) return;
+    if (!rt || (!rt.isGenerating && !rt.recoveryLocked)) return;
 
+    rt.terminalSeen = true;
     rt.abortController?.abort();
     rt.abortController = undefined;
     rt.queuedMessages = [];
     rt.isGenerating = false;
-    rt.eventBuffer = [];
-    void this._client.stopGeneration(sid).catch(() => undefined);
-    this._postMessage({ type: 'generationStopped' });
+    rt.recoveryLocked = true;
+    const stopGeneration = rt.streamGeneration ?? 0;
+    rt.terminal = { type: 'stopped', generation: stopGeneration };
+    this._postTerminalForSession(sid, { type: 'recoveryRequired' }, stopGeneration);
+    void this._client.stopGeneration(sid).then((result) => {
+      if (!result.success) throw new Error(result.message || 'stop request failed');
+      const current = this._sessionRuntimes.get(sid);
+      if (!current || current.streamGeneration !== stopGeneration) return;
+      current.recoveryLocked = false;
+      this._postTerminalForSession(sid, { type: 'generationStopped' }, stopGeneration);
+      this._postTerminalForSession(sid, { type: 'recoveryCleared' }, stopGeneration);
+    }).catch((error) => {
+      const current = this._sessionRuntimes.get(sid);
+      if (!current || current.streamGeneration !== stopGeneration) return;
+      current.recoveryLocked = true;
+      current.terminal = {
+        type: 'error',
+        generation: stopGeneration,
+        message: `Unable to confirm the turn stopped: ${this._messageFromError(error)}`,
+      };
+      this._postTerminalForSession(sid, this._terminalForWebview(current.terminal), stopGeneration);
+      this._postTerminalForSession(sid, { type: 'recoveryRequired' }, stopGeneration);
+    });
   }
 
   public focusInput() {
@@ -789,7 +1088,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _getRuntime(sessionId: string): SessionRuntime {
     let rt = this._sessionRuntimes.get(sessionId);
     if (!rt) {
-      rt = { isGenerating: false, queuedMessages: [], eventBuffer: [] };
+      rt = { isGenerating: false, streamGeneration: 0, queuedMessages: [], eventBuffer: [] };
       this._sessionRuntimes.set(sessionId, rt);
     }
     return rt;
@@ -802,6 +1101,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     clientMessageId?: string,
     msgSessionId?: string,
     approvalMode?: ApprovalMode,
+    ownerWebview?: vscode.Webview,
   ) {
     const trimmed = text.trim();
     const attachedImages = images?.length ? images : undefined;
@@ -812,7 +1112,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       sid = await this._ensureSession();
     }
     if (!sid) return;
+    const ownerStillBound = () => !ownerWebview || (
+      this._webviewPanels.has(ownerWebview)
+      && this._sessionIdForWebview(ownerWebview) === sid
+    );
+    if (!ownerStillBound()) return;
     const rt = this._getRuntime(sid);
+    this._activeSessionId = sid;
+
+    if (rt.recoveryLocked) {
+      try {
+        const activeSessions = await this._client.activeSessions();
+        if (!ownerStillBound()) return;
+        if (activeSessions.includes(sid)) {
+          this._postMessageForSession(sid, {
+            type: 'error',
+            message: 'The previous turn is still active, but this window cannot reattach to its stream. Stop it before starting another turn.',
+          });
+          return;
+        }
+        rt.recoveryLocked = false;
+      } catch {
+        this._postMessageForSession(sid, {
+          type: 'error',
+          message: 'Unable to verify whether the previous turn stopped. Stop it before starting another turn.',
+        });
+        return;
+      }
+    }
 
     if (rt.isGenerating) {
       rt.queuedMessages.push({ text: trimmed, context, images: attachedImages, clientMessageId, approvalMode });
@@ -826,11 +1153,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!attachedImages && await this._handleLocalCommand(trimmed, sid)) {
       return;
     }
+    if (!ownerStillBound()) return;
+
+    // A second send can pass the first admission check while this turn awaits
+    // local-command handling. Re-check the same session before claiming it.
+    if (rt.recoveryLocked) return;
+    if (rt.isGenerating) {
+      rt.queuedMessages.push({ text: trimmed, context, images: attachedImages, clientMessageId, approvalMode });
+      return;
+    }
 
     rt.isGenerating = true;
+    rt.terminalSeen = false;
+    rt.terminal = undefined;
+    rt.streamGeneration = (rt.streamGeneration ?? 0) + 1;
+    const turnGeneration = rt.streamGeneration;
+    rt.recoveryLocked = false;
     rt.eventBuffer = [];  // Start a fresh buffer for this turn
     rt.eventBuffer.push({ type: 'userMessage', data: { text: trimmed, images: attachedImages } });
-    this._postMessage({ type: 'generationStarted' });
+    const pending = this._pendingMessages.get(sid);
+    if (pending) {
+      const currentGeneration = rt.streamGeneration;
+      const current = pending.filter((entry) => entry.generation === undefined || entry.generation === currentGeneration);
+      if (current.length > 0) this._pendingMessages.set(sid, current);
+      else this._pendingMessages.delete(sid);
+    }
+    this._postStreamEventIfReady(sid, { type: 'generationStarted' });
 
     let fullMessage = trimmed;
     if (context && context.length > 0) {
@@ -880,40 +1228,71 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     // Capture session ID so callbacks always reference the correct session
     const streamSessionId = sid;
+    const streamGeneration = turnGeneration;
+    const preparedRuntime = this._sessionRuntimes.get(streamSessionId);
+    if (
+      preparedRuntime !== rt
+      || preparedRuntime.streamGeneration !== streamGeneration
+      || !preparedRuntime.isGenerating
+      || preparedRuntime.terminalSeen
+      || preparedRuntime.recoveryLocked
+    ) {
+      return;
+    }
+    const runtimeForStream = () => {
+      const current = this._sessionRuntimes.get(streamSessionId);
+      return current?.streamGeneration === streamGeneration
+        && current.isGenerating
+        && !current.terminalSeen
+        ? current
+        : undefined;
+    };
 
     rt.abortController = this._client.streamChat(request, {
+      onRuntimeInfo: (provider, model) => {
+        if (!runtimeForStream()) return;
+        this.onModelSelected?.(model);
+        this._broadcastMessage({ type: 'runtimeInfo', provider, model });
+      },
+      onMode: (mode) => {
+        if (!runtimeForStream()) return;
+        if (!this._approvalModeState.pendingMode) {
+          this._approvalModeState = initApprovalModeState(mode);
+          this._broadcastMessage({ type: 'approvalMode', mode, pending: false });
+        }
+      },
       onText: (content) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
+        const srt = runtimeForStream();
         if (!srt) return;
         srt.eventBuffer.push({ type: 'text', data: { content } });
-        this._postMessageToPanel(streamSessionId, { type: 'text', content });
+        this._postStreamEventIfReady(streamSessionId, { type: 'text', content });
       },
       onToolBatch: (calls) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
+        const srt = runtimeForStream();
         if (!srt) return;
         srt.eventBuffer.push({ type: 'toolBatchStart' as const, data: { calls } });
-        this._postMessageToPanel(streamSessionId, { type: 'toolBatchStart', calls });
+        this._postStreamEventIfReady(streamSessionId, { type: 'toolBatchStart', calls });
       },
       onToolStart: (id, name, args) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
+        const srt = runtimeForStream();
         if (!srt) return;
         srt.eventBuffer.push({ type: 'toolStart', data: { id, name, args } });
-        this._postMessageToPanel(streamSessionId, { type: 'toolStart', id, name, args });
+        this._postStreamEventIfReady(streamSessionId, { type: 'toolStart', id, name, args });
       },
       onToolProgress: (id, progress) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
+        const srt = runtimeForStream();
         if (!srt) return;
         srt.eventBuffer.push({ type: 'toolProgress', data: { id, progress } });
-        this._postMessageToPanel(streamSessionId, { type: 'toolProgress', id, progress });
+        this._postStreamEventIfReady(streamSessionId, { type: 'toolProgress', id, progress });
       },
       onToolResult: (id, name, output, success, durationMs) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
+        const srt = runtimeForStream();
         if (!srt) return;
         srt.eventBuffer.push({ type: 'toolResult', data: { id, name, output, success, durationMs } });
-        this._postMessageToPanel(streamSessionId, { type: 'toolResult', id, name, output, success, durationMs });
+        this._postStreamEventIfReady(streamSessionId, { type: 'toolResult', id, name, output, success, durationMs });
       },
       onPermissionRequest: (request) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
+        const srt = runtimeForStream();
         if (!srt) return;
         const msg = {
           sessionId: request.sessionId,
@@ -924,43 +1303,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           isDestructive: isDestructivePermissionTool(request.toolName),
         };
         srt.eventBuffer.push({ type: 'permissionRequest', data: msg });
-        this._postMessageToPanel(streamSessionId, { type: 'permissionRequest', ...msg });
+        this._postStreamEventIfReady(streamSessionId, { type: 'permissionRequest', ...msg });
       },
       onTokens: (prompt, completion, total) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
+        const srt = runtimeForStream();
         if (!srt) return;
         srt.eventBuffer.push({ type: 'tokens', data: { prompt, completion, total } });
-        this._postMessageToPanel(streamSessionId, { type: 'tokens', prompt, completion, total });
+        this._postStreamEventIfReady(streamSessionId, { type: 'tokens', prompt, completion, total });
       },
       onArtifactStart: (id, artifactType, language, title) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
+        const srt = runtimeForStream();
         if (!srt) return;
         srt.eventBuffer.push({ type: 'artifactStart', data: { id, artifactType, language, title } });
-        this._postMessageToPanel(streamSessionId, { type: 'artifactStart', id, artifactType, language, title });
+        this._postStreamEventIfReady(streamSessionId, { type: 'artifactStart', id, artifactType, language, title });
       },
       onArtifactContent: (id, content) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
+        const srt = runtimeForStream();
         if (!srt) return;
         srt.eventBuffer.push({ type: 'artifactContent', data: { id, content } });
-        this._postMessageToPanel(streamSessionId, { type: 'artifactContent', id, content });
+        this._postStreamEventIfReady(streamSessionId, { type: 'artifactContent', id, content });
       },
       onArtifactEnd: (id) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
+        const srt = runtimeForStream();
         if (!srt) return;
         srt.eventBuffer.push({ type: 'artifactEnd', data: { id } });
-        this._postMessageToPanel(streamSessionId, { type: 'artifactEnd', id });
+        this._postStreamEventIfReady(streamSessionId, { type: 'artifactEnd', id });
       },
       onWarning: (message) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
+        const srt = runtimeForStream();
         if (!srt) return;
         srt.eventBuffer.push({ type: 'warning', data: { message } });
-        this._postMessageToPanel(streamSessionId, { type: 'warning', message });
+        this._postStreamEventIfReady(streamSessionId, { type: 'warning', message });
       },
       onRateLimited: (event) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
+        const srt = runtimeForStream();
         if (!srt) return;
         srt.eventBuffer.push({ type: 'rateLimited', data: event });
-        this._postMessageToPanel(streamSessionId, {
+        this._postStreamEventIfReady(streamSessionId, {
           type: 'rateLimited',
           message: event.message,
           retryAfterSeconds: event.retryAfterSeconds,
@@ -968,20 +1347,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           maxAttempts: event.maxAttempts,
         });
       },
-      onDone: (tokens, toolCalls, sessionId) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
-        if (!srt) return;
+      onDone: (tokens, toolCalls, sessionId, stopReason, message) => {
+        const srt = runtimeForStream();
+        if (!srt || srt.terminalSeen) return;
+        srt.terminalSeen = true;
         srt.isGenerating = false;
-        srt.eventBuffer = [];
+        srt.recoveryLocked = false;
+        srt.abortController = undefined;
 
         if (sessionId && sessionId !== streamSessionId) {
+          const wasActive = this._activeSessionId === streamSessionId;
           this._sessionRuntimes.set(sessionId, srt);
           this._sessionRuntimes.delete(streamSessionId);
           // Update panel bindings
-          this._panels.set(sessionId, this._panels.get(streamSessionId)!);
+          const panel = this._panels.get(streamSessionId);
           this._panels.delete(streamSessionId);
-          this._panelReady.set(sessionId, this._panelReady.get(streamSessionId)!);
+          if (panel) {
+            this._panels.set(sessionId, panel);
+          }
+          const panelReady = this._panelReady.get(streamSessionId);
           this._panelReady.delete(streamSessionId);
+          if (panelReady !== undefined) {
+            this._panelReady.set(sessionId, panelReady);
+          }
+          const pending = this._pendingMessages.get(streamSessionId);
+          this._pendingMessages.delete(streamSessionId);
+          if (pending?.length) {
+            const canonicalPending = this._pendingMessages.get(sessionId) || [];
+            this._pendingMessages.set(sessionId, [...canonicalPending, ...pending]);
+          }
           const info = this._panelSessions.get(streamSessionId);
           if (info) {
             info.sessionId = sessionId;
@@ -991,32 +1385,75 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (this._focusedPanelId === streamSessionId) {
             this._focusedPanelId = sessionId;
           }
+          if (this._activeSessionId === streamSessionId) {
+            this._activeSessionId = sessionId;
+          }
+          const selection = {
+            type: 'sessionSelected',
+            sessionId,
+            projectHash: srt.projectHash ?? info?.projectHash,
+          };
+          if (wasActive) {
+            this._selectSession(sessionId, selection.projectHash);
+          } else {
+            this._postOrQueueToPanel(sessionId, selection);
+          }
         }
 
         const doneSessionId = sessionId || streamSessionId;
-        this._postMessageForSession(doneSessionId, { type: 'done', tokens, toolCalls, sessionId });
-        void this._reloadFinishedSessionHistory(doneSessionId)
+        srt.terminal = {
+          type: 'done',
+          generation: streamGeneration,
+          tokens,
+          toolCalls,
+          sessionId,
+          stopReason,
+          message,
+        };
+        const completedNormally = !stopReason || stopReason === 'stopped';
+        if (!completedNormally) {
+          srt.queuedMessages = [];
+          this._postTerminalForSession(doneSessionId, { type: 'clearQueuedMessages' }, streamGeneration);
+        }
+        this._postTerminalForSession(doneSessionId, {
+          type: 'done',
+          tokens,
+          toolCalls,
+          sessionId,
+          stopReason,
+          message,
+        }, streamGeneration);
+        void this._reloadFinishedSessionHistory(doneSessionId, streamGeneration)
           .finally(() => {
             void this._refreshSessions();
-            setTimeout(() => void this._sendNextQueuedMessage(doneSessionId), 75);
+            if (completedNormally) {
+              setTimeout(() => void this._sendNextQueuedMessage(doneSessionId), 75);
+            }
           });
       },
       onStopped: () => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
-        if (!srt) return;
+        const srt = runtimeForStream();
+        if (!srt || srt.terminalSeen) return;
+        srt.terminalSeen = true;
         srt.isGenerating = false;
+        srt.recoveryLocked = false;
+        srt.abortController = undefined;
         srt.queuedMessages = [];
-        srt.eventBuffer = [];
-        this._postMessageToPanel(streamSessionId, { type: 'stopped' });
+        srt.terminal = { type: 'stopped', generation: streamGeneration };
+        this._postTerminalForSession(streamSessionId, { type: 'stopped' }, streamGeneration);
       },
       onError: (message) => {
-        const srt = this._sessionRuntimes.get(streamSessionId);
-        if (!srt) return;
+        const srt = runtimeForStream();
+        if (!srt || srt.terminalSeen) return;
+        srt.terminalSeen = true;
         srt.isGenerating = false;
+        srt.recoveryLocked = true;
+        srt.abortController = undefined;
         srt.queuedMessages = [];
-        srt.eventBuffer = [];
-        srt.errorMessage = message;
-        this._postMessageToPanel(streamSessionId, { type: 'error', message });
+        srt.terminal = { type: 'error', generation: streamGeneration, message };
+        this._postTerminalForSession(streamSessionId, { type: 'error', message }, streamGeneration);
+        this._postTerminalForSession(streamSessionId, { type: 'recoveryRequired' }, streamGeneration);
+        void this._reconcileInterruptedSession(streamSessionId, streamGeneration);
       },
     });
   }
@@ -1042,6 +1479,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (!rt.isGenerating && rt.queuedMessages.length > 0) {
         void this._sendNextQueuedMessage(sessionId);
       }
+    }
+  }
+
+  private async _reconcileInterruptedSession(sessionId: string, generation: number) {
+    try {
+      const activeSessions = await this._client.activeSessions();
+      const rt = this._sessionRuntimes.get(sessionId);
+      if (!rt || rt.streamGeneration !== generation || !rt.recoveryLocked) return;
+      if (!activeSessions.includes(sessionId)) {
+        rt.recoveryLocked = false;
+        this._postTerminalForSession(sessionId, { type: 'recoveryCleared' }, generation);
+      }
+    } catch {
+      // Keep the recovery lock when daemon truth cannot be read. A later send
+      // re-checks /chat/active and refuses to overlap an unknown live turn.
     }
   }
 
@@ -1092,7 +1544,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async _reloadFinishedSessionHistory(sessionId: string) {
+  private async _reloadFinishedSessionHistory(sessionId: string, generation: number) {
     const info = this._panelSessions.get(sessionId);
     const projectHash = info?.projectHash ?? this._sessionRuntimes.get(sessionId)?.projectHash;
     if (!projectHash) return;
@@ -1101,15 +1553,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const detail = await this._client.getSession(projectHash, sessionId);
       const messages = detail?.messages;
       if (!messages) return;
+      const rt = this._sessionRuntimes.get(sessionId);
+      if (!rt || rt.streamGeneration !== generation) return;
 
-      this._panelSessions.set(sessionId, {
-        ...(info ?? { sessionId }),
-        sessionId,
-        projectHash,
+      const currentInfo = this._panelSessions.get(sessionId);
+      if (currentInfo && this._panels.has(sessionId)) {
+        this._panelSessions.set(sessionId, {
+          ...currentInfo,
+          sessionId,
+          projectHash,
+          messages,
+          messagesPromise: undefined,
+        });
+      }
+      rt.messages = messages;
+      rt.eventBuffer = [];
+      this._postOrQueueToPanel(sessionId, {
+        type: 'sessionMessages',
         messages,
-        messagesPromise: undefined,
-      });
-      this._postOrQueueToPanel(sessionId, { type: 'sessionMessages', messages });
+        terminal: this._terminalForWebview(rt.terminal),
+      }, generation);
     } catch {
       // The already-delivered stream remains visible if history refresh fails.
     }
@@ -1118,17 +1581,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async _ensureSession(forPanelSessionId?: string): Promise<string | undefined> {
     const sid = forPanelSessionId ?? this._focusedPanelId;
     if (sid) {
-      const rt = this._sessionRuntimes.get(sid);
-      if (rt) return sid;
+      const rt = this._getRuntime(sid);
+      rt.projectHash ??= this._panelSessions.get(sid)?.projectHash;
+      return sid;
     }
 
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const session = await this._client.createSession(undefined, workspaceFolder);
     this._getRuntime(session.id).projectHash = session.project_hash;
-
-    if (sid) {
-      this._panelSessions.set(sid, { sessionId: session.id, projectHash: session.project_hash, workingDir: session.working_dir });
-    }
 
     await this._refreshSessions();
     return session.id;
@@ -1141,21 +1601,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // New protocol methods
 
-  private async _sendInitialState(webview?: vscode.Webview, mode: WebviewMode = 'tab') {
+  private async _sendInitialState(
+    webview?: vscode.Webview,
+    mode: WebviewMode = 'tab',
+  ): Promise<StreamReplayCursor> {
     let currentModelName = '';
-    let sid: string | undefined;
+    let sid = webview && mode === 'tab' ? this._sessionIdForWebview(webview) : undefined;
+    const initialRuntime = sid ? this._getRuntime(sid) : undefined;
+    const initialGeneration = initialRuntime?.streamGeneration ?? 0;
     let messagesToLoad: MessageInfo[] | undefined;
+    let streamGeneration = 0;
+    let replayedEvents = 0;
+    let historyGeneration: number | undefined;
+    let terminalGeneration: number | undefined;
 
-    // Find session binding for this panel
-    if (webview && mode === 'tab') {
-      for (const [s, info] of this._panelSessions) {
-        const panel = this._panels.get(s);
-        if (panel?.webview === webview) {
-          sid = info.sessionId;
-          messagesToLoad = info.messages ?? await info.messagesPromise;
-          info.messages = undefined;
-          info.messagesPromise = undefined;
-          break;
+    if (sid) {
+      const info = this._panelSessions.get(sid);
+      messagesToLoad = info?.messages ?? initialRuntime?.messages;
+      if (!messagesToLoad && info?.messagesPromise) {
+        try {
+          messagesToLoad = await info.messagesPromise;
+          if (messagesToLoad) {
+            info.messages = messagesToLoad;
+            initialRuntime!.messages = messagesToLoad;
+          }
+        } catch {
+          // The remaining initial state still renders without history.
         }
       }
     }
@@ -1196,18 +1667,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this._sendEditorContext(webview);
 
-    if (messagesToLoad && mode === 'tab') {
-      this._postMessage({ type: 'sessionMessages', messages: messagesToLoad }, webview);
+    if (webview && mode === 'tab') {
+      sid = this._sessionIdForWebview(webview);
     }
 
     if (sid) {
-      const rt = this._sessionRuntimes.get(sid);
-      if (rt) {
-        this._replayStreamBuffer(sid, rt, webview);
-        if (rt.errorMessage) {
-          this._postMessage({ type: 'error', message: rt.errorMessage }, webview);
-          rt.errorMessage = undefined;
+      const beforeActiveCheck = this._getRuntime(sid);
+      if (!beforeActiveCheck.isGenerating && !beforeActiveCheck.abortController) {
+        try {
+          const activeSessions = await this._client.activeSessions();
+          if (activeSessions.includes(sid)) {
+            beforeActiveCheck.recoveryLocked = true;
+            beforeActiveCheck.terminal = {
+              type: 'error',
+              generation: beforeActiveCheck.streamGeneration ?? 0,
+              message: 'This turn is still active in the daemon, but this window cannot reattach to its stream. Stop it before continuing.',
+            };
+          } else if (beforeActiveCheck.recoveryLocked) {
+            beforeActiveCheck.recoveryLocked = false;
+          }
+        } catch {
+          // If daemon truth is unavailable, preserve any existing recovery lock.
         }
+      }
+
+      const rt = this._getRuntime(sid);
+      streamGeneration = rt.streamGeneration ?? 0;
+      const historyMatchesGeneration = streamGeneration === initialGeneration;
+      const terminal = rt.terminal?.generation === streamGeneration ? rt.terminal : undefined;
+
+      if (messagesToLoad && mode === 'tab' && historyMatchesGeneration) {
+        this._postMessage({
+          type: 'sessionMessages',
+          messages: messagesToLoad,
+          terminal: this._terminalForWebview(terminal),
+        }, webview);
+        historyGeneration = streamGeneration;
+        if (terminal) terminalGeneration = terminal.generation;
+      }
+
+      replayedEvents = this._replayStreamBuffer(sid, rt, webview);
+      if (!messagesToLoad && terminal) {
+        this._postMessage(this._terminalForWebview(terminal), webview);
+        terminalGeneration = terminal.generation;
       }
     }
 
@@ -1217,7 +1719,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this._postMessage({
       type: 'init',
-      generating: sid ? (this._sessionRuntimes.get(sid)?.isGenerating ?? false) : false,
+      generating: sid
+        ? Boolean(this._sessionRuntimes.get(sid)?.isGenerating || this._sessionRuntimes.get(sid)?.recoveryLocked)
+        : false,
+      recoveryLocked: sid ? Boolean(this._sessionRuntimes.get(sid)?.recoveryLocked) : false,
       currentModel: currentModelName,
       viewMode: mode,
       activeSessionId: sid,
@@ -1227,91 +1732,183 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       approvalMode: this._approvalModeState.displayMode,
       approvalModePending: Boolean(this._approvalModeState.pendingMode),
     }, webview);
+    return { sessionId: sid, streamGeneration, replayedEvents, historyGeneration, terminalGeneration };
   }
 
   private async _sendSetupState(webview?: vscode.Webview) {
+    const generation = ++this._setupStateGeneration;
+    const isCurrent = () => generation === this._setupStateGeneration;
     let auth: AuthStatusResponse | undefined;
     let providers: ProvidersResponse | undefined;
     let config: ConfigResponse | undefined;
     let models: ModelInfo[] | undefined;
-    const post = (msg: unknown) => webview
-      ? this._postMessage(msg, webview)
-      : this._broadcastMessage(msg);
+    const post = (msg: unknown) => {
+      if (!isCurrent()) return;
+      // Setup state is process-global. Broadcasting the newest snapshot keeps
+      // every open view coherent when a panel-focused refresh supersedes an
+      // older watcher refresh. A not-yet-registered webview still receives its
+      // direct initialization copy.
+      this._broadcastMessage(msg);
+      const tracked = webview && (
+        this._view?.webview === webview
+        || this._webviewPanels.has(webview)
+      );
+      if (webview && !tracked) this._postMessage(msg, webview);
+    };
 
     try {
       auth = await this._client.authStatus();
+      if (!isCurrent()) return;
       post({ type: 'authStatus', auth });
+      this._watchAtomCodeAuth(auth.auth_path);
     } catch (e) {
+      if (!isCurrent()) return;
       post({ type: 'setupError', message: this._messageFromError(e) });
     }
 
     try {
       providers = await this._client.listProviders();
+      if (!isCurrent()) return;
       post({ type: 'providers', providers: providers.providers, defaultProvider: providers.default_provider });
     } catch (e) {
+      if (!isCurrent()) return;
       post({ type: 'setupError', message: this._messageFromError(e) });
     }
 
     try {
       config = await this._client.getConfig();
+      if (!isCurrent()) return;
       post({ type: 'config', config });
+      this._watchAtomCodeConfig(config.path);
     } catch {
+      if (!isCurrent()) return;
       // Older daemons may not have P0 APIs; provider fetch error already surfaces enough.
     }
 
     try {
       models = await this._client.listModels();
+      if (!isCurrent()) return;
       post({ type: 'models', models });
-    } catch {}
+    } catch {
+      if (!isCurrent()) return;
+    }
 
     const defaultProvider = providers?.providers.find((p) => p.is_default);
+    const authUnavailable = !auth?.logged_in || auth.expired === true;
+    const selectedRequiresLogin = defaultProvider?.requires_login;
     post({
       type: 'setupState',
       auth,
       providers: providers?.providers ?? [],
       defaultProvider: providers?.default_provider ?? config?.default_provider ?? '',
       currentModel: defaultProvider?.model || models?.find((m) => m.is_default)?.model || '',
-      setupRequired: !auth?.logged_in || (providers?.providers.length ?? 0) === 0,
+      setupRequired: (providers?.providers.length ?? 0) === 0
+        || (selectedRequiresLogin === undefined
+          ? authUnavailable
+          : selectedRequiresLogin && authUnavailable),
     });
   }
 
+  private _watchAtomCodeConfig(configPath: string) {
+    if (!configPath || this._watchedConfigPath === configPath) return;
+    this._atomCodeConfigWatcher?.dispose();
+    this._watchedConfigPath = configPath;
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(path.dirname(configPath), path.basename(configPath)),
+    );
+    const scheduleRefresh = () => this._scheduleSetupStateRefresh();
+    watcher.onDidCreate(scheduleRefresh);
+    watcher.onDidChange(scheduleRefresh);
+    watcher.onDidDelete(scheduleRefresh);
+    this._atomCodeConfigWatcher = watcher;
+  }
+
+  private _watchAtomCodeAuth(authPath: string) {
+    if (!authPath || this._watchedAuthPath === authPath) return;
+    this._atomCodeAuthWatcher?.dispose();
+    this._watchedAuthPath = authPath;
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(path.dirname(authPath), path.basename(authPath)),
+    );
+    const scheduleRefresh = () => this._scheduleSetupStateRefresh();
+    watcher.onDidCreate(scheduleRefresh);
+    watcher.onDidChange(scheduleRefresh);
+    watcher.onDidDelete(scheduleRefresh);
+    this._atomCodeAuthWatcher = watcher;
+  }
+
+  private _scheduleSetupStateRefresh() {
+    if (this._setupRefreshTimer) clearTimeout(this._setupRefreshTimer);
+    this._setupRefreshTimer = setTimeout(() => {
+      this._setupRefreshTimer = undefined;
+      void this._sendSetupState();
+    }, 100);
+  }
+
   private async _startLogin() {
+    if (this._loginInFlight) return;
+    this._loginInFlight = true;
     try {
       await this._cancelLogin();
       const login = await this._client.startLogin(true);
       this._loginId = login.login_id;
+      const generation = ++this._loginGeneration;
       this._broadcastMessage({ type: 'loginStarted', loginId: login.login_id, url: login.url });
-
-      this._loginPoll = setInterval(() => {
-        void this._pollLogin();
-      }, 2000);
-      await this._pollLogin();
+      await this._pollLogin(login.login_id, generation, login.expires_in_seconds);
     } catch (e) {
       this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
+    } finally {
+      this._loginInFlight = false;
     }
   }
 
-  private async _pollLogin() {
-    if (!this._loginId) return;
+  private async _pollLogin(loginId: string, generation: number, expiresInSeconds: number) {
+    const deadline = Date.now() + Math.max(1, expiresInSeconds) * 1000;
     try {
-      const result = await this._client.pollLogin(this._loginId);
-      if (result.status === 'pending') {
-        this._broadcastMessage({ type: 'loginPending' });
+      while (this._loginId === loginId && this._loginGeneration === generation) {
+        if (Date.now() >= deadline) {
+          await this._client.cancelLogin(loginId).catch(() => undefined);
+          throw new Error('Login timed out; start a new login.');
+        }
+
+        let result;
+        try {
+          result = await this._client.pollLogin(loginId);
+        } catch (error) {
+          if (error instanceof DaemonHttpError && error.retryable && Date.now() < deadline) {
+            this._broadcastMessage({ type: 'loginPending' });
+            await delay(2000);
+            continue;
+          }
+          throw error;
+        }
+
+        if (result.status === 'pending') {
+          this._broadcastMessage({ type: 'loginPending' });
+          await delay(result.retry_after_ms ?? 2000);
+          continue;
+        }
+        if (result.status !== 'authorized') {
+          throw new Error(result.message || `Login ${result.status}; start a new login.`);
+        }
+
+        if (this._loginId !== loginId || this._loginGeneration !== generation) return;
+        this._loginId = undefined;
+        this._broadcastMessage({ type: 'loginAuthorized', user: result.user });
+        if (this._loginStartedFromCommand) {
+          this._postMessage({
+            type: 'assistantMessage',
+            text: vscode.l10n.t('Signed in as {name}.', { name: result.user?.name || result.user?.username || vscode.l10n.t('AtomGit user') }),
+          });
+          this._loginStartedFromCommand = false;
+        }
+        await this._sendSetupState();
         return;
       }
-      this._clearLoginPoll();
-      this._loginId = undefined;
-      this._broadcastMessage({ type: 'loginAuthorized', user: result.user });
-      if (this._loginStartedFromCommand) {
-        this._postMessage({
-          type: 'assistantMessage',
-          text: vscode.l10n.t('Signed in as {name}.', { name: result.user?.name || result.user?.username || vscode.l10n.t('AtomGit user') }),
-        });
-        this._loginStartedFromCommand = false;
-      }
-      await this._sendSetupState();
     } catch (e) {
-      this._clearLoginPoll();
+      if (this._loginGeneration !== generation) return;
+      this._loginGeneration += 1;
+      this._loginId = undefined;
       this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
       if (this._loginStartedFromCommand) {
         this._postMessage({ type: 'error', message: this._messageFromError(e) });
@@ -1321,7 +1918,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _cancelLogin() {
-    this._clearLoginPoll();
+    this._loginGeneration += 1;
     if (this._loginId) {
       const id = this._loginId;
       this._loginId = undefined;
@@ -1329,19 +1926,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private _clearLoginPoll() {
-    if (this._loginPoll) {
-      clearInterval(this._loginPoll);
-      this._loginPoll = undefined;
-    }
-  }
-
   private async _ensureLoggedInForCodingPlan(announceInChat = false): Promise<boolean> {
+    let ownsLogin = false;
     try {
       const auth = await this._client.authStatus();
-      if (auth.logged_in) {
+      if (auth.logged_in && !auth.expired) {
         return true;
       }
+      if (this._loginInFlight) {
+        while (this._loginInFlight) await delay(100);
+        const refreshed = await this._client.authStatus();
+        return refreshed.logged_in && !refreshed.expired;
+      }
+      this._loginInFlight = true;
+      ownsLogin = true;
 
       if (announceInChat) {
         this._postMessage({
@@ -1354,14 +1952,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._cancelLogin();
       const login = await this._client.startLogin(true);
       this._loginId = login.login_id;
+      const generation = ++this._loginGeneration;
+      const deadline = Date.now() + Math.max(1, login.expires_in_seconds) * 1000;
       this._broadcastMessage({ type: 'loginStarted', loginId: login.login_id, url: login.url });
 
-      while (this._loginId === login.login_id) {
-        const result = await this._client.pollLogin(login.login_id);
+      while (this._loginId === login.login_id && this._loginGeneration === generation) {
+        if (Date.now() >= deadline) {
+          await this._cancelLogin();
+          throw new Error('Login timed out; start a new login.');
+        }
+        let result;
+        try {
+          result = await this._client.pollLogin(login.login_id);
+        } catch (error) {
+          if (error instanceof DaemonHttpError && error.retryable && Date.now() < deadline) {
+            await delay(2000);
+            continue;
+          }
+          throw error;
+        }
         if (result.status === 'pending') {
           this._broadcastMessage({ type: 'loginPending' });
-          await delay(2000);
+          await delay(result.retry_after_ms ?? 2000);
           continue;
+        }
+        if (result.status !== 'authorized') {
+          throw new Error(result.message || `Login ${result.status}; start a new login.`);
         }
 
         this._loginId = undefined;
@@ -1378,7 +1994,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       return false;
     } catch (e) {
-      this._clearLoginPoll();
+      this._loginGeneration += 1;
       this._loginId = undefined;
       const message = this._messageFromError(e);
       this._broadcastMessage({ type: 'setupError', message });
@@ -1386,6 +2002,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postMessage({ type: 'error', message });
       }
       return false;
+    } finally {
+      if (ownsLogin) this._loginInFlight = false;
     }
   }
 
@@ -1423,6 +2041,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._sendSetupState();
     } catch (e) {
       this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
+      await this._sendSetupState();
     }
   }
 
@@ -1432,6 +2051,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._sendSetupState();
     } catch (e) {
       this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
+      // The webview updates optimistically; re-read daemon truth on failure.
+      await this._sendSetupState();
     }
   }
 
@@ -1444,6 +2065,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._sendSetupState();
     } catch (e) {
       this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
+      // The webview updates optimistically; re-read daemon truth on failure.
+      await this._sendSetupState();
     }
   }
 
@@ -1523,20 +2146,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const existing = this._panels.get(sessionId);
     if (existing) {
+      const cached = this._panelSessions.get(sessionId);
+      let hash = projectHash
+        ?? cached?.projectHash
+        ?? this._sessionRuntimes.get(sessionId)?.projectHash;
+      const cachedForProject = !projectHash || cached?.projectHash === projectHash
+        ? cached
+        : undefined;
+      let messages = cachedForProject?.messages;
+
+      if (messages === undefined) {
+        hash ??= await this._resolveSessionProjectHash(sessionId);
+        if (this._panels.get(sessionId) !== existing) return;
+        if (!hash) {
+          vscode.window.showErrorMessage(vscode.l10n.t('Unable to open session: missing project hash.'));
+          return;
+        }
+        try {
+          const pendingForProject = cachedForProject?.messagesPromise;
+          messages = await (pendingForProject
+            ?? this._loadPanelHistory(existing, sessionId, hash));
+          if (this._panels.get(sessionId) !== existing) return;
+          if (this._panelSessions.get(sessionId)?.projectHash !== hash) return;
+          if (messages === undefined) {
+            existing.reveal();
+            this._focusedPanelId = sessionId;
+            this._activeSessionId = sessionId;
+            this._selectSession(sessionId, hash);
+            return;
+          }
+        } catch (e) {
+          if (this._panels.get(sessionId) !== existing) return;
+          if (this._panelSessions.get(sessionId)?.projectHash !== hash) return;
+          vscode.window.showErrorMessage(`Unable to load session: ${this._messageFromError(e)}`);
+          return;
+        }
+      }
+
       existing.reveal();
       this._focusedPanelId = sessionId;
+      this._activeSessionId = sessionId;
+      this._selectSession(sessionId, hash);
       return;
     }
 
-    let hash = projectHash;
-    if (!hash) {
-      try {
-        const allSessions = await this._client.listSessions();
-        const match = (allSessions as Array<{ project_hash?: string; meta?: { id?: string }; id?: string }>)
-          .find(s => (s.meta?.id || s.id) === sessionId);
-        hash = match?.project_hash ?? this._sessionRuntimes.get(sessionId)?.projectHash;
-      } catch { /* proceed without hash */ }
-    }
+    const hash = await this._resolveSessionProjectHash(sessionId, projectHash);
 
     if (!hash) {
       vscode.window.showErrorMessage(vscode.l10n.t('Unable to open session: missing project hash.'));
@@ -1553,32 +2207,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     this._panelSessions.set(sessionId, { sessionId, projectHash: hash, messages });
-    this._getRuntime(sessionId).projectHash = hash;
+    const rt = this._getRuntime(sessionId);
+    rt.projectHash = hash;
+    rt.messages = messages;
+    this._activeSessionId = sessionId;
     this.openInTab(sessionId);
-    this._broadcastMessage({ type: 'sessionSelected', sessionId, projectHash: hash });
+    this._selectSession(sessionId, hash);
     await this._refreshSessions();
   }
 
   // Replay buffered stream events so the webview can resume displaying a
-  // background stream. Snapshot the event buffer to avoid conflicts with new
-  // events arriving during replay (they will be forwarded by callbacks once
-  // the panel's webview is bound).
-  private _replayStreamBuffer(_sessionId: string, rt: SessionRuntime, webview?: vscode.Webview) {
-    if (!rt.isGenerating || rt.eventBuffer.length === 0) return;
+  // background stream. `fromIndex` is used by the ready-handshake catch-up pass:
+  // events arriving across the final await are replayed once before live
+  // forwarding is enabled.
+  private _replayStreamBuffer(
+    _sessionId: string,
+    rt: SessionRuntime,
+    webview?: vscode.Webview,
+    fromIndex = 0,
+  ): number {
+    if ((!rt.isGenerating && !rt.terminal) || rt.eventBuffer.length === 0) return 0;
 
     const post = (msg: unknown) => webview
       ? webview.postMessage(msg)
       : this._broadcastMessage(msg);
 
-    const snapshot = [...rt.eventBuffer];
+    const replayedEvents = rt.eventBuffer.length;
+    const snapshot = rt.eventBuffer.slice(fromIndex, replayedEvents);
 
-    for (const evt of snapshot) {
-      if (evt.type === 'userMessage') {
-        post({ type: 'userMessage', text: evt.data.text });
+    if (fromIndex === 0) {
+      for (const evt of snapshot) {
+        if (evt.type === 'userMessage') {
+          post({ type: 'userMessage', text: evt.data.text });
+        }
       }
+      post({ type: 'resumeStreaming' });
     }
-
-    post({ type: 'resumeStreaming' });
 
     for (const evt of snapshot) {
       switch (evt.type) {
@@ -1626,6 +2290,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
       }
     }
+    return replayedEvents;
   }
 
   private async _renameSession(sessionId: string, projectHash?: string, currentName?: string) {
@@ -1676,6 +2341,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _deleteSessionInternal(sessionId: string, hash: string) {
+    const deletingActiveSession = this._activeSessionId === sessionId;
     // Stop any daemon-side stream before deleting
     const rt = this._sessionRuntimes.get(sessionId);
     if (rt?.isGenerating) {
@@ -1689,14 +2355,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._sessionRuntimes.delete(sessionId);
 
     // Clear any panels bound to this session
-    let cleared = false;
     for (const [pid, info] of [...this._panelSessions]) {
       if (info.sessionId === sessionId) {
         this._panelSessions.delete(pid);
         if (this._focusedPanelId === pid) {
           this._focusedPanelId = undefined;
         }
-        cleared = true;
       }
     }
     // Also close and clear direct panel binding (tab opened via openSessionInTab)
@@ -1708,12 +2372,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (this._focusedPanelId === sessionId) {
         this._focusedPanelId = undefined;
       }
-      cleared = true;
       panel.dispose();
     }
-    if (cleared) {
-      this._broadcastMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
-      this._broadcastMessage({ type: 'clearChat' });
+    if (deletingActiveSession) {
+      this._selectSession(undefined, undefined);
+      this._view?.webview.postMessage({ type: 'clearChat' });
     }
     await this._refreshSessions();
   }
@@ -1743,14 +2406,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const hash = await this._resolveSessionProjectHash(sessionId, projectHash);
       if (!hash) {
         // No daemon record — clean up panel bindings locally
-        let cleared = false;
+        const deletingActiveSession = this._activeSessionId === sessionId;
         for (const [pid, info] of [...this._panelSessions]) {
           if (info.sessionId === sessionId) {
             this._panelSessions.delete(pid);
             if (this._focusedPanelId === pid) {
               this._focusedPanelId = undefined;
             }
-            cleared = true;
           }
         }
         const panel = this._panels.get(sessionId);
@@ -1760,12 +2422,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (this._focusedPanelId === sessionId) {
             this._focusedPanelId = undefined;
           }
-          cleared = true;
           panel.dispose();
         }
-        if (cleared) {
-          this._broadcastMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
-          this._broadcastMessage({ type: 'clearChat' });
+        if (deletingActiveSession) {
+          this._selectSession(undefined, undefined);
+          this._view?.webview.postMessage({ type: 'clearChat' });
         }
         succeeded++;
         continue;
@@ -1792,13 +2453,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async _resolveSessionProjectHash(sessionId: string, projectHash?: string): Promise<string | undefined> {
     if (projectHash) return projectHash;
+    const boundProjectHash = this._panelSessions.get(sessionId)?.projectHash
+      ?? this._sessionRuntimes.get(sessionId)?.projectHash;
+    if (boundProjectHash) return boundProjectHash;
     try {
-      const sessions = await this._client.listSessions();
-      const match = (sessions as Array<{ project_hash?: string; meta?: { id?: string }; id?: string }>)
-        .find(s => (s.meta?.id || s.id) === sessionId);
-      return match?.project_hash;
+      return (await this._client.resolveSession(sessionId)).project_hash;
     } catch {
-      return undefined;
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!workspaceFolder) return undefined;
+      try {
+        const scoped = await this._client.listSessionsForWorkingDir(workspaceFolder);
+        return scoped.find((session) => session.id === sessionId)?.project_hash;
+      } catch {
+        try {
+          const resolvedWorkspace = path.resolve(workspaceFolder);
+          const matches = (await this._client.listSessions()).filter((session) =>
+            session.id === sessionId
+            && Boolean(session.project_hash)
+            && (session.working_dir
+              ? path.resolve(session.working_dir) === resolvedWorkspace
+              : false)
+          );
+          const projectHashes = new Set(matches.map((session) => session.project_hash));
+          return projectHashes.size === 1 ? matches[0]?.project_hash : undefined;
+        } catch {
+          return undefined;
+        }
+      }
     }
   }
 
@@ -1818,16 +2499,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private async _handleQuickAction(action: string) {
+  private async _handleQuickAction(
+    action: string,
+    targetSessionId?: string,
+    ownerWebview?: vscode.Webview,
+  ) {
     const prompt = getQuickActionPrompt(action, vscode.env.language);
-
-    this._postMessage({ type: 'userMessage', text: prompt });
-    await this._handleSend(prompt);
+    const sid = targetSessionId ?? this._focusedPanelId ?? await this._ensureSession();
+    if (!sid) return;
+    if (ownerWebview && this._sessionIdForWebview(ownerWebview) !== sid) return;
+    this._postOrQueueToPanel(sid, { type: 'userMessage', text: prompt });
+    await this._handleSend(prompt, undefined, undefined, undefined, sid, undefined, ownerWebview);
   }
 
-  private async _handleSlashCommand(command: string) {
-    const sid = this._focusedPanelId ?? await this._ensureSession();
+  private async _handleSlashCommand(
+    command: string,
+    targetSessionId?: string,
+    ownerWebview?: vscode.Webview,
+  ) {
+    const sid = targetSessionId ?? this._focusedPanelId ?? await this._ensureSession();
     if (!sid) return;
+    if (ownerWebview && this._sessionIdForWebview(ownerWebview) !== sid) return;
     await this._handleLocalCommand(command.trim(), sid);
   }
 
@@ -1854,7 +2546,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case '/whoami':
         try {
           const auth = await this._client.authStatus();
-          if (auth.logged_in && auth.user) {
+          const authState = classifyAuthDisplayState(auth);
+          if (authState === 'expired') {
+            this._postSlashInfo(vscode.l10n.t('AtomGit session expired. Sign in again.'), sessionId, text);
+          } else if (authState === 'signed_in' && auth.user) {
             const name = auth.user.name || auth.user.username || auth.user.email || auth.user.id;
             const lines = [
               `${name} (${auth.user.username || auth.user.id})`,
@@ -1886,9 +2581,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this._client.listProviders().catch(() => undefined),
           ]);
           const provider = providers?.providers.find((p) => p.name === providers.default_provider || p.is_default);
+          const authState = classifyAuthDisplayState(auth);
+          const authLabel = authState === 'expired'
+            ? vscode.l10n.t('expired')
+            : authState === 'signed_in'
+              ? vscode.l10n.t('signed in')
+              : vscode.l10n.t('not signed in');
           this._postSlashInfo([
             `Daemon: ${health.service} ${health.version}`,
-            `Auth: ${auth?.logged_in ? vscode.l10n.t('signed in') : vscode.l10n.t('not signed in')}`,
+            `Auth: ${authLabel}`,
             `Provider: ${provider ? `${provider.name} (${provider.model})` : vscode.l10n.t('not configured')}`,
           ].join('\n'), sessionId, text);
         } catch (e) {
@@ -1943,7 +2644,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private _postSlashInfo(text: string, sessionId?: string, userText?: string) {
-    this._postMessage({ type: 'assistantMessage', text });
+    if (sessionId) this._postMessageForSession(sessionId, { type: 'assistantMessage', text });
+    else this._postMessage({ type: 'assistantMessage', text });
     if (sessionId && userText) {
       void this._persistLocalCommandTranscript(sessionId, userText, text);
     }
@@ -2066,24 +2768,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  private _postOrQueueToPanel(sessionId: string, msg: any) {
+  private _postOrQueueToPanel(sessionId: string, msg: any, generation?: number) {
     if (this._panelReady.get(sessionId)) {
       this._postMessageToPanel(sessionId, msg);
-      return;
+    } else if (this._panels.has(sessionId)) {
+      // Generation-bound history/terminal messages must never cross into a
+      // replacement turn while a webview is rebuilding.
+      const queue = this._pendingMessages.get(sessionId) || [];
+      queue.push({ message: msg, generation });
+      this._pendingMessages.set(sessionId, queue);
     }
-    // Panel not ready yet — queue the message until webview sends 'ready'
-    const queue = this._pendingMessages.get(sessionId) || [];
-    queue.push(msg);
-    this._pendingMessages.set(sessionId, queue);
+    if (this._activeSessionId === sessionId) {
+      this._view?.webview.postMessage(msg);
+    }
   }
 
-  private _flushPendingMessages(sessionId: string) {
+  private _flushPendingMessages(
+    sessionId: string,
+    terminalAlreadyDeliveredGeneration?: number,
+    historyAlreadyDeliveredGeneration?: number,
+  ): boolean {
     const queue = this._pendingMessages.get(sessionId);
-    if (!queue || queue.length === 0) return;
+    if (!queue || queue.length === 0) return false;
     this._pendingMessages.delete(sessionId);
-    for (const msg of queue) {
-      this._postMessageToPanel(sessionId, msg);
+    const generation = this._sessionRuntimes.get(sessionId)?.streamGeneration ?? 0;
+    let terminalIncluded = false;
+    for (const entry of queue) {
+      if (entry.generation !== undefined && entry.generation !== generation) continue;
+      if (
+        entry.message?.type === 'sessionMessages'
+        && historyAlreadyDeliveredGeneration !== undefined
+        && entry.generation === historyAlreadyDeliveredGeneration
+      ) continue;
+      const isTerminal = entry.message?.type === 'done'
+        || entry.message?.type === 'stopped'
+        || entry.message?.type === 'error'
+        || entry.message?.type === 'generationStopped';
+      if (
+        isTerminal
+        && terminalAlreadyDeliveredGeneration !== undefined
+        && entry.generation === terminalAlreadyDeliveredGeneration
+      ) continue;
+      this._postMessageToPanel(sessionId, entry.message);
+      terminalIncluded ||= entry.message?.type === 'sessionMessages' && Boolean(entry.message.terminal);
     }
+    return terminalIncluded;
   }
 
   private _postMessage(msg: any, webview?: vscode.Webview) {
@@ -2110,18 +2839,80 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private _postMessageForSession(sessionId: string, msg: any) {
-    const panel = this._panels.get(sessionId);
-    if (panel) {
-      panel.webview.postMessage(msg);
-      return;
+  // While a tab is rebuilding its initial state, the event buffer is the sole stream
+  // source. Forwarding the same live event before replay finishes would render it twice.
+  private _postStreamEventIfReady(sessionId: string, msg: any) {
+    if (this._panelReady.get(sessionId)) {
+      this._postMessageToPanel(sessionId, msg);
     }
-    this._postMessage(msg);
+    if (this._activeSessionId === sessionId) {
+      this._view?.webview.postMessage(msg);
+    }
+  }
+
+  private _postTerminalForSession(sessionId: string, msg: any, generation?: number) {
+    if (this._panels.has(sessionId) && !this._panelReady.get(sessionId)) {
+      const queue = this._pendingMessages.get(sessionId) || [];
+      queue.push({ message: msg, generation });
+      this._pendingMessages.set(sessionId, queue);
+    } else {
+      this._postMessageToPanel(sessionId, msg);
+    }
+    if (this._activeSessionId === sessionId) {
+      this._view?.webview.postMessage(msg);
+    }
+  }
+
+  // Close the ready-handshake race without double-rendering. `_sendInitialState`
+  // records the generation and buffer length it replayed while the panel stayed
+  // not-ready. Any events appended before that async initialization returned are
+  // replayed from the cursor; if a new generation replaced the buffer, replay it
+  // from the beginning. Pending history and terminals are filtered by that same
+  // generation before the panel becomes live.
+  private _finishPanelReadyReplay(webview: vscode.Webview, cursor: StreamReplayCursor) {
+    const sid = cursor.sessionId;
+    let currentTerminal: SessionTerminal | undefined;
+    if (sid) {
+      const rt = this._sessionRuntimes.get(sid);
+      if (rt?.isGenerating) {
+        const fromIndex = (rt.streamGeneration ?? 0) === cursor.streamGeneration
+          ? cursor.replayedEvents
+          : 0;
+        this._replayStreamBuffer(sid, rt, webview, fromIndex);
+      }
+      const generation = rt?.streamGeneration ?? 0;
+      currentTerminal = rt?.terminal?.generation === generation ? rt.terminal : undefined;
+    }
+    this._markPanelReady(webview);
+    if (sid) {
+      const historyIncludedTerminal = this._flushPendingMessages(
+        sid,
+        cursor.terminalGeneration,
+        cursor.historyGeneration,
+      );
+      if (
+        currentTerminal
+        && cursor.terminalGeneration !== currentTerminal.generation
+        && !historyIncludedTerminal
+      ) {
+        this._postMessageToPanel(sid, this._terminalForWebview(currentTerminal));
+      }
+    }
+  }
+
+  private _postMessageForSession(sessionId: string, msg: any) {
+    this._postOrQueueToPanel(sessionId, msg);
+  }
+
+  private _terminalForWebview(terminal?: SessionTerminal): any | undefined {
+    if (!terminal) return undefined;
+    const { generation: _generation, ...message } = terminal;
+    return message;
   }
 
   private _broadcastToPanels(msg: any) {
-    for (const panel of this._panels.values()) {
-      panel.webview.postMessage(msg);
+    for (const webview of this._webviewPanels.keys()) {
+      webview.postMessage(msg);
     }
   }
 
@@ -2131,12 +2922,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private _markPanelReady(webview: vscode.Webview) {
-    for (const [sid, panel] of this._panels) {
-      if (panel.webview === webview) {
-        this._panelReady.set(sid, true);
-        return;
-      }
-    }
+    const sid = this._sessionIdForWebview(webview);
+    if (sid) this._panelReady.set(sid, true);
+  }
+
+  private _markPanelNotReady(webview: vscode.Webview) {
+    const sid = this._sessionIdForWebview(webview);
+    if (sid) this._panelReady.set(sid, false);
   }
 
   private _messageFromError(e: unknown): string {
@@ -2161,9 +2953,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     html = html.replace(/\{\{cspSource\}\}/g, webview.cspSource);
     html = html.replace(/\{\{viewMode\}\}/g, mode);
     html = html.replace(/\{\{locale\}\}/g, vscode.env.language || 'en');
+    // VS Code injects `editor.fontFamily` as `--vscode-editor-font-family` but NOT
+    // `chatEditor.fontFamily` (that setting is for the built-in chat only). Resolve the chat
+    // font ourselves and, when set, override the monospace var so code blocks AND the input
+    // honor it. Empty → no override, so the CSS default (`--vscode-editor-font-family`) wins.
+    const font = resolveChatFontFamily();
+    // Always emit the element (empty when no font) with a stable id, so the live-update path
+    // (`chromeFont`) can edit THIS SAME rule — setting/clearing its text — instead of an inline
+    // `documentElement.style`, which could not clear a value that lives in a stylesheet rule.
+    html = html.replace(
+      /\{\{fontStyle\}\}/g,
+      `<style id="atomcode-chat-font">${font ? `:root{--app-monospace-font-family:${font};}` : ''}</style>`,
+    );
 
     return html;
   }
+}
+
+/**
+ * Read the chat monospace font from config and sanitize it for safe inlining into a
+ * `<style>` block. Precedence: `atomcode.chat.fontFamily` (our own setting) > VS Code's
+ * `chatEditor.fontFamily`. Returns `undefined` when neither is set (fall back to the CSS
+ * default, i.e. `editor.fontFamily`). The sanitizer strips anything that could break out of
+ * the CSS value (`<`, `>`, `{`, `}`, `;`, `:`, backslash, …) — a font-family value only ever
+ * needs letters, digits, spaces, quotes, commas, dots and hyphens.
+ */
+function resolveChatFontFamily(): string | undefined {
+  // Scoped reads, matching the rest of this file (`getConfiguration('atomcode')`): our own
+  // key, else VS Code's built-in `chatEditor.fontFamily`. `editor.fontFamily` is deliberately
+  // NOT read here — it already reaches the webview as `--vscode-editor-font-family` (the CSS
+  // default), so an empty result correctly falls through to it with no override.
+  const raw =
+    vscode.workspace.getConfiguration('atomcode').get<string>('chat.fontFamily', '').trim() ||
+    vscode.workspace.getConfiguration('chatEditor').get<string>('fontFamily', '').trim();
+  if (!raw) {
+    return undefined;
+  }
+  // A font-family value only needs letters, digits, spaces, quotes, commas, dots and hyphens.
+  // Strip everything else — incl. `<>{};:()\` and `url` would be inert but we drop `()` too —
+  // so the value cannot break out of the inlined `--app-monospace-font-family:VALUE;` declaration.
+  const safe = raw.replace(/[^a-zA-Z0-9 ,._'"-]/g, '').slice(0, 200).trim();
+  return safe || undefined;
 }
 
 function getNonce(): string {

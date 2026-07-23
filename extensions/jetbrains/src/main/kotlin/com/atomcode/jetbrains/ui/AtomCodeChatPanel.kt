@@ -229,6 +229,12 @@ class AtomCodeChatPanel(
     private var currentSession: SessionRefView? = null
     private var welcomeLanguage: String = defaultWelcomeLanguage()
     private var loggedIn = false
+    private val setupRefreshTimer = Timer(2_000) {
+        if (isShowing && !disposed) refreshSetupSnapshot(silent = true)
+    }.apply {
+        isRepeats = true
+        initialDelay = 2_000
+    }
     private val streamHandler = StreamEventHandler(messageView)
     private val pendingContext = mutableListOf<ChatContextItem>()
     private val pendingImages = mutableListOf<PendingImageAttachment>()
@@ -272,6 +278,7 @@ class AtomCodeChatPanel(
         installInputKeyBindings()
 
         service.addConnectionListener(connectionListener)
+        setupRefreshTimer.start()
         renderConnectionState(service.connectionState)
         applyChatSettings()
         showWelcomePage()
@@ -302,6 +309,7 @@ class AtomCodeChatPanel(
         pendingContext.clear()
         pendingImages.clear()
         service.removeConnectionListener(connectionListener)
+        setupRefreshTimer.stop()
         messageView.dispose()
     }
 
@@ -393,21 +401,23 @@ class AtomCodeChatPanel(
         }
     }
 
-    private fun refreshSetupSnapshot() {
+    private fun refreshSetupSnapshot(silent: Boolean = false) {
         service.loadSetupSnapshot().whenComplete { snapshot, error ->
             SwingUtilities.invokeLater {
                 if (error != null) {
-                    addErrorMessage(error.cause?.message ?: error.message ?: "failed to load setup")
+                    if (!silent) {
+                        addErrorMessage(error.cause?.message ?: error.message ?: "failed to load setup")
+                    }
                     return@invokeLater
                 }
-                renderSetupSnapshot(snapshot)
+                if (snapshot != setupSnapshot) renderSetupSnapshot(snapshot)
             }
         }
     }
 
     private fun renderSetupSnapshot(snapshot: SetupSnapshot) {
         setupSnapshot = snapshot
-        loggedIn = snapshot.auth?.loggedIn == true
+        loggedIn = snapshot.auth?.let { it.loggedIn && !it.expired } == true
 
         loadingModels = true
         modelPicker.removeAllItems()
@@ -431,17 +441,20 @@ class AtomCodeChatPanel(
     private fun login() {
         service.loginWithBrowser { message ->
             SwingUtilities.invokeLater {
-                header.updateConnectionState(ConnectionState.CheckingDaemon)
+                header.updateLoginStatus(message)
             }
         }.whenComplete { snapshot, error ->
             SwingUtilities.invokeLater {
                 if (error != null) {
-                    addErrorMessage("Login failed: ${error.cause?.message ?: error.message ?: "failed"}")
+                    header.updateLoginStatus(
+                        "Login failed: ${error.cause?.message ?: error.message ?: "failed"}",
+                        failed = true,
+                    )
                     refreshSetupSnapshot()
                     return@invokeLater
                 }
                 renderSetupSnapshot(snapshot)
-                addSystemMessage("Login complete.")
+                header.updateConnectionState(service.connectionState)
             }
         }
     }
@@ -1069,6 +1082,10 @@ class AtomCodeChatPanel(
 
     private fun renderChatEvent(event: ChatEvent) {
         when (event) {
+            is ChatEvent.RuntimeInfo -> {
+                inputPanel.setModelName(event.model)
+                refreshSetupSnapshot(silent = true)
+            }
             is ChatEvent.Text -> streamHandler.onText(event.content)
             is ChatEvent.Reasoning -> streamHandler.onReasoning(event.content)
             is ChatEvent.ToolBatch -> streamHandler.onToolBatch()
@@ -1774,7 +1791,7 @@ class AtomCodeChatPanel(
     private fun handleLocalInputCommand(prompt: String): Boolean {
         val command = prompt.split(Regex("\\s+"), limit = 2).firstOrNull()?.lowercase() ?: return false
         return when (command) {
-            "/login" -> { addSystemMessage("Opening AtomGit sign-in in your browser..."); login(); true }
+            "/login" -> { login(); true }
             else -> false
         }
     }

@@ -197,7 +197,7 @@ pub fn refresh_mcp_oauth_token(server_name: &str, token: &McpOAuthToken) -> Resu
         form.push(("resource", resource.clone()));
     }
 
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
         .build()
         // No `Client::new()` fallback — it panics on TLS/resolver init
         // failure and `panic = "abort"` turns that into a process kill.
@@ -623,8 +623,7 @@ fn register_oauth_client(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED
-        {
+        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED {
             bail!(
                 "MCP OAuth dynamic client registration failed: HTTP {status} — \
                  the authorization server rejected the request. \
@@ -633,9 +632,7 @@ fn register_oauth_client(
                  Response: {body}"
             );
         }
-        bail!(
-            "MCP OAuth dynamic client registration failed: HTTP {status}\nResponse: {body}"
-        );
+        bail!("MCP OAuth dynamic client registration failed: HTTP {status}\nResponse: {body}");
     }
     resp.json()
         .context("Failed to parse MCP OAuth dynamic client registration response")

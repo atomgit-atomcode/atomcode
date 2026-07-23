@@ -16,7 +16,9 @@ pub struct SkillRegistry {
 
 impl SkillRegistry {
     pub fn new() -> Self {
-        Self { skills: BTreeMap::new() }
+        Self {
+            skills: BTreeMap::new(),
+        }
     }
 
     /// Load from `dirs` in LOW→HIGH priority order (a later dir's same-named skill wins).
@@ -82,7 +84,27 @@ impl SkillRegistry {
     }
     /// `(name, description)` for every skill, sorted by name.
     pub fn list(&self) -> Vec<(String, String)> {
-        self.skills.values().map(|s| (s.name.clone(), s.description.clone())).collect()
+        self.skills
+            .values()
+            .map(|s| (s.name.clone(), s.description.clone()))
+            .collect()
+    }
+
+    /// Render the `=== AVAILABLE SKILLS ===` system-prompt section (budget-gated,
+    /// source-ranked), or `None` when no skills are installed. See
+    /// [`super::render`].
+    pub fn render_catalog(&self) -> Option<String> {
+        let entries: Vec<super::render::CatalogEntry> = self
+            .skills
+            .values()
+            .map(|s| super::render::CatalogEntry {
+                name: s.name.clone(),
+                hint: None, // capabilities skills carry no argument hint
+                description: s.description.clone(),
+                source_rank: super::render::source_rank(&s.source_path),
+            })
+            .collect();
+        super::render::render_skill_catalog(&entries)
     }
 }
 
@@ -143,7 +165,10 @@ mod tests {
         std::fs::write(a.path().join("x.md"), "from A\n").unwrap();
         std::fs::write(b.path().join("x.md"), "from B\n").unwrap();
         let reg = SkillRegistry::load(&[a.path().to_path_buf(), b.path().to_path_buf()]);
-        assert!(reg.get("x").unwrap().template.contains("from B"), "later dir wins");
+        assert!(
+            reg.get("x").unwrap().template.contains("from B"),
+            "later dir wins"
+        );
     }
 
     #[test]
@@ -159,8 +184,14 @@ mod tests {
         let dirs = standard_skill_dirs(home, project);
         // `.agents/skills` is the cross-agent shared convention (opencode et al.) —
         // scanned at BOTH user and project level so shared skills load directly.
-        assert!(dirs.contains(&home.join(".agents/skills")), "user-level ~/.agents/skills");
-        assert!(dirs.contains(&project.join(".agents/skills")), "project-level .agents/skills");
+        assert!(
+            dirs.contains(&home.join(".agents/skills")),
+            "user-level ~/.agents/skills"
+        );
+        assert!(
+            dirs.contains(&project.join(".agents/skills")),
+            "project-level .agents/skills"
+        );
         // Precedence (last-wins): .claude < .agents < .atomcode at each level, so a
         // user's atomcode-native skill still overrides a same-named shared one.
         let pos = |p: PathBuf| dirs.iter().position(|d| *d == p).expect("dir present");
@@ -182,13 +213,27 @@ mod tests {
         .unwrap();
         // A skill dir's OWN nested *.md must NOT be mis-loaded as a separate skill.
         std::fs::create_dir_all(d.path().join("top")).unwrap();
-        std::fs::write(d.path().join("top/SKILL.md"), "---\ndescription: top\n---\nTop.\n").unwrap();
-        std::fs::write(d.path().join("top/resource.md"), "internal resource, not a command\n").unwrap();
+        std::fs::write(
+            d.path().join("top/SKILL.md"),
+            "---\ndescription: top\n---\nTop.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("top/resource.md"),
+            "internal resource, not a command\n",
+        )
+        .unwrap();
 
         let reg = SkillRegistry::load(&[d.path().to_path_buf()]);
-        assert!(reg.get("sub").is_some(), "nested GROUP/sub/SKILL.md must be discovered");
+        assert!(
+            reg.get("sub").is_some(),
+            "nested GROUP/sub/SKILL.md must be discovered"
+        );
         assert_eq!(reg.get("sub").unwrap().description, "nested skill");
         assert!(reg.get("top").is_some(), "top-level skill dir loaded");
-        assert!(reg.get("resource").is_none(), "a skill's own resource .md is not a command");
+        assert!(
+            reg.get("resource").is_none(),
+            "a skill's own resource .md is not a command"
+        );
     }
 }

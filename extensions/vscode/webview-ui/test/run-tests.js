@@ -15,11 +15,14 @@ async function main() {
     'at-mention.test.ts',
     'slash-picker-regression.test.ts',
     'daemon-client-error.test.ts',
+    'auth-status.test.ts',
     'daemon-process-env.test.ts',
     'provider-queue-regression.test.ts',
     'mode-state.test.ts',
     'mode-selector-style.test.ts',
     'session-list-regression.test.ts',
+    'search.test.ts',
+    'todo-regression.test.ts',
   ];
 
   try {

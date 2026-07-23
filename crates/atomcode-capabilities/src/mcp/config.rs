@@ -156,11 +156,10 @@ pub fn load_mcp_config(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
     let user_config = load_config_file(
         &crate::mcp::util::config_dir().join("mcp.json"),
         McpConfigSource::User,
-    )
-    .unwrap_or_default();
+    )?;
 
-    let project_config = load_config_file(&project_dir.join(".mcp.json"), McpConfigSource::Project)
-        .unwrap_or_default();
+    let project_config =
+        load_config_file(&project_dir.join(".mcp.json"), McpConfigSource::Project)?;
 
     // Merge: project overrides user
     let mut merged: BTreeMap<String, McpServerConfig> = BTreeMap::new();
@@ -568,13 +567,17 @@ mod tests {
         let (name, entry) = raw.mcp_servers.into_iter().next().unwrap();
         let cfg = server_entry_to_config(&name, entry).unwrap();
         assert!(cfg.trust, "trust:true must be parsed");
-        assert_eq!(cfg.auto_approve, vec!["query".to_string(), "search".to_string()]);
+        assert_eq!(
+            cfg.auto_approve,
+            vec!["query".to_string(), "search".to_string()]
+        );
     }
 
     #[test]
     fn trust_and_auto_approve_default_off_when_absent() {
         let raw: McpConfigFile =
-            serde_json::from_str(r#"{"mcpServers":{"s":{"url":"http://127.0.0.1:8080/mcp"}}}"#).unwrap();
+            serde_json::from_str(r#"{"mcpServers":{"s":{"url":"http://127.0.0.1:8080/mcp"}}}"#)
+                .unwrap();
         let (name, entry) = raw.mcp_servers.into_iter().next().unwrap();
         let cfg = server_entry_to_config(&name, entry).unwrap();
         assert!(!cfg.trust);
@@ -586,6 +589,16 @@ mod tests {
         let raw: McpConfigFile =
             serde_json::from_str(r#"{"servers":{"b":{"command":"echo","args":[]}}}"#).unwrap();
         assert!(raw.mcp_servers.contains_key("b"));
+    }
+
+    #[test]
+    fn load_mcp_config_reports_malformed_project_file() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join(".mcp.json"), "{not-json").unwrap();
+
+        let error = load_mcp_config(project.path()).unwrap_err();
+
+        assert!(error.to_string().contains("Failed to parse MCP config"));
     }
 
     #[test]

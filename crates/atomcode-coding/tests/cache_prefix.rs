@@ -71,7 +71,10 @@ fn is_strict_prefix(a: &str, b: &str) -> bool {
 
 /// Leading run of System messages — the persona plus any MemoryHook-injected block.
 fn leading_system(messages: &[Message]) -> &[Message] {
-    let n = messages.iter().take_while(|m| m.role == Role::System).count();
+    let n = messages
+        .iter()
+        .take_while(|m| m.role == Role::System)
+        .count();
     &messages[..n]
 }
 
@@ -86,13 +89,19 @@ fn without_date_tail(messages: &[Message]) -> &[Message] {
 }
 
 fn text_turn(t: &str) -> Vec<StreamEvent> {
-    vec![StreamEvent::TextDelta(t.into()), StreamEvent::Done { truncated: false }]
+    vec![
+        StreamEvent::TextDelta(t.into()),
+        StreamEvent::Done { truncated: false },
+    ]
 }
 
 async fn drive(handle: &mut atomcode_kernel::agent::AgentHandle, text: &str) {
     handle
         .commands
-        .send(AgentCommand::SendMessage { text: text.into(), images: vec![] })
+        .send(AgentCommand::SendMessage {
+            text: text.into(),
+            images: vec![],
+        })
         .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
@@ -117,16 +126,20 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
         skill_dirs: Some(vec![project.path().join("skills")]),
+        plugin_skill_dirs: Vec::new(),
         mcp: false,
         memory: true,
         web: false,
         review: false,
+        rate_limit_source: None,
     };
     let mut parts = prepare(&cfg, opts).await.unwrap();
 
     // Two text-only turns → one recorded provider call each.
-    let provider =
-        Arc::new(RecordingProvider::new(vec![text_turn("answer one"), text_turn("answer two")]));
+    let provider = Arc::new(RecordingProvider::new(vec![
+        text_turn("answer one"),
+        text_turn("answer two"),
+    ]));
     let calls = provider.calls();
     let mut h = assemble(&mut parts, &cfg, provider).unwrap().spawn();
     drive(&mut h, "first task").await;
@@ -135,7 +148,11 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
     let _ = h.task.await;
 
     let calls = calls.lock().unwrap();
-    assert!(calls.len() >= 2, "expected >=2 recorded calls, got {}", calls.len());
+    assert!(
+        calls.len() >= 2,
+        "expected >=2 recorded calls, got {}",
+        calls.len()
+    );
 
     let frozen_tools = tool_block_repr(&calls[0].1);
     let leading0 = history_repr(leading_system(&calls[0].0));
@@ -143,7 +160,12 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
     // Sanity: memory really did land in the frozen leading run (else we'd be
     // "verifying" a trivial persona-only system).
     assert!(
-        calls[0].0.iter().take_while(|m| m.role == Role::System).count() >= 2,
+        calls[0]
+            .0
+            .iter()
+            .take_while(|m| m.role == Role::System)
+            .count()
+            >= 2,
         "MemoryHook should add a system block after the persona"
     );
 
@@ -192,16 +214,15 @@ async fn tool_block_and_system_are_deterministic_across_independent_assemblies()
     let opts = || PrepareOptions {
         session: SessionMode::Disabled,
         skill_dirs: Some(vec![project.path().join("skills")]),
+        plugin_skill_dirs: Vec::new(),
         mcp: false,
         memory: true,
         web: true, // include web tools too — more tools = a stronger ordering check
         review: false,
+        rate_limit_source: None,
     };
 
-    async fn first_call(
-        cfg: &CodingAgentConfig,
-        opts: PrepareOptions,
-    ) -> (String, String) {
+    async fn first_call(cfg: &CodingAgentConfig, opts: PrepareOptions) -> (String, String) {
         let mut parts = prepare(cfg, opts).await.unwrap();
         let provider = Arc::new(RecordingProvider::new(vec![text_turn("ok")]));
         let calls = provider.calls();
@@ -210,12 +231,21 @@ async fn tool_block_and_system_are_deterministic_across_independent_assemblies()
         h.commands.send(AgentCommand::Shutdown).unwrap();
         let _ = h.task.await;
         let calls = calls.lock().unwrap();
-        (tool_block_repr(&calls[0].1), history_repr(leading_system(&calls[0].0)))
+        (
+            tool_block_repr(&calls[0].1),
+            history_repr(leading_system(&calls[0].0)),
+        )
     }
 
     let (tools_a, system_a) = first_call(&cfg, opts()).await;
     let (tools_b, system_b) = first_call(&cfg, opts()).await;
 
-    assert_eq!(tools_a, tools_b, "tool block must be byte-identical across independent assemblies");
-    assert_eq!(system_a, system_b, "leading system run must be byte-identical across assemblies");
+    assert_eq!(
+        tools_a, tools_b,
+        "tool block must be byte-identical across independent assemblies"
+    );
+    assert_eq!(
+        system_a, system_b,
+        "leading system run must be byte-identical across assemblies"
+    );
 }

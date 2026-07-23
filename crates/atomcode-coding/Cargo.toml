@@ -4,11 +4,13 @@ version.workspace = true
 edition = "2021"
 description = "L2 coding specialization: assembles the neutral kernel + capabilities into a runnable, self-correcting coding agent."
 
+[features]
+# Forward the AtomGit REST tool feature to the capabilities layer so the
+# CLI can enable it on the coding dep without reaching into capabilities directly.
+atomgit = ["atomcode-capabilities/atomgit"]
+
 [dependencies]
 atomcode-kernel = { path = "../atomcode-kernel" }
-# CodingPlan REST client + types for the RateLimitHook (rate_limit.rs).
-# L2 is allowed to depend on core (core does not depend on kernel/capabilities/coding).
-atomcode-core = { path = "../atomcode-core" }
 # Config system (leaf crate, extracted from core). Consumed directly instead of via
 # the transitional atomcode_core::config re-export shim.
 atomcode-config = { path = "../atomcode-config" }
@@ -22,13 +24,14 @@ atomcode-capabilities = { path = "../atomcode-capabilities", features = [
     # (prepare skips registration — see CCExternalHooks::is_empty).
     "cc-hooks",
     # Wire web_search transport failures into the offline_mode="auto" verdict so the
-    # default (v2) coding engine self-detects and flips offline on a connection failure.
+    # native coding runtime self-detects and flips offline on a connection failure.
     "offline",
 ] }
 # The review specialization, mounted as a `code_review` sub-agent TOOL so the coding
 # agent can review the current changes in-session (L2 composing a sibling L2).
 atomcode-review = { path = "../atomcode-review" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
 async-trait = "0.1"
 # Stream proxying for the compaction-summary telemetry provider decorator (folds
 # StreamEvent::Usage, emits one LlmChat at stream end). Also used by tests.
@@ -45,6 +48,7 @@ chrono = "0.4"
 # Parse the bash tool-call `arguments` JSON in the VerifyCadenceHook to tell a real
 # check from a read-only `ls`/`git diff` dodge (discipline/verify.rs).
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # in-memory capturing Telemetry for the TelemetryHook test.

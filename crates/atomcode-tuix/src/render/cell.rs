@@ -20,7 +20,7 @@
 // output) keeps the pure-append path — body lines enter scrollback and
 // never need a diff cycle.
 
-use crossterm::style::{Color, SetForegroundColor, SetBackgroundColor};
+use crossterm::style::Color;
 use std::io::Write as _;
 
 /// Visual attributes that can vary per cell in our footer. Kept minimal
@@ -211,11 +211,7 @@ pub fn push_str_cells(row: &mut Vec<Cell>, s: &str, style: &CellStyle) {
 /// Non-SGR CSI sequences (cursor moves, DSR, etc.) are silently
 /// dropped — they should have been scrubbed upstream; this is
 /// belt-and-suspenders.
-pub fn push_str_cells_sgr(
-    row: &mut Vec<Cell>,
-    s: &str,
-    mut working_style: CellStyle,
-) -> CellStyle {
+pub fn push_str_cells_sgr(row: &mut Vec<Cell>, s: &str, mut working_style: CellStyle) -> CellStyle {
     let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
@@ -552,7 +548,8 @@ pub fn serialize_frames_tight(prev: &[Vec<Cell>], next: &[Vec<Cell>]) -> Vec<u8>
         let p = prev.get(r).map(Vec::as_slice).unwrap_or(&[]);
         let n = next.get(r).map(Vec::as_slice).unwrap_or(&[]);
         let max_cols = p.len().max(n.len());
-        let changed = (0..max_cols).any(|c| p.get(c).unwrap_or(&blank) != n.get(c).unwrap_or(&blank));
+        let changed =
+            (0..max_cols).any(|c| p.get(c).unwrap_or(&blank) != n.get(c).unwrap_or(&blank));
         if !changed {
             continue;
         }
@@ -681,10 +678,10 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
             out.extend_from_slice(b"\x1b[7m");
         }
         if let Some(c) = to.fg {
-            let _ = write!(out, "{}", SetForegroundColor(c));
+            emit_ansi_color(out, 38, c);
         }
         if let Some(c) = to.bg {
-            let _ = write!(out, "{}", SetBackgroundColor(c));
+            emit_ansi_color(out, 48, c);
         }
     } else {
         // Additive path — current attributes stay, just flip on whatever
@@ -700,7 +697,7 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
         }
         if fg_change {
             if let Some(c) = to.fg {
-                let _ = write!(out, "{}", SetForegroundColor(c));
+                emit_ansi_color(out, 38, c);
             } else {
                 // Should have been caught by needs_reset, but defensive.
                 out.extend_from_slice(b"\x1b[39m");
@@ -708,12 +705,49 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
         }
         if bg_change {
             if let Some(c) = to.bg {
-                let _ = write!(out, "{}", SetBackgroundColor(c));
+                emit_ansi_color(out, 48, c);
             } else {
                 out.extend_from_slice(b"\x1b[49m");
             }
         }
     }
+}
+
+/// Serialize a concrete cell color without consulting crossterm's process-global
+/// `NO_COLOR` cache. Color enablement has already been resolved into `TerminalCaps`
+/// before a `CellStyle` is built; a second ambient-env check here can otherwise turn
+/// an explicitly colored cell into `ESC[m` and silently discard its attributes.
+fn emit_ansi_color(out: &mut Vec<u8>, channel: u8, color: Color) {
+    let reset = if channel == 38 { 39 } else { 49 };
+    match color {
+        Color::Reset => {
+            let _ = write!(out, "\x1b[{reset}m");
+        }
+        Color::Black => emit_ansi_index(out, channel, 0),
+        Color::DarkGrey => emit_ansi_index(out, channel, 8),
+        Color::Red => emit_ansi_index(out, channel, 9),
+        Color::DarkRed => emit_ansi_index(out, channel, 1),
+        Color::Green => emit_ansi_index(out, channel, 10),
+        Color::DarkGreen => emit_ansi_index(out, channel, 2),
+        Color::Yellow => emit_ansi_index(out, channel, 11),
+        Color::DarkYellow => emit_ansi_index(out, channel, 3),
+        Color::Blue => emit_ansi_index(out, channel, 12),
+        Color::DarkBlue => emit_ansi_index(out, channel, 4),
+        Color::Magenta => emit_ansi_index(out, channel, 13),
+        Color::DarkMagenta => emit_ansi_index(out, channel, 5),
+        Color::Cyan => emit_ansi_index(out, channel, 14),
+        Color::DarkCyan => emit_ansi_index(out, channel, 6),
+        Color::White => emit_ansi_index(out, channel, 15),
+        Color::Grey => emit_ansi_index(out, channel, 7),
+        Color::Rgb { r, g, b } => {
+            let _ = write!(out, "\x1b[{channel};2;{r};{g};{b}m");
+        }
+        Color::AnsiValue(value) => emit_ansi_index(out, channel, value),
+    }
+}
+
+fn emit_ansi_index(out: &mut Vec<u8>, channel: u8, value: u8) {
+    let _ = write!(out, "\x1b[{channel};5;{value}m");
 }
 
 #[cfg(test)]
@@ -752,7 +786,11 @@ mod tests {
 
         // Truecolor `38;2;R;G;B` should also resolve to Rgb.
         let mut row3: Vec<Cell> = Vec::new();
-        push_str_cells_sgr(&mut row3, "\x1b[38;2;10;20;30mY\x1b[0m", CellStyle::default());
+        push_str_cells_sgr(
+            &mut row3,
+            "\x1b[38;2;10;20;30mY\x1b[0m",
+            CellStyle::default(),
+        );
         assert_eq!(row3.len(), 1);
         assert_eq!(
             row3[0].style.fg,
@@ -1298,7 +1336,11 @@ mod tests {
         let prev = vec![vec![Cell::blank(); 5]];
         let next = vec![rule];
         let s = String::from_utf8(serialize_frames_tight(&prev, &next)).unwrap();
-        assert!(s.starts_with("\x1b[1;1H\x1b[K"), "row opens with CUP+EL: {:?}", s);
+        assert!(
+            s.starts_with("\x1b[1;1H\x1b[K"),
+            "row opens with CUP+EL: {:?}",
+            s
+        );
         // 'H' is the final byte of a CUP; exactly one for the whole row.
         assert_eq!(s.matches('H').count(), 1, "exactly one CUP, got: {:?}", s);
         assert!(s.contains("─────"), "dashes must be contiguous: {:?}", s);
@@ -1319,16 +1361,33 @@ mod tests {
         // re-stream only "he" (never re-emit the stale tail).
         let prev_row: Vec<Cell> = "hello"
             .chars()
-            .map(|ch| Cell { ch, style: CellStyle::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: CellStyle::default(),
+                width: 1,
+            })
             .collect();
         let next_row: Vec<Cell> = "he"
             .chars()
-            .map(|ch| Cell { ch, style: CellStyle::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: CellStyle::default(),
+                width: 1,
+            })
             .collect();
-        let s = String::from_utf8(serialize_frames_tight(&vec![prev_row], &vec![next_row])).unwrap();
-        assert!(s.contains("\x1b[1;1H\x1b[K"), "row cleared with EL: {:?}", s);
+        let s =
+            String::from_utf8(serialize_frames_tight(&vec![prev_row], &vec![next_row])).unwrap();
+        assert!(
+            s.contains("\x1b[1;1H\x1b[K"),
+            "row cleared with EL: {:?}",
+            s
+        );
         assert!(s.contains("he"));
-        assert!(!s.contains("llo"), "stale tail must not be re-emitted: {:?}", s);
+        assert!(
+            !s.contains("llo"),
+            "stale tail must not be re-emitted: {:?}",
+            s
+        );
     }
 
     #[test]
@@ -1340,7 +1399,11 @@ mod tests {
         let prev = vec![vec![Cell::blank(); row.len()]];
         let next = vec![row];
         let s = String::from_utf8(serialize_frames_tight(&prev, &next)).unwrap();
-        assert!(s.contains("a你b"), "glyph emitted once, no phantom cont: {:?}", s);
+        assert!(
+            s.contains("a你b"),
+            "glyph emitted once, no phantom cont: {:?}",
+            s
+        );
         assert_eq!(s.matches('H').count(), 1, "single CUP for the row: {:?}", s);
     }
 
@@ -1349,11 +1412,19 @@ mod tests {
         // Row went from content to all-blank → only CUP+EL, nothing streamed.
         let prev_row: Vec<Cell> = "xy"
             .chars()
-            .map(|ch| Cell { ch, style: CellStyle::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: CellStyle::default(),
+                width: 1,
+            })
             .collect();
         let next = vec![vec![Cell::blank(); 2]];
         let s = String::from_utf8(serialize_frames_tight(&vec![prev_row], &next)).unwrap();
-        assert_eq!(s, "\x1b[1;1H\x1b[K", "blank row emits only the clear: {:?}", s);
+        assert_eq!(
+            s, "\x1b[1;1H\x1b[K",
+            "blank row emits only the clear: {:?}",
+            s
+        );
     }
 
     /// Reverse: wide→narrow at same cell index. The wide char's

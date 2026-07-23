@@ -53,7 +53,11 @@ impl RequestCtx {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        let _ = self.events.send(AgentEvent::Request { id, kind: kind.to_string(), payload });
+        let _ = self.events.send(AgentEvent::Request {
+            id,
+            kind: kind.to_string(),
+            payload,
+        });
         match self.request_timeout {
             Some(d) => match tokio::time::timeout(d, rx).await {
                 // Driver answered in time (or the sender was dropped → Null).
@@ -87,5 +91,47 @@ impl RequestCtx {
         for (_, tx) in self.pending.lock().unwrap().drain() {
             let _ = tx.send(Value::Null);
         }
+    }
+
+    /// A request-only handle for tools (see [`Requester`]).
+    pub fn requester(&self) -> Requester {
+        Requester {
+            inner: self.clone(),
+        }
+    }
+}
+
+/// A thin, cloneable handle exposing ONLY the request round-trip (not emit/resolve/
+/// cancel_pending). Threaded into ToolContext so a plain tool can ask the driver a
+/// question and await the answer.
+#[derive(Clone)]
+pub struct Requester {
+    inner: RequestCtx,
+}
+
+impl Requester {
+    pub async fn request(&self, kind: &str, payload: Value) -> Value {
+        self.inner.request(kind, payload).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn requester_forwards_request_and_resolves() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = RequestCtx::new(tx, None);
+        let requester = ctx.requester();
+        let ctx2 = ctx.clone();
+        tokio::spawn(async move {
+            if let Some(crate::event::AgentEvent::Request { id, kind, .. }) = rx.recv().await {
+                assert_eq!(kind, "ask");
+                ctx2.resolve(id, serde_json::json!({"ok": true}));
+            }
+        });
+        let v = requester.request("ask", serde_json::json!({"q": 1})).await;
+        assert_eq!(v, serde_json::json!({"ok": true}));
     }
 }

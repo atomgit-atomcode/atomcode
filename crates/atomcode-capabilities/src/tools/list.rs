@@ -62,8 +62,18 @@ impl Tool for ListDirTool {
 
         match tokio::fs::metadata(&root).await {
             Ok(m) if m.is_dir() => {}
-            Ok(_) => return err(format!("Not a directory: {}", crate::pathnorm::to_display(&root))),
-            Err(_) => return err(format!("Directory not found: {}", crate::pathnorm::to_display(&root))),
+            Ok(_) => {
+                return err(format!(
+                    "Not a directory: {}",
+                    crate::pathnorm::to_display(&root)
+                ))
+            }
+            Err(_) => {
+                return err(format!(
+                    "Directory not found: {}",
+                    crate::pathnorm::to_display(&root)
+                ))
+            }
         }
 
         let root2 = root.clone();
@@ -127,7 +137,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        }
     }
 
     #[tokio::test]
@@ -157,14 +172,19 @@ mod tests {
     async fn invalid_json_args_error() {
         let d = tempfile::tempdir().unwrap();
         let r = ListDirTool.execute("{not valid json", &ctx(d.path())).await;
-        assert!(r.is_error, "malformed args must surface an error, not silently default");
+        assert!(
+            r.is_error,
+            "malformed args must surface an error, not silently default"
+        );
         assert!(r.content.contains("invalid arguments"), "{}", r.content);
     }
 
     #[tokio::test]
     async fn missing_dir_errors() {
         let d = tempfile::tempdir().unwrap();
-        let r = ListDirTool.execute(r#"{"path":"nope"}"#, &ctx(d.path())).await;
+        let r = ListDirTool
+            .execute(r#"{"path":"nope"}"#, &ctx(d.path()))
+            .await;
         assert!(r.is_error);
         assert!(r.content.contains("Directory not found"), "{}", r.content);
     }

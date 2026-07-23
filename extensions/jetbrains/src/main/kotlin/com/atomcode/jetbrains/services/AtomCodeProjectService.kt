@@ -3,6 +3,7 @@ package com.atomcode.jetbrains.services
 import com.atomcode.jetbrains.daemon.AtomCodeDaemonClient
 import com.atomcode.jetbrains.daemon.AtomCodeDaemonProcess
 import com.atomcode.jetbrains.daemon.ApprovalMode
+import com.atomcode.jetbrains.daemon.AuthStatusResponse
 import com.atomcode.jetbrains.daemon.ChatEvent
 import com.atomcode.jetbrains.daemon.ChatRequest
 import com.atomcode.jetbrains.daemon.ChatStreamListener
@@ -16,6 +17,7 @@ import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.daemon.ModelInfo
 import com.atomcode.jetbrains.daemon.PatchProviderRequest
 import com.atomcode.jetbrains.daemon.PatchThinkingRequest
+import com.atomcode.jetbrains.daemon.ProviderInfo
 import com.atomcode.jetbrains.daemon.SessionDetail
 import com.atomcode.jetbrains.daemon.SessionMeta
 import com.atomcode.jetbrains.daemon.SetupSnapshot
@@ -45,6 +47,20 @@ private const val DAEMON_STARTUP_RETRY_DELAY_MS = 150L
 private const val BACKGROUND_HEALTH_INITIAL_DELAY_SECONDS = 5L
 private const val BACKGROUND_HEALTH_INTERVAL_SECONDS = 30L
 
+internal fun providerSetupRequired(
+    providers: List<ProviderInfo>,
+    defaultProvider: String,
+    auth: AuthStatusResponse?,
+): Boolean {
+    if (providers.isEmpty()) return true
+    val selected = providers.firstOrNull { it.name == defaultProvider }
+        ?: providers.firstOrNull { it.isDefault }
+    val authUnavailable = auth?.loggedIn != true || auth.expired
+    // Older daemons do not expose requires_login. Keep the previous
+    // fail-closed behaviour until both sides speak the new protocol.
+    return selected?.requiresLogin?.let { it && authUnavailable } ?: authUnavailable
+}
+
 internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode.Build) {
     @Volatile
     var confirmedMode: ApprovalMode = initialMode
@@ -69,7 +85,7 @@ internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode
     @Synchronized
     fun completeSwitch(requested: ApprovalMode, responseMode: String): ApprovalMode {
         if (pendingMode != requested) return displayMode
-        val applied = parseApprovalMode(responseMode, requested)
+        val applied = parseApprovalMode(responseMode, confirmedMode)
         confirmedMode = applied
         displayMode = applied
         pendingMode = null
@@ -95,8 +111,9 @@ internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode
 
     private fun parseApprovalMode(wire: String, fallback: ApprovalMode): ApprovalMode =
         when (wire) {
+            ApprovalMode.AcceptEdits.wire -> ApprovalMode.AcceptEdits
+            ApprovalMode.Auto.wire -> ApprovalMode.Auto
             ApprovalMode.Plan.wire -> ApprovalMode.Plan
-            ApprovalMode.Bypass.wire -> ApprovalMode.Bypass
             ApprovalMode.Build.wire -> ApprovalMode.Build
             else -> fallback
         }
@@ -539,7 +556,11 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                         models = models,
                         defaultProvider = defaultProvider,
                         currentModel = currentModel,
-                        setupRequired = auth?.loggedIn != true || providers?.providers.isNullOrEmpty(),
+                        setupRequired = providerSetupRequired(
+                            providers = providers?.providers.orEmpty(),
+                            defaultProvider = defaultProvider,
+                            auth = auth,
+                        ),
                     )
                 }
             }
@@ -551,10 +572,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                 CompletableFuture.failedFuture(IllegalStateException("AtomCode is not connected."))
             } else {
                 val client = getOrCreateClient()
-                client.startLogin(true).thenCompose { start ->
-                    onStatus("Opened browser for AtomGit sign-in.")
-                    pollLoginUntilAuthorized(client, start.loginId, start.expiresInSeconds, onStatus)
-                }.thenCompose {
+                AtomCodeLoginCoordinator.getInstance().login(client, onStatus).thenCompose {
                     loadSetupSnapshot()
                 }
             }
@@ -633,39 +651,6 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                     setConnectionState(ConnectionState.SetupRequired("AtomCode daemon is not running."))
                 }
             }
-    }
-
-    private fun pollLoginUntilAuthorized(
-        client: AtomCodeDaemonClient,
-        loginId: String,
-        expiresInSeconds: Int,
-        onStatus: (String) -> Unit,
-    ): CompletableFuture<Unit> {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(expiresInSeconds.coerceAtLeast(30).toLong())
-        fun poll(): CompletableFuture<Unit> {
-            return client.pollLogin(loginId).thenCompose { result ->
-                when (result.status) {
-                    "authorized" -> {
-                        onStatus("Signed in${result.userName?.let { " as $it" } ?: ""}.")
-                        CompletableFuture.completedFuture(Unit)
-                    }
-                    "pending" -> {
-                        if (System.nanoTime() >= deadline) {
-                            client.cancelLogin(loginId)
-                            CompletableFuture.failedFuture(IllegalStateException("Login timed out."))
-                        } else {
-                            onStatus("Waiting for browser authorization...")
-                            CompletableFuture.supplyAsync(
-                                { Unit },
-                                CompletableFuture.delayedExecutor(2, TimeUnit.SECONDS),
-                            ).thenCompose { poll() }
-                        }
-                    }
-                    else -> CompletableFuture.failedFuture(IllegalStateException("Unexpected login status: ${result.status}"))
-                }
-            }
-        }
-        return poll()
     }
 
     private fun syncProjectDirectory(client: AtomCodeDaemonClient, version: String): CompletableFuture<ConnectionState> {

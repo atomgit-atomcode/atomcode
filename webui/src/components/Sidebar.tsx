@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { listSessions, listProjectSessions, searchSessions, getSkills, getMcpStatus, getSession, getProjects, SkillInfo, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
+import { listSessions, listProjectSessions, searchSessions, getSkills, getMcpStatus, postLiveMcpTrust, getSession, getProjects, SkillInfo, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
@@ -344,6 +344,9 @@ export function Sidebar({
   const [mcpMenuPos, setMcpMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const mcpMenuRef = useRef<HTMLDivElement | null>(null);
   const mcpBtnRef = useRef<HTMLButtonElement | null>(null);
+  // Trust flow: in-flight POST + error for the "Trust this project" button.
+  const [trusting, setTrusting] = useState(false);
+  const [trustError, setTrustError] = useState<string | null>(null);
   // Per-session kebab menu: which session, and where to anchor the fixed menu.
   const [menuFor, setMenuFor] = useState<string | null>(null);
   // top XOR bottom: `top` opens the menu downward below the kebab; `bottom`
@@ -673,6 +676,26 @@ export function Sidebar({
     };
   }, [mcpMenuOpen]);
 
+  async function onTrust() {
+    if (trusting) return;
+    setTrusting(true);
+    setTrustError(null);
+    try {
+      const result = await postLiveMcpTrust();
+      if (result.ok) {
+        // Refresh MCP status so the blocked notice disappears and new servers appear.
+        mcpPollAttemptsRef.current = 0;
+        refreshMcpStatus();
+      } else {
+        setTrustError(result.error ?? 'Trust failed');
+      }
+    } catch (e) {
+      setTrustError(e instanceof Error ? e.message : 'Trust failed');
+    } finally {
+      setTrusting(false);
+    }
+  }
+
   function toggleMcpMenu(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
@@ -877,8 +900,17 @@ export function Sidebar({
             }}
           >
             {mcpLoading && <div class="group-by-menu-title">{t('sidebar.mcpLoading')}</div>}
-            {!mcpLoading && (mcpStatus?.servers?.length ?? 0) === 0 && (
+            {!mcpLoading && (mcpStatus?.servers?.length ?? 0) === 0 && !(mcpStatus?.blocked?.length) && (
               <div class="group-by-menu-title">{t('sidebar.mcpEmpty')}</div>
+            )}
+            {!mcpLoading && (mcpStatus?.blocked?.length ?? 0) > 0 && (
+              <div class="mcp-blocked-notice">
+                <span>{t('mcp.blockedUntrusted').replace('{n}', String(mcpStatus!.blocked!.length))}</span>
+                {trustError && <span class="mcp-blocked-error">{trustError}</span>}
+                <button class="btn btn-primary" disabled={trusting} onClick={onTrust}>
+                  {trusting ? '…' : t('mcp.trustProject')}
+                </button>
+              </div>
             )}
             {!mcpLoading &&
               (mcpStatus?.servers ?? []).map((srv) => {

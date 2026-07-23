@@ -62,9 +62,13 @@ impl CustomCommandRegistry {
         let mut commands = HashMap::new();
         // Global first — project overrides on second pass.
         Self::load_from_dir(&config_dir.join("commands"), None, &mut commands);
-        Self::load_from_dir(&project_root.join(".atomcode/commands"), None, &mut commands);
+        Self::load_from_dir(
+            &project_root.join(".atomcode/commands"),
+            None,
+            &mut commands,
+        );
         // Plugin layer
-        for assets in atomcode_core::plugin::loader::iter_installed_plugin_assets() {
+        for assets in atomcode_capabilities::plugin::loader::iter_installed_plugin_assets() {
             Self::load_from_dir(&assets.commands_dir(), Some(&assets.plugin), &mut commands);
         }
         Self { commands }
@@ -276,10 +280,7 @@ mod tests {
         let path = dir.path().join("huge.md");
         // Create a file larger than 1 MiB (1_048_576 bytes).
         let padding = "x".repeat(1_048_577);
-        let huge_content = format!(
-            "---\nname: huge\ndescription: Huge\n---\n{}",
-            padding
-        );
+        let huge_content = format!("---\nname: huge\ndescription: Huge\n---\n{}", padding);
         std::fs::write(&path, huge_content).unwrap();
         assert!(CustomCommandRegistry::parse_command_file(&path).is_none());
     }
@@ -422,11 +423,7 @@ mod tests {
     fn parse_file_without_name_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("noname.md");
-        std::fs::write(
-            &path,
-            "---\ndescription: Missing name field\n---\nTemplate",
-        )
-        .unwrap();
+        std::fs::write(&path, "---\ndescription: Missing name field\n---\nTemplate").unwrap();
         assert!(CustomCommandRegistry::parse_command_file(&path).is_none());
     }
 
@@ -545,4 +542,3 @@ mod tests {
         assert!(reg.render("a:wechat", "").is_some());
     }
 }
-

@@ -1,130 +1,122 @@
-# 目标架构（北极星）— AtomCode 去 core 终极态
+# 目标架构与当前收口方向
 
-> 状态：方向性目标，非现状。现状是「旧引擎(atomcode-core) + 新栈(kernel/capabilities/coding) + bridge 绞杀缝」并存的迁移中途。
-> 本文定义迁移**收尾后**的形态，作为后续每一步重构的对照基准。
+> 状态：当前有效的方向性约束。
 >
-> 终极态里 **`atomcode-core`、`atomcode-bridge`、以及过渡用的 legacy-protocol 全部消失**。
+> core driver 协议、v1 engine 和 `atomcode-bridge` 已退役。当前工作不再是继续迁移 bridge，
+> 而是收敛接入层仍保留的 session/conversation 双模型、历史兼容和基础设施重复实现。
+>
+> 目标是单一状态所有权、清晰依赖方向和可验证兼容性；`atomcode-core` 是否最终移除，
+> 取决于它是否自然失去职责和消费者，不作为独立 KPI。
 
----
+## 1. 当前目标调用链
 
-## 1. 依赖图
-
-```
-                         ┌──────────────────────────────────────────┐
-  前端 / 接入层           │  tuix    cli    daemon    webui   <新前端>  │
-  (Frontends)            └───┬─────────┬────────┬────────┬───────────┘
-                            │         │        │        │
-                  ┌─────────┴─────────┴────────┴────────┴──────────┐
-                  │  业务专业化 L2 (一业务一 crate, 平级)            │
-                  │  coding      review      <wechat>   <docs-agent> │
-                  └───────────────────────┬────────────────────────┘
-                                          │ (+ foundation 横向供给)
-                  ┌───────────────────────┴────────────────────────┐
-                  │  atomcode-capabilities (L1)                      │
-                  │  feature 门控的能力池: provider/tools/web/mcp/    │
-                  │  skills/session/memory/codeintel/atomgit         │
-                  └───────────────────────┬────────────────────────┘
-                                          │
-                  ┌───────────────────────┴────────────────────────┐
-                  │  atomcode-kernel (L0 运行时)                      │
-                  │  Agent 循环 / 中间件 / hook / tool&provider trait │
-                  └───────────────────────┬────────────────────────┘
-                                          │
-                  ┌───────────────────────┴────────────────────────┐
-                  │  atomcode-protocol (叶子, 唯一对外契约)           │
-                  │  Command / Event / Message / Conversation 纯数据  │
-                  │  全 serde 可序列化, 可跨进程/网络                  │
-                  └─────────────────────────────────────────────────┘
-
-  横切 (任意层可依赖, 自身只依赖 protocol 或无依赖):
-     atomcode-foundation   应用级共享基础设施 (config/i18n/auth/plugin/...)
-     atomcode-telemetry    遥测 (叶子)
-
-  依赖方向铁律 (编译期强制, 只能向下):
-     protocol ← kernel ← capabilities ← L2 ← 前端
-     foundation / telemetry 是侧叶子, 只被「上层」依赖, 自己绝不向上依赖
+```text
+CLI / TUI / daemon / background / ACP / clix code
+                    │
+                    ▼
+       CodingRuntimeHandle / DriverCommand
+                    │
+                    ▼
+               CodingRuntime
+                    │
+                    ▼
+          atomcode-kernel Agent
 ```
 
-**关键点：箭头只能向下。** 任何反向依赖（如 capabilities 依赖某个 L2、kernel 依赖 capabilities）都是架构违例，应编译期挡掉。
+`atomcode-review` 等其他 L2 可以装配并驱动自己的 kernel agent；但每个业务只能有一个明确的
+运行时 owner，不能让 driver、adapter 和 L2 同时持有多套 live `AgentHandle`。
 
----
+## 2. 分层与依赖方向
 
-## 2. 每个 crate 的职责边界
+```text
+kernel ← capabilities ← L2 specialization ← frontend/transport
 
-下表三列：**拥有什么** / **绝不能含什么**（治理的牙齿）/ **依赖谁**。
+叶子基础设施：config、auth、telemetry、updater 等按职责被上层依赖
+兼容边界：legacy session importer，只允许从旧格式流向当前模型
+```
 
-### `atomcode-protocol`（叶子 · 唯一对外契约）
-- **拥有**：驱动 ↔ 引擎之间交谈的**纯数据**——`AgentCommand`、`AgentEvent`、`StopReason`、`RequestId`；`Message`、`Conversation`、`Role`、`ImageContent`、`ReasoningBlock`、`MessageMeta`、`SessionSnapshot`、`CompactReport` 等消息数据。全部 `#[derive(Serialize, Deserialize)]`。
-- **绝不能含**：任何运行时（tokio、channel、JoinHandle）、任何 trait 行为（如 `CompactionStrategy` 这类策略 trait 留在 kernel）、任何业务词汇（approval/persona/plan/git/review）。
-- **依赖**：无（纯 std + serde）。
-- **为什么独立**：webui 后端、微信 Node 桥、未来 TS 客户端 codegen，只需类型不需运行时；运行时重构不波及任何接入方编译。**这是「协议在 kernel 家族」的正解，但它装中立类型，不是 core 的 legacy 类型。**
-
-### `atomcode-kernel`（L0 · 中立运行时）
-- **拥有**：`Agent` 循环 / `AgentHandle` / `AgentBuilder` / `Outcome`；`clock`、`middleware`、`hook`、`stream`；`Tool` 与 `LlmProvider` 的**抽象 trait**；`CompactionStrategy` trait；`conformance`/`testkit`。
-- **绝不能含**：approval、persona、code-intelligence、任何具体 provider/tool 实现、任何业务逻辑。**试金石**：类型名里出现 approval/persona/plan/code/git/review → 不属于 kernel。
-- **依赖**：`protocol`。
-- **不变量**：`knows nothing about approval, persona, or code-intelligence`（保持现有 spike 注释的承诺）。
-
-### `atomcode-capabilities`（L1 · 能力池）
-- **拥有**：真 provider 适配器（OpenAI 兼容：GLM/DeepSeek…）、真 tools（fs/bash/grep/glob/web）、mcp、skills、session、memory、codeintel、atomgit REST。全部 **feature 门控**。
-- **绝不能含**：atomcode-core（已写死「NEVER add core」）、任何 L2/前端、任何具体业务 persona。能力是中立的、可被任意 L2 复用的。
-- **依赖**：`kernel`（+ `protocol`）。**配置/密钥靠注入**（构造参数），不自己读 config/auth 文件。
-- **不变量**：每个能力可选；`default = ["provider","tools"]`；联网/codeintel/mcp 等按需 opt-in，嵌入方能取最小子集。
-
-### `atomcode-coding` / `atomcode-review` / `<新业务>`（L2 · 业务专业化，平级）
-- **拥有**：把 kernel + capabilities 子集**组装**成一个具体业务 agent。coding：persona/discipline/plan_mode/自纠错装配；review：评审规则。
-- **绝不能含**：另一个业务的逻辑（coding 不含 review 词汇，反之亦然）；前端/UI 代码。
-- **依赖**：`kernel` + `capabilities`（选 feature）+ 可选 `foundation`。
-- **不变量**：**新业务 = 新 L2 crate，永不在 coding 里开分支**。微信助手、文档 agent 都是 coding/review 的平级兄弟。
-
-### 前端 `tuix` / `cli` / `daemon` / `webui` / `<新前端>`（接入层）
-- **拥有**：UI/渲染/输入（tuix）、参数与生命周期（cli）、HTTP/WS 服务（daemon/webui）。通过 `protocol` 的 Command/Event handle 驱动某个 L2。
-- **绝不能含**：业务推理逻辑（属于 L2）、引擎实现（属于 kernel/capabilities）。
-- **依赖**：某个 L2 + `protocol` + `foundation` + `telemetry`。
-- **daemon 的特殊职责**：把 kernel handle 暴露成 HTTP/WS，让**非 Rust 业务**（TS webui、Node 微信桥）不链 Rust 即可接入——「协议出网」的适配器。
-
-### `atomcode-foundation`（侧叶子 · 应用级共享基础设施）
-- **拥有**：`config`、`i18n`/`locale`、`auth`（加载/存储 auth.toml）、`plugin`、`self_update`、`setup`、`notify`、`process_utils`、`input_history`、`telemetry_bootstrap`、`trace`、`live`。
-- **绝不能含**：agent 运行逻辑、协议类型、业务逻辑。纯「应用怎么把自己跑起来」的横切。
-- **依赖**：尽量无（最多 `protocol`）。**关键约束**：引擎需要的 config/auth 是**值注入**给 capabilities/L2 的——foundation 负责「读盘」，引擎只收到普通值，所以 foundation **不被** kernel/capabilities 依赖，只被 L2 装配处和前端依赖。
-
-### `atomcode-telemetry`（叶子 · 横切）
-- **拥有**：遥测上报。**依赖**：无内部依赖（保持现状叶子）。
-
----
-
-## 3. 四类「业务对接」分别插哪层
-
-| 场景 | 例子 | 插入点 | 动作 |
-|---|---|---|---|
-| 同 agent 换前端 | webui / 新 TUI / 移动端 | **protocol 层** | 进程内连 handle，或经 daemon 走 HTTP/WS |
-| 新领域/新垂直 | 微信助手 / 文档 agent | **新 L2 crate** | 装配 kernel+capabilities，**不 fork coding** |
-| 新能力 | 新工具 / 新 provider | **capabilities + feature** | L2 按需 opt-in |
-| 嵌入方要子集 | 只 tools 不联网 | **capabilities feature 选择** | 依赖 kernel + 选定 features |
-
-口诀：**任何「对接」需求，先归类到这四类的哪一类。绝大多数是「新 L2」，而不是动 kernel。**
-
----
-
-## 4. 终极态会消失的东西
-
-| 消失项 | 现状 LOC | 去向 |
+| 层 | 拥有 | 禁止 |
 |---|---|---|
-| `atomcode-core` 旧引擎 | ~75k | 删除（kernel/capabilities/coding 已重写） |
-| `atomcode-core` 共享设施 | ~16k | 搬入 `atomcode-foundation` |
-| `atomcode-bridge` | ~1.5k | 删除（绞杀缝是脚手架，旧引擎一死即拆） |
-| 过渡用 legacy-protocol | — | 不建则无；若建则最后删 |
+| `atomcode-kernel` | 中立 agent 循环、hook/middleware/tool/provider trait、kernel message/event | coding、approval、plan、plugin、具体 provider/tool 实现 |
+| `atomcode-capabilities` | provider、tools、MCP、skills、session、memory、codeintel 等可复用能力 | 依赖 core、L2 或前端；读取前端状态 |
+| `atomcode-coding` | coding persona、runtime 生命周期、provider/session reassemble、goal/loop、审批协调 | 依赖 core；UI、HTTP、终端渲染 |
+| CLI/TUI/daemon | 输入、展示、HTTP/WS/SSE、本地明确操作、历史格式接入 | 第二 runtime owner；把 coding 生命周期直接塞进 kernel 命令 |
+| `atomcode-core` 兼容负担 | 当前仍被接入层使用的 session/conversation、plugin、live、部分旧能力 | 恢复旧 driver 协议、bridge 或 runtime fallback |
 
-**注意**：迁移期可能临时出现一个「抽 core 的 legacy AgentCommand/AgentEvent」的 `atomcode-protocol-legacy` 脚手架，用于让驱动早点脱离 90k core。它**不是**本文的 `atomcode-protocol`（中立契约），用完即删，别混淆。
+编译期不变量：
 
----
+- kernel 不依赖 capabilities、L2 或前端；
+- capabilities 不依赖 core、L2 或前端；
+- coding 不依赖 core 或前端；
+- frontend 可以依赖 L2 和叶子基础设施，但不得持有第二套业务 runtime。
 
-## 5. 落地顺序（与本文对照）
+## 3. Runtime 所有权
 
-1. **冻结协议面**：把 kernel 的 `event`/`message`/`request` 中立类型剥成 `atomcode-protocol` 叶子（数据进叶子，trait 行为留 kernel）。这是所有业务的绑定点，最先稳定。
-2. **抽 `atomcode-foundation`**：把 core 的 config/i18n/auth/plugin/... 共享设施挪出，core 只剩纯引擎。
-3. **驱动直迁 kernel 词汇**：把 tuix/cli/daemon 的 `core::agent::*` 调用点逐个迁到 `protocol`/`kernel`，bridge 当临时适配器。
-4. **v2 默认化 + 删旧引擎**：最后一个驱动迁完 → 删 core 旧引擎 + 删 bridge。
-5. core 清零，从 workspace 移除。
+`CodingRuntime` 统一拥有：
 
-> 北极星不变量：**kernel 永远中立；协议是唯一对外契约；新业务一律新 L2 或新前端，绝不进 kernel。** coding 只是第一个业务。
+- live agent、config、parts、provider、session binding；
+- generation、pending request、snapshot broker；
+- submit/steer/cancel/approval/request/compact；
+- provider/model reload、fresh/resume/restore/undo/cd；
+- goal/self-paced loop 和 shutdown。
+
+driver 可以执行不需要运行中状态的本地操作。凡是会改变 conversation、snapshot、provider、
+session binding 或 agent generation 的行为，必须通过 runtime 的显式事务完成，不能用本地文件写入
+绕过 runtime。
+
+kernel `AgentCommand/AgentEvent` 是运行时执行边界，不是承载所有产品命令的公共总线。
+
+## 4. 当前剩余问题
+
+### 4.1 Session/conversation 双模型
+
+当前同一 project bucket 中并存：
+
+- core `<id>.json`：完整 UI/session 对象，仍被 CLI/TUI/daemon 列表、重命名、删除、恢复和镜像写入；
+- native `<id>.snapshot`：kernel working-set snapshot，供 runtime resume；
+- native `<id>.meta`：快速列表元数据；
+- native `<id>.jsonl`：不压缩的逐回合 transcript，用于 recall。
+
+native snapshot 是运行中 conversation 的权威数据，但 core JSON 目前仍包含 UI-only message、
+cold summaries、命名状态、turn stats 等接入层语义，不能直接删除。目标是先补齐 native store 的
+必要语义，再把 core JSON 降为只读、幂等、可失败的历史 importer，最后删除 live 双写和双向转换。
+
+### 4.2 基础设施重复
+
+core 中仍有 plugin、live、MCP、LSP、provider、tool、graph、semantic 等实现。处理顺序必须由真实
+消费者决定：先切消费者和状态 owner，再删除旧实现。只复制到新 crate、保留两份实现不算进度。
+
+## 5. Protocol 与 foundation 的决策门槛
+
+不预设先创建 `atomcode-protocol`。只有同时出现以下需求之一时才拆纯协议叶子：
+
+- HTTP/WS 对外 schema 需要独立版本；
+- 非 Rust 客户端需要稳定 codegen；
+- kernel 类型演进已对外部消费者造成实际耦合。
+
+拆分前应先证明现有 kernel/coding 中立类型不能满足需求，且新 crate 会删除现有重复协议，而不是
+再增加一套类型。
+
+不创建大而全的 `atomcode-foundation`。config、auth、plugin、session、transport、process utilities
+应按内聚职责复用现有叶子 crate 或单独拆分；目标是减少耦合，不是把 core 改名。
+
+## 6. 收口顺序
+
+1. 收敛 session/conversation 持久化和恢复语义；
+2. 将 core session JSON 降为独立单向 importer，删除 live 双写/双向转换；
+3. 按职责收口 plugin、live transport、MCP host；
+4. 消费者归零后删除 core 中重复的 provider/tool/MCP/LSP/graph/semantic 实现；
+5. 重新评估 core 剩余职责；只有自然为空时才移出 workspace。
+
+每个垂直切片必须实际减少至少一项：状态 owner、数据模型、转换链、直接依赖或 fallback。
+不得以移动文件、增加 facade、新建 crate 或净删除行数冒充架构进度。
+
+## 7. 兼容与失败原则
+
+- 历史格式读取必须有显式 schema/字段映射和真实 fixture 测试；
+- importer 必须幂等，导入失败不得覆盖旧文件或生成可被误判为成功的半成品；
+- legacy 与 native 同时存在时必须有明确冲突规则，禁止按 mtime 猜测后静默覆盖；
+- runtime rebuild 失败必须显式失败或回滚，禁止 silent fresh、空 snapshot、noop handle；
+- pending approval/request 在 cancel、reload、session switch 和 shutdown 时 fail-closed；
+- 旧 generation 的迟到事件不得进入 replacement runtime；
+- 未删除旧 writer、handler、依赖或 fallback 时必须明确“尚未退役”。

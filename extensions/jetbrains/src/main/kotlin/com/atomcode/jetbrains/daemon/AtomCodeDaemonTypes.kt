@@ -5,6 +5,7 @@ data class HealthResponse(
     val version: String,
     val service: String,
     val binaryHash: String? = null,
+    val instanceId: String? = null,
 )
 
 data class ProjectState(
@@ -27,6 +28,7 @@ data class ConfigResponse(
 
 data class AuthStatusResponse(
     val loggedIn: Boolean,
+    val expired: Boolean = false,
     val authPath: String,
     val userName: String?,
 )
@@ -35,11 +37,15 @@ data class LoginStartResponse(
     val loginId: String,
     val url: String,
     val expiresInSeconds: Int,
+    val daemonInstanceId: String? = null,
 )
 
 data class LoginPollResponse(
     val status: String,
     val userName: String?,
+    val code: String? = null,
+    val message: String? = null,
+    val retryAfterMs: Int? = null,
 )
 
 data class ProviderInfo(
@@ -48,6 +54,7 @@ data class ProviderInfo(
     val model: String,
     val isDefault: Boolean,
     val hasApiKey: Boolean,
+    val requiresLogin: Boolean? = null,
     val thinkingEnabled: Boolean,
     val thinkingBudget: Int?,
     val thinkingType: String?,
@@ -172,13 +179,15 @@ data class ChatRequest(
 
 enum class ApprovalMode(val wire: String) {
     Build("build"),
-    Plan("plan"),
-    Bypass("bypass");
+    AcceptEdits("accept_edits"),
+    Auto("bypass"),
+    Plan("plan");
 
     override fun toString(): String = when (this) {
         Build -> "Build"
+        AcceptEdits -> "Accept Edits"
+        Auto -> "Auto"
         Plan -> "Plan"
-        Bypass -> "Bypass"
     }
 }
 
@@ -209,6 +218,7 @@ interface ChatStreamListener {
 }
 
 sealed interface ChatEvent {
+    data class RuntimeInfo(val provider: String, val model: String) : ChatEvent
     data class Text(val content: String) : ChatEvent
     data class Reasoning(val content: String) : ChatEvent
     data class ToolBatch(val callsJson: String) : ChatEvent

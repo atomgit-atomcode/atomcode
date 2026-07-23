@@ -13,26 +13,74 @@ pub struct Tip {
 }
 
 /// Always shown first.
-pub const PINNED: Tip = Tip { cmd: "/login", desc: Msg::WelcomeTipLogin };
+pub const PINNED: Tip = Tip {
+    cmd: "/login",
+    desc: Msg::WelcomeTipLogin,
+};
 
 /// Random pool (15). Filtered to onboarding-relevant commands; excludes
 /// exit/clear/destructive and pure-utility commands. Edit + recompile to refresh.
 pub const POOL: &[Tip] = &[
-    Tip { cmd: "/provider", desc: Msg::WelcomeTipProvider },
-    Tip { cmd: "/model",    desc: Msg::WelcomeTipModel },
-    Tip { cmd: "/resume",   desc: Msg::WelcomeTipResume },
-    Tip { cmd: "/setup",    desc: Msg::WelcomeTipSetup },
-    Tip { cmd: "/skills",   desc: Msg::WelcomeTipSkills },
-    Tip { cmd: "/plugin",   desc: Msg::WelcomeTipPlugin },
-    Tip { cmd: "/webui",    desc: Msg::WelcomeTipWebui },
-    Tip { cmd: "/mcp",      desc: Msg::WelcomeTipMcp },
-    Tip { cmd: "/plan",     desc: Msg::WelcomeTipPlan },
-    Tip { cmd: "/session",  desc: Msg::WelcomeTipSession },
-    Tip { cmd: "/loop",     desc: Msg::WelcomeTipLoop },
-    Tip { cmd: "/goal",     desc: Msg::WelcomeTipGoal },
-    Tip { cmd: "/init",     desc: Msg::WelcomeTipInit },
-    Tip { cmd: "/language", desc: Msg::WelcomeTipLanguage },
-    Tip { cmd: "/usage",    desc: Msg::WelcomeTipUsage },
+    Tip {
+        cmd: "/provider",
+        desc: Msg::WelcomeTipProvider,
+    },
+    Tip {
+        cmd: "/model",
+        desc: Msg::WelcomeTipModel,
+    },
+    Tip {
+        cmd: "/resume",
+        desc: Msg::WelcomeTipResume,
+    },
+    Tip {
+        cmd: "/setup",
+        desc: Msg::WelcomeTipSetup,
+    },
+    Tip {
+        cmd: "/skills",
+        desc: Msg::WelcomeTipSkills,
+    },
+    Tip {
+        cmd: "/plugin",
+        desc: Msg::WelcomeTipPlugin,
+    },
+    Tip {
+        cmd: "/webui",
+        desc: Msg::WelcomeTipWebui,
+    },
+    Tip {
+        cmd: "/mcp",
+        desc: Msg::WelcomeTipMcp,
+    },
+    Tip {
+        cmd: "/plan",
+        desc: Msg::WelcomeTipPlan,
+    },
+    Tip {
+        cmd: "/session",
+        desc: Msg::WelcomeTipSession,
+    },
+    Tip {
+        cmd: "/loop",
+        desc: Msg::WelcomeTipLoop,
+    },
+    Tip {
+        cmd: "/goal",
+        desc: Msg::WelcomeTipGoal,
+    },
+    Tip {
+        cmd: "/init",
+        desc: Msg::WelcomeTipInit,
+    },
+    Tip {
+        cmd: "/language",
+        desc: Msg::WelcomeTipLanguage,
+    },
+    Tip {
+        cmd: "/usage",
+        desc: Msg::WelcomeTipUsage,
+    },
 ];
 
 /// How many random tips to show below the pinned one.
@@ -68,7 +116,9 @@ mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng};
 
-    fn fixed(seed: u64) -> StdRng { StdRng::seed_from_u64(seed) }
+    fn fixed(seed: u64) -> StdRng {
+        StdRng::seed_from_u64(seed)
+    }
 
     #[test]
     fn pinned_is_first_and_login() {
@@ -86,7 +136,9 @@ mod tests {
     fn random_three_are_distinct_and_not_pinned() {
         let t = choose_tips(&mut fixed(7));
         let rest = &t[1..];
-        for w in rest { assert_ne!(w.cmd, "/login"); }
+        for w in rest {
+            assert_ne!(w.cmd, "/login");
+        }
         for i in 0..rest.len() {
             for j in (i + 1)..rest.len() {
                 assert_ne!(rest[i].cmd, rest[j].cmd, "duplicate random tip");
@@ -103,8 +155,18 @@ mod tests {
 
     #[test]
     fn pool_excludes_filtered_commands() {
-        let banned = ["/quit", "/clear", "/status", "/cd", "/logout",
-                      "/delete_session", "/undo", "/stop", "/whoami", "/cost"];
+        let banned = [
+            "/quit",
+            "/clear",
+            "/status",
+            "/cd",
+            "/logout",
+            "/delete_session",
+            "/undo",
+            "/stop",
+            "/whoami",
+            "/cost",
+        ];
         for t in POOL {
             assert!(!banned.contains(&t.cmd), "{} must not be in POOL", t.cmd);
         }

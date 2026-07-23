@@ -82,7 +82,7 @@ pub enum StreamEvent {
     Delta(String),
     /// Reasoning-model thinking content (e.g. MiniMax-M2.7, DeepSeek-R1,
     /// o1-series). Some OpenAI-compatible gateways route the full response
-    /// here when `content` is empty — `TurnRunner` promotes it to the
+    /// here when `content` is empty — the kernel agent promotes it to the
     /// final text on `Done` if `content` ends up empty, which keeps us from
     /// silently returning 0-token "Nailed it" responses for reasoning models.
     Reasoning(String),
@@ -116,7 +116,7 @@ pub enum StreamEvent {
     /// `Error`, the stream and the turn continue normally — the warning
     /// is a heads-up (e.g. "your proxy looks like it's truncating
     /// input"), not a failure. The runner forwards it to
-    /// `TurnEvent::Warning` so the TUI can render it without aborting.
+    /// a non-fatal warning so drivers can render it without aborting.
     Warning(String),
 }
 
@@ -127,8 +127,14 @@ mod runaway_tests {
     #[test]
     fn normal_prose_never_trips() {
         let mut d = RunawayDetector::new(1024);
-        assert_eq!(d.feed("Here is a perfectly fine response with no repetition."), None);
-        assert_eq!(d.feed(" Even with some emphasis. Even with     spaces."), None);
+        assert_eq!(
+            d.feed("Here is a perfectly fine response with no repetition."),
+            None
+        );
+        assert_eq!(
+            d.feed(" Even with some emphasis. Even with     spaces."),
+            None
+        );
     }
 
     #[test]
@@ -147,7 +153,10 @@ mod runaway_tests {
         let mut d = RunawayDetector::new(5);
         assert!(d.feed("aa").is_none());
         assert!(d.feed("aa").is_none());
-        assert!(d.feed("a").expect("split runaway must still trip").contains("'a'"));
+        assert!(d
+            .feed("a")
+            .expect("split runaway must still trip")
+            .contains("'a'"));
     }
 
     #[test]

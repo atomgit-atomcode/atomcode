@@ -1,5 +1,4 @@
-//! LiveSession 的 daemon 侧：独立 turn 构造 + 真实 TurnExecutor + /live 端点。
-//! 不依赖也不修改 process_chat_request / `/chat`（以少量重复换 /chat 零回归）。
+//! daemon `/live` transport and the shared `/chat` turn-construction helpers.
 
 // This module runs IN the TUI process under `/webui`, so any write to the real
 // stdout/stderr corrupts the terminal — diagnostics MUST use the file-sink
@@ -10,63 +9,41 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
-use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent};
 use atomcode_config::config::Config;
 use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
-use atomcode_core::live::{LiveEvent, TurnExecutor, TurnState, UserInput};
 use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
 use atomcode_core::provider;
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::PermissionDecision;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
-use atomcode_core::turn::event::TurnEvent;
 use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use std::sync::OnceLock;
+
 pub(crate) use crate::approval_mode::ApprovalMode;
 use crate::CachedMcpRegistry;
-use crate::kernel_runtime::DaemonRuntimeEvent;
 
 pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
     match mode {
-        ApprovalMode::Plan => PermissionDecision::Deny,
-        // AcceptEdits groups with Build here: this coarse daemon/webui fallback has no
-        // per-tool granularity yet (webui 4th-mode support is deferred). The real
-        // AcceptEdits enforcement (edits auto-approve, bash still prompts) is the
-        // WriteApprovalGate middleware on the interactive path.
-        ApprovalMode::Build | ApprovalMode::Auto | ApprovalMode::AcceptEdits => {
-            PermissionDecision::Allow
-        }
+        // AcceptEdits auto-approval is implemented by WriteApprovalGate. Any
+        // request that still reaches the driver requires a real approver
+        // (for example bash or a sensitive path), so missing responders must
+        // fail closed.
+        ApprovalMode::AcceptEdits | ApprovalMode::Plan => PermissionDecision::Deny,
+        ApprovalMode::Build | ApprovalMode::Auto => PermissionDecision::Allow,
     }
 }
 
-// ============================================================================
-// 进程内全局 LiveSession 持有者
-// ============================================================================
-
-/// 进程内单一活动 LiveSession（TUI 与进程内 webui 共享）。
-static LIVE: StdMutex<Option<Arc<atomcode_core::live::LiveSession>>> = StdMutex::new(None);
-
-/// 当前 LiveSession 的稳定 session_id（字符串），供 /live SSE 端点在 Snapshot 中暴露。
-static LIVE_SESSION_ID: StdMutex<Option<String>> = StdMutex::new(None);
-
-/// 当前 LiveSession 选中的 provider（模型）。None=用 config.default_provider。
-/// webui 每次 /live/message 带上 provider 时更新；DaemonTurnExecutor::run_turn 每轮读取，
-/// 因此在 sync/live 模式下切换模型才能对下一轮生效（执行器是 Arc<dyn> 不可变，故用进程级覆盖）。
-static LIVE_PROVIDER: StdMutex<Option<String>> = StdMutex::new(None);
-
-/// 当前 LiveSession 的审批模式（webui 底栏「模式」pill 切换，默认 Build）。
-/// `/live/mode` 端点写入；DaemonTurnExecutor::run_turn 每轮读取以选择 PermissionDecider，
-/// 因此在 sync/live 模式下切换模式对下一轮生效（执行器 Arc<dyn> 不可变，沿用 LIVE_PROVIDER
-/// 的进程级覆盖范式）。跨 tab / TUI 通过 LiveEvent::ModeChanged 广播同步。
+/// Web/TUI 共同显示并下发给 Coding Runtime 的审批模式。
 static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::Build);
 
 /// 读取当前生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
@@ -75,75 +52,42 @@ pub(crate) fn live_current_approval_mode() -> ApprovalMode {
     *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 当前审批模式的线格字符串（"build" / "plan" / "bypass"），供 Snapshot / 广播使用。
+fn native_runtime_mode(mode: ApprovalMode) -> atomcode_coding::RuntimeMode {
+    match mode {
+        ApprovalMode::Plan => atomcode_coding::RuntimeMode::Plan,
+        ApprovalMode::Auto => atomcode_coding::RuntimeMode::Auto,
+        ApprovalMode::AcceptEdits => atomcode_coding::RuntimeMode::AcceptEdits,
+        ApprovalMode::Build => atomcode_coding::RuntimeMode::Build,
+    }
+}
+
+/// 当前审批模式的线格字符串（"build" / "accept_edits" / "bypass" / "plan"），
+/// 供 Snapshot / 广播使用。
 fn live_current_mode_wire() -> String {
     live_current_approval_mode().wire().to_string()
 }
 
-/// 当前 LiveSession 的 telemetry mode（来自 X-AtomCode-Client 请求头）。
-/// live_message / live_stream 端点写入；DaemonTurnExecutor::run_turn 读取后设置
-/// CurrentContext.mode，确保 live 路径发出的遥测事件携带正确的 client 来源。
-static LIVE_MODE: StdMutex<Option<atomcode_telemetry::SessionMode>> = StdMutex::new(None);
-
-/// 当前 LiveSession 生效的工作目录。None=用执行器创建时的目录。
-/// webui 的 /cd（change_dir → live_set_working_dir）更新；两个执行器每轮读取，
-/// 因此 sync/live 模式下 /cd 切目录才能对下一轮生效——执行器是 Arc<dyn> 且其
-/// working_dir 在创建时冻结，故沿用 LIVE_PROVIDER 的进程级覆盖模式（issue #755）。
-/// 会话创建/替换时（ensure_live_session_global）同步为新会话的目录，避免上一次
-/// /cd 的残留值污染在另一项目里新建的会话。
-static LIVE_WORKING_DIR: StdMutex<Option<std::path::PathBuf>> = StdMutex::new(None);
-
-/// 读取当前生效的工作目录覆盖（无则回退到 `fallback`，即执行器创建时的目录）。
+/// Coding Runtime 是工作目录的唯一运行时所有者；未绑定时使用 daemon 项目状态。
 fn live_current_working_dir(fallback: &Path) -> std::path::PathBuf {
-    LIVE_WORKING_DIR
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .unwrap_or_else(|| fallback.to_path_buf())
-}
-
-fn send_agent_command(
-    client: &AgentClient,
-    command: AgentCommand,
-    action: &str,
-) -> Result<(), TurnEvent> {
-    client.cmd_tx.send(command).map_err(|_| {
-        TurnEvent::Error(format!(
-            "engine v2：{}失败，kernel 命令通道已关闭，请重试本轮会话",
-            action
-        ))
-    })
+    crate::native_live::binding()
+        .map(|binding| binding.working_dir)
+        .unwrap_or_else(|_| fallback.to_path_buf())
 }
 
 struct AuthoritativeTerminal {
     snapshot: ConversationSnapshot,
-    cancelled: bool,
 }
 
-/// 设置当前 LiveSession 选中的 provider（None 时不覆盖，保留既有选择）。
-fn set_live_provider(provider: Option<String>) {
-    if let Some(p) = provider {
-        live_set_provider(p);
-    }
-}
-
-/// 设置进程级选中 provider 并把切换广播给所有视图（TUI live 转发器 / 其他 webui tab）。
-/// webui 下拉框（/live/provider）、/live/message 带的 provider、以及 TUI 的 /model 选择器
-/// 都经此处，确保任一端切换模型时，另一端的下拉框与头部显示都能实时跟随。
-pub fn live_set_provider(provider: String) {
-    *LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(provider.clone());
-    if let Some(s) = current_live_session() {
-        s.notify_provider_changed(provider);
-    }
-}
-
-/// 设置进程级审批模式并广播给所有视图（webui 底栏 pill / 其他 tab）。下一轮
-/// `run_turn` 读 `LIVE_APPROVAL_MODE` 选 decider。无活动 LiveSession 时仍更新
-/// 状态（下次 ensure 出会话即生效），只是没有订阅者收到广播（无妨）。
+/// 设置 live 视图审批模式；已绑定 runtime 的调用方另行下发 `SetMode`。
 pub fn live_set_mode(mode: ApprovalMode) {
     *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
-    if let Some(s) = current_live_session() {
-        s.notify_mode_changed(mode.wire().to_string());
+    if let Ok(binding) = crate::native_live::binding() {
+        let _ = crate::native_live::publish_unsequenced(
+            &binding,
+            atomcode_coding::CodingRuntimeEvent::ModeChanged {
+                mode: native_runtime_mode(mode),
+            },
+        );
     }
 }
 
@@ -172,15 +116,9 @@ impl Drop for ScopedApprovalModeForTest {
     }
 }
 
-/// 把 webui 的 /cd 工作目录切换广播给所有视图。同进程 sync 模式下的 TUI live
-/// 转发器据此切目录并开一个全新会话。无活动 LiveSession 时静默跳过（如 headless
-/// daemon 无 TUI 附着）。跨进程（独立 daemon + 浏览器）不覆盖——那条路需要 TUI
-/// 作为 /live 网络客户端订阅。
+/// 同步 daemon 的项目视图状态；运行时切换由 CodingRuntime 的可等待接口负责。
 pub fn live_set_working_dir(dir: std::path::PathBuf) {
-    // 记录进程级覆盖，供两个执行器下一轮读取（修复 #755：sync 模式下 /cd 后模型
-    // 仍报旧目录——执行器的 working_dir 在创建时冻结，仅靠广播无法让引擎切目录）。
     let dir = crate::normalize_working_dir_case(dir);
-    *LIVE_WORKING_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
 
     if let Some(store) = crate::DAEMON_PROJECT.lock().unwrap().as_ref() {
         let store = store.clone();
@@ -196,10 +134,10 @@ pub fn live_set_working_dir(dir: std::path::PathBuf) {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "project".to_string());
-                    let new_key = atomcode_core::tool::path_case_key(&dir);
+                    let new_key = atomcode_capabilities::pathnorm::path_case_key(&dir);
                     project
                         .recent_dirs
-                        .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+                        .retain(|d| atomcode_capabilities::pathnorm::path_case_key(d) != new_key);
                     project.recent_dirs.insert(0, dir.clone());
                     project.recent_dirs.truncate(5);
                 }
@@ -214,209 +152,32 @@ pub fn live_set_working_dir(dir: std::path::PathBuf) {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "project".to_string());
-                let new_key = atomcode_core::tool::path_case_key(&dir);
+                let new_key = atomcode_capabilities::pathnorm::path_case_key(&dir);
                 project
                     .recent_dirs
-                    .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+                    .retain(|d| atomcode_capabilities::pathnorm::path_case_key(d) != new_key);
                 project.recent_dirs.insert(0, dir.clone());
                 project.recent_dirs.truncate(5);
             }
         }
     }
-
-    if let Some(s) = current_live_session() {
-        s.notify_working_dir_changed(dir);
-    }
 }
 
-/// 把新会话创建事件广播给所有视图。webui 新建对话时调用，让同进程 TUI 跟随
-/// 切换到新会话。无活动 LiveSession 时静默跳过。
-/// 注意：不更新 LIVE_SESSION_ID——该变量由 ensure_live_session_global 在
-/// 实际创建/替换 LiveSession 时更新；提前更新会导致 ensure_live_session_global
-/// 误判旧 LiveSession 已匹配新 session_id 而复用它。
-pub fn live_switch_session(session_id: atomcode_core::session::SessionId) {
-    let id_str = session_id.to_string();
-    if let Some(s) = current_live_session() {
-        s.notify_session_switched(id_str);
-    }
+/// 请求当前 Coding Runtime 恢复指定会话。
+pub async fn live_switch_session(
+    session_id: String,
+) -> Result<atomcode_coding::SessionChanged, crate::live_hub::HubError> {
+    crate::native_live::resume_session(session_id).await
 }
 
-/// 当前生效的 provider 名：优先进程级选择（LIVE_PROVIDER），回退 config 默认。
-/// 供 /live 快照在新 tab 连上时回显正确的选中模型。
+/// 当前生效的 provider 名由绑定 runtime 投影；未绑定时才回退共享启动默认。
 fn live_current_provider() -> String {
-    if let Some(p) = LIVE_PROVIDER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-    {
-        return p;
+    if let Ok(binding) = crate::native_live::binding() {
+        return binding.provider;
     }
     Config::load(&Config::default_path())
         .map(|c| c.default_provider)
         .unwrap_or_default()
-}
-
-/// 进程级共享 MCP 缓存（供 TUI 侧 ensure_live_session 使用，无需 AppState）。
-static LIVE_MCP_CACHE: OnceLock<
-    Arc<
-        tokio::sync::RwLock<
-            std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>,
-        >,
-    >,
-> = OnceLock::new();
-
-fn live_mcp_cache(
-) -> Arc<tokio::sync::RwLock<std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>>>
-{
-    LIVE_MCP_CACHE
-        .get_or_init(|| Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))
-        .clone()
-}
-
-/// 取当前活动 LiveSession（无则 None）。供 TUI（同进程）附着用。
-pub fn current_live_session() -> Option<Arc<atomcode_core::live::LiveSession>> {
-    LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
-/// Return the MCP registry that serves the *current live session's* tools, if a
-/// live session exists. In sync mode (TUI `/webui`) this is the registry the AI
-/// actually uses — kept in the process-global MCP cache, keyed by the live
-/// session's working_dir — which is distinct from the daemon's startup
-/// `state.mcp_registry`. Lets `/mcp/status` report what's really connected
-/// instead of a separate registry that reconnects on the side.
-pub(crate) async fn live_serving_mcp_registry() -> Option<Arc<McpRegistry>> {
-    let working_dir = LIVE_WORKING_DIR
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()?;
-    let cache = live_mcp_cache();
-    let guard = cache.read().await;
-    guard.get(&working_dir).map(|entry| entry.registry.clone())
-}
-
-/// 取或建当前活动 LiveSession（TUI 与 /live 共用）。进程级单例。
-/// 不需要传入 AppState — 使用进程级共享 MCP 缓存。
-///
-/// `session_id`：若提供，则复用此 session_id（而非生成新的），使 LiveSession 与
-/// TUI/WebUI 的当前会话落到同一个文件，修复 #561（三端历史分离）。
-/// `initial_snapshot`：作为 LiveSession 的完整初始对话状态导入。
-pub fn ensure_live_session(
-    working_dir: std::path::PathBuf,
-    telemetry: Arc<atomcode_telemetry::Telemetry>,
-    session_id: Option<atomcode_core::session::SessionId>,
-    initial_snapshot: ConversationSnapshot,
-) -> Arc<atomcode_core::live::LiveSession> {
-    // TUI 调用方传入的是已在内存里的完整 conversation snapshot。
-    ensure_live_session_global(
-        working_dir,
-        live_mcp_cache(),
-        telemetry,
-        session_id,
-        move || (initial_snapshot.messages, initial_snapshot.cold_summaries),
-    )
-}
-
-/// 取或建当前活动 LiveSession（webui /live 用）。阶段③ Task 3 会把 auto_approve 改交互式。
-///
-/// `session_id`：若提供且与现有 LiveSession 不同，则替换（解决 #561：TUI/WebUI
-/// 切换到新会话后 sync 应跟随）。None 时复用已有 LiveSession 或新建。
-/// `initial_session`：**惰性**闭包，仅在确实要新建/替换 LiveSession 时（持锁内）
-/// 求值。复用既有会话时根本不会调用，从而避免 webui 每条消息都为被丢弃的历史读盘。
-pub(crate) fn ensure_live_session_global(
-    working_dir: std::path::PathBuf,
-    // Retained in the signature for call-site compatibility; the kernel executor
-    // resolves MCP itself, so this daemon-level cache is no longer read here.
-    _mcp_cache: Arc<
-        tokio::sync::RwLock<
-            std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>,
-        >,
-    >,
-    telemetry: Arc<atomcode_telemetry::Telemetry>,
-    session_id: Option<atomcode_core::session::SessionId>,
-    initial_session: impl FnOnce() -> (
-        Vec<atomcode_core::conversation::message::Message>,
-        Vec<String>,
-    ),
-) -> Arc<atomcode_core::live::LiveSession> {
-    let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    // 若已有 LiveSession 且 session_id 匹配（或调用方未指定），直接复用。
-    if let Some(s) = g.as_ref() {
-        let dominated = match &session_id {
-            Some(req) => {
-                LIVE_SESSION_ID
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_deref()
-                    == Some(req.as_str())
-            }
-            None => true,
-        };
-        if dominated {
-            // Diagnostics via core's `ctrace!` (file sink, gated by
-            // ATOMCODE_TRACE), never eprintln: under /webui the embedded
-            // HTTP server runs in the TUI process, so stderr lands on the
-            // raw-mode terminal and corrupts the display. See core trace.rs.
-            atomcode_core::ctrace!(
-                "LIVE",
-                "ensure_global REUSE existing session, dominated=true, req_id={:?} live_id={:?}",
-                session_id,
-                LIVE_SESSION_ID
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_deref()
-            );
-            return s.clone();
-        }
-        // session_id 不匹配 → 当前 LiveSession 属于旧会话，需要替换。
-        atomcode_core::ctrace!(
-            "LIVE",
-            "ensure_global REPLACE old session, dominated=false, req_id={:?} live_id={:?}",
-            session_id,
-            LIVE_SESSION_ID
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_deref()
-        );
-    } else {
-        atomcode_core::ctrace!(
-            "LIVE",
-            "ensure_global CREATE new session, no existing, req_id={:?}",
-            session_id
-        );
-    }
-    let session_id = session_id.unwrap_or_default();
-    // 存储稳定的 session_id 字符串，供 /live SSE 在 Snapshot 中暴露。
-    *LIVE_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
-    // 新会话的目录即为当前生效目录：重置 /cd 覆盖，避免上一会话的 /cd 残留值
-    // 污染在另一项目里新建/替换的会话（issue #755）。仅在确实新建/替换时执行，
-    // 复用既有会话的分支已在上方提前 return，不会走到这里。
-    *LIVE_WORKING_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(working_dir.clone());
-    atomcode_core::ctrace!("LIVE", "daemon live turns on the kernel stack");
-    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(KernelTurnExecutor::new(
-        working_dir,
-        None,
-        false,
-        session_id,
-        telemetry,
-    ));
-    // 历史在锁内、确认要建会话后才求值——既省掉无谓读盘，也避免「锁外判定、锁内已被
-    // 别的请求替换」的 TOCTOU：是否新建与用什么历史新建是同一临界区里的决定。
-    let (initial_messages, cold_summaries) = initial_session();
-    let session = atomcode_core::live::LiveSession::new_with_cold_summaries(
-        executor,
-        initial_messages,
-        cold_summaries,
-    );
-    *g = Some(session.clone());
-    session
-}
-/// 取当前 LiveSession 的稳定 session_id 字符串（无则 "unknown"）。
-fn live_session_id_or_unknown() -> String {
-    LIVE_SESSION_ID
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// All components needed to run one agent turn.
@@ -425,6 +186,34 @@ pub(crate) struct TurnParts {
     pub tools: Arc<ToolRegistry>,
     pub ctx: Arc<dyn atomcode_core::ctx::CtxBuilder>,
     pub system_prompt: String,
+}
+
+pub(crate) fn commit_mcp_cache_miss(
+    cache: &mut HashMap<PathBuf, CachedMcpRegistry>,
+    working_dir: PathBuf,
+    candidate: Arc<McpRegistry>,
+) -> Arc<McpRegistry> {
+    if let Some(current) = cache.get_mut(&working_dir) {
+        current.last_used = std::time::Instant::now();
+        return current.registry.clone();
+    }
+    if cache.len() >= crate::MCP_CACHE_MAX {
+        if let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, value)| value.last_used)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest_key);
+        }
+    }
+    cache.insert(
+        working_dir,
+        CachedMcpRegistry {
+            registry: candidate.clone(),
+            last_used: std::time::Instant::now(),
+        },
+    );
+    candidate
 }
 
 /// 独立构造 turn 组件（与 process_chat_request 等价，但不复用其代码）。
@@ -454,8 +243,15 @@ pub(crate) async fn build_turn_parts(
         .get(&resolved_provider_name)
         .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved_provider_name))?;
 
-    // Create provider instance
-    let provider = provider::create_provider(provider_config)?;
+    // Create provider instance. `create_provider` may do blocking auth I/O
+    // (OAuth token refresh) — run it off the async runtime so a slow/unreachable
+    // auth host can't block a worker thread.
+    let provider = {
+        let cfg = provider_config.clone();
+        tokio::task::spawn_blocking(move || provider::create_provider(&cfg))
+            .await
+            .map_err(|e| anyhow::anyhow!("provider construction task panicked: {e}"))??
+    };
 
     // Build tool context — use "live" as session-id label
     let mut tool_context =
@@ -501,26 +297,10 @@ pub(crate) async fn build_turn_parts(
             new_registry
                 .wait_for_initial_connections(Duration::from_secs(5))
                 .await;
-            // Store in cache
+            // Store only if another reload/cache-miss did not win while the
+            // connection attempt was in flight.
             let mut cache = mcp_cache.write().await;
-            // Evict LRU if cache is full
-            if cache.len() >= crate::MCP_CACHE_MAX {
-                if let Some(oldest_key) = cache
-                    .iter()
-                    .min_by_key(|(_, v)| v.last_used)
-                    .map(|(k, _)| k.clone())
-                {
-                    cache.remove(&oldest_key);
-                }
-            }
-            cache.insert(
-                working_dir_buf.clone(),
-                CachedMcpRegistry {
-                    registry: new_registry.clone(),
-                    last_used: std::time::Instant::now(),
-                },
-            );
-            new_registry
+            commit_mcp_cache_miss(&mut cache, working_dir_buf.clone(), new_registry)
         }
     };
     // Update last_used timestamp
@@ -583,155 +363,7 @@ pub(crate) async fn build_turn_parts(
     })
 }
 
-
 // ============================================================================
-// Engine v2: kernel-backed TurnExecutor (via atomcode-bridge)
-// ============================================================================
-
-/// `TurnExecutor` backed by the new stack, presented through atomcode-bridge's
-/// legacy channel protocol. ONE bridge runtime per LiveSession (persistent across
-/// turns) so MCP/memory are prepared once, not per message. `conv` stays the
-/// source of truth: the bridge is seeded from it on the first turn, then each turn
-/// sends only the new user message and the engine's resulting snapshot is written
-/// back.
-pub(crate) struct KernelTurnExecutor {
-    working_dir: PathBuf,
-    provider_name: Option<String>,
-    /// Phase-2 default false (interactive); the approver slot is wired to the
-    /// bridge's ApproveTool/DenyTool exactly as the legacy executor wires it to
-    /// the PermissionDecider.
-    auto_approve: bool,
-    session_id: atomcode_core::session::SessionId,
-    telemetry: Arc<Telemetry>,
-    /// Persistent bridge runtime; built lazily on the first turn.
-    bridge: Mutex<Option<BridgeState>>,
-}
-
-struct BridgeState {
-    client: AgentClient,
-    events: mpsc::UnboundedReceiver<DaemonRuntimeEvent>,
-    /// Whether the pre-existing history has been seeded into the bridge.
-    seeded: bool,
-    /// The provider name used to build this bridge. Compared against
-    /// `LIVE_PROVIDER` on each `run_turn` to detect model switches
-    /// that require a `ReloadConfig` to the bridge runtime.
-    provider_name: String,
-    /// The working directory this bridge is currently rooted at. Compared
-    /// against `LIVE_WORKING_DIR` on each `run_turn` to detect a `/cd` that
-    /// requires a `ChangeDir` (→ bridge respawn(Fresh)) so the new project's
-    /// system prompt / context bind. Without this, a sync-mode `/cd` updates
-    /// the override but the bridge's frozen session context still names the
-    /// old project — the model reports the stale cwd (issue #755).
-    working_dir: std::path::PathBuf,
-}
-
-impl KernelTurnExecutor {
-    pub(crate) fn new(
-        working_dir: PathBuf,
-        provider_name: Option<String>,
-        auto_approve: bool,
-        session_id: atomcode_core::session::SessionId,
-        telemetry: Arc<Telemetry>,
-    ) -> Self {
-        Self {
-            working_dir,
-            provider_name,
-            auto_approve,
-            session_id,
-            telemetry,
-            bridge: Mutex::new(None),
-        }
-    }
-
-    /// Resolve the currently active provider name using the same precedence as
-    /// `bridge_config`: LIVE_PROVIDER → executor default → config default.
-    fn resolve_provider_name(&self) -> String {
-        let live = LIVE_PROVIDER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        live.or_else(|| self.provider_name.clone())
-            .unwrap_or_else(|| {
-                Config::load(&Config::default_path())
-                    .map(|c| c.default_provider)
-                    .unwrap_or_default()
-            })
-    }
-
-    /// Resolve the bridge config from the live provider selection + on-disk config.
-    /// Mirrors `build_turn_parts`' provider resolution (LIVE_PROVIDER → executor
-    /// default → config default).
-    fn bridge_config(&self) -> Option<atomcode_bridge::BridgeConfig> {
-        let config = Config::load(&Config::default_path()).ok()?;
-        let name = self.resolve_provider_name();
-        let p = config.providers.get(&name)?;
-        Some(atomcode_bridge::BridgeConfig {
-            api_key: p.api_key.clone().unwrap_or_default(),
-            base_url: p.base_url.clone().unwrap_or_default(),
-            model: p.model.clone(),
-            // Honor a live `/cd` override (issue #755) when first building the bridge;
-            // falls back to the executor's creation dir.
-            working_dir: live_current_working_dir(&self.working_dir),
-            context_window: p.context_window as u32,
-            max_tokens: p.max_tokens.map(|m| m as u32),
-            mcp: true,
-            telemetry: Some(self.telemetry.clone()),
-            reasoning_history: p.reasoning_history.clone(),
-            reasoning_effort: p.reasoning_effort.clone(),
-            provider_type: p.provider_type.clone(),
-            thinking_enabled: p.thinking_enabled,
-            thinking_type: p.thinking_type.clone(),
-            thinking_keep: p.thinking_keep.clone(),
-            // The daemon answers approvals at its OWN driver seam (the `/live`
-            // BypassAll decider / `/chat` interactive perm_rx), so the bridge must
-            // NOT auto-approve — keep the round-trip and the daemon decides.
-            dangerously_skip_permissions: false,
-            // Keep the fail-closed approval timeout for the daemon (current behavior); the
-            // interactive PARK behavior is wired for the cli TUI path for now.
-            interactive: false,
-            keep_interrupted_context: config.keep_interrupted_context,
-            user_agent: p.user_agent.clone(),
-            skip_tls_verify: p.skip_tls_verify,
-            loop_max_rounds: config.loop_config.max_rounds,
-        })
-    }
-}
-
-/// Persist an AI-generated session rename without setting `user_renamed`.
-/// Guards with `should_accept_ai_name` — silently no-ops if the session has
-/// already been user-renamed or has a non-default AI name.
-/// Returns `Ok(true)` when the AI name was actually applied+persisted, `Ok(false)`
-/// when the guard rejected it (already user-renamed / already AI-named) so the
-/// caller can skip the broadcast — otherwise browser tabs would flip to a name
-/// that was never persisted (and could contradict an explicit `/rename`).
-fn ai_rename_session_file(
-    working_dir: &std::path::Path,
-    session_id: &atomcode_core::session::SessionId,
-    new_name: &str,
-) -> std::io::Result<bool> {
-    use atomcode_core::session::SessionManager;
-    let mut session = SessionManager::load_any(session_id)?;
-    if !atomcode_core::agent::session_title::should_accept_ai_name(
-        session.user_renamed,
-        session.ai_named,
-    ) {
-        return Ok(false);
-    }
-    session.name = new_name.to_string();
-    session.ai_named = true;
-    session.touch();
-    // Save via the session's own working_dir (most accurate); fall back to the
-    // executor working_dir only if the session's stored path is missing/wrong.
-    let save_dir = if session.working_dir.as_os_str().is_empty() {
-        working_dir.to_path_buf()
-    } else {
-        session.working_dir.clone()
-    };
-    SessionManager::new(&save_dir).save(&session)?;
-    Ok(true)
-}
-
-/// Pull the text + images out of the just-appended user message.
 fn extract_user_input(
     m: &atomcode_core::conversation::message::Message,
 ) -> (String, Vec<ImagePart>) {
@@ -742,505 +374,6 @@ fn extract_user_input(
             (text.clone().unwrap_or_default(), images.clone())
         }
         _ => (String::new(), Vec::new()),
-    }
-}
-
-#[async_trait]
-impl TurnExecutor for KernelTurnExecutor {
-    async fn preprocess_input(&self, input: UserInput) -> UserInput {
-        if input.images.is_empty() {
-            return input;
-        }
-        let live_provider = LIVE_PROVIDER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
-        let original_text = input.text.clone();
-        let text = preprocess_live_caption(
-            &input.text,
-            &input.images,
-            provider_name,
-            Some(self.session_id.as_str()),
-        )
-        .await;
-        // VL 预处理成功后（text 发生了变化），图片已被转成文字，清空 images
-        // 以免 kernel 的 provider adapter 把原图发给不支持视觉的模型（导致 400 错误）
-        let images = if text != original_text {
-            Vec::new()
-        } else {
-            input.images
-        };
-        UserInput { text, images }
-    }
-
-    async fn run_turn(
-        &self,
-        conv: &Arc<Mutex<Conversation>>,
-        events: broadcast::Sender<LiveEvent>,
-        approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
-        cancel: CancellationToken,
-    ) {
-        let emit = |te: TurnEvent| {
-            let _ = events.send(LiveEvent::Turn(te));
-        };
-
-        // Lazily build the persistent bridge for this LiveSession.
-        let mut guard = self.bridge.lock().await;
-        if guard.is_none() {
-            let Some(cfg) = self.bridge_config() else {
-                emit(TurnEvent::Error("engine v2：provider 未配置".into()));
-                return;
-            };
-            let provider_name = self.resolve_provider_name();
-            let working_dir = live_current_working_dir(&self.working_dir);
-            let (client, rx) = crate::kernel_runtime::spawn_daemon_runtime(cfg);
-            *guard = Some(BridgeState {
-                client,
-                events: rx,
-                seeded: false,
-                provider_name,
-                working_dir,
-            });
-        }
-
-        // Detect model switch: if LIVE_PROVIDER changed since this bridge was built,
-        // send ReloadConfig so the bridge runtime updates its system prompt, provider,
-        // and context strategy. Without this, a webui dropdown switch updates
-        // LIVE_PROVIDER but the bridge's frozen system prompt still carries the old
-        // model name — the agent mis-identifies itself (issue #659).
-        let (client, should_seed) = {
-            let current_provider = self.resolve_provider_name();
-            let state = guard.as_mut().unwrap();
-            if current_provider != state.provider_name {
-                if let Ok(new_config) = Config::load(&Config::default_path()) {
-                    let _ = state
-                        .client
-                        .cmd_tx
-                        .send(atomcode_core::agent::AgentCommand::ReloadConfig(new_config));
-                }
-                state.provider_name = current_provider;
-            }
-
-            // Detect working-dir switch: a sync-mode `/cd` updated LIVE_WORKING_DIR but the
-            // persistent bridge is still rooted at the old project (its session context is
-            // frozen at prepare time). Send ChangeDir so the bridge respawn(Fresh)es into the
-            // new dir — the SAME mechanism the TUI uses — rebinding persona/context/cwd.
-            // Mirrors the model-switch detection above (issue #755). NOTE: respawn(Fresh)
-            // starts the new project's conversation empty; `seeded` stays true so we do NOT
-            // re-push the old project's history (matches /cd = a fresh session in the new dir).
-            let current_dir = live_current_working_dir(&self.working_dir);
-            if current_dir != state.working_dir {
-                let _ = state
-                    .client
-                    .cmd_tx
-                    .send(atomcode_core::agent::AgentCommand::ChangeDir(
-                        current_dir.to_string_lossy().into_owned(),
-                    ));
-                state.working_dir = current_dir;
-            }
-
-            (state.client.clone(), !state.seeded)
-        };
-
-        // `conv` already has the just-typed user message appended (coordinator).
-        // Split it off: the prefix seeds the bridge (first turn only), the last
-        // message is sent as this turn's input. `turn_base` keeps the FULL message
-        // list (incl. the user message) for the crash-durable in-progress saves below.
-        let (prefix, user_text, user_images, turn_base) = {
-            let c = conv.lock().await;
-            let turn_base = c.messages.clone();
-            let mut msgs = c.messages.clone();
-            let last = msgs.pop();
-            let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
-            (
-                ConversationSnapshot {
-                    messages: msgs,
-                    cold_summaries: c.cold_summaries.clone(),
-                },
-                text,
-                images,
-                turn_base,
-            )
-        };
-
-        // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
-        // （非视觉模型的 provider adapter 会因原图而报 400 错误）
-        let user_images = if user_text.contains("[图片内容（由")
-            || user_text.contains("[图片识别失败]")
-        {
-            Vec::new()
-        } else {
-            user_images
-        };
-        let effective_mode = if self.auto_approve {
-            ApprovalMode::Auto
-        } else {
-            live_current_approval_mode()
-        };
-        if let Err(event) = send_agent_command(
-            &client,
-            AgentCommand::SetPlanMode(effective_mode == ApprovalMode::Plan),
-            "切换 Plan 模式",
-        ) {
-            *guard = None;
-            emit(event);
-            return;
-        }
-
-        if should_seed {
-            if let Err(event) = send_agent_command(
-                &client,
-                AgentCommand::SetConversation {
-                    snapshot: prefix,
-                    restore_id: None,
-                },
-                "初始化桥接会话",
-            ) {
-                *guard = None;
-                emit(event);
-                return;
-            }
-        }
-        if let Err(event) = send_agent_command(
-            &client,
-            AgentCommand::SendMessage {
-                text: user_text,
-                images: user_images,
-                image_markers: Vec::new(),
-            },
-            "发送用户消息",
-        ) {
-            *guard = None;
-            emit(event);
-            return;
-        }
-        if should_seed {
-            guard.as_mut().unwrap().seeded = true;
-        }
-
-        // DURABILITY — fix A: persist the user message to the stable `.json` NOW, before
-        // the (possibly long, possibly laggy) turn runs. A hard kill / window-close
-        // mid-turn otherwise loses the WHOLE unfinished turn, since the webui loads from
-        // `.json` and the terminal save below never runs. Best-effort: a write miss must
-        // not block the turn (and the terminal save is authoritative). See
-        // `save_live_session_json`.
-        let _ = save_live_session_json(&self.working_dir, &self.session_id, turn_base.clone());
-
-        // DURABILITY — fix B: accumulate streamed assistant TEXT and re-persist on a
-        // throttle, so a crash while the model is still answering preserves how far it
-        // got. The provisional message is text-only (NO tool_calls) so the on-disk
-        // conversation is always resume- and display-safe; the terminal writeback below
-        // replaces it with the authoritative snapshot on a clean finish.
-        let mut assistant_buf = String::new();
-        let mut last_progress_persist = std::time::Instant::now();
-        // Bytes of `assistant_buf` already on disk — skip a re-save when the text hasn't
-        // grown (e.g. a tool BATCH fires many ToolCallStarted with identical preceding
-        // narration, which would otherwise rewrite the same file N times).
-        let mut persisted_len: usize = 0;
-        const PROGRESS_PERSIST_INTERVAL: std::time::Duration =
-            std::time::Duration::from_millis(1500);
-        // Build [turn_base + provisional assistant(text)] and persist it (best-effort).
-        let persist_progress = |text: &str| {
-            if text.is_empty() {
-                return;
-            }
-            let mut msgs = turn_base.clone();
-            msgs.push(atomcode_core::conversation::message::Message::new(
-                atomcode_core::conversation::message::Role::Assistant,
-                text,
-            ));
-            let _ = save_live_session_json(&self.working_dir, &self.session_id, msgs);
-        };
-
-        // Interactive approval: register the response sender so any view's
-        // `LiveSession.approve()` delivers the decision here.
-        let mut perm_rx = if effective_mode == ApprovalMode::Build {
-            let (tx, rx) = mpsc::unbounded_channel::<PermissionDecision>();
-            *approver.lock().await = Some(tx);
-            Some(rx)
-        } else {
-            None
-        };
-
-        let state = guard.as_mut().unwrap();
-        let mut cancelled = false;
-        let mut bridge_dead = false;
-        let final_messages = loop {
-            let ev = tokio::select! {
-                _ = cancel.cancelled(), if !cancelled => {
-                    cancelled = true;
-                    let _ = client.cmd_tx.send(AgentCommand::Cancel);
-                    continue;
-                }
-                ev = state.events.recv() => ev,
-            };
-            let Some(ev) = ev else {
-                // Bridge task exited (channel closed). Drop it after the loop so the
-                // next turn respawns instead of no-op'ing on a dead bridge forever.
-                bridge_dead = true;
-                break None;
-            };
-            let ev = match ev {
-                DaemonRuntimeEvent::Legacy(event) => event,
-                DaemonRuntimeEvent::TurnCancelledWithoutSnapshot {
-                    runtime_terminated,
-                } => {
-                    bridge_dead |= runtime_terminated;
-                    break None;
-                }
-                DaemonRuntimeEvent::Native(event) => {
-                    let compact_snapshot = match committed_compaction_snapshot(&event) {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            emit(TurnEvent::Error(error.into()));
-                            continue;
-                        }
-                    };
-                    if let Some(snapshot) = compact_snapshot {
-                        {
-                            let mut conversation = conv.lock().await;
-                            *conversation = Conversation::from_snapshot(snapshot.clone());
-                        }
-                        if let Err(error) = save_live_compaction_json(
-                            &self.working_dir,
-                            &self.session_id,
-                            snapshot,
-                        ) {
-                            emit(TurnEvent::Error(format!(
-                                "compact session save failed: {error}"
-                            )));
-                            continue;
-                        }
-                    }
-                    if let Some(event) = coding_runtime_to_turn(event) {
-                        emit(event);
-                    }
-                    continue;
-                }
-            };
-            match ev {
-                AgentEvent::TextDelta(t) => {
-                    // fix B: accumulate, then throttle a crash-durable progress save.
-                    assistant_buf.push_str(&t);
-                    emit(TurnEvent::TextDelta(t));
-                    if last_progress_persist.elapsed() >= PROGRESS_PERSIST_INTERVAL
-                        && assistant_buf.len() != persisted_len
-                    {
-                        persist_progress(&assistant_buf);
-                        last_progress_persist = std::time::Instant::now();
-                        persisted_len = assistant_buf.len();
-                    }
-                }
-                AgentEvent::ReasoningDelta(t) => emit(TurnEvent::ReasoningDelta(t)),
-                AgentEvent::ToolCallStreaming { name, hint } => {
-                    emit(TurnEvent::ToolCallStreaming { name, hint })
-                }
-                AgentEvent::ToolCallStarted {
-                    id,
-                    name,
-                    arguments,
-                } => {
-                    // A tool can run long; flush the assistant narration that preceded it
-                    // so a crash DURING the tool still shows what the model just said.
-                    // Skip when nothing new accumulated (batched tool calls share text).
-                    if assistant_buf.len() != persisted_len {
-                        persist_progress(&assistant_buf);
-                        last_progress_persist = std::time::Instant::now();
-                        persisted_len = assistant_buf.len();
-                    }
-                    emit(TurnEvent::ToolCallStarted {
-                        id,
-                        name,
-                        arguments,
-                    })
-                }
-                AgentEvent::ToolOutputChunk { call_id, chunk } => {
-                    emit(TurnEvent::ToolOutputChunk { call_id, chunk })
-                }
-                AgentEvent::ToolCallResult {
-                    call_id,
-                    name,
-                    output,
-                    success,
-                    duration,
-                } => emit(TurnEvent::ToolCallResult {
-                    call_id,
-                    name,
-                    output,
-                    success,
-                    duration,
-                }),
-                AgentEvent::TokenUsage(u) => emit(TurnEvent::TokenUsage {
-                    prompt_tokens: u.prompt_tokens,
-                    completion_tokens: u.completion_tokens,
-                    total_tokens: u.prompt_tokens + u.completion_tokens,
-                    cached_tokens: u.cached_tokens,
-                }),
-                AgentEvent::ContextStats {
-                    system_tokens,
-                    sent_tokens,
-                    dropped_tokens,
-                    working_set_tokens,
-                    total_messages,
-                    ..
-                } => emit(TurnEvent::ContextStats {
-                    system_tokens,
-                    sent_tokens,
-                    dropped_tokens,
-                    working_set_tokens,
-                    total_messages,
-                }),
-                AgentEvent::WorkingDirChanged(p) => emit(TurnEvent::WorkingDirChanged(p)),
-                AgentEvent::Warning(w) => emit(TurnEvent::Warning(w)),
-                AgentEvent::ApprovalNeeded {
-                    tool_name,
-                    reason,
-                    call,
-                    snapshot,
-                } => {
-                    let call_id = call.id.clone();
-                    emit(TurnEvent::ApprovalRequested {
-                        tool_name,
-                        reason,
-                        call,
-                        snapshot,
-                    });
-                    let decision = match &mut perm_rx {
-                        None => fallback_approval_decision(effective_mode),
-                        Some(rx) => {
-                            tokio::select! {
-                                _ = cancel.cancelled(), if !cancelled => {
-                                    cancelled = true;
-                                    // Deny this tool AND stop the turn — without the
-                                    // Cancel the outer cancel branch is now disabled
-                                    // (`if !cancelled`) so the turn would otherwise run
-                                    // on after a single denied tool.
-                                    let _ = client.cmd_tx.send(AgentCommand::Cancel);
-                                    PermissionDecision::Deny
-                                }
-                                d = rx.recv() => d.unwrap_or(PermissionDecision::Deny),
-                            }
-                        }
-                    };
-                    // 广播审批已解决，让其他视图（App/WebUI）同步卡片状态。
-                    let decision_str = match decision {
-                        PermissionDecision::Allow => "allow",
-                        PermissionDecision::AllowAlways => "always_allow",
-                        _ => "deny",
-                    };
-                    emit(TurnEvent::ApprovalResolved {
-                        call_id,
-                        decision: decision_str.to_string(),
-                    });
-                    let cmd = match decision {
-                        PermissionDecision::Allow => AgentCommand::ApproveTool,
-                        PermissionDecision::AllowAlways => AgentCommand::ApproveToolAlways,
-                        PermissionDecision::Ask(_) | PermissionDecision::Deny => {
-                            AgentCommand::DenyTool
-                        }
-                    };
-                    let _ = client.cmd_tx.send(cmd);
-                }
-                AgentEvent::Error { error, .. } => {
-                    // NON-terminal. The bridge forwards the kernel error HERE and then
-                    // still emits a terminal TurnComplete/TurnCancelled (or closes the
-                    // channel). Breaking now would (a) write back the bridge's empty
-                    // `messages` and WIPE the conversation + on-disk session, and (b)
-                    // leave the bridge's later terminal events to be mis-read by the
-                    // NEXT turn. Surface the error and keep draining to the real end.
-                    emit(TurnEvent::Error(error));
-                }
-                AgentEvent::RateLimited {
-                    reset_at_display,
-                    reset_label,
-                    secs_until_reset,
-                    auto_resuming,
-                } => emit(TurnEvent::RateLimited {
-                    reset_at_display,
-                    reset_label,
-                    secs_until_reset,
-                    auto_resuming,
-                }),
-                AgentEvent::TurnCancelled { snapshot } => {
-                    break Some(AuthoritativeTerminal {
-                        snapshot,
-                        cancelled: true,
-                    })
-                }
-                AgentEvent::TurnComplete { snapshot, .. } => {
-                    break Some(AuthoritativeTerminal {
-                        snapshot,
-                        cancelled: false,
-                    })
-                }
-                AgentEvent::SessionRenamed { name } => {
-                    // Persist on the daemon side (AI rename: sets name + ai_named,
-                    // never user_renamed). Broadcast to browser tabs ONLY when the
-                    // rename was actually applied — a guard-rejected name (already
-                    // user-renamed / AI-named) must not flip every tab's title to a
-                    // value that was never persisted.
-                    match ai_rename_session_file(&self.working_dir, &self.session_id, &name) {
-                        Ok(true) => {
-                            let _ = events.send(LiveEvent::SessionRenamed {
-                                session_id: self.session_id.to_string(),
-                                name,
-                            });
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            emit(TurnEvent::Warning(format!(
-                                "session rename persist failed: {e}"
-                            )));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        };
-
-        // The approval slot is per-turn; clear it so a stale sender can't leak.
-        *approver.lock().await = None;
-
-        // Writeback + AUTHORITATIVE terminal persist — the engine's snapshot becomes the
-        // conversation of record, and we overwrite the stable `<id>.json` with it (so
-        // /resume + the webui see the conversation after a quit). This replaces any
-        // provisional in-progress save (fix A/B above) with the engine's final messages.
-        // LOAD-MERGE-SAVE preserves `user_renamed` / accumulated fields — see
-        // `save_live_session_json`.
-        //
-        // CRITICAL: only when the engine actually delivered a terminal snapshot. If the
-        // bridge died mid-turn (`final_messages == None`), `conv` was never updated this
-        // turn, so persisting it would CLOBBER the richer in-progress save (fix A/B) with
-        // a staler `[.., user]` list — losing the partial turn the user should still see.
-        // A typed lifecycle-only cancellation also becomes None here: unlike a real
-        // terminal snapshot (which may legitimately be empty), it carries no history.
-        if let Some(terminal) = final_messages {
-            let snapshot = {
-                let mut c = conv.lock().await;
-                install_authoritative_terminal_snapshot(
-                    &mut c,
-                    terminal.snapshot,
-                    &turn_base,
-                );
-                c.snapshot()
-            };
-            let cancelled_turn_base = terminal.cancelled.then_some(turn_base.as_slice());
-            if let Err(e) = save_live_terminal_snapshot_json(
-                &self.working_dir,
-                &self.session_id,
-                snapshot,
-                cancelled_turn_base,
-            ) {
-                atomcode_core::ctrace!("LIVE", "failed to save live session (v2): {e}");
-            }
-        }
-
-        // A dead bridge can't serve another turn — drop it so the next run_turn
-        // rebuilds a fresh one (see the `guard.is_none()` lazy-init above).
-        if bridge_dead {
-            *guard = None;
-        }
     }
 }
 
@@ -1318,285 +451,6 @@ fn install_authoritative_terminal_snapshot(
     snapshot.messages = restore_images_from_turn_base(snapshot.messages, turn_base);
     *conversation = Conversation::from_snapshot(snapshot);
 }
-
-/// Persist the live conversation to the stable `<session_id>.json` (LOAD-MERGE-SAVE so
-/// `user_renamed` and other accumulated fields survive — not a blind overwrite). Called at
-/// THREE points across a v2 live turn: (1) turn START — so an interrupted / hard-killed
-/// turn's user message is durable and the unfinished turn stays VISIBLE on reopen (the
-/// webui loads from `.json`); (2) throttled MID-turn — so partial assistant text survives a
-/// crash; (3) the TERMINAL — the authoritative final snapshot.
-///
-/// Before this existed, only (3) ran, so a hard kill mid-turn lost the whole unfinished
-/// turn (the webui showed only prior completed turns — user-reported bug). Returns the
-/// IO result so the terminal caller can log a failure; the best-effort in-progress
-/// callers ignore it (a transient write miss must never break the turn).
-/// True when persisting `incoming` over `disk` would DROP already-persisted turns — a
-/// staler/divergent write must not silently shrink the on-disk conversation.
-///
-/// The metric is the count of real (non-synthetic) USER messages = completed turns, NOT
-/// total messages. Keying off USER turns is deliberate: within one turn the throttled
-/// Fix-B save persists a PROVISIONAL assistant message that the authoritative terminal
-/// snapshot may legitimately drop (cancel / timeout / rollback) — that lowers the total
-/// message count but keeps the user turns, so it is correctly allowed through. A stale
-/// clobber that loses a whole turn drops a USER message, so it is caught.
-///
-/// Compaction is the one legitimate loss of user turns: it drops old turns but injects a
-/// synthetic `[Context was compressed …]` summary, so its synthetic count grows — that
-/// case is explicitly NOT a net loss and is allowed.
-///
-/// KNOWN BOUND: keys off counts, so a same-length write that SWAPS a persisted turn for a
-/// different one (equal user count) is not caught here. The dominant reported failure is
-/// whole turns vanishing (count drop); the ctrace on refusal is the probe for the rest.
-fn save_would_lose_persisted_turns(
-    disk: &[atomcode_core::conversation::message::Message],
-    incoming: &[atomcode_core::conversation::message::Message],
-) -> bool {
-    use atomcode_core::conversation::message::Role;
-    // (real user turns, synthetic messages) in one pass.
-    let counts = |ms: &[atomcode_core::conversation::message::Message]| {
-        ms.iter().fold((0usize, 0usize), |(turns, synth), m| {
-            if m.synthetic {
-                (turns, synth + 1)
-            } else if m.role == Role::User {
-                (turns + 1, synth)
-            } else {
-                (turns, synth)
-            }
-        })
-    };
-    let (in_turns, in_synth) = counts(incoming);
-    let (disk_turns, disk_synth) = counts(disk);
-    in_turns < disk_turns && in_synth <= disk_synth
-}
-
-fn save_live_session_json(
-    working_dir: &std::path::Path,
-    session_id: &atomcode_core::session::SessionId,
-    messages: Vec<atomcode_core::conversation::message::Message>,
-) -> std::io::Result<()> {
-    save_live_session_state_json(working_dir, session_id, messages, None, None)
-}
-
-fn save_live_terminal_snapshot_json(
-    working_dir: &std::path::Path,
-    session_id: &atomcode_core::session::SessionId,
-    snapshot: ConversationSnapshot,
-    cancelled_turn_base: Option<&[atomcode_core::conversation::message::Message]>,
-) -> std::io::Result<()> {
-    save_live_session_state_json(
-        working_dir,
-        session_id,
-        snapshot.messages,
-        Some(snapshot.cold_summaries),
-        cancelled_turn_base,
-    )
-}
-
-fn save_live_session_state_json(
-    working_dir: &std::path::Path,
-    session_id: &atomcode_core::session::SessionId,
-    messages: Vec<atomcode_core::conversation::message::Message>,
-    cold_summaries: Option<Vec<String>>,
-    cancelled_turn_base: Option<&[atomcode_core::conversation::message::Message]>,
-) -> std::io::Result<()> {
-    use atomcode_core::session::{Session, SessionManager};
-    let manager = SessionManager::new(working_dir);
-    let mut session = manager
-        .load(session_id)
-        .unwrap_or_else(|_| Session::new(working_dir.to_path_buf()));
-    // Net-loss guard: a stuck/divergent turn's later authoritative writeback (from a
-    // stale persistent bridge) could carry fewer turns than durability already saved,
-    // reducing the `.json` to just the first turn AND bumping `updated_at` (re-sorting it
-    // to the sidebar top). Refuse such a write: keep disk untouched, don't `touch()`.
-    // See `save_would_lose_persisted_turns` (webui refresh-mid-turn bug).
-    let current_turn_was_rolled_back = cancelled_turn_base.is_some_and(|turn_base| {
-        cancelled_turn_rollback_matches(&session.messages, &messages, turn_base)
-    });
-    if save_would_lose_persisted_turns(&session.messages, &messages)
-        && !current_turn_was_rolled_back
-    {
-        atomcode_core::ctrace!(
-            "LIVE",
-            "save REFUSED net-loss write for {}: disk has {} msgs, incoming {} — keeping disk",
-            session_id,
-            session.messages.len(),
-            messages.len()
-        );
-        return Ok(());
-    }
-    session.id = session_id.clone();
-    session.messages = messages;
-    if let Some(cold_summaries) = cold_summaries {
-        session.cold_summaries = cold_summaries;
-    }
-    session.auto_name_from_messages();
-    session.touch();
-    manager.save(&session)
-}
-
-fn cancelled_turn_rollback_matches(
-    disk: &[atomcode_core::conversation::message::Message],
-    incoming: &[atomcode_core::conversation::message::Message],
-    turn_base: &[atomcode_core::conversation::message::Message],
-) -> bool {
-    use atomcode_core::conversation::message::Role;
-
-    let real_users = |messages: &[atomcode_core::conversation::message::Message]| {
-        messages
-            .iter()
-            .filter(|message| message.role == Role::User && !message.synthetic)
-            .map(serde_json::to_vec)
-            .collect::<Result<Vec<_>, _>>()
-    };
-    let (Ok(disk_users), Ok(incoming_users), Ok(turn_users)) =
-        (real_users(disk), real_users(incoming), real_users(turn_base))
-    else {
-        return false;
-    };
-    let Some((_cancelled, prior_turn_users)) = turn_users.split_last() else {
-        return false;
-    };
-
-    disk_users == turn_users && incoming_users == prior_turn_users
-}
-
-/// Persist a kernel-confirmed compaction snapshot without the generic stale-write
-/// guard: this is the exact candidate accepted by the single live runtime, so a
-/// smaller user-turn count is an intentional compaction rather than stale data.
-fn save_live_compaction_json(
-    working_dir: &std::path::Path,
-    session_id: &atomcode_core::session::SessionId,
-    snapshot: ConversationSnapshot,
-) -> std::io::Result<()> {
-    use atomcode_core::session::{Session, SessionManager};
-    let manager = SessionManager::new(working_dir);
-    let mut session = manager
-        .load(session_id)
-        .unwrap_or_else(|_| Session::new(working_dir.to_path_buf()));
-    session.id = session_id.clone();
-    session.update_from_conversation_snapshot(snapshot);
-    session.auto_name_from_messages();
-    session.touch();
-    manager.save(&session)
-}
-
-/// Simple 1:1 `AgentEvent` → `TurnEvent` translations (the streaming surface both
-/// the `/live` executor and the `/chat` v2 producer forward). Returns `None` for
-/// events the caller handles specially (approval, turn terminals) or ignores.
-pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
-    Some(match ev {
-        AgentEvent::TextDelta(t) => TurnEvent::TextDelta(t),
-        AgentEvent::ReasoningDelta(t) => TurnEvent::ReasoningDelta(t),
-        AgentEvent::ToolCallStreaming { name, hint } => TurnEvent::ToolCallStreaming { name, hint },
-        AgentEvent::ToolCallStarted {
-            id,
-            name,
-            arguments,
-        } => TurnEvent::ToolCallStarted {
-            id,
-            name,
-            arguments,
-        },
-        AgentEvent::ToolOutputChunk { call_id, chunk } => {
-            TurnEvent::ToolOutputChunk { call_id, chunk }
-        }
-        AgentEvent::ToolCallResult {
-            call_id,
-            name,
-            output,
-            success,
-            duration,
-        } => TurnEvent::ToolCallResult {
-            call_id,
-            name,
-            output,
-            success,
-            duration,
-        },
-        AgentEvent::TokenUsage(u) => TurnEvent::TokenUsage {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.prompt_tokens + u.completion_tokens,
-            cached_tokens: u.cached_tokens,
-        },
-        AgentEvent::ContextStats {
-            system_tokens,
-            sent_tokens,
-            dropped_tokens,
-            working_set_tokens,
-            total_messages,
-            ..
-        } => TurnEvent::ContextStats {
-            system_tokens,
-            sent_tokens,
-            dropped_tokens,
-            working_set_tokens,
-            total_messages,
-        },
-        AgentEvent::WorkingDirChanged(p) => TurnEvent::WorkingDirChanged(p),
-        AgentEvent::Warning(w) => TurnEvent::Warning(w),
-        AgentEvent::RateLimited {
-            reset_at_display,
-            reset_label,
-            secs_until_reset,
-            auto_resuming,
-        } => TurnEvent::RateLimited {
-            reset_at_display,
-            reset_label,
-            secs_until_reset,
-            auto_resuming,
-        },
-        _ => return None,
-    })
-}
-
-/// Convert driver-neutral coding runtime events to the daemon streaming surface.
-pub(crate) fn coding_runtime_to_turn(ev: CodingRuntimeEvent) -> Option<TurnEvent> {
-    match ev {
-        CodingRuntimeEvent::CompactionStarted { .. } => None,
-        CodingRuntimeEvent::CompactionFinished {
-            completion: CompactionCompletion::Completed(outcome),
-        } if outcome.committed => {
-            Some(TurnEvent::Warning(
-                atomcode_config::i18n::format_compaction_mark(
-                    outcome.removed_messages,
-                    outcome.estimated_tokens_before,
-                    outcome.estimated_tokens_after,
-                ),
-            ))
-        }
-        CodingRuntimeEvent::CompactionFinished {
-            completion: CompactionCompletion::Completed(outcome),
-        } if outcome.is_manual() => {
-            Some(TurnEvent::TextDelta(
-                atomcode_config::i18n::format_compaction_noop(
-                    outcome.estimated_tokens_before,
-                    outcome.estimated_tokens_after,
-                    outcome.summary_would_grow(),
-                ),
-            ))
-        }
-        CodingRuntimeEvent::CompactionFinished {
-            completion:
-                CompactionCompletion::Interrupted {
-                    trigger: atomcode_kernel::message::CompactTrigger::Manual { .. },
-                    ..
-                },
-        } => Some(TurnEvent::Warning(
-            atomcode_config::i18n::format_compaction_interrupted(),
-        )),
-        CodingRuntimeEvent::CompactionFinished {
-            completion:
-                CompactionCompletion::Failed {
-                    trigger: atomcode_kernel::message::CompactTrigger::Manual { .. },
-                    error,
-                },
-        } => Some(TurnEvent::Error(format!("compact failed: {error}"))),
-        CodingRuntimeEvent::CompactionFinished { .. } => None,
-        _ => None,
-    }
-}
-
 fn committed_compaction_snapshot(
     event: &CodingRuntimeEvent,
 ) -> Result<Option<atomcode_core::conversation::ConversationSnapshot>, &'static str> {
@@ -1613,21 +467,26 @@ fn committed_compaction_snapshot(
         .committed_snapshot
         .as_deref()
         .ok_or("compact completed without a resumable session snapshot")?;
-    Ok(Some(atomcode_bridge::convert::snapshot_to_core(snapshot)))
+    Ok(Some(crate::legacy_convert::snapshot_to_core(snapshot)))
 }
 
-/// Derive the bridge config for a `/chat` request from the resolved provider.
-pub(crate) fn chat_bridge_config(
+/// Derive the native runtime config for a `/chat` request.
+pub(crate) fn chat_runtime_config(
     config: &Config,
     provider_name: &str,
     working_dir: &Path,
     telemetry: Arc<Telemetry>,
-) -> atomcode_bridge::BridgeConfig {
+) -> atomcode_coding::CodingRuntimeConfig {
     let p = config.providers.get(provider_name);
-    atomcode_bridge::BridgeConfig {
+    atomcode_coding::CodingRuntimeConfig {
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         model: p.map(|p| p.model.clone()).unwrap_or_default(),
+        preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
+            None,
+            config.language,
+        )),
+        provider_name: provider_name.to_string(),
         working_dir: working_dir.to_path_buf(),
         context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
         max_tokens: p.and_then(|p| p.max_tokens).map(|m| m as u32),
@@ -1641,35 +500,54 @@ pub(crate) fn chat_bridge_config(
         thinking_enabled: p.and_then(|p| p.thinking_enabled),
         thinking_type: p.and_then(|p| p.thinking_type.clone()),
         thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
-        // The daemon answers `/chat` approvals at its own seam (interactive perm_rx),
-        // so the bridge must keep the round-trip rather than auto-approving here.
+        // The daemon answers `/chat` approvals at its own seam when an interactive
+        // responder is registered; otherwise run_chat_turn_v2 applies the mode-specific,
+        // fail-closed fallback. Keep the runtime round-trip enabled here.
         dangerously_skip_permissions: false,
         // Keep the fail-closed approval timeout for the daemon (current behavior).
         interactive: false,
         keep_interrupted_context: config.keep_interrupted_context,
         user_agent: p.and_then(|p| p.user_agent.clone()),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
-        loop_max_rounds: config.loop_config.max_rounds,
+        loop_max_rounds: atomcode_coding::resolve_loop_max_rounds(
+            config.loop_config.max_rounds,
+            std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
+        ),
+        subagent_config: Some(Arc::new(config.clone())),
     }
 }
 
-/// The engine-v2 producer for `/chat`: drive a bridged agent over `conv` and forward
-/// its events as `TurnEvent`s on `turn_tx` (which the shared `/chat` consumer turns
-/// into SSE). `perm_rx` carries interactive approval decisions from `/chat/permission`
-/// (`None` = auto-approve / standalone). The kernel snapshot is written back to `conv`
-/// so the caller persists the completed turn. Mirrors the `/live` KernelTurnExecutor.
+fn send_chat_runtime_error(
+    events: &mpsc::UnboundedSender<CodingRuntimeEvent>,
+    message: impl Into<String>,
+) {
+    let _ = events.send(CodingRuntimeEvent::Agent(
+        atomcode_kernel::event::AgentEvent::Error {
+            message: message.into(),
+            http_status: None,
+            code: None,
+        },
+    ));
+}
+
+/// Drive a native runtime over `conv` and forward its native events to the shared
+/// `/chat` consumer. `perm_rx` carries interactive approval decisions from `/chat/permission`
+/// (`None` = apply [`fallback_approval_decision`] for the selected mode). The kernel
+/// snapshot is written back to `conv` so the caller persists the completed turn.
 pub(crate) async fn run_chat_turn_v2(
+    session_id: String,
     conv: Arc<Mutex<Conversation>>,
-    turn_tx: mpsc::UnboundedSender<TurnEvent>,
+    runtime_event_tx: mpsc::UnboundedSender<CodingRuntimeEvent>,
     cancel: CancellationToken,
-    bridge_cfg: atomcode_bridge::BridgeConfig,
+    runtime_cfg: atomcode_coding::CodingRuntimeConfig,
     mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
     approval_mode: ApprovalMode,
 ) {
-    let (client, mut events) = crate::kernel_runtime::spawn_daemon_runtime(bridge_cfg);
+    use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
+    use atomcode_coding::{CodingRuntime, TurnCompletion};
 
-    // Seed the bridge from conv (which already has the just-sent user message), then
-    // send that message to actually run the turn.
+    // Split the just-submitted user input from the persisted prefix before runtime
+    // startup. The prefix is imported/initialized under the target session's lease.
     let (prefix, user_text, user_images, turn_base) = {
         let c = conv.lock().await;
         let turn_base = c.messages.clone();
@@ -1686,6 +564,31 @@ pub(crate) async fn run_chat_turn_v2(
             turn_base,
         )
     };
+    let prefix = crate::legacy_convert::snapshot_to_kernel(&prefix);
+    let naming_session_id = session_id.clone();
+    let naming_project_bucket =
+        atomcode_capabilities::session::SessionManager::project_hash(&runtime_cfg.working_dir);
+    let (runtime, _coding_cfg) = match crate::start_native_runtime_with_session(
+        runtime_cfg,
+        atomcode_coding::SessionMode::ExternalSnapshot {
+            id: session_id,
+            snapshot: prefix,
+        },
+    )
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            send_chat_runtime_error(&runtime_event_tx, error.to_string());
+            return;
+        }
+    };
+    let CodingRuntime {
+        handle,
+        mut events,
+        task,
+        ..
+    } = runtime;
     // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
     // （非视觉模型的 provider adapter 会因原图而报 400 错误）
     let user_images = if user_text.contains("[图片内容（由") || user_text.contains("[图片识别失败]")
@@ -1694,35 +597,19 @@ pub(crate) async fn run_chat_turn_v2(
     } else {
         user_images
     };
-    if let Err(event) = send_agent_command(
-        &client,
-        AgentCommand::SetConversation {
-            snapshot: prefix,
-            restore_id: None,
-        },
-        "初始化桥接会话",
-    ) {
-        let _ = turn_tx.send(event);
+    if let Err(error) = handle.set_mode(native_runtime_mode(approval_mode)).await {
+        send_chat_runtime_error(&runtime_event_tx, format!("切换模式失败：{error}"));
         return;
     }
-    if let Err(event) = send_agent_command(
-        &client,
-        AgentCommand::SetPlanMode(approval_mode == ApprovalMode::Plan),
-        "切换 Plan 模式",
-    ) {
-        let _ = turn_tx.send(event);
-        return;
-    }
-    if let Err(event) = send_agent_command(
-        &client,
-        AgentCommand::SendMessage {
-            text: user_text,
-            images: user_images,
-            image_markers: Vec::new(),
-        },
-        "发送用户消息",
-    ) {
-        let _ = turn_tx.send(event);
+    let input = atomcode_coding::UserInput {
+        text: user_text,
+        images: user_images
+            .iter()
+            .map(crate::legacy_convert::image_to_kernel)
+            .collect(),
+    };
+    if let Err(error) = handle.submit(input).await {
+        send_chat_runtime_error(&runtime_event_tx, format!("发送用户消息失败：{error}"));
         return;
     }
 
@@ -1731,20 +618,76 @@ pub(crate) async fn run_chat_turn_v2(
         let ev = tokio::select! {
             _ = cancel.cancelled(), if !cancelled => {
                 cancelled = true;
-                let _ = client.cmd_tx.send(AgentCommand::Cancel);
+                let _ = handle.cancel().await;
                 continue;
             }
             ev = events.recv() => ev,
         };
-        let Some(ev) = ev else { break None };
-        let ev = match ev {
-            DaemonRuntimeEvent::Legacy(event) => event,
-            DaemonRuntimeEvent::TurnCancelledWithoutSnapshot { .. } => break None,
-            DaemonRuntimeEvent::Native(event) => {
+        let Some(ev) = ev.map(|event| event.event) else {
+            send_chat_runtime_error(
+                &runtime_event_tx,
+                "coding runtime event stream closed before turn terminal",
+            );
+            break None;
+        };
+        match ev {
+            event @ CodingRuntimeEvent::Agent(_) => {
+                let _ = runtime_event_tx.send(event);
+            }
+            CodingRuntimeEvent::Request(request) if request.kind == APPROVAL_KIND => {
+                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                if serde_json::from_value::<ApprovalRequest>(request.payload).is_err() {
+                    let _ = handle.respond(request.id, serde_json::Value::Null).await;
+                    continue;
+                }
+                let decision = match &mut perm_rx {
+                    None => fallback_approval_decision(approval_mode),
+                    Some(rx) => tokio::select! {
+                        _ = cancel.cancelled(), if !cancelled => {
+                            cancelled = true;
+                            let _ = handle.cancel().await;
+                            PermissionDecision::Deny
+                        }
+                        decision = rx.recv() => decision.unwrap_or(PermissionDecision::Deny),
+                    },
+                };
+                let response = match decision {
+                    PermissionDecision::Allow => ApprovalResponse::allow(),
+                    PermissionDecision::AllowAlways => ApprovalResponse::allow_always(),
+                    _ => ApprovalResponse::deny(),
+                };
+                let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+                let _ = handle.respond(request.id, value).await;
+            }
+            CodingRuntimeEvent::Request(request) => {
+                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                // `/chat` has no interactive user-input endpoint. Fail closed so
+                // request_user_input returns its graceful unsupported result instead
+                // of leaving the native runtime parked forever.
+                let _ = handle.respond(request.id, serde_json::Value::Null).await;
+            }
+            CodingRuntimeEvent::TurnFinished(completion @ TurnCompletion::Completed { .. }) => {
+                let snapshot = match &completion {
+                    TurnCompletion::Completed { snapshot, .. } => snapshot.clone(),
+                    TurnCompletion::SnapshotUnavailable { .. } => unreachable!(),
+                };
+                let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(completion));
+                break Some(AuthoritativeTerminal {
+                    snapshot: crate::legacy_convert::snapshot_to_core(snapshot.as_ref()),
+                });
+            }
+            event @ CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
+                ..
+            }) => {
+                let _ = runtime_event_tx.send(event);
+                break None;
+            }
+            event @ CodingRuntimeEvent::CompactionStarted { .. }
+            | event @ CodingRuntimeEvent::CompactionFinished { .. } => {
                 let compact_snapshot = match committed_compaction_snapshot(&event) {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
-                        let _ = turn_tx.send(TurnEvent::Error(error.into()));
+                        send_chat_runtime_error(&runtime_event_tx, error);
                         continue;
                     }
                 };
@@ -1753,63 +696,28 @@ pub(crate) async fn run_chat_turn_v2(
                     conversation.messages = snapshot.messages;
                     conversation.cold_summaries.clear();
                 }
-                if let Some(event) = coding_runtime_to_turn(event) {
-                    let _ = turn_tx.send(event);
+                let _ = runtime_event_tx.send(event);
+            }
+            CodingRuntimeEvent::SessionNameSuggested { name } => {
+                if let Err(error) = crate::legacy_convert::apply_ai_catalog_name_in_project(
+                    &naming_project_bucket,
+                    &naming_session_id,
+                    &name,
+                ) {
+                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                        "session naming failed: {error}"
+                    )));
                 }
-                continue;
             }
-        };
-        match ev {
-            AgentEvent::ApprovalNeeded {
-                tool_name,
-                reason,
-                call,
-                snapshot,
-            } => {
-                let _ = turn_tx.send(TurnEvent::ApprovalRequested {
-                    tool_name,
-                    reason,
-                    call,
-                    snapshot,
-                });
-                let decision = match &mut perm_rx {
-                    None => fallback_approval_decision(approval_mode),
-                    Some(rx) => tokio::select! {
-                        _ = cancel.cancelled(), if !cancelled => {
-                            cancelled = true;
-                            let _ = client.cmd_tx.send(AgentCommand::Cancel);
-                            PermissionDecision::Deny
-                        }
-                        d = rx.recv() => d.unwrap_or(PermissionDecision::Deny),
-                    },
-                };
-                let cmd = match decision {
-                    PermissionDecision::Allow => AgentCommand::ApproveTool,
-                    PermissionDecision::AllowAlways => AgentCommand::ApproveToolAlways,
-                    _ => AgentCommand::DenyTool,
-                };
-                let _ = client.cmd_tx.send(cmd);
+            CodingRuntimeEvent::RuntimeStopped(_) => {
+                send_chat_runtime_error(
+                    &runtime_event_tx,
+                    "coding runtime stopped before turn terminal",
+                );
+                break None;
             }
-            AgentEvent::Error { error, .. } => {
-                // Non-terminal: forward, keep draining to the real terminal.
-                let _ = turn_tx.send(TurnEvent::Error(error));
-            }
-            AgentEvent::TurnCancelled { snapshot } => {
-                break Some(AuthoritativeTerminal {
-                    snapshot,
-                    cancelled: true,
-                })
-            }
-            AgentEvent::TurnComplete { snapshot, .. } => {
-                break Some(AuthoritativeTerminal {
-                    snapshot,
-                    cancelled: false,
-                })
-            }
-            other => {
-                if let Some(te) = agent_to_turn(other) {
-                    let _ = turn_tx.send(te);
-                }
+            event => {
+                let _ = runtime_event_tx.send(event);
             }
         }
     };
@@ -1817,13 +725,16 @@ pub(crate) async fn run_chat_turn_v2(
         let mut c = conv.lock().await;
         install_authoritative_terminal_snapshot(&mut c, terminal.snapshot, &turn_base);
     }
-    // Dropping turn_tx here closes the consumer loop (its `turn_rx.recv()` returns
-    // None), which then persists conv and sends Done.
+    let _ = handle.shutdown().await;
+    let _ = task.await;
+    // Dropping runtime_event_tx here closes the consumer loop, which then shapes
+    // the final HTTP events and sends Done.
 }
 
 use crate::AppState;
 use axum::{
     extract::{Extension, State},
+    http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json,
@@ -1849,7 +760,8 @@ pub(crate) enum LiveWireEvent {
         session_name: String,
         project_hash: String,
         provider: String,
-        /// 当前审批模式（build / plan / bypass），让新连上的 tab 立刻显示正确的模式 pill。
+        /// 当前审批模式（build / accept_edits / bypass / plan），
+        /// 让新连上的 tab 立刻显示正确的模式 pill。
         mode: String,
         /// 当前工作目录，让 App 端能展示项目名。
         #[serde(rename = "working_dir")]
@@ -1857,7 +769,8 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "provider")]
     Provider { provider: String },
-    /// 审批模式切换（build / plan / bypass）——webui 各 tab 的「模式」pill 据此同步。
+    /// 审批模式切换（build / accept_edits / bypass / plan）——
+    /// webui 各 tab 的「模式」pill 据此同步。
     #[serde(rename = "mode")]
     Mode { mode: String },
     /// 斜杠命令的文本输出（如 /status 报告）。`text` 首行即 `/cmd` 标头，
@@ -1879,8 +792,6 @@ pub(crate) enum LiveWireEvent {
         name: String,
         arguments: String,
     },
-    #[serde(rename = "tool_output")]
-    ToolOutput { chunk: String },
     #[serde(rename = "tool_progress")]
     ToolProgress { id: String, progress: String },
     #[serde(rename = "tool_result")]
@@ -1898,7 +809,13 @@ pub(crate) enum LiveWireEvent {
         total: usize,
     },
     #[serde(rename = "state")]
-    State { running: bool },
+    State {
+        running: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     #[serde(rename = "error")]
     Error { message: String },
     /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
@@ -1912,8 +829,20 @@ pub(crate) enum LiveWireEvent {
         call_id: String,
         arguments: String,
     },
-    #[serde(rename = "permission_resolved")]
-    PermissionResolved { call_id: String, decision: String },
+    #[serde(rename = "user_input_request")]
+    UserInputRequest {
+        request_id: u64,
+        header: String,
+        question: String,
+        mode: String,
+        options: Vec<serde_json::Value>,
+        /// Present for a multi-question batch (each item is a `{header,question,mode,options}`
+        /// object). Omitted for a single question — the webui then uses the flat fields above.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        questions: Option<Vec<serde_json::Value>>,
+        /// Whether to offer the "type your own answer" row (single question). Default true.
+        custom: bool,
+    },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
     /// AI auto-renamed a session (daemon AI namer). Carries `session_id` so a
@@ -1937,161 +866,289 @@ pub(crate) enum LiveWireEvent {
         /// `false` = Pause (kernel stopped the turn, user must act).
         #[serde(default)]
         auto_resuming: bool,
+        /// Provider's own 429 message (no `HTTP …:` prefix), for the generic pause.
+        #[serde(default)]
+        server_message: Option<String>,
     },
 }
 
-/// Map one LiveEvent → 0/1 wire events (variants the frontend doesn't need → None).
-fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
-    use atomcode_core::turn::event::TurnEvent as TE;
-    Some(match ev {
-        LiveEvent::UserMessage { text, images } => LiveWireEvent::UserMessage {
-            text,
-            images: images
-                .into_iter()
-                .map(|i| crate::ImageData {
-                    media_type: i.media_type,
-                    data: i.data,
-                    missing: false,
-                })
-                .collect(),
-        },
-        LiveEvent::StateChanged(s) => LiveWireEvent::State {
-            running: matches!(s, TurnState::Running),
-        },
-        LiveEvent::ProviderChanged(p) => LiveWireEvent::Provider { provider: p },
-        // 审批模式切换：让所有 webui tab 的「模式」pill 跟随。
-        LiveEvent::ModeChanged(mode) => LiveWireEvent::Mode { mode },
-        // Carry a cwd switch (TUI `/cd`, webui `/cd`, worktree command) to every
-        // webui tab so its path display + session-list filter follow. The
-        // sync-mode TUI follows the same LiveEvent in-process via live_sync.
-        LiveEvent::WorkingDirChanged(p) => LiveWireEvent::WorkingDir {
-            working_dir: p.to_string_lossy().to_string(),
-        },
-        // 会话切换：通知所有 webui tab 跟随切换到新会话。
-        LiveEvent::SessionSwitched(session_id) => LiveWireEvent::SessionSwitched { session_id },
-        // AI 自动命名：通知所有 webui tab 更新标签/标题。
-        LiveEvent::SessionRenamed { session_id, name } => {
-            LiveWireEvent::SessionRenamed { session_id, name }
-        }
-        // 仅进程内：由 TUI 执行，结果走 CommandOutput 回来。
-        LiveEvent::RemoteCommand(_) => return None,
-        LiveEvent::CommandOutput(text) => LiveWireEvent::CommandOutput { text },
-        LiveEvent::Turn(te) => match te {
-            TE::TextDelta(content) => LiveWireEvent::TextDelta { content },
-            TE::ReasoningDelta(content) => LiveWireEvent::ReasoningDelta { content },
-            TE::ToolCallStarted {
-                id,
-                name,
-                arguments,
-            } => LiveWireEvent::ToolStart {
-                id,
-                name,
-                arguments,
+#[derive(Default)]
+struct NativeLiveWireProjector {
+    tools: HashMap<String, (String, std::time::Instant)>,
+    session_id: String,
+}
+
+impl NativeLiveWireProjector {
+    fn project(&mut self, event: crate::live_hub::LiveViewEvent) -> Option<LiveWireEvent> {
+        use atomcode_capabilities::tools::{
+            request_user_input::REQUEST_USER_INPUT_KIND, ApprovalRequest, APPROVAL_KIND,
+        };
+        use atomcode_coding::CodingRuntimeEvent as Runtime;
+        use atomcode_kernel::event::AgentEvent as Kernel;
+
+        Some(match event {
+            crate::live_hub::LiveViewEvent::CommandOutput(text) => {
+                LiveWireEvent::CommandOutput { text }
+            }
+            crate::live_hub::LiveViewEvent::InputAccepted(input) => LiveWireEvent::UserMessage {
+                text: input.text,
+                images: input
+                    .images
+                    .into_iter()
+                    .map(|image| crate::ImageData {
+                        media_type: image.media_type,
+                        data: image.data,
+                        missing: false,
+                    })
+                    .collect(),
             },
-            TE::ToolOutputChunk { call_id, chunk } => {
-                if let Some(progress) = chunk.strip_prefix('\u{1e}') {
-                    LiveWireEvent::ToolProgress {
-                        id: call_id,
-                        progress: progress.to_string(),
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(event)) => match event {
+                Kernel::TurnStarted => LiveWireEvent::State {
+                    running: true,
+                    stop_reason: None,
+                    message: None,
+                },
+                Kernel::TextDelta(content) => LiveWireEvent::TextDelta { content },
+                Kernel::Reasoning(content) => LiveWireEvent::ReasoningDelta { content },
+                Kernel::ToolStarted { call } => {
+                    self.tools.insert(
+                        call.id.clone(),
+                        (call.name.clone(), std::time::Instant::now()),
+                    );
+                    LiveWireEvent::ToolStart {
+                        id: call.id,
+                        name: call.name,
+                        arguments: call.arguments,
+                    }
+                }
+                Kernel::ToolProgress { call_id, message } => LiveWireEvent::ToolProgress {
+                    id: call_id,
+                    progress: message,
+                },
+                Kernel::ToolResult { result } => {
+                    let (name, started) = self
+                        .tools
+                        .remove(&result.call_id)
+                        .unwrap_or_else(|| ("tool".into(), std::time::Instant::now()));
+                    LiveWireEvent::ToolResult {
+                        id: result.call_id,
+                        name,
+                        output: result.content,
+                        success: !result.is_error,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    }
+                }
+                Kernel::Usage(meta) => LiveWireEvent::Tokens {
+                    prompt: meta.tokens.prompt as usize,
+                    completion: meta.tokens.completion as usize,
+                    total: (meta.tokens.prompt + meta.tokens.completion) as usize,
+                },
+                Kernel::Error { message, .. } => LiveWireEvent::Error { message },
+                Kernel::Warning(message) => LiveWireEvent::Warning { message },
+                Kernel::RateLimited {
+                    reset_at_display,
+                    reset_label,
+                    secs_until_reset,
+                    auto_resuming,
+                    server_message,
+                } => LiveWireEvent::RateLimited {
+                    reset_at_display,
+                    reset_label,
+                    secs_until_reset,
+                    auto_resuming,
+                    server_message,
+                },
+                Kernel::ToolCallStreaming { .. }
+                | Kernel::ToolBatchStarted { .. }
+                | Kernel::ToolBatchCompleted { .. }
+                | Kernel::Request { .. }
+                | Kernel::Snapshot { .. }
+                | Kernel::TurnComplete { .. }
+                | Kernel::Cancelled
+                | Kernel::Steered { .. }
+                | Kernel::CompactionStarted { .. }
+                | Kernel::Compacted { .. }
+                | Kernel::CompactionFailed { .. } => return None,
+                _ => return None,
+            },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::Request(request)) => {
+                if request.kind == APPROVAL_KIND {
+                    let approval: ApprovalRequest = serde_json::from_value(request.payload).ok()?;
+                    LiveWireEvent::PermissionRequest {
+                        tool_name: approval.tool,
+                        reason: "Requires approval".into(),
+                        call_id: approval.call_id,
+                        arguments: approval.args,
+                    }
+                } else if request.kind == REQUEST_USER_INPUT_KIND {
+                    LiveWireEvent::UserInputRequest {
+                        request_id: request.id,
+                        header: request
+                            .payload
+                            .get("header")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        question: request
+                            .payload
+                            .get("question")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        mode: request
+                            .payload
+                            .get("mode")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("single")
+                            .to_string(),
+                        options: request
+                            .payload
+                            .get("options")
+                            .and_then(serde_json::Value::as_array)
+                            .cloned()
+                            .unwrap_or_default(),
+                        questions: request
+                            .payload
+                            .get("questions")
+                            .and_then(serde_json::Value::as_array)
+                            .cloned(),
+                        custom: request
+                            .payload
+                            .get("custom")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(true),
                     }
                 } else {
-                    LiveWireEvent::ToolOutput { chunk }
+                    return None;
                 }
             }
-            TE::ToolCallResult {
-                call_id,
-                name,
-                output,
-                success,
-                duration,
-            } => LiveWireEvent::ToolResult {
-                id: call_id,
-                name,
-                output,
-                success,
-                duration_ms: duration.as_millis() as u64,
-            },
-            TE::TokenUsage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-                ..
-            } => LiveWireEvent::Tokens {
-                prompt: prompt_tokens,
-                completion: completion_tokens,
-                total: total_tokens,
-            },
-            TE::Error(message) => LiveWireEvent::Error { message },
-            // Non-fatal advisory (e.g. "conversation compacted") — its OWN wire type so
-            // the webui renders it as a muted notice, NOT a red "[错误: …]" error glued
-            // into the assistant bubble. No "[warning]" prefix: the type conveys severity.
-            TE::Warning(w) => LiveWireEvent::Warning { message: w },
-            TE::ApprovalRequested {
-                tool_name,
-                reason,
-                call,
-                ..
-            } => LiveWireEvent::PermissionRequest {
-                tool_name,
-                reason,
-                call_id: call.id,
-                arguments: call.arguments,
-            },
-            TE::ApprovalResolved { call_id, decision } => {
-                LiveWireEvent::PermissionResolved { call_id, decision }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::TurnFinished(completion)) => {
+                self.tools.clear();
+                match completion {
+                    atomcode_coding::TurnCompletion::Completed { reason, .. } => {
+                        LiveWireEvent::State {
+                            running: false,
+                            stop_reason: Some(crate::stop_reason_wire(reason).to_string()),
+                            message: None,
+                        }
+                    }
+                    atomcode_coding::TurnCompletion::SnapshotUnavailable { error, .. } => {
+                        LiveWireEvent::State {
+                            running: false,
+                            stop_reason: Some("snapshot_unavailable".into()),
+                            message: Some(error.message),
+                        }
+                    }
+                }
             }
-            TE::RateLimited {
-                reset_at_display,
-                reset_label,
-                secs_until_reset,
-                auto_resuming,
-            } => LiveWireEvent::RateLimited {
-                reset_at_display,
-                reset_label,
-                secs_until_reset,
-                auto_resuming,
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::ModeChanged { mode }) => {
+                LiveWireEvent::Mode {
+                    mode: mode.wire().into(),
+                }
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderChanged {
+                provider, ..
+            }) => LiveWireEvent::Provider { provider },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::SessionNameSuggested { name }) => {
+                LiveWireEvent::SessionRenamed {
+                    session_id: self.session_id.clone(),
+                    name,
+                }
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::SessionChanged(changed)) => {
+                let session_id = changed.session_id?;
+                self.session_id = session_id.clone();
+                LiveWireEvent::SessionSwitched { session_id }
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::WorkingDirectoryChanged(
+                working_dir,
+            )) => LiveWireEvent::WorkingDir {
+                working_dir: working_dir.to_string_lossy().to_string(),
             },
-            TE::ToolCallStreaming { .. }
-            | TE::ToolBatchStarted { .. }
-            | TE::ToolBatchCompleted { .. }
-            | TE::ContextStats { .. }
-            | TE::WorkingDirChanged(_) => return None,
-        },
-    })
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::ControllerWarning(message)) => {
+                LiveWireEvent::Warning { message }
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::RuntimeStopped(exit)) => {
+                self.tools.clear();
+                LiveWireEvent::State {
+                    running: false,
+                    stop_reason: Some("runtime_stopped".into()),
+                    message: Some(format!(
+                        "coding runtime stopped: {:?}{}",
+                        exit.reason,
+                        if exit.forced { " (forced)" } else { "" }
+                    )),
+                }
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            }) if outcome.committed => LiveWireEvent::Warning {
+                message: atomcode_config::i18n::format_compaction_mark(
+                    outcome.removed_messages,
+                    outcome.estimated_tokens_before,
+                    outcome.estimated_tokens_after,
+                ),
+            },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
+                completion: CompactionCompletion::Failed { error, .. },
+            }) => LiveWireEvent::Error {
+                message: format!("compact failed: {error}"),
+            },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderUnavailable {
+                reason,
+                ..
+            }) => LiveWireEvent::Error {
+                message: reason.to_string(),
+            },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderReloadFinished(Err(
+                error,
+            ))) => LiveWireEvent::Error {
+                message: format!("provider reload failed: {error}"),
+            },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderDeactivationFinished(
+                Err(error),
+            )) => LiveWireEvent::Error {
+                message: format!("provider deactivation failed: {error}"),
+            },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::SnapshotRestoreFinished {
+                result: Err(error),
+                ..
+            }) => LiveWireEvent::Error {
+                message: format!("snapshot restore failed: {error}"),
+            },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::UndoFinished(Err(error))) => {
+                LiveWireEvent::Error {
+                    message: format!("undo failed: {error}"),
+                }
+            }
+            crate::live_hub::LiveViewEvent::Runtime(_) => return None,
+        })
+    }
 }
 
 // ============================================================================
 // Handlers: GET /live (SSE) + POST /live/message
 // ============================================================================
 
-/// 把前端传来的 session_id 字符串解析为 `SessionId`（None/空字符串 → None）。
-/// 仅做解析、不读盘——历史加载留给 `load_session_seed`，且仅在 LiveSession
-/// 确实要新建/替换时经惰性闭包触发（见 ensure_live_session_global）。
-fn parse_session_id(session_id_str: Option<String>) -> Option<atomcode_core::session::SessionId> {
-    let id_str = session_id_str?;
-    if id_str.is_empty() {
-        return None;
-    }
-    Some(atomcode_core::session::SessionId::from_string(id_str))
+/// 规范化前端传来的 session id（None/空字符串 → None）。
+/// 仅做解析、不读盘；严格的历史加载由 native runtime 绑定流程负责。
+fn parse_session_id(session_id_str: Option<String>) -> Option<String> {
+    session_id_str.and_then(|id| {
+        let id = id.trim();
+        (!id.is_empty()).then(|| id.to_string())
+    })
 }
 
-/// 从 SessionManager 加载指定会话的历史作为 LiveSession 种子；
-/// 加载失败时降级为空历史（不阻断）。
-fn load_session_seed(
-    working_dir: &std::path::Path,
-    sid: &atomcode_core::session::SessionId,
-) -> (
-    Vec<atomcode_core::conversation::message::Message>,
-    Vec<String>,
-) {
-    atomcode_core::session::SessionManager::new(working_dir)
-        .load(sid)
-        .map(|s| (s.messages, s.cold_summaries))
-        .unwrap_or_default()
+fn provider_reload_required(
+    active: &str,
+    active_fingerprint: &str,
+    requested: &str,
+    requested_fingerprint: &str,
+) -> bool {
+    active != requested || active_fingerprint != requested_fingerprint
 }
 
-/// GET /live 查询参数。`session_id` 可选：提供时把 LiveSession 绑定到该会话
-///（修复 #561：sync 与常规会话统一）。
+/// GET /live 查询参数。`session_id` 可选：提供时绑定到该 native session。
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct LiveStreamQuery {
     #[serde(default)]
@@ -2103,90 +1160,113 @@ pub(crate) async fn live_stream(
     axum::extract::Query(q): axum::extract::Query<LiveStreamQuery>,
 ) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
-    let project_hash = crate::hash_path(&working_dir);
-    // 若前端传了 session_id，绑定到该会话；历史仅在确实要新建 LiveSession 时才读盘。
     let sid = parse_session_id(q.session_id);
-    let load_dir = working_dir.clone();
-    let load_sid = sid.clone();
-    // snapshot 的 working_dir 优先取 LIVE_WORKING_DIR（TUI 的 `/cd` 会更新它），
-    // 没有再回退到 state.project.working_dir。避免 TUI `/cd` 后 app 重连拿到旧目录
-    //（TUI 只更新了 ctx.working_dir 和 LIVE_WORKING_DIR，没更新 state.project.working_dir）。
-    let snapshot_wd = live_current_working_dir(&working_dir);
-    let session = ensure_live_session_global(
-        snapshot_wd.clone(),
-        live_mcp_cache(),
+    let join = match crate::native_live::ensure_headless_runtime(
+        live_current_working_dir(&working_dir),
         state.telemetry.clone(),
+        live_current_provider(),
+        native_runtime_mode(live_current_approval_mode()),
         sid,
-        move || match load_sid {
-            Some(s) => load_session_seed(&load_dir, &s),
-            None => (Vec::new(), Vec::new()),
-        },
-    );
-    let (snapshot, replay, mut rx) = session.join_with_replay().await;
-
-    // 用实际生效的 session_id(非查询参数传入的 sid)加载会话名,供 snapshot 携带。
-    // 查询参数 sid 在首次扫码连接时为空,但 LiveSession 一定有真实的 session_id
-    // (已设置到 LIVE_SESSION_ID)。用此 id + load_dir 从 SessionManager 取 name。
-    let live_sid = live_session_id_or_unknown();
-    let sid_for_snapshot = live_sid.clone();
-    let session_name = if live_sid == "unknown" {
-        String::new()
-    } else {
-        atomcode_core::session::SessionManager::new(&snapshot_wd)
-            .load(&atomcode_core::session::SessionId::from_string(live_sid))
-            .ok()
-            .map(|s| s.name)
-            .unwrap_or_default()
+    )
+    .await
+    {
+        Ok(join) => join,
+        Err(error) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response()
+        }
     };
+    let snapshot_wd = join.binding.working_dir.clone();
+    let session_name = {
+        let bucket = atomcode_capabilities::session::SessionManager::project_hash(&snapshot_wd);
+        match crate::legacy_convert::load_catalog_session_view_in_project(
+            &bucket,
+            &join.binding.session_id,
+        ) {
+            Ok(Some(session)) => session.meta.name,
+            Ok(None) => String::new(),
+            Err(error) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": error.to_string() })),
+                )
+                    .into_response()
+            }
+        }
+    };
+    let project_hash = crate::hash_path(&snapshot_wd);
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
     let _ = tx.send(LiveWireEvent::Snapshot {
-        messages: snapshot.iter().map(crate::MessageInfo::from).collect(),
-        session_id: sid_for_snapshot,
+        messages: join
+            .snapshot
+            .messages
+            .iter()
+            .map(crate::MessageInfo::from_kernel)
+            .collect(),
+        session_id: join.binding.session_id.clone(),
         session_name,
         project_hash,
-        provider: live_current_provider(),
+        provider: join.binding.provider.clone(),
         mode: live_current_mode_wire(),
         working_dir: snapshot_wd.to_string_lossy().to_string(),
     });
-    // 进行中回合的事件回放（StateChanged(Running) + 本回合 Turn 事件）：snapshot
-    // 只到上一个 turn 边界，这段补上当前回合已发生的执行过程（工具卡片、流式
-    // 文本、待审批请求），手机退后台回来/新 tab 中途加入不再丢进度。
-    for ev in replay {
-        if let Some(w) = to_wire(ev) {
+    let mut projector = NativeLiveWireProjector {
+        session_id: join.binding.session_id.clone(),
+        ..Default::default()
+    };
+    for observation in join.replay {
+        if let Some(w) = projector.project(observation.event) {
             let _ = tx.send(w);
         }
     }
+    let binding_id = join.binding.id;
+    let mut rx = join.receiver;
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(ev) => {
-                    if let Some(w) = to_wire(ev) {
+                Ok(observation) if observation.binding_id == binding_id => {
+                    if let Some(w) = projector.project(observation.event) {
                         if tx.send(w).is_err() {
                             break;
                         }
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Ok(_) => break,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let _ = tx.send(LiveWireEvent::Error {
+                        message: format!("live stream lagged by {skipped} events; reconnect"),
+                    });
+                    break;
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|w| {
-        let json = match serde_json::to_string(&w) {
-            Ok(s) => s,
-            Err(e) => {
-                atomcode_core::ctrace!("LIVE", "live_stream: serde_json serialization failed: {e}");
-                return Ok::<_, std::convert::Infallible>(Event::default().data(""));
-            }
-        };
+        let json = serde_json::to_string(&w).unwrap_or_else(|error| {
+            atomcode_core::ctrace!(
+                "LIVE",
+                "live_stream: serde_json serialization failed: {error}"
+            );
+            serde_json::json!({
+                "type": "error",
+                "message": format!("live event serialization failed: {error}"),
+            })
+            .to_string()
+        });
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(std::time::Duration::from_secs(15))
-            .text("ping"),
-    )
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -2194,27 +1274,56 @@ pub(crate) struct LiveMessageReq {
     pub message: String,
     #[serde(default)]
     pub images: Vec<crate::ImageInput>,
-    /// webui 选中的模型（provider 名）。Some 时更新 LIVE_PROVIDER，下一轮生效。
+    /// webui 选中的模型（provider 名）。Some 时切换当前绑定 runtime。
     #[serde(default)]
     pub provider: Option<String>,
-    /// 调用方的当前 session_id（#561 修复：使 LiveSession 绑定到同一会话）。
+    /// 调用方的当前 session_id。
     #[serde(default)]
     pub session_id: Option<String>,
 }
 
+/// Apply the shared daemon image-preprocessing policy to one user caption.
+///
+/// The caller keeps the original images in its persisted/display conversation. A changed
+/// return value means the runtime input must clear those images because the returned text
+/// already contains either the VL description or an explicit failure marker.
+pub(crate) async fn preprocess_image_caption(
+    config: &Config,
+    active: &dyn atomcode_core::provider::LlmProvider,
+    message: &str,
+    images: &[ImagePart],
+) -> String {
+    use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
+    match maybe_preprocess(config, active, message, images).await {
+        PreprocessOutcome::Skipped => message.to_string(),
+        PreprocessOutcome::Replaced { text, vl_model } => {
+            if message.trim().is_empty() {
+                format!("[图片内容（由 {vl_model} 识别）]\n{text}")
+            } else {
+                format!("{message}\n\n[图片内容（由 {vl_model} 识别）]\n{text}")
+            }
+        }
+        PreprocessOutcome::Failed { .. } => {
+            if message.trim().is_empty() {
+                "[图片识别失败]".to_string()
+            } else {
+                format!("{message}\n\n[图片识别失败]")
+            }
+        }
+    }
+}
+
 /// 对 live 输入做视觉预处理：主模型不支持视觉时，用 VL 模型把图片转文字拼进 caption
-/// （原图始终保留在 MultiPart 里用于缩略图渲染）。与 `/chat` 路径（lib.rs:process_chat_request）
-/// 行为一致——同步会话把 live 路径从 `Agent::run` 切到 coordinator 后曾漏掉这一步，导致
-/// 非视觉主模型（如 deepseek-v4-flash）在 sync/live 下看不到图片。任何 config/provider
-/// 加载失败都降级为原文，不阻断发送。`provider_name` 为本轮已解析的主 provider（与
-/// `DaemonTurnExecutor::run_turn` 同源），仅用其模型名判定是否原生支持视觉。
+/// （原图始终保留在 MultiPart 里用于缩略图渲染）。与 `/chat` 路径共享
+/// [`preprocess_image_caption`]；任何 config/provider 加载失败都降级为原文，不阻断发送。
+/// `provider_name` 为本轮已解析的主 provider，
+/// 仅用其模型名判定是否原生支持视觉。
 async fn preprocess_live_caption(
     message: &str,
     images: &[ImagePart],
     provider_name: Option<&str>,
     session_id: Option<&str>,
 ) -> String {
-    use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
     if images.is_empty() {
         return message.to_string();
     }
@@ -2236,95 +1345,122 @@ async fn preprocess_live_caption(
     if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
         active.set_session_id(sid);
     }
-    match maybe_preprocess(&config, &*active, message, images).await {
-        PreprocessOutcome::Skipped => message.to_string(),
-        PreprocessOutcome::Replaced { text, vl_key } => {
-            if message.trim().is_empty() {
-                format!("[图片内容（由 {vl_key} 识别）]\n{text}")
-            } else {
-                format!("{message}\n\n[图片内容（由 {vl_key} 识别）]\n{text}")
-            }
-        }
-        PreprocessOutcome::Failed { .. } => {
-            if message.trim().is_empty() {
-                "[图片识别失败]".to_string()
-            } else {
-                format!("{message}\n\n[图片识别失败]")
-            }
-        }
-    }
+    preprocess_image_caption(&config, &*active, message, images).await
 }
 
 pub(crate) async fn live_message(
     State(state): State<AppState>,
-    Extension(client_mode): Extension<atomcode_telemetry::SessionMode>,
+    Extension(_client_mode): Extension<atomcode_telemetry::SessionMode>,
     Json(req): Json<LiveMessageReq>,
 ) -> impl IntoResponse {
-    // 更新进程级 live mode，供 live turn 执行时设置 telemetry envelope mode。
-    *LIVE_MODE.lock().unwrap() = Some(client_mode);
     let working_dir = { state.project.read().await.working_dir.clone() };
-    // 切换模型：在投递输入前更新进程级选中的 provider，使本轮 turn 用新模型构造。
-    set_live_provider(req.provider);
-    // #561 修复：把调用方的 session_id 传递给 LiveSession，使 sync 与常规会话统一。
-    // 历史惰性加载——会话已存在且匹配时直接复用，不会为被丢弃的历史读盘。
-    let req_session_id = req.session_id.clone();
     let sid = parse_session_id(req.session_id);
-    let current_live_id = LIVE_SESSION_ID
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    atomcode_core::ctrace!(
-        "LIVE",
-        "live_message req.session_id={:?} parsed_sid={:?} current_LIVE_SESSION_ID={:?}",
-        req_session_id,
-        sid,
-        current_live_id
-    );
-    let load_dir = working_dir.clone();
-    let load_sid = sid.clone();
-    let session = ensure_live_session_global(
-        working_dir,
-        live_mcp_cache(),
+    let requested_provider = req.provider.clone();
+    let bootstrap_provider = requested_provider
+        .clone()
+        .unwrap_or_else(live_current_provider);
+    let join = match crate::native_live::ensure_headless_runtime(
+        live_current_working_dir(&working_dir),
         state.telemetry.clone(),
+        bootstrap_provider,
+        native_runtime_mode(live_current_approval_mode()),
         sid,
-        move || match load_sid {
-            Some(s) => load_session_seed(&load_dir, &s),
-            None => (Vec::new(), Vec::new()),
-        },
-    );
-    let after_live_id = LIVE_SESSION_ID
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    atomcode_core::ctrace!(
-        "LIVE",
-        "live_message after ensure: LIVE_SESSION_ID={:?} session_ptr={:p}",
-        after_live_id,
-        Arc::as_ptr(&session)
-    );
-    // 视觉预处理在 coordinator 经 executor.preprocess_input 统一做（TUI / webui 共享），
-    // 此处只负责投递原始输入。
-    let ok = session.send_input(UserInput {
-        text: req.message,
-        images: req
-            .images
+    )
+    .await
+    {
+        Ok(join) => join,
+        Err(error) => {
+            return Json(serde_json::json!({ "accepted": false, "error": error }));
+        }
+    };
+    let active_provider = join.binding.provider.clone();
+    let mut provider_name = active_provider.clone();
+    if let Some(requested_provider) = requested_provider {
+        let config = match Config::load(&Config::default_path()) {
+            Ok(config) => config,
+            Err(error) => {
+                return Json(serde_json::json!({
+                    "accepted": false,
+                    "error": format!("load provider config failed: {error}"),
+                }));
+            }
+        };
+        if !config.providers.contains_key(&requested_provider) {
+            return Json(serde_json::json!({
+                "accepted": false,
+                "error": format!("provider {requested_provider:?} not found"),
+            }));
+        }
+        let requested_fingerprint =
+            match crate::native_live::provider_fingerprint(&config, &requested_provider) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    return Json(serde_json::json!({ "accepted": false, "error": error }));
+                }
+            };
+        if provider_reload_required(
+            &active_provider,
+            &join.binding.provider_fingerprint,
+            &requested_provider,
+            &requested_fingerprint,
+        ) {
+            let runtime_config = chat_runtime_config(
+                &config,
+                &requested_provider,
+                &join.binding.working_dir,
+                state.telemetry.clone(),
+            );
+            let next = crate::kernel_runtime::coding_config_from_runtime(&runtime_config);
+            if let Err(error) =
+                crate::native_live::reload_provider(&join.binding, next, requested_fingerprint)
+                    .await
+            {
+                return Json(serde_json::json!({
+                    "accepted": false,
+                    "error": format!("provider reload rejected: {error:?}"),
+                }));
+            }
+        }
+        provider_name = requested_provider;
+    }
+    let original_images: Vec<ImagePart> = req
+        .images
+        .into_iter()
+        .map(|image| ImagePart {
+            media_type: image.media_type,
+            data: image.data,
+        })
+        .collect();
+    let text = preprocess_live_caption(
+        &req.message,
+        &original_images,
+        Some(&provider_name),
+        Some(&join.binding.session_id),
+    )
+    .await;
+    let images = if text != req.message {
+        Vec::new()
+    } else {
+        original_images
             .into_iter()
-            .map(|i| ImagePart {
-                media_type: i.media_type,
-                data: i.data,
+            .map(|image| atomcode_kernel::message::ImageContent {
+                media_type: image.media_type,
+                data: image.data,
             })
-            .collect(),
-    });
-    atomcode_core::ctrace!("LIVE", "live_message send_input accepted={}", ok);
-    Json(serde_json::json!({ "accepted": ok }))
+            .collect()
+    };
+    match crate::native_live::submit_confirmed(atomcode_coding::UserInput { text, images }).await {
+        Ok(_) => Json(serde_json::json!({ "accepted": true })),
+        Err(error) => Json(serde_json::json!({
+            "accepted": false,
+            "error": format!("live submit rejected: {error:?}"),
+        })),
+    }
 }
 
 /// POST /live/stop — cancel the turn shared by the TUI and synchronized webui tabs.
 pub(crate) async fn live_stop() -> impl IntoResponse {
-    let accepted = match current_live_session() {
-        Some(session) => session.cancel_current_turn().await,
-        None => false,
-    };
+    let accepted = crate::native_live::cancel_confirmed().await.is_ok();
     Json(serde_json::json!({ "accepted": accepted }))
 }
 
@@ -2336,56 +1472,120 @@ pub(crate) struct LiveSwitchSessionReq {
 /// POST /live/switch_session — webui 切到「已存在」的会话时广播会话切换，
 /// 让同进程 sync 模式的 TUI 跟随加载该会话（含历史）。
 ///
-/// 与新建会话（create_session）走同一条广播：仅带 session_id；TUI 侧按 id
-/// 跨项目定位会话文件（SessionManager::load_any），据其 working_dir 切目录、
-/// 回放历史。无活动 LiveSession（如 headless daemon 无 TUI 附着，或 TUI 未开
-/// sync）时静默 no-op——没有视图需要跟随。不在此处 ensure_live_session：避免
-/// 在无人跟随时凭空建一个新的 LiveSession。
+/// 目标会话在当前 live binding 的 project bucket 内精确定位，并在
+/// legacy 收敛后将同一 lease 交给 CodingRuntime。无绑定 runtime 时明确
+/// 返回拒绝，不隐式创建另一条执行路径。
 pub(crate) async fn live_switch_session_endpoint(
     Json(req): Json<LiveSwitchSessionReq>,
 ) -> impl IntoResponse {
-    let sid = atomcode_core::session::SessionId::from_string(req.session_id);
-    live_switch_session(sid);
-    Json(serde_json::json!({ "ok": true }))
+    match crate::native_live::resume_session(req.session_id).await {
+        Ok(_) => Json(serde_json::json!({ "ok": true })),
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "error": format!("session switch rejected: {error:?}"),
+        })),
+    }
 }
 
 #[derive(serde::Deserialize)]
 pub(crate) struct LiveProviderReq {
     pub provider: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// POST /live/provider — webui 切换模型即时同步。
 ///
 /// 与"发送消息才带 provider"不同，下拉框一变就调本端点，让对端立即跟随而无需先发消息。
-/// 行为与 TUI 的 /model 选择器对齐：把它持久化为 config 默认 provider（仅当确为已知
-/// provider，避免把无效名写进配置），再在 live 总线上广播 ProviderChanged，使 TUI 头部
-/// 与其他 webui tab 的下拉框实时更新。下一轮实际用哪个模型由 LIVE_PROVIDER 决定（已在
-/// live_set_provider 里更新）。
+/// 该端点仍是 live runtime 的即时切换接口；TUI `/model` 另会更新新会话默认值。
 pub(crate) async fn live_provider(
     State(state): State<AppState>,
     Json(req): Json<LiveProviderReq>,
 ) -> impl IntoResponse {
-    if let Ok(mut cfg) = Config::load(&Config::default_path()) {
-        if cfg.providers.contains_key(&req.provider) && cfg.default_provider != req.provider {
-            cfg.default_provider = req.provider.clone();
-            let _ = cfg.save(&Config::default_path());
-        }
-    }
-    // 确保有 live 会话可供广播（与 /live/message 一致的幂等 ensure）。
     let working_dir = { state.project.read().await.working_dir.clone() };
-    ensure_live_session(
-        working_dir,
+    let config = match Config::load(&Config::default_path()) {
+        Ok(config) => config,
+        Err(error) => {
+            return Json(serde_json::json!({
+                "ok": false,
+                "error": format!("load provider config failed: {error}"),
+            }));
+        }
+    };
+    if !config.providers.contains_key(&req.provider) {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": format!("provider {:?} not found", req.provider),
+        }));
+    }
+    let requested_session_id = parse_session_id(req.session_id);
+    let join = match crate::native_live::join_for_provider(requested_session_id.as_deref()) {
+        Ok(join) => join,
+        Err(crate::live_hub::HubError::Unbound) => {
+            match crate::native_live::ensure_headless_runtime(
+                live_current_working_dir(&working_dir),
+                state.telemetry.clone(),
+                req.provider.clone(),
+                native_runtime_mode(live_current_approval_mode()),
+                requested_session_id,
+            )
+            .await
+            {
+                Ok(join) => join,
+                Err(error) => {
+                    return Json(serde_json::json!({
+                        "ok": false,
+                        "error": error,
+                    }));
+                }
+            }
+        }
+        Err(error) => {
+            return Json(serde_json::json!({
+                "ok": false,
+                "error": format!("provider session rejected: {error:?}"),
+            }));
+        }
+    };
+    let requested_fingerprint =
+        match crate::native_live::provider_fingerprint(&config, &req.provider) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return Json(serde_json::json!({ "ok": false, "error": error }));
+            }
+        };
+    if !provider_reload_required(
+        &join.binding.provider,
+        &join.binding.provider_fingerprint,
+        &req.provider,
+        &requested_fingerprint,
+    ) {
+        return Json(serde_json::json!({ "ok": true }));
+    }
+    let runtime_config = chat_runtime_config(
+        &config,
+        &req.provider,
+        &join.binding.working_dir,
         state.telemetry.clone(),
-        None,
-        ConversationSnapshot::default(),
     );
-    live_set_provider(req.provider);
-    Json(serde_json::json!({ "ok": true }))
+    match crate::native_live::reload_provider(
+        &join.binding,
+        crate::kernel_runtime::coding_config_from_runtime(&runtime_config),
+        requested_fingerprint,
+    )
+    .await
+    {
+        Ok(_) => Json(serde_json::json!({ "ok": true })),
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "error": format!("provider reload rejected: {error:?}"),
+        })),
+    }
 }
 
 #[derive(serde::Deserialize)]
 pub(crate) struct LiveModeReq {
-    /// "build" | "plan" | "bypass"
+    /// "build" | "accept_edits" | "bypass" | "plan"
     pub mode: ApprovalMode,
 }
 
@@ -2402,26 +1602,40 @@ pub(crate) async fn approval_mode_get() -> impl IntoResponse {
     })
 }
 
+async fn apply_live_mode(mode: ApprovalMode) -> bool {
+    let accepted = match crate::native_live::binding() {
+        Ok(_) => crate::native_live::set_mode(native_runtime_mode(mode))
+            .await
+            .is_ok(),
+        Err(_) => true,
+    };
+    if accepted {
+        live_set_mode(mode);
+    }
+    accepted
+}
+
 pub(crate) async fn approval_mode_set(Json(req): Json<LiveModeReq>) -> impl IntoResponse {
-    live_set_mode(req.mode);
+    let ok = apply_live_mode(req.mode).await;
     Json(ApprovalModeResp {
-        ok: true,
-        mode: req.mode,
+        ok,
+        mode: live_current_approval_mode(),
     })
 }
 
-/// POST /live/mode — webui 底栏「模式」pill 切换审批模式（build / plan / bypass）。
+/// POST /live/mode — webui 底栏「模式」pill 切换审批模式
+/// （build / accept_edits / bypass / plan）。
 ///
 /// 更新进程级 LIVE_APPROVAL_MODE；若当前已有 live 会话，则广播 ModeChanged 让
 /// 其他 webui tab / TUI 实时跟随。没有 live 会话时不为一次普通模式切换创建会话。
 /// 下一轮实际用哪个 PermissionDecider 由 run_turn 读 LIVE_APPROVAL_MODE 决定。
 /// 模式是运行时会话状态，不写入 config（与 provider 持久化为默认不同）——避免
-/// 「免审批」这种危险态被静默持久化。
+/// Auto（wire: bypass）这种危险态被静默持久化。
 pub(crate) async fn live_mode(Json(req): Json<LiveModeReq>) -> impl IntoResponse {
-    live_set_mode(req.mode);
+    let ok = apply_live_mode(req.mode).await;
     Json(ApprovalModeResp {
-        ok: true,
-        mode: req.mode,
+        ok,
+        mode: live_current_approval_mode(),
     })
 }
 
@@ -2461,24 +1675,89 @@ pub(crate) async fn live_reasoning_effort(
                 .into_response();
         }
     };
-    if let Ok(mut cfg) = Config::load(&Config::default_path()) {
-        let target = req
-            .provider
+    let store = atomcode_config::ConfigStore::default_store();
+    let requested = req.provider;
+    let mut target = String::new();
+    let mut previous_effort = None;
+    let mut provider_missing = false;
+    let commit = match store.update(|config| {
+        target = requested
             .clone()
-            .unwrap_or_else(|| cfg.default_provider.clone());
-        if let Some(p) = cfg.providers.get_mut(&target) {
-            p.reasoning_effort = effort;
-            let _ = cfg.save(&Config::default_path());
+            .unwrap_or_else(|| config.default_provider.clone());
+        let Some(provider) = config.providers.get_mut(&target) else {
+            provider_missing = true;
+            anyhow::bail!("provider {target:?} not found");
+        };
+        previous_effort = provider.reasoning_effort.clone();
+        provider.reasoning_effort = effort;
+        Ok(())
+    }) {
+        Ok(commit) => commit,
+        Err(_) if provider_missing => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("provider {target:?} not found"),
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("save provider config failed: {error}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let config = commit.snapshot.config.clone();
+
+    if let Ok(binding) = crate::native_live::binding() {
+        let runtime_config = chat_runtime_config(
+            &config,
+            &target,
+            &binding.working_dir,
+            state.telemetry.clone(),
+        );
+        let reload_result = match crate::native_live::provider_fingerprint(&config, &target) {
+            Ok(fingerprint) => {
+                crate::native_live::reload_provider(
+                    &binding,
+                    crate::kernel_runtime::coding_config_from_runtime(&runtime_config),
+                    fingerprint,
+                )
+                .await
+            }
+            Err(error) => Err(crate::live_hub::HubError::RuntimeRejected(error)),
+        };
+        if let Err(error) = reload_result {
+            let rollback_error =
+                match store.update_if_revision(&commit.snapshot.revision, |config| {
+                    if let Some(provider) = config.providers.get_mut(&target) {
+                        provider.reasoning_effort = previous_effort;
+                    }
+                    Ok(())
+                }) {
+                    Ok(Some(_)) | Ok(None) => None,
+                    Err(error) => Some(error.to_string()),
+                };
+            return Json(serde_json::json!({
+                "ok": false,
+                "error": match rollback_error {
+                    Some(rollback) => format!(
+                        "provider reload rejected: {error:?}; config rollback failed: {rollback}"
+                    ),
+                    None => format!("provider reload rejected: {error:?}"),
+                },
+            }))
+            .into_response();
         }
     }
-    // 与 /live/provider 一致的幂等 ensure，保证有 live 会话存在。
-    let working_dir = { state.project.read().await.working_dir.clone() };
-    ensure_live_session(
-        working_dir,
-        state.telemetry.clone(),
-        None,
-        ConversationSnapshot::default(),
-    );
+
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
@@ -2491,7 +1770,7 @@ pub(crate) struct LivePermissionReq {
 }
 
 /// POST /live/permission — Deliver a permission decision for a pending live-session tool-approval
-/// request. First-come-first-served via LiveSession.approve (takes the approver slot).
+/// request. The hub correlates the response with the pending native request.
 ///
 /// Decision mapping mirrors /chat/permission:
 ///   "allow"        → PermissionDecision::Allow
@@ -2519,22 +1798,61 @@ pub(crate) async fn live_permission(
     } else {
         parse_permission_decision(&req.decision)
     };
-    let working_dir = { state.project.read().await.working_dir.clone() };
-    let ok = match current_live_session() {
-        Some(s) => s.approve(decision).await,
-        None => {
-            // No live session — try to ensure one exists (idempotent) but there's nothing
-            // waiting; return accepted: false so the caller knows.
-            ensure_live_session(
-                working_dir,
-                state.telemetry.clone(),
-                None,
-                ConversationSnapshot::default(),
-            );
-            false
+    let response = match decision {
+        PermissionDecision::Allow => atomcode_capabilities::tools::ApprovalResponse::allow(),
+        PermissionDecision::AllowAlways => {
+            atomcode_capabilities::tools::ApprovalResponse::allow_always()
         }
+        _ => atomcode_capabilities::tools::ApprovalResponse::deny(),
     };
+    let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+    let ok = crate::native_live::respond_pending_kind_confirmed(
+        atomcode_capabilities::tools::APPROVAL_KIND,
+        value,
+    )
+    .await
+    .is_ok();
     Json(serde_json::json!({ "accepted": ok }))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct UserInputAnswerReq {
+    pub request_id: u64,
+    #[serde(default)]
+    pub declined: bool,
+    #[serde(default)]
+    pub selected: Vec<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Present for a multi-question batch: one response object per question. When set,
+    /// the daemon responds `{ "responses": [...] }`; otherwise the flat single shape.
+    #[serde(default)]
+    pub responses: Option<serde_json::Value>,
+}
+
+/// POST /live/user-input — Deliver the user's answer to a pending `request_user_input`
+/// question raised by the agent, correlated by native request id.
+///
+/// Request body: `{ "request_id": u64, "declined": bool, "selected": [string], "text": string|null }`
+/// Response: `{ "accepted": bool }` — false if there is no live session or no pending request
+/// with that id.
+pub(crate) async fn live_user_input(
+    State(_state): State<AppState>,
+    Json(req): Json<UserInputAnswerReq>,
+) -> impl IntoResponse {
+    // Batch answer (webui stepper) → `{ "responses": [...] }`; single → the flat shape.
+    let value = match req.responses {
+        Some(responses) => serde_json::json!({ "responses": responses }),
+        None => serde_json::json!({
+            "declined": req.declined,
+            "selected": req.selected,
+            "text": req.text,
+        }),
+    };
+    let ok = crate::native_live::respond_confirmed(req.request_id, value)
+        .await
+        .is_ok();
+    axum::Json(serde_json::json!({ "accepted": ok }))
 }
 
 #[derive(serde::Deserialize)]
@@ -2552,11 +1870,7 @@ pub(crate) async fn live_command(
     Json(req): Json<LiveCommandReq>,
 ) -> impl IntoResponse {
     let line = req.command.trim().to_string();
-    let ok = !line.is_empty()
-        && match current_live_session() {
-            Some(s) => s.notify_remote_command(line),
-            None => false,
-        };
+    let ok = !line.is_empty() && crate::native_live::send_remote_command(line);
     Json(serde_json::json!({ "accepted": ok }))
 }
 
@@ -2564,17 +1878,114 @@ pub(crate) async fn live_command(
 /// 任一视图(手机 App「停止」/ webui / TUI)都可调用,先到先停。
 /// 返回 `{"cancelled": bool}`:false 表示当前没有运行中的 turn。
 pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResponse {
-    let cancelled = match current_live_session() {
-        Some(s) => s.cancel_turn().await,
-        None => false,
-    };
+    let cancelled = crate::native_live::cancel_confirmed().await.is_ok();
     Json(serde_json::json!({ "cancelled": cancelled }))
+}
+
+/// POST /live/mcp/trust — Trust the current project so its `.mcp.json` servers
+/// are allowed to connect on the next turn. Rebuilds the serving MCP registry
+/// so newly-allowed servers start connecting immediately.
+///
+/// Response on success: `{"ok": true, "trusted": true}`
+/// Response on failure: HTTP 500 + `{"ok": false, "error": "..."}`
+pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoResponse {
+    let fallback = { state.project.read().await.working_dir.clone() };
+    let working_dir = live_current_working_dir(&fallback);
+    match atomcode_core::mcp::trust::trust_project(&working_dir) {
+        Ok(()) => {
+            let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir));
+            crate::replace_project_mcp_registry(&state, &working_dir, new_registry).await;
+            // Re-prepare the persistent native runtime so it mounts the newly
+            // trusted project servers immediately. Best-effort: before the first
+            // turn there is no runtime yet, and its first prepare reads trust
+            // from disk directly.
+            let reloaded = match crate::native_live::binding() {
+                Ok(_) => crate::native_live::reload_capabilities().await.is_ok(),
+                Err(_) => true,
+            };
+            Json(serde_json::json!({
+                "ok": reloaded,
+                "trusted": true,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use atomcode_core::conversation::message::Message;
+
+    /// Trust round-trip at the daemon layer: trust_project → is_project_trusted → partition_by_trust
+    /// clears blocked list.  Uses ATOMCODE_MCP_TRUST_STORE as the test seam so we never touch the
+    /// developer's real trust store.
+    #[test]
+    #[serial_test::serial]
+    fn mcp_trust_round_trip_clears_blocked() {
+        use atomcode_core::mcp::config::{McpConfigSource, McpServerConfig, McpTransportConfig};
+        use atomcode_core::mcp::trust::{is_project_trusted, partition_by_trust, trust_project};
+
+        let store_dir = tempfile::tempdir().unwrap();
+        // SAFETY: test seam; serial attribute prevents concurrent mutation.
+        unsafe {
+            std::env::set_var(
+                "ATOMCODE_MCP_TRUST_STORE",
+                store_dir.path().join("mcp_trust_daemon_test.json"),
+            );
+        }
+
+        let proj = store_dir.path().join("fake-project");
+
+        // Before trust: project-source server appears in blocked.
+        let project_cfg = McpServerConfig {
+            name: "untrusted-server".to_string(),
+            disabled: false,
+            config: McpTransportConfig::Stdio {
+                command: "true".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout_ms: None,
+            },
+            source: McpConfigSource::Project,
+            trust: false,
+            auto_approve: vec![],
+        };
+        let part_before = partition_by_trust(vec![project_cfg.clone()], &proj);
+        assert_eq!(
+            part_before.blocked.len(),
+            1,
+            "untrusted project: server should be blocked"
+        );
+        assert!(part_before.allowed.is_empty());
+        assert!(
+            !is_project_trusted(&proj),
+            "fresh store: project must be untrusted"
+        );
+
+        // Trust the project.
+        trust_project(&proj).expect("trust_project must not fail");
+        assert!(
+            is_project_trusted(&proj),
+            "after trust_project: project must be trusted"
+        );
+
+        // After trust: same config yields empty blocked.
+        let part_after = partition_by_trust(vec![project_cfg], &proj);
+        assert!(
+            part_after.blocked.is_empty(),
+            "trusted project: blocked must be empty"
+        );
+        assert_eq!(part_after.allowed.len(), 1);
+
+        // Cleanup env so other serial tests see a clean state.
+        unsafe { std::env::remove_var("ATOMCODE_MCP_TRUST_STORE") };
+    }
 
     #[test]
     fn real_empty_terminal_snapshot_clears_the_conversation() {
@@ -2597,12 +2008,13 @@ mod tests {
     }
 
     /// The webui `/live/mode` body + `mode`/`snapshot` SSE events serialize the
-    /// mode as lowercase `build`/`plan`/`bypass`. The frontend `ApprovalMode`
+    /// mode as lowercase `build`/`accept_edits`/`bypass`/`plan`. The frontend `ApprovalMode`
     /// union depends on these EXACT strings — lock the wire contract.
     #[test]
     fn approval_mode_wire_strings_are_lowercase() {
         let cases = [
             (ApprovalMode::Build, "build"),
+            (ApprovalMode::AcceptEdits, "accept_edits"),
             (ApprovalMode::Plan, "plan"),
             (ApprovalMode::Auto, "bypass"),
         ];
@@ -2618,9 +2030,13 @@ mod tests {
     }
 
     #[test]
-    fn v2_fallback_approval_is_closed_for_plan_mode() {
+    fn fallback_approval_is_closed_for_prompt_required_modes() {
         assert!(matches!(
             fallback_approval_decision(ApprovalMode::Plan),
+            PermissionDecision::Deny
+        ));
+        assert!(matches!(
+            fallback_approval_decision(ApprovalMode::AcceptEdits),
             PermissionDecision::Deny
         ));
         assert!(matches!(
@@ -2631,6 +2047,23 @@ mod tests {
             fallback_approval_decision(ApprovalMode::Auto),
             PermissionDecision::Allow
         ));
+    }
+
+    #[test]
+    fn native_runtime_mode_preserves_all_approval_modes() {
+        let cases = [
+            (ApprovalMode::Build, atomcode_coding::RuntimeMode::Build),
+            (
+                ApprovalMode::AcceptEdits,
+                atomcode_coding::RuntimeMode::AcceptEdits,
+            ),
+            (ApprovalMode::Auto, atomcode_coding::RuntimeMode::Auto),
+            (ApprovalMode::Plan, atomcode_coding::RuntimeMode::Plan),
+        ];
+
+        for (approval_mode, runtime_mode) in cases {
+            assert_eq!(native_runtime_mode(approval_mode), runtime_mode);
+        }
     }
 
     #[tokio::test]
@@ -2650,9 +2083,9 @@ mod tests {
     }
 
     /// Regression guard (2nd occurrence — see the `never eprintln` note near the
-    /// top of this file). Under `/webui` the LiveSession path runs IN the TUI
+    /// top of this file). Under `/webui` the live path runs IN the TUI
     /// process, so a console print writes straight to the shared terminal and
-    /// corrupts the TUI — a stray "[engine v2] daemon live turns on the new stack"
+    /// corrupts the TUI — a stray native-runtime startup diagnostic
     /// landed on the input line when a dir switch during sync spun up the live
     /// stack. Every diagnostic in this file must use the file-sink `ctrace!`.
     ///
@@ -2689,10 +2122,9 @@ mod tests {
         }
     }
 
-    // 回归：webui sync/live 模式切换模型——/live/message 必须解析 provider 字段，
-    // 且 set_live_provider 把选择写入 LIVE_PROVIDER（None 不覆盖既有选择）。
+    // 回归：/live/message 必须解析显式 provider，但不接受 per-message mode 覆盖。
     #[test]
-    fn live_message_parses_provider_and_updates_override() {
+    fn live_message_parses_optional_provider() {
         // 带 provider 的请求体被解析。
         // `approval_mode` is deliberately ignored here: live approval mode is
         // global runtime state changed only through /approval_mode or /live/mode,
@@ -2702,22 +2134,36 @@ mod tests {
                 .unwrap();
         assert_eq!(req.provider.as_deref(), Some("openai"));
 
-        // set_live_provider(Some) 写入覆盖。
-        set_live_provider(req.provider);
-        assert_eq!(LIVE_PROVIDER.lock().unwrap().as_deref(), Some("openai"));
-
-        // 不带 provider 的请求体默认 None，且 set_live_provider(None) 不覆盖既有选择。
+        // 不带 provider 的请求体默认 None。
         let req2: LiveMessageReq = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
         assert_eq!(req2.provider, None);
-        set_live_provider(req2.provider);
-        assert_eq!(LIVE_PROVIDER.lock().unwrap().as_deref(), Some("openai"));
     }
 
-    // 回归 #755：sync/live 模式下 /cd（live_set_working_dir）必须更新 LIVE_WORKING_DIR
-    // 进程级覆盖，使两个执行器下一轮读到新目录（否则模型仍报旧 cwd）。同时验证
-    // live_current_working_dir 的「覆盖 → 回退」解析，这正是执行器检测 /cd 的依据。
     #[test]
-    fn cd_updates_working_dir_override_and_resolution() {
+    fn live_message_reloads_only_when_the_runtime_provider_identity_changes() {
+        assert!(!provider_reload_required(
+            "ds-gf",
+            "fingerprint-a",
+            "ds-gf",
+            "fingerprint-a",
+        ));
+        assert!(provider_reload_required(
+            "ds-gf",
+            "fingerprint-a",
+            "ds-gf",
+            "fingerprint-b",
+        ));
+        assert!(provider_reload_required(
+            "ds-gf",
+            "fingerprint-a",
+            "other",
+            "fingerprint-a",
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn live_working_dir_updates_daemon_project_view() {
         let dir_a = std::path::PathBuf::from("/tmp/atomcode-test-a");
         let dir_b = std::path::PathBuf::from("/tmp/atomcode-test-b");
 
@@ -2731,19 +2177,8 @@ mod tests {
         let project_store = Arc::new(tokio::sync::RwLock::new(project_state));
         *crate::DAEMON_PROJECT.lock().unwrap() = Some(project_store.clone());
 
-        // 无覆盖时回退到执行器创建目录。
-        *LIVE_WORKING_DIR.lock().unwrap() = None;
-        assert_eq!(live_current_working_dir(&dir_a), dir_a);
-
-        // /cd → live_set_working_dir 写入覆盖；解析返回新目录、忽略 fallback。
         live_set_working_dir(dir_b.clone());
-        assert_eq!(
-            LIVE_WORKING_DIR.lock().unwrap().clone(),
-            Some(dir_b.clone())
-        );
-        assert_eq!(live_current_working_dir(&dir_a), dir_b);
 
-        // 验证 DAEMON_PROJECT 也已被同步更新。
         {
             let project = project_store.blocking_read();
             assert_eq!(project.working_dir, dir_b);
@@ -2752,12 +2187,6 @@ mod tests {
             assert_eq!(project.recent_dirs, vec![dir_b.clone(), dir_a.clone()]);
         }
 
-        // 这正是执行器里的 /cd 检测条件：current(dir_b) != bridge_built_with(dir_a)
-        // → 触发 ChangeDir / 重建 parts。
-        assert_ne!(live_current_working_dir(&dir_a), dir_a);
-
-        // 清理进程级状态，避免污染同进程其他测试。
-        *LIVE_WORKING_DIR.lock().unwrap() = None;
         *crate::DAEMON_PROJECT.lock().unwrap() = None;
     }
 
@@ -2770,7 +2199,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_images_from_turn_base_preserves_v2_history_user_display_payload() {
+    fn restore_images_from_turn_base_preserves_history_user_display_payload() {
         use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
 
         let original_user = Message {
@@ -2929,89 +2358,182 @@ mod tests {
     }
 
     #[test]
-    fn coding_compaction_events_preserve_daemon_display_policy() {
-        use atomcode_coding::runtime::CompactionOutcome;
-        use atomcode_kernel::message::CompactTrigger;
+    fn native_live_projector_preserves_rate_limit_fields() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::RateLimited {
+                    reset_at_display: "18:09".into(),
+                    reset_label: "5h".into(),
+                    secs_until_reset: Some(7200),
+                    auto_resuming: false,
+                    server_message: Some("provider quota exhausted".into()),
+                }),
+            ))
+            .expect("rate limit must reach the live wire");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "rate_limited");
+        assert_eq!(json["reset_at_display"], "18:09");
+        assert_eq!(json["reset_label"], "5h");
+        assert_eq!(json["secs_until_reset"], 7200);
+        assert_eq!(json["server_message"], "provider quota exhausted");
+    }
 
-        let outcome = |trigger, committed| CompactionOutcome {
-            trigger,
-            epoch: 1,
-            removed_messages: 3,
-            bytes_before: 160_000,
-            bytes_after: 40_000,
-            committed,
-            estimated_tokens_before: 40_000,
-            estimated_tokens_after: 10_000,
-            committed_snapshot: None,
+    #[test]
+    fn native_live_projector_preserves_the_authoritative_stop_reason() {
+        for (reason, expected) in [
+            (atomcode_kernel::event::StopReason::MaxRounds, "max_rounds"),
+            (
+                atomcode_kernel::event::StopReason::RepeatLoop,
+                "repeat_loop",
+            ),
+            (
+                atomcode_kernel::event::StopReason::ToolLoopDetected,
+                "tool_loop_detected",
+            ),
+        ] {
+            let mut projector = NativeLiveWireProjector::default();
+            let wire = projector
+                .project(crate::live_hub::LiveViewEvent::Runtime(
+                    CodingRuntimeEvent::TurnFinished(atomcode_coding::TurnCompletion::Completed {
+                        turn_id: 7,
+                        reason,
+                        snapshot: std::sync::Arc::new(
+                            atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
+                        ),
+                        stats: atomcode_coding::RuntimeTurnStats::default(),
+                    }),
+                ))
+                .expect("turn terminal must reach the live wire");
+            let json = serde_json::to_value(wire).unwrap();
+            assert_eq!(json["type"], "state");
+            assert_eq!(json["running"], false);
+            assert_eq!(json["stop_reason"], expected);
+            assert!(json.get("message").is_none());
+        }
+    }
+
+    #[test]
+    fn native_live_projector_projects_runtime_stop_as_authoritative_state() {
+        let mut projector = NativeLiveWireProjector::default();
+        projector
+            .tools
+            .insert("call-1".into(), ("bash".into(), std::time::Instant::now()));
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::RuntimeStopped(atomcode_coding::RuntimeExit {
+                    reason: atomcode_coding::RuntimeExitReason::OwnerStopped,
+                    forced: false,
+                }),
+            ))
+            .expect("runtime stop must reach the live wire");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "state");
+        assert_eq!(json["running"], false);
+        assert_eq!(json["stop_reason"], "runtime_stopped");
+        assert!(json["message"].as_str().is_some_and(|m| !m.is_empty()));
+        assert!(projector.tools.is_empty());
+    }
+
+    #[test]
+    fn native_live_projector_prioritizes_snapshot_failure_over_inner_stop_reason() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::TurnFinished(
+                    atomcode_coding::TurnCompletion::SnapshotUnavailable {
+                        turn_id: 7,
+                        reason: atomcode_kernel::event::StopReason::Stopped,
+                        error: atomcode_coding::RuntimeSnapshotError {
+                            message: "snapshot failed".into(),
+                        },
+                        stats: atomcode_coding::RuntimeTurnStats::default(),
+                    },
+                ),
+            ))
+            .expect("snapshot failure must reach the live wire");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "state");
+        assert_eq!(json["running"], false);
+        assert_eq!(json["stop_reason"], "snapshot_unavailable");
+        assert_eq!(json["message"], "snapshot failed");
+    }
+
+    #[test]
+    fn native_live_projector_exposes_only_typed_user_input_requests() {
+        use atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND;
+
+        let mut projector = NativeLiveWireProjector::default();
+        let request = atomcode_coding::RuntimeRequest {
+            id: 42,
+            kind: REQUEST_USER_INPUT_KIND.into(),
+            payload: serde_json::json!({
+                "header": "Pick one",
+                "question": "Red or blue?",
+                "mode": "single",
+                "options": [{ "label": "Red" }, { "label": "Blue" }]
+            }),
+            snapshot: None,
         };
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Request(request),
+            ))
+            .expect("typed request must reach the live wire");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "user_input_request");
+        assert_eq!(json["request_id"], 42);
+        assert_eq!(json["mode"], "single");
+        assert_eq!(json["options"][0]["label"], "Red");
 
-        assert!(matches!(
-            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
-                completion: CompactionCompletion::Completed(outcome(
-                    CompactTrigger::Auto { utilization: 0.8 },
-                    true,
-                )),
-            }),
-            Some(TurnEvent::Warning(label)) if label.contains("40.0K") && label.contains("10.0K")
-        ));
-        assert!(matches!(
-            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
-                completion: CompactionCompletion::Completed(outcome(
-                    CompactTrigger::Manual { focus: None },
-                    false,
-                )),
-            }),
-            Some(TurnEvent::TextDelta(_))
-        ));
-        assert!(coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
-            completion: CompactionCompletion::Completed(outcome(
-                CompactTrigger::Auto { utilization: 0.8 },
-                false,
-            )),
-        })
-        .is_none());
-        assert!(coding_runtime_to_turn(CodingRuntimeEvent::CompactionStarted {
-            trigger: CompactTrigger::Manual { focus: None },
-        })
-        .is_none());
-        assert!(matches!(
-            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
-                completion: CompactionCompletion::Interrupted {
-                    trigger: CompactTrigger::Manual { focus: None },
-                    reason: atomcode_coding::runtime::CompactionInterruption::RuntimeReconfigured,
-                },
-            }),
-            Some(TurnEvent::Warning(text)) if text.contains("interrupt") || text.contains("中断")
-        ));
-        assert!(matches!(
-            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
-                completion: CompactionCompletion::Failed {
-                    trigger: CompactTrigger::Manual { focus: None },
-                    error: atomcode_kernel::checkpoint::CompactionCheckpointError::new(
-                        "disk full",
-                    ),
-                },
-            }),
-            Some(TurnEvent::Error(text)) if text.contains("disk full")
-        ));
-
-        let missing_snapshot = CodingRuntimeEvent::CompactionFinished {
-            completion: CompactionCompletion::Completed(outcome(
-                CompactTrigger::Manual { focus: None },
-                true,
-            )),
+        let unknown = atomcode_coding::RuntimeRequest {
+            id: 43,
+            kind: "unknown_future_kind".into(),
+            payload: serde_json::Value::Null,
+            snapshot: None,
         };
-        assert!(committed_compaction_snapshot(&missing_snapshot).is_err());
+        assert!(projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Request(unknown),
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn native_live_projector_keeps_warning_and_tool_progress_distinct() {
+        let mut projector = NativeLiveWireProjector::default();
+        let warning = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Warning(
+                    "conversation compacted".into(),
+                )),
+            ))
+            .expect("warning must reach the live wire");
+        assert_eq!(
+            serde_json::to_string(&warning).unwrap(),
+            r#"{"type":"warning","message":"conversation compacted"}"#
+        );
+
+        let progress = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::ToolProgress {
+                    call_id: "c1".into(),
+                    message: "explore#4 · grep unwrap".into(),
+                }),
+            ))
+            .expect("tool progress must reach the live wire");
+        let json = serde_json::to_value(progress).unwrap();
+        assert_eq!(json["type"], "tool_progress");
+        assert_eq!(json["id"], "c1");
     }
 
     #[test]
     fn committed_compaction_event_exposes_exact_core_mirror_messages() {
-        use atomcode_coding::runtime::CompactionOutcome;
+        use atomcode_coding::runtime::{CompactionCompletion, CompactionOutcome};
         use atomcode_kernel::message::{CompactTrigger, Message, SessionSnapshot};
 
         let mut kernel_message = Message::user("after compact");
         kernel_message.synthetic = true;
-        let snapshot = SessionSnapshot::new(vec![kernel_message]);
         let event = CodingRuntimeEvent::CompactionFinished {
             completion: CompactionCompletion::Completed(CompactionOutcome {
                 trigger: CompactTrigger::Manual { focus: None },
@@ -3022,7 +2544,9 @@ mod tests {
                 committed: true,
                 estimated_tokens_before: 25,
                 estimated_tokens_after: 12,
-                committed_snapshot: Some(std::sync::Arc::new(snapshot)),
+                committed_snapshot: Some(std::sync::Arc::new(SessionSnapshot::new(vec![
+                    kernel_message,
+                ]))),
             }),
         };
 
@@ -3033,472 +2557,5 @@ mod tests {
         assert!(snapshot.messages[0].synthetic);
         assert_eq!(snapshot.messages[0].text(), Some("after compact"));
         assert!(snapshot.cold_summaries.is_empty());
-    }
-
-    // 回归：agent_to_turn 必须转发 AgentEvent::RateLimited 为 TurnEvent::RateLimited，
-    // 字段透传——历史上该臂缺失导致事件被 `_ => return None` 静默丢弃（dead code）。
-    #[test]
-    fn agent_to_turn_rate_limited_is_forwarded_not_dropped() {
-        use atomcode_core::agent::AgentEvent;
-        let result = agent_to_turn(AgentEvent::RateLimited {
-            reset_at_display: "18:09".into(),
-            reset_label: "5h".into(),
-            secs_until_reset: Some(7200),
-            auto_resuming: false,
-        });
-        match result {
-            Some(TurnEvent::RateLimited {
-                reset_at_display,
-                reset_label,
-                secs_until_reset,
-                auto_resuming,
-            }) => {
-                assert_eq!(reset_at_display, "18:09");
-                assert_eq!(reset_label, "5h");
-                assert_eq!(secs_until_reset, Some(7200));
-                assert!(!auto_resuming);
-            }
-            other => panic!(
-                "expected Some(TurnEvent::RateLimited{{..}}), got {:?}",
-                other
-            ),
-        }
-    }
-
-    // 限流事件必须作为独立的 rate_limited 线事件下发，带 reset_at_display/reset_label/
-    // secs_until_reset 字段，供 webui 渲染倒计时提示而非普通错误。
-    #[test]
-    fn rate_limited_serializes_as_its_own_type() {
-        let wire = to_wire(LiveEvent::Turn(TurnEvent::RateLimited {
-            reset_at_display: "18:09".into(),
-            reset_label: "5h".into(),
-            secs_until_reset: Some(7200),
-            auto_resuming: false,
-        }))
-        .expect("should map");
-        let json = serde_json::to_string(&wire).unwrap();
-        assert!(
-            json.contains(r#""type":"rate_limited""#),
-            "wire type must be rate_limited: {json}"
-        );
-        assert!(json.contains(r#""reset_at_display":"18:09""#), "{json}");
-        assert!(json.contains(r#""secs_until_reset":7200"#), "{json}");
-        assert!(json.contains(r#""reset_label":"5h""#), "{json}");
-    }
-
-    // U+001E 前缀是子代理的 latest-wins 活性行。WebUI 必须收到独立 progress 事件，
-    // 不能把它丢掉，也不能当普通 output 累积进转录。
-    #[test]
-    fn subagent_activity_marker_maps_to_tool_progress() {
-        let progress = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
-            call_id: "c1".into(),
-            chunk: "\u{1e}explore#4 · grep unwrap".into(),
-        }))
-        .expect("marker-prefixed activity must reach webui as progress");
-        let json = serde_json::to_string(&progress).unwrap();
-        assert!(
-            json.contains(r#""type":"tool_progress""#)
-                && json.contains(r#""id":"c1""#)
-                && json.contains("explore#4 · grep unwrap"),
-            "{json}"
-        );
-    }
-
-    #[test]
-    fn normal_tool_output_is_still_forwarded() {
-        // Ordinary tool output → forwarded.
-        let kept = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
-            call_id: "c2".into(),
-            chunk: "hello from bash".into(),
-        }))
-        .expect("normal tool output must still reach the webui");
-        let json = serde_json::to_string(&kept).unwrap();
-        assert!(json.contains("hello from bash"), "{json}");
-    }
-
-    // 回归：非致命提示（如 "conversation compacted"）必须作为独立的 warning 线事件下发，
-    // 不能被当成 error —— webui 会把 error 渲染成红色「[错误: …]」并塞进回复气泡，
-    // 让一条善意提示看起来像任务出错（用户实测报的 bug）。
-    #[test]
-    fn turn_warning_maps_to_its_own_wire_event_not_error() {
-        let wire = to_wire(LiveEvent::Turn(TurnEvent::Warning(
-            "conversation compacted".into(),
-        )))
-        .expect("a warning must produce a wire event");
-        let json = serde_json::to_string(&wire).unwrap();
-        // Its own severity type — NOT error.
-        assert!(
-            json.contains(r#""type":"warning""#),
-            "wire type must be warning: {json}"
-        );
-        assert!(
-            !json.contains(r#""type":"error""#),
-            "warning must not be sent as error: {json}"
-        );
-        // The type conveys severity; no "[warning]" string prefix smuggled into the message.
-        assert_eq!(
-            json,
-            r#"{"type":"warning","message":"conversation compacted"}"#
-        );
-    }
-
-    // ── In-progress (crash-durable) persistence ───────────────────────────────
-    // Regression: a v2 live turn used to persist `<id>.json` ONLY at the terminal
-    // (TurnComplete/TurnCancelled). A hard kill mid-turn (computer too laggy, window
-    // closed) therefore lost the WHOLE unfinished turn — the webui loads from .json
-    // and showed only prior completed turns (user-reported bug). `save_live_session_json`
-    // is the helper the executor now also calls at turn start (user message durable) and
-    // throttled mid-turn (partial assistant text durable).
-
-    /// Shared process-global env lock so ATOMCODE_HOME-mutating tests across ALL
-    /// daemon test modules in this binary never race.
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        crate::atomcode_home_test_lock()
-    }
-
-    /// Point ATOMCODE_HOME (→ sessions root) at a tempdir for the duration of a test,
-    /// restoring the previous value on drop. Mirrors core's `ScopedHome` pattern.
-    struct ScopedHome {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        prev: Option<String>,
-        _dir: tempfile::TempDir,
-    }
-    impl ScopedHome {
-        fn new() -> Self {
-            let guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var("ATOMCODE_HOME").ok();
-            let dir = tempfile::tempdir().expect("tempdir");
-            std::env::set_var("ATOMCODE_HOME", dir.path());
-            Self {
-                _guard: guard,
-                prev,
-                _dir: dir,
-            }
-        }
-    }
-    impl Drop for ScopedHome {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var("ATOMCODE_HOME", v),
-                None => std::env::remove_var("ATOMCODE_HOME"),
-            }
-        }
-    }
-
-    fn user_msg(text: &str) -> atomcode_core::conversation::message::Message {
-        atomcode_core::conversation::message::Message::new(
-            atomcode_core::conversation::message::Role::User,
-            text,
-        )
-    }
-    fn assistant_msg(text: &str) -> atomcode_core::conversation::message::Message {
-        atomcode_core::conversation::message::Message::new(
-            atomcode_core::conversation::message::Role::Assistant,
-            text,
-        )
-    }
-    fn synthetic_msg(text: &str) -> atomcode_core::conversation::message::Message {
-        atomcode_core::conversation::message::Message::synthetic_user(text)
-    }
-
-    // Fix A: persisting just the user message mid-turn makes the unfinished turn
-    // durable — load() reads it straight back. Before the fix the .json was never
-    // written until the terminal, so a hard kill lost it entirely.
-    #[test]
-    fn save_live_session_json_persists_user_message_for_reopen() {
-        use atomcode_core::session::{SessionId, SessionManager};
-        let _home = ScopedHome::new();
-        let dir = std::path::PathBuf::from("/proj/a");
-        let id = SessionId::new();
-
-        save_live_session_json(&dir, &id, vec![user_msg("cd d:")]).expect("save");
-
-        let loaded = SessionManager::new(&dir).load(&id).expect("load");
-        assert_eq!(loaded.messages.len(), 1);
-        assert_eq!(loaded.messages[0].text(), Some("cd d:"));
-    }
-
-    // Fix B: a throttled mid-turn save carries the partial assistant text too, so a
-    // crash while the model was still answering preserves how far it got.
-    #[test]
-    fn save_live_session_json_persists_partial_assistant_progress() {
-        use atomcode_core::session::{SessionId, SessionManager};
-        let _home = ScopedHome::new();
-        let dir = std::path::PathBuf::from("/proj/b");
-        let id = SessionId::new();
-
-        save_live_session_json(
-            &dir,
-            &id,
-            vec![user_msg("hello"), assistant_msg("partial ans")],
-        )
-        .expect("save");
-
-        let loaded = SessionManager::new(&dir).load(&id).expect("load");
-        assert_eq!(loaded.messages.len(), 2);
-        assert_eq!(loaded.messages[1].text(), Some("partial ans"));
-    }
-
-    // The helper LOAD-MERGE-SAVEs (not blind overwrite) so a user `/rename` and other
-    // accumulated fields survive an in-progress save — same contract as the terminal save.
-    #[test]
-    fn save_live_session_json_preserves_user_rename() {
-        use atomcode_core::session::{Session, SessionManager};
-        let _home = ScopedHome::new();
-        let dir = std::path::PathBuf::from("/proj/c");
-        let mgr = SessionManager::new(&dir);
-
-        // A pre-existing, user-renamed session on disk.
-        let mut existing = Session::new(dir.clone());
-        let id = existing.id.clone();
-        existing.rename("我的会话".to_string());
-        mgr.save(&existing).expect("seed save");
-
-        // An in-progress save with new messages must NOT clobber the custom name.
-        save_live_session_json(&dir, &id, vec![user_msg("继续")]).expect("save");
-
-        let loaded = mgr.load(&id).expect("load");
-        assert_eq!(
-            loaded.name, "我的会话",
-            "user rename must survive an in-progress save"
-        );
-        assert!(loaded.user_renamed);
-        assert_eq!(loaded.messages.len(), 1);
-        assert_eq!(loaded.messages[0].text(), Some("继续"));
-    }
-
-    // Fix A is idempotent with the terminal save: persisting the same id repeatedly
-    // (turn-start → throttled → terminal) overwrites the one file, never duplicates it.
-    #[test]
-    fn save_live_session_json_overwrites_same_file() {
-        use atomcode_core::session::{SessionId, SessionManager};
-        let _home = ScopedHome::new();
-        let dir = std::path::PathBuf::from("/proj/d");
-        let id = SessionId::new();
-
-        save_live_session_json(&dir, &id, vec![user_msg("q")]).expect("turn start");
-        save_live_session_json(&dir, &id, vec![user_msg("q"), assistant_msg("a1")]).expect("mid");
-        save_live_session_json(&dir, &id, vec![user_msg("q"), assistant_msg("a1 a2")])
-            .expect("end");
-
-        let loaded = SessionManager::new(&dir).load(&id).expect("load");
-        assert_eq!(
-            loaded.messages.len(),
-            2,
-            "one session, latest snapshot — not appended copies"
-        );
-        assert_eq!(loaded.messages[1].text(), Some("a1 a2"));
-    }
-
-    // GUARD — webui refresh-mid-turn bug: a stuck turn's later authoritative writeback
-    // (sourced from a divergent persistent bridge) could carry FEWER turns than what
-    // durability already persisted, silently reducing the on-disk `.json` to just the
-    // first turn. A staler write that would DROP already-persisted turns must be refused.
-    #[test]
-    fn save_live_session_json_refuses_net_loss_of_persisted_turns() {
-        use atomcode_core::session::{SessionId, SessionManager};
-        let _home = ScopedHome::new();
-        let dir = std::path::PathBuf::from("/proj/guard1");
-        let id = SessionId::new();
-
-        // Two full turns durably persisted.
-        save_live_session_json(
-            &dir,
-            &id,
-            vec![
-                user_msg("u1"),
-                assistant_msg("a1"),
-                user_msg("u2"),
-                assistant_msg("a2"),
-            ],
-        )
-        .expect("seed");
-
-        // A stale writeback carrying only the first turn must NOT win (best-effort Ok).
-        save_live_session_json(&dir, &id, vec![user_msg("u1"), assistant_msg("a1")])
-            .expect("stale save is best-effort ok");
-
-        let loaded = SessionManager::new(&dir).load(&id).expect("load");
-        assert_eq!(
-            loaded.messages.len(),
-            4,
-            "persisted turns must not be dropped by a staler write"
-        );
-        assert_eq!(loaded.messages[2].text(), Some("u2"));
-    }
-
-    // A refused net-loss write must leave `updated_at` untouched — otherwise the sidebar
-    // re-sorts the session to the top (the reported "first execution time got updated")
-    // even though its content just regressed.
-    #[test]
-    fn save_live_session_json_refused_write_keeps_updated_at() {
-        use atomcode_core::session::{Session, SessionManager};
-        let _home = ScopedHome::new();
-        let dir = std::path::PathBuf::from("/proj/guard2");
-        let mgr = SessionManager::new(&dir);
-
-        let mut existing = Session::new(dir.clone());
-        let id = existing.id.clone();
-        existing.messages = vec![
-            user_msg("u1"),
-            assistant_msg("a1"),
-            user_msg("u2"),
-            assistant_msg("a2"),
-        ];
-        existing.updated_at = 1000;
-        mgr.save(&existing).expect("seed");
-
-        save_live_session_json(&dir, &id, vec![user_msg("u1")]).expect("ok");
-
-        let loaded = mgr.load(&id).expect("load");
-        assert_eq!(
-            loaded.updated_at, 1000,
-            "a refused net-loss write must not bump updated_at"
-        );
-    }
-
-    // Intra-turn rollback: a throttled Fix-B save persisted a PROVISIONAL assistant, then
-    // the turn was cancelled / timed out and the authoritative terminal snapshot drops
-    // that partial. The user turns are unchanged, so this is NOT a net loss — the terminal
-    // must win, else disk wedges on a phantom reply the model actually discarded.
-    #[test]
-    fn save_live_session_json_allows_terminal_to_drop_own_provisional_assistant() {
-        use atomcode_core::session::{SessionId, SessionManager};
-        let _home = ScopedHome::new();
-        let dir = std::path::PathBuf::from("/proj/guard4");
-        let id = SessionId::new();
-
-        // Fix-B provisional save: [u1, a1, u2, partial-a2].
-        save_live_session_json(
-            &dir,
-            &id,
-            vec![
-                user_msg("u1"),
-                assistant_msg("a1"),
-                user_msg("u2"),
-                assistant_msg("partial a2"),
-            ],
-        )
-        .expect("provisional");
-
-        // Terminal after cancel: same 2 user turns, the provisional assistant is gone.
-        save_live_session_json(
-            &dir,
-            &id,
-            vec![user_msg("u1"), assistant_msg("a1"), user_msg("u2")],
-        )
-        .expect("terminal");
-
-        let loaded = SessionManager::new(&dir).load(&id).expect("load");
-        assert_eq!(
-            loaded.messages.len(),
-            3,
-            "terminal snapshot must replace its own provisional save (same user turns)"
-        );
-        assert_eq!(loaded.messages[2].text(), Some("u2"));
-    }
-
-    #[test]
-    fn cancelled_first_turn_empty_snapshot_removes_provisional_prompt() {
-        use atomcode_core::session::{SessionId, SessionManager};
-        let _home = ScopedHome::new();
-        let dir = std::path::PathBuf::from("/proj/cancel-empty");
-        let id = SessionId::new();
-        let turn_base = vec![user_msg("cancel me")];
-
-        save_live_session_json(&dir, &id, turn_base.clone()).expect("provisional save");
-        save_live_terminal_snapshot_json(
-            &dir,
-            &id,
-            ConversationSnapshot::default(),
-            Some(&turn_base),
-        )
-        .expect("authoritative cancellation save");
-
-        let loaded = SessionManager::new(&dir).load(&id).expect("load");
-        assert!(loaded.messages.is_empty());
-        assert!(loaded.cold_summaries.is_empty());
-    }
-
-    // Compaction legitimately SHRINKS the message list (drops old turns, injects a
-    // synthetic summary). The guard keys off the synthetic count so it must NOT mistake a
-    // real compaction for a stale clobber.
-    #[test]
-    fn save_live_session_json_allows_compaction_shrink() {
-        use atomcode_core::session::{SessionId, SessionManager};
-        let _home = ScopedHome::new();
-        let dir = std::path::PathBuf::from("/proj/guard3");
-        let id = SessionId::new();
-
-        save_live_session_json(
-            &dir,
-            &id,
-            vec![
-                user_msg("u1"),
-                assistant_msg("a1"),
-                user_msg("u2"),
-                assistant_msg("a2"),
-            ],
-        )
-        .expect("seed");
-
-        // Compaction: fewer real messages, but a NEW synthetic summary marks it.
-        save_live_session_json(
-            &dir,
-            &id,
-            vec![
-                synthetic_msg("[Context was compressed. ...]"),
-                user_msg("u2"),
-                assistant_msg("a2"),
-            ],
-        )
-        .expect("compaction save");
-
-        let loaded = SessionManager::new(&dir).load(&id).expect("load");
-        assert_eq!(
-            loaded.messages.len(),
-            3,
-            "compaction shrink (synthetic summary present) must be allowed"
-        );
-        assert!(loaded.messages[0].synthetic);
-    }
-
-    #[test]
-    fn trusted_compaction_save_allows_repeated_shrink_with_same_summary_count() {
-        use atomcode_core::session::{SessionId, SessionManager};
-        let _home = ScopedHome::new();
-        let dir = std::path::PathBuf::from("/proj/compact-checkpoint");
-        let id = SessionId::new();
-
-        save_live_session_json(
-            &dir,
-            &id,
-            vec![
-                synthetic_msg("summary 1"),
-                user_msg("u2"),
-                assistant_msg("a2"),
-                user_msg("u3"),
-                assistant_msg("a3"),
-            ],
-        )
-        .expect("seed");
-
-        save_live_compaction_json(
-            &dir,
-            &id,
-            ConversationSnapshot {
-                messages: vec![
-                    synthetic_msg("summary 2"),
-                    user_msg("u3"),
-                    assistant_msg("a3"),
-                ],
-                cold_summaries: Vec::new(),
-            },
-        )
-        .expect("trusted compaction save");
-
-        let loaded = SessionManager::new(&dir).load(&id).expect("load");
-        assert_eq!(loaded.messages.len(), 3);
-        assert_eq!(loaded.messages[0].text(), Some("summary 2"));
     }
 }

@@ -73,7 +73,10 @@ impl CompactionStrategy for DrainOldOnOverflow {
 #[tokio::test]
 async fn overflow_triggers_compaction_then_retries_same_round() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let provider = Arc::new(OverflowWhenLarge { max: 4, calls: calls.clone() });
+    let provider = Arc::new(OverflowWhenLarge {
+        max: 4,
+        calls: calls.clone(),
+    });
     // Seed 6 messages; + the new input = 7 > max=4 → first open overflows.
     let snapshot = SessionSnapshot::new(vec![
         Message::system("persona"),
@@ -91,19 +94,31 @@ async fn overflow_triggers_compaction_then_retries_same_round() {
         .compaction(Arc::new(DrainOldOnOverflow))
         .compact_threshold(1.0) // never auto-compact; only overflow drives compaction
         .build();
-    let outcome = agent.run_to_completion("new question", AutoRespond::AllowAll).await;
+    let outcome = agent
+        .run_to_completion("new question", AutoRespond::AllowAll)
+        .await;
 
     let calls = calls.lock().unwrap();
     assert!(calls.len() >= 2, "must retry after overflow: {calls:?}");
-    assert!(calls[1] < calls[0], "retry request is smaller after compaction: {calls:?}");
-    assert_eq!(outcome.error, None, "turn recovered cleanly: {:?}", outcome.error);
+    assert!(
+        calls[1] < calls[0],
+        "retry request is smaller after compaction: {calls:?}"
+    );
+    assert_eq!(
+        outcome.error, None,
+        "turn recovered cleanly: {:?}",
+        outcome.error
+    );
     assert!(outcome.text.contains("recovered"), "got: {}", outcome.text);
 }
 
 #[tokio::test]
 async fn no_overflow_never_compacts() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let provider = Arc::new(OverflowWhenLarge { max: 100, calls: calls.clone() });
+    let provider = Arc::new(OverflowWhenLarge {
+        max: 100,
+        calls: calls.clone(),
+    });
     let agent = Agent::builder()
         .provider(provider)
         .tools(ToolRegistry::new().mount(&[]))
@@ -112,6 +127,10 @@ async fn no_overflow_never_compacts() {
         .compact_threshold(1.0)
         .build();
     let outcome = agent.run_to_completion("hi", AutoRespond::AllowAll).await;
-    assert_eq!(calls.lock().unwrap().len(), 1, "single clean call, no retry");
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "single clean call, no retry"
+    );
     assert_eq!(outcome.error, None);
 }

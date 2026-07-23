@@ -60,7 +60,7 @@ pub struct OpenAiCompatConfig {
     /// `bearer_auth(api_key)`. See [`RequestSigner`].
     pub request_signer: Option<std::sync::Arc<dyn RequestSigner>>,
     /// User-Agent sent on every request. `None` ⇒ the generic [`super::DEFAULT_USER_AGENT`]
-    /// fallback; the driver (bridge) sets this to `atomcode/<version>` so a forwarding
+    /// fallback; the host adapter sets this to `atomcode/<version>` so a forwarding
     /// gateway can attribute traffic by product version (analytics + per-version cache-hit
     /// slicing). This crate is versioned independently of the product, so the real version
     /// MUST be injected here rather than read from a local `CARGO_PKG_VERSION`.
@@ -74,21 +74,14 @@ pub struct OpenAiCompatConfig {
     /// array — re-sending a historical image to a text-only model 400s the whole
     /// request (`glm-5.2 is not a multimodal model`) on every resumed turn.
     /// `new()` DEFAULTS this from the model name (`model_suggests_vision`), so
-    /// every construction site — including the core-decoupled acp/review/clix
-    /// drivers — is correct without extra wiring; core-aware callers (bridge,
-    /// coding assemble) override it with core's authoritative copy. Mirrors v1
-    /// `supports_vision`.
+    /// every construction site — including ACP/review/clix and coding assembly —
+    /// is correct without extra wiring.
     pub supports_vision: bool,
 }
 
-/// Heuristic: does this model name look vision-capable? A VERBATIM copy of
-/// `atomcode_core::provider::model_name_suggests_vision` — this L0 crate cannot
-/// depend on core, so it is duplicated (like `session::hash_path` is in the
-/// daemon). MUST stay in sync: it also gates the live VL-preprocess and the
-/// `read_file` vision path; a drift silently drops (or wrongly forwards) images.
-/// `pub` so the v2 `bridge` reuses THIS copy for its resumed-image vision gate
-/// (dropping its former `atomcode_core::provider::model_name_suggests_vision`
-/// dependency) — one authority as the v1 stack is retired.
+/// Canonical native-stack heuristic for whether a model name looks vision-capable.
+/// It gates provider image encoding and the `read_file` vision path; daemon live
+/// preprocessing also uses it. A drift would silently drop or wrongly forward images.
 pub fn model_suggests_vision(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("vision")
@@ -161,6 +154,13 @@ pub struct OpenAiCompatProvider {
     /// provider's life — a `/session` switch rebuilds the provider, never re-binds.
     /// Unset ⇒ header omitted (session-less sub-agent / summary).
     session_id: std::sync::OnceLock<String>,
+    /// Set once this provider's gateway has rejected a `reasoning_effort` value
+    /// with a 400 (e.g. SenseNova accepts low/medium/high/xhigh/none but NOT the
+    /// `max` that DeepSeek's own API takes). After that, the field is stripped
+    /// up front for the rest of the session so every subsequent turn doesn't
+    /// re-trigger the same 400. Session-scoped: a `/session` switch rebuilds the
+    /// provider and resets this.
+    effort_unsupported: std::sync::atomic::AtomicBool,
 }
 
 impl OpenAiCompatProvider {
@@ -177,7 +177,14 @@ impl OpenAiCompatProvider {
             build_http_client(connect_timeout, skip_tls_verify, user_agent.clone())
         })?);
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-        Ok(Self { cfg, policy, client, url, session_id: std::sync::OnceLock::new() })
+        Ok(Self {
+            cfg,
+            policy,
+            client,
+            url,
+            session_id: std::sync::OnceLock::new(),
+            effort_unsupported: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 }
 
@@ -199,6 +206,12 @@ fn build_http_client(
         // (parity with core's `build_http_client`). Driver injects the real
         // `atomcode/<version>`; bare fallback when unset.
         .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+    // TLS trust (issue #514): webpki base roots are always present so `.build()`
+    // never hard-fails on certs; layer the OS native store (corporate MITM CAs)
+    // and SSL_CERT_FILE on top, additively and best-effort. This is the DEFAULT
+    // v2 provider path. Mirrors `core::provider::add_trusted_roots` — kept
+    // crate-local because capabilities does not depend on core.
+    builder = add_trusted_roots(builder);
     if skip_tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
     }
@@ -207,6 +220,57 @@ fn build_http_client(
         message: format!("http client build failed: {e}"),
         ..Default::default()
     })
+}
+
+/// Add the OS native root store and `SSL_CERT_FILE` (if set) to the builder's
+/// trusted roots, ON TOP of the built-in webpki roots. Best-effort: unparseable
+/// certs, an unreadable/malformed `SSL_CERT_FILE`, or native-store load errors
+/// are warned and skipped — NEVER fatal (the webpki base guarantees a working
+/// client). Mirrors `core::provider::add_trusted_roots`; codex-style graceful
+/// `load_native_certs`. See issue #514.
+fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    // 1) OS native roots (corporate MITM CAs live here).
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        tracing::warn!(
+            "loaded OS native roots with {} error(s); using the {} that parsed (issue #514)",
+            native.errors.len(),
+            native.certs.len()
+        );
+    }
+    for der in native.certs {
+        if let Ok(cert) = reqwest::Certificate::from_der(der.as_ref()) {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    // 2) SSL_CERT_FILE override/extra (empty string = unset). Loaded explicitly
+    //    for cross-platform certainty. reqwest's `Certificate` is validated only
+    //    at `.build()`, so a MALFORMED SSL_CERT_FILE surfaces there as a clear
+    //    `ProviderError` (never a panic, and only for this opt-in builder — every
+    //    other client build uses the webpki base and is unaffected). See #514.
+    let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|p| !p.is_empty()) else {
+        return builder;
+    };
+    let Ok(pem) = std::fs::read(&path) else {
+        tracing::warn!("SSL_CERT_FILE={path:?} could not be read; ignoring (issue #514)");
+        return builder;
+    };
+    match reqwest::Certificate::from_pem_bundle(&pem) {
+        Ok(certs) => {
+            let count = certs.len();
+            for c in certs {
+                builder = builder.add_root_certificate(c);
+            }
+            tracing::info!("Loaded {count} TLS root(s) from SSL_CERT_FILE={path:?} (issue #514)");
+        }
+        Err(e) => {
+            tracing::warn!(
+                "SSL_CERT_FILE={path:?} is not a valid PEM bundle: {e}; ignoring (issue #514)"
+            );
+        }
+    }
+    builder
 }
 
 /// An HTTP client held behind a rebuild seam. `get()` hands out the current client
@@ -226,7 +290,10 @@ impl SwappableClient {
         build: impl Fn() -> Result<reqwest::Client, ProviderError> + Send + Sync + 'static,
     ) -> Result<Self, ProviderError> {
         let initial = build()?;
-        Ok(Self { current: std::sync::RwLock::new(initial), build: Box::new(build) })
+        Ok(Self {
+            current: std::sync::RwLock::new(initial),
+            build: Box::new(build),
+        })
     }
 
     /// The current client (clone is an `Arc` bump — the pool is shared). Poison-tolerant:
@@ -234,7 +301,10 @@ impl SwappableClient {
     /// unrelated panic must not turn every subsequent request into a hard panic — that would
     /// re-create the exact "wedged until restart" failure this seam exists to prevent.
     pub(crate) fn get(&self) -> reqwest::Client {
-        self.current.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.current
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Rebuild with a fresh (empty) pool and swap it in, returning the new client.
@@ -273,10 +343,32 @@ impl LlmProvider for OpenAiCompatProvider {
         tools: &[ToolDef],
         options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
-        let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg, self.policy);
+        // If this provider's gateway already rejected `reasoning_effort` earlier
+        // this session, strip it up front so the same 400 isn't re-triggered on
+        // every turn (see `effort_unsupported`).
+        let effort_known_unsupported = self
+            .effort_unsupported
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let stripped_opts;
+        let options = if effort_known_unsupported && options.reasoning_effort.is_some() {
+            let mut o = options.clone();
+            o.reasoning_effort = None;
+            stripped_opts = o;
+            &stripped_opts
+        } else {
+            options
+        };
+        let body = build_request_body(
+            &self.cfg.model,
+            messages,
+            tools,
+            options,
+            &self.cfg,
+            self.policy,
+        );
         super::wire_dump_request(&self.cfg.model, &body); // byte-level dump (ATOMCODE_WIRE_DUMP=1)
-        // Serialize once and reuse the exact bytes across retries (hence `.body()`
-        // with an explicit content-type rather than re-serializing via `.json()`).
+                                                          // Serialize once and reuse the exact bytes across retries (hence `.body()`
+                                                          // with an explicit content-type rather than re-serializing via `.json()`).
         let body_bytes = match serde_json::to_vec(&body) {
             Ok(b) => b,
             Err(e) => {
@@ -300,8 +392,30 @@ impl LlmProvider for OpenAiCompatProvider {
         // the initial open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
-        let resp =
-            open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy).await?;
+        let resp = match open_stream(
+            &client,
+            &url,
+            &body_bytes,
+            &signer,
+            &api_key,
+            &session_id,
+            &policy,
+        )
+        .await
+        {
+            Ok(r) => r,
+            // Gateway rejected `reasoning_effort`. Remember it for the session
+            // (next send strips the field up front → succeeds) and surface one
+            // actionable error instead of the raw `field ReasoningEffort invalid`.
+            // Guarded on `!effort_known_unsupported` so we never loop: once the
+            // field is stripped, any further 400 is a different problem.
+            Err(e) if !effort_known_unsupported && is_reasoning_effort_rejection(&e) => {
+                self.effort_unsupported
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(effort_unsupported_error());
+            }
+            Err(e) => return Err(e),
+        };
 
         let s = async_stream::stream! {
             // v1 parity (core/openai.rs ~676): a chunked body that dies BEFORE any
@@ -419,7 +533,12 @@ async fn open_stream(
             .body(body_bytes.to_vec());
         match signer {
             Some(signer) => {
-                let auth = signer.sign(body_bytes);
+                let auth = signer.sign(body_bytes).map_err(|error| ProviderError {
+                    retryable: false,
+                    message: error.to_string(),
+                    code: Some(error.code().to_string()),
+                    ..Default::default()
+                })?;
                 req = req.bearer_auth(auth.bearer.as_deref().unwrap_or(api_key));
                 for (name, value) in auth.headers {
                     req = req.header(name, value);
@@ -445,17 +564,18 @@ async fn open_stream(
                     }
                     // Capture the real `Retry-After` BEFORE `text()` consumes `resp` — the
                     // authoritative rate-limit countdown for the self-heal (vs scraping text).
-                    let retry_after_secs = retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
+                    let retry_after_secs =
+                        retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
                     let text = resp.text().await.unwrap_or_default();
-                    // Parse the error envelope ONCE for both the readable detail and
-                    // the STRUCTURED provider code.
+                    // Standard multi-shape extraction (detail / error / top-level message)
+                    // so a clean human message surfaces for EVERY vendor — not just the
+                    // OpenAI `error` object. GLM returns top-level `{"code","message"}`.
+                    let detail = extract_error_detail(&text);
                     let envelope = serde_json::from_str::<serde_json::Value>(&text).ok();
-                    let err_obj = envelope.as_ref().and_then(|v| v.get("error"));
-                    let detail = err_obj.map(parse_error_obj).unwrap_or_else(|| truncate_msg(&text));
-                    let provider_code = err_obj.and_then(error_code);
+                    let provider_code = envelope.as_ref().and_then(provider_error_code);
                     return Err(ProviderError {
                         retryable: retry::is_retryable_status(code),
-                        message: format!("HTTP {code}: {detail}"),
+                        message: super::friendly_http_error(code, &detail),
                         http_status: Some(code),
                         code: provider_code,
                         retry_after_secs,
@@ -498,7 +618,11 @@ async fn open_stream(
 /// resumed conversation whose history contains an image from 400ing against a
 /// text-only model (`glm-5.2 is not a multimodal model`) on every turn — v1
 /// `OpenAiProvider::format_messages` had the same degrade; the v2 port lost it.
-fn format_messages(messages: &[Message], policy: ReasoningPolicy, supports_vision: bool) -> Vec<Value> {
+fn format_messages(
+    messages: &[Message],
+    policy: ReasoningPolicy,
+    supports_vision: bool,
+) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         match m.role {
@@ -658,7 +782,9 @@ fn build_request_body(
     }
     // Kimi-family `thinking` object — only when configured (omitted otherwise so non-Kimi
     // gateways don't 400 on an unknown top-level key). Port of v1's `thinking_body_value`.
-    if let Some(thinking) = thinking_body_value(cfg.thinking_type.as_deref(), cfg.thinking_keep.as_deref()) {
+    if let Some(thinking) =
+        thinking_body_value(cfg.thinking_type.as_deref(), cfg.thinking_keep.as_deref())
+    {
         body.insert("thinking".into(), thinking);
     }
     if !tools.is_empty() {
@@ -683,6 +809,33 @@ fn build_request_body(
 fn reason_effort_applicable(model: &str) -> bool {
     // Only DeepSeek-V4 takes a top-level `reasoning_effort`; others reject/ignore it.
     model.to_ascii_lowercase().contains("deepseek-v4")
+}
+
+/// True when an OPEN failure is a 400 specifically complaining about
+/// `reasoning_effort`. Gateways hosting DeepSeek-V4 don't agree on the value
+/// enum — DeepSeek's own API takes `max`, but SenseNova's returns
+/// `field ReasoningEffort invalid, should be one of: low, medium, high, xhigh,
+/// none`. Matched narrowly (400 + the field name in either casing) so an
+/// unrelated 400 is never misrouted into the effort-strip path.
+fn is_reasoning_effort_rejection(e: &ProviderError) -> bool {
+    e.http_status == Some(400) && {
+        let m = e.message.to_ascii_lowercase();
+        m.contains("reasoning_effort") || m.contains("reasoningeffort")
+    }
+}
+
+/// The actionable error shown once when a gateway rejects `reasoning_effort`.
+/// The turn fails, but [`OpenAiCompatProvider::effort_unsupported`] is set so the
+/// user's next send strips the field and succeeds.
+fn effort_unsupported_error() -> ProviderError {
+    ProviderError {
+        retryable: false,
+        message: "当前模型/网关不支持「强度」(reasoning_effort) 设置，已为本会话自动禁用——请重新发送。\
+                  (Provider rejected reasoning_effort; auto-disabled for this session — resend to continue.)"
+            .to_string(),
+        http_status: Some(400),
+        ..Default::default()
+    }
 }
 
 /// Build Kimi's `thinking` request-body object from the two flat config fields. `None`
@@ -738,11 +891,53 @@ fn truncate_msg(s: &str) -> String {
     format!("{}…", &s[..end])
 }
 
+/// Extract a human-readable error detail from a provider's JSON error body, covering
+/// the common envelope shapes so a clean message surfaces regardless of vendor:
+/// - FastAPI / AtomGit-gateway: `{"detail":{"message":…}}` or `{"detail":"…"}`
+/// - OpenAI / Anthropic: `{"error":{"message","type","code"}}` (kept as the tagged
+///   `[type/code] message` form via [`parse_error_obj`])
+/// - Top-level `{"code","message"}` (e.g. GLM `{"code":"1113","message":"余额不足…"}`)
+/// Falls back to the truncated raw body when nothing parses. Mirrors
+/// `atomcode_core::provider::extract_error_message`'s shape list (kept LOCAL — L1 must
+/// not depend on core). Previously only the `error` object was handled, so GLM-style
+/// top-level `message` bodies dumped raw JSON into the user-facing error.
+fn extract_error_detail(text: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+        if let Some(detail) = v.get("detail") {
+            if detail.is_object() {
+                return parse_error_obj(detail);
+            }
+            if let Some(s) = detail.as_str() {
+                return truncate_msg(s.trim());
+            }
+        }
+        if let Some(err) = v.get("error") {
+            if err.is_object() {
+                return parse_error_obj(err);
+            }
+            if let Some(s) = err.as_str() {
+                return truncate_msg(s.trim());
+            }
+        }
+        if v.get("message").and_then(|m| m.as_str()).is_some() {
+            return parse_error_obj(&v);
+        }
+    }
+    truncate_msg(text)
+}
+
 /// Format an OpenAI-compatible error OBJECT (`{"message","type","code"}`) as a readable
 /// "[type/code] message" one-liner carrying BOTH the error CODE and the REASON.
 fn parse_error_obj(err: &serde_json::Value) -> String {
-    let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("").trim();
-    let typ = err.get("type").and_then(|t| t.as_str()).filter(|s| !s.is_empty());
+    let msg = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .trim();
+    let typ = err
+        .get("type")
+        .and_then(|t| t.as_str())
+        .filter(|s| !s.is_empty());
     // `code` may be a string OR a number (vendors differ) — normalize to a string.
     let code = err.get("code").and_then(|c| match c {
         serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
@@ -760,20 +955,35 @@ fn parse_error_obj(err: &serde_json::Value) -> String {
 
 /// Extract the provider's STRUCTURED error code from an error object: `code` (string or
 /// number) if present, else fall back to `type`. For `ProviderError.code`.
-fn error_code(err: &serde_json::Value) -> Option<String> {
-    err.get("code")
-        .and_then(|c| match c {
-            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        })
-        .or_else(|| {
-            err.get("type")
-                .and_then(|t| t.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        })
+fn error_code_value(code: &serde_json::Value) -> Option<String> {
+    match code {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
+
+fn error_code(err: &serde_json::Value) -> Option<String> {
+    err.get("code").and_then(error_code_value).or_else(|| {
+        err.get("type")
+            .and_then(|t| t.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    })
+}
+
+/// Extract a code from either the standard nested `error` envelope or vendor-style
+/// top-level `{code,message}` responses.
+fn provider_error_code(envelope: &serde_json::Value) -> Option<String> {
+    envelope
+        .get("error")
+        .and_then(error_code)
+        .or_else(|| envelope.get("detail").and_then(error_code))
+        .or_else(|| envelope.get("code").and_then(error_code_value))
+}
+
+// `friendly_http_error` (was here) moved to the shared `provider` module so
+// every protocol wraps auth/billing codes identically; see `super::friendly_http_error`.
 
 // ---------------------------------------------------------------------------
 // SSE decoding (unit-testable, no network)
@@ -794,6 +1004,8 @@ struct SseDecoder {
     done: bool,
     /// True once the provider's response id has been emitted (emit it exactly once).
     response_id_seen: bool,
+    /// True once the provider-reported model has been emitted.
+    response_model_seen: bool,
     seen_finish: bool,
     tool_call_delta_count: usize,
 }
@@ -807,6 +1019,7 @@ impl SseDecoder {
             truncated: false,
             done: false,
             response_id_seen: false,
+            response_model_seen: false,
             seen_finish: false,
             tool_call_delta_count: 0,
         }
@@ -838,13 +1051,19 @@ impl SseDecoder {
         }
         for (id, name, args) in std::mem::take(&mut self.tool_calls) {
             if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                out.push(StreamEvent::ToolCall(ToolCall { id, name, arguments: args }));
+                out.push(StreamEvent::ToolCall(ToolCall {
+                    id,
+                    name,
+                    arguments: args,
+                }));
             }
         }
         if let Some(u) = self.last_usage.take() {
             out.push(StreamEvent::Usage(u));
         }
-        out.push(StreamEvent::Done { truncated: self.truncated });
+        out.push(StreamEvent::Done {
+            truncated: self.truncated,
+        });
         self.done = true;
         out
     }
@@ -855,11 +1074,14 @@ impl SseDecoder {
         };
         let data = data.trim();
         if data == "[DONE]" {
-            if let Some(u) = self.last_usage.take() {
-                out.push(StreamEvent::Usage(u));
-            }
-            out.push(StreamEvent::Done { truncated: self.truncated });
-            self.done = true;
+            // Same finalization as a stream EOF: flush any accumulated tool
+            // calls, then usage + Done. `finish()` does exactly this (and is a
+            // no-op if already done). Calling it here — instead of emitting
+            // only usage + Done — closes the gap where a gateway that reports
+            // ONLY `finish_reason:""` (never a real non-empty reason) and ends
+            // with `[DONE]` would otherwise drop its buffered tool call, since
+            // "" is treated as non-terminal and never triggers the flush above.
+            out.extend(self.finish());
             return;
         }
         if data.is_empty() {
@@ -883,6 +1105,12 @@ impl SseDecoder {
             if let Some(id) = chunk.id.as_deref().filter(|s| !s.is_empty()) {
                 self.response_id_seen = true;
                 out.push(StreamEvent::ResponseId(id.to_string()));
+            }
+        }
+        if !self.response_model_seen {
+            if let Some(model) = chunk.model.as_deref().filter(|s| !s.is_empty()) {
+                self.response_model_seen = true;
+                out.push(StreamEvent::ResponseModel(model.to_string()));
             }
         }
         // A mid-stream provider error chunk: surface it (code + reason) and TERMINATE —
@@ -962,11 +1190,22 @@ impl SseDecoder {
                 }
             }
         }
-        if let Some(fr) = choice.finish_reason {
+        // Only a NON-EMPTY finish_reason is terminal. SenseNova's free
+        // `deepseek-v4-flash` sends `"finish_reason":""` (empty string, not
+        // null) on EVERY chunk — including the reasoning and tool_call-fragment
+        // chunks that precede the real `"tool_calls"`. Arming `seen_finish` on
+        // the empty string makes the `if self.seen_finish { return }` guard
+        // above discard every subsequent tool_call delta, so the whole call is
+        // dropped and the model shows "0 工具". Treat "" as non-terminal.
+        if let Some(fr) = choice.finish_reason.filter(|s| !s.is_empty()) {
             self.seen_finish = true;
             for (id, name, args) in std::mem::take(&mut self.tool_calls) {
                 if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                    out.push(StreamEvent::ToolCall(ToolCall { id, name, arguments: args }));
+                    out.push(StreamEvent::ToolCall(ToolCall {
+                        id,
+                        name,
+                        arguments: args,
+                    }));
                 }
             }
             if fr == "length" {
@@ -998,6 +1237,9 @@ struct ChunkResponse {
     /// The provider's own response/completion id (same across all chunks).
     #[serde(default)]
     id: Option<String>,
+    /// Provider-reported model identity (may be an alias or the actual routed model).
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     choices: Vec<Choice>,
     #[serde(default)]
@@ -1072,11 +1314,8 @@ struct PromptTokensDetails {
 mod tests {
     use super::*;
 
-    // Parity lock: `model_suggests_vision` MUST classify identically to
-    // `atomcode_core::provider::model_name_suggests_vision` (verbatim copy). The
-    // v2 `bridge` now depends on THIS copy, so a drift would silently change the
-    // resumed-image vision gate. Covers every match rule (in core's list order)
-    // plus a representative text-only negative.
+    // Classification lock for every supported vision naming rule plus a
+    // representative text-only negative.
     #[test]
     fn model_suggests_vision_matches_core_classifications() {
         for m in [
@@ -1099,7 +1338,13 @@ mod tests {
         ] {
             assert!(model_suggests_vision(m), "should be vision: {m}");
         }
-        for m in ["glm-5.2", "deepseek-v4", "gpt-4-turbo", "claude-2.1", "o3-mini"] {
+        for m in [
+            "glm-5.2",
+            "deepseek-v4",
+            "gpt-4-turbo",
+            "claude-2.1",
+            "o3-mini",
+        ] {
             assert!(!model_suggests_vision(m), "should be text-only: {m}");
         }
     }
@@ -1124,7 +1369,11 @@ mod tests {
         let _ = sc.get();
         assert_eq!(calls.load(Ordering::SeqCst), 1, "get() must NOT rebuild");
         sc.rebuild();
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "rebuild() constructs a fresh client (empty pool)");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "rebuild() constructs a fresh client (empty pool)"
+        );
     }
 
     #[tokio::test]
@@ -1137,13 +1386,21 @@ mod tests {
             if c.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok(reqwest::Client::new())
             } else {
-                Err(ProviderError { retryable: false, message: "boom".into(), ..Default::default() })
+                Err(ProviderError {
+                    retryable: false,
+                    message: "boom".into(),
+                    ..Default::default()
+                })
             }
         })
         .expect("initial build");
         // A failing rebuild must not panic and must leave a usable client in place.
         let _client = sc.rebuild();
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "rebuild attempted the builder");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "rebuild attempted the builder"
+        );
         let _still_usable = sc.get(); // does not panic → old client retained
     }
 
@@ -1163,7 +1420,10 @@ mod tests {
         assert_eq!(out[2]["role"], "assistant");
         assert_eq!(out[2]["content"], "ans");
         assert!(out[2].get("reasoning_content").is_none());
-        assert_eq!(out[3], json!({"role":"tool","tool_call_id":"call_1","content":"result text"}));
+        assert_eq!(
+            out[3],
+            json!({"role":"tool","tool_call_id":"call_1","content":"result text"})
+        );
     }
 
     #[test]
@@ -1180,8 +1440,14 @@ mod tests {
         ];
         let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
         let systems = out.iter().filter(|v| v["role"] == "system").count();
-        assert_eq!(systems, 1, "consecutive system messages must coalesce to one: {out:?}");
-        assert_eq!(out[0], json!({"role":"system","content":"persona\n\nMEMORY\n- fact"}));
+        assert_eq!(
+            systems, 1,
+            "consecutive system messages must coalesce to one: {out:?}"
+        );
+        assert_eq!(
+            out[0],
+            json!({"role":"system","content":"persona\n\nMEMORY\n- fact"})
+        );
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
         assert_eq!(out.len(), 2, "exactly one system + one user");
     }
@@ -1199,7 +1465,10 @@ mod tests {
         use atomcode_kernel::message::ImageContent;
         let m = Message::user_with_images(
             "look",
-            vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
+            vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
         let c = &out[0]["content"];
@@ -1219,14 +1488,26 @@ mod tests {
         use atomcode_kernel::message::ImageContent;
         let m = Message::user_with_images(
             "[Image #1] 这是什么图啊",
-            vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
+            vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, false);
         let c = &out[0]["content"];
-        assert!(c.is_string(), "text-only target must get a string, got: {c}");
+        assert!(
+            c.is_string(),
+            "text-only target must get a string, got: {c}"
+        );
         let s = c.as_str().unwrap();
-        assert!(s.contains("这是什么图啊"), "caption must survive degradation: {s:?}");
-        assert!(!s.contains("data:image"), "no image_url bytes may leak: {s:?}");
+        assert!(
+            s.contains("这是什么图啊"),
+            "caption must survive degradation: {s:?}"
+        );
+        assert!(
+            !s.contains("data:image"),
+            "no image_url bytes may leak: {s:?}"
+        );
     }
 
     #[test]
@@ -1244,7 +1525,10 @@ mod tests {
         use atomcode_kernel::message::ImageContent;
         let m = Message::user_with_images(
             "",
-            vec![ImageContent { media_type: "image/jpeg".into(), data: "eHl6".into() }],
+            vec![ImageContent {
+                media_type: "image/jpeg".into(),
+                data: "eHl6".into(),
+            }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
         let c = out[0]["content"].as_array().unwrap();
@@ -1259,9 +1543,15 @@ mod tests {
         // degrades to a plain STRING content (never an empty content array a server rejects).
         let m = Message::user_with_images(
             "",
-            vec![ImageContent { media_type: "image/png".into(), data: "".into() }],
+            vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "".into(),
+            }],
         );
-        assert_eq!(format_messages(&[m], ReasoningPolicy::Exclude, true)[0], json!({"role":"user","content":""}));
+        assert_eq!(
+            format_messages(&[m], ReasoningPolicy::Exclude, true)[0],
+            json!({"role":"user","content":""})
+        );
     }
 
     #[test]
@@ -1269,10 +1559,16 @@ mod tests {
         use atomcode_kernel::message::ImageContent;
         let m = Message::user_with_images(
             "x",
-            vec![ImageContent { media_type: "".into(), data: "QUJD".into() }],
+            vec![ImageContent {
+                media_type: "".into(),
+                data: "QUJD".into(),
+            }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
-        assert_eq!(out[0]["content"][1]["image_url"]["url"], "data:application/octet-stream;base64,QUJD");
+        assert_eq!(
+            out[0]["content"][1]["image_url"]["url"],
+            "data:application/octet-stream;base64,QUJD"
+        );
     }
 
     #[test]
@@ -1292,7 +1588,10 @@ mod tests {
         assert_eq!(a["tool_calls"][0]["id"], "c1");
         assert_eq!(a["tool_calls"][0]["type"], "function");
         assert_eq!(a["tool_calls"][0]["function"]["name"], "read");
-        assert_eq!(a["tool_calls"][0]["function"]["arguments"], "{\"path\":\"a\"}");
+        assert_eq!(
+            a["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"a\"}"
+        );
     }
 
     #[test]
@@ -1307,16 +1606,22 @@ mod tests {
                 id: "c1".into(),
                 name: "write_file".into(),
                 // raw string: contains a single backslash before each segment.
-                arguments: r#"{"file_path":"C:\Users\fgv70\Downloads\deepseek.yaml","content":"app"}"#
-                    .into(),
+                arguments:
+                    r#"{"file_path":"C:\Users\fgv70\Downloads\deepseek.yaml","content":"app"}"#
+                        .into(),
             }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
-        let args = out[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        let args = out[0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
         let parsed: Value = serde_json::from_str(args)
             .unwrap_or_else(|e| panic!("outgoing arguments must be valid JSON ({e}): {args}"));
         // Repair preserves the path the model meant (backslashes survive a round-trip).
-        assert_eq!(parsed["file_path"], "C:\\Users\\fgv70\\Downloads\\deepseek.yaml");
+        assert_eq!(
+            parsed["file_path"],
+            "C:\\Users\\fgv70\\Downloads\\deepseek.yaml"
+        );
     }
 
     #[test]
@@ -1325,10 +1630,17 @@ mod tests {
         // (no re-encode), so the request prefix stays byte-stable across turns.
         let m = Message::assistant(
             "",
-            vec![ToolCall { id: "c1".into(), name: "read".into(), arguments: "{\"path\":\"a\"}".into() }],
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{\"path\":\"a\"}".into(),
+            }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
-        assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"], "{\"path\":\"a\"}");
+        assert_eq!(
+            out[0]["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"a\"}"
+        );
     }
 
     #[test]
@@ -1344,7 +1656,9 @@ mod tests {
             }],
         );
         let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
-        let args = out[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        let args = out[0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
         assert!(
             serde_json::from_str::<Value>(args).is_ok(),
             "even unsalvageable args must serialize as valid JSON, got: {args}"
@@ -1373,12 +1687,22 @@ mod tests {
     fn body_basics_and_omissions() {
         let cfg = OpenAiCompatConfig::new("k", "https://x.test", "glm-5.1");
         let opts = ChatOptions::default();
-        let body = build_request_body("glm-5.1", &[Message::user("hi")], &[], &opts, &cfg, ReasoningPolicy::Exclude);
+        let body = build_request_body(
+            "glm-5.1",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert!(body.get("tools").is_none(), "empty tools omitted");
         assert!(body.get("tool_choice").is_none(), "Auto omits tool_choice");
-        assert!(body.get("temperature").is_none(), "None temperature omitted");
+        assert!(
+            body.get("temperature").is_none(),
+            "None temperature omitted"
+        );
         assert!(body.get("max_tokens").is_none(), "no max_tokens set");
     }
 
@@ -1397,7 +1721,14 @@ mod tests {
             description: "d".into(),
             parameters: json!({"type":"object"}),
         }];
-        let body = build_request_body("deepseek-v4-flash", &[Message::user("hi")], &tools, &opts, &cfg, ReasoningPolicy::Include);
+        let body = build_request_body(
+            "deepseek-v4-flash",
+            &[Message::user("hi")],
+            &tools,
+            &opts,
+            &cfg,
+            ReasoningPolicy::Include,
+        );
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["max_tokens"].as_u64(), Some(100)); // cfg fallback
@@ -1413,7 +1744,14 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::Max),
             ..Default::default()
         };
-        let body = build_request_body("deepseek-v4-flash", &[Message::user("hi")], &[], &opts, &cfg, ReasoningPolicy::Include);
+        let body = build_request_body(
+            "deepseek-v4-flash",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Include,
+        );
         assert_eq!(body["reasoning_effort"], "max");
     }
 
@@ -1424,8 +1762,18 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::High),
             ..Default::default()
         };
-        let body = build_request_body("glm-5.1", &[Message::user("hi")], &[], &opts, &cfg, ReasoningPolicy::Exclude);
-        assert!(body.get("reasoning_effort").is_none(), "non-v4 omits reasoning_effort");
+        let body = build_request_body(
+            "glm-5.1",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "non-v4 omits reasoning_effort"
+        );
     }
 
     #[test]
@@ -1433,15 +1781,32 @@ mod tests {
         let mut cfg = OpenAiCompatConfig::new("k", "https://x", "kimi-k2");
         cfg.thinking_type = Some("enabled".into());
         cfg.thinking_keep = Some("all".into());
-        let body = build_request_body("kimi-k2", &[Message::user("hi")], &[], &ChatOptions::default(), &cfg, ReasoningPolicy::Exclude);
+        let body = build_request_body(
+            "kimi-k2",
+            &[Message::user("hi")],
+            &[],
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
         assert_eq!(body["thinking"], json!({"type":"enabled","keep":"all"}));
     }
 
     #[test]
     fn no_thinking_object_when_unconfigured() {
         let cfg = OpenAiCompatConfig::new("k", "https://x", "kimi-k2");
-        let body = build_request_body("kimi-k2", &[Message::user("hi")], &[], &ChatOptions::default(), &cfg, ReasoningPolicy::Exclude);
-        assert!(body.get("thinking").is_none(), "omit thinking when unset (non-Kimi-safe)");
+        let body = build_request_body(
+            "kimi-k2",
+            &[Message::user("hi")],
+            &[],
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+        assert!(
+            body.get("thinking").is_none(),
+            "omit thinking when unset (non-Kimi-safe)"
+        );
     }
 
     #[test]
@@ -1451,7 +1816,14 @@ mod tests {
             tool_choice: ToolChoice::None,
             ..Default::default()
         };
-        let body = build_request_body("glm", &[Message::user("hi")], &[], &opts, &cfg, ReasoningPolicy::Exclude);
+        let body = build_request_body(
+            "glm",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
         assert_eq!(body["tool_choice"], "none");
     }
 
@@ -1492,10 +1864,29 @@ mod tests {
             },
         ];
         let msgs = vec![Message::system("s"), Message::user("u")];
-        let first = serde_json::to_string(&build_request_body("deepseek-v4-flash", &msgs, &tools, &opts, &cfg, ReasoningPolicy::Include)).unwrap();
+        let first = serde_json::to_string(&build_request_body(
+            "deepseek-v4-flash",
+            &msgs,
+            &tools,
+            &opts,
+            &cfg,
+            ReasoningPolicy::Include,
+        ))
+        .unwrap();
         for _ in 0..100 {
-            let again = serde_json::to_string(&build_request_body("deepseek-v4-flash", &msgs, &tools, &opts, &cfg, ReasoningPolicy::Include)).unwrap();
-            assert_eq!(first, again, "request body serialization must be deterministic");
+            let again = serde_json::to_string(&build_request_body(
+                "deepseek-v4-flash",
+                &msgs,
+                &tools,
+                &opts,
+                &cfg,
+                ReasoningPolicy::Include,
+            ))
+            .unwrap();
+            assert_eq!(
+                first, again,
+                "request body serialization must be deterministic"
+            );
         }
     }
 
@@ -1511,6 +1902,7 @@ mod tests {
                 StreamEvent::ToolCallDelta { .. } => "tooldelta",
                 StreamEvent::Usage(_) => "usage",
                 StreamEvent::ResponseId(_) => "response_id",
+                StreamEvent::ResponseModel(_) => "response_model",
                 StreamEvent::Done { .. } => "done",
                 StreamEvent::Error(_) => "error",
                 StreamEvent::Malformed => "malformed",
@@ -1530,11 +1922,20 @@ mod tests {
         assert!(matches!(&ev[1], StreamEvent::TextDelta(s) if s == "lo"));
         let usage = ev
             .iter()
-            .find_map(|e| if let StreamEvent::Usage(u) = e { Some(*u) } else { None })
+            .find_map(|e| {
+                if let StreamEvent::Usage(u) = e {
+                    Some(*u)
+                } else {
+                    None
+                }
+            })
             .unwrap();
         assert_eq!(usage.prompt, 5);
         assert_eq!(usage.completion, 2);
-        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
+        assert!(matches!(
+            ev.last().unwrap(),
+            StreamEvent::Done { truncated: false }
+        ));
     }
 
     #[test]
@@ -1567,15 +1968,25 @@ mod tests {
         let mut ev = Vec::new();
         ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\"pa"}}]}}]})).as_bytes()));
         ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a\"}"}}]}}]})).as_bytes()));
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
         assert_eq!(
-            ev.iter().filter(|e| matches!(e, StreamEvent::ToolCall(_))).count(),
+            ev.iter()
+                .filter(|e| matches!(e, StreamEvent::ToolCall(_)))
+                .count(),
             1,
             "exactly one whole tool call, no partials"
         );
         let tc = ev
             .iter()
-            .find_map(|e| if let StreamEvent::ToolCall(t) = e { Some(t.clone()) } else { None })
+            .find_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
             .unwrap();
         assert_eq!(tc.id, "c1");
         assert_eq!(tc.name, "read");
@@ -1583,17 +1994,101 @@ mod tests {
     }
 
     #[test]
+    fn sse_empty_string_finish_reason_does_not_drop_tool_calls() {
+        // SenseNova's free `deepseek-v4-flash` sends `"finish_reason":""` (EMPTY
+        // STRING, not null) on EVERY streaming chunk — reasoning AND tool_call
+        // fragments — and only the real `"tool_calls"` on the final chunk
+        // (captured from the live wire 2026-07-20). Setting `seen_finish` on the
+        // empty string made the decoder discard every later tool_call delta
+        // (the `if self.seen_finish { return }` guard), so a real web_search
+        // call vanished and the model showed "0 工具".
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        // reasoning chunk carrying finish_reason:"" — must NOT arm seen_finish
+        ev.extend(d.feed(line(json!({"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"searching"},"finish_reason":""}]})).as_bytes()));
+        // tool_call fragments, each ALSO carrying finish_reason:""
+        ev.extend(d.feed(line(json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_915","function":{"name":"web_search","arguments":""}}]},"finish_reason":""}]})).as_bytes()));
+        ev.extend(d.feed(line(json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":\"bj\"}"}}]},"finish_reason":""}]})).as_bytes()));
+        // real terminal chunk
+        ev.extend(d.feed(line(json!({"choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}]})).as_bytes()));
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "empty-string finish_reason must not drop the tool call: {ev:?}"
+        );
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].arguments, "{\"query\":\"bj\"}");
+    }
+
+    #[test]
+    fn sse_tool_call_flushed_at_done_without_a_nonempty_finish_reason() {
+        // Defensive companion to the test above: a gateway that reports ONLY
+        // `finish_reason:""` (never a real non-empty reason) and terminates with
+        // `data: [DONE]` must still get its accumulated tool call flushed. Since
+        // "" is (correctly) non-terminal, the flush now has to happen at [DONE]
+        // — which mirrors the stream-EOF `finish()` path.
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(line(json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"web_search","arguments":"{\"q\":\"x\"}"}}]},"finish_reason":""}]})).as_bytes()));
+        ev.extend(d.feed(b"data: [DONE]\n"));
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "tool call must be flushed at [DONE] even without a non-empty finish_reason: {ev:?}"
+        );
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].arguments, "{\"q\":\"x\"}");
+        assert!(
+            ev.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
+            "Done must still be emitted at [DONE]: {ev:?}"
+        );
+    }
+
+    #[test]
     fn sse_multi_index_tool_calls() {
         let mut d = SseDecoder::new();
         let mut ev = Vec::new();
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[
-            {"index":0,"id":"c0","function":{"name":"a","arguments":"{}"}},
-            {"index":1,"id":"c1","function":{"name":"b","arguments":"{}"}}
-        ]}}]})).as_bytes()));
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()));
+        ev.extend(
+            d.feed(
+                line(json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"c0","function":{"name":"a","arguments":"{}"}},
+                    {"index":1,"id":"c1","function":{"name":"b","arguments":"{}"}}
+                ]}}]}))
+                .as_bytes(),
+            ),
+        );
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
         let calls: Vec<_> = ev
             .iter()
-            .filter_map(|e| if let StreamEvent::ToolCall(t) = e { Some(t.clone()) } else { None })
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
@@ -1622,9 +2117,17 @@ mod tests {
     fn sse_length_sets_truncated() {
         let mut d = SseDecoder::new();
         let mut ev = Vec::new();
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{"content":"x"},"finish_reason":"length"}]})).as_bytes()));
+        ev.extend(
+            d.feed(
+                line(json!({"choices":[{"delta":{"content":"x"},"finish_reason":"length"}]}))
+                    .as_bytes(),
+            ),
+        );
         ev.extend(d.feed(b"data: [DONE]\n"));
-        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: true }));
+        assert!(matches!(
+            ev.last().unwrap(),
+            StreamEvent::Done { truncated: true }
+        ));
     }
 
     #[test]
@@ -1648,10 +2151,27 @@ mod tests {
         let ev = d.feed(sse.as_bytes());
         // The tool_calls delta chunk now also emits a streaming `tooldelta` fragment
         // (live display) BEFORE the whole `tool` call is emitted at finish_reason.
-        assert_eq!(kinds(&ev), vec!["reason", "text", "text", "tooldelta", "tool", "usage", "done"]);
+        assert_eq!(
+            kinds(&ev),
+            vec![
+                "reason",
+                "text",
+                "text",
+                "tooldelta",
+                "tool",
+                "usage",
+                "done"
+            ]
+        );
         let usage = ev
             .iter()
-            .find_map(|e| if let StreamEvent::Usage(u) = e { Some(*u) } else { None })
+            .find_map(|e| {
+                if let StreamEvent::Usage(u) = e {
+                    Some(*u)
+                } else {
+                    None
+                }
+            })
             .unwrap();
         assert_eq!(usage.cached, 8);
     }
@@ -1663,26 +2183,45 @@ mod tests {
         // id+name arrive first, then arguments stream across two chunks.
         ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"search","arguments":"{\"q\":"}}]}}]})).as_bytes()));
         ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hi\"}"}}]}}]})).as_bytes()));
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
 
         // Streaming fragments (live display): id/name on the first, args chunks on both.
         let deltas: Vec<(u32, Option<String>, Option<String>, String)> = ev
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::ToolCallDelta { index, id, name, arguments } => {
-                    Some((*index, id.clone(), name.clone(), arguments.clone()))
-                }
+                StreamEvent::ToolCallDelta {
+                    index,
+                    id,
+                    name,
+                    arguments,
+                } => Some((*index, id.clone(), name.clone(), arguments.clone())),
                 _ => None,
             })
             .collect();
         assert_eq!(deltas.len(), 2);
-        assert_eq!(deltas[0], (0, Some("c1".into()), Some("search".into()), "{\"q\":".into()));
+        assert_eq!(
+            deltas[0],
+            (
+                0,
+                Some("c1".into()),
+                Some("search".into()),
+                "{\"q\":".into()
+            )
+        );
         assert_eq!(deltas[1], (0, None, None, "\"hi\"}".into()));
 
         // The WHOLE call (execution) is emitted once at finish, args reassembled.
         let whole: Vec<_> = ev
             .iter()
-            .filter_map(|e| if let StreamEvent::ToolCall(c) = e { Some(c.clone()) } else { None })
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(c) = e {
+                    Some(c.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(whole.len(), 1);
         assert_eq!(whole[0].id, "c1");
@@ -1703,7 +2242,13 @@ mod tests {
         );
         let u = ev
             .iter()
-            .find_map(|e| if let StreamEvent::Usage(u) = e { Some(*u) } else { None })
+            .find_map(|e| {
+                if let StreamEvent::Usage(u) = e {
+                    Some(*u)
+                } else {
+                    None
+                }
+            })
             .unwrap();
         assert_eq!(u.cached, 2);
     }
@@ -1712,14 +2257,62 @@ mod tests {
     fn sse_emits_provider_response_id_once() {
         let mut d = SseDecoder::new();
         let mut ev = Vec::new();
-        ev.extend(d.feed(line(json!({"id":"resp_xyz","choices":[{"delta":{"content":"a"}}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"id":"resp_xyz","choices":[{"delta":{"content":"a"}}]})).as_bytes()),
+        );
         // same id repeats on later chunks — must NOT re-emit.
-        ev.extend(d.feed(line(json!({"id":"resp_xyz","choices":[{"delta":{"content":"b"}}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"id":"resp_xyz","choices":[{"delta":{"content":"b"}}]})).as_bytes()),
+        );
         let ids: Vec<String> = ev
             .iter()
-            .filter_map(|e| if let StreamEvent::ResponseId(id) = e { Some(id.clone()) } else { None })
+            .filter_map(|e| {
+                if let StreamEvent::ResponseId(id) = e {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
-        assert_eq!(ids, vec!["resp_xyz".to_string()], "response id emitted exactly once, with value");
+        assert_eq!(
+            ids,
+            vec!["resp_xyz".to_string()],
+            "response id emitted exactly once, with value"
+        );
+    }
+
+    #[test]
+    fn sse_emits_provider_response_model_once() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(
+            d.feed(
+                line(json!({
+                    "id":"resp_xyz",
+                    "model":"deepseek-v4-flash",
+                    "choices":[{"delta":{"content":"a"}}]
+                }))
+                .as_bytes(),
+            ),
+        );
+        ev.extend(
+            d.feed(
+                line(json!({
+                    "id":"resp_xyz",
+                    "model":"deepseek-v4-flash",
+                    "choices":[{"delta":{"content":"b"}}]
+                }))
+                .as_bytes(),
+            ),
+        );
+        let models: Vec<String> = ev
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ResponseModel(model) => Some(model.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(models, vec!["deepseek-v4-flash"]);
     }
 
     #[test]
@@ -1731,13 +2324,35 @@ mod tests {
         );
         let err = ev
             .iter()
-            .find_map(|e| if let StreamEvent::Error(e) = e { Some(e.clone()) } else { None })
+            .find_map(|e| {
+                if let StreamEvent::Error(e) = e {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            })
             .expect("a mid-stream error chunk must surface a StreamEvent::Error");
-        assert!(err.message.contains("server_error"), "must carry error type: {}", err.message);
-        assert!(err.message.contains("overloaded"), "must carry error code: {}", err.message);
-        assert!(err.message.contains("the model is overloaded"), "must carry reason: {}", err.message);
+        assert!(
+            err.message.contains("server_error"),
+            "must carry error type: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("overloaded"),
+            "must carry error code: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("the model is overloaded"),
+            "must carry reason: {}",
+            err.message
+        );
         assert!(!err.retryable, "mid-stream errors are non-retryable");
-        assert_eq!(err.code.as_deref(), Some("overloaded"), "structured code on mid-stream error");
+        assert_eq!(
+            err.code.as_deref(),
+            Some("overloaded"),
+            "structured code on mid-stream error"
+        );
     }
 
     #[test]
@@ -1752,10 +2367,74 @@ mod tests {
         assert!(formatted.contains("does not exist"), "{formatted}");
         assert_eq!(error_code(&v).as_deref(), Some("model_not_found"));
         // missing `code` falls back to `type`; numeric code normalizes to a string.
-        let v2: serde_json::Value = serde_json::from_str(r#"{"message":"x","type":"server_error"}"#).unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(r#"{"message":"x","type":"server_error"}"#).unwrap();
         assert_eq!(error_code(&v2).as_deref(), Some("server_error"));
         let v3: serde_json::Value = serde_json::from_str(r#"{"message":"x","code":429}"#).unwrap();
         assert_eq!(error_code(&v3).as_deref(), Some("429"));
+    }
+
+    #[test]
+    fn extract_error_detail_covers_all_envelope_shapes() {
+        // OpenAI / Anthropic `{"error":{...}}` → tagged "[type/code] message".
+        let openai = extract_error_detail(
+            r#"{"error":{"message":"boom","type":"rate_limit","code":"429"}}"#,
+        );
+        assert!(
+            openai.contains("boom") && openai.contains("rate_limit"),
+            "{openai}"
+        );
+        // FastAPI / AtomGit `{"detail":{"message":...}}`.
+        assert_eq!(
+            extract_error_detail(r#"{"detail":{"code":"X","message":"请升级"}}"#),
+            "[X] 请升级"
+        );
+        // FastAPI `{"detail":"..."}` string form.
+        assert_eq!(extract_error_detail(r#"{"detail":"nope"}"#), "nope");
+        // GLM-style TOP-LEVEL `{"code","message"}` keeps both fields so callers can
+        // distinguish auth, quota, and concurrency failures that share one HTTP status.
+        assert_eq!(
+            extract_error_detail(r#"{"code":"1113","message":"余额不足或无可用资源包,请充值。"}"#),
+            "[1113] 余额不足或无可用资源包,请充值。"
+        );
+        // Non-JSON / unknown shape → raw body (truncated).
+        assert_eq!(extract_error_detail("plain text error"), "plain text error");
+        assert_eq!(
+            provider_error_code(&json!({
+                "detail": {
+                    "code": "atomgit_session_concurrency_conflict",
+                    "message": "busy"
+                }
+            })),
+            Some("atomgit_session_concurrency_conflict".into())
+        );
+    }
+
+    #[test]
+    fn friendly_http_error_wraps_billing_and_auth_codes() {
+        // Shared across provider protocols; lives in the parent `provider` module.
+        use super::super::friendly_http_error;
+        // 402 欠费: concise actionable headline + the code; raw English detail is
+        // dropped (redundant, and this short form folds into the summary line).
+        assert_eq!(
+            friendly_http_error(402, "Insufficient Balance"),
+            "账户余额不足（HTTP 402）"
+        );
+        // 403 is NOT necessarily auth: AtomGit also uses it for session-concurrency
+        // conflicts. Preserve the structured reason instead of inventing an API-key error.
+        assert_eq!(
+            friendly_http_error(
+                403,
+                "[atomgit_session_concurrency_conflict/403] 该模型不支持多窗口同时发起请求"
+            ),
+            "HTTP 403: [atomgit_session_concurrency_conflict/403] 该模型不支持多窗口同时发起请求"
+        );
+        assert!(friendly_http_error(401, "").contains("API key"));
+        // 429 is NOT wrapped (kernel rate-limit path owns it — must keep the
+        // literal `HTTP 429: ` prefix so `rate_limit_server_message` can strip it).
+        assert_eq!(friendly_http_error(429, "slow down"), "HTTP 429: slow down");
+        // Unknown/other codes keep the original shape (detail is the only signal).
+        assert_eq!(friendly_http_error(500, "boom"), "HTTP 500: boom");
     }
 
     #[test]
@@ -1764,7 +2443,10 @@ mod tests {
         let mut ev = d.feed(line(json!({"choices":[{"delta":{"content":"x"}}]})).as_bytes());
         // no [DONE]; the network loop calls finish() on EOF
         ev.extend(d.finish());
-        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
+        assert!(matches!(
+            ev.last().unwrap(),
+            StreamEvent::Done { truncated: false }
+        ));
     }
 
     #[test]
@@ -1772,7 +2454,9 @@ mod tests {
         let mut d = SseDecoder::new();
         let mut ev = Vec::new();
         ev.extend(d.feed(line(json!({"choices":[{"delta":{"content":"ok"}}]})).as_bytes()));
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes()),
+        );
         assert!(!d.done);
 
         // This tool call delta chunk arrives after finish_reason.
@@ -1792,7 +2476,9 @@ mod tests {
         let mut ev = Vec::new();
         // Send a tool call delta 20000 times.
         // On the 20001-th time, it should terminate.
-        let delta_chunk = line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"w","arguments":"x"}}]}}]}));
+        let delta_chunk = line(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"w","arguments":"x"}}]}}]}),
+        );
         let delta_bytes = delta_chunk.as_bytes();
         for _ in 0..20000 {
             ev.extend(d.feed(delta_bytes));
@@ -1890,7 +2576,10 @@ mod tests {
         let events: Vec<StreamEvent> = stream.collect().await;
 
         let has_error = events.iter().any(|e| matches!(e, StreamEvent::Error(_)));
-        assert!(!has_error, "must not surface a mid-stream error after a clean re-open: {events:?}");
+        assert!(
+            !has_error,
+            "must not surface a mid-stream error after a clean re-open: {events:?}"
+        );
         let text: String = events
             .iter()
             .filter_map(|e| match e {
@@ -1898,7 +2587,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "ok", "should deliver the re-opened response: {events:?}");
+        assert_eq!(
+            text, "ok",
+            "should deliver the re-opened response: {events:?}"
+        );
 
         let _ = handle.join();
     }
@@ -1963,7 +2655,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "ok", "should deliver the third (successful) response: {events:?}");
+        assert_eq!(
+            text, "ok",
+            "should deliver the third (successful) response: {events:?}"
+        );
 
         let _ = handle.join();
     }
@@ -1990,7 +2685,8 @@ mod tests {
             .unwrap();
             // One complete chunk (delivers the delta), then abrupt close before the
             // `0\r\n\r\n` terminator → mid-stream EOF after an event was emitted.
-            s.write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes()).unwrap();
+            s.write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes())
+                .unwrap();
             s.flush().unwrap();
             drop(s);
         });
@@ -2011,7 +2707,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "x", "the one delivered delta must appear exactly once: {events:?}");
+        assert_eq!(
+            text, "x",
+            "the one delivered delta must appear exactly once: {events:?}"
+        );
         assert!(
             events.iter().any(|e| matches!(e, StreamEvent::Error(_))),
             "a post-emit mid-stream EOF must surface an error: {events:?}"
@@ -2040,7 +2739,10 @@ mod tests {
                 let clen = head
                     .to_lowercase()
                     .lines()
-                    .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().to_string()))
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .map(|v| v.trim().to_string())
+                    })
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(0);
                 let mut remaining = clen.saturating_sub(buf.len() - (pos + 4));
@@ -2132,5 +2834,206 @@ mod tests {
             head.contains("user-agent: atomcode"),
             "UA fallback must still be present: {head}"
         );
+    }
+
+    // ---- reasoning_effort 400 self-heal (b2) ----
+
+    #[test]
+    fn is_reasoning_effort_rejection_matches_only_the_field_400() {
+        let mk = |code: u16, msg: &str| ProviderError {
+            retryable: false,
+            message: msg.into(),
+            http_status: Some(code),
+            code: None,
+            retry_after_secs: None,
+        };
+        // Real SenseNova shape.
+        assert!(is_reasoning_effort_rejection(&mk(
+            400,
+            "HTTP 400: field ReasoningEffort invalid, should be one of: low, medium, high, xhigh, none"
+        )));
+        // snake_case variant.
+        assert!(is_reasoning_effort_rejection(&mk(
+            400,
+            "HTTP 400: reasoning_effort not supported"
+        )));
+        // Unrelated 400 must NOT be misrouted into the effort-strip path.
+        assert!(!is_reasoning_effort_rejection(&mk(
+            400,
+            "HTTP 400: invalid api key"
+        )));
+        // Right text but not a 400 (e.g. a 500 that echoes the field) must not match.
+        assert!(!is_reasoning_effort_rejection(&mk(
+            500,
+            "reasoning_effort invalid"
+        )));
+    }
+
+    /// Read a full HTTP request (headers + Content-Length body) and return it as
+    /// a string so a stub can assert what the client sent.
+    fn read_req_full(s: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = match s.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                let clen = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut remaining = clen.saturating_sub(buf.len() - (pos + 4));
+                while remaining > 0 {
+                    match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            remaining = remaining.saturating_sub(n);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_400_disables_it_for_session_then_succeeds() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bodies_w = bodies.clone();
+
+        let handle = std::thread::spawn(move || {
+            // #1: request carries reasoning_effort → gateway 400s rejecting it.
+            let (mut s1, _) = listener.accept().unwrap();
+            bodies_w.lock().unwrap().push(read_req_full(&mut s1));
+            let err = r#"{"error":{"message":"field ReasoningEffort invalid, should be one of: low, medium, high, xhigh, none","type":"invalid_request_error","code":"3"}}"#;
+            s1.write_all(
+                format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", err.len(), err)
+                    .as_bytes(),
+            )
+            .unwrap();
+            s1.flush().unwrap();
+            drop(s1);
+
+            // #2: after self-heal the retry must NOT carry reasoning_effort → 200.
+            let (mut s2, _) = listener.accept().unwrap();
+            bodies_w.lock().unwrap().push(read_req_full(&mut s2));
+            let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+            s2.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}")
+                    .as_bytes(),
+            )
+            .unwrap();
+            s2.flush().unwrap();
+            drop(s2);
+        });
+
+        let cfg =
+            OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "deepseek-v4-flash");
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+        let opts = ChatOptions {
+            reasoning_effort: Some(ReasoningEffort::Max),
+            ..Default::default()
+        };
+
+        // Call 1: 400 → actionable error, effort flagged for the session.
+        let err = provider
+            .chat_stream(&[Message::user("hi")], &[], &opts)
+            .await
+            .err()
+            .expect("first open should fail on the effort 400");
+        assert!(
+            err.message.contains("强度")
+                || err
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("reasoning_effort"),
+            "must surface the actionable effort message, got: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("field ReasoningEffort invalid"),
+            "raw gateway text must be replaced: {}",
+            err.message
+        );
+
+        // Call 2: SAME Max options → effort stripped up front → 200 succeeds.
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &opts)
+            .await
+            .expect("second open should succeed after self-heal");
+        let events: Vec<StreamEvent> = stream.collect().await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "ok")),
+            "self-healed turn must deliver the response: {events:?}"
+        );
+
+        let _ = handle.join();
+        let bodies = bodies.lock().unwrap();
+        assert!(
+            bodies[0].contains("reasoning_effort"),
+            "1st request should carry reasoning_effort: {}",
+            bodies[0]
+        );
+        assert!(
+            !bodies[1].contains("reasoning_effort"),
+            "2nd request must have effort stripped after the 400: {}",
+            bodies[1]
+        );
+    }
+
+    // ---- TLS root trust (issue #514) ----
+
+    #[test]
+    #[serial_test::serial(ssl_cert_file_env)]
+    fn build_http_client_builds_with_webpki_base_no_ssl_cert_file() {
+        std::env::remove_var("SSL_CERT_FILE");
+        // Plain build must succeed on the webpki base roots.
+        assert!(build_http_client(std::time::Duration::from_secs(5), false, None).is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial(ssl_cert_file_env)]
+    fn build_http_client_reports_malformed_ssl_cert_file_as_error_not_panic() {
+        // A malformed SSL_CERT_FILE surfaces as a clear `ProviderError` at
+        // `.build()` — NEVER a panic, and only for this opt-in builder. The
+        // webpki base leaves every other client build unaffected. See #514.
+        let tmp = tempfile::tempdir().unwrap();
+        let cert_path = tmp.path().join("roots.pem");
+        std::fs::write(
+            &cert_path,
+            "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::env::set_var("SSL_CERT_FILE", &cert_path);
+        let built = build_http_client(std::time::Duration::from_secs(5), false, None);
+        std::env::remove_var("SSL_CERT_FILE");
+        assert!(
+            built.is_err(),
+            "a malformed SSL_CERT_FILE must surface as Err, not panic"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(ssl_cert_file_env)]
+    fn build_http_client_skip_tls_verify_still_builds() {
+        std::env::remove_var("SSL_CERT_FILE");
+        // Root loading happens before the danger_accept path.
+        assert!(build_http_client(std::time::Duration::from_secs(5), true, None).is_ok());
     }
 }

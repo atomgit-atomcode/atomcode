@@ -293,7 +293,11 @@ fn find_frontmatter_close(after_open: &str) -> Option<(usize, usize)> {
         .find("\n---\n")
         .map(|p| (p, 5usize))
         .or_else(|| after_open.find("\n---\r\n").map(|p| (p, 6)))
-        .or_else(|| after_open.strip_suffix("\n---").map(|_| (after_open.len() - 4, 4)))
+        .or_else(|| {
+            after_open
+                .strip_suffix("\n---")
+                .map(|_| (after_open.len() - 4, 4))
+        })
         .or_else(|| {
             after_open
                 .strip_suffix("\n---\r")
@@ -512,25 +516,61 @@ impl SkillRegistry {
 
         // Load Claude Code compat paths from system home (always)
         if let Some(ref home) = system_home {
-            self.load_flat_commands(&home.join(".claude").join("commands"), LOOSE_NS, &mut warnings);
-            self.load_skills_dir(&home.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
+            self.load_flat_commands(
+                &home.join(".claude").join("commands"),
+                LOOSE_NS,
+                &mut warnings,
+            );
+            self.load_skills_dir(
+                &home.join(".claude").join("skills"),
+                LOOSE_NS,
+                &mut warnings,
+            );
             // `~/.agents/skills` — cross-agent shared convention (opencode et al.).
             // Between `.claude` and the `.atomcode` native dir below so an
             // atomcode-native skill still wins a same-name collision.
-            self.load_skills_dir(&home.join(".agents").join("skills"), LOOSE_NS, &mut warnings);
+            self.load_skills_dir(
+                &home.join(".agents").join("skills"),
+                LOOSE_NS,
+                &mut warnings,
+            );
         }
 
         // Load atomcode native paths from the unified config dir.
-        self.load_flat_commands(&atomcode_config_dir.join("commands"), LOOSE_NS, &mut warnings);
+        self.load_flat_commands(
+            &atomcode_config_dir.join("commands"),
+            LOOSE_NS,
+            &mut warnings,
+        );
         self.load_skills_dir(&atomcode_config_dir.join("skills"), LOOSE_NS, &mut warnings);
 
         // Project-level skills (always from working dir)
-        self.load_flat_commands(&working_dir.join(".claude").join("commands"), LOOSE_NS, &mut warnings);
-        self.load_flat_commands(&working_dir.join(".atomcode").join("commands"), LOOSE_NS, &mut warnings);
-        self.load_skills_dir(&working_dir.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
+        self.load_flat_commands(
+            &working_dir.join(".claude").join("commands"),
+            LOOSE_NS,
+            &mut warnings,
+        );
+        self.load_flat_commands(
+            &working_dir.join(".atomcode").join("commands"),
+            LOOSE_NS,
+            &mut warnings,
+        );
+        self.load_skills_dir(
+            &working_dir.join(".claude").join("skills"),
+            LOOSE_NS,
+            &mut warnings,
+        );
         // `.agents/skills` (project) — same shared convention, before `.atomcode` so native wins.
-        self.load_skills_dir(&working_dir.join(".agents").join("skills"), LOOSE_NS, &mut warnings);
-        self.load_skills_dir(&working_dir.join(".atomcode").join("skills"), LOOSE_NS, &mut warnings);
+        self.load_skills_dir(
+            &working_dir.join(".agents").join("skills"),
+            LOOSE_NS,
+            &mut warnings,
+        );
+        self.load_skills_dir(
+            &working_dir.join(".atomcode").join("skills"),
+            LOOSE_NS,
+            &mut warnings,
+        );
 
         // Plugin layer — installed plugins contribute namespaced skills.
         for assets in crate::plugin::loader::iter_installed_plugin_assets() {
@@ -600,10 +640,32 @@ impl SkillRegistry {
         self.skills.values().filter(|s| !s.disable_model_invocation)
     }
 
+    /// Render the `=== AVAILABLE SKILLS ===` system-prompt section (budget-gated,
+    /// source-ranked), or `None` when nothing is invocable. Verbatim-aligned twin of
+    /// [`crate::skill_render`]'s capabilities counterpart. Only LLM-invocable skills
+    /// are listed (respects `disable-model-invocation`).
+    pub fn render_catalog(&self) -> Option<String> {
+        let entries: Vec<crate::skill_render::CatalogEntry> = self
+            .invocable_by_llm()
+            .map(|s| crate::skill_render::CatalogEntry {
+                name: s.name.clone(),
+                hint: s.argument_hint.clone(),
+                description: s.description.clone(),
+                source_rank: crate::skill_render::source_rank(&s.source_path),
+            })
+            .collect();
+        crate::skill_render::render_skill_catalog(&entries)
+    }
+
     // -----------------------------------------------------------------------
 
     /// Load all `.md` files from a flat `commands/` directory.
-    fn load_flat_commands(&mut self, dir: &Path, namespace: Option<&str>, warnings: &mut Vec<String>) {
+    fn load_flat_commands(
+        &mut self,
+        dir: &Path,
+        namespace: Option<&str>,
+        warnings: &mut Vec<String>,
+    ) {
         if !dir.is_dir() {
             return;
         }
@@ -740,9 +802,18 @@ mod tests {
 
     #[test]
     fn test_normalize_skill_name_trimming() {
-        assert_eq!(normalize_skill_name("/skills:gitcode-issue"), "skills:gitcode-issue");
-        assert_eq!(normalize_skill_name("-skills:gitcode-issue"), "skills:gitcode-issue");
-        assert_eq!(normalize_skill_name("\\skills:gitcode-issue"), "skills:gitcode-issue");
+        assert_eq!(
+            normalize_skill_name("/skills:gitcode-issue"),
+            "skills:gitcode-issue"
+        );
+        assert_eq!(
+            normalize_skill_name("-skills:gitcode-issue"),
+            "skills:gitcode-issue"
+        );
+        assert_eq!(
+            normalize_skill_name("\\skills:gitcode-issue"),
+            "skills:gitcode-issue"
+        );
         assert_eq!(normalize_skill_name("gitcode-issue"), "gitcode-issue");
     }
 
@@ -816,10 +887,15 @@ mod tests {
         s.skill_dir = PathBuf::from("/home/user/.claude/skills/wiki");
         s.source_path = s.skill_dir.join("SKILL.md");
         let out = s.expand_for_injection("", "");
-        assert!(out.contains("/home/user/.claude/skills/wiki"), "note must name the skill dir");
+        assert!(
+            out.contains("/home/user/.claude/skills/wiki"),
+            "note must name the skill dir"
+        );
         assert!(out.contains("NOT the current working directory"));
         // Original body is preserved after the note.
-        assert!(out.trim_end().ends_with("Run scripts/scan.py then read references/spec.md"));
+        assert!(out
+            .trim_end()
+            .ends_with("Run scripts/scan.py then read references/spec.md"));
     }
 
     #[test]
@@ -1068,7 +1144,10 @@ mod tests {
         let got_all: Vec<&str> = reg.all().map(|s| s.name.as_str()).collect();
         let mut want_all = got_all.clone();
         want_all.sort_unstable();
-        assert_eq!(got_all, want_all, "all() iteration must be deterministic too");
+        assert_eq!(
+            got_all, want_all,
+            "all() iteration must be deterministic too"
+        );
     }
 
     #[test]
@@ -1141,7 +1220,10 @@ mod tests {
         let working = tempfile::tempdir().unwrap();
         let mut reg = SkillRegistry::new();
         reg.reload(working.path());
-        assert!(reg.get("p:hello").is_some(), "expected namespaced plugin skill");
+        assert!(
+            reg.get("p:hello").is_some(),
+            "expected namespaced plugin skill"
+        );
     }
 
     #[test]
@@ -1149,7 +1231,11 @@ mod tests {
         // A project sharing skills with opencode et al. via `.agents/skills/`.
         // (Unique name so the real ~/.claude|~/.agents|~/.atomcode can't collide.)
         let working = tempfile::tempdir().unwrap();
-        let skill_dir = working.path().join(".agents").join("skills").join("agents-shared-xyz");
+        let skill_dir = working
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("agents-shared-xyz");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
@@ -1219,8 +1305,14 @@ mod tests {
         let mut warnings = Vec::new();
         reg.load_skills_dir(tmp.path(), Some("test"), &mut warnings);
 
-        assert!(reg.get("test:hybrid").is_some(), "self SKILL.md should load");
-        assert!(reg.get("test:sub-skill").is_some(), "subdirectory SKILL.md should load");
+        assert!(
+            reg.get("test:hybrid").is_some(),
+            "self SKILL.md should load"
+        );
+        assert!(
+            reg.get("test:sub-skill").is_some(),
+            "subdirectory SKILL.md should load"
+        );
     }
 
     /// A grouping directory without its own SKILL.md should still have its
@@ -1252,7 +1344,10 @@ mod tests {
         let mut warnings = Vec::new();
         reg.load_skills_dir(tmp.path(), Some("test"), &mut warnings);
 
-        assert!(reg.get("test:a-skill").is_some(), "depth-1 skill should load");
+        assert!(
+            reg.get("test:a-skill").is_some(),
+            "depth-1 skill should load"
+        );
         assert!(
             reg.get("test:sub-skill").is_some(),
             "nested skill under a grouping directory should load"
@@ -1295,7 +1390,8 @@ mod tests {
         let mut reg = SkillRegistry::new();
         reg.reload(working.path());
         assert!(
-            reg.get("andrej-karpathy-skills:karpathy-guidelines").is_some(),
+            reg.get("andrej-karpathy-skills:karpathy-guidelines")
+                .is_some(),
             "CC array plugin: skill should be loaded from direct skill directory"
         );
     }
@@ -1320,7 +1416,11 @@ mod tests {
         let mut warnings = Vec::new();
         reg.load_skills_dir(tmp.path(), Some("MyPlugin"), &mut warnings);
 
-        assert!(warnings.is_empty(), "uppercase skill name should not produce warnings: {:?}", warnings);
+        assert!(
+            warnings.is_empty(),
+            "uppercase skill name should not produce warnings: {:?}",
+            warnings
+        );
         // Internal storage key must be all-lowercase
         assert!(
             reg.get("myplugin:ascend-model-verification").is_some(),
@@ -1397,7 +1497,11 @@ mod tests {
         let mut warnings = Vec::new();
         reg.load_skills_dir(tmp.path(), Some("MyPlugin"), &mut warnings);
 
-        assert!(warnings.is_empty(), "slash in skill name should not produce warnings: {:?}", warnings);
+        assert!(
+            warnings.is_empty(),
+            "slash in skill name should not produce warnings: {:?}",
+            warnings
+        );
         // `/` is normalized to `-` in the storage key
         assert!(
             reg.get("myplugin:ssh-dev-suite-long-task").is_some(),
@@ -1413,7 +1517,10 @@ mod tests {
     #[test]
     fn test_normalize_skill_name() {
         assert_eq!(normalize_skill_name("Foo"), "foo");
-        assert_eq!(normalize_skill_name("ssh-dev-suite/long-task"), "ssh-dev-suite-long-task");
+        assert_eq!(
+            normalize_skill_name("ssh-dev-suite/long-task"),
+            "ssh-dev-suite-long-task"
+        );
         assert_eq!(normalize_skill_name("MySkill/SubName"), "myskill-subname");
         assert_eq!(normalize_skill_name("hello"), "hello");
         assert_eq!(normalize_skill_name("A/B/C"), "a-b-c");

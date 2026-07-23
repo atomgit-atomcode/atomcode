@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>子代理 · AtomCode 文档</title>
+<meta name="description" content="通过 task 工具把可并行、机械或只读的子任务委派给短生命周期子代理，并强制写入范围。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="subagents">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v5.0.1</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
+    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>子代理</h1>
+      <p class="lede">当一个任务能被干净地切分——可并行的编辑、机械重复的改动、或只读的调查——主代理可以通过 <code>task</code> 工具把子任务交给短生命周期的<strong>子代理</strong>。每个子代理在自己独立的上下文里运行；跨文件的推理和最终结果仍由主代理掌控。<code>task</code> 工具<strong>默认开启</strong>。</p>
+
+      <h2>两种子代理</h2>
+      <table>
+        <thead>
+          <tr><th>类型</th><th>能做什么</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>explore 探索</strong></td><td>只读调查——读取、搜索代码库来回答「在哪 / 怎么做」，返回结论。<strong>不能改文件。</strong></td></tr>
+          <tr><td><strong>worker 执行</strong></td><td>执行一个被精确指定的改动。可自由读取，但<em>写入</em>被限制在声明的 <code>scope</code> 范围内。</td></tr>
+        </tbody>
+      </table>
+
+      <h2>它们如何运行</h2>
+      <ul>
+        <li>子代理并行运行，同时最多 <code>max_concurrent</code> 个，各自独立上下文。</li>
+        <li>每个子任务带一个难度：<code>simple</code> 路由到你的<strong>快速</strong>模型，<code>hard</code> 路由到<strong>能力更强</strong>的模型——依据你所配置各 provider 的 <code>capable_model</code> 档位来选。只有单个 provider 时，子代理使用当前模型。</li>
+        <li>主代理在继续前会审阅每个结果——子代理提议，主代理定夺。</li>
+      </ul>
+
+      <h2>Worker 范围与安全</h2>
+      <p><code>worker</code> 子任务<strong>必须</strong>声明一个 <code>scope</code>：一组相对工作目录、允许写入的 glob，例如 <code>["src/auth/**", "Cargo.toml"]</code>。这是强制的，不是建议：</p>
+      <ul>
+        <li>范围之外的写入（<code>edit_file</code>、<code>write_file</code>、<code>search_replace</code>）会被 WorkerScopeGate <strong>直接拒绝</strong>——不弹审批。</li>
+        <li>读取和 <code>bash</code> 不受范围限制。</li>
+        <li>只要一次派发里含有 <code>worker</code>，就被视为 <strong>Risky</strong> 操作，会先走<a href="./approvals.html">审批</a>并展示各自的范围。</li>
+        <li>多个 worker 同时跑时，给它们互不重叠的范围，避免相互覆盖。</li>
+      </ul>
+
+      <h2>配置</h2>
+      <p>在 <code>~/.atomcode/config.toml</code> 中调整子代理池：</p>
+      <pre><code>[subagent]
+max_concurrent = 3     # 同时并行的子代理数（最小 1）
+timeout_secs   = 900   # 每个子任务的墙钟超时，秒（最小 30）
+max_rounds     = 200   # 每个子任务的模型轮次上限（0 = 不限）</code></pre>
+      <table>
+        <thead>
+          <tr><th>键</th><th>默认</th><th>含义</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>max_concurrent</code></td><td>3</td><td>并行运行的子代理数</td></tr>
+          <tr><td><code>timeout_secs</code></td><td>900</td><td>每个子任务的墙钟超时（下限 30 秒）</td></tr>
+          <tr><td><code>max_rounds</code></td><td>200</td><td>每个子任务的模型轮次上限；<code>0</code> = 不限</td></tr>
+        </tbody>
+      </table>
+      <p>环境变量覆盖：<code>ATOMCODE_SUBAGENT_TIMEOUT</code> 和 <code>ATOMCODE_SUBAGENT_MAX_ROUNDS</code> 优先于配置值。</p>
+
+      <h2>关闭该功能</h2>
+      <p><code>task</code> 工具默认开启。若要彻底移除它，设置：</p>
+      <pre><code>ATOMCODE_SUBAGENT=0 atomcode</code></pre>
+      <p><code>0</code>、<code>false</code>、<code>off</code> 任一都会关闭；不设置（或其它值）则保持开启。</p>
+
+      <h2>相关</h2>
+      <ul>
+        <li><a href="./tools.html">内置工具</a> —— 子代理可用的工具</li>
+        <li><a href="./approvals.html">权限审批</a> —— 为什么 worker 派发会请求审批</li>
+        <li><a href="./configuration.html">配置文件</a> —— 完整的 <code>config.toml</code> 参考</li>
+      </ul>
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

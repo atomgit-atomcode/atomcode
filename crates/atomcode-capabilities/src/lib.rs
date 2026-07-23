@@ -41,7 +41,7 @@ pub mod reminder;
 
 /// Claude-Code-compatible EXTERNAL hooks ([`cc_hooks::CCExternalHooks`]) — runs the
 /// user's `hooks.json` commands on the kernel's [`LifecycleHooks`]/[`ToolMiddleware`]
-/// seams (the port of core's hook engine onto the v2 engine). Opt-in: spawns
+/// seams (the port of core's hook engine onto the native stack). Opt-in: spawns
 /// subprocesses, so it pulls `tokio/process` + `dirs`.
 #[cfg(feature = "cc-hooks")]
 pub mod cc_hooks;
@@ -55,31 +55,56 @@ pub mod compaction;
 /// home for the rule (and for documenting its single known `sudo` divergence from
 /// production). Internal; compiled only when a feature that persists needs it.
 /// `provider` also needs it: the byte-level wire dump lands under `config_dir()/wire-dump`.
-#[cfg(any(feature = "mcp", feature = "session", feature = "memory", feature = "provider"))]
+#[cfg(any(
+    feature = "mcp",
+    feature = "session",
+    feature = "memory",
+    feature = "provider"
+))]
 pub(crate) mod paths;
 
-/// Kernel-only (L0) console-window suppressors — a local copy of
-/// `core::process_utils` so spawn sites here can stop the Windows
-/// console-window flash without `capabilities` depending on `core`.
-pub(crate) mod process_utils;
+/// Shared L1 process utilities (console-window suppression, `shell_command`,
+/// UTF-8 locale, `is_running_as_admin`) — used here and by the CLI/TUI drivers, so
+/// `capabilities` owns them without depending on `core`. `shell_command` +
+/// `is_running_as_admin` mirror core's copies until core is retired (see module doc).
+pub mod process_utils;
 
 /// ONE home for Windows path normalization (native-canonical internally,
-/// forward-slash at the LLM/UI boundary). `pub` so the v2 drivers that depend on
-/// capabilities (`review`, `clix`, `bridge`) can reuse it. Local copy of
+/// forward-slash at the LLM/UI boundary). `pub` so native drivers and L2 crates
+/// (`review`, `clix`, `coding`) can reuse it. Local copy of
 /// `core::tool::strip_verbatim_prefix` (L1 must not depend on `core`).
 pub mod pathnorm;
 
 /// Proxy policy for outbound HTTP clients — a self-contained mirror of
-/// `core::proxy` (reads the process `ATOMCODE_PROXY_MODE` env) so v2 clients
+/// `core::proxy` (reads the process `ATOMCODE_PROXY_MODE` env) so native clients
 /// honor `no_proxy` without `capabilities` depending on `core`. Compiled
 /// whenever a reqwest-using capability is enabled.
-#[cfg(any(feature = "provider", feature = "web", feature = "atomgit", feature = "mcp"))]
+#[cfg(any(
+    feature = "provider",
+    feature = "web",
+    feature = "atomgit",
+    feature = "mcp"
+))]
 pub(crate) mod proxy;
 
 /// Ungated path helpers (leading-`~` expansion, home dir) shared by the `tools` and
 /// `codeintel` families so model-supplied paths resolve identically across both — see
 /// [`pathutil`]. Free of any feature `cfg` because `codeintel` is independent of `tools`.
 pub(crate) mod pathutil;
+
+/// Cross-platform atomic file write (tempfile → fsync → persist → parent-dir fsync).
+/// Ported from `atomcode-core`'s `fs_atomic` for the `plugin` feature (trust store).
+/// Opt-in behind `feature = "plugin"` or `feature = "mcp"` (the mcp trust store
+/// uses `atomic_write` for the security-sensitive `mcp_trust.json`).
+#[cfg(any(feature = "plugin", feature = "mcp"))]
+pub mod fs;
+
+/// Plugin subsystem: loader / installer / marketplace / manifest / trust store.
+/// Faithful port of `core::plugin` as a v2 migration target for the front-ends.
+/// Synchronous (shells out to `git` via `std::process` — no async runtime).
+/// Opt-in behind `feature = "plugin"`.
+#[cfg(feature = "plugin")]
+pub mod plugin;
 
 #[cfg(feature = "provider")]
 pub mod provider;
@@ -95,11 +120,16 @@ pub mod askpass;
 /// Desktop / terminal notifications: fires an OS-native or terminal-protocol notification
 /// (kitty OSC 99, OSC 777, iTerm2 OSC 9, `notify-send`, `terminal-notifier`/`osascript`)
 /// when a turn finishes or an approval is pending. A host (TUI/cli) feeds terminal-focus
-/// state via [`notify::set_terminal_focus_state`] and maps its engine's turn-stop reason
+/// state via [`notify::set_terminal_focus_state`] and maps its turn-stop reason
 /// into [`notify::NotifyStopReason`] before calling [`notify::notify`]. Reads
 /// `NotificationConfig` from the config leaf; carries no dependency on any engine crate.
 #[cfg(feature = "notify")]
 pub mod notify;
+
+/// One-time project setup/install: scan → seed config → atomic writes (file-locked).
+/// Reads i18n + Config from the config leaf. Opt-in (NOT default).
+#[cfg(feature = "setup")]
+pub mod setup;
 
 /// Real, NEUTRAL coding [`Tool`](atomcode_kernel::tool::Tool)s — fs `read`/`write`/
 /// `edit`/`list` + `bash` + `grep`/`glob` — plus a generic

@@ -74,9 +74,8 @@ pub fn format_compaction_mark(
         })
         .into_owned()
     } else {
-        let saved = fmt_compaction_tokens(
-            estimated_tokens_before.saturating_sub(estimated_tokens_after),
-        );
+        let saved =
+            fmt_compaction_tokens(estimated_tokens_before.saturating_sub(estimated_tokens_after));
         t(Msg::CompactMarkStub { saved: &saved }).into_owned()
     }
 }
@@ -118,10 +117,7 @@ fn fmt_compaction_tokens(tokens: usize) -> String {
 /// Determine the initial locale from (in priority order):
 /// CLI `--lang` flag, config file `language` field, environment
 /// variables `LC_ALL` / `LC_MESSAGES` / `LANG`.
-pub fn resolve_initial_locale(
-    cli_lang: Option<&str>,
-    config_lang: Option<Locale>,
-) -> Locale {
+pub fn resolve_initial_locale(cli_lang: Option<&str>, config_lang: Option<Locale>) -> Locale {
     resolve_initial_locale_with_env(cli_lang, config_lang, &|k| std::env::var(k).ok())
 }
 
@@ -303,8 +299,14 @@ mod tests {
                 cached_pct: None,
             },
         );
-        assert!(without.trim_end().ends_with("152.00K tokens"), "got: {without}");
-        assert!(!without.contains("cached"), "no annotation when None: {without}");
+        assert!(
+            without.trim_end().ends_with("152.00K tokens"),
+            "got: {without}"
+        );
+        assert!(
+            !without.contains("cached"),
+            "no annotation when None: {without}"
+        );
     }
 
     #[test]
@@ -375,8 +377,13 @@ mod tests {
 
     #[test]
     fn env_zh_cn_resolves_to_zh_cn() {
-        let env =
-            |k: &str| if k == "LANG" { Some("zh_CN.UTF-8".into()) } else { None };
+        let env = |k: &str| {
+            if k == "LANG" {
+                Some("zh_CN.UTF-8".into())
+            } else {
+                None
+            }
+        };
         assert_eq!(
             resolve_initial_locale_with_env(None, None, &env),
             Locale::ZhCn
@@ -385,7 +392,13 @@ mod tests {
 
     #[test]
     fn env_zh_tw_maps_to_zh_cn() {
-        let env = |k: &str| if k == "LANG" { Some("zh_TW".into()) } else { None };
+        let env = |k: &str| {
+            if k == "LANG" {
+                Some("zh_TW".into())
+            } else {
+                None
+            }
+        };
         assert_eq!(
             resolve_initial_locale_with_env(None, None, &env),
             Locale::ZhCn
@@ -461,7 +474,10 @@ mod tests {
             after: "9.1K",
         });
         assert!(s.contains("12"), "message count missing: {s}");
-        assert!(s.contains("48.2K") && s.contains("9.1K"), "token figures missing: {s}");
+        assert!(
+            s.contains("48.2K") && s.contains("9.1K"),
+            "token figures missing: {s}"
+        );
         assert!(s.contains('→'), "before→after arrow missing: {s}");
         assert!(s.contains('~'), "estimate marker missing: {s}");
         assert!(s.contains("tok"), "token unit missing: {s}");
@@ -471,7 +487,10 @@ mod tests {
     fn compact_mark_stub_renders_saved_without_arrow() {
         let s = crate::i18n::t(crate::i18n::Msg::CompactMarkStub { saved: "6.0K" });
         assert!(s.contains("6.0K"), "saved figure missing: {s}");
-        assert!(!s.contains('→'), "stub marker shows a single figure, no arrow: {s}");
+        assert!(
+            !s.contains('→'),
+            "stub marker shows a single figure, no arrow: {s}"
+        );
         assert!(s.contains("tok"), "token unit missing: {s}");
     }
 
@@ -545,6 +564,41 @@ mod tests {
     }
 
     #[test]
+    fn model_copy_explains_default_and_current_session_scope() {
+        let en_desc = t_with(Locale::En, Msg::CmdDescModel);
+        let zh_desc = t_with(Locale::ZhCn, Msg::CmdDescModel);
+        assert!(en_desc.contains("default") && en_desc.contains("this session"));
+        assert!(zh_desc.contains("默认") && zh_desc.contains("当前会话"));
+
+        let en_switched = t_with(
+            Locale::En,
+            Msg::ModelSwitchedAndDefault {
+                provider: "provider",
+                model: "model",
+            },
+        );
+        let zh_switched = t_with(
+            Locale::ZhCn,
+            Msg::ModelSwitchedAndDefault {
+                provider: "provider",
+                model: "model",
+            },
+        );
+        assert!(en_switched.contains("default for new sessions"));
+        assert!(zh_switched.contains("新会话默认"));
+
+        let ephemeral = t_with(
+            Locale::En,
+            Msg::ModelSwitched {
+                provider: "provider",
+                model: "model",
+            },
+        );
+        assert!(ephemeral.contains("this session"));
+        assert!(!ephemeral.contains("default"));
+    }
+
+    #[test]
     fn usage_modal_i18n_present_both_langs() {
         macro_rules! check {
             ($variant:expr) => {{
@@ -576,8 +630,32 @@ mod tests {
         check!(Msg::UsagePlanTitle);
         check!(Msg::UsagePlanActive);
         check!(Msg::UsagePlanExpired);
-        check!(Msg::UsagePlanClaimedExpires { claimed: "2026-06-01", expires: "2026-07-01" });
-        check!(Msg::UsagePlanRemaining { remaining: 5, total: 30 });
+        check!(Msg::UsagePlanClaimedExpires {
+            claimed: "2026-06-01",
+            expires: "2026-07-01"
+        });
+        check!(Msg::UsagePlanRemaining {
+            remaining: 5,
+            total: 30
+        });
         check!(Msg::UsageCopied);
+    }
+
+    #[test]
+    fn network_connect_hint_present_both_langs() {
+        let _g = test_lock();
+        let en = t_with(Locale::En, Msg::NetworkConnectHint);
+        let zh = t_with(Locale::ZhCn, Msg::NetworkConnectHint);
+        assert!(!en.trim().is_empty(), "en hint must be non-empty");
+        assert!(!zh.trim().is_empty(), "zh hint must be non-empty");
+        // Mentions the actionable knobs so the hint is useful.
+        assert!(
+            en.contains("/proxy") && en.contains("HTTPS_PROXY"),
+            "en: {en}"
+        );
+        assert!(
+            zh.contains("/proxy") && zh.contains("HTTPS_PROXY"),
+            "zh: {zh}"
+        );
     }
 }

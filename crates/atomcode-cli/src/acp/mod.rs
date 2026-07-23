@@ -42,24 +42,22 @@ use agent_client_protocol::schema::v1::{
     NewSessionRequest, PromptCapabilities, PromptRequest,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, Dispatch, Handled, Stdio};
-use atomcode_kernel::provider::LlmProvider;
+use atomcode_coding::CodingProviderFactory;
 
 use crate::acp::dispatch::{handle_cancel, handle_new_session, Sessions};
 
 /// Options for the ACP stdio server.
 ///
-/// `engine` supplies provider config; `provider` is the pre-built (signed)
-/// provider for AtomGit gateway sessions.  The CLI (Task 10) sets both from the
-/// active user config; integration tests (Task 11) inject a stub provider and
-/// can leave `engine` as `None` if `provider` is `Some`.
+/// `engine` supplies provider config; `provider_factory` creates a provider for
+/// each session so session identity and gateway affinity never leak across ACP
+/// sessions.
 pub struct AcpServeOptions {
     /// Provider + model config for session spawning.  `None` → handler returns
     /// an error telling the user to run via `atomcode acp`.
     pub engine: Option<crate::acp::engine::EngineConfig>,
-    /// Pre-built (authenticated) provider, e.g. the AtomGit gateway signer.
-    /// When `Some`, forwarded to each `spawn_session` call verbatim.
-    /// When `None`, `engine::build_provider` builds a fallback per session.
-    pub provider: Option<Arc<dyn LlmProvider>>,
+    /// Authenticated provider factory, e.g. the AtomGit gateway factory.
+    /// When `None`, the native default factory is used.
+    pub provider_factory: Option<Arc<dyn CodingProviderFactory>>,
     /// When `true` (`--dangerously-skip-permissions`), kernel approval requests are
     /// auto-allowed in the turn loop WITHOUT round-tripping to the ACP client.
     pub auto_approve: bool,
@@ -69,7 +67,7 @@ impl Default for AcpServeOptions {
     fn default() -> Self {
         Self {
             engine: None,
-            provider: None,
+            provider_factory: None,
             auto_approve: false,
         }
     }
@@ -103,7 +101,7 @@ where
     let sessions: Sessions = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let counter = Arc::new(AtomicU64::new(0));
     let engine = Arc::new(opts.engine);
-    let provider = opts.provider;
+    let provider_factory = opts.provider_factory;
     let auto_approve = opts.auto_approve;
 
     Agent
@@ -126,7 +124,7 @@ where
                 let sessions = Arc::clone(&sessions);
                 let counter = Arc::clone(&counter);
                 let engine = Arc::clone(&engine);
-                let provider = provider.clone();
+                let provider_factory = provider_factory.clone();
                 async move |req: NewSessionRequest, responder, _cx: ConnectionTo<Client>| {
                     let engine_ref = engine.as_ref().as_ref().ok_or_else(|| {
                         agent_client_protocol::util::internal_error(
@@ -135,7 +133,7 @@ where
                     })?;
                     let resp = handle_new_session(
                         engine_ref,
-                        provider.clone(),
+                        provider_factory.clone(),
                         &sessions,
                         &counter,
                         req,
@@ -163,7 +161,13 @@ where
                         let cx = cx.clone();
                         async move {
                             dispatch::run_prompt_turn(
-                                cx, sessions, sid, text, images, responder, auto_approve,
+                                cx,
+                                sessions,
+                                sid,
+                                text,
+                                images,
+                                responder,
+                                auto_approve,
                             )
                             .await
                         }
@@ -206,7 +210,10 @@ where
                     )?;
                     Ok(Handled::Yes)
                 } else {
-                    Ok(Handled::No { message, retry: false })
+                    Ok(Handled::No {
+                        message,
+                        retry: false,
+                    })
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),

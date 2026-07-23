@@ -772,3 +772,76 @@
   color: var(--app-secondary-foreground);
   font-size: 10px;
 }
+
+/* === Search Bar === */
+.search-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 0.5px solid var(--app-input-border);
+  background: var(--app-primary-background);
+  flex-shrink: 0;
+}
+
+.search-bar-icon {
+  flex-shrink: 0;
+}
+
+.search-bar-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--app-primary-foreground);
+  font-size: 12px;
+  font-family: inherit;
+  min-width: 0;
+}
+
+.search-bar-count {
+  font-size: 11px;
+  color: var(--app-secondary-foreground);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.search-bar-close {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--app-secondary-foreground);
+  font-size: 14px;
+  padding: 0;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.search-bar-close:hover {
+  color: var(--app-primary-foreground);
+}
+
+.search-nav-btn {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--app-secondary-foreground);
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.search-nav-btn:hover {
+  background: var(--app-ghost-button-hover-background);
+  color: var(--app-primary-foreground);
+}
+
+.search-nav-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}

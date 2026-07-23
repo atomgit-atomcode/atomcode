@@ -3,9 +3,9 @@
 // `/language` modal — language picker.
 //
 // Lists available locales with the current one pre-selected.
-// Up/Down navigates, Enter selects (persists to config + switches
-// global locale), Esc cancels. Renders as a MenuPayload above the
-// input box.
+// Up/Down navigates, Enter selects (persists config + reloads the
+// runtime prompt transactionally, then switches the UI locale), Esc
+// cancels. Renders as a MenuPayload above the input box.
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -61,28 +61,9 @@ impl Modal for LanguagePicker {
                 Ok(ModalAction::Continue)
             }
             KeyCode::Enter => {
-                let (locale, label, _) = &self.options[self.selected];
+                let (locale, _, _) = &self.options[self.selected];
                 let locale = *locale;
-                let label = label.clone();
-                // Flip the global locale FIRST so the confirmation
-                // below renders in the just-picked language. Without
-                // this the "switched to 简体中文" line still comes
-                // back in English on a zh_CN selection.
-                i18n::set_locale(locale);
-                ctx.config.language = Some(locale);
-                let config_path = atomcode_config::config::Config::default_path();
-                if let Err(e) = ctx.config.save(&config_path) {
-                    // TODO: surface via renderer once a non-modal error display is available
-                    eprintln!("[language] failed to save config: {e}");
-                }
-                renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
-                        label: &label,
-                        locale: &locale.to_string(),
-                    })
-                    .into_owned(),
-                ));
-                renderer.flush();
+                crate::event_loop::save_language_and_reload(ctx, locale, renderer);
                 Ok(ModalAction::Close)
             }
             KeyCode::Esc => Ok(ModalAction::Close),
@@ -164,7 +145,11 @@ mod tests {
         assert!(msg.contains("✓"), "missing checkmark: {}", msg);
         assert!(msg.contains("English"), "missing label: {}", msg);
         assert!(msg.contains("(en)"), "missing locale code: {}", msg);
-        assert!(msg.to_lowercase().contains("switched"), "missing 'switched' verb: {}", msg);
+        assert!(
+            msg.to_lowercase().contains("switched"),
+            "missing 'switched' verb: {}",
+            msg
+        );
         assert!(msg.ends_with('\n'), "missing trailing newline: {:?}", msg);
     }
 }

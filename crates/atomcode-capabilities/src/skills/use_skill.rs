@@ -33,7 +33,10 @@ impl Tool for UseSkillTool {
     }
     fn description(&self) -> &str {
         "Invoke a named skill (a reusable prompt/workflow template) and return its content \
-         with your arguments substituted. Run list_skills first to see what's available."
+         with your arguments substituted. Trigger a skill when the task matches its description \
+         — not only when the user names it. Installed skills are listed under \
+         '=== AVAILABLE SKILLS ===' in the system prompt; list_skills shows any lower-priority \
+         ones omitted there."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -49,7 +52,11 @@ impl Tool for UseSkillTool {
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => return err(format!("use_skill: invalid arguments: {e}. Expected {{\"name\":\"<skill>\"}}.")),
+            Err(e) => {
+                return err(format!(
+                    "use_skill: invalid arguments: {e}. Expected {{\"name\":\"<skill>\"}}."
+                ))
+            }
         };
         let skill = match self.registry.get(&a.name) {
             Some(s) => s,
@@ -58,7 +65,11 @@ impl Tool for UseSkillTool {
                 return err(format!(
                     "use_skill: skill '{}' not found. Available: {}",
                     a.name,
-                    if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
+                    if names.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        names.join(", ")
+                    }
                 ));
             }
         };
@@ -116,7 +127,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
-        ToolContext { working_dir: std::path::PathBuf::from("."), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+        ToolContext {
+            working_dir: std::path::PathBuf::from("."),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        }
     }
     fn registry_with(skills: &[(&str, &str)]) -> Arc<SkillRegistry> {
         let d = Box::leak(Box::new(tempfile::tempdir().unwrap())); // keep alive for the test
@@ -129,7 +145,9 @@ mod tests {
     #[tokio::test]
     async fn use_skill_expands() {
         let tool = UseSkillTool::new(registry_with(&[("greet", "Hello $ARGUMENTS!")]));
-        let r = tool.execute(r#"{"name":"greet","arguments":"world"}"#, &ctx()).await;
+        let r = tool
+            .execute(r#"{"name":"greet","arguments":"world"}"#, &ctx())
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert_eq!(r.content, "Hello world!");
     }
@@ -140,12 +158,19 @@ mod tests {
         let r = tool.execute(r#"{"name":"nope"}"#, &ctx()).await;
         assert!(r.is_error);
         assert!(r.content.contains("not found"), "{}", r.content);
-        assert!(r.content.contains("a") && r.content.contains("b"), "{}", r.content);
+        assert!(
+            r.content.contains("a") && r.content.contains("b"),
+            "{}",
+            r.content
+        );
     }
 
     #[tokio::test]
     async fn list_skills_formats() {
-        let tool = ListSkillsTool::new(registry_with(&[("greet", "---\ndescription: say hi\n---\nHello")]));
+        let tool = ListSkillsTool::new(registry_with(&[(
+            "greet",
+            "---\ndescription: say hi\n---\nHello",
+        )]));
         let r = tool.execute("{}", &ctx()).await;
         assert!(r.content.contains("Available skills (1)"), "{}", r.content);
         assert!(r.content.contains("- greet: say hi"), "{}", r.content);
@@ -156,5 +181,67 @@ mod tests {
         let tool = ListSkillsTool::new(Arc::new(SkillRegistry::new()));
         let r = tool.execute("{}", &ctx()).await;
         assert!(r.content.contains("No skills"), "{}", r.content);
+    }
+
+    // Regression for issue-use-skill-plugin-not-loaded: plugin skills MUST be reachable
+    // when the driver feeds them into the registry with a namespace (the capabilities crate
+    // cannot reach the core plugin loader by design — the bridge/driver feeds plugin dirs).
+    // This is the L1 contract `atomcode-coding::parts` relies on via `load_dir(dir, Some(ns))`.
+    #[tokio::test]
+    async fn use_skill_finds_plugin_namespaced_skill() {
+        let base = Box::leak(Box::new(tempfile::tempdir().unwrap())); // loose user skill
+        std::fs::write(base.path().join("setup.md"), "built-in setup body\n").unwrap();
+
+        let plugin_ns = "plugin-total-design";
+        let plugin = Box::leak(Box::new(tempfile::tempdir().unwrap())); // plugin install dir
+        let skills_dir = plugin.path().join("skills");
+        std::fs::create_dir_all(skills_dir.join("td-explore")).unwrap();
+        std::fs::write(
+            skills_dir.join("td-explore").join("SKILL.md"),
+            "---\ndescription: explore a subsystem\n---\nExplore body $ARGUMENTS\n",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::load(&[base.path().to_path_buf()]);
+        reg.load_dir(&skills_dir, Some(plugin_ns));
+
+        let tool = UseSkillTool::new(Arc::new(reg));
+        // qualified name `<plugin>:<skill-name>` resolves
+        let r = tool
+            .execute(&format!(r#"{{"name":"{plugin_ns}:td-explore"}}"#), &ctx())
+            .await;
+        assert!(!r.is_error, "qualified lookup failed: {}", r.content);
+        assert!(r.content.contains("Explore body"), "{}", r.content);
+
+        // the loose user skill is still separately reachable (no namespace collision)
+        let r2 = tool.execute(r#"{"name":"setup"}"#, &ctx()).await;
+        assert!(!r2.is_error, "loose skill missing: {}", r2.content);
+    }
+
+    #[tokio::test]
+    async fn use_skill_plugin_namespace_shows_in_available_list() {
+        let plugin_ns = "my-plugin";
+        let plugin = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let skills_dir = plugin.path().join("skills");
+        std::fs::create_dir_all(skills_dir.join("alpha")).unwrap();
+        std::fs::write(
+            skills_dir.join("alpha").join("SKILL.md"),
+            "---\ndescription: alpha plugin skill\n---\nalpha body\n",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        reg.load_dir(&skills_dir, Some(plugin_ns));
+
+        let tool = UseSkillTool::new(Arc::new(reg));
+        // asking for a non-existent skill must list `my-plugin:alpha` among available —
+        // the bug from issue was that available NEVER showed any `<plugin>:<skill>` entry.
+        let r = tool.execute(r#"{"name":"nope"}"#, &ctx()).await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("my-plugin:alpha"),
+            "available list missing plugin entry: {}",
+            r.content
+        );
     }
 }

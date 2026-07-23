@@ -24,6 +24,8 @@ pub enum McpConnectEvent {
     Failed { name: String, error: String },
     /// Non-fatal warning (e.g. tools/list failed after connect).
     Warning { name: String, message: String },
+    /// Server withheld because it comes from an untrusted project's `.mcp.json`.
+    BlockedUntrusted { name: String },
 }
 
 /// Registry of connected MCP servers.
@@ -76,7 +78,9 @@ impl McpRegistry {
             Self {
                 servers: Arc::new(RwLock::new(BTreeMap::new())),
                 trusted_servers: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-                auto_approved_tools: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+                auto_approved_tools: Arc::new(std::sync::RwLock::new(
+                    std::collections::HashSet::new(),
+                )),
                 server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
                 failed_servers: Arc::new(RwLock::new(BTreeMap::new())),
                 connect_events: Some(tx),
@@ -122,6 +126,20 @@ impl McpRegistry {
                 return registry;
             }
         };
+
+        // SECURITY: withhold project-source servers from untrusted projects so a
+        // committed `.mcp.json` cannot auto-spawn a subprocess. Fail-closed.
+        let super::trust::TrustPartition {
+            allowed: configs,
+            blocked,
+        } = super::trust::partition_by_trust(configs, project_dir);
+        for b in &blocked {
+            if let Some(tx) = &combined_tx {
+                let _ = tx.send(McpConnectEvent::BlockedUntrusted {
+                    name: b.name.clone(),
+                });
+            }
+        }
 
         if !configs.is_empty() {
             let servers = registry.servers.clone();
@@ -282,6 +300,14 @@ impl McpRegistry {
             }
         };
 
+        let super::trust::TrustPartition {
+            allowed: configs,
+            blocked,
+        } = super::trust::partition_by_trust(configs, project_dir);
+        for b in &blocked {
+            eprintln!("[mcp] withheld untrusted project server: {}", b.name);
+        }
+
         for config in configs {
             if let Err(e) = registry.add_server(config).await {
                 tracing::warn!("[mcp] Failed to connect server: {}", e);
@@ -293,19 +319,31 @@ impl McpRegistry {
 
     /// Mark a server as trusted (its tools auto-approve). Tests + config-load (`trust: true`).
     pub fn mark_trusted(&self, server_name: &str) {
-        self.trusted_servers.write().unwrap_or_else(|e| e.into_inner()).insert(server_name.to_string());
+        self.trusted_servers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(server_name.to_string());
     }
     /// Whether a server's tools should bypass interactive approval.
     pub fn is_server_trusted(&self, server_name: &str) -> bool {
-        self.trusted_servers.read().unwrap_or_else(|e| e.into_inner()).contains(server_name)
+        self.trusted_servers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(server_name)
     }
     /// Permanently auto-approve a single tool (full name `mcp__{server}__{tool}`).
     pub fn mark_tool_auto_approved(&self, full_tool_name: &str) {
-        self.auto_approved_tools.write().unwrap_or_else(|e| e.into_inner()).insert(full_tool_name.to_string());
+        self.auto_approved_tools
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(full_tool_name.to_string());
     }
     /// Whether a specific tool is permanently auto-approved.
     pub fn is_tool_auto_approved(&self, full_tool_name: &str) -> bool {
-        self.auto_approved_tools.read().unwrap_or_else(|e| e.into_inner()).contains(full_tool_name)
+        self.auto_approved_tools
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(full_tool_name)
     }
     /// Split a full MCP tool name (`mcp__{server}__{tool}`) into (server, tool),
     /// matching known server names so server names containing `__` still resolve.
@@ -362,7 +400,10 @@ impl McpRegistry {
         servers.insert(config.name.clone(), Arc::from(client));
         drop(servers);
         if config.trust {
-            self.trusted_servers.write().unwrap_or_else(|e| e.into_inner()).insert(config.name.clone());
+            self.trusted_servers
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(config.name.clone());
         }
         for tool in &config.auto_approve {
             self.auto_approved_tools
@@ -532,6 +573,12 @@ impl McpRegistry {
         let _ = tokio::time::timeout(timeout, self.initial_ready.notified()).await;
     }
 
+    /// Return the names of all currently connected servers.
+    /// Used in tests to verify that blocked servers never entered the connect loop.
+    pub async fn connected_server_names(&self) -> Vec<String> {
+        self.servers.read().await.keys().cloned().collect()
+    }
+
     /// Get an Arc clone for sharing across threads.
     pub fn share(&self) -> Arc<Self> {
         Arc::new(Self {
@@ -552,9 +599,17 @@ fn classify_mcp_error(error: &str) -> McpErrorKind {
     let e = error.to_lowercase();
     if e.contains("connection refused") || e.contains("dns") || e.contains("network") {
         McpErrorKind::NetworkError
-    } else if e.contains("401") || e.contains("403") || e.contains("unauthorized") || e.contains("oauth") {
+    } else if e.contains("401")
+        || e.contains("403")
+        || e.contains("unauthorized")
+        || e.contains("oauth")
+    {
         McpErrorKind::AuthError
-    } else if e.contains("not found") || e.contains("no such") || e.contains("path") || e.contains("spawn") {
+    } else if e.contains("not found")
+        || e.contains("no such")
+        || e.contains("path")
+        || e.contains("spawn")
+    {
         McpErrorKind::ExecutionFailed
     } else if e.contains("timeout") || e.contains("timed out") {
         McpErrorKind::Timeout
@@ -585,6 +640,51 @@ impl Default for McpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
+
+    /// SECURITY: an untrusted project's `.mcp.json` stdio server must never be
+    /// connected or spawned. The registry must emit `BlockedUntrusted` and leave
+    /// the servers map empty.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn untrusted_project_stdio_server_never_connects() {
+        // Isolated trust store => project is untrusted.
+        let store = tempfile::tempdir().unwrap();
+        // SAFETY: test-only env mutation; #[serial] prevents concurrent tests from
+        // racing on this variable.
+        unsafe {
+            std::env::set_var("ATOMCODE_MCP_TRUST_STORE", store.path().join("s.json"));
+        }
+
+        // A project dir containing a malicious .mcp.json (project-source stdio).
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(
+            proj.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "evil": { "command": "/nonexistent/pwn", "args": ["x"] } } }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reg = McpRegistry::from_config_background_with_events(proj.path(), Some(tx));
+        // Give the background task a chance to run (it must NOT spawn).
+        reg.wait_for_initial_connections(std::time::Duration::from_millis(500))
+            .await;
+
+        // No server connected.
+        assert!(
+            reg.connected_server_names().await.is_empty(),
+            "no server should connect"
+        );
+
+        // A BlockedUntrusted event was emitted for "evil".
+        let mut saw_blocked = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, McpConnectEvent::BlockedUntrusted { ref name } if name == "evil") {
+                saw_blocked = true;
+            }
+        }
+        assert!(saw_blocked, "expected BlockedUntrusted for evil");
+    }
 
     /// `add_server` against a stdio command that cannot be spawned must
     /// still record the failure into `failed_servers`, so the `/mcp`

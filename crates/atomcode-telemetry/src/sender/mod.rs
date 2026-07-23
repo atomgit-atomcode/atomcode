@@ -83,9 +83,7 @@ impl SenderRuntime {
         self.counters
             .segments_posted
             .fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .bytes_sent
-            .fetch_add(bytes, Ordering::Relaxed);
+        self.counters.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)

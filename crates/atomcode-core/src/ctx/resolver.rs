@@ -21,13 +21,10 @@ use atomcode_config::config::provider::ProviderConfig;
 
 /// 给定 provider config 返回对应的 [`CtxBuilder`]。
 ///
-/// 由 [`crate::agent::AgentLoop::new`] 在会话开始时调用一次，
-/// 以及由 `AgentCommand::ReloadConfig` 在用户切模型时重新调用。
+/// 由 coding runtime 在会话准备和 provider 重建时调用。
 ///
-/// 返回 `Arc` 而非 `Box`:AgentLoop 与它持有的 `TurnRunner` 共享
-/// 同一个 ctx 实例,确保 datalog build_messages 和 runner 实际发送
-/// 走同一条 ctx 路径(不会因为一边走 trait 派发、另一边走自由函数
-/// 而漂移)。ReloadConfig 重建时两处一起更新。
+/// 返回 `Arc` 而非 `Box`，让消息构建与 kernel agent 共享同一个 ctx 实例，
+/// 避免上下文渲染与实际发送路径漂移。
 pub fn for_provider(provider: &ProviderConfig) -> Arc<dyn CtxBuilder> {
     // ── 规则表（按注册顺序匹配）─────────────────────────
 
@@ -70,8 +67,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-
-}
+        }
     }
 
     #[test]

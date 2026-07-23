@@ -20,6 +20,8 @@ pub mod client;
 pub mod issue;
 pub mod models;
 pub mod pr;
+pub mod push_label_mw;
+pub mod remote;
 pub mod repo;
 
 pub use client::AtomgitClient;
@@ -46,6 +48,25 @@ pub struct AtomgitConfig {
     pub user_agent: String,
     /// Token source (see [`TokenProvider`]).
     pub token: Arc<dyn TokenProvider>,
+}
+
+/// Live token provider — reads/refreshes the OAuth token from auth.toml.
+/// NOTE: `token()` is sync and (rarely) does network I/O on refresh; callers on
+/// the hot async path should prefer prefetching via spawn_blocking + StaticTokenProvider.
+pub struct LiveTokenProvider;
+impl TokenProvider for LiveTokenProvider {
+    fn token(&self) -> Result<String, String> {
+        atomcode_auth::oauth::get_valid_token().map_err(|e| format!("{e:#}"))
+    }
+}
+
+/// A pre-fetched, fixed token (used by the push-label middleware, which fetches
+/// once via spawn_blocking so `token()` never blocks the runtime).
+pub struct StaticTokenProvider(pub String);
+impl TokenProvider for StaticTokenProvider {
+    fn token(&self) -> Result<String, String> {
+        Ok(self.0.clone())
+    }
 }
 
 #[cfg(test)]

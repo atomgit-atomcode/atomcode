@@ -29,7 +29,10 @@ fn cfg(working_dir: &std::path::Path) -> CodingAgentConfig {
 }
 
 fn text_turn(text: &str) -> Vec<StreamEvent> {
-    vec![StreamEvent::TextDelta(text.into()), StreamEvent::Done { truncated: false }]
+    vec![
+        StreamEvent::TextDelta(text.into()),
+        StreamEvent::Done { truncated: false },
+    ]
 }
 
 /// Drive one user turn; answer every approval Request with `decision`.
@@ -38,7 +41,13 @@ async fn drive(
     text: &str,
     decision: Option<&str>,
 ) -> (Vec<AgentEvent>, usize) {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: text.into(),
+            images: vec![],
+        })
+        .unwrap();
     let mut events = Vec::new();
     let mut requests = 0;
     while let Some(ev) = handle.events.recv().await {
@@ -100,10 +109,19 @@ async fn full_assembly_lifecycle() {
     {
         let calls = calls1.lock().unwrap();
         let defs: Vec<&str> = calls[0].1.iter().map(|d| d.name.as_str()).collect();
-        for expected in
-            ["bash", "read_file", "list_symbols", "web_fetch", "use_skill", "recall", "code_review"]
-        {
-            assert!(defs.contains(&expected), "missing tool {expected}: {defs:?}");
+        for expected in [
+            "bash",
+            "read_file",
+            "list_symbols",
+            "web_fetch",
+            "use_skill",
+            "recall",
+            "code_review",
+        ] {
+            assert!(
+                defs.contains(&expected),
+                "missing tool {expected}: {defs:?}"
+            );
         }
     }
 
@@ -111,7 +129,12 @@ async fn full_assembly_lifecycle() {
     {
         let calls = calls1.lock().unwrap();
         let first = &calls[0].0;
-        let shape = || first.iter().map(|m| (&m.role, m.text[..m.text.len().min(30)].to_string())).collect::<Vec<_>>();
+        let shape = || {
+            first
+                .iter()
+                .map(|m| (&m.role, m.text[..m.text.len().min(30)].to_string()))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(first[0].role, Role::System, "persona leads");
         assert!(
             first[1].role == Role::System && first[1].text.starts_with("=== SESSION CONTEXT ==="),
@@ -128,21 +151,38 @@ async fn full_assembly_lifecycle() {
         // turn), so NO status tail rides this request — the last message is the user turn,
         // not a "<system-reminder>". (The reminder appears from round 2 onward; covered by
         // the hook's own unit tests.)
-        assert_eq!(first.last().unwrap().role, Role::User, "round 1 ends at the user turn");
+        assert_eq!(
+            first.last().unwrap().role,
+            Role::User,
+            "round 1 ends at the user turn"
+        );
         // Scope to USER messages: the reminder is a user-role tail. (The persona — a System
         // message — legitimately *mentions* the `<system-reminder>` tag to explain it, so a
         // blanket text search would false-positive on the persona.)
         assert!(
-            !first.iter().any(|m| m.role == Role::User && m.text.contains("<system-reminder>")),
+            !first
+                .iter()
+                .any(|m| m.role == Role::User && m.text.contains("<system-reminder>")),
             "no status reminder (user tail) on a turn's round 1: {:?}",
             shape()
         );
     }
 
     // The turn persisted all three session files.
-    assert!(sessions_root.join(format!("{session_id}.snapshot")).exists(), "snapshot persisted");
-    assert!(sessions_root.join(format!("{session_id}.meta")).exists(), "meta persisted");
-    assert!(sessions_root.join(format!("{session_id}.jsonl")).exists(), "transcript persisted");
+    assert!(
+        sessions_root
+            .join(format!("{session_id}.snapshot"))
+            .exists(),
+        "snapshot persisted"
+    );
+    assert!(
+        sessions_root.join(format!("{session_id}.meta")).exists(),
+        "meta persisted"
+    );
+    assert!(
+        sessions_root.join(format!("{session_id}.jsonl")).exists(),
+        "transcript persisted"
+    );
 
     // ===== Phase 2: RESPAWN on the SAME parts (model swap) continues the session ====
     // assemble() reloads the latest on-disk snapshot for a session-bound parts — a
@@ -163,10 +203,16 @@ async fn full_assembly_lifecycle() {
     }
 
     // ================= Phase 3: resume continues the SAME session =================
-    let mut parts2 = prepare(&cfg, PrepareOptions {
-        session: SessionMode::Resume(session_id.clone()),
-        ..opts()
-    })
+    // This phase models a new process. Dropping the previous parts releases its
+    // active-session lease before the new owner resumes the persisted session.
+    drop(parts);
+    let mut parts2 = prepare(
+        &cfg,
+        PrepareOptions {
+            session: SessionMode::Resume(session_id.clone()),
+            ..opts()
+        },
+    )
     .await
     .unwrap();
     let provider2 = Arc::new(RecordingProvider::new(vec![text_turn("second answer")]));
@@ -180,8 +226,14 @@ async fn full_assembly_lifecycle() {
     {
         let calls = calls2.lock().unwrap();
         let first = &calls[0].0;
-        assert!(first.iter().any(|m| m.text == "the first task"), "resume carries history");
-        assert!(first.iter().any(|m| m.text == "the swap task"), "incl. the respawned turn");
+        assert!(
+            first.iter().any(|m| m.text == "the first task"),
+            "resume carries history"
+        );
+        assert!(
+            first.iter().any(|m| m.text == "the swap task"),
+            "incl. the respawned turn"
+        );
         assert!(first.iter().any(|m| m.text == "the second task"));
         let system_count = first.iter().filter(|m| m.role == Role::System).count();
         assert_eq!(
@@ -195,7 +247,11 @@ async fn full_assembly_lifecycle() {
     let jsonl = std::fs::read_to_string(sessions_root.join(format!("{session_id}.jsonl"))).unwrap();
     let turn_ids: Vec<u64> = jsonl
         .lines()
-        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["turn_id"].as_u64().unwrap())
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["turn_id"]
+                .as_u64()
+                .unwrap()
+        })
         .collect();
     assert_eq!(
         turn_ids,
@@ -204,10 +260,13 @@ async fn full_assembly_lifecycle() {
     );
 
     // ============== Phase 4: respawn on the SAME parts keeps approval grants ======
-    let mut parts3 = prepare(&cfg, PrepareOptions {
-        session: SessionMode::Disabled, // independent of the session above
-        ..opts()
-    })
+    let mut parts3 = prepare(
+        &cfg,
+        PrepareOptions {
+            session: SessionMode::Disabled, // independent of the session above
+            ..opts()
+        },
+    )
     .await
     .unwrap();
 
@@ -217,7 +276,10 @@ async fn full_assembly_lifecycle() {
         arguments: serde_json::json!({ "command": "git reset --hard HEAD~3" }).to_string(),
     };
     let provider3 = Arc::new(RecordingProvider::new(vec![
-        vec![StreamEvent::ToolCall(risky()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::ToolCall(risky()),
+            StreamEvent::Done { truncated: false },
+        ],
         text_turn("done"),
     ]));
     let mut h3 = assemble(&mut parts3, &cfg, provider3).unwrap().spawn();
@@ -229,12 +291,18 @@ async fn full_assembly_lifecycle() {
     // RESPAWN (model swap) on the SAME parts: the identical risky call must NOT ask
     // again — the grant store survives because the approval handle lives in parts.
     let provider4 = Arc::new(RecordingProvider::new(vec![
-        vec![StreamEvent::ToolCall(risky()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::ToolCall(risky()),
+            StreamEvent::Done { truncated: false },
+        ],
         text_turn("done again"),
     ]));
     let mut h4 = assemble(&mut parts3, &cfg, provider4).unwrap().spawn();
     let (_, reqs) = drive(&mut h4, "again", None).await;
-    assert_eq!(reqs, 0, "allow-always grant survives the respawn (parts own the store)");
+    assert_eq!(
+        reqs, 0,
+        "allow-always grant survives the respawn (parts own the store)"
+    );
     h4.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = h4.task.await;
 }

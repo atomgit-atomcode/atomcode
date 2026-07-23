@@ -118,17 +118,19 @@ impl AnthropicProvider {
             // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
             .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
             // Product UA for gateway attribution (parity with core's build_http_client).
-            .user_agent(cfg.user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+            .user_agent(
+                cfg.user_agent
+                    .as_deref()
+                    .unwrap_or(super::DEFAULT_USER_AGENT),
+            );
         if cfg.skip_tls_verify {
             builder = builder.danger_accept_invalid_certs(true);
         }
-        let client = builder
-            .build()
-            .map_err(|e| ProviderError {
-                retryable: false,
-                message: format!("http client build failed: {e}"),
-                ..Default::default()
-            })?;
+        let client = builder.build().map_err(|e| ProviderError {
+            retryable: false,
+            message: format!("http client build failed: {e}"),
+            ..Default::default()
+        })?;
         let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
         Ok(Self {
             cfg,
@@ -172,8 +174,16 @@ impl LlmProvider for AnthropicProvider {
         // Snapshot the session id once; reused across the open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
-        let resp =
-            open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy).await?;
+        let resp = open_stream(
+            &client,
+            &url,
+            &body,
+            &api_key,
+            &anthropic_version,
+            &session_id,
+            &policy,
+        )
+        .await?;
 
         let s = async_stream::stream! {
             // v1 parity: a body that dies BEFORE any event reaches the consumer is
@@ -281,15 +291,18 @@ async fn open_stream(
                     }
                     // Capture the real `Retry-After` BEFORE `text()` consumes `resp` — the
                     // authoritative rate-limit countdown for the self-heal (vs scraping text).
-                    let retry_after_secs = retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
+                    let retry_after_secs =
+                        retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
                     let text = resp.text().await.unwrap_or_default();
                     let envelope = serde_json::from_str::<serde_json::Value>(&text).ok();
                     let err_obj = envelope.as_ref().and_then(|v| v.get("error"));
-                    let detail = err_obj.map(parse_error_obj).unwrap_or_else(|| truncate_msg(&text));
+                    let detail = err_obj
+                        .map(parse_error_obj)
+                        .unwrap_or_else(|| truncate_msg(&text));
                     let provider_code = err_obj.and_then(error_type);
                     return Err(ProviderError {
                         retryable: retry::is_retryable_status(code),
-                        message: format!("HTTP {code}: {detail}"),
+                        message: super::friendly_http_error(code, &detail),
                         http_status: Some(code),
                         code: provider_code,
                         retry_after_secs,
@@ -326,7 +339,10 @@ fn build_request_body(
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
     // `max_tokens` is REQUIRED. Per-call override wins; else the cfg default.
-    body.insert("max_tokens".into(), json!(options.max_tokens.unwrap_or(cfg.max_tokens)));
+    body.insert(
+        "max_tokens".into(),
+        json!(options.max_tokens.unwrap_or(cfg.max_tokens)),
+    );
     body.insert("stream".into(), json!(true));
 
     let (system, msgs) = format_messages(messages, cfg.thinking);
@@ -355,7 +371,10 @@ fn build_request_body(
         body.insert("thinking".into(), json!({ "type": "adaptive" }));
     }
     if let Some(effort) = options.reasoning_effort {
-        body.insert("output_config".into(), json!({ "effort": effort_str(effort) }));
+        body.insert(
+            "output_config".into(),
+            json!({ "effort": effort_str(effort) }),
+        );
     }
     if !tools.is_empty() {
         let t: Vec<Value> = tools
@@ -385,7 +404,11 @@ fn format_messages(messages: &[Message], echo_thinking: bool) -> (Option<String>
         .map(|m| m.text.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let system = if system_text.is_empty() { None } else { Some(system_text) };
+    let system = if system_text.is_empty() {
+        None
+    } else {
+        Some(system_text)
+    };
 
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
     let mut i = 0;
@@ -444,8 +467,10 @@ fn merge_consecutive_user(messages: Vec<Value>) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
     for m in messages {
         let is_user = m.get("role").and_then(Value::as_str) == Some("user");
-        let prev_user =
-            out.last().and_then(|p| p.get("role").and_then(Value::as_str)) == Some("user");
+        let prev_user = out
+            .last()
+            .and_then(|p| p.get("role").and_then(Value::as_str))
+            == Some("user");
         if is_user && prev_user {
             let last = out.last_mut().unwrap();
             let merged = merge_user_content(
@@ -595,15 +620,25 @@ fn truncate_msg(s: &str) -> String {
 /// Format an Anthropic error OBJECT (`{"type","message"}`) as a readable
 /// "[type] message" one-liner.
 fn parse_error_obj(err: &serde_json::Value) -> String {
-    let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("").trim();
-    let typ = err.get("type").and_then(|t| t.as_str()).filter(|s| !s.is_empty());
+    let msg = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .trim();
+    let typ = err
+        .get("type")
+        .and_then(|t| t.as_str())
+        .filter(|s| !s.is_empty());
     let tag = typ.map(|t| format!("[{t}] ")).unwrap_or_default();
     truncate_msg(&format!("{tag}{msg}"))
 }
 
 /// The Anthropic error `type` (e.g. `"overloaded_error"`) for `ProviderError.code`.
 fn error_type(err: &serde_json::Value) -> Option<String> {
-    err.get("type").and_then(|t| t.as_str()).filter(|s| !s.is_empty()).map(String::from)
+    err.get("type")
+        .and_then(|t| t.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -679,7 +714,9 @@ impl AnthropicSseDecoder {
         if self.input_tokens > 0 || self.output_tokens > 0 || self.cached_total() > 0 {
             out.push(StreamEvent::Usage(self.usage()));
         }
-        out.push(StreamEvent::Done { truncated: self.truncated });
+        out.push(StreamEvent::Done {
+            truncated: self.truncated,
+        });
         self.done = true;
         out
     }
@@ -721,7 +758,11 @@ impl AnthropicSseDecoder {
             "message_start" => {
                 let msg = v.get("message");
                 if !self.response_id_seen {
-                    if let Some(id) = msg.and_then(|m| m.get("id")).and_then(|i| i.as_str()).filter(|s| !s.is_empty()) {
+                    if let Some(id) = msg
+                        .and_then(|m| m.get("id"))
+                        .and_then(|i| i.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
                         self.response_id_seen = true;
                         out.push(StreamEvent::ResponseId(id.to_string()));
                     }
@@ -735,10 +776,26 @@ impl AnthropicSseDecoder {
             "content_block_start" => {
                 let index = usize_at(&v, "index");
                 let cb = v.get("content_block");
-                let kind = cb.and_then(|c| c.get("type")).and_then(|t| t.as_str()).unwrap_or("").to_string();
-                let id = cb.and_then(|c| c.get("id")).and_then(|s| s.as_str()).unwrap_or("").to_string();
-                let name = cb.and_then(|c| c.get("name")).and_then(|s| s.as_str()).unwrap_or("").to_string();
-                let data = cb.and_then(|c| c.get("data")).and_then(|s| s.as_str()).unwrap_or("").to_string();
+                let kind = cb
+                    .and_then(|c| c.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let id = cb
+                    .and_then(|c| c.get("id"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = cb
+                    .and_then(|c| c.get("name"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let data = cb
+                    .and_then(|c| c.get("data"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let b = self.block_mut(index);
                 b.kind = kind;
                 b.id = id;
@@ -748,24 +805,34 @@ impl AnthropicSseDecoder {
             "content_block_delta" => {
                 let index = usize_at(&v, "index");
                 let delta = v.get("delta");
-                let dtype = delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+                let dtype = delta
+                    .and_then(|d| d.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
                 match dtype {
                     "text_delta" => {
-                        if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|s| s.as_str()) {
+                        if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|s| s.as_str())
+                        {
                             if !t.is_empty() {
                                 out.push(StreamEvent::TextDelta(t.to_string()));
                             }
                         }
                     }
                     "thinking_delta" => {
-                        if let Some(t) = delta.and_then(|d| d.get("thinking")).and_then(|s| s.as_str()) {
+                        if let Some(t) = delta
+                            .and_then(|d| d.get("thinking"))
+                            .and_then(|s| s.as_str())
+                        {
                             if !t.is_empty() {
                                 out.push(StreamEvent::Reasoning(t.to_string()));
                             }
                         }
                     }
                     "signature_delta" => {
-                        if let Some(s) = delta.and_then(|d| d.get("signature")).and_then(|s| s.as_str()) {
+                        if let Some(s) = delta
+                            .and_then(|d| d.get("signature"))
+                            .and_then(|s| s.as_str())
+                        {
                             self.block_mut(index).signature.push_str(s);
                         }
                     }
@@ -796,20 +863,38 @@ impl AnthropicSseDecoder {
                 let b = std::mem::take(&mut self.blocks[index]);
                 match b.kind.as_str() {
                     "tool_use" => {
-                        let args = if b.input_json.trim().is_empty() { "{}".to_string() } else { b.input_json };
-                        out.push(StreamEvent::ToolCall(ToolCall { id: b.id, name: b.name, arguments: args }));
+                        let args = if b.input_json.trim().is_empty() {
+                            "{}".to_string()
+                        } else {
+                            b.input_json
+                        };
+                        out.push(StreamEvent::ToolCall(ToolCall {
+                            id: b.id,
+                            name: b.name,
+                            arguments: args,
+                        }));
                     }
                     "thinking" => {
-                        out.push(StreamEvent::ReasoningSignature { opaque: b.signature, provider: "anthropic".into() });
+                        out.push(StreamEvent::ReasoningSignature {
+                            opaque: b.signature,
+                            provider: "anthropic".into(),
+                        });
                     }
                     "redacted_thinking" => {
-                        out.push(StreamEvent::ReasoningSignature { opaque: b.redacted_data, provider: "anthropic".into() });
+                        out.push(StreamEvent::ReasoningSignature {
+                            opaque: b.redacted_data,
+                            provider: "anthropic".into(),
+                        });
                     }
                     _ => {}
                 }
             }
             "message_delta" => {
-                if let Some(sr) = v.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()) {
+                if let Some(sr) = v
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|s| s.as_str())
+                {
                     if sr == "max_tokens" {
                         self.truncated = true;
                     }
@@ -823,12 +908,16 @@ impl AnthropicSseDecoder {
             }
             "message_stop" => {
                 out.push(StreamEvent::Usage(self.usage()));
-                out.push(StreamEvent::Done { truncated: self.truncated });
+                out.push(StreamEvent::Done {
+                    truncated: self.truncated,
+                });
                 self.done = true;
             }
             "error" => {
                 let err = v.get("error");
-                let detail = err.map(parse_error_obj).unwrap_or_else(|| "unknown error".to_string());
+                let detail = err
+                    .map(parse_error_obj)
+                    .unwrap_or_else(|| "unknown error".to_string());
                 out.push(StreamEvent::Error(ProviderError {
                     retryable: false,
                     message: format!("provider error: {detail}"),
@@ -870,7 +959,9 @@ mod tests {
             .collect()
     }
     fn has_consecutive_user(out: &[Value]) -> bool {
-        roles(out).windows(2).any(|w| w[0] == "user" && w[1] == "user")
+        roles(out)
+            .windows(2)
+            .any(|w| w[0] == "user" && w[1] == "user")
     }
 
     #[test]
@@ -883,16 +974,30 @@ mod tests {
             Message::user("do X"),
             Message::assistant(
                 "",
-                vec![ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() }],
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
             ),
             Message::tool_result("c1", "result text", false),
             Message::user("<system-reminder>\nstatus\n</system-reminder>"),
         ];
         let (_system, out) = format_messages(&msgs, false);
-        assert!(!has_consecutive_user(&out), "no consecutive user on the wire: {:?}", roles(&out));
+        assert!(
+            !has_consecutive_user(&out),
+            "no consecutive user on the wire: {:?}",
+            roles(&out)
+        );
         let wire = serde_json::to_string(&out).unwrap();
-        assert!(wire.contains("system-reminder"), "reminder preserved (merged): {wire}");
-        assert!(wire.contains("result text"), "tool result preserved: {wire}");
+        assert!(
+            wire.contains("system-reminder"),
+            "reminder preserved (merged): {wire}"
+        );
+        assert!(
+            wire.contains("result text"),
+            "tool result preserved: {wire}"
+        );
     }
 
     #[test]
@@ -901,11 +1006,22 @@ mod tests {
         // After compaction: synthetic-summary (user) sits beside the real user turn.
         let mut summary = Message::user("summary of prior work");
         summary.synthetic = true;
-        let msgs = vec![Message::user("prompt1"), summary, Message::user("follow up")];
+        let msgs = vec![
+            Message::user("prompt1"),
+            summary,
+            Message::user("follow up"),
+        ];
         let (_system, out) = format_messages(&msgs, false);
-        assert!(!has_consecutive_user(&out), "merged into one user: {:?}", roles(&out));
+        assert!(
+            !has_consecutive_user(&out),
+            "merged into one user: {:?}",
+            roles(&out)
+        );
         assert_eq!(out.len(), 1, "three consecutive users → one");
-        assert_eq!(out[0]["content"], json!("prompt1\n\nsummary of prior work\n\nfollow up"));
+        assert_eq!(
+            out[0]["content"],
+            json!("prompt1\n\nsummary of prior work\n\nfollow up")
+        );
     }
 
     fn line(event: &str, v: Value) -> String {
@@ -919,17 +1035,31 @@ mod tests {
         let msgs = vec![
             Message::system("be terse"),
             Message::user("hi"),
-            Message::assistant("ans", vec![ToolCall { id: "tc1".into(), name: "read".into(), arguments: "{\"p\":\"a\"}".into() }]),
+            Message::assistant(
+                "ans",
+                vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "read".into(),
+                    arguments: "{\"p\":\"a\"}".into(),
+                }],
+            ),
             Message::tool_result("tc1", "file body", false),
         ];
         let (system, out) = format_messages(&msgs, false);
-        assert_eq!(system.as_deref(), Some("be terse"), "leading System lifts to top-level system");
+        assert_eq!(
+            system.as_deref(),
+            Some("be terse"),
+            "leading System lifts to top-level system"
+        );
         // text-only user → content STRING (prefix-cache parity with no-block path).
         assert_eq!(out[0], json!({"role":"user","content":"hi"}));
         // assistant with a tool call → content ARRAY: text block then tool_use (input is an OBJECT).
         assert_eq!(out[1]["role"], "assistant");
         assert_eq!(out[1]["content"][0], json!({"type":"text","text":"ans"}));
-        assert_eq!(out[1]["content"][1], json!({"type":"tool_use","id":"tc1","name":"read","input":{"p":"a"}}));
+        assert_eq!(
+            out[1]["content"][1],
+            json!({"type":"tool_use","id":"tc1","name":"read","input":{"p":"a"}})
+        );
         // tool result → a USER message carrying a tool_result block.
         assert_eq!(
             out[2],
@@ -941,16 +1071,31 @@ mod tests {
     fn consecutive_tool_results_fold_into_one_user_message() {
         let msgs = vec![
             Message::user("go"),
-            Message::assistant("", vec![
-                ToolCall { id: "a".into(), name: "x".into(), arguments: "{}".into() },
-                ToolCall { id: "b".into(), name: "y".into(), arguments: "{}".into() },
-            ]),
+            Message::assistant(
+                "",
+                vec![
+                    ToolCall {
+                        id: "a".into(),
+                        name: "x".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "b".into(),
+                        name: "y".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+            ),
             Message::tool_result("a", "ra", false),
             Message::tool_result("b", "rb", true),
         ];
         let (_sys, out) = format_messages(&msgs, false);
         // user, assistant, then ONE user with two tool_result blocks.
-        assert_eq!(out.len(), 3, "two consecutive tool results fold into one user message");
+        assert_eq!(
+            out.len(),
+            3,
+            "two consecutive tool results fold into one user message"
+        );
         let blocks = out[2]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["tool_use_id"], "a");
@@ -960,16 +1105,37 @@ mod tests {
 
     #[test]
     fn assistant_signed_thinking_is_echoed_when_enabled() {
-        let mut a = Message::assistant("answer", vec![ToolCall { id: "t".into(), name: "n".into(), arguments: "{}".into() }]);
+        let mut a = Message::assistant(
+            "answer",
+            vec![ToolCall {
+                id: "t".into(),
+                name: "n".into(),
+                arguments: "{}".into(),
+            }],
+        );
         a.reasoning_blocks = vec![
-            ReasoningBlock { text: "let me think".into(), opaque: Some("sig-1".into()), provider: Some("anthropic".into()) },
-            ReasoningBlock { text: String::new(), opaque: Some("redacted-data".into()), provider: Some("anthropic".into()) },
+            ReasoningBlock {
+                text: "let me think".into(),
+                opaque: Some("sig-1".into()),
+                provider: Some("anthropic".into()),
+            },
+            ReasoningBlock {
+                text: String::new(),
+                opaque: Some("redacted-data".into()),
+                provider: Some("anthropic".into()),
+            },
         ];
         let (_s, out) = format_messages(&[Message::user("hi"), a], true);
         let content = out[1]["content"].as_array().unwrap();
         // thinking blocks FIRST (signed), redacted next, then text, then tool_use.
-        assert_eq!(content[0], json!({"type":"thinking","thinking":"let me think","signature":"sig-1"}));
-        assert_eq!(content[1], json!({"type":"redacted_thinking","data":"redacted-data"}));
+        assert_eq!(
+            content[0],
+            json!({"type":"thinking","thinking":"let me think","signature":"sig-1"})
+        );
+        assert_eq!(
+            content[1],
+            json!({"type":"redacted_thinking","data":"redacted-data"})
+        );
         assert_eq!(content[2], json!({"type":"text","text":"answer"}));
         assert_eq!(content[3]["type"], "tool_use");
     }
@@ -977,7 +1143,11 @@ mod tests {
     #[test]
     fn signed_thinking_is_dropped_when_thinking_disabled() {
         let mut a = Message::assistant("answer", vec![]);
-        a.reasoning_blocks = vec![ReasoningBlock { text: "x".into(), opaque: Some("s".into()), provider: Some("anthropic".into()) }];
+        a.reasoning_blocks = vec![ReasoningBlock {
+            text: "x".into(),
+            opaque: Some("s".into()),
+            provider: Some("anthropic".into()),
+        }];
         let (_s, out) = format_messages(&[Message::user("hi"), a], false);
         // thinking disabled → no signed blocks echoed; plain text content.
         assert_eq!(out[1], json!({"role":"assistant","content":"answer"}));
@@ -989,8 +1159,16 @@ mod tests {
         // opaque token is provider-bound; echoing it 400s). `None` is foreign too.
         let mut a = Message::assistant("answer", vec![]);
         a.reasoning_blocks = vec![
-            ReasoningBlock { text: "from openai".into(), opaque: Some("oai-sig".into()), provider: Some("openai".into()) },
-            ReasoningBlock { text: "no provider".into(), opaque: Some("x".into()), provider: None },
+            ReasoningBlock {
+                text: "from openai".into(),
+                opaque: Some("oai-sig".into()),
+                provider: Some("openai".into()),
+            },
+            ReasoningBlock {
+                text: "no provider".into(),
+                opaque: Some("x".into()),
+                provider: None,
+            },
         ];
         // thinking ENABLED, but every block is foreign → collapses to a plain string.
         let (_s, out) = format_messages(&[Message::user("hi"), a], true);
@@ -1005,33 +1183,63 @@ mod tests {
     fn mixed_provider_blocks_echo_only_anthropic_ones_in_order() {
         let mut a = Message::assistant("answer", vec![]);
         a.reasoning_blocks = vec![
-            ReasoningBlock { text: "ours".into(), opaque: Some("sig-a".into()), provider: Some("anthropic".into()) },
-            ReasoningBlock { text: "theirs".into(), opaque: Some("sig-b".into()), provider: Some("openai".into()) },
+            ReasoningBlock {
+                text: "ours".into(),
+                opaque: Some("sig-a".into()),
+                provider: Some("anthropic".into()),
+            },
+            ReasoningBlock {
+                text: "theirs".into(),
+                opaque: Some("sig-b".into()),
+                provider: Some("openai".into()),
+            },
         ];
         let (_s, out) = format_messages(&[Message::user("hi"), a], true);
         let content = out[1]["content"].as_array().unwrap();
         // only the Anthropic block is echoed, then the text — the foreign one is dropped.
-        assert_eq!(content[0], json!({"type":"thinking","thinking":"ours","signature":"sig-a"}));
+        assert_eq!(
+            content[0],
+            json!({"type":"thinking","thinking":"ours","signature":"sig-a"})
+        );
         assert_eq!(content[1], json!({"type":"text","text":"answer"}));
         assert_eq!(content.len(), 2, "the foreign block must not appear");
     }
 
     #[test]
     fn user_images_become_base64_image_blocks() {
-        let m = Message::user_with_images("look", vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }]);
+        let m = Message::user_with_images(
+            "look",
+            vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            }],
+        );
         let (_s, out) = format_messages(&[m], false);
         let c = out[0]["content"].as_array().unwrap();
         assert_eq!(c[0], json!({"type":"text","text":"look"}));
-        assert_eq!(c[1], json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}));
+        assert_eq!(
+            c[1],
+            json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}})
+        );
     }
 
     #[test]
     fn body_has_required_max_tokens_stream_and_system() {
         let mut c = cfg();
         c.max_tokens = 1000;
-        let body = build_request_body("claude-opus-4-8", &[Message::system("s"), Message::user("hi")], &[], &ChatOptions::default(), &c);
+        let body = build_request_body(
+            "claude-opus-4-8",
+            &[Message::system("s"), Message::user("hi")],
+            &[],
+            &ChatOptions::default(),
+            &c,
+        );
         assert_eq!(body["model"], "claude-opus-4-8");
-        assert_eq!(body["max_tokens"].as_u64(), Some(1000), "max_tokens from cfg when options has none");
+        assert_eq!(
+            body["max_tokens"].as_u64(),
+            Some(1000),
+            "max_tokens from cfg when options has none"
+        );
         assert_eq!(body["stream"], true);
         assert_eq!(body["system"], "s");
         assert!(body.get("tools").is_none(), "empty tools omitted");
@@ -1049,9 +1257,17 @@ mod tests {
             temperature: Some(0.5),
             tool_choice: ToolChoice::Required,
         };
-        let tools = vec![ToolDef { name: "read".into(), description: "d".into(), parameters: json!({"type":"object"}) }];
+        let tools = vec![ToolDef {
+            name: "read".into(),
+            description: "d".into(),
+            parameters: json!({"type":"object"}),
+        }];
         let body = build_request_body("claude-opus-4-8", &[Message::user("hi")], &tools, &opts, &c);
-        assert_eq!(body["max_tokens"].as_u64(), Some(2048), "options.max_tokens overrides cfg");
+        assert_eq!(
+            body["max_tokens"].as_u64(),
+            Some(2048),
+            "options.max_tokens overrides cfg"
+        );
         assert!(
             body.get("temperature").is_none(),
             "sampling params omitted by default (Opus 4.7+ reject temperature)"
@@ -1060,21 +1276,42 @@ mod tests {
         assert_eq!(body["thinking"], json!({"type":"adaptive"}));
         assert_eq!(body["output_config"]["effort"], "high");
         // tools use input_schema, NOT function.parameters.
-        assert_eq!(body["tools"][0], json!({"name":"read","description":"d","input_schema":{"type":"object"}}));
+        assert_eq!(
+            body["tools"][0],
+            json!({"name":"read","description":"d","input_schema":{"type":"object"}})
+        );
     }
 
     #[test]
     fn tool_choice_none_maps() {
-        let opts = ChatOptions { tool_choice: ToolChoice::None, ..Default::default() };
-        let body = build_request_body("claude-opus-4-8", &[Message::user("hi")], &[], &opts, &cfg());
+        let opts = ChatOptions {
+            tool_choice: ToolChoice::None,
+            ..Default::default()
+        };
+        let body = build_request_body(
+            "claude-opus-4-8",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg(),
+        );
         assert_eq!(body["tool_choice"], json!({"type":"none"}));
     }
 
     #[test]
     fn temperature_sent_only_when_sampling_params_enabled() {
-        let opts = ChatOptions { temperature: Some(0.5), ..Default::default() };
+        let opts = ChatOptions {
+            temperature: Some(0.5),
+            ..Default::default()
+        };
         // Default cfg (modern Claude): temperature is OMITTED — Opus 4.7+ 400 on it.
-        let off = build_request_body("claude-opus-4-8", &[Message::user("hi")], &[], &opts, &cfg());
+        let off = build_request_body(
+            "claude-opus-4-8",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg(),
+        );
         assert!(off.get("temperature").is_none(), "omitted by default");
         // Opt in for an older Claude that still accepts sampling params.
         let mut c = cfg();
@@ -1087,16 +1324,45 @@ mod tests {
     fn body_serialization_is_deterministic() {
         let mut c = cfg();
         c.thinking = true;
-        let opts = ChatOptions { temperature: Some(0.7), tool_choice: ToolChoice::Required, ..Default::default() };
+        let opts = ChatOptions {
+            temperature: Some(0.7),
+            tool_choice: ToolChoice::Required,
+            ..Default::default()
+        };
         let tools = vec![
-            ToolDef { name: "b".into(), description: "db".into(), parameters: json!({"type":"object","properties":{"z":{"type":"string"},"a":{"type":"number"}}}) },
-            ToolDef { name: "a".into(), description: "da".into(), parameters: json!({"type":"object"}) },
+            ToolDef {
+                name: "b".into(),
+                description: "db".into(),
+                parameters: json!({"type":"object","properties":{"z":{"type":"string"},"a":{"type":"number"}}}),
+            },
+            ToolDef {
+                name: "a".into(),
+                description: "da".into(),
+                parameters: json!({"type":"object"}),
+            },
         ];
         let msgs = vec![Message::system("s"), Message::user("u")];
-        let first = serde_json::to_string(&build_request_body("claude-opus-4-8", &msgs, &tools, &opts, &c)).unwrap();
+        let first = serde_json::to_string(&build_request_body(
+            "claude-opus-4-8",
+            &msgs,
+            &tools,
+            &opts,
+            &c,
+        ))
+        .unwrap();
         for _ in 0..100 {
-            let again = serde_json::to_string(&build_request_body("claude-opus-4-8", &msgs, &tools, &opts, &c)).unwrap();
-            assert_eq!(first, again, "request body serialization must be deterministic");
+            let again = serde_json::to_string(&build_request_body(
+                "claude-opus-4-8",
+                &msgs,
+                &tools,
+                &opts,
+                &c,
+            ))
+            .unwrap();
+            assert_eq!(
+                first, again,
+                "request body serialization must be deterministic"
+            );
         }
     }
 
@@ -1128,6 +1394,7 @@ mod tests {
                 StreamEvent::ToolCallDelta { .. } => "tooldelta",
                 StreamEvent::Usage(_) => "usage",
                 StreamEvent::ResponseId(_) => "response_id",
+                StreamEvent::ResponseModel(_) => "response_model",
                 StreamEvent::Done { .. } => "done",
                 StreamEvent::Error(_) => "error",
                 StreamEvent::Malformed => "malformed",
@@ -1143,18 +1410,41 @@ mod tests {
         ev.extend(d.feed(line("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})).as_bytes()));
         ev.extend(d.feed(line("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}})).as_bytes()));
         ev.extend(d.feed(line("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}})).as_bytes()));
-        ev.extend(d.feed(line("content_block_stop", json!({"type":"content_block_stop","index":0})).as_bytes()));
+        ev.extend(
+            d.feed(
+                line(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":0}),
+                )
+                .as_bytes(),
+            ),
+        );
         ev.extend(d.feed(line("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}})).as_bytes()));
         ev.extend(d.feed(line("message_stop", json!({"type":"message_stop"})).as_bytes()));
 
         assert!(matches!(&ev[0], StreamEvent::ResponseId(id) if id == "msg_1"));
         assert!(matches!(&ev[1], StreamEvent::TextDelta(s) if s == "Hel"));
         assert!(matches!(&ev[2], StreamEvent::TextDelta(s) if s == "lo"));
-        let u = ev.iter().find_map(|e| if let StreamEvent::Usage(u) = e { Some(*u) } else { None }).unwrap();
-        assert_eq!(u.prompt, 13, "prompt = input + cache_read (+ cache_creation)");
+        let u = ev
+            .iter()
+            .find_map(|e| {
+                if let StreamEvent::Usage(u) = e {
+                    Some(*u)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            u.prompt, 13,
+            "prompt = input + cache_read (+ cache_creation)"
+        );
         assert_eq!(u.completion, 5);
         assert_eq!(u.cached, 3);
-        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
+        assert!(matches!(
+            ev.last().unwrap(),
+            StreamEvent::Done { truncated: false }
+        ));
     }
 
     #[test]
@@ -1164,13 +1454,33 @@ mod tests {
         ev.extend(d.feed(line("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"search","input":{}}})).as_bytes()));
         ev.extend(d.feed(line("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":"}})).as_bytes()));
         ev.extend(d.feed(line("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"hi\"}"}})).as_bytes()));
-        ev.extend(d.feed(line("content_block_stop", json!({"type":"content_block_stop","index":0})).as_bytes()));
+        ev.extend(
+            d.feed(
+                line(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":0}),
+                )
+                .as_bytes(),
+            ),
+        );
 
         // live fragments for display
-        let deltas: Vec<_> = ev.iter().filter(|e| matches!(e, StreamEvent::ToolCallDelta { .. })).collect();
+        let deltas: Vec<_> = ev
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolCallDelta { .. }))
+            .collect();
         assert_eq!(deltas.len(), 2, "one ToolCallDelta per input_json_delta");
         // one whole call at content_block_stop
-        let tc = ev.iter().find_map(|e| if let StreamEvent::ToolCall(c) = e { Some(c.clone()) } else { None }).unwrap();
+        let tc = ev
+            .iter()
+            .find_map(|e| {
+                if let StreamEvent::ToolCall(c) = e {
+                    Some(c.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
         assert_eq!(tc.id, "tu_1");
         assert_eq!(tc.name, "search");
         assert_eq!(tc.arguments, "{\"q\":\"hi\"}");
@@ -1183,10 +1493,20 @@ mod tests {
         ev.extend(d.feed(line("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}})).as_bytes()));
         ev.extend(d.feed(line("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step 1"}})).as_bytes()));
         ev.extend(d.feed(line("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-xyz"}})).as_bytes()));
-        ev.extend(d.feed(line("content_block_stop", json!({"type":"content_block_stop","index":0})).as_bytes()));
+        ev.extend(
+            d.feed(
+                line(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":0}),
+                )
+                .as_bytes(),
+            ),
+        );
         assert_eq!(kinds(&ev), vec!["reason", "reasonsig"]);
         assert!(matches!(&ev[0], StreamEvent::Reasoning(s) if s == "step 1"));
-        assert!(matches!(&ev[1], StreamEvent::ReasoningSignature { opaque, provider } if opaque == "sig-xyz" && provider == "anthropic"));
+        assert!(
+            matches!(&ev[1], StreamEvent::ReasoningSignature { opaque, provider } if opaque == "sig-xyz" && provider == "anthropic")
+        );
     }
 
     #[test]
@@ -1194,9 +1514,19 @@ mod tests {
         let mut d = AnthropicSseDecoder::new();
         let mut ev = Vec::new();
         ev.extend(d.feed(line("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"enc-data"}})).as_bytes()));
-        ev.extend(d.feed(line("content_block_stop", json!({"type":"content_block_stop","index":0})).as_bytes()));
+        ev.extend(
+            d.feed(
+                line(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":0}),
+                )
+                .as_bytes(),
+            ),
+        );
         assert_eq!(kinds(&ev), vec!["reasonsig"]);
-        assert!(matches!(&ev[0], StreamEvent::ReasoningSignature { opaque, .. } if opaque == "enc-data"));
+        assert!(
+            matches!(&ev[0], StreamEvent::ReasoningSignature { opaque, .. } if opaque == "enc-data")
+        );
     }
 
     #[test]
@@ -1207,14 +1537,32 @@ mod tests {
         ev.extend(d.feed(line("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}})).as_bytes()));
         ev.extend(d.feed(line("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":1}})).as_bytes()));
         ev.extend(d.feed(line("message_stop", json!({"type":"message_stop"})).as_bytes()));
-        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: true }));
+        assert!(matches!(
+            ev.last().unwrap(),
+            StreamEvent::Done { truncated: true }
+        ));
     }
 
     #[test]
     fn sse_mid_stream_error_surfaces_and_terminates() {
         let mut d = AnthropicSseDecoder::new();
-        let ev = d.feed(line("error", json!({"type":"error","error":{"type":"overloaded_error","message":"overloaded"}})).as_bytes());
-        let e = ev.iter().find_map(|e| if let StreamEvent::Error(e) = e { Some(e.clone()) } else { None }).expect("error surfaced");
+        let ev = d.feed(
+            line(
+                "error",
+                json!({"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}),
+            )
+            .as_bytes(),
+        );
+        let e = ev
+            .iter()
+            .find_map(|e| {
+                if let StreamEvent::Error(e) = e {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("error surfaced");
         assert!(e.message.contains("overloaded_error"));
         assert!(e.message.contains("overloaded"));
         assert_eq!(e.code.as_deref(), Some("overloaded_error"));
@@ -1225,9 +1573,18 @@ mod tests {
     fn sse_byte_split_robust_and_utf8_safe() {
         let payload = format!(
             "{}{}{}{}",
-            line("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})),
-            line("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"héllo世界"}})),
-            line("content_block_stop", json!({"type":"content_block_stop","index":0})),
+            line(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})
+            ),
+            line(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"héllo世界"}})
+            ),
+            line(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0})
+            ),
             line("message_stop", json!({"type":"message_stop"})),
         );
         let mut d1 = AnthropicSseDecoder::new();
@@ -1245,26 +1602,55 @@ mod tests {
     fn sse_full_fixture_thinking_text_tool_usage() {
         let mut d = AnthropicSseDecoder::new();
         let mut sse = String::new();
-        sse.push_str(&line("message_start", json!({"type":"message_start","message":{"id":"msg_x","usage":{"input_tokens":7}}})));
+        sse.push_str(&line(
+            "message_start",
+            json!({"type":"message_start","message":{"id":"msg_x","usage":{"input_tokens":7}}}),
+        ));
         sse.push_str(&line("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}})));
         sse.push_str(&line("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}})));
         sse.push_str(&line("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"s1"}})));
-        sse.push_str(&line("content_block_stop", json!({"type":"content_block_stop","index":0})));
+        sse.push_str(&line(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        ));
         sse.push_str(&line("content_block_start", json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}})));
         sse.push_str(&line("content_block_delta", json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi"}})));
-        sse.push_str(&line("content_block_stop", json!({"type":"content_block_stop","index":1})));
+        sse.push_str(&line(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":1}),
+        ));
         sse.push_str(&line("content_block_start", json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tu","name":"now","input":{}}})));
-        sse.push_str(&line("content_block_stop", json!({"type":"content_block_stop","index":2})));
+        sse.push_str(&line(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":2}),
+        ));
         sse.push_str(&line("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}})));
         sse.push_str(&line("message_stop", json!({"type":"message_stop"})));
 
         let ev = d.feed(sse.as_bytes());
         assert_eq!(
             kinds(&ev),
-            vec!["response_id", "reason", "reasonsig", "text", "tool", "usage", "done"]
+            vec![
+                "response_id",
+                "reason",
+                "reasonsig",
+                "text",
+                "tool",
+                "usage",
+                "done"
+            ]
         );
         // a tool_use block that received NO input_json_delta defaults to "{}".
-        let tc = ev.iter().find_map(|e| if let StreamEvent::ToolCall(c) = e { Some(c.clone()) } else { None }).unwrap();
+        let tc = ev
+            .iter()
+            .find_map(|e| {
+                if let StreamEvent::ToolCall(c) = e {
+                    Some(c.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
         assert_eq!(tc.arguments, "{}");
     }
 
@@ -1354,7 +1740,10 @@ mod tests {
         let events: Vec<StreamEvent> = stream.collect().await;
 
         let has_error = events.iter().any(|e| matches!(e, StreamEvent::Error(_)));
-        assert!(!has_error, "must not surface a mid-stream error after a clean re-open: {events:?}");
+        assert!(
+            !has_error,
+            "must not surface a mid-stream error after a clean re-open: {events:?}"
+        );
         let text: String = events
             .iter()
             .filter_map(|e| match e {
@@ -1362,7 +1751,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "ok", "should deliver the re-opened response: {events:?}");
+        assert_eq!(
+            text, "ok",
+            "should deliver the re-opened response: {events:?}"
+        );
 
         let _ = handle.join();
     }
@@ -1423,18 +1815,28 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "ok", "should deliver the third (successful) response: {events:?}");
+        assert_eq!(
+            text, "ok",
+            "should deliver the third (successful) response: {events:?}"
+        );
 
         let _ = handle.join();
     }
 
     /// Capture the first request's head, drain its body, then answer 200 + close so
     /// `chat_stream` resolves and the stream ends on EOF (provider-agnostic).
-    fn capture_then_ok(port_back: std::sync::mpsc::Sender<u16>) -> (std::sync::Arc<std::sync::Mutex<String>>, std::thread::JoinHandle<()>) {
+    fn capture_then_ok(
+        port_back: std::sync::mpsc::Sender<u16>,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<String>>,
+        std::thread::JoinHandle<()>,
+    ) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        port_back.send(listener.local_addr().unwrap().port()).unwrap();
+        port_back
+            .send(listener.local_addr().unwrap().port())
+            .unwrap();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let cap = captured.clone();
         let handle = std::thread::spawn(move || {
@@ -1442,13 +1844,23 @@ mod tests {
             let mut buf = Vec::new();
             let mut tmp = [0u8; 1024];
             loop {
-                let n = match s.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => n };
+                let n = match s.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
                 buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
             }
-            *cap.lock().unwrap() =
-                String::from_utf8_lossy(&buf).split("\r\n\r\n").next().unwrap_or("").to_string();
-            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            *cap.lock().unwrap() = String::from_utf8_lossy(&buf)
+                .split("\r\n\r\n")
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
             let _ = s.flush();
             drop(s);
         });
@@ -1473,8 +1885,17 @@ mod tests {
         let _ = handle.join();
 
         let head = captured.lock().unwrap().to_lowercase();
-        assert!(head.contains("x-api-key: ak"), "anthropic auth must remain: {head}");
-        assert!(head.contains("x-atomcode-session-id: sess-anthropic"), "session header must be forwarded: {head}");
-        assert!(head.contains("user-agent: atomcode/9.9.9"), "product UA must be sent: {head}");
+        assert!(
+            head.contains("x-api-key: ak"),
+            "anthropic auth must remain: {head}"
+        );
+        assert!(
+            head.contains("x-atomcode-session-id: sess-anthropic"),
+            "session header must be forwarded: {head}"
+        );
+        assert!(
+            head.contains("user-agent: atomcode/9.9.9"),
+            "product UA must be sent: {head}"
+        );
     }
 }

@@ -9,7 +9,6 @@
 //! Per-turn wall-clock `duration_ms` (and the `errored` flag) live HERE in L1 — the
 //! kernel is clock-free — feeding the `turn_stats` a resume uses to re-render dividers.
 
-use std::io;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -18,15 +17,46 @@ use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
 
-use super::{now_ms, SessionManager, SessionMeta, TurnStat};
+use super::{
+    now_ms, PresentationFile, SessionLease, SessionManager, SessionMeta, SessionStoreError,
+    TurnStat,
+};
 
-/// Per-turn accumulation (reset each turn): start time for duration, and the turn's
-/// tool-call count / token total gathered across rounds.
+/// Per-turn accumulation (reset each turn): duration, round/tool counts, and the final
+/// model request's token/context figures.
 #[derive(Default)]
 struct TurnAccum {
     started_ms: i64,
+    round_count: u32,
     tool_calls: u32,
     total_tokens: u32,
+    used_tokens: u32,
+    ctx_window: u32,
+}
+
+/// One-shot signal from the persistence hook to its owning runtime. A normal
+/// I/O failure whose rollback completed stays best-effort; an uncertain commit
+/// means the on-disk aggregate can no longer be trusted and must fail-close.
+#[derive(Clone, Default)]
+pub struct SnapshotPersistenceStatus {
+    uncertain_commit: Arc<Mutex<Option<String>>>,
+}
+
+impl SnapshotPersistenceStatus {
+    #[doc(hidden)]
+    pub fn report_uncertain_commit(&self, message: impl Into<String>) {
+        *self
+            .uncertain_commit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(message.into());
+    }
+
+    pub fn take_uncertain_commit(&self) -> Option<String> {
+        self.uncertain_commit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
 }
 
 /// Saves `<id>.snapshot` (the compacted working set) + updates `<id>.meta` each turn.
@@ -34,7 +64,9 @@ pub struct SnapshotHook {
     mgr: Arc<SessionManager>,
     session_id: String,
     working_dir: String,
+    lease: Option<SessionLease>,
     accum: Mutex<TurnAccum>,
+    persistence_status: SnapshotPersistenceStatus,
 }
 
 impl SnapshotHook {
@@ -47,17 +79,99 @@ impl SnapshotHook {
             mgr,
             session_id: session_id.into(),
             working_dir: working_dir.into(),
+            lease: None,
             accum: Mutex::new(TurnAccum::default()),
+            persistence_status: SnapshotPersistenceStatus::default(),
         }
+    }
+
+    pub fn with_lease(mut self, lease: SessionLease) -> Self {
+        self.lease = Some(lease);
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, TurnAccum> {
         self.accum.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    pub fn persistence_status(&self) -> SnapshotPersistenceStatus {
+        self.persistence_status.clone()
+    }
+
+    fn record_persistence_error(&self, error: &SessionStoreError) {
+        if error.is_uncertain_commit() {
+            self.persistence_status
+                .report_uncertain_commit(error.to_string());
+        }
+    }
+
+    fn compaction_error(&self, error: SessionStoreError) -> CompactionCheckpointError {
+        self.record_persistence_error(&error);
+        CompactionCheckpointError::new(error.to_string())
+    }
+}
+
+fn reindex_compacted_sidecars(
+    before: &SessionSnapshot,
+    after: &SessionSnapshot,
+    meta: &mut SessionMeta,
+    presentation: &mut PresentationFile,
+) {
+    if before.messages.len() != after.messages.len() {
+        let prefix = before
+            .messages
+            .iter()
+            .zip(&after.messages)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let suffix = before.messages[prefix..]
+            .iter()
+            .rev()
+            .zip(after.messages[prefix..].iter().rev())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let old_end = before.messages.len().saturating_sub(suffix);
+        let new_end = after.messages.len().saturating_sub(suffix);
+        meta.turn_stats.retain_mut(|stat| {
+            if !stat.position_valid {
+                return true;
+            }
+            if stat.after_message > prefix && stat.after_message < old_end {
+                false
+            } else {
+                if stat.after_message >= old_end {
+                    stat.after_message = new_end + stat.after_message.saturating_sub(old_end);
+                }
+                true
+            }
+        });
+    }
+    let surviving_turn_ids: std::collections::BTreeSet<_> = meta
+        .turn_stats
+        .iter()
+        .filter_map(|stat| (stat.position_valid && stat.turn_id != 0).then_some(stat.turn_id))
+        .collect();
+    presentation.retain_turns(&surviving_turn_ids);
+    meta.message_count = u32::try_from(after.messages.len()).unwrap_or(u32::MAX);
+    meta.turn_count = u32::try_from(meta.turn_stats.len()).unwrap_or(u32::MAX);
+    meta.updated_at = now_ms();
 }
 
 impl CompactionCheckpoint for SnapshotHook {
     fn save(&self, snapshot: &SessionSnapshot) -> Result<(), CompactionCheckpointError> {
+        if let Some(lease) = &self.lease {
+            return self
+                .mgr
+                .commit_native_runtime_mutation(
+                    lease,
+                    snapshot,
+                    |current_snapshot, meta, presentation| {
+                        reindex_compacted_sidecars(current_snapshot, snapshot, meta, presentation);
+                        Ok(())
+                    },
+                )
+                .map_err(|error| self.compaction_error(error));
+        }
         self.mgr
             .save_snapshot(&self.session_id, snapshot)
             .map_err(|error| CompactionCheckpointError::new(error.to_string()))
@@ -69,18 +183,27 @@ impl LifecycleHooks for SnapshotHook {
     /// Mark the turn's wall-clock start (for `duration_ms`) and reset per-turn counters.
     async fn user_prompt_submit(&self, _text: &mut String) -> Result<(), String> {
         let mut a = self.lock();
-        *a = TurnAccum { started_ms: now_ms(), tool_calls: 0, total_tokens: 0 };
+        *a = TurnAccum {
+            started_ms: now_ms(),
+            ..Default::default()
+        };
         Ok(())
     }
 
-    /// Accumulate this round's tool-call count + the cumulative context-token count.
+    /// Count this model round and retain the final request's usage/context figures.
     async fn on_model_response(&self, response: &mut Message) {
         let mut a = self.lock();
-        a.tool_calls = a.tool_calls.saturating_add(response.tool_calls.len() as u32);
+        a.round_count = a.round_count.saturating_add(1);
+        a.tool_calls = a
+            .tool_calls
+            .saturating_add(response.tool_calls.len() as u32);
         if let Some(meta) = &response.meta {
-            // `used_tokens` is the round's cumulative context size; the last round's is
-            // the turn's footprint — what a `✓ … tokens` divider shows.
-            a.total_tokens = meta.used_tokens;
+            // Match the live runtime projection: the turn divider shows prompt +
+            // completion from the FINAL request, while context restore needs the
+            // distinct used/window pair. Do not conflate these three values.
+            a.total_tokens = meta.tokens.prompt.saturating_add(meta.tokens.completion);
+            a.used_tokens = meta.used_tokens;
+            a.ctx_window = meta.ctx_window;
         }
     }
 
@@ -95,54 +218,68 @@ impl LifecycleHooks for SnapshotHook {
         // resume seeds past THIS turn even when it stored nothing.
         snap.turn_counter = snap.turn_counter.max(ctx.turn_id);
         snap.request_counter = snap.request_counter.max(ctx.request_id);
-        if let Err(e) = self.mgr.save_snapshot(&self.session_id, &snap) {
-            eprintln!("[SnapshotHook] save_snapshot failed: {e}");
-        }
-
         let now = now_ms();
-        let (duration_ms, tool_call_count, total_tokens) = {
+        let (duration_ms, round_count, tool_call_count, total_tokens, used_tokens, ctx_window) = {
             let a = self.lock();
             (
                 (now - a.started_ms).max(0) as u64,
+                a.round_count,
                 a.tool_calls,
                 a.total_tokens,
+                a.used_tokens,
+                a.ctx_window,
             )
         };
 
-        // Read-modify-write so accumulated turn_stats (persisted on disk) survive, and a
-        // user `/rename` is preserved. ONLY a genuinely-absent meta (NotFound) starts
-        // fresh; any OTHER read error (a transient IO failure, or a corrupt/partially
-        // written file) must NOT clobber the on-disk meta — skip this turn's update and
-        // leave the existing data intact (the snapshot above already persisted).
-        let mut meta = match self.mgr.read_meta(&self.session_id) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                SessionMeta::new(&self.session_id, &self.working_dir, now)
-            }
-            Err(_) => return,
-        };
         let msg_count = convo.messages.len();
-        meta.updated_at = now;
-        meta.turn_count = meta.turn_count.saturating_add(1);
-        meta.message_count = msg_count as u32;
-        // Drop turn_stats whose divider position no longer exists in the (possibly
-        // compacted, hence shorter) snapshot, so the stats stay consistent with what a
-        // resume will load — mirrors production's `retain(|s| s.after_message <= new_len)`.
-        meta.turn_stats.retain(|s| s.after_message <= msg_count);
-        meta.turn_stats.push(TurnStat {
-            after_message: msg_count,
-            tool_call_count,
-            duration_ms,
-            total_tokens,
-            errored: *reason != StopReason::Stopped,
-        });
-        let _ = self.mgr.write_meta(&meta);
+        let update_meta = |meta: &mut SessionMeta| {
+            meta.auto_name_from_messages(&convo.messages);
+            meta.updated_at = now;
+            meta.turn_count = meta.turn_count.saturating_add(1);
+            meta.message_count = msg_count as u32;
+            meta.turn_stats
+                .retain(|s| s.turn_id != 0 || s.after_message <= msg_count);
+            meta.turn_stats.push(TurnStat {
+                after_message: msg_count,
+                position_valid: true,
+                turn_id: ctx.turn_id,
+                round_count,
+                tool_call_count,
+                duration_ms,
+                total_tokens,
+                errored: *reason != StopReason::Stopped,
+                used_tokens,
+                ctx_window,
+            });
+        };
+        let result = if let Some(lease) = &self.lease {
+            self.mgr.commit_native_runtime_mutation(
+                lease,
+                &snap,
+                |_current_snapshot, meta, _presentation| {
+                    update_meta(meta);
+                    Ok(())
+                },
+            )
+        } else {
+            if let Err(error) = self.mgr.save_snapshot(&self.session_id, &snap) {
+                eprintln!("[SnapshotHook] save_snapshot failed: {error}");
+            }
+            let fresh = SessionMeta::new(&self.session_id, &self.working_dir, now);
+            self.mgr
+                .update_meta_or_insert(&self.session_id, fresh, update_meta)
+        };
+        if let Err(error) = result {
+            self.record_persistence_error(&error);
+            eprintln!("[SnapshotHook] update_meta failed: {error}");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::StorageOwner;
     use atomcode_kernel::message::{Message, MessageMeta};
     use atomcode_kernel::stream::TokenUsage;
 
@@ -170,7 +307,201 @@ mod tests {
         assert_eq!(manager.load_snapshot("compact-now").unwrap(), snapshot);
     }
 
+    #[test]
+    fn leased_compaction_checkpoint_reindexes_meta_and_presentation() {
+        use crate::session::{DisplayAnchor, PresentationEntry, PresentationRole};
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::with_root(dir.path()));
+        let id = "compact-sidecars";
+        let before = SessionSnapshot::new(vec![
+            Message::user("u1"),
+            Message::assistant("a1", Vec::new()),
+            Message::user("u2"),
+            Message::assistant("a2", Vec::new()),
+            Message::user("u3"),
+            Message::assistant("a3", Vec::new()),
+        ]);
+        manager.save_snapshot(id, &before).unwrap();
+        let stat = |after_message, turn_id| TurnStat {
+            after_message,
+            position_valid: true,
+            turn_id,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 10,
+        };
+        let mut meta = SessionMeta::new(id, "/p", 1);
+        meta.owner = StorageOwner::Native;
+        meta.turn_stats = vec![stat(2, 1), stat(4, 2), stat(6, 3)];
+        meta.turn_count = 3;
+        meta.message_count = 6;
+        manager.write_meta(&meta).unwrap();
+        manager
+            .write_presentation(
+                id,
+                &PresentationFile {
+                    v: crate::session::presentation::PRESENTATION_VERSION,
+                    entries: vec![
+                        PresentationEntry {
+                            anchor: DisplayAnchor::AfterTurn { turn_id: 1 },
+                            role: PresentationRole::Assistant,
+                            text: "drop".into(),
+                        },
+                        PresentationEntry {
+                            anchor: DisplayAnchor::AfterTurn { turn_id: 2 },
+                            role: PresentationRole::Assistant,
+                            text: "keep".into(),
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        let hook = SnapshotHook::new(manager.clone(), id, "/p").with_lease(lease);
+        let after = SessionSnapshot::new(vec![
+            Message::user("summary"),
+            Message::user("u3"),
+            Message::assistant("a3", Vec::new()),
+        ]);
+
+        CompactionCheckpoint::save(&hook, &after).unwrap();
+
+        let meta = manager.read_meta(id).unwrap();
+        assert_eq!(meta.turn_stats.len(), 2);
+        assert_eq!(meta.turn_stats[0].after_message, 1);
+        assert_eq!(meta.turn_stats[1].after_message, 3);
+        let presentation = manager.read_presentation(id).unwrap();
+        assert_eq!(presentation.entries.len(), 1);
+        assert_eq!(presentation.entries[0].text, "keep");
+    }
+
+    #[test]
+    fn leased_compaction_reindexes_from_the_snapshot_read_under_the_manager_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::with_root(dir.path()));
+        let id = "compact-current-snapshot";
+        let before = SessionSnapshot::new(vec![
+            Message::user("u1"),
+            Message::assistant("a1", Vec::new()),
+            Message::user("u2"),
+            Message::assistant("a2", Vec::new()),
+        ]);
+        let concurrent = SessionSnapshot::new(vec![
+            Message::user("u1"),
+            Message::assistant("a1", Vec::new()),
+            Message::user("u2"),
+            Message::assistant("a2", Vec::new()),
+            Message::user("u3"),
+            Message::assistant("a3", Vec::new()),
+        ]);
+        let compacted = SessionSnapshot::new(vec![
+            Message::user("summary"),
+            Message::user("u3"),
+            Message::assistant("a3", Vec::new()),
+        ]);
+        let stat = |after_message, turn_id| TurnStat {
+            after_message,
+            position_valid: true,
+            turn_id,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 10,
+        };
+        let mut meta = SessionMeta::new(id, "/p", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 4;
+        meta.turn_count = 3;
+        meta.turn_stats = vec![stat(2, 1), stat(4, 2), stat(6, 3)];
+        let lease = manager.acquire_lease(id).unwrap();
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&before),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+
+        // Hold the metadata lock after the concurrent writer has read the old
+        // aggregate. The compaction can read the old snapshot outside the lock,
+        // but must reindex from the writer's committed snapshot once it acquires
+        // the lock itself.
+        let pause = manager.pause_next_meta_read();
+        let writer_manager = manager.clone();
+        let writer_lease = lease.clone();
+        let writer = std::thread::spawn(move || {
+            writer_manager.commit_native_runtime_mutation(
+                &writer_lease,
+                &concurrent,
+                |_current_snapshot, _meta, _presentation| Ok(()),
+            )
+        });
+        pause.wait_until_read();
+
+        let hook = SnapshotHook::new(manager.clone(), id, "/p").with_lease(lease);
+        let (done_tx, done_rx) = mpsc::channel();
+        let compact = std::thread::spawn(move || {
+            let result = CompactionCheckpoint::save(&hook, &compacted);
+            let _ = done_tx.send(result);
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(1)).is_err(),
+            "compaction must wait for the concurrent native mutation"
+        );
+        pause.resume();
+        writer.join().unwrap().unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        compact.join().unwrap();
+
+        let stats = manager.read_meta(id).unwrap().turn_stats;
+        assert_eq!(stats.len(), 2);
+        assert_eq!((stats[0].turn_id, stats[0].after_message), (2, 1));
+        assert_eq!((stats[1].turn_id, stats[1].after_message), (3, 3));
+    }
+
+    #[test]
+    fn uncertain_compaction_commit_is_reported_once() {
+        let (hook, _manager, _dir) = hook("uncertain-turn");
+        let error = hook.compaction_error(crate::session::SessionStoreError::UncertainCommit {
+            id: "uncertain-turn".into(),
+            commit_error: "meta replacement failed".into(),
+            rollback_errors: vec!["snapshot rollback failed".into()],
+        });
+
+        let status = hook.persistence_status();
+        assert!(error.to_string().contains("rollback was incomplete"));
+        assert!(status
+            .take_uncertain_commit()
+            .is_some_and(|message| message.contains("rollback was incomplete")));
+        assert_eq!(status.take_uncertain_commit(), None);
+    }
+
     fn resp(tool_calls: usize, used: u32) -> Message {
+        resp_with_usage(tool_calls, used, 5, used, 0)
+    }
+
+    fn resp_with_usage(
+        tool_calls: usize,
+        prompt: u32,
+        completion: u32,
+        used: u32,
+        ctx_window: u32,
+    ) -> Message {
         let calls = (0..tool_calls)
             .map(|i| atomcode_kernel::tool::ToolCall {
                 id: format!("c{i}"),
@@ -181,7 +512,12 @@ mod tests {
         let mut m = Message::assistant("ok", calls);
         m.meta = Some(MessageMeta {
             used_tokens: used,
-            tokens: TokenUsage { prompt: used, completion: 5, cached: 0 },
+            ctx_window,
+            tokens: TokenUsage {
+                prompt,
+                completion,
+                cached: 0,
+            },
             ..Default::default()
         });
         m
@@ -193,7 +529,15 @@ mod tests {
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp(2, 1234)).await;
         let convo = convo_with(3);
-        h.turn_complete(&convo, &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(
+            &convo,
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: 7,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
 
         // Snapshot is loadable and holds the conversation.
         let snap = mgr.load_snapshot("s1").unwrap();
@@ -206,9 +550,52 @@ mod tests {
         assert_eq!(meta.turn_stats.len(), 1);
         let st = &meta.turn_stats[0];
         assert_eq!(st.tool_call_count, 2);
-        assert_eq!(st.total_tokens, 1234);
+        assert_eq!(st.total_tokens, 1239);
+        assert_eq!(st.round_count, 1);
+        assert_eq!(st.used_tokens, 1234);
+        assert_eq!(st.ctx_window, 0);
         assert_eq!(st.after_message, 3);
+        assert_eq!(st.turn_id, 7);
         assert!(!st.errored);
+    }
+
+    #[tokio::test]
+    async fn turn_complete_auto_names_default_meta_from_first_real_user_message() {
+        let (h, mgr, _d) = hook("auto-name");
+        let mut convo = Conversation::new();
+        convo.push(Message::synthetic_user("[System meta] ignore"));
+        convo.push(Message::user("修复恢复会话名称\n补测试"));
+        convo.push(Message::assistant("done", Vec::new()));
+
+        h.turn_complete(&convo, &StopReason::Stopped, &TurnCtx::default())
+            .await;
+
+        let meta = mgr.read_meta("auto-name").unwrap();
+        assert_eq!(meta.name, "修复恢复会话名称");
+        assert!(!meta.user_renamed);
+        assert!(!meta.ai_named);
+    }
+
+    #[tokio::test]
+    async fn records_round_count_and_distinct_token_semantics() {
+        let (h, mgr, _d) = hook("s1a-stats");
+        h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
+        h.on_model_response(&mut resp_with_usage(1, 100, 10, 800, 1_000))
+            .await;
+        h.on_model_response(&mut resp_with_usage(2, 200, 20, 900, 1_000))
+            .await;
+        h.turn_complete(&convo_with(3), &StopReason::Stopped, &TurnCtx::default())
+            .await;
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(mgr.meta_path("s1a-stats").unwrap()).unwrap())
+                .unwrap();
+        let stat = &raw["turn_stats"][0];
+        assert_eq!(stat["round_count"], 2);
+        assert_eq!(stat["tool_call_count"], 3);
+        assert_eq!(stat["total_tokens"], 220);
+        assert_eq!(stat["used_tokens"], 900);
+        assert_eq!(stat["ctx_window"], 1_000);
     }
 
     #[tokio::test]
@@ -218,10 +605,18 @@ mod tests {
         // The turn died before ANY assistant message was stored — the convo carries
         // no metas, so derive_counters alone would say 0. The live TurnCtx is
         // authoritative: a resume must seed PAST this turn.
-        let ctx = TurnCtx { turn_id: 7, request_id: 12, ..Default::default() };
-        h.turn_complete(&convo_with(1), &StopReason::ProviderError, &ctx).await;
+        let ctx = TurnCtx {
+            turn_id: 7,
+            request_id: 12,
+            ..Default::default()
+        };
+        h.turn_complete(&convo_with(1), &StopReason::ProviderError, &ctx)
+            .await;
         let snap = mgr.load_snapshot("s1").unwrap();
-        assert_eq!(snap.turn_counter, 7, "ctx.turn_id stamps the high-water mark");
+        assert_eq!(
+            snap.turn_counter, 7,
+            "ctx.turn_id stamps the high-water mark"
+        );
         assert_eq!(snap.request_counter, 12, "ctx.request_id too");
     }
 
@@ -230,9 +625,17 @@ mod tests {
         let (h, mgr, _d) = hook("s1");
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 10)).await;
-        h.turn_complete(&convo_with(2), &StopReason::ProviderError, &TurnCtx::default()).await;
+        h.turn_complete(
+            &convo_with(2),
+            &StopReason::ProviderError,
+            &TurnCtx::default(),
+        )
+        .await;
         let meta = mgr.read_meta("s1").unwrap();
-        assert!(meta.turn_stats[0].errored, "a ProviderError terminal is errored");
+        assert!(
+            meta.turn_stats[0].errored,
+            "a ProviderError terminal is errored"
+        );
     }
 
     #[tokio::test]
@@ -241,12 +644,17 @@ mod tests {
         for t in 1..=3u32 {
             h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
             h.on_model_response(&mut resp(1, 100 * t)).await;
-            h.turn_complete(&convo_with(t as usize), &StopReason::Stopped, &TurnCtx::default()).await;
+            h.turn_complete(
+                &convo_with(t as usize),
+                &StopReason::Stopped,
+                &TurnCtx::default(),
+            )
+            .await;
         }
         let meta = mgr.read_meta("s1").unwrap();
         assert_eq!(meta.turn_count, 3);
         assert_eq!(meta.turn_stats.len(), 3);
-        assert_eq!(meta.turn_stats[2].total_tokens, 300);
+        assert_eq!(meta.turn_stats[2].total_tokens, 305);
     }
 
     #[tokio::test]
@@ -255,30 +663,37 @@ mod tests {
         // Turn 1 writes a good meta.
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 1)).await;
-        h.turn_complete(&convo_with(1), &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(&convo_with(1), &StopReason::Stopped, &TurnCtx::default())
+            .await;
         // Corrupt the meta on disk → read_meta now returns InvalidData (NOT NotFound).
-        std::fs::write(mgr.meta_path("s1"), b"not valid json {{{").unwrap();
+        std::fs::write(mgr.meta_path("s1").unwrap(), b"not valid json {{{").unwrap();
         // Turn 2 must NOT overwrite the file with a fresh (reset) meta.
         h.user_prompt_submit(&mut "more".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 1)).await;
-        h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default()).await;
-        let raw = std::fs::read_to_string(mgr.meta_path("s1")).unwrap();
-        assert_eq!(raw, "not valid json {{{", "a non-NotFound read error must not clobber the meta");
+        h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
+            .await;
+        let raw = std::fs::read_to_string(mgr.meta_path("s1").unwrap()).unwrap();
+        assert_eq!(
+            raw, "not valid json {{{",
+            "a non-NotFound read error must not clobber the meta"
+        );
         // The snapshot still saved fine — resume is unaffected by the meta read failure.
         assert_eq!(mgr.load_snapshot("s1").unwrap().messages.len(), 2);
     }
 
     #[tokio::test]
-    async fn prunes_stale_turn_stats_when_snapshot_shrinks() {
+    async fn prunes_unconverted_legacy_stats_when_snapshot_shrinks() {
         let (h, mgr, _d) = hook("s1");
         // Turn 1: a 5-message snapshot → stat at after_message=5.
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 1)).await;
-        h.turn_complete(&convo_with(5), &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(&convo_with(5), &StopReason::Stopped, &TurnCtx::default())
+            .await;
         // Turn 2: a compaction shrank the snapshot to 2 messages.
         h.user_prompt_submit(&mut "more".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 1)).await;
-        h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
+            .await;
         let meta = mgr.read_meta("s1").unwrap();
         assert!(
             meta.turn_stats.iter().all(|s| s.after_message <= 2),
@@ -289,20 +704,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shrinking_snapshot_does_not_prune_native_stable_turn_stats_by_position() {
+        let (h, mgr, _d) = hook("s1");
+        h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
+        h.on_model_response(&mut resp(0, 1)).await;
+        h.turn_complete(
+            &convo_with(5),
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: 1,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
+
+        h.user_prompt_submit(&mut "more".to_string()).await.unwrap();
+        h.on_model_response(&mut resp(0, 1)).await;
+        h.turn_complete(
+            &convo_with(2),
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: 2,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
+
+        let stats = mgr.read_meta("s1").unwrap().turn_stats;
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].turn_id, 1);
+        assert_eq!(stats[0].after_message, 5);
+        assert_eq!(stats[1].turn_id, 2);
+    }
+
+    #[tokio::test]
     async fn preserves_user_rename_across_turns() {
         let (h, mgr, _d) = hook("s1");
         // First turn creates the meta.
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 1)).await;
-        h.turn_complete(&convo_with(1), &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(&convo_with(1), &StopReason::Stopped, &TurnCtx::default())
+            .await;
         // User renames; a later turn must NOT clobber it.
         mgr.rename("s1", "My Work").unwrap();
         h.user_prompt_submit(&mut "more".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 1)).await;
-        h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
+            .await;
         let meta = mgr.read_meta("s1").unwrap();
         assert_eq!(meta.name, "My Work");
         assert!(meta.user_renamed);
         assert_eq!(meta.turn_count, 2);
+    }
+
+    #[tokio::test]
+    async fn leased_turn_complete_preserves_prior_rename_and_presentation_append() {
+        use crate::session::{DisplayAnchor, PresentationEntry, PresentationRole};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(SessionManager::with_root(dir.path()));
+        let id = "leased-prior-sidecars";
+        let mut meta = SessionMeta::new(id, "/proj", 1);
+        meta.owner = StorageOwner::Native;
+        let lease = mgr.acquire_lease(id).unwrap();
+        mgr.commit_native_import(
+            &lease,
+            Some(&SessionSnapshot::from_conversation(&convo_with(1))),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let hook = SnapshotHook::new(mgr.clone(), id, "/proj").with_lease(lease);
+
+        mgr.rename(id, "User title").unwrap();
+        mgr.append_presentation(
+            id,
+            PresentationEntry {
+                anchor: DisplayAnchor::AtStart,
+                role: PresentationRole::Assistant,
+                text: "prior append".into(),
+            },
+        )
+        .unwrap();
+        hook.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
+            .await;
+
+        let meta = mgr.read_meta(id).unwrap();
+        assert_eq!(meta.name, "User title");
+        assert!(meta.user_renamed);
+        assert_eq!(meta.turn_count, 1);
+        let presentation = mgr.read_presentation(id).unwrap();
+        assert_eq!(presentation.entries.len(), 1);
+        assert_eq!(presentation.entries[0].text, "prior append");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_rename_and_turn_complete_preserve_both_updates() {
+        use crate::session::{DisplayAnchor, PresentationEntry, PresentationRole};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(SessionManager::with_root(dir.path()));
+        let id = "concurrent-meta";
+        let mut meta = SessionMeta::new(id, "/proj", 1);
+        meta.owner = StorageOwner::Native;
+        let lease = mgr.acquire_lease(id).unwrap();
+        mgr.commit_native_import(
+            &lease,
+            Some(&SessionSnapshot::from_conversation(&convo_with(1))),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let hook = SnapshotHook::new(mgr.clone(), id, "/proj").with_lease(lease);
+        hook.user_prompt_submit(&mut "go".to_string())
+            .await
+            .unwrap();
+
+        // Pause turn-complete after its fresh locked read. Both sidecar RMWs must
+        // wait, then apply to the committed turn instead of being overwritten by it.
+        let pause = mgr.pause_next_meta_read();
+        let turn = tokio::spawn(async move {
+            hook.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
+                .await;
+        });
+        pause.wait_until_read();
+
+        let rename_mgr = mgr.clone();
+        let (renamed_tx, renamed_rx) = mpsc::channel();
+        let rename = std::thread::spawn(move || {
+            let result = rename_mgr.rename(id, "User title");
+            let _ = renamed_tx.send(());
+            result
+        });
+        let append_mgr = mgr.clone();
+        let (appended_tx, appended_rx) = mpsc::channel();
+        let append = std::thread::spawn(move || {
+            let result = append_mgr.append_presentation(
+                id,
+                PresentationEntry {
+                    anchor: DisplayAnchor::AtStart,
+                    role: PresentationRole::Assistant,
+                    text: "concurrent append".into(),
+                },
+            );
+            let _ = appended_tx.send(());
+            result
+        });
+        let rename_waited = renamed_rx.recv_timeout(Duration::from_secs(1)).is_err();
+        let append_waited = appended_rx.recv_timeout(Duration::from_secs(1)).is_err();
+        pause.resume();
+
+        turn.await.unwrap();
+        rename.join().unwrap().unwrap();
+        append.join().unwrap().unwrap();
+        assert!(
+            rename_waited,
+            "rename must wait for the turn meta update lock"
+        );
+        assert!(
+            append_waited,
+            "presentation append must wait for the turn sidecar update lock"
+        );
+        let meta = mgr.read_meta(id).unwrap();
+        assert_eq!(meta.name, "User title");
+        assert!(meta.user_renamed);
+        assert_eq!(meta.turn_count, 1);
+        assert_eq!(meta.turn_stats.len(), 1);
+        let presentation = mgr.read_presentation(id).unwrap();
+        assert_eq!(presentation.entries.len(), 1);
+        assert_eq!(presentation.entries[0].text, "concurrent append");
     }
 }

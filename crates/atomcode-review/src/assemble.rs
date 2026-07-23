@@ -49,7 +49,14 @@ use std::sync::Arc;
 /// reviewer investigates and reports, it never mutates. (The diff itself is injected as
 /// the task by the caller, so the agent needs no shell to obtain it.)
 fn review_tool_names(no_web: bool, mount_graph: bool) -> Vec<&'static str> {
-    let mut names = vec!["read_file", "grep", "glob", "list_directory", "ast_grep", "report_finding"];
+    let mut names = vec![
+        "read_file",
+        "grep",
+        "glob",
+        "list_directory",
+        "ast_grep",
+        "report_finding",
+    ];
     // web_search is mounted by default; `no_web` drops it (the tool stays registered but
     // unmounted), so a blocked/unreachable web egress can't make the model's web_search
     // call abort the whole review.
@@ -80,8 +87,8 @@ pub fn build_review_agent(cfg: ReviewAgentConfig) -> Result<(Agent, ReportFindin
     // provider watchdog and the kernel watchdog agree instead of the provider cutting
     // a long-thinking review off early with a spurious `[Error: stream idle timeout]`.
     provider_cfg.idle_timeout = cfg.stream_timeout;
-    let provider =
-        OpenAiCompatProvider::new(provider_cfg).map_err(|e| format!("provider init failed: {}", e.message))?;
+    let provider = OpenAiCompatProvider::new(provider_cfg)
+        .map_err(|e| format!("provider init failed: {}", e.message))?;
     Ok(build_review_agent_with(&cfg, Arc::new(provider)))
 }
 
@@ -139,6 +146,9 @@ pub fn build_review_agent_with_cancel(
         )))
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout);
+    if let Some(policy) = cfg.tool_loop_policy {
+        builder = builder.tool_loop_policy(policy);
+    }
     // Round fuse is opt-in: only bound rounds when the caller asked for it (keeps a bare
     // CLI run unbounded; engineering callers pass `--max-rounds`). When bounded, also mount
     // the round-budget pressure hook so the reviewer LANDS findings before the fuse trips
@@ -181,7 +191,9 @@ pub fn build_review_agent_with_cancel(
 ///
 /// Exposed so drivers (e.g. `atomcode-clix`) don't need a direct `tokio-util` dep just
 /// to construct a `CancellationToken` + timer.
-pub fn shared_review_deadline(duration: Option<std::time::Duration>) -> Option<tokio_util::sync::CancellationToken> {
+pub fn shared_review_deadline(
+    duration: Option<std::time::Duration>,
+) -> Option<tokio_util::sync::CancellationToken> {
     duration.map(|d| {
         let token = tokio_util::sync::CancellationToken::new();
         let t = token.clone();
@@ -210,8 +222,16 @@ fn mount_review_tools(report: &ReportFindingTool, no_web: bool, mount_graph: boo
 /// append section (the normal customization channel: domain rules / ignore lists / repo
 /// style guides / PR metadata) composes on top of either base.
 fn compose_persona(cfg: &ReviewAgentConfig) -> String {
-    let mut persona = cfg.persona.clone().unwrap_or_else(|| review_persona(&cfg.model));
-    if let Some(append) = cfg.persona_append.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let mut persona = cfg
+        .persona
+        .clone()
+        .unwrap_or_else(|| review_persona(&cfg.model));
+    if let Some(append) = cfg
+        .persona_append
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         persona.push_str("\n\n");
         persona.push_str(append);
     }
@@ -248,9 +268,14 @@ mod tests {
             _o: &ChatOptions,
         ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
             // After the tool result comes back, the history grows → emit the final answer.
-            let has_tool_result = messages.iter().any(|m| matches!(m.role, atomcode_kernel::message::Role::Tool));
+            let has_tool_result = messages
+                .iter()
+                .any(|m| matches!(m.role, atomcode_kernel::message::Role::Tool));
             let evs = if has_tool_result {
-                vec![StreamEvent::TextDelta("Review complete: 1 P1 finding.".into()), StreamEvent::Done { truncated: false }]
+                vec![
+                    StreamEvent::TextDelta("Review complete: 1 P1 finding.".into()),
+                    StreamEvent::Done { truncated: false },
+                ]
             } else {
                 vec![
                     StreamEvent::ToolCall(ToolCall {
@@ -280,8 +305,8 @@ mod tests {
         assert!(findings[0].title.contains("unchecked unwrap"));
     }
 
-    /// Never terminates on its own: every round emits another tool call. Only `max_rounds`
-    /// can stop it — guards that the review path actually wires the round fuse through.
+    /// Never terminates on its own: every round emits the same no-progress tool call.
+    /// A low explicit `max_rounds` must fire before the exact-loop guard.
     struct LoopingProvider;
     #[async_trait]
     impl LlmProvider for LoopingProvider {
@@ -318,6 +343,35 @@ mod tests {
             outcome.stop,
             atomcode_kernel::event::StopReason::MaxRounds,
             "endless tool calls must be capped by max_rounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_no_progress_loop_is_stopped_when_rounds_are_unbounded() {
+        let (agent, _report) = build_review_agent_with(&cfg(), Arc::new(LoopingProvider));
+        let outcome = agent
+            .run_to_completion("Review this diff:\n+ x", AutoRespond::AllowAll)
+            .await;
+        assert_eq!(
+            outcome.stop,
+            atomcode_kernel::event::StopReason::ToolLoopDetected,
+            "unbounded rounds must not permit an exact unchanged tool loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_guard_can_be_disabled_for_an_intentional_repetition_policy() {
+        let mut c = cfg();
+        c.max_rounds = Some(5);
+        c.tool_loop_policy = None;
+        let (agent, _report) = build_review_agent_with(&c, Arc::new(LoopingProvider));
+        let outcome = agent
+            .run_to_completion("Repeat this probe intentionally", AutoRespond::AllowAll)
+            .await;
+        assert_eq!(
+            outcome.stop,
+            atomcode_kernel::event::StopReason::MaxRounds,
+            "disabling the exact guard must leave the caller's coarse cap authoritative"
         );
     }
 
@@ -395,7 +449,12 @@ mod tests {
         let _ = agent
             .run_to_completion("Review this diff:\n+ x", AutoRespond::AllowAll)
             .await;
-        let text: String = seen.lock().unwrap().iter().map(|m| m.text.clone()).collect();
+        let text: String = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
         assert!(
             text.contains("[review budget]"),
             "bounded run must project the round-budget reminder onto the wire: {text}"
@@ -411,7 +470,12 @@ mod tests {
         let _ = agent
             .run_to_completion("Review this diff:\n+ x", AutoRespond::AllowAll)
             .await;
-        let text: String = seen.lock().unwrap().iter().map(|m| m.text.clone()).collect();
+        let text: String = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
         assert!(
             !text.contains("[review budget]"),
             "unbounded run must not inject the reminder: {text}"
@@ -422,9 +486,23 @@ mod tests {
     fn review_mounts_readonly_set_only() {
         // The mounted names are read-only — no mutation tools.
         let names = review_tool_names(false, true);
-        assert!(names.contains(&"read_file") && names.contains(&"report_finding") && names.contains(&"ast_grep"));
-        for forbidden in ["write_file", "edit_file", "bash", "change_dir", "search_replace", "parallel_edit_files"] {
-            assert!(!names.contains(&forbidden), "reviewer must not mount `{forbidden}`");
+        assert!(
+            names.contains(&"read_file")
+                && names.contains(&"report_finding")
+                && names.contains(&"ast_grep")
+        );
+        for forbidden in [
+            "write_file",
+            "edit_file",
+            "bash",
+            "change_dir",
+            "search_replace",
+            "parallel_edit_files",
+        ] {
+            assert!(
+                !names.contains(&forbidden),
+                "reviewer must not mount `{forbidden}`"
+            );
         }
     }
 
@@ -435,9 +513,19 @@ mod tests {
         assert!(with_web.contains(&"web_search"), "默认应挂 web_search");
 
         let without_web = review_tool_names(true, true);
-        assert!(!without_web.contains(&"web_search"), "no_web 应去掉 web_search");
+        assert!(
+            !without_web.contains(&"web_search"),
+            "no_web 应去掉 web_search"
+        );
         // 其它只读工具仍在
-        for keep in ["read_file", "grep", "glob", "list_directory", "ast_grep", "report_finding"] {
+        for keep in [
+            "read_file",
+            "grep",
+            "glob",
+            "list_directory",
+            "ast_grep",
+            "report_finding",
+        ] {
             assert!(without_web.contains(&keep), "no_web 不应误伤 `{keep}`");
         }
     }
@@ -449,18 +537,30 @@ mod tests {
         let without_graph = review_tool_names(true, false);
         // codeintel names present with the flag on, absent with it off.
         let graph_names = atomcode_capabilities::codeintel::codeintel_tool_names();
-        assert!(graph_names.iter().all(|g| with_graph.contains(g)), "graph tools mounted when on");
-        assert!(graph_names.iter().all(|g| !without_graph.contains(g)), "graph tools dropped when off");
+        assert!(
+            graph_names.iter().all(|g| with_graph.contains(g)),
+            "graph tools mounted when on"
+        );
+        assert!(
+            graph_names.iter().all(|g| !without_graph.contains(g)),
+            "graph tools dropped when off"
+        );
         // Base tools unaffected either way.
         for keep in ["read_file", "grep", "report_finding"] {
-            assert!(without_graph.contains(&keep), "base tool `{keep}` must survive");
+            assert!(
+                without_graph.contains(&keep),
+                "base tool `{keep}` must survive"
+            );
         }
     }
 
     #[test]
     fn should_mount_graph_thresholds() {
         // Unlimited (bare-CLI default) → always mount, even kernel-scale.
-        assert!(should_mount_graph(85_000, usize::MAX), "unlimited → always mount");
+        assert!(
+            should_mount_graph(85_000, usize::MAX),
+            "unlimited → always mount"
+        );
         // Bounded (engineering caller, e.g. service sets 8000).
         assert!(should_mount_graph(0, 8000), "empty/unknown repo → mount");
         assert!(should_mount_graph(8000, 8000), "at threshold → still mount");
@@ -478,7 +578,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
-            Command::new("git").current_dir(root).args(args).output().unwrap();
+            Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .unwrap();
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
@@ -503,7 +607,10 @@ mod shared_deadline_tests {
     #[test]
     fn no_duration_means_no_deadline() {
         // `None` never reaches the spawn inside `map`, so no runtime is needed.
-        assert!(shared_review_deadline(None).is_none(), "unbounded review → no token");
+        assert!(
+            shared_review_deadline(None).is_none(),
+            "unbounded review → no token"
+        );
     }
 
     /// The whole-review cap: ONE token, fired once after `duration`, regardless of how
@@ -524,14 +631,21 @@ mod shared_deadline_tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         // The advance wakes the timer task; yield so it actually runs `cancel()`.
         tokio::task::yield_now().await;
-        assert!(pass1.is_cancelled(), "first pass stops at the wall-clock cap");
-        assert!(pass2.is_cancelled(), "re-review gets NO fresh budget — same token, already fired");
+        assert!(
+            pass1.is_cancelled(),
+            "first pass stops at the wall-clock cap"
+        );
+        assert!(
+            pass2.is_cancelled(),
+            "re-review gets NO fresh budget — same token, already fired"
+        );
     }
 
     /// External token wins over the config duration: no second per-agent timer may race it.
     #[tokio::test(start_paused = true)]
     async fn external_token_suppresses_per_agent_timer() {
-        let mut cfg = ReviewAgentConfig::new("k", "https://x.test", "mock-model", std::env::temp_dir());
+        let mut cfg =
+            ReviewAgentConfig::new("k", "https://x.test", "mock-model", std::env::temp_dir());
         cfg.max_turn_duration = Some(Duration::from_secs(1));
         let external = tokio_util::sync::CancellationToken::new();
         let provider: Arc<dyn LlmProvider> = Arc::new(super::tests::ScriptedReviewProvider);
@@ -542,7 +656,10 @@ mod shared_deadline_tests {
         // only token wired, and only its owner may fire it.
         tokio::time::advance(Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
-        assert!(!external.is_cancelled(), "cfg.max_turn_duration must be ignored when a token is passed in");
+        assert!(
+            !external.is_cancelled(),
+            "cfg.max_turn_duration must be ignored when a token is passed in"
+        );
     }
 }
 
@@ -563,8 +680,14 @@ mod persona_compose_tests {
     fn append_composes_on_builtin() {
         let c = cfg().with_persona_append("## Domain Rules\n- no fmt nits");
         let p = compose_persona(&c);
-        assert!(p.starts_with("You are AtomCode Reviewer"), "built-in stays as the base");
-        assert!(p.ends_with("## Domain Rules\n- no fmt nits"), "append goes last");
+        assert!(
+            p.starts_with("You are AtomCode Reviewer"),
+            "built-in stays as the base"
+        );
+        assert!(
+            p.ends_with("## Domain Rules\n- no fmt nits"),
+            "append goes last"
+        );
     }
 
     #[test]

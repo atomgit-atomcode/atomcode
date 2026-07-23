@@ -40,7 +40,10 @@ mod confine;
 mod review_tool;
 mod round_budget;
 
-pub use assemble::{build_review_agent, build_review_agent_with, build_review_agent_with_cancel, shared_review_deadline};
+pub use assemble::{
+    build_review_agent, build_review_agent_with, build_review_agent_with_cancel,
+    shared_review_deadline,
+};
 pub use config::ReviewAgentConfig;
 pub use diff::annotate_diff_line_numbers;
 pub use impact_plan::render_review_impact_plan;

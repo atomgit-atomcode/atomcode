@@ -46,7 +46,11 @@ impl Tool for FindReferencesTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => return err(format!("find_references: invalid arguments: {e}. Expected {{\"symbol\":\"<name>\"}}.")),
+            Err(e) => {
+                return err(format!(
+                    "find_references: invalid arguments: {e}. Expected {{\"symbol\":\"<name>\"}}."
+                ))
+            }
         };
         if a.symbol.trim().is_empty() {
             return err("find_references: symbol must not be empty.".to_string());
@@ -70,14 +74,28 @@ fn line_has_word(line: &str, word: &str) -> bool {
     while let Some(pos) = line[from..].find(word) {
         let start = from + pos;
         let end = start + word.len();
-        let before_ok = start == 0 || !line[..start].chars().next_back().map(is_word_char).unwrap_or(false);
-        let after_ok = end >= line.len() || !line[end..].chars().next().map(is_word_char).unwrap_or(false);
+        let before_ok = start == 0
+            || !line[..start]
+                .chars()
+                .next_back()
+                .map(is_word_char)
+                .unwrap_or(false);
+        let after_ok = end >= line.len()
+            || !line[end..]
+                .chars()
+                .next()
+                .map(is_word_char)
+                .unwrap_or(false);
         if before_ok && after_ok {
             return true;
         }
         // Advance past the first char of this match — a CHAR-boundary step (a raw +1 byte
         // could land inside a multibyte char and panic on the next `line[from..]` slice).
-        let step = line[start..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        let step = line[start..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
         from = start + step;
     }
     false
@@ -85,11 +103,21 @@ fn line_has_word(line: &str, word: &str) -> bool {
 
 fn render(dir: &Path, display_dir: &str, symbol: &str) -> ToolResult {
     if std::fs::metadata(dir).is_err() {
-        return err(format!("find_references: path not found: {}", dir.display()));
+        return err(format!(
+            "find_references: path not found: {}",
+            dir.display()
+        ));
     }
     let mut refs: Vec<String> = Vec::new();
     let mut capped = false;
-    'walk: for entry in WalkBuilder::new(dir).hidden(true).git_ignore(true).git_global(true).git_exclude(true).build().flatten() {
+    'walk: for entry in WalkBuilder::new(dir)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build()
+        .flatten()
+    {
         let p = entry.path();
         if !p.is_file() {
             continue;
@@ -115,9 +143,14 @@ fn render(dir: &Path, display_dir: &str, symbol: &str) -> ToolResult {
     }
 
     if refs.is_empty() {
-        return ok(format!("No references to '{symbol}' found in {display_dir}."));
+        return ok(format!(
+            "No references to '{symbol}' found in {display_dir}."
+        ));
     }
-    let mut out = format!("References for '{symbol}' in {display_dir}:\n\nUSAGES ({}):\n", refs.len());
+    let mut out = format!(
+        "References for '{symbol}' in {display_dir}:\n\nUSAGES ({}):\n",
+        refs.len()
+    );
     out.push_str(&refs.join("\n"));
     if capped {
         out.push_str(&format!("\n\n[Results capped at {MAX_REFS} matches]"));
@@ -132,7 +165,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        }
     }
 
     #[test]
@@ -158,11 +196,21 @@ mod tests {
     async fn finds_references_across_files() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn helper() {}\n").unwrap();
-        std::fs::write(d.path().join("b.rs"), "fn x() { helper(); }\nfn y() { helper(); }\n").unwrap();
-        let r = FindReferencesTool.execute(r#"{"symbol":"helper"}"#, &ctx(d.path())).await;
+        std::fs::write(
+            d.path().join("b.rs"),
+            "fn x() { helper(); }\nfn y() { helper(); }\n",
+        )
+        .unwrap();
+        let r = FindReferencesTool
+            .execute(r#"{"symbol":"helper"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("a.rs:1:"), "{}", r.content);
-        assert!(r.content.contains("b.rs:1:") && r.content.contains("b.rs:2:"), "{}", r.content);
+        assert!(
+            r.content.contains("b.rs:1:") && r.content.contains("b.rs:2:"),
+            "{}",
+            r.content
+        );
         assert!(r.content.contains("USAGES (3)"), "{}", r.content);
     }
 
@@ -170,7 +218,9 @@ mod tests {
     async fn no_references_is_success() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn x() {}\n").unwrap();
-        let r = FindReferencesTool.execute(r#"{"symbol":"absent_sym"}"#, &ctx(d.path())).await;
+        let r = FindReferencesTool
+            .execute(r#"{"symbol":"absent_sym"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("No references"), "{}", r.content);
     }

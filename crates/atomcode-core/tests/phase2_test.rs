@@ -20,10 +20,7 @@ fn unified_prompt_has_all_sections() {
 #[test]
 fn unified_prompt_has_key_guidance() {
     let prompt = build_rules();
-    assert!(
-        prompt.contains("edit_file"),
-        "Must guide edit mode format"
-    );
+    assert!(prompt.contains("edit_file"), "Must guide edit mode format");
     assert!(
         prompt.contains("search_replace"),
         "Must guide search-replace editing"

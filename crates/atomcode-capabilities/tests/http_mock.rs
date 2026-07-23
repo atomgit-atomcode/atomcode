@@ -94,7 +94,11 @@ async fn retry_on_transient_500_then_succeeds() {
     assert_eq!(text, "It is noon.");
 
     let reqs = server.received_requests().await.unwrap();
-    assert_eq!(reqs.len(), 2, "one 500 + one 200 = the retry actually happened");
+    assert_eq!(
+        reqs.len(),
+        2,
+        "one 500 + one 200 = the retry actually happened"
+    );
 }
 
 #[tokio::test]
@@ -111,12 +115,22 @@ async fn retry_exhausts_on_persistent_500_returns_err() {
         .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
         .await;
 
-    let err = res.err().expect("persistent 500 must return Err on the open");
+    let err = res
+        .err()
+        .expect("persistent 500 must return Err on the open");
     assert!(err.retryable, "500 is classified retryable");
-    assert!(err.message.contains("500"), "message should carry the status: {}", err.message);
+    assert!(
+        err.message.contains("500"),
+        "message should carry the status: {}",
+        err.message
+    );
 
     let reqs = server.received_requests().await.unwrap();
-    assert_eq!(reqs.len(), 3, "should try exactly max_attempts (3) times then give up");
+    assert_eq!(
+        reqs.len(),
+        3,
+        "should try exactly max_attempts (3) times then give up"
+    );
 }
 
 #[tokio::test]
@@ -146,12 +160,28 @@ async fn open_failure_parses_provider_error_code_and_reason() {
     assert!(!err.retryable, "400 is fatal");
     // In the message string: status + type + code + reason.
     assert!(err.message.contains("400"), "status: {}", err.message);
-    assert!(err.message.contains("invalid_request_error"), "type: {}", err.message);
-    assert!(err.message.contains("model_not_found"), "code: {}", err.message);
-    assert!(err.message.contains("does not exist"), "reason: {}", err.message);
+    assert!(
+        err.message.contains("invalid_request_error"),
+        "type: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("model_not_found"),
+        "code: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("does not exist"),
+        "reason: {}",
+        err.message
+    );
     // STRUCTURED fields (not just the message string):
     assert_eq!(err.http_status, Some(400), "structured HTTP status");
-    assert_eq!(err.code.as_deref(), Some("model_not_found"), "structured provider code");
+    assert_eq!(
+        err.code.as_deref(),
+        Some("model_not_found"),
+        "structured provider code"
+    );
 }
 
 #[tokio::test]
@@ -180,8 +210,16 @@ async fn agent_outcome_carries_structured_error_code() {
     // The structured code threads all the way out: adapter → ProviderError →
     // AgentEvent::Error → Outcome.
     assert!(outcome.error.is_some(), "the turn should fail");
-    assert_eq!(outcome.http_status, Some(400), "Outcome carries structured HTTP status");
-    assert_eq!(outcome.error_code.as_deref(), Some("model_not_found"), "Outcome carries provider code");
+    assert_eq!(
+        outcome.http_status,
+        Some(400),
+        "Outcome carries structured HTTP status"
+    );
+    assert_eq!(
+        outcome.error_code.as_deref(),
+        Some("model_not_found"),
+        "Outcome carries provider code"
+    );
 }
 
 #[tokio::test]
@@ -224,7 +262,12 @@ impl Tool for GetTimeTool {
     }
     async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
         // call_id left empty: the kernel fills it from the originating tool_call.
-        ToolResult { call_id: String::new(), content: "12:00".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "12:00".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -250,7 +293,9 @@ async fn multi_round_tool_loop_executes_tool_and_logs_each_round() {
     // Capture the general wire-log hook's output to assert it fired per round.
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let log_sink = log.clone();
-    let hooks = WireLogHooks::with_sink(Arc::new(move |s: &str| log_sink.lock().unwrap().push(s.to_string())));
+    let hooks = WireLogHooks::with_sink(Arc::new(move |s: &str| {
+        log_sink.lock().unwrap().push(s.to_string())
+    }));
 
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(GetTimeTool));
@@ -266,8 +311,15 @@ async fn multi_round_tool_loop_executes_tool_and_logs_each_round() {
         .run_to_completion("what time is it?", AutoRespond::AllowAll)
         .await;
 
-    assert!(outcome.error.is_none(), "no error expected: {:?}", outcome.error);
-    assert_eq!(outcome.text, "It is noon.", "final answer comes from round 2");
+    assert!(
+        outcome.error.is_none(),
+        "no error expected: {:?}",
+        outcome.error
+    );
+    assert_eq!(
+        outcome.text, "It is noon.",
+        "final answer comes from round 2"
+    );
 
     // The server saw exactly two LLM rounds.
     let reqs = server.received_requests().await.unwrap();
@@ -275,28 +327,68 @@ async fn multi_round_tool_loop_executes_tool_and_logs_each_round() {
 
     // Round 2's request must carry BOTH the assistant tool_call and the tool result.
     let round2 = String::from_utf8_lossy(&reqs[1].body);
-    assert!(round2.contains("get_time"), "round 2 must echo the assistant tool_call");
-    assert!(round2.contains("12:00"), "round 2 must carry the tool result fed back by the kernel");
-    assert!(round2.contains("\"role\":\"tool\""), "round 2 must include a tool-role result message");
+    assert!(
+        round2.contains("get_time"),
+        "round 2 must echo the assistant tool_call"
+    );
+    assert!(
+        round2.contains("12:00"),
+        "round 2 must carry the tool result fed back by the kernel"
+    );
+    assert!(
+        round2.contains("\"role\":\"tool\""),
+        "round 2 must include a tool-role result message"
+    );
 
     // The general WireLogHooks logged a request for EACH round (round 1 and round 2).
     let logs = log.lock().unwrap();
-    let request_lines: Vec<&String> = logs.iter().filter(|l| l.contains("[wire] request")).collect();
-    assert_eq!(request_lines.len(), 2, "WireLogHooks must observe both rounds: {logs:?}");
+    let request_lines: Vec<&String> = logs
+        .iter()
+        .filter(|l| l.contains("[wire] request"))
+        .collect();
+    assert_eq!(
+        request_lines.len(),
+        2,
+        "WireLogHooks must observe both rounds: {logs:?}"
+    );
 
     // IDs threaded through the real loop: injected session_id present; both rounds share
     // ONE turn_id (same user message); request_id bumps per round.
     let joined = logs.join("\n");
-    assert!(joined.contains("sess-test"), "injected session_id must appear in the log");
-    assert!(request_lines.iter().all(|l| l.contains("turn=1")), "both rounds share turn_id=1");
-    assert!(joined.contains("req=1") && joined.contains("req=2"), "request_id must bump per round");
+    assert!(
+        joined.contains("sess-test"),
+        "injected session_id must appear in the log"
+    );
+    assert!(
+        request_lines.iter().all(|l| l.contains("turn=1")),
+        "both rounds share turn_id=1"
+    );
+    assert!(
+        joined.contains("req=1") && joined.contains("req=2"),
+        "request_id must bump per round"
+    );
     // The PROVIDER's response id is captured onto Message.meta and shows in the response log.
-    assert!(joined.contains("provider_response_id"), "provider response id must be recorded");
-    assert!(joined.contains("resp-final"), "round-2 response carries the provider's id: {joined}");
+    assert!(
+        joined.contains("provider_response_id"),
+        "provider response id must be recorded"
+    );
+    assert!(
+        joined.contains("resp-final"),
+        "round-2 response carries the provider's id: {joined}"
+    );
     // Message.meta now also carries session_id + finish_reason (the response's "code").
-    assert!(joined.contains("\"finish_reason\": \"tool_calls\""), "round-1 meta finish_reason: {joined}");
-    assert!(joined.contains("\"finish_reason\": \"stop\""), "round-2 meta finish_reason");
-    assert!(joined.contains("\"session_id\": \"sess-test\""), "meta carries session_id");
+    assert!(
+        joined.contains("\"finish_reason\": \"tool_calls\""),
+        "round-1 meta finish_reason: {joined}"
+    );
+    assert!(
+        joined.contains("\"finish_reason\": \"stop\""),
+        "round-2 meta finish_reason"
+    );
+    assert!(
+        joined.contains("\"session_id\": \"sess-test\""),
+        "meta carries session_id"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -357,9 +449,7 @@ async fn multi_round_reasoning_is_echoed_back_for_deepseek_v4() {
     );
 }
 
-async fn drain_until_turn_complete(
-    events: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
-) {
+async fn drain_until_turn_complete(events: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
     while let Some(ev) = events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             return;
@@ -391,7 +481,9 @@ async fn round_resets_per_turn_request_id_is_session_global() {
     let provider = Arc::new(provider_for(&server.uri(), "glm-test"));
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = log.clone();
-    let hooks = WireLogHooks::with_sink(Arc::new(move |s: &str| sink.lock().unwrap().push(s.to_string())));
+    let hooks = WireLogHooks::with_sink(Arc::new(move |s: &str| {
+        sink.lock().unwrap().push(s.to_string())
+    }));
 
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(GetTimeTool));
@@ -407,19 +499,42 @@ async fn round_resets_per_turn_request_id_is_session_global() {
         .spawn();
 
     // Turn 1 (tool call → 2 rounds), then Turn 2 (direct answer → 1 round).
-    handle.commands.send(AgentCommand::SendMessage { text: "turn one".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "turn one".into(),
+            images: vec![],
+        })
+        .unwrap();
     drain_until_turn_complete(&mut handle.events).await;
-    handle.commands.send(AgentCommand::SendMessage { text: "turn two".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "turn two".into(),
+            images: vec![],
+        })
+        .unwrap();
     drain_until_turn_complete(&mut handle.events).await;
     handle.commands.send(AgentCommand::Shutdown).unwrap();
 
     let logs = log.lock().unwrap();
-    let reqs: Vec<&String> = logs.iter().filter(|l| l.contains("[wire] request")).collect();
-    assert_eq!(reqs.len(), 3, "turn1 (tool→2 rounds) + turn2 (1 round) = 3 requests: {reqs:?}");
+    let reqs: Vec<&String> = logs
+        .iter()
+        .filter(|l| l.contains("[wire] request"))
+        .collect();
+    assert_eq!(
+        reqs.len(),
+        3,
+        "turn1 (tool→2 rounds) + turn2 (1 round) = 3 requests: {reqs:?}"
+    );
     assert!(reqs[0].contains("turn=1 round=1 req=1"), "got: {}", reqs[0]);
     assert!(reqs[1].contains("turn=1 round=2 req=2"), "got: {}", reqs[1]);
     // THE point: turn 2 RESETS round to 1, but request_id CONTINUES to 3 (and turn_id→2).
-    assert!(reqs[2].contains("turn=2 round=1 req=3"), "round must reset while request_id is session-global: {}", reqs[2]);
+    assert!(
+        reqs[2].contains("turn=2 round=1 req=3"),
+        "round must reset while request_id is session-global: {}",
+        reqs[2]
+    );
 }
 
 /// DeepSeek-R1 (Exclude): even though the model returned reasoning in round 1 (and the
@@ -438,5 +553,8 @@ async fn multi_round_reasoning_is_stripped_for_deepseek_r1() {
     );
     // sanity: the round still carried the tool result + the assistant tool_call.
     assert!(round2.contains("12:00"), "tool result still fed back");
-    assert!(round2.contains("get_time"), "assistant tool_call still echoed");
+    assert!(
+        round2.contains("get_time"),
+        "assistant tool_call still echoed"
+    );
 }

@@ -123,3 +123,5 @@ extensions/jetbrains/.spec_docs
 # 本地评测脚手架(A/B 对比脚本、日志、测试仓),不入库
 .aacr-eval/
 .superpowers/
+
+.liftoff/

@@ -63,7 +63,6 @@
 | `ctx/truncate.rs` | 521 | **输出截断** — 按工具类型截断（bash 保错误行、read 出 skeleton）、>512B 外部化到 result_store (2026-04 从 turn/truncation.rs 迁入 ctx 模块) |
 | `turn/permission.rs` | ~100 | **权限决策** — InteractivePermissionDecider（弹确认框）、AutoBypass/AutoDeny |
 | `turn/json_repair.rs` | 439 | **JSON 修复** — 自动修复 JSON 语法错误（缺逗号、单引号、未闭合） |
-| `turn/event.rs` | ~50 | **事件定义** — TurnEvent 枚举（TextDelta/ToolCallStarted/ToolCallResult 等） |
 | `turn/log.rs` | ~160 | **LLM 请求日志** — 每次 LLM 调用写 JSON 到 ~/.atomcode/logs/ |
 
 ### 语义层 — 代码理解

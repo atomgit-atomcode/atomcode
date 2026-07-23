@@ -10,6 +10,7 @@ pub mod registry;
 pub mod tool_adapter;
 pub mod transport_http;
 pub mod transport_stdio;
+pub mod trust;
 pub mod types;
 
 pub use client::{McpClient, McpToolInfo};

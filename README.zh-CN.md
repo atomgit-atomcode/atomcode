@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.0.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.0.1-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -193,10 +193,10 @@ brew install --cask atomcode
 
 请用**普通用户**运行 AtomCode，切勿 `sudo`。AtomCode 把配置、会话、日志都放在
 `~/.atomcode`；一旦用 root 跑过一次，就会在那里留下 root 属主的文件，之后非 root
-启动会在引擎初始化阶段报错：
+启动会在运行时初始化阶段报错：
 
 ```
-engine v2 assemble failed: Permission denied (os error 13)
+coding runtime assemble failed: Permission denied (os error 13)
 ```
 
 （提示里可能是 `prepare` 而非 `assemble`——同一个原因。）遇到这种情况，把属主收回
@@ -318,7 +318,6 @@ atomcode --prompt-file task.md
 | `Enter` | 发送消息 |
 | `Shift+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
 | `Ctrl+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
-| `Ctrl+J` | 换行（需要终端支持 Kitty 键盘协议） |
 | `Alt+Enter` | 换行（多数终端可用，见下方兼容性说明） |
 | `\` + `Enter` | 换行（所有终端通用——输入一个 `\` 后按回车，`\` 会被自动删除） |
 | `Esc` | 清空输入 / 取消流式输出 |
@@ -331,7 +330,7 @@ atomcode --prompt-file task.md
 | `Ctrl+V` | 从剪贴板粘贴图片（Windows 下请改用 `/paste`，见下方说明） |
 
 > **换行快捷键的终端兼容性：**
-> - `Shift+Enter`、`Ctrl+Enter`、`Ctrl+J` 都需要终端支持 Kitty 键盘协议 — kitty、WezTerm、Alacritty、iTerm2 ≥3.5、Windows Terminal ≥1.21。不支持的终端会把它们都退化成普通 `Enter`（直接发送消息）。
+> - `Shift+Enter`、`Ctrl+Enter` 需要终端支持 Kitty 键盘协议 — kitty、WezTerm、Alacritty、iTerm2 ≥3.5、Windows Terminal ≥1.21。不支持的终端（以及 Windows，atomcode 在其上不启用该协议）会把它们退化成普通 `Enter`（直接发送消息）—— 请改用 `\` + `Enter`，它在所有终端都生效。
 > - `Alt+Enter` 在多数终端的字节层面就能工作，但 **Windows Terminal 默认把它绑给"切换全屏"** — 在 设置 → 操作 中删掉那条绑定即可释放。
 > - Xshell 不支持 Kitty 协议；可在键盘映射设置中把某个空闲组合映射为发送 `ESC, Enter`（`\x1b\r`）达到同样效果，或直接从剪贴板粘贴多行文本（已启用 bracketed paste）。
 
@@ -366,7 +365,7 @@ atomcode --prompt-file task.md
 | `/clear` | 开始新对话（清空上下文与屏幕） |
 | `/bg` | 将当前会话放到后台；子命令：`/bg list`、`/bg <N>`、`/bg drop <N>`、`/bg help` |
 | `/background <task>` | 兼容入口：在 `/bg` 槽位中启动一次性后台任务 |
-| `/cd` | 切换工作目录 |
+| `/cd` | 切换工作目录并开启新建对话 |
 | `/worktree` | Git worktree 隔离（`create` / `list` / `done` / `cleanup`） |
 | `/webui` | 启动浏览器 webui（子命令：`stop`、`lan`、`--host <地址>`） |
 | `/sync` | 连接到实时 webui 会话（`/sync off` 断开） |
@@ -433,7 +432,7 @@ atomcode --prompt-file task.md
 | `/upgrade` | 升级 atomcode 到最新版（子命令：`rollback`） |
 | `/setup` | 首次运行：安装推荐 skill 并执行 |
 | `/welcome` | 重新运行引导向导 |
-| `/language` | 切换显示语言 |
+| `/language` | 切换显示语言及默认 Git 提交消息语言 |
 | `/issue` | 反馈 bug / 提交功能需求（交互式向导） |
 | `/guide <问题>` | 向 atomcode-guide 询问使用方式 |
 | `/keys` | 查看键盘快捷键 |
@@ -449,42 +448,35 @@ atomcode --prompt-file task.md
 
 ## 架构
 
-AtomCode 是一个 Rust workspace，由四个 crate 组成：
+AtomCode 是一个分层的 Rust workspace：
 
 ```
 atomcode/
   crates/
-    atomcode-core/     # 无头核心库，不依赖 TUI
-      agent/           # AgentLoop：自主工具调用循环
-      turn/            # TurnRunner、datalog、权限决策器
-      config/          # 配置加载、provider 配置
-      conversation/    # 消息类型、窗口化上下文
-      provider/        # LlmProvider trait + OpenAI/Claude/Ollama
-      tool/            # Tool trait + 内置工具实现
-      session/         # 持久化会话
-      skill.rs         # 用户自定义 skill
-
-    atomcode-tuix/     # 终端 UI — retained-mode 渲染器（CC 风格 normal mode）
-      event_loop/      # App 状态机、命令分发
-      render/          # cell-level 渲染器、diff、retained-mode 帧循环
-      modals/          # 各种 picker（dir、model、session、provider、issue）
-
-    atomcode-cli/      # 可执行入口（TUI + headless -p 模式）
-      main.rs          # CLI 参数、首次运行向导、启动
-      auth/            # AtomGit OAuth 客户端
-
-    atomcode-daemon/   # 基于 atomcode-core 的 HTTP/SSE API 服务
+    atomcode-kernel/        # 中立 agent 循环与运行时 trait
+    atomcode-capabilities/  # provider、tools、MCP、skills、session、memory
+    atomcode-coding/        # coding 专业化与 CodingRuntime 生命周期
+    atomcode-review/        # 代码评审专业化
+    atomcode-tuix/          # 终端 UI
+    atomcode-cli/           # TUI 与 headless 入口
+    atomcode-daemon/        # HTTP/SSE/WebSocket 传输层
+    atomcode-core/          # 过渡期 session/plugin/live 兼容代码
 ```
+
+coding 主调用链是 `CLI/TUI/daemon → CodingRuntime → kernel`。已经退役的 core agent
+协议和 `atomcode-bridge` 不再位于运行时路径中。
 
 ### 设计原则
 
 1. **技术栈无关** —— 核心引擎不硬编码任何特定语言的逻辑，通过 `package.json`、`Cargo.toml`、`pyproject.toml`、`pom.xml` 等描述文件动态探测项目类型。
 
-2. **Agent 解耦** —— `AgentLoop` 作为独立的异步任务运行，通过 channel（`AgentCommand` / `AgentEvent`）与 TUI 通信。核心库完全不依赖 TUI，这也是 daemon 得以存在的基础。
+2. **单一运行时所有者** —— `CodingRuntime` 统一拥有 live coding agent、provider/session 生命周期、pending request、snapshot 和 controller。driver 只负责输入、展示和传输，不重建第二套 agent runtime。
 
 3. **工具安全** —— 所有破坏性操作必须经用户显式确认。工具失败会作为 observation 返回给模型，绝不 panic。
 
 4. **上下文感知** —— token 预算感知的会话窗口、项目文件树注入、每轮系统提醒，在不超出上下文限制的同时让模型保持专注。
+
+5. **依赖单向** —— kernel 保持中立；capabilities 和 coding 保持 core-free；历史 session 数据只在显式兼容边界处理，不作为 runtime fallback。
 
 ## 项目指令文件
 

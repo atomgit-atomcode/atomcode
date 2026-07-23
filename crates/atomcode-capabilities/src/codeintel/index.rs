@@ -17,7 +17,9 @@ use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 /// `classify_symbol_kind`.
 fn classify_symbol_kind(ts: &str) -> SymbolKind {
     match ts {
-        "function_item" | "function_definition" | "function_declaration" | "func_literal" => SymbolKind::Function,
+        "function_item" | "function_definition" | "function_declaration" | "func_literal" => {
+            SymbolKind::Function
+        }
         "method_definition" | "method_declaration" => SymbolKind::Method,
         "struct_item" | "struct_specifier" | "struct_type" => SymbolKind::Struct,
         "class_definition" | "class_declaration" | "class_specifier" => SymbolKind::Class,
@@ -82,7 +84,12 @@ fn extract_calls(source: &str, lang: Lang, syms: &[Symbol]) -> Vec<RawCall> {
             // Innermost enclosing Function/Method (max start_line whose range covers the call).
             let caller = syms
                 .iter()
-                .filter(|s| matches!(classify_symbol_kind(&s.kind), SymbolKind::Function | SymbolKind::Method))
+                .filter(|s| {
+                    matches!(
+                        classify_symbol_kind(&s.kind),
+                        SymbolKind::Function | SymbolKind::Method
+                    )
+                })
                 .filter(|s| s.start_line <= line && line <= s.end_line)
                 .max_by_key(|s| s.start_line);
             if let Some(caller) = caller {
@@ -124,8 +131,10 @@ fn parse_file(path: &Path, source: &str) -> Option<(Vec<SymbolNode>, Vec<RawCall
 }
 
 /// Extensions walked into the graph (matches production's INDEXED set + variants).
-const INDEXED_EXTS: &[&str] =
-    &["rs", "py", "js", "jsx", "mjs", "cjs", "ts", "mts", "tsx", "go", "java", "c", "h", "cc", "cpp", "cxx", "hpp", "hh"];
+const INDEXED_EXTS: &[&str] = &[
+    "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "mts", "tsx", "go", "java", "c", "h", "cc", "cpp",
+    "cxx", "hpp", "hh",
+];
 
 /// A walked source file + the inputs to its staleness fingerprint.
 struct Walked {
@@ -153,7 +162,11 @@ fn collect_files(root: &Path) -> Vec<Walked> {
         if !p.is_file() {
             continue;
         }
-        let ext_ok = p.extension().and_then(|e| e.to_str()).map(|e| INDEXED_EXTS.contains(&e)).unwrap_or(false);
+        let ext_ok = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| INDEXED_EXTS.contains(&e))
+            .unwrap_or(false);
         if !ext_ok {
             continue;
         }
@@ -165,7 +178,11 @@ fn collect_files(root: &Path) -> Vec<Walked> {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let len = md.as_ref().map(|m| m.len()).unwrap_or(0);
-        out.push(Walked { path: p.to_path_buf(), mtime_ns, len });
+        out.push(Walked {
+            path: p.to_path_buf(),
+            mtime_ns,
+            len,
+        });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
@@ -182,7 +199,11 @@ fn fingerprint(files: &[Walked]) -> u64 {
 }
 
 fn top_component(p: &Path, root: &Path) -> Option<std::ffi::OsString> {
-    p.strip_prefix(root).ok()?.components().next().map(|c| c.as_os_str().to_os_string())
+    p.strip_prefix(root)
+        .ok()?
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_os_string())
 }
 
 /// Resolve a callee name to a symbol id, preferring closer candidates (production
@@ -190,7 +211,12 @@ fn top_component(p: &Path, root: &Path) -> Option<std::ffi::OsString> {
 /// (Import-based score 3 is omitted — like production, we do not parse imports yet.)
 /// Ties are broken DETERMINISTICALLY by the smallest (file, start_line) — production's
 /// tie-break depends on HashMap iteration order, which is not reproducible.
-fn resolve_callee(g: &CodeGraph, callee: &str, caller_file: &Path, root: &Path) -> Option<SymbolId> {
+fn resolve_callee(
+    g: &CodeGraph,
+    callee: &str,
+    caller_file: &Path,
+    root: &Path,
+) -> Option<SymbolId> {
     let score = |n: &SymbolNode| -> i32 {
         if n.file == caller_file {
             4
@@ -211,7 +237,11 @@ fn resolve_callee(g: &CodeGraph, callee: &str, caller_file: &Path, root: &Path) 
         let s = score(n);
         let better = match best {
             None => true,
-            Some(b) => s > best_score || (s == best_score && (n.file.as_path(), n.start_line) < (b.file.as_path(), b.start_line)),
+            Some(b) => {
+                s > best_score
+                    || (s == best_score
+                        && (n.file.as_path(), n.start_line) < (b.file.as_path(), b.start_line))
+            }
         };
         if better {
             best = Some(n);
@@ -232,7 +262,8 @@ fn build_from_files(root: &Path, files: Vec<Walked>) -> CodeGraph {
             for n in nodes {
                 g.add_symbol(n);
             }
-            g.file_mtimes.insert(w.path.clone(), (w.mtime_ns / 1_000_000_000) as u64);
+            g.file_mtimes
+                .insert(w.path.clone(), (w.mtime_ns / 1_000_000_000) as u64);
             for c in calls {
                 raw_calls.push((w.path.clone(), c));
             }
@@ -246,7 +277,14 @@ fn build_from_files(root: &Path, files: Vec<Walked>) -> CodeGraph {
             continue;
         }
         if let Some(callee) = resolve_callee(&g, &rc.callee_name, &caller_file, root) {
-            g.add_edge(caller, Edge { to: callee, kind: EdgeKind::Calls, line: rc.line });
+            g.add_edge(
+                caller,
+                Edge {
+                    to: callee,
+                    kind: EdgeKind::Calls,
+                    line: rc.line,
+                },
+            );
         }
     }
     g
@@ -292,35 +330,67 @@ mod tests {
     #[test]
     fn builds_cross_file_call_edges() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("a.rs"), "fn helper() {}\nfn main() {\n    helper();\n}\n").unwrap();
+        std::fs::write(
+            d.path().join("a.rs"),
+            "fn helper() {}\nfn main() {\n    helper();\n}\n",
+        )
+        .unwrap();
         let g = build_graph(d.path());
         let main = g.find_by_name("main").into_iter().next().expect("main");
         let helper = g.find_by_name("helper").into_iter().next().expect("helper");
         // main → helper edge exists
         let callees = g.callees(main.id).expect("callees");
-        assert!(callees.iter().any(|e| e.to == helper.id), "main should call helper");
+        assert!(
+            callees.iter().any(|e| e.to == helper.id),
+            "main should call helper"
+        );
         // reverse: helper has main as caller
-        assert!(g.callers(helper.id).unwrap().iter().any(|e| e.to == main.id));
+        assert!(g
+            .callers(helper.id)
+            .unwrap()
+            .iter()
+            .any(|e| e.to == main.id));
     }
 
     #[test]
     fn resolves_calls_across_files() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("util.rs"), "pub fn compute() -> i32 { 42 }\n").unwrap();
-        std::fs::write(d.path().join("main.rs"), "fn run() {\n    let _ = compute();\n}\n").unwrap();
+        std::fs::write(
+            d.path().join("main.rs"),
+            "fn run() {\n    let _ = compute();\n}\n",
+        )
+        .unwrap();
         let g = build_graph(d.path());
         let run = g.find_by_name("run").into_iter().next().expect("run");
-        let compute = g.find_by_name("compute").into_iter().next().expect("compute");
-        assert!(g.callees(run.id).unwrap().iter().any(|e| e.to == compute.id), "run → compute across files");
+        let compute = g
+            .find_by_name("compute")
+            .into_iter()
+            .next()
+            .expect("compute");
+        assert!(
+            g.callees(run.id)
+                .unwrap()
+                .iter()
+                .any(|e| e.to == compute.id),
+            "run → compute across files"
+        );
     }
 
     #[test]
     fn self_calls_are_skipped() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("r.rs"), "fn recur(n: i32) {\n    if n > 0 { recur(n - 1); }\n}\n").unwrap();
+        std::fs::write(
+            d.path().join("r.rs"),
+            "fn recur(n: i32) {\n    if n > 0 { recur(n - 1); }\n}\n",
+        )
+        .unwrap();
         let g = build_graph(d.path());
         let recur = g.find_by_name("recur").into_iter().next().expect("recur");
-        assert!(g.callees(recur.id).map(|e| e.is_empty()).unwrap_or(true), "self-call must be skipped");
+        assert!(
+            g.callees(recur.id).map(|e| e.is_empty()).unwrap_or(true),
+            "self-call must be skipped"
+        );
     }
 
     #[test]
@@ -335,7 +405,10 @@ mod tests {
         assert!(g1.find_by_name("two").is_empty());
         std::fs::write(&f, "fn one() {}\nfn two() {}\n").unwrap();
         let g2 = idx.get(d.path());
-        assert!(!g2.find_by_name("two").is_empty(), "same-second edit must rebuild (nanos/len changed)");
+        assert!(
+            !g2.find_by_name("two").is_empty(),
+            "same-second edit must rebuild (nanos/len changed)"
+        );
     }
 
     #[test]
@@ -348,12 +421,26 @@ mod tests {
         std::fs::write(d.path().join("main.rs"), "fn run() { dup(); }\n").unwrap();
         let g = build_graph(d.path());
         let run = g.find_by_name("run").into_iter().next().unwrap();
-        let target = g.callees(run.id).and_then(|e| e.first()).and_then(|e| g.node(e.to)).map(|n| n.file.clone());
-        assert!(target.as_ref().map(|f| f.ends_with("a_util.rs")).unwrap_or(false), "tie → a_util.rs, got {target:?}");
+        let target = g
+            .callees(run.id)
+            .and_then(|e| e.first())
+            .and_then(|e| g.node(e.to))
+            .map(|n| n.file.clone());
+        assert!(
+            target
+                .as_ref()
+                .map(|f| f.ends_with("a_util.rs"))
+                .unwrap_or(false),
+            "tie → a_util.rs, got {target:?}"
+        );
         // stable across a rebuild
         let g2 = build_graph(d.path());
         let run2 = g2.find_by_name("run").into_iter().next().unwrap();
-        let t2 = g2.callees(run2.id).and_then(|e| e.first()).and_then(|e| g2.node(e.to)).map(|n| n.file.clone());
+        let t2 = g2
+            .callees(run2.id)
+            .and_then(|e| e.first())
+            .and_then(|e| g2.node(e.to))
+            .map(|n| n.file.clone());
         assert_eq!(target, t2);
     }
 
@@ -364,13 +451,19 @@ mod tests {
         let idx = CodeIndex::new();
         let g1 = idx.get(d.path());
         let g2 = idx.get(d.path());
-        assert!(Arc::ptr_eq(&g1, &g2), "unchanged repo → cached graph reused");
+        assert!(
+            Arc::ptr_eq(&g1, &g2),
+            "unchanged repo → cached graph reused"
+        );
         assert!(g1.find_by_name("two").is_empty());
         // change the repo (new mtime via a new file) → rebuild
         std::fs::write(d.path().join("b.rs"), "fn two() {}\n").unwrap();
         let g3 = idx.get(d.path());
         assert!(!Arc::ptr_eq(&g1, &g3), "changed repo → rebuilt");
-        assert!(!g3.find_by_name("two").is_empty(), "rebuilt graph sees new symbol");
+        assert!(
+            !g3.find_by_name("two").is_empty(),
+            "rebuilt graph sees new symbol"
+        );
     }
 
     #[test]
@@ -379,8 +472,16 @@ mod tests {
         // The old resolver picked the first same-named symbol as caller, so both edges hung
         // off ONE handler. Caller id must be reconstructed exactly, per file.
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("a.rs"), "fn handler() {\n    alpha();\n}\nfn alpha() {}\n").unwrap();
-        std::fs::write(d.path().join("b.rs"), "fn handler() {\n    beta();\n}\nfn beta() {}\n").unwrap();
+        std::fs::write(
+            d.path().join("a.rs"),
+            "fn handler() {\n    alpha();\n}\nfn alpha() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("b.rs"),
+            "fn handler() {\n    beta();\n}\nfn beta() {}\n",
+        )
+        .unwrap();
         let g = build_graph(d.path());
 
         let a_handler = g
@@ -399,9 +500,21 @@ mod tests {
         let a_callees = g.callees(a_handler.id).cloned().unwrap_or_default();
         let b_callees = g.callees(b_handler.id).cloned().unwrap_or_default();
 
-        assert!(a_callees.iter().any(|e| e.to == alpha.id), "a.rs::handler → alpha");
-        assert!(!a_callees.iter().any(|e| e.to == beta.id), "a.rs::handler must NOT call beta");
-        assert!(b_callees.iter().any(|e| e.to == beta.id), "b.rs::handler → beta");
-        assert!(!b_callees.iter().any(|e| e.to == alpha.id), "b.rs::handler must NOT call alpha");
+        assert!(
+            a_callees.iter().any(|e| e.to == alpha.id),
+            "a.rs::handler → alpha"
+        );
+        assert!(
+            !a_callees.iter().any(|e| e.to == beta.id),
+            "a.rs::handler must NOT call beta"
+        );
+        assert!(
+            b_callees.iter().any(|e| e.to == beta.id),
+            "b.rs::handler → beta"
+        );
+        assert!(
+            !b_callees.iter().any(|e| e.to == alpha.id),
+            "b.rs::handler must NOT call alpha"
+        );
     }
 }

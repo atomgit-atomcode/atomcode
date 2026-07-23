@@ -38,3 +38,16 @@ test('approval mode state ignores a second selection while pending', () => {
 
   assert.deepEqual(beginApprovalModeSwitch(pending, 'bypass'), pending);
 });
+
+test('approval mode state accepts accept_edits switch', () => {
+  const pending = beginApprovalModeSwitch(initApprovalModeState('build'), 'accept_edits');
+  assert.deepEqual(pending, {
+    confirmedMode: 'build',
+    displayMode: 'accept_edits',
+    pendingMode: 'accept_edits',
+  });
+  assert.deepEqual(completeApprovalModeSwitch(pending, 'accept_edits'), {
+    confirmedMode: 'accept_edits',
+    displayMode: 'accept_edits',
+  });
+});

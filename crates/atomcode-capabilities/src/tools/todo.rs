@@ -97,12 +97,19 @@ pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
         if item.content.trim().is_empty() {
             return Err("todowrite: every task needs non-empty `content`.".to_string());
         }
-        let status = TodoStatus::parse(&item.status)
-            .ok_or_else(|| format!("todowrite: `status` must be one of pending|in_progress|completed (got `{}`).", item.status))?;
+        let status = TodoStatus::parse(&item.status).ok_or_else(|| {
+            format!(
+                "todowrite: `status` must be one of pending|in_progress|completed (got `{}`).",
+                item.status
+            )
+        })?;
         if status == TodoStatus::InProgress {
             in_progress += 1;
         }
-        out.push(TodoItem { content: item.content, status });
+        out.push(TodoItem {
+            content: item.content,
+            status,
+        });
     }
     if in_progress > 1 {
         return Err("todowrite: keep exactly ONE task `in_progress` at a time.".to_string());
@@ -142,14 +149,19 @@ pub fn apply_todo_action(list: &mut Vec<TodoItem>, args: &str) {
             if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
                 let content = content.trim();
                 if !content.is_empty() {
-                    list.push(TodoItem { content: content.to_string(), status: TodoStatus::Pending });
+                    list.push(TodoItem {
+                        content: content.to_string(),
+                        status: TodoStatus::Pending,
+                    });
                 }
             }
         }
         Some("update") => {
             let (Some(id), Some(status)) = (
                 v.get("id").and_then(|x| x.as_u64()),
-                v.get("status").and_then(|x| x.as_str()).and_then(TodoStatus::parse),
+                v.get("status")
+                    .and_then(|x| x.as_str())
+                    .and_then(TodoStatus::parse),
             ) else {
                 return;
             };
@@ -330,6 +342,7 @@ mod tests {
             working_dir: std::path::PathBuf::from("."),
             cancel: CancellationToken::new(),
             progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
         }
     }
 
@@ -368,7 +381,7 @@ mod tests {
     fn glyph_unicode_vs_ascii() {
         assert_eq!(todo_glyph(TodoStatus::Pending, true), "[ ]");
         assert_eq!(todo_glyph(TodoStatus::InProgress, true), "[\u{2022}]"); // [•]
-        assert_eq!(todo_glyph(TodoStatus::Completed, true), "[\u{2713}]");  // [✓]
+        assert_eq!(todo_glyph(TodoStatus::Completed, true), "[\u{2713}]"); // [✓]
         assert_eq!(todo_glyph(TodoStatus::Pending, false), "[ ]");
         assert_eq!(todo_glyph(TodoStatus::InProgress, false), "[~]");
         assert_eq!(todo_glyph(TodoStatus::Completed, false), "[x]");
@@ -377,8 +390,14 @@ mod tests {
     #[test]
     fn render_text_ascii() {
         let todos = vec![
-            TodoItem { content: "first".into(), status: TodoStatus::Completed },
-            TodoItem { content: "second".into(), status: TodoStatus::InProgress },
+            TodoItem {
+                content: "first".into(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "second".into(),
+                status: TodoStatus::InProgress,
+            },
         ];
         let s = render_todos_text(&todos, false);
         assert!(s.contains("[x] first"), "{s}");
@@ -389,10 +408,22 @@ mod tests {
     fn derive_finds_last_todowrite() {
         let msgs = vec![
             Message::user("hi"),
-            Message::assistant("", vec![ToolCall { id: "1".into(), name: "todowrite".into(),
-                arguments: r#"{"todos":[{"content":"old","status":"pending"}]}"#.into() }]),
-            Message::assistant("", vec![ToolCall { id: "2".into(), name: "todowrite".into(),
-                arguments: r#"{"todos":[{"content":"new","status":"in_progress"}]}"#.into() }]),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "1".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"old","status":"pending"}]}"#.into(),
+                }],
+            ),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "2".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"new","status":"in_progress"}]}"#.into(),
+                }],
+            ),
         ];
         let todos = derive_current_todos(&msgs);
         assert_eq!(todos.len(), 1);
@@ -439,7 +470,11 @@ mod tests {
             }]),
         ];
         let todos = derive_current_todos(&msgs);
-        assert_eq!(todos.len(), 1, "should skip invalid call and return last valid list");
+        assert_eq!(
+            todos.len(),
+            1,
+            "should skip invalid call and return last valid list"
+        );
         assert_eq!(todos[0].content, "keep");
         assert_eq!(todos[0].status, TodoStatus::Pending);
     }
@@ -447,16 +482,33 @@ mod tests {
     // ---- incremental `todo` action reducer ----------------------------------------------
 
     fn todo_call(id: &str, args: &str) -> Message {
-        Message::assistant("", vec![ToolCall { id: id.into(), name: "todo".into(), arguments: args.into() }])
+        Message::assistant(
+            "",
+            vec![ToolCall {
+                id: id.into(),
+                name: "todo".into(),
+                arguments: args.into(),
+            }],
+        )
     }
     fn write_call(id: &str, args: &str) -> Message {
-        Message::assistant("", vec![ToolCall { id: id.into(), name: "todowrite".into(), arguments: args.into() }])
+        Message::assistant(
+            "",
+            vec![ToolCall {
+                id: id.into(),
+                name: "todowrite".into(),
+                arguments: args.into(),
+            }],
+        )
     }
     const PLAN3: &str = r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"pending"},{"content":"c","status":"pending"}]}"#;
 
     #[test]
     fn reduce_add_appends_after_baseline() {
-        let msgs = vec![write_call("1", PLAN3), todo_call("2", r#"{"action":"add","content":"d"}"#)];
+        let msgs = vec![
+            write_call("1", PLAN3),
+            todo_call("2", r#"{"action":"add","content":"d"}"#),
+        ];
         let todos = derive_current_todos(&msgs);
         assert_eq!(todos.len(), 4);
         assert_eq!(todos[3].content, "d");
@@ -465,7 +517,10 @@ mod tests {
 
     #[test]
     fn reduce_update_flips_only_that_id() {
-        let msgs = vec![write_call("1", PLAN3), todo_call("2", r#"{"action":"update","id":2,"status":"completed"}"#)];
+        let msgs = vec![
+            write_call("1", PLAN3),
+            todo_call("2", r#"{"action":"update","id":2,"status":"completed"}"#),
+        ];
         let todos = derive_current_todos(&msgs);
         assert_eq!(todos[0].status, TodoStatus::Pending);
         assert_eq!(todos[1].status, TodoStatus::Completed); // #2 (1-based)
@@ -481,17 +536,37 @@ mod tests {
             todo_call("3", r#"{"action":"update","id":3,"status":"in_progress"}"#),
         ];
         let todos = derive_current_todos(&msgs);
-        assert_eq!(todos[0].status, TodoStatus::Pending, "#1 must revert to pending");
-        assert_eq!(todos[2].status, TodoStatus::InProgress, "#3 is the only in_progress");
-        assert_eq!(todos.iter().filter(|t| t.status == TodoStatus::InProgress).count(), 1);
+        assert_eq!(
+            todos[0].status,
+            TodoStatus::Pending,
+            "#1 must revert to pending"
+        );
+        assert_eq!(
+            todos[2].status,
+            TodoStatus::InProgress,
+            "#3 is the only in_progress"
+        );
+        assert_eq!(
+            todos
+                .iter()
+                .filter(|t| t.status == TodoStatus::InProgress)
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn reduce_unknown_id_is_ignored() {
-        let msgs = vec![write_call("1", PLAN3), todo_call("2", r#"{"action":"update","id":9,"status":"completed"}"#)];
+        let msgs = vec![
+            write_call("1", PLAN3),
+            todo_call("2", r#"{"action":"update","id":9,"status":"completed"}"#),
+        ];
         let todos = derive_current_todos(&msgs);
         assert_eq!(todos.len(), 3);
-        assert!(todos.iter().all(|t| t.status == TodoStatus::Pending), "unknown id must not change anything");
+        assert!(
+            todos.iter().all(|t| t.status == TodoStatus::Pending),
+            "unknown id must not change anything"
+        );
     }
 
     #[test]
@@ -500,14 +575,25 @@ mod tests {
         let msgs = vec![
             write_call("1", PLAN3),
             todo_call("2", r#"{"action":"update","id":1,"status":"completed"}"#), // pre-replan → void
-            write_call("3", r#"{"todos":[{"content":"x","status":"pending"},{"content":"y","status":"pending"}]}"#),
+            write_call(
+                "3",
+                r#"{"todos":[{"content":"x","status":"pending"},{"content":"y","status":"pending"}]}"#,
+            ),
             todo_call("4", r#"{"action":"update","id":2,"status":"completed"}"#),
         ];
         let todos = derive_current_todos(&msgs);
         assert_eq!(todos.len(), 2, "list is the re-plan, not the old plan");
         assert_eq!(todos[0].content, "x");
-        assert_eq!(todos[0].status, TodoStatus::Pending, "pre-replan update on old #1 is void");
-        assert_eq!(todos[1].status, TodoStatus::Completed, "post-replan update on new #2 applies");
+        assert_eq!(
+            todos[0].status,
+            TodoStatus::Pending,
+            "pre-replan update on old #1 is void"
+        );
+        assert_eq!(
+            todos[1].status,
+            TodoStatus::Completed,
+            "post-replan update on new #2 applies"
+        );
     }
 
     #[test]
@@ -535,7 +621,12 @@ mod tests {
     #[tokio::test]
     async fn execute_echoes_normalized_list() {
         let t = TodoTool::new();
-        let r = t.execute(r#"{"todos":[{"content":"task","status":"pending"}]}"#, &ctx()).await;
+        let r = t
+            .execute(
+                r#"{"todos":[{"content":"task","status":"pending"}]}"#,
+                &ctx(),
+            )
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("task"), "{}", r.content);
     }
@@ -543,7 +634,9 @@ mod tests {
     #[tokio::test]
     async fn execute_rejects_invalid() {
         let t = TodoTool::new();
-        let r = t.execute(r#"{"todos":[{"content":"a","status":"nope"}]}"#, &ctx()).await;
+        let r = t
+            .execute(r#"{"todos":[{"content":"a","status":"nope"}]}"#, &ctx())
+            .await;
         assert!(r.is_error);
         assert!(r.content.contains("pending"), "{}", r.content);
     }
@@ -567,7 +660,11 @@ mod tests {
         assert_eq!(t.name(), "todowrite");
         let r = t.execute(PLAN3, &ctx()).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("1. a"), "numbered list echoed: {}", r.content);
+        assert!(
+            r.content.contains("1. a"),
+            "numbered list echoed: {}",
+            r.content
+        );
     }
 
     #[tokio::test]
@@ -575,10 +672,18 @@ mod tests {
         // The reported confusion is gone: the SAME `todowrite` tool takes the {action} shape too,
         // so a model that sends `{action}` no longer hits `action must be add or update`.
         let t = TodoTool::new();
-        let add = t.execute(r#"{"action":"add","content":"write tests"}"#, &ctx()).await;
-        assert!(!add.is_error && add.content.contains("write tests"), "{}", add.content);
+        let add = t
+            .execute(r#"{"action":"add","content":"write tests"}"#, &ctx())
+            .await;
+        assert!(
+            !add.is_error && add.content.contains("write tests"),
+            "{}",
+            add.content
+        );
         // `#<id> → <status>` is the exact base the TUI enrich step splices a title into.
-        let upd = t.execute(r#"{"action":"update","id":2,"status":"completed"}"#, &ctx()).await;
+        let upd = t
+            .execute(r#"{"action":"update","id":2,"status":"completed"}"#, &ctx())
+            .await;
         assert!(!upd.is_error, "{}", upd.content);
         assert_eq!(upd.content, "#2 \u{2192} completed");
     }
@@ -586,12 +691,40 @@ mod tests {
     #[tokio::test]
     async fn todowrite_rejects_bad_args() {
         let t = TodoTool::new();
-        assert!(t.execute(r#"{"action":"add","content":"  "}"#, &ctx()).await.is_error, "empty add");
-        assert!(t.execute(r#"{"action":"update","status":"completed"}"#, &ctx()).await.is_error, "no id");
-        assert!(t.execute(r#"{"action":"update","id":2}"#, &ctx()).await.is_error, "no status");
-        assert!(t.execute(r#"{"action":"update","id":2,"status":"nope"}"#, &ctx()).await.is_error, "bad status");
-        assert!(t.execute(r#"{"action":"frobnicate"}"#, &ctx()).await.is_error, "bad action");
-        assert!(t.execute(r#"{}"#, &ctx()).await.is_error, "neither todos nor action");
+        assert!(
+            t.execute(r#"{"action":"add","content":"  "}"#, &ctx())
+                .await
+                .is_error,
+            "empty add"
+        );
+        assert!(
+            t.execute(r#"{"action":"update","status":"completed"}"#, &ctx())
+                .await
+                .is_error,
+            "no id"
+        );
+        assert!(
+            t.execute(r#"{"action":"update","id":2}"#, &ctx())
+                .await
+                .is_error,
+            "no status"
+        );
+        assert!(
+            t.execute(r#"{"action":"update","id":2,"status":"nope"}"#, &ctx())
+                .await
+                .is_error,
+            "bad status"
+        );
+        assert!(
+            t.execute(r#"{"action":"frobnicate"}"#, &ctx())
+                .await
+                .is_error,
+            "bad action"
+        );
+        assert!(
+            t.execute(r#"{}"#, &ctx()).await.is_error,
+            "neither todos nor action"
+        );
     }
 
     #[test]
@@ -599,8 +732,14 @@ mod tests {
         // Merge regression: an incremental {action} carried by the `todowrite` tool name (not the
         // legacy `todo` name) must still fold — the baseline/patch decision is by SHAPE, not name.
         let list = reduce_todos([
-            ("todowrite", r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"pending"}]}"#),
-            ("todowrite", r#"{"action":"update","id":1,"status":"completed"}"#),
+            (
+                "todowrite",
+                r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"pending"}]}"#,
+            ),
+            (
+                "todowrite",
+                r#"{"action":"update","id":1,"status":"completed"}"#,
+            ),
             ("todowrite", r#"{"action":"add","content":"c"}"#),
         ]);
         assert_eq!(list.len(), 3);
@@ -608,8 +747,14 @@ mod tests {
         assert_eq!(list[2].content, "c");
         // Legacy `todo`-named action still folds too (resume compatibility).
         let legacy = reduce_todos([
-            ("todowrite", r#"{"todos":[{"content":"a","status":"pending"}]}"#),
-            ("todo", r#"{"action":"update","id":1,"status":"in_progress"}"#),
+            (
+                "todowrite",
+                r#"{"todos":[{"content":"a","status":"pending"}]}"#,
+            ),
+            (
+                "todo",
+                r#"{"action":"update","id":1,"status":"in_progress"}"#,
+            ),
         ]);
         assert_eq!(legacy[0].status, TodoStatus::InProgress);
     }
@@ -618,8 +763,17 @@ mod tests {
     fn description_covers_both_plan_and_update_modes() {
         let t = TodoTool::new();
         let d = t.description();
-        assert!(d.contains("not tool calls"), "clarifies steps ≠ tool calls: {d}");
-        assert!(d.contains("PLAN") && d.contains("UPDATE ONE ITEM"), "covers both modes: {d}");
-        assert!(d.contains("specific, verifiable action"), "sets item-quality bar: {d}");
+        assert!(
+            d.contains("not tool calls"),
+            "clarifies steps ≠ tool calls: {d}"
+        );
+        assert!(
+            d.contains("PLAN") && d.contains("UPDATE ONE ITEM"),
+            "covers both modes: {d}"
+        );
+        assert!(
+            d.contains("specific, verifiable action"),
+            "sets item-quality bar: {d}"
+        );
     }
 }

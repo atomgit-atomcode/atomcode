@@ -15,6 +15,7 @@ atomcode-coding = { path = "../atomcode-coding" }
 # the typed approval wire contract, SessionManager (session listing).
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "session", "memory", "mcp"] }
 atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-config = { path = "../atomcode-config" }
 # Standalone telemetry sink (clix is core-decoupled, so it resolves + inits its own,
 # mirroring atomcode-cli) — feeds LlmChat/ToolCall events for both subcommands.
 atomcode-telemetry = { path = "../atomcode-telemetry" }

@@ -13,10 +13,20 @@ anyhow = "1"
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 # `real_home_dir` (config_dir resolution): home dir + sudo-aware passwd lookup.
 dirs = "6"
+# Shared config is mutated by TUI and IDE daemon processes concurrently.
+fs2 = "0.4"
+# Stable opaque revision for cross-process reconciliation.
+sha2 = "0.10"
+# Same-directory temporary file + platform-correct atomic replacement.
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 # `getpwnam_r` for the sudo-aware home lookup in util::real_home_dir.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Read HKCU Internet Settings (the per-user static proxy the system browser uses).
+winreg = "0.55"
 
 [features]
 test-util = []
@@ -24,5 +34,3 @@ test-util = []
 [dev-dependencies]
 # locale.rs serde round-trip tests.
 serde_json = "1"
-# config load/save round-trip tests write to throwaway temp dirs.
-tempfile = "3"

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 /// on stock Windows and sends us down a fallback path that then hits
 /// `/tmp` (also nonexistent on Windows).
 pub fn home_dir() -> Option<PathBuf> {
-    atomcode_core::tool::real_home_dir()
+    atomcode_config::util::real_home_dir()
 }
 
 /// Replace a leading `$HOME` in `path` with `~`. Returns `path`
@@ -121,7 +121,9 @@ pub fn collapse_home_in_command(cmd: &str) -> String {
 }
 
 fn collapse_home_in_command_with(cmd: &str, home: Option<&std::path::Path>) -> String {
-    let Some(home) = home else { return cmd.to_string() };
+    let Some(home) = home else {
+        return cmd.to_string();
+    };
     let home = home.to_string_lossy();
     if home.is_empty() || !cmd.contains(&*home) {
         return cmd.to_string();
@@ -132,8 +134,12 @@ fn collapse_home_in_command_with(cmd: &str, home: Option<&std::path::Path>) -> S
     while i < cmd.len() {
         let rest = &cmd[i..];
         if rest.starts_with(&*home) {
-            let before_ok =
-                i == 0 || cmd[..i].chars().next_back().map(is_boundary).unwrap_or(true);
+            let before_ok = i == 0
+                || cmd[..i]
+                    .chars()
+                    .next_back()
+                    .map(is_boundary)
+                    .unwrap_or(true);
             let after = &rest[home.len()..];
             let after_ok = after.is_empty()
                 || after.starts_with('/')
@@ -226,7 +232,10 @@ mod tests {
     #[test]
     fn collapse_home_in_command_bare_home_becomes_tilde() {
         let home = std::path::Path::new("/Users/me");
-        assert_eq!(collapse_home_in_command_with("cd /Users/me", Some(home)), "cd ~");
+        assert_eq!(
+            collapse_home_in_command_with("cd /Users/me", Some(home)),
+            "cd ~"
+        );
         assert_eq!(
             collapse_home_in_command_with("cd /Users/me && ls", Some(home)),
             "cd ~ && ls"
@@ -325,10 +334,7 @@ mod tests {
     #[test]
     fn collapse_home_windows_exact_home() {
         let home = std::path::Path::new(r"C:\Users\username");
-        assert_eq!(
-            collapse_home_with(r"C:\Users\username", Some(home)),
-            "~"
-        );
+        assert_eq!(collapse_home_with(r"C:\Users\username", Some(home)), "~");
     }
 
     /// Regression test for the slice-offset bug in the Windows
@@ -349,10 +355,7 @@ mod tests {
     fn collapse_home_windows_deeply_nested_path() {
         let home = std::path::Path::new(r"C:\Users\hao");
         assert_eq!(
-            collapse_home_with(
-                r"C:\Users\hao\Documents\WPSDrive\NotLoginPage",
-                Some(home),
-            ),
+            collapse_home_with(r"C:\Users\hao\Documents\WPSDrive\NotLoginPage", Some(home),),
             "~/Documents/WPSDrive/NotLoginPage"
         );
     }

@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::hook::HookEngine;
+use super::async_batcher::{AsyncWebhookConfig, AsyncWebhookRegistry};
 use super::script_runner::{ScriptHook, ScriptHookConfig};
-use super::webhook::{WebhookHook, WebhookConfig};
-use super::async_batcher::{AsyncWebhookRegistry, AsyncWebhookConfig};
+use super::webhook::{WebhookConfig, WebhookHook};
+use crate::hook::HookEngine;
 
 /// Hooks 配置结构
 #[derive(Debug, Deserialize)]
@@ -65,7 +65,10 @@ impl HooksConfig {
             };
 
             if !script_path.exists() {
-                tracing::warn!("[Hook] Warning: Script not found: {}", script_path.display());
+                tracing::warn!(
+                    "[Hook] Warning: Script not found: {}",
+                    script_path.display()
+                );
                 continue;
             }
 
@@ -132,7 +135,10 @@ impl HooksConfig {
         }
 
         if !async_registry.batchers.is_empty() {
-            tracing::info!("[AsyncWebhook] Registered {} async batchers", async_registry.batchers.len());
+            tracing::info!(
+                "[AsyncWebhook] Registered {} async batchers",
+                async_registry.batchers.len()
+            );
         }
     }
 
@@ -211,7 +217,8 @@ pub fn load_script_hooks_with_names(project_dir: &Path) -> Vec<(String, ScriptHo
                 if global_dir.exists() {
                     tracing::warn!(
                         "[Hook] Failed to load global TOML hook config from {}: {}",
-                        global_dir.display(), e
+                        global_dir.display(),
+                        e
                     );
                 }
             }
@@ -235,7 +242,8 @@ pub fn load_script_hooks_with_names(project_dir: &Path) -> Vec<(String, ScriptHo
             if project_hooks_dir.exists() {
                 tracing::warn!(
                     "[Hook] Failed to load project TOML hook config from {}: {}",
-                    project_hooks_dir.display(), e
+                    project_hooks_dir.display(),
+                    e
                 );
             }
         }
@@ -329,14 +337,18 @@ batch_size = 20
         let dir = std::env::temp_dir().join(format!("hook_test_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let config_path = dir.join("hooks.toml");
-        fs::write(&config_path, r#"
+        fs::write(
+            &config_path,
+            r#"
 [[hooks]]
 name = "test-hook"
 trigger = "pre_tool"
 script = "test.sh"
 enabled = true
 timeout_secs = 3
-"#).expect("Should write test file");
+"#,
+        )
+        .expect("Should write test file");
 
         let config = HooksConfig::from_file(&config_path).expect("Should load from file");
         assert_eq!(config.hooks.len(), 1);
@@ -357,12 +369,16 @@ timeout_secs = 3
     fn test_from_dir_with_existing_config() {
         let dir = std::env::temp_dir().join(format!("hook_test_dir_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
-        fs::write(dir.join("hooks.toml"), r#"
+        fs::write(
+            dir.join("hooks.toml"),
+            r#"
 [[hooks]]
 name = "dir-hook"
 trigger = "post_turn"
 script = "report.sh"
-"#).expect("Should write test file");
+"#,
+        )
+        .expect("Should write test file");
 
         let config = HooksConfig::from_dir(&dir).expect("Should load from dir");
         assert_eq!(config.hooks.len(), 1);
@@ -479,7 +495,11 @@ script = "report.sh"
     #[test]
     fn test_register_hooks_to_engine_nonexistent_script() {
         let config = HooksConfig {
-            hooks: vec![make_script_config("missing", "pre_tool", "/tmp/nonexistent_script_12345.sh")],
+            hooks: vec![make_script_config(
+                "missing",
+                "pre_tool",
+                "/tmp/nonexistent_script_12345.sh",
+            )],
             webhooks: vec![],
             async_webhooks: vec![],
         };
@@ -533,13 +553,17 @@ script = "report.sh"
         let hooks_dir = dir.path().join(".atomcode").join("hooks");
         fs::create_dir_all(&hooks_dir).expect("create project hooks dir");
         fs::write(hooks_dir.join("project-hook.sh"), "").expect("create hook script");
-        fs::write(hooks_dir.join("hooks.toml"), r#"
+        fs::write(
+            hooks_dir.join("hooks.toml"),
+            r#"
 [[hooks]]
 name = "test-hook"
 trigger = "pre_tool"
 script = "project-hook.sh"
 enabled = true
-"#).expect("Should write test file");
+"#,
+        )
+        .expect("Should write test file");
 
         let mut engine = HookEngine::new();
         engine.load_all(dir.path());

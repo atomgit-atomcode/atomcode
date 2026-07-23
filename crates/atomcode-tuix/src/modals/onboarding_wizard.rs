@@ -25,7 +25,16 @@ use unicode_width::UnicodeWidthStr;
 /// `←` all return width 1 from `unicode-width` but conhost allocates
 /// them slightly wider in practice, so the right `│` lands at a
 /// different column on every row that contains one.
-fn box_chars(unicode_symbols: bool) -> (&'static str, &'static str, &'static str, &'static str, &'static str, &'static str) {
+fn box_chars(
+    unicode_symbols: bool,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
     if unicode_symbols {
         ("┌", "┐", "└", "┘", "─", "│")
     } else {
@@ -47,10 +56,9 @@ fn ascii_fallback(s: &str) -> String {
             '○' => out.push('o'),
             '·' => out.push('-'),
             '←' => out.push('<'),
-            '→' => out.push('>'),
+            '→' | '▶' => out.push('>'),
             '↑' => out.push('^'),
             '↓' => out.push('v'),
-            '█' => out.push('#'),
             // Box-drawing glyphs in content (e.g. tables emitted by
             // markdown into the panel) get the same swap as the
             // outer panel border.
@@ -188,13 +196,25 @@ fn pad_to_width(s: &str, target: usize) -> String {
 /// panel must not push into the footer.
 const FOOTER_ROWS: usize = 5;
 
+/// Maximum panel width for the onboarding wizard box. Must not exceed
+/// `screen_width - 4` (76 cols on an 80-col terminal) because
+/// `RetainedRenderer::push_body_text_sgr` automatically prepends
+/// `PAD_COL` (2 spaces) and wraps lines at `screen_width - 4`. A panel
+/// of 80 cols on an 80-col terminal would exceed the 76-col wrap budget
+/// and break into double-lines with wrapped right borders.
+pub(super) const MAX_PANEL_WIDTH: usize = 76;
+
+pub(super) fn calc_panel_width(term_cols: u16) -> usize {
+    (term_cols as usize).saturating_sub(4).min(MAX_PANEL_WIDTH)
+}
+
 /// Wrap `lines` with top + bottom padding blanks and a left
 /// indent so the wizard panel sits at the visual centre of the
 /// visible body area. `panel_width` is the horizontal extent of
-/// the widest line (typically the bordered panel — 80 cols
-/// capped); callers pass this in rather than scanning every line
-/// for SGR width because draw_panel-shaped output already commits
-/// to a known width.
+/// the widest line (typically the bordered panel — capped at
+/// `MAX_PANEL_WIDTH`); callers pass this in rather than scanning
+/// every line for SGR width because draw_panel-shaped output
+/// already commits to a known width.
 ///
 /// RetainedRenderer anchors body content to the body region's BOTTOM:
 /// when total pushed rows < body_height, the auto-empty rows appear
@@ -219,7 +239,8 @@ fn center_lines(
     let free = body_rows.saturating_sub(lines.len());
     let top_blanks = free / 2;
     let bottom_blanks = free - top_blanks;
-    let left_pad = term_cols.saturating_sub(panel_width) / 2;
+    let usable_cols = term_cols.saturating_sub(4);
+    let left_pad = usable_cols.saturating_sub(panel_width) / 2;
     let pad_str = " ".repeat(left_pad);
     let mut out = Vec::with_capacity(lines.len() + free);
     for _ in 0..top_blanks {
@@ -323,8 +344,13 @@ pub struct OnboardingWizard {
     /// completing the in-browser consent and auto-close the modal —
     /// no manual Enter required. `None` after a take, after an Esc,
     /// or when `start_login()` itself errored at construction.
-    pub(super) pending_session:
-        Option<atomcode_core::auth::oauth::LoginSession>,
+    pub(super) pending_session: Option<atomcode_auth::oauth::LoginSession>,
+    /// Transient "link copied" feedback for the QR step: flipped true
+    /// when the user presses `c` to copy `qr_login_url` to the
+    /// clipboard, swapping the `c 复制链接` legend hint for a
+    /// `链接已复制` confirmation on the next redraw. Reset whenever a
+    /// fresh login URL is produced (retry) so the hint returns.
+    pub(super) qr_url_copied: bool,
 }
 
 impl OnboardingWizard {
@@ -341,6 +367,7 @@ impl OnboardingWizard {
             qr_login_url: None,
             qr_login_error: None,
             pending_session: None,
+            qr_url_copied: false,
         }
     }
 
@@ -356,6 +383,7 @@ impl OnboardingWizard {
             qr_login_url: None,
             qr_login_error: None,
             pending_session: None,
+            qr_url_copied: false,
         }
     }
 
@@ -367,7 +395,7 @@ impl OnboardingWizard {
     /// / `$LANG` (i18n step gone); user can switch later via
     /// `/language`.
     ///
-    /// Synchronously calls [`atomcode_core::auth::oauth::start_login`]
+    /// Synchronously calls [`atomcode_auth::oauth::start_login`]
     /// up front so the QR is paintable the moment the modal opens.
     /// On network failure the error is stashed on the wizard and
     /// rendered in place of the QR — Esc bails, Enter retries via
@@ -380,7 +408,7 @@ impl OnboardingWizard {
     /// loop.
     pub fn new_qr_fast_path() -> Self {
         let (qr_login_url, qr_login_error, pending_session) =
-            match atomcode_core::auth::oauth::start_login() {
+            match atomcode_auth::oauth::start_login() {
                 Ok(session) => (Some(session.url().to_string()), None, Some(session)),
                 Err(e) => (None, Some(format!("{e:#}")), None),
             };
@@ -392,6 +420,7 @@ impl OnboardingWizard {
             qr_login_url,
             qr_login_error,
             pending_session,
+            qr_url_copied: false,
         }
     }
 
@@ -402,9 +431,7 @@ impl OnboardingWizard {
     /// already took it). Called exactly once per QR session by
     /// `event_loop::run_loop`'s first-launch setup; subsequent calls
     /// return None and are harmless.
-    pub fn take_pending_session(
-        &mut self,
-    ) -> Option<atomcode_core::auth::oauth::LoginSession> {
+    pub fn take_pending_session(&mut self) -> Option<atomcode_auth::oauth::LoginSession> {
         self.pending_session.take()
     }
 
@@ -441,11 +468,7 @@ impl OnboardingWizard {
     /// the world. The Modal::handle_key wrapper (Task 6) calls this,
     /// then performs the i18n / config / flag side effects based on
     /// the returned `PureOutcome`.
-    pub(super) fn handle_key_pure(
-        &mut self,
-        code: KeyCode,
-        _mods: KeyModifiers,
-    ) -> PureOutcome {
+    pub(super) fn handle_key_pure(&mut self, code: KeyCode, mods: KeyModifiers) -> PureOutcome {
         use Step::*;
         match (self.step, code) {
             // Confirm
@@ -554,6 +577,15 @@ impl OnboardingWizard {
                     PureOutcome::Noop
                 }
             }
+            // `c` copies the login URL to the clipboard so the user can
+            // paste it into a browser on the same or another machine. Guard
+            // against Ctrl+C (that stays a global cancel, never a copy) and
+            // only offer it when there IS a URL to copy.
+            (QrLogin, KeyCode::Char('c')) | (QrLogin, KeyCode::Char('C'))
+                if !mods.contains(KeyModifiers::CONTROL) && self.qr_login_url.is_some() =>
+            {
+                PureOutcome::CopyQrUrl
+            }
             (QrLogin, KeyCode::Esc) => PureOutcome::Close,
 
             _ => PureOutcome::Noop,
@@ -579,6 +611,9 @@ impl OnboardingWizard {
     ) -> Vec<String> {
         use crate::i18n::{t, Msg};
         let compact = term_rows < 22;
+        let panel_width = calc_panel_width(term_cols);
+        let inner_width = panel_width.saturating_sub(4);
+        let cell_w = inner_width.saturating_sub(2);
 
         // Step header (above box)
         let mut out = Vec::new();
@@ -596,14 +631,24 @@ impl OnboardingWizard {
             // ANSI Shadow style) broke in fonts that draw `█` at
             // 100% cell coverage while keeping `╔═` at line weight,
             // leaving the shadow outline floating disjointly from
-            // the letter bodies. Each row is 49 cells; 12-col
-            // leading pad centres the 49-wide logo inside
-            // draw_panel's 74-col content area (12 + 49 + 13 = 74).
-            content.push("             ███  █████  ███  █     █  ████  ███  ████  █████".to_string());
-            content.push("            █   █   █   █   █ ██   ██ █     █   █ █   █ █    ".to_string());
-            content.push("            █████   █   █   █ █ █ █ █ █     █   █ █   █ ████ ".to_string());
-            content.push("            █   █   █   █   █ █  █  █ █     █   █ █   █ █    ".to_string());
-            content.push("            █   █   █    ███  █     █  ████  ███  ████  █████".to_string());
+            // the letter bodies. Each row is 49 cells; logo_pad
+            // centres the 49-wide logo inside draw_panel's content area.
+            let logo_pad = " ".repeat(cell_w.saturating_sub(49) / 2);
+            content.push(format!(
+                "{logo_pad}███  █████  ███  █     █  ████  ███  ████  █████"
+            ));
+            content.push(format!(
+                "{logo_pad}█   █   █   █   █ ██   ██ █     █   █ █   █ █    "
+            ));
+            content.push(format!(
+                "{logo_pad}█████   █   █   █ █ █ █ █ █     █   █ █   █ ████ "
+            ));
+            content.push(format!(
+                "{logo_pad}█   █   █   █   █ █  █  █ █     █   █ █   █ █    "
+            ));
+            content.push(format!(
+                "{logo_pad}█   █   █    ███  █     █  ████  ███  ████  █████"
+            ));
             content.push(String::new());
             content.push(
                 t(Msg::OnboardingIntroVersionLine {
@@ -636,7 +681,7 @@ impl OnboardingWizard {
             &t(Msg::OnboardingPanelTitle),
             &content,
             "Step 1/3",
-            (term_cols as usize).min(80),
+            panel_width,
             unicode_symbols,
         ));
         ascii_fallback_step(out, unicode_symbols)
@@ -677,7 +722,7 @@ impl OnboardingWizard {
             &t(Msg::OnboardingPanelTitle),
             &content,
             "Step 2/3",
-            (term_cols as usize).min(80),
+            calc_panel_width(term_cols),
             unicode_symbols,
         ));
         ascii_fallback_step(out, unicode_symbols)
@@ -695,6 +740,7 @@ impl OnboardingWizard {
     pub(super) fn apply_language(
         &self,
         config: &mut atomcode_config::config::Config,
+        store: &atomcode_config::ConfigStore,
     ) -> anyhow::Result<atomcode_config::locale::Locale> {
         use atomcode_config::locale::Locale;
         let new_locale = match self.language_idx {
@@ -714,7 +760,10 @@ impl OnboardingWizard {
             _ => unreachable!("language_idx is bounded 0..=2"),
         };
         crate::i18n::set_locale(new_locale);
-        config.save(&atomcode_config::config::Config::default_path())?;
+        store.update(|latest| {
+            latest.language = config.language;
+            Ok(())
+        })?;
         Ok(new_locale)
     }
 
@@ -764,7 +813,7 @@ impl OnboardingWizard {
             &t(Msg::OnboardingPanelTitle),
             &content,
             "Step 3/3",
-            (term_cols as usize).min(80),
+            calc_panel_width(term_cols),
             unicode_symbols,
         ));
         ascii_fallback_step(out, unicode_symbols)
@@ -794,85 +843,104 @@ impl OnboardingWizard {
     /// instruction line below reads "按 Enter 重试" — handled by
     /// `RetryQrLogin` in `handle_key_pure`.
     ///
-    /// ASCII-only terminals (`unicode_symbols == false`): QR is
-    /// omitted entirely; URL is shown as the only login affordance
-    /// so the user can paste it into a browser on a different machine.
-    /// QR glyphs render as `□` tofu on Windows legacy conhost / `LANG=C`
-    /// and a tofu QR is silently unscannable — better to show nothing.
+    /// Terminals without reliable half-block geometry use a font-independent
+    /// background-space renderer when the complete QR fits. Otherwise the URL
+    /// is shown as the login affordance; a clipped or distorted QR is worse
+    /// than no QR because it looks actionable but cannot be scanned.
     pub(super) fn draw_qr_login_lines(
         &self,
         term_cols: u16,
+        term_rows: u16,
         unicode_symbols: bool,
+        colors: bool,
+        reliable_qr_half_blocks: bool,
     ) -> Vec<String> {
-        let panel_width = (term_cols as usize).min(80);
+        let panel_width = calc_panel_width(term_cols);
         let inner_width = panel_width.saturating_sub(4);
         // Cells available for content inside the panel's `│ <2sp> ... <2sp> │`
         // padding. Centring is leading-space prefix; draw_panel adds the
         // trailing pad to inner_width-2.
         let cell_w = inner_width.saturating_sub(2);
         let center = |s: &str| -> String {
-            let w = UnicodeWidthStr::width(s);
+            let plain = strip_sgr(s);
+            let w = UnicodeWidthStr::width(plain.as_str());
             let pad = cell_w.saturating_sub(w) / 2;
             format!("{}{}", " ".repeat(pad), s)
         };
 
+        // Shared "scan to claim the plan" header for every state EXCEPT the
+        // no-QR fallback, which leads with its own link-first header instead.
+        let scan_header = "微信扫码登录,自动领取 CodingPlan 免费额度";
+
         let mut content: Vec<String> = Vec::new();
-        content.push(String::new());
-        content.push(center("微信扫码登录,自动领取 CodingPlan 免费额度"));
-        content.push(String::new());
 
         if let Some(reason) = &self.qr_login_error {
-            // start_login failed at construction. Surface the cause
-            // so the user knows whether to check network, broker, or
-            // their own clock; offer Enter-to-retry below.
+            content.push(center(scan_header));
+            content.push(String::new());
             content.push(center("× 无法生成登录链接"));
-            content.push(String::new());
-            // Error reason may be long; just left-align with indent
-            // rather than centre — easier to scan.
             content.push(format!("    {}", reason));
-            content.push(String::new());
             content.push(center("按 Enter 重试 · Esc 跳过"));
         } else if let Some(url) = &self.qr_login_url {
-            // Render QR block (Unicode mode) or skip it (ASCII).
-            if let Some(qr_rows) = super::qr::render_for_terminal(url, unicode_symbols) {
-                for row in qr_rows {
-                    content.push(center(&row));
+            // Header, borders, copy and action hints consume eight rows. Never
+            // return a partial QR: a clipped finder/quiet zone looks plausible
+            // but is unscannable.
+            let qr_height_budget = (term_rows as usize).saturating_sub(8);
+            let qr_rows = super::qr::render_for_terminal(
+                url,
+                reliable_qr_half_blocks,
+                colors,
+                cell_w as usize,
+                qr_height_budget,
+            );
+            match qr_rows {
+                Some(qr_rows) => {
+                    // Scannable QR available: keep the "扫码" framing.
+                    content.push(center(scan_header));
+                    for row in qr_rows {
+                        content.push(center(&row));
+                    }
+                    content.push(center("或在浏览器打开:"));
+                    content.push(center(url));
+                    content.push(center("扫码完成后自动跳转 · 按 Enter 浏览器打开"));
                 }
-                content.push(String::new());
+                None => {
+                    // Terminal can't render a scannable QR. Drop the "扫码"
+                    // framing entirely (there is no code on screen to scan) and
+                    // lead with the actionable link — opening it in a browser IS
+                    // the login here. We deliberately do NOT promise WeChat-scan
+                    // or auto-continue in the copy: the short link lands on
+                    // atomgit.com's OAuth page (already-signed-in users skip
+                    // straight through without scanning anything), so a hard claim
+                    // would be wrong for a large share of users. The background
+                    // poll (see `event_loop::oauth_poll`) still advances the flow
+                    // silently either way.
+                    content.push(center("领取 CodingPlan 免费额度"));
+                    content.push(String::new());
+                    content.push(center(url));
+                    content.push(center("▶ 按 Enter 打开浏览器  ·  或手动复制上面的链接"));
+                    content.push(String::new());
+                }
             }
-            content.push(center(if unicode_symbols {
-                "或在浏览器打开:"
-            } else {
-                "无法显示二维码 — 请在浏览器打开:"
-            }));
-            content.push(center(url));
-            content.push(center("(按 Enter 自动打开)"));
-            content.push(String::new());
-            // Polling thread auto-closes the modal the moment AtomGit
-            // reports authorisation, so no force-continue Enter is
-            // needed. Enter is wired to a best-effort browser launch
-            // on the URL above (mirrors what /codingplan does); see
-            // handle_key_pure's QrLogin Enter arm for the rationale
-            // and the historical duplicate-QR bug that gates it.
-            content.push(center("扫码完成后自动跳转"));
         } else {
-            // Shouldn't happen — `new_qr_fast_path` always populates
-            // exactly one of url / error. Defensive fallback so a
-            // broken constructor doesn't paint a blank panel.
+            content.push(center(scan_header));
             content.push(center("(状态未初始化)"));
         }
-        content.push(String::new());
-        content.push(center("Esc 跳过 · /login 重试 · /provider 手动配置"));
-        content.push(String::new());
+        // The `c 复制链接` hint only makes sense when there IS a URL to copy;
+        // once copied it becomes a `链接已复制` confirmation. The error /
+        // uninitialised states have nothing to copy, so they keep the bare
+        // legend. Only the prefix varies — the tail is shared so a future edit
+        // to the key list touches one string.
+        let legend_prefix = match (self.qr_login_url.is_some(), self.qr_url_copied) {
+            (true, true) => "链接已复制 · ",
+            (true, false) => "c 复制链接 · ",
+            (false, _) => "",
+        };
+        content.push(center(&format!(
+            "{legend_prefix}Esc 跳过 · /login 重试 · /provider 手动配置"
+        )));
 
         let mut out = Vec::new();
         out.push("扫码登录 · 领取CodingPlan".to_string());
-        out.push(String::new());
-        // Panel title carries the running atomcode version so users
-        // reporting a screenshot tell us the build their bug landed
-        // in without having to /status first. CARGO_PKG_VERSION is
-        // workspace-bound (e.g. "4.23.2") — matches the convention
-        // used by the Step::Intro version line above.
         let panel_title = format!("AtomCode · v{}", env!("CARGO_PKG_VERSION"));
         out.extend(draw_panel(
             &panel_title,
@@ -935,13 +1003,11 @@ impl crate::modals::Modal for OnboardingWizard {
                 Ok(ModalAction::Continue)
             }
             PureOutcome::ApplyLanguageThenAdvance => {
-                if let Err(e) = self.apply_language(&mut ctx.config) {
+                if let Err(e) = self.apply_language(&mut ctx.config, &ctx.config_store) {
                     let msg = crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
                         error: &e.to_string(),
                     });
-                    renderer.render(crate::render::UiLine::CommandOutput(
-                        format!("{}\n", msg),
-                    ));
+                    renderer.render(crate::render::UiLine::CommandOutput(format!("{}\n", msg)));
                 }
                 self.step = Step::Setup;
                 renderer.clear_screen();
@@ -958,8 +1024,21 @@ impl crate::modals::Modal for OnboardingWizard {
                 // panel content is unchanged; the browser launch is
                 // a pure side effect.
                 if let Some(url) = &self.qr_login_url {
-                    let _ = atomcode_core::auth::oauth::open_browser(url);
+                    let _ = atomcode_auth::oauth::open_browser(url);
                 }
+                Ok(ModalAction::Continue)
+            }
+            PureOutcome::CopyQrUrl => {
+                // Copy the login URL to the clipboard (arboard first, OSC 52
+                // fallback for SSH/headless — see the `/copy` path). Only flag
+                // "copied" on success so the legend never lies about a failed
+                // copy; then redraw so the confirmation replaces the `c` hint.
+                if let Some(url) = &self.qr_login_url {
+                    self.qr_url_copied =
+                        crate::event_loop::commands::copy_text_to_clipboard_osc52(url);
+                }
+                renderer.clear_screen();
+                self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
             PureOutcome::RetryQrLogin => {
@@ -969,10 +1048,13 @@ impl crate::modals::Modal for OnboardingWizard {
                 // round-trip, store either url or error, AND on success
                 // spawn a fresh background poll thread so the new
                 // session auto-completes the way the original did.
-                match atomcode_core::auth::oauth::start_login() {
+                match atomcode_auth::oauth::start_login() {
                     Ok(session) => {
                         self.qr_login_url = Some(session.url().to_string());
                         self.qr_login_error = None;
+                        // Fresh URL → the old "copied" confirmation no longer
+                        // applies; restore the `c 复制链接` hint.
+                        self.qr_url_copied = false;
                         // session is consumed by `spawn_oauth_poll`;
                         // `pending_session` stays None because the
                         // task owns it now.
@@ -1039,12 +1121,12 @@ impl crate::modals::Modal for OnboardingWizard {
         renderer: &mut dyn crate::render::Renderer,
     ) {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        // The wizard panel is capped at 80 cols by draw_panel; use that
-        // as the centering anchor so the bordered box stays at the
+        // The wizard panel is capped at MAX_PANEL_WIDTH cols by calc_panel_width;
+        // use that as the centering anchor so the bordered box stays at the
         // canvas middle in wide terminals. Confirm is deliberately
         // left uncentred — it's an inline scrollback message that
         // shares space with the preserved body context.
-        let panel_width = (cols as usize).min(80);
+        let panel_width = calc_panel_width(cols);
         // Mirror of TerminalCaps::unicode_symbols — false on Windows
         // legacy conhost / LANG=C / TERM=dumb. Threaded into the
         // panel + content rendering so those terminals get an ASCII
@@ -1057,10 +1139,36 @@ impl crate::modals::Modal for OnboardingWizard {
                 let msg = crate::i18n::t(crate::i18n::Msg::OnboardingConfirmClear).into_owned();
                 vec![if unicode { msg } else { ascii_fallback(&msg) }]
             }
-            Step::Intro => center_lines(self.draw_intro_lines(cols, rows, unicode), panel_width, cols, rows),
-            Step::Language => center_lines(self.draw_language_lines(cols, unicode), panel_width, cols, rows),
-            Step::Setup => center_lines(self.draw_setup_lines(cols, unicode), panel_width, cols, rows),
-            Step::QrLogin => center_lines(self.draw_qr_login_lines(cols, unicode), panel_width, cols, rows),
+            Step::Intro => center_lines(
+                self.draw_intro_lines(cols, rows, unicode),
+                panel_width,
+                cols,
+                rows,
+            ),
+            Step::Language => center_lines(
+                self.draw_language_lines(cols, unicode),
+                panel_width,
+                cols,
+                rows,
+            ),
+            Step::Setup => center_lines(
+                self.draw_setup_lines(cols, unicode),
+                panel_width,
+                cols,
+                rows,
+            ),
+            Step::QrLogin => center_lines(
+                self.draw_qr_login_lines(
+                    cols,
+                    rows,
+                    unicode,
+                    state.colors,
+                    unicode && !ctx.caps.legacy_conhost,
+                ),
+                panel_width,
+                cols,
+                rows,
+            ),
         };
         for line in lines {
             // No trailing `\n` — the retained renderer's
@@ -1095,6 +1203,26 @@ impl crate::modals::Modal for OnboardingWizard {
     }
 }
 
+/// Strip every SGR escape so we can assert on or measure visible glyphs.
+fn strip_sgr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            while let Some(&n) = chars.peek() {
+                chars.next();
+                if n == 'm' || n.is_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Outcome of `handle_key_pure` — what the Modal-trait wrapper should
 /// do with the world after the pure transition. Splitting this out
 /// keeps state-machine tests free of LoopCtx / renderer mocks.
@@ -1123,6 +1251,10 @@ pub(super) enum PureOutcome {
     /// missing, headless Linux, etc.); the QR + URL remain on screen
     /// as fallbacks, so the modal layout doesn't change.
     OpenQrUrlInBrowser,
+    /// QR step `c` — copy `qr_login_url` to the system clipboard and
+    /// flip `qr_url_copied` so the legend shows a confirmation. No-op
+    /// when there is no URL (error state).
+    CopyQrUrl,
     /// Close modal, no side effect.
     Close,
     /// Ignore the key.
@@ -1396,10 +1528,7 @@ mod tests {
             .join("\n");
         // ASCII logo signature: M's row 3 collapses to alternating
         // `█ █ █ █`, unique to the new pure-block design.
-        assert!(
-            joined.contains("█ █ █ █"),
-            "logo missing: {joined}"
-        );
+        assert!(joined.contains("█ █ █ █"), "logo missing: {joined}");
         assert!(joined.contains("Version "));
         assert!(joined.contains("Multi-step agent loop"));
         assert!(joined.contains("Connects to any OpenAI"));
@@ -1495,7 +1624,7 @@ mod tests {
         let _g = crate::i18n::test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         // ATOMCODE_HOME drives Config::config_dir() ahead of $HOME, so
-        // the test's config.save lands in `<tmp>/config.toml` and not
+        // the test's config transaction lands in `<tmp>/config.toml` and not
         // the real home dir. Saved+restored around the test to keep
         // parallel tests from racing on the global env.
         let prev_atomcode_home = std::env::var("ATOMCODE_HOME").ok();
@@ -1504,7 +1633,9 @@ mod tests {
         let mut cfg = blank_config_for_test();
         let mut w = OnboardingWizard::new();
         w.language_idx = 2;
-        let applied = w.apply_language(&mut cfg).unwrap();
+        let applied = w
+            .apply_language(&mut cfg, &atomcode_config::ConfigStore::default_store())
+            .unwrap();
         assert_eq!(applied, Locale::ZhCn);
         assert_eq!(cfg.language, Some(Locale::ZhCn));
         assert_eq!(crate::i18n::current_locale(), Locale::ZhCn);
@@ -1533,7 +1664,8 @@ mod tests {
         cfg.language = Some(Locale::En); // start with non-None
         let mut w = OnboardingWizard::new();
         w.language_idx = 0;
-        w.apply_language(&mut cfg).unwrap();
+        w.apply_language(&mut cfg, &atomcode_config::ConfigStore::default_store())
+            .unwrap();
         assert_eq!(cfg.language, None);
 
         match prev {
@@ -1749,7 +1881,11 @@ mod tests {
             .map(|r| vt.row_text(r))
             .filter(|r| r.contains("[1]") || r.contains("[2]") || r.contains("[3]"))
             .collect();
-        assert_eq!(rows_with_bracket.len(), 3, "expected 3 option rows, got {rows_with_bracket:?}");
+        assert_eq!(
+            rows_with_bracket.len(),
+            3,
+            "expected 3 option rows, got {rows_with_bracket:?}"
+        );
         // Bullet position (●/○) — all three rows must place it at
         // the same column index. Locate via find().
         let bullet_cols: Vec<Option<usize>> = rows_with_bracket
@@ -1757,7 +1893,9 @@ mod tests {
             .map(|r| r.find('●').or_else(|| r.find('○')))
             .collect();
         assert!(
-            bullet_cols.iter().all(|c| c.is_some() && *c == bullet_cols[0]),
+            bullet_cols
+                .iter()
+                .all(|c| c.is_some() && *c == bullet_cols[0]),
             "bullet column drift across rows: {bullet_cols:?}"
         );
     }
@@ -1810,7 +1948,11 @@ mod tests {
             30,
             false,
         );
-        let joined: String = lines.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
+        let joined: String = lines
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         // Box-drawing glyphs gone, ASCII fallbacks in their place.
         assert!(!joined.contains('┌'), "U+250C leaked: {:?}", joined);
         assert!(!joined.contains('┐'), "U+2510 leaked: {:?}", joined);
@@ -1832,7 +1974,11 @@ mod tests {
     fn draw_panel_ascii_fallback_substitutes_decorative_chars_in_content() {
         let content = vec!["● filled".into(), "○ open · mid · ← back • bullet".into()];
         let lines = draw_panel("X", &content, "Y", 60, false);
-        let joined: String = lines.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
+        let joined: String = lines
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         for bad in ['●', '○', '·', '←', '•'] {
             assert!(
                 !joined.contains(bad),
@@ -1854,7 +2000,11 @@ mod tests {
         let _g = atomcode_config::i18n::test_lock();
         atomcode_config::i18n::set_locale(atomcode_config::i18n::Locale::En);
         let lines = OnboardingWizard::new().draw_setup_lines(80, false);
-        let joined: String = lines.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
+        let joined: String = lines
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         for bad in ['┌', '┐', '└', '┘', '─', '│', '●', '○', '·', '←', '•'] {
             assert!(
                 !joined.contains(bad),
@@ -1884,7 +2034,11 @@ mod tests {
             .map(|l| strip_sgr(l))
             .filter(|l| l.contains('|') || l.contains('+'))
             .collect();
-        assert!(bordered.len() >= 3, "expected top + content + bottom: {:?}", bordered);
+        assert!(
+            bordered.len() >= 3,
+            "expected top + content + bottom: {:?}",
+            bordered
+        );
         let widths: std::collections::HashSet<usize> = bordered
             .iter()
             .map(|l| UnicodeWidthStr::width(l.as_str()))
@@ -1913,6 +2067,7 @@ mod tests {
             qr_login_url: Some(url.to_string()),
             qr_login_error: None,
             pending_session: None,
+            qr_url_copied: false,
         }
     }
 
@@ -1925,6 +2080,7 @@ mod tests {
             qr_login_url: None,
             qr_login_error: Some(msg.to_string()),
             pending_session: None,
+            qr_url_copied: false,
         }
     }
 
@@ -1940,6 +2096,51 @@ mod tests {
         let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
         let outcome = w.handle_key_pure(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(outcome, PureOutcome::OpenQrUrlInBrowser);
+    }
+
+    #[test]
+    fn qr_login_c_copies_url_and_ctrl_c_does_not() {
+        // `c` on the happy path signals a clipboard copy; Ctrl+C must stay a
+        // global cancel (Noop here) and never be swallowed as a copy.
+        let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        assert_eq!(
+            w.handle_key_pure(KeyCode::Char('c'), KeyModifiers::NONE),
+            PureOutcome::CopyQrUrl
+        );
+        assert_eq!(
+            w.handle_key_pure(KeyCode::Char('C'), KeyModifiers::NONE),
+            PureOutcome::CopyQrUrl
+        );
+        assert_eq!(
+            w.handle_key_pure(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            PureOutcome::Noop
+        );
+    }
+
+    #[test]
+    fn qr_login_c_in_error_state_is_noop() {
+        // No URL to copy in the error state — `c` must not offer a copy.
+        let mut w = qr_wizard_with_error("transport: connection refused");
+        assert_eq!(
+            w.handle_key_pure(KeyCode::Char('c'), KeyModifiers::NONE),
+            PureOutcome::Noop
+        );
+    }
+
+    #[test]
+    fn qr_login_legend_shows_copy_hint_then_copied_confirmation() {
+        // Before copy the legend advertises `c 复制链接`; once `qr_url_copied`
+        // is set (the wrapper flips it after a successful clipboard write) the
+        // hint becomes the `链接已复制` confirmation.
+        let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let before = w.draw_qr_login_lines(80, 24, true, true, false).join("\n");
+        assert!(before.contains("c 复制链接"));
+        assert!(!before.contains("链接已复制"));
+
+        w.qr_url_copied = true;
+        let after = w.draw_qr_login_lines(80, 24, true, true, false).join("\n");
+        assert!(after.contains("链接已复制"));
+        assert!(!after.contains("c 复制链接"));
     }
 
     #[test]
@@ -1988,8 +2189,13 @@ mod tests {
         // unintended menu-navigation semantics on this single-page
         // screen.
         let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
-        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Left,
-                     KeyCode::Char('1'), KeyCode::Char('a')] {
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Char('1'),
+            KeyCode::Char('a'),
+        ] {
             assert_eq!(
                 w.handle_key_pure(code, KeyModifiers::NONE),
                 PureOutcome::Noop,
@@ -2002,7 +2208,7 @@ mod tests {
     #[test]
     fn qr_login_draw_with_url_includes_url_in_output() {
         let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
-        let lines = w.draw_qr_login_lines(80, true);
+        let lines = w.draw_qr_login_lines(80, 24, true, true, true);
         let blob = lines.join("\n");
         assert!(
             blob.contains("https://acs.atomgit.com/s/AbC123"),
@@ -2019,7 +2225,7 @@ mod tests {
     #[test]
     fn qr_login_draw_with_error_surfaces_reason() {
         let w = qr_wizard_with_error("transport: timeout after 10s");
-        let lines = w.draw_qr_login_lines(80, true);
+        let lines = w.draw_qr_login_lines(80, 24, true, true, true);
         let blob = lines.join("\n");
         assert!(blob.contains("无法生成登录链接"));
         assert!(blob.contains("transport: timeout after 10s"));
@@ -2034,13 +2240,15 @@ mod tests {
         // and ASCII renderings carry the hint since the action is
         // available in either layout.
         let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
-        let unicode_blob = w.draw_qr_login_lines(80, true).join("\n");
+        let unicode_blob = w.draw_qr_login_lines(80, 24, true, true, true).join("\n");
         assert!(
             unicode_blob.contains("Enter"),
             "Unicode QR step missing Enter-to-open affordance:\n{}",
             unicode_blob
         );
-        let ascii_blob = w.draw_qr_login_lines(80, false).join("\n");
+        let ascii_blob = w
+            .draw_qr_login_lines(80, 24, false, false, false)
+            .join("\n");
         assert!(
             ascii_blob.contains("Enter"),
             "ASCII QR step missing Enter-to-open affordance:\n{}",
@@ -2050,18 +2258,77 @@ mod tests {
 
     #[test]
     fn qr_login_draw_ascii_fallback_drops_qr_keeps_url() {
-        // Half-block glyphs render as tofu on ASCII-only terminals,
+        // Half-block glyphs render as tofu on ASCII-only terminals without color,
         // so the QR is dropped entirely and we tell the user to use
         // the URL instead. URL itself MUST stay — otherwise the
         // screen has nothing actionable.
         let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
-        let lines = w.draw_qr_login_lines(80, false);
+        let lines = w.draw_qr_login_lines(80, 24, false, false, false);
         let blob = lines.join("\n");
         assert!(blob.contains("https://acs.atomgit.com/s/AbC123"));
-        assert!(blob.contains("无法显示二维码"));
+        // Fallback drops the QR and leads with the link + browser action.
+        assert!(blob.contains("手动复制上面的链接"));
+        // The "扫码" framing must NOT survive when there is no code to scan.
+        assert!(!blob.contains("扫码完成后自动跳转"));
         // Half-block glyphs must NOT leak through the ASCII fallback.
         assert!(!blob.contains('▀'));
         assert!(!blob.contains('▄'));
         assert!(!blob.contains('█'));
+        // The action-marker triangle must degrade to ASCII, not tofu.
+        assert!(!blob.contains('▶'));
+    }
+
+    #[test]
+    fn qr_login_win10_sized_color_console_falls_back_instead_of_clipping() {
+        let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let blob = w.draw_qr_login_lines(80, 24, false, true, false).join("\n");
+
+        assert!(blob.contains("手动复制上面的链接"));
+        assert!(blob.contains("https://acs.atomgit.com/s/AbC123"));
+        assert!(!blob.contains('▀'));
+        assert!(!blob.contains('▄'));
+        assert!(!blob.contains('█'));
+    }
+
+    #[test]
+    fn qr_login_legacy_console_ignores_forced_unicode_for_qr_geometry() {
+        let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let blob = w
+            // Unicode remains enabled for the surrounding UI, but legacy
+            // conhost is not allowed onto the compact half-block QR path.
+            .draw_qr_login_lines(80, 24, true, true, false)
+            .join("\n");
+
+        assert!(blob.contains("手动复制上面的链接"));
+        assert!(blob.contains("https://acs.atomgit.com/s/AbC123"));
+        assert!(!blob.contains('▀'));
+        assert!(!blob.contains('▄'));
+        assert!(!blob.contains('█'));
+    }
+
+    #[test]
+    fn panel_line_widths_fit_within_80_col_budget() {
+        // RetainedRenderer prepends PAD_COL (2 spaces) and wraps body lines
+        // at screen_width - 4. On an 80-col terminal, lines passed via
+        // UiLine::CommandOutput must not exceed 76 visible columns so the
+        // right border does not wrap onto a second line.
+        let wizard = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let steps_lines = vec![
+            wizard.draw_intro_lines(80, 24, true),
+            wizard.draw_language_lines(80, true),
+            wizard.draw_setup_lines(80, true),
+            wizard.draw_qr_login_lines(80, 24, true, true, true),
+        ];
+
+        for (idx, raw_lines) in steps_lines.into_iter().enumerate() {
+            let centered = center_lines(raw_lines, calc_panel_width(80), 80, 24);
+            for (line_idx, line) in centered.into_iter().enumerate() {
+                let w = UnicodeWidthStr::width(strip_sgr(&line).as_str());
+                assert!(
+                    w <= 76,
+                    "Step {idx} line {line_idx} width ({w}) exceeds 76-col budget: {line:?}"
+                );
+            }
+        }
     }
 }

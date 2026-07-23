@@ -77,9 +77,11 @@ impl Tool for SearchReplaceTool {
         // never silently inherit a prior [A] press on a safe scope.
         let parsed = match serde_json::from_str::<SearchReplaceArgs>(args) {
             Ok(p) => p,
-            Err(_) => return ApprovalRequirement::RequireApproval(
-                "Cannot parse search_replace args — requiring approval for safety".to_string()
-            ),
+            Err(_) => {
+                return ApprovalRequirement::RequireApproval(
+                    "Cannot parse search_replace args — requiring approval for safety".to_string(),
+                )
+            }
         };
         let scope = parsed.path.as_deref().unwrap_or(".");
         if super::is_sensitive_input_path(scope) {
@@ -206,7 +208,11 @@ impl Tool for SearchReplaceTool {
             ctx.notify_lsp_file_changed(&canon, &new_content).await;
             ctx.file_store.write().await.invalidate(&canon);
             total_replacements += count;
-            files_modified.push(format!("  {} ({} replacements)", file_path.display(), count));
+            files_modified.push(format!(
+                "  {} ({} replacements)",
+                file_path.display(),
+                count
+            ));
         }
 
         if files_modified.is_empty() {

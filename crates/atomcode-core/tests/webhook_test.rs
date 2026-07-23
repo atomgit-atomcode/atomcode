@@ -2,9 +2,8 @@
 
 use std::collections::HashMap;
 
-
+use atomcode_core::hook::webhook::{WebhookConfig, WebhookHook};
 use atomcode_core::hook::Hook;
-use atomcode_core::hook::webhook::{WebhookHook, WebhookConfig};
 
 /// 测试用的 Mock HTTP 服务器（使用 wiremock）
 mod webhook_test {

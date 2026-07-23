@@ -4,10 +4,22 @@ version.workspace = true
 edition = "2021"
 description = "L1 capabilities layered on atomcode-kernel (L0): real provider adapters, tools, mcp, skills. Depends ONLY on the kernel."
 publish = false
+# The `setup` capability's seeds.rs `include_bytes!`s an archive that this build
+# script packs from `assets/setup-seeds/` into OUT_DIR.
+build = "build.rs"
+
+[build-dependencies]
+# Pack the embedded setup seeds (tar.zst) in build.rs. Cargo can't feature-gate
+# [build-dependencies], so these compile for every capabilities build; the packer itself
+# is gated on CARGO_FEATURE_SETUP so a lean (no-setup) build skips the packing work. Light,
+# build-only (never shipped in the binary).
+zstd = "0.13"
+tar = "0.4"
 
 [dependencies]
 # L0 only. NEVER add atomcode-core or any L2/L3 crate here (layering is compile-enforced).
 atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-auth = { path = "../atomcode-auth", optional = true }
 # Leaf config crate (sits below core). The `notify` capability reads NotificationConfig;
 # the config crate is explicitly designed so every stack layer can read config without an
 # atomcode-core dep. Optional + behind the `notify` feature so a provider-only / lean
@@ -25,10 +37,21 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 tokio-util = { version = "0.7", optional = true }
 # `provider` capability deps (HTTP + SSE). Optional so a downstream embedder that
 # only wants other capabilities does not pull in the TLS/HTTP stack.
+# `rustls-tls` (webpki base) — an INFALLIBLE base so `.build()` never hard-fails
+# on certs. OS native roots + SSL_CERT_FILE are layered on TOP, gracefully, in
+# `build_http_client` (`add_trusted_roots`). NOT `rustls-tls-native-roots`:
+# reqwest reads native roots / SSL_CERT_FILE STRICTLY there and fails the build
+# ("zero valid certificates …") on a bad SSL_CERT_FILE or empty store, which
+# cascades into panics at every `.build()` site. This is the DEFAULT v2 provider
+# path; the whole-workspace feature must stay `rustls-tls`. See issue #514.
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false, optional = true }
+# OS native root store loader for corporate MITM-proxy CAs. Best-effort. #514.
+rustls-native-certs = { version = "0.8", optional = true }
 # RFC 7231 HTTP-date parsing for `Retry-After` headers that use the date form (e.g. some
 # Anthropic 429s) instead of delta-seconds. Already in the tree via reqwest. provider-only.
 httpdate = { version = "1", optional = true }
+getrandom = { version = "0.2", optional = true }
+tracing = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
 async-stream = { version = "0.3", optional = true }
 # `tools` capability deps. gitignore-aware file walking (grep/glob), regex (grep),
@@ -79,15 +102,31 @@ uuid = { version = "1", features = ["v4"], optional = true }
 dirs = { version = "6", optional = true }
 toml = { version = "0.8", optional = true }
 # `session` capability deps: chrono for epoch↔ISO + local-time date math (transcript
-# timestamps, current-date injection, recall date filtering). dirs (already optional)
-# resolves $ATOMCODE_HOME/sessions. Matches production's chrono pin.
+# timestamps, current-date injection, recall date filtering). dirs resolves
+# $ATOMCODE_HOME/sessions; fs2 serializes per-session meta read-modify-write.
 chrono = { version = "0.4", optional = true }
+# `setup` also uses fs2 for its install lock; thiserror provides typed setup errors.
+# anyhow/sha2/chrono/serde/serde_json/tempfile are shared with other
+# capabilities (or already non-optional). Optional so a non-setup embedder skips them.
+fs2 = { version = "0.4", optional = true }
+thiserror = { version = "1", optional = true }
+# `setup`'s fs_atomic writes via a same-dir NamedTempFile → persist. Runtime dep for
+# setup (also a dev-dep below for tests). Optional so non-setup builds skip it.
+tempfile = { version = "3", optional = true }
+# `setup` lock.rs reads host name + process start-time for the advisory install lock
+# sentinel (stale-lock detection). Optional so non-setup builds skip it.
+sysinfo = { version = "0.32", default-features = false, features = ["system"], optional = true }
+# `setup` structured log lines reuse the optional `tracing` dependency declared above.
+# `setup` seeds.rs decompresses/unpacks the embedded tar.zst seed archive at first
+# run. Same crates as the build-dependencies packer (separate dep trees). Optional.
+zstd = { version = "0.13", optional = true }
+tar = { version = "0.4", optional = true }
 
 [features]
 default = ["provider", "tools"]
 # Real LlmProvider adapters (OpenAI-compatible: GLM / DeepSeek / …). `dirs` resolves the
 # wire-dump output dir (config_dir()/wire-dump) for the byte-level ATOMCODE_WIRE_DUMP.
-provider = ["dep:reqwest", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate"]
+provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:getrandom", "dep:tracing"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
 tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "tokio/fs", "tokio/process", "tokio/io-util"]
@@ -98,7 +137,7 @@ web = ["tools", "dep:reqwest", "dep:url", "tokio/net"]
 # AtomGit REST tools (atomgit_repo / atomgit_pr / atomgit_issue). Opt-in on top of
 # `tools`; pulls the async HTTP stack (reqwest). NOT in default — an embedder that
 # wants no AtomGit egress skips it.
-atomgit = ["tools", "dep:reqwest"]
+atomgit = ["tools", "dep:reqwest", "dep:atomcode-auth"]
 # Code-intelligence tools (tree-sitter symbol extraction): list_symbols / read_symbol.
 # Opt-in (NOT default) — pulls 12 tree-sitter grammar crates (heavy C compilation).
 codeintel = [
@@ -118,6 +157,10 @@ lsp-e2e = ["lsp"]
 # from the config leaf, so it pulls `atomcode-config`. Opt-in (NOT default) — a provider-only
 # embedder skips config→telemetry. Hosts that surface notifications (TUI/CLI) enable it.
 notify = ["dep:atomcode-config"]
+# One-time project setup/install (scan → seed config → atomic writes, file-locked).
+# Pulls the config leaf (i18n + Config) + the light serde/anyhow/sha2/chrono/thiserror/fs2
+# stack. Opt-in (NOT default) — only CLI/TUI hosts that run `atomcode setup` enable it.
+setup = ["dep:atomcode-config", "dep:anyhow", "dep:sha2", "dep:chrono", "chrono/serde", "dep:fs2", "dep:thiserror", "dep:tempfile", "dep:sysinfo", "dep:tracing", "dep:zstd", "dep:tar"]
 # Skills: markdown/frontmatter skill loader + use_skill / list_skills tools. No new deps.
 skills = []
 # CC-compatible external hooks: run the user's hooks.json commands on the kernel
@@ -132,7 +175,7 @@ e2e = ["provider"]
 # login/refresh flow; transport_http uses the async reqwest client. OAuth's callback
 # listener is std::net (no tokio/net needed).
 mcp = [
-    "dep:anyhow", "dep:sha2", "dep:uuid", "dep:dirs", "dep:toml",
+    "dep:anyhow", "dep:sha2", "dep:uuid", "dep:dirs", "dep:toml", "dep:tempfile",
     "dep:reqwest", "reqwest/blocking", "dep:url",
     "tokio/process", "tokio/io-util",
 ]
@@ -141,7 +184,7 @@ mcp = [
 # coexist) — a per-turn compacted <id>.snapshot for RESUME + an append-only,
 # never-compacted <id>.jsonl transcript for RECALL — plus the SnapshotHook /
 # TranscriptHook / recall tool / current-date hook that drive it. Opt-in (NOT default).
-session = ["dep:dirs", "dep:chrono"]
+session = ["dep:dirs", "dep:chrono", "dep:fs2", "dep:atomcode-config"]
 # User-driven persistent memory: the production memory.md store (global
 # $ATOMCODE_HOME/memory.md + per-project <root>/.atomcode/memory.md, same files so
 # old/new coexist) + a MemoryHook that injects the merged entries at session_start.
@@ -152,6 +195,16 @@ memory = ["dep:dirs"]
 # offline verdict (for offline_mode="auto"). Pulls the config leaf (where the verdict
 # lives). Opt-in — a network embedder that doesn't use offline_mode skips it.
 offline = ["dep:atomcode-config"]
+# The plugin subsystem (loader / installer / marketplace / manifest / trust store),
+# ported from core::plugin as a v2 migration target. Synchronous (shells out to `git`
+# via std::process — no async runtime). Opt-in (NOT default). Enables `skills` so the
+# loader can build a SkillRegistry, plus the auth/config leaves and fs/home helpers.
+plugin = [
+    "dep:anyhow", "dep:sha2", "dep:url", "dep:toml", "dep:dirs", "dep:tempfile",
+    "dep:chrono",
+    "dep:atomcode-auth", "dep:atomcode-config",
+    "skills",
+]
 
 [target.'cfg(unix)'.dependencies]
 # Askpass (the `askpass` module): a Unix-socket server + wrapper script that route
@@ -161,6 +214,14 @@ offline = ["dep:atomcode-config"]
 tokio = { version = "1", features = ["net", "io-util"] }
 libc = "0.2"
 zeroize = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# `is_running_as_admin` (process_utils) calls CheckTokenMembership against the
+# BUILTIN\Administrators SID to detect elevation without depending on `core`.
+# `Win32_System_JobObjects` (+ `Win32_System_Threading` for the IO_COUNTERS that
+# JOBOBJECT_EXTENDED_LIMIT_INFORMATION embeds): the Bash tool assigns each shell
+# child to a kill-on-close Job Object so timeout/cancel reaps the WHOLE process tree.
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "test-util"] }

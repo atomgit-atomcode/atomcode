@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.0</span>
+    <span class="dhdr-ver">v5.0.1</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -135,7 +137,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       <ul>
         <li>plugin 贡献的 skill 出现在 <code>/</code> 菜单,带 <code>&lt;plugin-name&gt;:</code> 前缀。例如 <code>/ascend-model-agent-plugin:ascend-model-verification</code>。</li>
         <li>模型也能通过 <code>UseSkill</code> 工具自动调用这些 skill。</li>
-        <li>Hook 立即激活 —— v4.21.1 起 <code>/plugin install</code> 完成后自动重建 hook executor,不再需要 <code>/cd</code> 或重启。</li>
+        <li>Hook 需信任后才激活 —— 安装时会打印该插件贡献的 hook 告知(但不运行),运行 <code>atomcode plugin trust &lt;name&gt;</code> 授权后,下次 session 启动时生效。详见<a href="#hook-trust">Hook 信任流程</a>。</li>
       </ul>
 
       <h2>目录布局</h2>
@@ -169,7 +171,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
 }</code></pre>
 
       <h2>Hook 事件</h2>
-      <p>plugin 可以挂以下事件(与 CC 一致):</p>
+      <p>plugin 可以挂以下事件(与 CC 一致)。事件名大小写/风格不敏感——loader 同时接受 PascalCase(<code>PreToolUse</code>、<code>SessionStart</code>)和 snake_case(<code>pre_tool_use</code>、<code>session_start</code>),两种拼写等价。</p>
       <table>
         <thead>
           <tr><th>事件</th><th>触发时机</th><th>用途</th></tr>
@@ -183,6 +185,28 @@ atomcode plugin marketplace remove|update|list</code></pre>
           <tr><td><code>Notification</code></td><td>系统通知</td><td>转发外部告警通道</td></tr>
         </tbody>
       </table>
+
+      <h3>默认目录自动发现</h3>
+      <p>plugin 的资产目录无需在 <code>plugin.json</code> 中逐一声明——loader 会按以下规则自动下钻:</p>
+      <ul>
+        <li><strong>Hooks</strong> — 优先读 <code>hooks/hooks.json</code>(CC 布局),其次回退到根目录的 <code>hooks.json</code>。</li>
+        <li><strong>Skills</strong> — 自动扫描 <code>skills/</code> 目录。</li>
+        <li><strong>Commands</strong> — 自动扫描 <code>commands/</code> 目录。</li>
+      </ul>
+      <p>只有当路径不符合默认约定时(如自定义子目录名),才需要在 <code>plugin.json</code> 中显式声明 <code>"skills"</code>/<code>"commands"</code>/<code>"hooks"</code> 字段。</p>
+
+      <h3 id="hook-trust">Hook 信任流程</h3>
+      <p>为防止恶意插件静默执行任意命令,plugin hook 受信任门控保护:</p>
+      <ol>
+        <li><strong>安装时</strong>(<code>/plugin install</code> / <code>atomcode plugin install</code>)——打印 hook 内容告知,<strong>不立即运行</strong> hook。</li>
+        <li><strong>授权信任</strong>——用户确认后运行:
+          <pre><code>atomcode plugin trust &lt;plugin-name&gt;</code></pre>
+          AtomCode 记录当前 hook 命令集的哈希值。</li>
+        <li><strong>下次 session 生效</strong>——受信任的 hook 在下次启动时加载并激活。</li>
+        <li><strong>更新失效</strong>——插件更新后若 hook 命令有变动,哈希自动失效;需重新 <code>trust</code> 才能运行新版本 hook。</li>
+      </ol>
+      <p>撤销信任:</p>
+      <pre><code>atomcode plugin untrust &lt;plugin-name&gt;</code></pre>
 
       <h3>UserPromptSubmit IO 协议</h3>
       <p>Hook 通过 stdin 拿到 JSON,通过 stdout 决定如何处理:</p>

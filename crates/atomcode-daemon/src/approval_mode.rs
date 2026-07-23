@@ -1,10 +1,7 @@
 /// Runtime approval mode shared by `/live`, `/chat`, WebUI, and IDE clients.
-/// Unified onto the shared `atomcode_core::agent::Mode` (wire: build/plan/bypass,
-/// where the old `Bypass` is `Mode::Auto`).
-pub use atomcode_core::agent::Mode as ApprovalMode;
+pub use atomcode_coding::RuntimeMode as ApprovalMode;
 
-// Wire strings come from `ApprovalMode::wire()` (core), which the core
-// `mode_wire_matches_serde` test locks against the serde rename.
+// Wire strings come from the native runtime mode.
 
 #[cfg(test)]
 mod tests {
@@ -14,6 +11,7 @@ mod tests {
     fn approval_mode_wire_strings_are_lowercase() {
         for (mode, wire) in [
             (ApprovalMode::Build, "build"),
+            (ApprovalMode::AcceptEdits, "accept_edits"),
             (ApprovalMode::Plan, "plan"),
             (ApprovalMode::Auto, "bypass"),
         ] {

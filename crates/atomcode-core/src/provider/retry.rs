@@ -141,8 +141,7 @@ async fn classify_429(resp: reqwest::Response) -> (reqwest::Response, bool) {
     let headers = resp.headers().clone();
     match resp.bytes().await {
         Ok(body) => {
-            let non_retryable =
-                super::is_non_retryable_rate_limit(&String::from_utf8_lossy(&body));
+            let non_retryable = super::is_non_retryable_rate_limit(&String::from_utf8_lossy(&body));
             let mut builder = http::Response::builder().status(status);
             if let Some(h) = builder.headers_mut() {
                 *h = headers;
@@ -302,10 +301,15 @@ where
     Err(last_err.expect("send_with_retry_resign: loop terminated without error or response"))
 }
 
-/// Blocking variant for sync code paths (e.g. OAuth token refresh in `create_provider`).
+/// Blocking variant for crate-internal sync code paths.
+///
+/// This helper uses `reqwest::blocking` and `std::thread::sleep` between
+/// attempts. Callers in async contexts must run it through
+/// `tokio::task::spawn_blocking` or a dedicated thread.
+///
 /// Same contract as `send_with_retry`: builder-chain errors are surfaced
 /// as `reqwest::Error` rather than panics.
-pub fn send_with_retry_blocking(
+pub(crate) fn send_with_retry_blocking(
     builder: reqwest::blocking::RequestBuilder,
     policy: &RetryPolicy,
 ) -> Result<reqwest::blocking::Response, reqwest::Error> {
@@ -447,9 +451,15 @@ mod tests {
             ErrorKind::BrokenPipe,
             ErrorKind::UnexpectedEof,
         ] {
-            assert!(chain_has_transient_io(&Wrap(Error::new(kind, "x"))), "{kind:?}");
+            assert!(
+                chain_has_transient_io(&Wrap(Error::new(kind, "x"))),
+                "{kind:?}"
+            );
         }
-        assert!(!chain_has_transient_io(&Wrap(Error::new(ErrorKind::NotFound, "nf"))));
+        assert!(!chain_has_transient_io(&Wrap(Error::new(
+            ErrorKind::NotFound,
+            "nf"
+        ))));
     }
 
     #[test]
@@ -477,8 +487,14 @@ mod tests {
             base_delay: Duration::from_millis(1000),
             max_delay: Duration::from_secs(10),
         };
-        assert_eq!(compute_backoff_jittered(1, &policy, 0.0), Duration::from_millis(750));
-        assert_eq!(compute_backoff_jittered(1, &policy, 0.5), Duration::from_millis(1000));
+        assert_eq!(
+            compute_backoff_jittered(1, &policy, 0.0),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            compute_backoff_jittered(1, &policy, 0.5),
+            Duration::from_millis(1000)
+        );
         let hi = compute_backoff_jittered(1, &policy, 0.999);
         assert!(
             (Duration::from_millis(1240)..Duration::from_millis(1250)).contains(&hi),
@@ -505,7 +521,10 @@ mod tests {
         let d1 = compute_backoff_jittered(1, &p, 0.5);
         let d2 = compute_backoff_jittered(2, &p, 0.5);
         let d3 = compute_backoff_jittered(3, &p, 0.5);
-        assert!(d1 < d2 && d2 < d3, "backoff must grow: {d1:?} {d2:?} {d3:?}");
+        assert!(
+            d1 < d2 && d2 < d3,
+            "backoff must grow: {d1:?} {d2:?} {d3:?}"
+        );
     }
 
     #[test]

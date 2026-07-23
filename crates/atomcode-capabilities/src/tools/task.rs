@@ -3,7 +3,7 @@
 //! 选子工具集。子 agent 跑在独立内核会话里,结果用 <task_result> 包回。
 
 use async_trait::async_trait;
-use atomcode_kernel::agent::{Agent, AutoRespond, Outcome};
+use atomcode_kernel::agent::{Agent, AutoRespond, Outcome, ToolLoopPolicy};
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
@@ -15,6 +15,7 @@ use atomcode_kernel::tool::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_MAX_CONCURRENT: usize = 3;
@@ -30,7 +31,7 @@ pub const SUBAGENT_ACTIVITY_MARKER: char = '\u{1e}';
 /// 900s (15 min) is generous on purpose — this is the TOTAL time for ALL of a subtask's
 /// rounds, and a thorough read-only review on a slow hidden-reasoning model (GLM) can take
 /// many minutes. It only exists to bound a genuinely wedged/looping child. Overridable via
-/// the `ATOMCODE_SUBAGENT_TIMEOUT` env var (see coding/parts.rs `subagent_timeout_from_env`).
+/// the `ATOMCODE_SUBAGENT_TIMEOUT` env var (see coding/parts.rs `subagent_runtime_knobs`).
 const DEFAULT_SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 /// After a timed-out child is cancelled, how long to wait for it to unwind cooperatively
 /// and hand back its partial work before we detach it and report a bare timeout.
@@ -62,6 +63,214 @@ impl ToolMiddleware for DenySensitivePaths {
     }
 }
 
+/// The literal directory prefix of a glob: the leading path segments before the first
+/// segment that contains a glob metacharacter. `src/auth/**` → `src/auth`; `**` → ``;
+/// `Cargo.toml` → `Cargo.toml`. Used to test a `search_replace` DIR root against a scope
+/// (globset's `src/auth/**` does NOT match the bare dir `src/auth`).
+fn recursive_dir_prefix(glob: &str) -> Option<String> {
+    // `**` covers the whole tree.
+    if glob == "**" {
+        return Some(String::new());
+    }
+    // Only a recursive dir glob (`<literal-dir>/**`) confines a search_replace root: the tool
+    // rewrites EVERY file under its root, so the root is "entirely in scope" only when the
+    // scope covers the whole subtree. A non-recursive scope (`*.rs`, `src/*.rs`, `Cargo.toml`,
+    // `src/**/x.rs`, or a bare dir like `src/auth`) matches only specific files, never a whole
+    // directory, so it grants NO search_replace root.
+    let prefix = glob.strip_suffix("/**")?;
+    if prefix.is_empty() || prefix.contains(['*', '?', '[', ']', '{', '}']) {
+        return None;
+    }
+    Some(prefix.to_string())
+}
+
+/// Lexically collapse `.` / `..` WITHOUT touching the filesystem (targets may be new files
+/// that don't exist yet). A `..` at the root is absorbed, so an escape normalizes to a path
+/// that will fail the working-dir `strip_prefix` below → denied.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// 1-based indices of `worker` subtasks that declared no non-empty `scope`. A worker must
+/// declare its writable lane so the dispatch approval shows it and the gate can enforce it.
+fn workers_missing_scope(tasks: &[SubTask]) -> Vec<usize> {
+    tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.subagent_type == "worker" && t.scope.iter().all(|s| s.trim().is_empty()))
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+/// Confines a `worker` subagent's WRITE tools to its declared `scope`. Mirrors
+/// [`DenySensitivePaths`]: a hard deny (the child runs `AutoRespond::AllowAll`, so a prompt
+/// would self-approve). ONLY the write tools are gated — reads are unrestricted (a worker
+/// often reads elsewhere for context) and `bash` retains dispatch-level trust (design §6).
+struct WorkerScopeGate {
+    working_dir: PathBuf,
+    /// Compiled globs for single-file targets (`edit_file` / `write_file` `file_path`).
+    globs: globset::GlobSet,
+    /// Literal directory prefix of each scope, for `search_replace` DIR roots.
+    dir_prefixes: Vec<PathBuf>,
+    /// Human-readable scope list for deny messages.
+    display: String,
+}
+
+impl WorkerScopeGate {
+    fn new(scopes: &[String], working_dir: &Path) -> Self {
+        let mut builder = globset::GlobSetBuilder::new();
+        let mut dir_prefixes = Vec::new();
+        for s in scopes {
+            // Only scopes whose glob compiles participate — in BOTH the file-path globset and
+            // the search_replace dir-prefix list — so a malformed scope can't confine writes
+            // one way and allow them the other.
+            if let Ok(g) = globset::GlobBuilder::new(s).literal_separator(true).build() {
+                builder.add(g);
+                if let Some(dir) = recursive_dir_prefix(s) {
+                    dir_prefixes.push(PathBuf::from(dir));
+                }
+            }
+        }
+        let globs = builder
+            .build()
+            .unwrap_or_else(|_| globset::GlobSet::empty());
+        Self {
+            working_dir: working_dir.to_path_buf(),
+            globs,
+            dir_prefixes,
+            display: scopes.join(", "),
+        }
+    }
+
+    /// `None` = allow; `Some(reason)` = deny. Non-write tools (reads, `bash`, anything else)
+    /// always return `None`.
+    fn violation(&self, tool: &str, args_json: &str) -> Option<String> {
+        match tool {
+            "edit_file" | "write_file" => {
+                let raw = match serde_json::from_str::<serde_json::Value>(args_json)
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| v.get("file_path"))
+                    .and_then(|x| x.as_str())
+                {
+                    Some(p) => p.to_string(),
+                    // Fail closed: a write tool with no usable `file_path` must not slip past
+                    // the gate (defense-in-depth; the tool itself also rejects it).
+                    None => {
+                        return Some(format!(
+                            "worker {tool} call has no usable `file_path`; cannot verify it is within scope."
+                        ))
+                    }
+                };
+                match self.workspace_relative(&raw) {
+                    None => Some(format!(
+                        "worker edit out of scope: {raw} is outside the working directory."
+                    )),
+                    Some(rel) if self.globs.is_match(&rel) => None,
+                    Some(rel) => Some(self.deny_out_of_scope(&rel)),
+                }
+            }
+            "search_replace" => {
+                let value = serde_json::from_str::<serde_json::Value>(args_json)
+                    .unwrap_or(serde_json::Value::Null);
+                match value.get("path").and_then(|x| x.as_str()) {
+                    None => Some(format!(
+                        "worker search_replace has no `path`, which would rewrite the whole tree; \
+                         restrict `path` to within the declared scope [{}].",
+                        self.display
+                    )),
+                    Some(dir) => match self.workspace_relative(dir) {
+                        None => Some(format!(
+                            "worker edit out of scope: {dir} is outside the working directory."
+                        )),
+                        Some(rel_dir) if self.dir_in_scope(&rel_dir) => None,
+                        Some(rel_dir) => Some(self.deny_out_of_scope(&rel_dir)),
+                    },
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn deny_out_of_scope(&self, rel: &str) -> String {
+        format!(
+            "worker edit out of scope: {rel} is not within the declared scope [{}]. To change \
+             it, re-dispatch this worker with a wider scope that includes it.",
+            self.display
+        )
+    }
+
+    /// Resolve `raw` (absolute, or relative to the working dir) to a working-dir-relative,
+    /// `.`/`..`-collapsed path with `/` separators. `None` if it escapes the working dir
+    /// (absolute-outside, or `..` above the root) — such writes are denied.
+    fn workspace_relative(&self, raw: &str) -> Option<String> {
+        let joined = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            self.working_dir.join(raw)
+        };
+        let base = lexical_normalize(&self.working_dir);
+        let full = lexical_normalize(&joined);
+        full.strip_prefix(&base)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// Whether a working-dir-relative DIRECTORY (a `search_replace` root) is within scope: it
+    /// equals or lives under any RECURSIVE scope's dir (see [`recursive_dir_prefix`]). An empty
+    /// prefix (scope `**`) covers the whole tree. Only recursive `<dir>/**` scopes grant a root
+    /// here — a non-recursive scope (`*.rs`, `src/*.rs`, `Cargo.toml`, or a bare dir `src/auth`)
+    /// covers only specific files, so it grants NO search_replace root even though it may still
+    /// match a single-file `edit_file`/`write_file` target. A worker wanting to search_replace a
+    /// whole directory must declare it recursively: `src/auth/**`.
+    fn dir_in_scope(&self, rel_dir: &str) -> bool {
+        let rd = Path::new(rel_dir);
+        self.dir_prefixes
+            .iter()
+            .any(|p| p.as_os_str().is_empty() || rd == p.as_path() || rd.starts_with(p))
+    }
+}
+
+#[async_trait]
+impl ToolMiddleware for WorkerScopeGate {
+    async fn before(
+        &self,
+        call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        _rt: &RequestCtx,
+    ) -> BeforeOutcome {
+        match self.violation(&call.name, &call.arguments) {
+            Some(reason) => BeforeOutcome::deny(reason),
+            None => BeforeOutcome::Proceed,
+        }
+    }
+}
+
+/// The middleware stack for a subagent child: `DenySensitivePaths` for everyone, plus a
+/// `WorkerScopeGate` confining a `worker`'s writes to its `scope`. `explore` children mount
+/// only read tools, so they never need the gate.
+fn child_middlewares(
+    is_worker: bool,
+    scope: &[String],
+    working_dir: &Path,
+) -> Vec<Arc<dyn ToolMiddleware>> {
+    let mut mw: Vec<Arc<dyn ToolMiddleware>> = vec![Arc::new(DenySensitivePaths)];
+    if is_worker {
+        mw.push(Arc::new(WorkerScopeGate::new(scope, working_dir)));
+    }
+    mw
+}
+
 const EXPLORE_PERSONA: &str = "You are a READ-ONLY investigation subagent. Use read/search \
 tools to answer the assigned task about the codebase. You CANNOT edit files. When done, \
 stop with a concise findings report the parent agent can act on.";
@@ -83,6 +292,10 @@ struct SubTask {
     subagent_type: String,
     #[serde(default)]
     difficulty: String,
+    /// Worker-only: working-dir-relative globs the worker may WRITE within. Required for
+    /// `worker`; ignored for `explore` (read-only). Enforced by `WorkerScopeGate`.
+    #[serde(default)]
+    scope: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -97,6 +310,8 @@ pub struct TaskTool {
     make_worker_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     max_concurrent: usize,
     subtask_timeout: std::time::Duration,
+    max_rounds: Option<u32>,
+    tool_loop_policy: Option<ToolLoopPolicy>,
 }
 
 impl TaskTool {
@@ -113,6 +328,8 @@ impl TaskTool {
             make_worker_tools: Box::new(make_worker_tools),
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             subtask_timeout: DEFAULT_SUBTASK_TIMEOUT,
+            max_rounds: Some(super::DEFAULT_CHILD_MAX_ROUNDS),
+            tool_loop_policy: Some(ToolLoopPolicy::default()),
         }
     }
 
@@ -125,6 +342,20 @@ impl TaskTool {
 
     pub fn with_max_concurrent(mut self, n: usize) -> Self {
         self.max_concurrent = n.max(1);
+        self
+    }
+
+    /// Override the per-child model-round high-water mark. `0` disables this cap;
+    /// the exact no-progress policy is configured independently.
+    pub fn with_max_rounds(mut self, n: u32) -> Self {
+        self.max_rounds = (n != 0).then_some(n);
+        self
+    }
+
+    /// Use the embedding product's exact no-progress policy. `None` disables it
+    /// for intentional repeated operations; the independent round/timeout caps remain.
+    pub fn with_tool_loop_policy(mut self, policy: Option<ToolLoopPolicy>) -> Self {
+        self.tool_loop_policy = policy;
         self
     }
 }
@@ -144,7 +375,9 @@ each worker a TIGHTLY-specified task and non-overlapping file scopes when dispat
 several. Subagents run in parallel and cannot themselves dispatch. The WHOLE batch is \
 emitted as ONE JSON payload, so keep each `prompt` concise and dispatch in small batches \
 (a few at a time): many long prompts in one call can overflow the model's output and be \
-rejected as invalid JSON — prefer several smaller calls over one huge one."
+rejected as invalid JSON — prefer several smaller calls over one huge one. Each `worker` \
+MUST declare a `scope` (working-dir-relative globs) listing the files it may write; give \
+parallel workers NON-OVERLAPPING scopes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -159,7 +392,12 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
                             "description": {"type": "string", "description": "3-5 word label"},
                             "prompt": {"type": "string", "description": "The full subtask for the subagent"},
                             "subagent_type": {"type": "string", "enum": ["explore", "worker"]},
-                            "difficulty": {"type": "string", "enum": ["simple", "hard"]}
+                            "difficulty": {"type": "string", "enum": ["simple", "hard"]},
+                            "scope": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Worker-only, REQUIRED for worker: working-directory-relative globs the worker may write within (e.g. [\"src/auth/**\", \"Cargo.toml\"]). The worker can only write files inside this scope; reads are unrestricted. Ignored for explore."
+                            }
                         },
                         "required": ["description", "prompt", "subagent_type"]
                     }
@@ -205,8 +443,29 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
             };
         }
 
+        let missing = workers_missing_scope(&parsed.tasks);
+        if !missing.is_empty() {
+            let idxs = missing
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return ToolResult {
+                call_id: String::new(),
+                content: format!(
+                    "worker subtask {idxs} declared no `scope`. Each worker must declare `scope` \
+                     (working-dir-relative globs, e.g. [\"src/auth/**\"]) — its writable file lane, \
+                     shown at approval time and enforced during the run. Add a scope and retry."
+                ),
+                is_error: true,
+                images: vec![],
+            };
+        }
+
         let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
         let timeout_dur = self.subtask_timeout;
+        let max_rounds = self.max_rounds;
+        let tool_loop_policy = self.tool_loop_policy;
         let mut set = tokio::task::JoinSet::new();
         // Live progress: the whole batch would otherwise be a black box until every subtask
         // finishes. Emit a header + per-subtask start/done so the driver renders them live.
@@ -215,6 +474,7 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
 
         for (idx, t) in parsed.tasks.into_iter().enumerate() {
             let is_worker = t.subagent_type == "worker";
+            let scope = t.scope.clone();
             let is_hard = t.difficulty == "hard";
             // Fresh provider + fresh tools per child (a session consumes its provider).
             let provider = if is_hard {
@@ -230,7 +490,12 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
             } else {
                 (self.make_explore_tools)()
             };
-            let persona = if is_worker { WORKER_PERSONA } else { EXPLORE_PERSONA }.to_string();
+            let persona = if is_worker {
+                WORKER_PERSONA
+            } else {
+                EXPLORE_PERSONA
+            }
+            .to_string();
             let child_cancel = ctx.cancel.child_token();
             // A second handle to fire the child's cancel on timeout (the token given to the
             // builder is moved in; this clone stays so we can stop a timed-out detached child).
@@ -257,16 +522,25 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
                     &model,
                     &desc,
                 ));
-                let child = Agent::builder()
+                let mut builder = Agent::builder()
                     .provider(provider)
                     .tools(tools)
                     .persona(persona)
-                    .working_dir(wd)
-                    .cancel_token(child_cancel)
-                    // The child runs AutoRespond::AllowAll (no human in its loop), so the
-                    // parent's prompting sensitive-path gate wouldn't protect it. Hard-deny
-                    // sensitive-path file ops instead (#1).
-                    .middleware(Arc::new(DenySensitivePaths))
+                    .working_dir(wd.clone())
+                    .cancel_token(child_cancel);
+                if let Some(policy) = tool_loop_policy {
+                    builder = builder.tool_loop_policy(policy);
+                }
+                if let Some(max_rounds) = max_rounds {
+                    builder = builder.max_rounds(max_rounds);
+                }
+                // The child runs AutoRespond::AllowAll (no human in its loop), so the parent's
+                // prompting gates wouldn't protect it. Hard-deny sensitive-path ops for every
+                // child (#1); additionally confine a `worker`'s WRITES to its declared scope.
+                for mw in child_middlewares(is_worker, &scope, &wd) {
+                    builder = builder.middleware(mw);
+                }
+                let child = builder
                     // Funnel the child's live activity (thinking / current tool) up to the
                     // parent progress sink so the TUI spinner shows what this subtask is doing.
                     .hook(Arc::new(SubtaskProgressHook {
@@ -286,8 +560,12 @@ rejected as invalid JSON — prefer several smaller calls over one huge one."
                 let mut handle = tokio::spawn(async move {
                     child.run_to_completion(prompt, AutoRespond::AllowAll).await
                 });
-                let timed_out_msg =
-                    || format!("subagent exceeded the {}s time limit", timeout_dur.as_secs());
+                let timed_out_msg = || {
+                    format!(
+                        "subagent exceeded the {}s time limit",
+                        timeout_dur.as_secs()
+                    )
+                };
                 let outcome = match tokio::time::timeout(timeout_dur, &mut handle).await {
                     Ok(Ok(o)) => o,
                     Ok(Err(join_err)) => Outcome {
@@ -428,7 +706,10 @@ fn summarize_tool_call(call: &ToolCall) -> String {
             KEYS.iter()
                 .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(str::to_string))
         });
-    let short = arg.as_deref().map(|a| first_line_capped(a, 30)).unwrap_or_default();
+    let short = arg
+        .as_deref()
+        .map(|a| first_line_capped(a, 30))
+        .unwrap_or_default();
     if short.is_empty() {
         call.name.clone()
     } else {
@@ -442,7 +723,10 @@ fn summarize_tool_call(call: &ToolCall) -> String {
 fn first_line_capped(s: &str, max: usize) -> String {
     let first = s.lines().next().unwrap_or("").trim();
     if first.chars().count() > max {
-        format!("{}\u{2026}", first.chars().take(max - 1).collect::<String>())
+        format!(
+            "{}\u{2026}",
+            first.chars().take(max - 1).collect::<String>()
+        )
     } else {
         first.to_string()
     }
@@ -470,8 +754,10 @@ impl LifecycleHooks for SubtaskProgressHook {
         }
         // No trailing ellipsis: the TUI spinner appends its own `…`, so emitting one
         // here would double it (`thinking……`).
-        self.progress
-            .emit(format!("{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} thinking", self.label));
+        self.progress.emit(format!(
+            "{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} thinking",
+            self.label
+        ));
     }
 
     async fn on_model_response(&self, response: &mut Message) {
@@ -586,6 +872,7 @@ mod tests {
             working_dir: dir,
             cancel: CancellationToken::new(),
             progress: ProgressSink::noop(),
+            requester: None,
         }
     }
 
@@ -607,6 +894,24 @@ mod tests {
     }
 
     #[test]
+    fn child_round_limit_is_configurable_and_zero_means_unbounded() {
+        assert_eq!(dummy().max_rounds, Some(200));
+        assert_eq!(dummy().with_max_rounds(500).max_rounds, Some(500));
+        assert_eq!(dummy().with_max_rounds(0).max_rounds, None);
+    }
+
+    #[test]
+    fn child_exact_loop_policy_can_be_inherited_or_disabled() {
+        assert_eq!(dummy().tool_loop_policy, Some(ToolLoopPolicy::default()));
+        assert_eq!(dummy().with_tool_loop_policy(None).tool_loop_policy, None);
+        let custom = ToolLoopPolicy::new(10, 12).unwrap();
+        assert_eq!(
+            dummy().with_tool_loop_policy(Some(custom)).tool_loop_policy,
+            Some(custom)
+        );
+    }
+
+    #[test]
     fn finalize_grace_outcome_keeps_success_relabels_others() {
         // Child that finished cleanly in the grace window → kept as-is (beat the cancel).
         let ok = Outcome {
@@ -617,7 +922,10 @@ mod tests {
         let out = finalize_grace_outcome(ok, "time limit".into());
         assert_eq!(out.stop, StopReason::Stopped);
         assert_eq!(out.text, "real result");
-        assert!(out.error.is_none(), "a genuine success must not gain a timeout error");
+        assert!(
+            out.error.is_none(),
+            "a genuine success must not gain a timeout error"
+        );
 
         // Child that observed the cancel → relabeled Timeout with our message, partial kept.
         let cancelled = Outcome {
@@ -660,7 +968,10 @@ mod tests {
         assert!(long.starts_with("bash "), "{long}");
         assert!(long.ends_with('\u{2026}'), "{long}");
         // No recognised key / bad JSON → just the tool name.
-        assert_eq!(summarize_tool_call(&mk("todowrite", r#"{"todos":[]}"#)), "todowrite");
+        assert_eq!(
+            summarize_tool_call(&mk("todowrite", r#"{"todos":[]}"#)),
+            "todowrite"
+        );
         assert_eq!(summarize_tool_call(&mk("weird", "not json")), "weird");
     }
 
@@ -702,9 +1013,17 @@ mod tests {
         {
             let c = captured.lock().unwrap();
             assert_eq!(c.len(), 2, "expected thinking + tool lines: {c:?}");
-            assert!(c[0].starts_with(SUBAGENT_ACTIVITY_MARKER), "marker-prefixed: {:?}", c[0]);
+            assert!(
+                c[0].starts_with(SUBAGENT_ACTIVITY_MARKER),
+                "marker-prefixed: {:?}",
+                c[0]
+            );
             // The spinner appends its OWN ellipsis — the thinking line must carry none.
-            assert!(!c[0].contains('\u{2026}'), "no ellipsis on thinking line: {:?}", c[0]);
+            assert!(
+                !c[0].contains('\u{2026}'),
+                "no ellipsis on thinking line: {:?}",
+                c[0]
+            );
             assert!(c[0].ends_with("thinking"), "thinking line: {:?}", c[0]);
             assert!(c[1].contains("read_file a.rs"), "tool line: {:?}", c[1]);
         }
@@ -713,7 +1032,11 @@ mod tests {
         cancel.cancel();
         hook.pre_request(&mut Vec::new(), &ctx).await;
         hook.on_model_response(&mut msg).await;
-        assert_eq!(captured.lock().unwrap().len(), 2, "cancelled hook must stay silent");
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            2,
+            "cancelled hook must stay silent"
+        );
     }
 
     #[test]
@@ -727,8 +1050,14 @@ mod tests {
         let long = "audit every unwrap() call across the whole crate for panic safety and report\nsecond line";
         let line = subtask_progress_line("\u{2713} done \u{b7} worker#2", "GLM-5.2", long);
         assert!(line.starts_with("\u{2713} done \u{b7} worker#2 \u{b7} GLM-5.2 \u{b7} "));
-        assert!(line.ends_with('\u{2026}'), "long desc must be ellipsized: {line}");
-        assert!(!line.contains("second line"), "only first line should show: {line}");
+        assert!(
+            line.ends_with('\u{2026}'),
+            "long desc must be ellipsized: {line}"
+        );
+        assert!(
+            !line.contains("second line"),
+            "only first line should show: {line}"
+        );
         // Empty description → no trailing separator after the model.
         assert_eq!(
             subtask_progress_line("\u{21bb} explore#1", "deepseek", "  "),
@@ -751,17 +1080,37 @@ mod tests {
         let r1 = reg.clone();
         let r2 = reg.clone();
         let tool = TaskTool::new(
-            || Arc::new(MockProvider { reply: Some("FOUND: the answer is 42".into()) }) as Arc<dyn LlmProvider>,
-            || Arc::new(MockProvider { reply: Some("FOUND: the answer is 42".into()) }) as Arc<dyn LlmProvider>,
+            || {
+                Arc::new(MockProvider {
+                    reply: Some("FOUND: the answer is 42".into()),
+                }) as Arc<dyn LlmProvider>
+            },
+            || {
+                Arc::new(MockProvider {
+                    reply: Some("FOUND: the answer is 42".into()),
+                }) as Arc<dyn LlmProvider>
+            },
             move || r1.mount(&[]),
             move || r2.mount(&[]),
         );
         let args = r#"{"tasks":[{"description":"find","prompt":"where is X","subagent_type":"explore","difficulty":"simple"}]}"#;
         let out = tool.execute(args, &ctx()).await;
         assert!(!out.is_error, "unexpected error: {}", out.content);
-        assert!(out.content.contains("<task_result>"), "missing tag: {}", out.content);
-        assert!(out.content.contains("FOUND: the answer is 42"), "missing reply: {}", out.content);
-        assert!(out.content.contains("state=\"completed\""), "missing state: {}", out.content);
+        assert!(
+            out.content.contains("<task_result>"),
+            "missing tag: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("FOUND: the answer is 42"),
+            "missing reply: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("state=\"completed\""),
+            "missing state: {}",
+            out.content
+        );
     }
 
     #[tokio::test]
@@ -778,7 +1127,11 @@ mod tests {
         let args = r#"{"tasks":[{"description":"x","prompt":"p","subagent_type":"explore"}]}"#;
         let out = tool.execute(args, &ctx()).await;
         assert!(out.is_error, "expected error result, got: {}", out.content);
-        assert!(out.content.contains("<task_error>"), "missing tag: {}", out.content);
+        assert!(
+            out.content.contains("<task_error>"),
+            "missing tag: {}",
+            out.content
+        );
     }
 
     /// A child whose stream never yields must be capped by the per-subtask
@@ -813,9 +1166,12 @@ mod tests {
         .with_subtask_timeout(std::time::Duration::from_millis(150));
         let args = r#"{"tasks":[{"description":"x","prompt":"p","subagent_type":"explore"}]}"#;
         // Outer guard: if the per-subtask timeout is broken, this rejects instead of hanging CI.
-        let out = tokio::time::timeout(std::time::Duration::from_secs(5), tool.execute(args, &ctx()))
-            .await
-            .expect("execute must return via the per-subtask timeout, not hang");
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tool.execute(args, &ctx()),
+        )
+        .await
+        .expect("execute must return via the per-subtask timeout, not hang");
         assert!(out.is_error, "expected timeout error, got: {}", out.content);
         assert!(
             out.content.contains("time limit"),
@@ -842,8 +1198,9 @@ mod tests {
             ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
                 // Emit some text, then hang (no Done) → the child accumulates the text,
                 // then waits forever until its cancel fires on timeout.
-                let evs = stream::once(async { StreamEvent::TextDelta("PARTIAL-EDIT-DONE".into()) })
-                    .chain(stream::pending());
+                let evs =
+                    stream::once(async { StreamEvent::TextDelta("PARTIAL-EDIT-DONE".into()) })
+                        .chain(stream::pending());
                 Ok(evs.boxed())
             }
         }
@@ -858,11 +1215,18 @@ mod tests {
         )
         .with_subtask_timeout(std::time::Duration::from_millis(150));
         let args = r#"{"tasks":[{"description":"x","prompt":"p","subagent_type":"explore"}]}"#;
-        let out = tokio::time::timeout(std::time::Duration::from_secs(10), tool.execute(args, &ctx()))
-            .await
-            .expect("execute must return via the per-subtask timeout, not hang");
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tool.execute(args, &ctx()),
+        )
+        .await
+        .expect("execute must return via the per-subtask timeout, not hang");
         assert!(out.is_error, "expected timeout error, got: {}", out.content);
-        assert!(out.content.contains("time limit"), "missing time limit: {}", out.content);
+        assert!(
+            out.content.contains("time limit"),
+            "missing time limit: {}",
+            out.content
+        );
         assert!(
             out.content.contains("PARTIAL-EDIT-DONE"),
             "partial output must survive the timeout: {}",
@@ -880,7 +1244,11 @@ mod tests {
             let calls = calls.clone();
             move || {
                 let n = calls.fetch_add(1, Ordering::SeqCst);
-                let reply = if n == 0 { Some("did it".to_string()) } else { None };
+                let reply = if n == 0 {
+                    Some("did it".to_string())
+                } else {
+                    None
+                };
                 Arc::new(MockProvider { reply }) as Arc<dyn LlmProvider>
             }
         };
@@ -890,9 +1258,21 @@ mod tests {
         let tool = TaskTool::new(mk.clone(), mk, move || r1.mount(&[]), move || r2.mount(&[]));
         let args = r#"{"tasks":[{"description":"a","prompt":"p","subagent_type":"explore"},{"description":"b","prompt":"q","subagent_type":"explore"}]}"#;
         let out = tool.execute(args, &ctx()).await;
-        assert!(!out.is_error, "partial failure must not be overall error: {}", out.content);
-        assert!(out.content.contains("<task_result>"), "missing success block: {}", out.content);
-        assert!(out.content.contains("<task_error>"), "missing failure block: {}", out.content);
+        assert!(
+            !out.is_error,
+            "partial failure must not be overall error: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("<task_result>"),
+            "missing success block: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("<task_error>"),
+            "missing failure block: {}",
+            out.content
+        );
     }
 
     #[tokio::test]
@@ -901,15 +1281,27 @@ mod tests {
         let r1 = reg.clone();
         let r2 = reg.clone();
         let tool = TaskTool::new(
-            || Arc::new(MockProvider { reply: Some("done".into()) }) as Arc<dyn LlmProvider>,
-            || Arc::new(MockProvider { reply: Some("done".into()) }) as Arc<dyn LlmProvider>,
+            || {
+                Arc::new(MockProvider {
+                    reply: Some("done".into()),
+                }) as Arc<dyn LlmProvider>
+            },
+            || {
+                Arc::new(MockProvider {
+                    reply: Some("done".into()),
+                }) as Arc<dyn LlmProvider>
+            },
             move || r1.mount(&[]),
             move || r2.mount(&[]),
         );
         let args = r#"{"tasks":[{"description":"d","prompt":"p","subagent_type":"explore"}]}"#;
         let out = tool.execute(args, &ctx()).await;
         // The block surfaces the actual model the subagent ran on (MockProvider::model_name).
-        assert!(out.content.contains("model=\"mock\""), "missing model attr: {}", out.content);
+        assert!(
+            out.content.contains("model=\"mock\""),
+            "missing model attr: {}",
+            out.content
+        );
     }
 
     #[tokio::test]
@@ -918,8 +1310,16 @@ mod tests {
         let r1 = reg.clone();
         let r2 = reg.clone();
         let tool = TaskTool::new(
-            || Arc::new(MockProvider { reply: Some("ok".into()) }) as Arc<dyn LlmProvider>,
-            || Arc::new(MockProvider { reply: Some("ok".into()) }) as Arc<dyn LlmProvider>,
+            || {
+                Arc::new(MockProvider {
+                    reply: Some("ok".into()),
+                }) as Arc<dyn LlmProvider>
+            },
+            || {
+                Arc::new(MockProvider {
+                    reply: Some("ok".into()),
+                }) as Arc<dyn LlmProvider>
+            },
             move || r1.mount(&[]),
             move || r2.mount(&[]),
         );
@@ -936,7 +1336,11 @@ mod tests {
             "repair should have recovered the args, got: {}",
             out.content
         );
-        assert!(out.content.contains("<task_result>"), "expected a result: {}", out.content);
+        assert!(
+            out.content.contains("<task_result>"),
+            "expected a result: {}",
+            out.content
+        );
     }
 
     #[test]
@@ -949,5 +1353,176 @@ mod tests {
             "test premise: raw control char must be invalid JSON"
         );
         assert!(matches!(dummy().risk(worker), RiskLevel::Risky));
+    }
+
+    #[test]
+    fn recursive_dir_prefix_only_grants_roots_for_recursive_scopes() {
+        use super::recursive_dir_prefix as p;
+        // Recursive dir globs grant a search_replace root at their literal dir.
+        assert_eq!(p("src/auth/**"), Some("src/auth".into()));
+        assert_eq!(p("**"), Some(String::new())); // whole tree
+                                                  // Non-recursive scopes cover only specific files → NO search_replace root.
+        assert_eq!(p("src/**/x.rs"), None); // matches only x.rs files, not whole dirs
+        assert_eq!(p("src/*.rs"), None);
+        assert_eq!(p("*.rs"), None);
+        assert_eq!(p("Cargo.toml"), None);
+        assert_eq!(p("src/auth"), None); // bare dir matches only itself, not its contents
+        assert_eq!(p("src/*/**"), None); // non-literal prefix before /** → not granted
+    }
+
+    #[test]
+    fn worker_scope_gate_confines_writes_but_not_reads() {
+        use super::WorkerScopeGate;
+        use std::path::Path;
+        let g = WorkerScopeGate::new(
+            &["src/auth/**".into(), "Cargo.toml".into()],
+            Path::new("/w"),
+        );
+
+        // in-scope write → allowed
+        assert!(g
+            .violation("edit_file", r#"{"file_path":"src/auth/login.rs"}"#)
+            .is_none());
+        // in-scope NEW file (need not exist) → allowed
+        assert!(g
+            .violation("write_file", r#"{"file_path":"src/auth/new_mod.rs"}"#)
+            .is_none());
+        // exact-file scope → allowed
+        assert!(g
+            .violation("write_file", r#"{"file_path":"Cargo.toml"}"#)
+            .is_none());
+        // out-of-scope write → denied, message names the path + scope
+        let deny = g
+            .violation("edit_file", r#"{"file_path":"src/db/schema.rs"}"#)
+            .expect("out-of-scope write denied");
+        assert!(deny.contains("src/db/schema.rs"), "{deny}");
+        assert!(deny.contains("src/auth/**"), "{deny}");
+        // READS are never gated, even outside scope
+        assert!(g
+            .violation("read_file", r#"{"file_path":"src/db/schema.rs"}"#)
+            .is_none());
+        assert!(g
+            .violation("grep", r#"{"pattern":"x","path":"src/db"}"#)
+            .is_none());
+        // bash is never gated (dispatch-trust; design §6)
+        assert!(g
+            .violation("bash", r#"{"command":"rm -rf src/db"}"#)
+            .is_none());
+        // write with no usable file_path fails CLOSED (denied), not allowed through
+        assert!(g.violation("write_file", r#"{"content":"x"}"#).is_some());
+        assert!(g.violation("edit_file", r#"{"file_path":null}"#).is_some());
+    }
+
+    #[test]
+    fn worker_scope_gate_denies_workspace_escape_and_absolute_outside() {
+        use super::WorkerScopeGate;
+        use std::path::Path;
+        let g = WorkerScopeGate::new(&["**".into()], Path::new("/w"));
+        // `**` allows anything INSIDE the workspace
+        assert!(g
+            .violation("write_file", r#"{"file_path":"anything/here.rs"}"#)
+            .is_none());
+        // ...but a `..` escape is denied even under `**`
+        assert!(g
+            .violation("write_file", r#"{"file_path":"../outside.rs"}"#)
+            .is_some());
+        // ...and an absolute path outside the working dir is denied
+        assert!(g
+            .violation("write_file", r#"{"file_path":"/etc/passwd"}"#)
+            .is_some());
+        // an absolute path INSIDE the working dir is normalized + allowed
+        assert!(g
+            .violation("write_file", r#"{"file_path":"/w/in.rs"}"#)
+            .is_none());
+    }
+
+    #[test]
+    fn worker_scope_gate_confines_search_replace_root() {
+        use super::WorkerScopeGate;
+        use std::path::Path;
+        let g = WorkerScopeGate::new(&["src/auth/**".into()], Path::new("/w"));
+        // root inside scope dir → allowed
+        assert!(g
+            .violation("search_replace", r#"{"path":"src/auth"}"#)
+            .is_none());
+        assert!(g
+            .violation("search_replace", r#"{"path":"src/auth/sub"}"#)
+            .is_none());
+        // root outside scope → denied
+        assert!(g
+            .violation("search_replace", r#"{"path":"src/db"}"#)
+            .is_some());
+        // NO path (whole-tree rewrite) → denied
+        let deny = g
+            .violation("search_replace", r#"{"pattern":"x","replacement":"y"}"#)
+            .expect("whole-tree search_replace denied");
+        assert!(
+            deny.contains("whole tree") || deny.contains("path"),
+            "{deny}"
+        );
+        // root escaping the workspace → denied
+        assert!(g
+            .violation("search_replace", r#"{"path":"../outside"}"#)
+            .is_some());
+
+        // Regression: a NON-recursive glob scope must NOT grant a wide search_replace root.
+        // `["*.rs"]` (root-level .rs files) must not let search_replace rewrite the whole tree,
+        // and `["src/*.rs"]` must not let it rewrite all of src/.
+        let g_root = WorkerScopeGate::new(&["*.rs".into()], Path::new("/w"));
+        assert!(
+            g_root
+                .violation("search_replace", r#"{"path":"src/db"}"#)
+                .is_some(),
+            "*.rs scope must not grant a search_replace root under src/"
+        );
+        assert!(
+            g_root
+                .violation("search_replace", r#"{"path":"."}"#)
+                .is_some(),
+            "*.rs scope must not grant a whole-tree search_replace root"
+        );
+        let g_srcrs = WorkerScopeGate::new(&["src/*.rs".into()], Path::new("/w"));
+        assert!(
+            g_srcrs
+                .violation("search_replace", r#"{"path":"src/db"}"#)
+                .is_some(),
+            "src/*.rs scope must not grant a search_replace root over src/db"
+        );
+        // ...but a single-file write still matches the file glob (unchanged).
+        assert!(g_srcrs
+            .violation("edit_file", r#"{"file_path":"src/main.rs"}"#)
+            .is_none());
+    }
+
+    #[test]
+    fn workers_missing_scope_flags_scopeless_workers_only() {
+        use super::{workers_missing_scope, SubTask};
+        let mk = |ty: &str, scope: Vec<&str>| SubTask {
+            description: "d".into(),
+            prompt: "p".into(),
+            subagent_type: ty.into(),
+            difficulty: String::new(),
+            scope: scope.into_iter().map(String::from).collect(),
+        };
+        let tasks = vec![
+            mk("worker", vec!["src/a/**"]), // #1 ok
+            mk("explore", vec![]),          // #2 explore — ignored even with no scope
+            mk("worker", vec![]),           // #3 missing → flagged
+            mk("worker", vec!["   "]),      // #4 whitespace-only → flagged
+        ];
+        assert_eq!(workers_missing_scope(&tasks), vec![3, 4]);
+    }
+
+    #[test]
+    fn child_middlewares_add_the_scope_gate_only_for_workers() {
+        use super::child_middlewares;
+        use std::path::Path;
+        // explore: only DenySensitivePaths.
+        assert_eq!(child_middlewares(false, &[], Path::new("/w")).len(), 1);
+        // worker: DenySensitivePaths + WorkerScopeGate.
+        assert_eq!(
+            child_middlewares(true, &["src/**".into()], Path::new("/w")).len(),
+            2
+        );
     }
 }

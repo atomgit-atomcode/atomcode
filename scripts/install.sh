@@ -15,18 +15,23 @@
 set -eu
 
 # Fallback version used only when ATOMCODE_VERSION is unset and the API lookup fails.
-DEFAULT_VERSION="v5.0.0"
+DEFAULT_VERSION="v5.0.1"
 REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 REPO_LATEST_API="https://api.atomgit.com/api/v5/repos/atomgit_atomcode/atomcode/releases/latest"
 
 # --- detect platform ---
 uname_s=$(uname -s)
 uname_m=$(uname -m)
+ext=""  # binary filename suffix; ".exe" on Windows shells (set below)
 
 case "$uname_s" in
     Darwin) os="darwin" ;;
     Linux)  os="linux"  ;;
     HarmonyOS) os="ohos" ;;
+    # MSYS2 / MinGW / Git-Bash / Cygwin: a Unix shell running ON Windows. `uname -s` looks
+    # like MSYS_NT-10.0-26100 / MINGW64_NT-... / CYGWIN_NT-.... Install the native Windows
+    # `.exe` into this shell's environment (windows-specific PREFIX + suffix handled below).
+    MSYS*|MINGW*|CYGWIN*) os="windows"; ext=".exe" ;;
     *) echo "Unsupported OS: $uname_s (Windows users: download the zip from the release page)"; exit 1 ;;
 esac
 
@@ -39,7 +44,9 @@ esac
 # --- pick install dir ---
 if [ -n "${ATOMCODE_PREFIX:-}" ]; then
     PREFIX="$ATOMCODE_PREFIX"
-elif [ "$os" = "ohos" ]; then
+elif [ "$os" = "ohos" ] || [ "$os" = "windows" ]; then
+    # Windows shells (MSYS/Git-Bash/Cygwin) have no sudo and a system /usr/local/bin under
+    # the MSYS root; install into the user's home instead (always writable, no elevation).
     PREFIX="$HOME/.local/bin"
 elif [ -w /usr/local/bin ] 2>/dev/null; then
     PREFIX="/usr/local/bin"
@@ -96,7 +103,7 @@ fi
 # --- download ---
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-DEST="$TMP/atomcode"
+DEST="$TMP/atomcode${ext}"
 
 # Pick download tool: $_fetch streams a URL to stdout (for the API lookup),
 # $_down saves a URL to a file (for the binary).
@@ -122,7 +129,7 @@ else
     [ -n "$VERSION" ] || VERSION="$DEFAULT_VERSION"
 fi
 
-BIN_NAME="atomcode-${VERSION}-${os}-${arch}"
+BIN_NAME="atomcode-${VERSION}-${os}-${arch}${ext}"
 URL="${REPO_BASE}/${VERSION}/${BIN_NAME}"
 
 echo "==> Downloading $BIN_NAME"
@@ -140,8 +147,18 @@ fi
 chmod +x "$DEST"
 
 # --- install ---
-TARGET="$PREFIX/atomcode"
-if [ -e "$TARGET" ] && [ ! -w "$TARGET" ]; then
+TARGET="$PREFIX/atomcode${ext}"
+if [ "$os" = "windows" ]; then
+    # No sudo on MSYS/Git-Bash, and PREFIX is the user's own dir. A running atomcode.exe locks
+    # the file on NTFS, so `mv` can fail with a lock error — surface a clear hint instead of a
+    # raw `set -e` abort (mirrors install.ps1's "close any running atomcode.exe" guidance).
+    echo "==> Installing to $TARGET"
+    if ! mv "$DEST" "$TARGET"; then
+        echo "Error: could not write $TARGET." >&2
+        echo "       If atomcode is already running, close it and re-run this installer." >&2
+        exit 1
+    fi
+elif [ -e "$TARGET" ] && [ ! -w "$TARGET" ]; then
     echo "==> Installing to $TARGET (sudo required)"
     sudo mv "$DEST" "$TARGET"
 elif [ ! -w "$PREFIX" ]; then
@@ -156,6 +173,13 @@ fi
 echo ""
 echo "Installed: $TARGET"
 "$TARGET" --version 2>/dev/null || true
+
+if [ "$os" = "windows" ]; then
+    echo ""
+    echo "Note: installed for this Unix shell (MSYS/MinGW/Git-Bash/Cygwin)."
+    echo "      For a system-wide Windows install (cmd / PowerShell PATH), use instead:"
+    echo "      powershell -c \"irm https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/install.ps1 | iex\""
+fi
 
 case ":$PATH:" in
     *":$PREFIX:"*) ;;

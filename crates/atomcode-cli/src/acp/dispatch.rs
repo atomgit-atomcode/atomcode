@@ -12,14 +12,36 @@ use agent_client_protocol::schema::v1::{
     SessionNotification,
 };
 use agent_client_protocol::{Client, ConnectionTo, Responder};
-use atomcode_kernel::agent::AgentHandle;
-use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
+use atomcode_coding::{
+    CodingProviderFactory, CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents,
+    CodingRuntimeHandle, TurnCompletion, UserInput,
+};
+use atomcode_kernel::event::{AgentEvent, StopReason};
 use atomcode_kernel::message::ImageContent;
-use atomcode_kernel::provider::LlmProvider;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
 
 use crate::acp::engine::EngineConfig;
+
+fn prompt_terminal(
+    stop: StopReason,
+    last_error: Option<String>,
+) -> Result<agent_client_protocol::schema::v1::StopReason, String> {
+    crate::acp::translate::stop_reason(stop)
+        .map_err(|fallback| last_error.unwrap_or_else(|| fallback.to_string()))
+}
+
+fn prompt_completion_terminal(
+    completion: &TurnCompletion,
+    last_error: Option<String>,
+) -> Result<agent_client_protocol::schema::v1::StopReason, String> {
+    match completion {
+        TurnCompletion::Completed { reason, .. } => prompt_terminal(*reason, last_error),
+        TurnCompletion::SnapshotUnavailable { reason, error, .. } => Err(format!(
+            "{} (turn completion: SnapshotUnavailable, reason: {reason:?})",
+            error.message
+        )),
+    }
+}
 
 // ── Session table ─────────────────────────────────────────────────────────────
 
@@ -35,14 +57,9 @@ use crate::acp::engine::EngineConfig;
 /// lock only this session's receiver for the turn's duration. One prompt runs
 /// per session at a time, so that lock is uncontended in practice.
 pub struct SessionState {
-    /// Clonable command sender — the turn loop forwards the prompt, and
-    /// `session/cancel` (Task 9) sends [`AgentCommand::Cancel`] concurrently.
-    pub commands: UnboundedSender<AgentCommand>,
-    /// The kernel event stream, locked by the in-flight turn.
-    pub events: Arc<Mutex<UnboundedReceiver<AgentEvent>>>,
-    /// Kernel agent task. Dropping this `JoinHandle` detaches the task (it is NOT
-    /// aborted); the kernel agent is shut down by dropping its `commands` sender.
-    pub _task: tokio::task::JoinHandle<()>,
+    pub runtime: CodingRuntimeHandle,
+    pub events: Arc<Mutex<CodingRuntimeEvents>>,
+    pub _task: tokio::task::JoinHandle<atomcode_coding::RuntimeExit>,
 }
 
 /// Live ACP sessions, keyed by session id.
@@ -71,33 +88,30 @@ pub fn new_session_id(n: u64) -> SessionId {
 /// Spawns a kernel session, inserts it into the shared table, and returns the
 /// fresh [`SessionId`] to the client.
 ///
-/// `provider` — when `Some`, the pre-built (authenticated) provider is used
-/// directly; when `None`, [`crate::acp::engine::build_provider`] constructs a
-/// fallback from the engine config (valid for non-gateway endpoints only).
+/// `provider_factory` creates a distinct provider for the session. When absent,
+/// the native default factory is used.
 pub async fn handle_new_session(
     engine: &EngineConfig,
-    provider: Option<Arc<dyn LlmProvider>>,
+    provider_factory: Option<Arc<dyn CodingProviderFactory>>,
     sessions: &Sessions,
     counter: &std::sync::atomic::AtomicU64,
     req: NewSessionRequest,
 ) -> Result<NewSessionResponse, agent_client_protocol::Error> {
     let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let id = new_session_id(n);
-    // provider is the CLI-built, authenticated provider (Task 10); cloned per
-    // session (Arc clone is cheap). engine::spawn_session falls back to its own
-    // build_provider only when None (non-gateway test/dev paths).
-    let handle = crate::acp::engine::spawn_session(engine, req.cwd.clone(), provider)
+    let runtime = crate::acp::engine::spawn_session(engine, req.cwd.clone(), provider_factory)
         .await
         .map_err(|e| agent_client_protocol::util::internal_error(format!("{e}")))?;
-    let AgentHandle {
-        commands,
+    let CodingRuntime {
+        handle,
         events,
         task,
-    } = handle;
+        ..
+    } = runtime;
     sessions.lock().await.insert(
         id.0.to_string(),
         SessionState {
-            commands,
+            runtime: handle,
             events: Arc::new(Mutex::new(events)),
             _task: task,
         },
@@ -157,10 +171,10 @@ pub async fn run_prompt_turn(
 ) -> Result<(), agent_client_protocol::Error> {
     // Take what the turn needs (clonable command sender + the events mutex Arc),
     // then release the map lock so it is never held across the turn.
-    let (cmd_tx, events) = {
+    let (runtime, events) = {
         let map = sessions.lock().await;
         match map.get(sid.0.as_ref()) {
-            Some(st) => (st.commands.clone(), Arc::clone(&st.events)),
+            Some(st) => (st.runtime.clone(), Arc::clone(&st.events)),
             None => return responder.respond_with_internal_error("acp: unknown session"),
         }
     };
@@ -170,10 +184,7 @@ pub async fn run_prompt_turn(
     // events mutex and cannot interleave its `SendMessage` into the kernel ahead of
     // this turn's recv loop. Locking is therefore serialized; enqueue follows.
     let mut rx = events.lock().await;
-    if cmd_tx
-        .send(AgentCommand::SendMessage { text, images })
-        .is_err()
-    {
+    if runtime.submit(UserInput { text, images }).await.is_err() {
         // The kernel agent is gone (panicked / cancelled / session torn down): the
         // prompt will NEVER reach it. We must NOT fall through into the recv loop —
         // a dead kernel drops the events channel, so `rx.recv()` yields `None`, the
@@ -183,8 +194,7 @@ pub async fn run_prompt_turn(
         // above). Deliberately NOT an `Err` return: that tears down the whole ACP
         // connection, which is reserved for genuine transport failures — here the
         // client transport is healthy and only the kernel side died.
-        return responder
-            .respond_with_internal_error("acp: kernel agent is no longer running");
+        return responder.respond_with_internal_error("acp: kernel agent is no longer running");
     }
 
     // The kernel ALWAYS emits a trailing `TurnComplete` after an `Error` (see
@@ -193,62 +203,77 @@ pub async fn run_prompt_turn(
     // poisons the NEXT prompt (which would read the stale `TurnComplete` first).
     // Capture the error message and decide the response AFTER the loop.
     let mut last_error: Option<String> = None;
-    let stop = loop {
-        match rx.recv().await {
-            Some(AgentEvent::Request { id, kind, payload }) if kind == "approval" => {
+    let terminal = loop {
+        match rx.recv().await.map(|event| event.event) {
+            Some(CodingRuntimeEvent::Request(request)) if request.kind == "approval" => {
                 if auto_approve {
                     // `--dangerously-skip-permissions`: auto-allow without round-tripping
                     // to the client (which would otherwise make the flag a no-op).
-                    let _ = cmd_tx.send(AgentCommand::Respond {
-                        id,
-                        value: serde_json::json!({"decision": "allow"}),
-                    });
-                } else if let Err(e) =
-                    crate::acp::permission::handle_approval(&cx, &sid, &cmd_tx, id, payload).await
+                    let _ = runtime
+                        .respond(request.id, serde_json::json!({"decision": "allow"}))
+                        .await;
+                } else if let Err(e) = crate::acp::permission::handle_approval(
+                    &cx,
+                    &sid,
+                    &runtime,
+                    request.id,
+                    request.payload,
+                )
+                .await
                 {
                     // Defense-in-depth: `handle_approval` already fails closed internally
                     // and returns `Ok`, but a `?` here would tear the WHOLE connection down
                     // (see this function's doc) — reserved for genuine transport death, NOT
                     // an approval hiccup. Deny this call so the kernel unparks, keep the turn.
-                    eprintln!("acp: approval handling errored ({e}); denying this call, turn continues");
-                    let _ = cmd_tx.send(AgentCommand::Respond {
-                        id,
-                        value: serde_json::json!({"decision": "deny"}),
-                    });
+                    eprintln!(
+                        "acp: approval handling errored ({e}); denying this call, turn continues"
+                    );
+                    let _ = runtime
+                        .respond(request.id, serde_json::json!({"decision": "deny"}))
+                        .await;
                 }
             }
-            Some(AgentEvent::Request { id, .. }) => {
+            Some(CodingRuntimeEvent::Request(request)) => {
                 // Unknown (non-approval) kernel request kind: we cannot satisfy it.
                 // Respond with null (fail-closed) so the kernel unparks and the turn
                 // cannot hang waiting for a reply we will never produce.
                 eprintln!("acp: unhandled kernel request kind; responding null");
-                let _ = cmd_tx.send(AgentCommand::Respond {
-                    id,
-                    value: serde_json::Value::Null,
-                });
+                let _ = runtime.respond(request.id, serde_json::Value::Null).await;
             }
-            Some(AgentEvent::TurnComplete { reason }) => break reason,
-            Some(AgentEvent::Error { message, .. }) => {
+            Some(CodingRuntimeEvent::TurnFinished(completion)) => break Ok(completion),
+            Some(CodingRuntimeEvent::Agent(AgentEvent::Error { message, .. })) => {
                 // Do NOT return — keep looping so the trailing `TurnComplete` is
                 // consumed and cannot poison the next prompt on this session.
                 last_error = Some(message);
             }
-            Some(other) => {
+            Some(CodingRuntimeEvent::Agent(other)) => {
                 if let Some(update) = crate::acp::translate::event_to_update(&other) {
                     cx.send_notification(SessionNotification::new(sid.clone(), update))?;
                 }
             }
-            None => break StopReason::Stopped,
+            Some(CodingRuntimeEvent::RuntimeStopped(_)) => {
+                last_error = Some("acp: coding runtime stopped before turn terminal".into());
+                break Err(StopReason::ProviderError);
+            }
+            Some(_) => {}
+            None => {
+                last_error =
+                    Some("acp: coding runtime event stream closed before turn terminal".into());
+                break Err(StopReason::ProviderError);
+            }
         }
     };
 
-    if let Some(msg) = last_error {
-        responder.respond_with_internal_error(msg)
-    } else {
-        match crate::acp::translate::stop_reason(stop) {
-            Ok(sr) => responder.respond(PromptResponse::new(sr)),
-            Err(msg) => responder.respond_with_internal_error(msg),
-        }
+    // TurnFinished is authoritative. Budget/loop fuses may emit an AgentError
+    // diagnostic immediately before their typed terminal; ACP must still return
+    // MaxTurnRequests instead of misreporting an internal provider failure.
+    let response = match terminal {
+        Ok(completion) => prompt_completion_terminal(&completion, last_error),
+        Err(stop) => prompt_terminal(stop, last_error),
+    };
+    match response {
+        Ok(sr) => responder.respond(PromptResponse::new(sr)),
+        Err(message) => responder.respond_with_internal_error(message),
     }
 }
 
@@ -263,8 +288,15 @@ pub async fn run_prompt_turn(
 /// The map lock is held only for the synchronous `.get` + `.send` pair; it is
 /// released before any `await`, satisfying the hard constraint in the task brief.
 pub async fn handle_cancel(sessions: &Sessions, session_id: &str) {
-    if let Some(st) = sessions.lock().await.get(session_id) {
-        let _ = st.commands.send(AgentCommand::Cancel);
+    let runtime = {
+        sessions
+            .lock()
+            .await
+            .get(session_id)
+            .map(|state| state.runtime.clone())
+    };
+    if let Some(runtime) = runtime {
+        let _ = runtime.cancel().await;
     }
 }
 
@@ -300,23 +332,82 @@ mod tests {
         assert_eq!(images[0].data, "BASE64");
     }
 
+    #[test]
+    fn typed_fuse_terminal_overrides_preceding_error_diagnostic() {
+        use agent_client_protocol::schema::v1::StopReason as AcpStop;
+
+        assert_eq!(
+            prompt_terminal(StopReason::MaxRounds, Some("max rounds diagnostic".into()),).unwrap(),
+            AcpStop::MaxTurnRequests,
+        );
+        assert_eq!(
+            prompt_terminal(
+                StopReason::ToolLoopDetected,
+                Some("tool loop diagnostic".into()),
+            )
+            .unwrap(),
+            AcpStop::MaxTurnRequests,
+        );
+        assert_eq!(
+            prompt_terminal(
+                StopReason::ProviderError,
+                Some("provider connection failed".into()),
+            )
+            .unwrap_err(),
+            "provider connection failed",
+        );
+    }
+
+    #[test]
+    fn snapshot_unavailable_is_acp_failure_even_when_reason_is_stopped() {
+        let completion = TurnCompletion::SnapshotUnavailable {
+            turn_id: 1,
+            reason: StopReason::Stopped,
+            error: atomcode_coding::RuntimeSnapshotError {
+                message: "snapshot failed".into(),
+            },
+            stats: Default::default(),
+        };
+
+        let error = prompt_completion_terminal(&completion, None).unwrap_err();
+        assert!(error.contains("snapshot failed"));
+        assert!(error.contains("Stopped"));
+    }
+
     #[tokio::test]
     async fn cancel_sends_cancel_command() {
-        use atomcode_kernel::event::{AgentCommand, AgentEvent};
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<AgentCommand>();
-        let (_ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        use atomcode_coding::runtime::{
+            coding_runtime_control_channel, CodingRuntimeControl, RuntimeExit, RuntimeExitReason,
+        };
+        let (runtime, mut controls) = coding_runtime_control_channel();
+        let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let state = SessionState {
-            commands: cmd_tx,
-            events: std::sync::Arc::new(tokio::sync::Mutex::new(ev_rx)),
-            _task: tokio::spawn(async {}),
+            runtime,
+            events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
+            _task: tokio::spawn(async {
+                RuntimeExit {
+                    reason: RuntimeExitReason::ShutdownRequested,
+                    forced: false,
+                }
+            }),
         };
         let sessions: Sessions =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         sessions.lock().await.insert("acp-1".into(), state);
 
+        let control_task = tokio::spawn(async move {
+            match controls.recv().await {
+                Some(CodingRuntimeControl::Cancel { done, .. }) => {
+                    let _ = done.send(Ok(()));
+                    true
+                }
+                _ => false,
+            }
+        });
+
         handle_cancel(&sessions, "acp-1").await;
 
-        assert!(matches!(cmd_rx.recv().await, Some(AgentCommand::Cancel)));
+        assert!(control_task.await.unwrap());
     }
 
     #[tokio::test]

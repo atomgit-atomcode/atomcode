@@ -39,7 +39,7 @@ pub struct ToolCall {
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Risk classification a tool declares about itself. **Advisory metadata, NOT an
 /// enforcement boundary** (see the module-level trust-model contract): the kernel
@@ -134,7 +134,9 @@ impl Default for ProgressSink {
 
 impl std::fmt::Debug for ProgressSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProgressSink").field("active", &self.inner.is_some()).finish()
+        f.debug_struct("ProgressSink")
+            .field("active", &self.inner.is_some())
+            .finish()
     }
 }
 
@@ -144,6 +146,18 @@ pub struct ToolContext {
     /// Live progress channel (see [`ProgressSink`]). Default `noop()` — a tool reports
     /// progress only if it wants to, and only a driver that cares receives it.
     pub progress: ProgressSink,
+    /// Request seam so a tool can ask the driver a structured question and await the
+    /// answer. `None` in tests/headless → `request()` returns Null and callers degrade.
+    pub requester: Option<crate::request::Requester>,
+}
+
+impl ToolContext {
+    pub async fn request(&self, kind: &str, payload: serde_json::Value) -> serde_json::Value {
+        match &self.requester {
+            Some(r) => r.request(kind, payload).await,
+            None => serde_json::Value::Null,
+        }
+    }
 }
 
 /// A mounted tool. Its `execute` runs with the host process's FULL ambient
@@ -213,11 +227,12 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult;
 }
 
-/// Holds *all* available tools. BTreeMap for deterministic ordering (prompt-cache
-/// stability — same discipline as the production registry).
-#[derive(Default)]
+/// Holds *all* available tools. Clones share the same registry so a runtime-owned
+/// background capability reconciler can register tools before publishing a new
+/// mounted snapshot. BTreeMap preserves deterministic prompt ordering.
+#[derive(Clone, Default)]
 pub struct ToolRegistry {
-    tools: BTreeMap<String, Arc<dyn Tool>>,
+    tools: Arc<RwLock<BTreeMap<String, Arc<dyn Tool>>>>,
 }
 
 impl ToolRegistry {
@@ -225,36 +240,136 @@ impl ToolRegistry {
         Self::default()
     }
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.name().to_string(), tool);
+        let mut tools = match self.tools.write() {
+            Ok(tools) => tools,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tools.insert(tool.name().to_string(), tool);
     }
     /// Select the subset exposed to the LLM. Unmounted tools never produce a
     /// ToolDef and are not resolvable during a turn → zero effect on the agent.
     pub fn mount(&self, names: &[&str]) -> MountedTools {
-        let selected = names
+        let (mounted, _publisher) = self.mount_updatable(names);
+        mounted
+    }
+
+    /// Select a subset whose complete contents may later be atomically replaced.
+    ///
+    /// The publisher is deliberately separate from [`MountedTools`]: the agent
+    /// only reads snapshots, while the embedding runtime remains the sole writer.
+    pub fn mount_updatable(&self, names: &[&str]) -> (MountedTools, MountedToolsPublisher) {
+        let snapshot = Arc::new(MountedToolsSnapshot::new(
+            ToolCatalogRevision(0),
+            self.select(names),
+        ));
+        let current = Arc::new(RwLock::new(snapshot));
+        (
+            MountedTools {
+                current: current.clone(),
+            },
+            MountedToolsPublisher { current },
+        )
+    }
+
+    fn select(&self, names: &[&str]) -> BTreeMap<String, Arc<dyn Tool>> {
+        let tools = match self.tools.read() {
+            Ok(tools) => tools,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        names
             .iter()
-            .filter_map(|n| self.tools.get(*n).map(|t| (n.to_string(), t.clone())))
-            .collect();
-        MountedTools { selected }
+            .filter_map(|n| tools.get(*n).map(|t| (n.to_string(), t.clone())))
+            .collect()
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ToolCatalogRevision(pub u64);
+
+#[derive(Clone)]
 pub struct MountedTools {
-    selected: BTreeMap<String, Arc<dyn Tool>>,
+    current: Arc<RwLock<Arc<MountedToolsSnapshot>>>,
 }
 
-impl MountedTools {
-    pub fn defs(&self) -> Vec<ToolDef> {
-        self.selected
+/// The exact tool definitions and implementations used for one agent turn.
+///
+/// A snapshot stays valid after a newer catalog is published, preventing a
+/// model request and its subsequent tool execution from observing different
+/// tool sets.
+pub struct MountedToolsSnapshot {
+    revision: ToolCatalogRevision,
+    selected: BTreeMap<String, Arc<dyn Tool>>,
+    defs: Arc<[ToolDef]>,
+}
+
+impl MountedToolsSnapshot {
+    fn new(revision: ToolCatalogRevision, selected: BTreeMap<String, Arc<dyn Tool>>) -> Self {
+        let defs = selected
             .values()
             .map(|t| ToolDef {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
                 parameters: t.parameters_schema(),
             })
-            .collect()
+            .collect::<Vec<_>>()
+            .into();
+        Self {
+            revision,
+            selected,
+            defs,
+        }
     }
+
+    pub fn revision(&self) -> ToolCatalogRevision {
+        self.revision
+    }
+
+    pub fn defs(&self) -> Vec<ToolDef> {
+        self.defs.to_vec()
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.selected.get(name).cloned()
+    }
+}
+
+/// Runtime-owned write side of an updatable tool mount.
+///
+/// Publishing always replaces the full selected set under one write lock. Clones
+/// are writer capabilities for tasks spawned by that same runtime owner; revision
+/// assignment remains serialized by the shared lock.
+#[derive(Clone)]
+pub struct MountedToolsPublisher {
+    current: Arc<RwLock<Arc<MountedToolsSnapshot>>>,
+}
+
+impl MountedToolsPublisher {
+    pub fn publish(&self, registry: &ToolRegistry, names: &[&str]) -> ToolCatalogRevision {
+        let selected = registry.select(names);
+        let mut current = match self.current.write() {
+            Ok(current) => current,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let revision = ToolCatalogRevision(current.revision.0.saturating_add(1));
+        *current = Arc::new(MountedToolsSnapshot::new(revision, selected));
+        revision
+    }
+}
+
+impl MountedTools {
+    pub fn snapshot(&self) -> Arc<MountedToolsSnapshot> {
+        match self.current.read() {
+            Ok(current) => current.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub fn defs(&self) -> Vec<ToolDef> {
+        self.snapshot().defs()
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.snapshot().get(name)
     }
 }
 
@@ -269,25 +384,52 @@ mod tests {
         struct Plain;
         #[async_trait::async_trait]
         impl Tool for Plain {
-            fn name(&self) -> &str { "plain" }
-            fn description(&self) -> &str { "" }
-            fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+            fn name(&self) -> &str {
+                "plain"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
             async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-                ToolResult { call_id: String::new(), content: String::new(), is_error: false, images: vec![] }
+                ToolResult {
+                    call_id: String::new(),
+                    content: String::new(),
+                    is_error: false,
+                    images: vec![],
+                }
             }
         }
         struct RO;
         #[async_trait::async_trait]
         impl Tool for RO {
-            fn name(&self) -> &str { "ro" }
-            fn description(&self) -> &str { "" }
-            fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-            fn read_only_hint(&self) -> bool { true }
+            fn name(&self) -> &str {
+                "ro"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn read_only_hint(&self) -> bool {
+                true
+            }
             async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-                ToolResult { call_id: String::new(), content: String::new(), is_error: false, images: vec![] }
+                ToolResult {
+                    call_id: String::new(),
+                    content: String::new(),
+                    is_error: false,
+                    images: vec![],
+                }
             }
         }
-        assert!(!Plain.parallel_safe("{}"), "default (no read_only_hint) is NOT parallel-safe");
+        assert!(
+            !Plain.parallel_safe("{}"),
+            "default (no read_only_hint) is NOT parallel-safe"
+        );
         assert!(RO.parallel_safe("{}"), "a read-only tool IS parallel-safe");
     }
 
@@ -295,12 +437,25 @@ mod tests {
 
     #[async_trait]
     impl Tool for Dummy {
-        fn name(&self) -> &str { self.0 }
-        fn description(&self) -> &str { "dummy" }
-        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
-        fn risk(&self, _args: &str) -> RiskLevel { self.1 }
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "dummy"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn risk(&self, _args: &str) -> RiskLevel {
+            self.1
+        }
         async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-            ToolResult { call_id: String::new(), content: "ok".into(), is_error: false, images: vec![] }
+            ToolResult {
+                call_id: String::new(),
+                content: "ok".into(),
+                is_error: false,
+                images: vec![],
+            }
         }
     }
 
@@ -318,7 +473,10 @@ mod tests {
         let sink = ProgressSink::new(Arc::new(move |m| c2.lock().unwrap().push(m)));
         sink.emit("a");
         sink.emit("b");
-        assert_eq!(*captured.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]
@@ -334,6 +492,61 @@ mod tests {
         assert_eq!(defs[0].name, "echo");
 
         assert!(mounted.get("echo").is_some());
-        assert!(mounted.get("risky_write").is_none(), "unmounted tool must be inert/invisible");
+        assert!(
+            mounted.get("risky_write").is_none(),
+            "unmounted tool must be inert/invisible"
+        );
+    }
+
+    #[test]
+    fn updatable_mount_publishes_an_atomic_new_snapshot() {
+        let mut initial = ToolRegistry::new();
+        initial.register(Arc::new(Dummy("echo", RiskLevel::Safe)));
+        let (mounted, publisher) = initial.mount_updatable(&["echo"]);
+        let turn_one = mounted.snapshot();
+
+        let mut replacement = ToolRegistry::new();
+        replacement.register(Arc::new(Dummy("risky_write", RiskLevel::Risky)));
+        let revision = publisher.publish(&replacement, &["risky_write"]);
+        let turn_two = mounted.snapshot();
+
+        assert_eq!(revision, ToolCatalogRevision(1));
+        assert_eq!(turn_one.revision(), ToolCatalogRevision(0));
+        assert!(turn_one.get("echo").is_some());
+        assert!(turn_one.get("risky_write").is_none());
+        assert_eq!(turn_two.revision(), ToolCatalogRevision(1));
+        assert!(turn_two.get("echo").is_none());
+        assert!(turn_two.get("risky_write").is_some());
+    }
+
+    #[test]
+    fn mounted_tools_reads_the_latest_published_snapshot() {
+        let mut initial = ToolRegistry::new();
+        initial.register(Arc::new(Dummy("echo", RiskLevel::Safe)));
+        let (mounted, publisher) = initial.mount_updatable(&["echo"]);
+
+        let mut replacement = ToolRegistry::new();
+        replacement.register(Arc::new(Dummy("risky_write", RiskLevel::Risky)));
+        publisher.publish(&replacement, &["risky_write"]);
+
+        let defs = mounted.defs();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "risky_write");
+        assert!(mounted.get("echo").is_none());
+        assert!(mounted.get("risky_write").is_some());
+    }
+
+    #[tokio::test]
+    async fn tool_context_without_requester_returns_null() {
+        let ctx = ToolContext {
+            working_dir: std::path::PathBuf::from("/"),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: ProgressSink::noop(),
+            requester: None,
+        };
+        assert_eq!(
+            ctx.request("ask", serde_json::json!({})).await,
+            serde_json::Value::Null
+        );
     }
 }

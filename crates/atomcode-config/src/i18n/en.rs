@@ -1,5 +1,5 @@
-use std::borrow::Cow;
 use super::messages::Msg;
+use std::borrow::Cow;
 
 pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
@@ -21,6 +21,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  ⚠ Stored login expired — re-authenticating...\n".into(),
         Msg::ChatAuthExpired =>
             "Authentication expired — please run /login to sign in again".into(),
+        Msg::NetworkConnectHint =>
+            "Network connect failed. If this works in a browser you may be behind a proxy/firewall: configure a proxy with /proxy or set HTTPS_PROXY, or open the login URL above in a browser to finish. Press Esc to skip and /login later.".into(),
         Msg::CpSetupHeader =>
             "  AtomCode CodingPlan setup:\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
@@ -119,6 +121,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── Status bar ──
         Msg::StatusNoProvider =>
             "no provider · /provider to configure".into(),
+        Msg::StatusRuntimeUnavailable =>
+            "runtime unavailable · restart or inspect the error above".into(),
         Msg::StatusOfficialBuildRequired =>
             "CodingPlan needs the official build".into(),
         Msg::StatusUpgradeHint { version } =>
@@ -128,7 +132,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusModelNotConfigured =>
             "(not configured)".into(),
         Msg::StatusClipboardImageHint =>
-            "Image in clipboard · ctrl+v to paste".into(),
+            "Image in clipboard · ctrl+v / ctrl+alt+v to paste".into(),
         Msg::StatusClipboardImageHintSlash =>
             "Image in clipboard · /paste".into(),
         Msg::StatusWebuiHint =>
@@ -177,8 +181,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── Input ──
     Enter                            Send message
-    Ctrl+J                           Insert newline (universal)
-    \ then Enter                     Insert newline (atomcode fallback, universal)
+    \ then Enter                     Insert newline (works in every terminal)
     Alt+Enter                        Insert newline *
     Shift+Enter                      Insert newline **
     /                                Open slash command menu
@@ -223,24 +226,25 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
      enabled) / Windows Terminal / Ghostty / Warp. Other terminals
      (macOS Apple Terminal, default xterm, GNOME Terminal, VS Code's
      integrated terminal) collapse Shift+Enter into plain Enter —
-     use Ctrl+J or \ + Enter instead.
+     use \ + Enter instead.
 
   Tip: run /help for the full slash command list.
 "#.into(),
 
         // ── Provider wizard ──
         Msg::ProviderWizardHeader =>
-            "  Provider management — Add / Edit / Delete / Set default. Esc to cancel.\n".into(),
+            "  Manage providers: add, edit, delete, or set the global default. Press Esc to cancel.\n".into(),
         Msg::ProviderWizardCancelled =>
             "(cancelled)".into(),
-        Msg::ProviderMenuAdd => "add".into(),
-        Msg::ProviderMenuAddDesc => "Add a new provider".into(),
-        Msg::ProviderMenuEdit => "edit".into(),
-        Msg::ProviderMenuEditDesc => "Edit an existing provider".into(),
-        Msg::ProviderMenuDelete => "delete".into(),
-        Msg::ProviderMenuDeleteDesc => "Remove a provider".into(),
-        Msg::ProviderMenuSetDefault => "set-default".into(),
-        Msg::ProviderMenuSetDefaultDesc => "Switch the default provider".into(),
+        Msg::ProviderMenuAdd => "Add".into(),
+        Msg::ProviderMenuAddDesc => "Create a provider configuration".into(),
+        Msg::ProviderMenuEdit => "Edit".into(),
+        Msg::ProviderMenuEditDesc => "Modify an existing provider configuration".into(),
+        Msg::ProviderMenuDelete => "Delete".into(),
+        Msg::ProviderMenuDeleteDesc => "Delete an existing provider configuration".into(),
+        Msg::ProviderMenuSetDefault => "Set global default".into(),
+        Msg::ProviderMenuSetDefaultDesc =>
+            "Set the default provider and switch this session".into(),
         Msg::ProviderImportPrompt =>
             "Paste a template to auto-detect (curl / JSON / TOML), or Enter to fill manually:".into(),
         Msg::ProviderImportParsed { base_url, type_name, model } =>
@@ -252,7 +256,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDeleteConfirm { name } =>
             format!("Delete \"{name}\"? [y/N]").into(),
         Msg::ProviderDeleted { name } =>
-            format!("Removed \"{name}\".").into(),
+            format!("Deleted \"{name}\".").into(),
         Msg::ProviderDeleteKept => "(kept)".into(),
         Msg::ProviderDefaultSet { name } =>
             format!("Default set to {name}.").into(),
@@ -301,13 +305,20 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── Model picker ──
         Msg::ModelSwitched { provider, model } =>
-            format!("  Switched to {provider} · {model}\n").into(),
+            format!("  Switched to {provider} · {model} for this session\n").into(),
+        Msg::ModelSwitchedAndDefault { provider, model } =>
+            format!("  Switched to {provider} · {model}; set as default for new sessions\n").into(),
 
         // ── Session picker ──
         Msg::SessionLoadFailed { error } =>
             format!("load session failed: {error}").into(),
         Msg::SessionResumedLabel { name } =>
             format!("resumed: {name}").into(),
+        Msg::SessionBusyForked { source_id, fork_id } =>
+            format!(
+                "The latest session ({source_id}) is active in another window. \
+                 Created an independent fork ({fork_id}) from its last committed state."
+            ).into(),
 
         // ── Todo panel ──
         Msg::TodoPanelTitle => "Todos".into(),
@@ -320,6 +331,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAlwaysAllowFolder => {
             "Always allow writes to this folder (this session)".into()
         }
+        Msg::ApprovalAlwaysAllowCommand => "Always allow this command (this session)".into(),
         Msg::ApprovalDeny => "Deny".into(),
         Msg::ApprovalHint => "↑↓ select · Enter confirm · Esc cancel".into(),
         Msg::ApprovalHeader { tool, detail } => {
@@ -356,6 +368,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Failed to save session: {error}. The name was not persisted.").into(),
         Msg::SessionNoneSelected =>
             "No session selected".into(),
+        Msg::SessionPickerHint =>
+            "↑↓ move · Enter open · Ctrl+D×2 delete · Type to search · Esc cancel".into(),
+        Msg::SessionPickerTitle { n, total, project } =>
+            format!("Resume session ({n}/{total} · {project})").into(),
+        Msg::SessionPickerTitleBare =>
+            "Resume session".into(),
+        Msg::SessionPickerEmptyProject =>
+            "(no sessions in this project yet)".into(),
+        Msg::SessionPickerEmptyFilter =>
+            "(no sessions match)".into(),
+        Msg::SessionPickerEmptyFilterQuery { query } =>
+            format!("(no sessions match \"{query}\" — Backspace to clear)").into(),
         Msg::SessionDeleted { name } =>
             format!("\"{name}\" deleted").into(),
         Msg::SessionDeleteConfirm { name } =>
@@ -406,7 +430,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeTipsHeading => "Tips for getting started".into(),
         Msg::WelcomeTipLogin => "claim a free token quota".into(),
         Msg::WelcomeTipProvider => "add a custom model".into(),
-        Msg::WelcomeTipModel => "switch the active model".into(),
+        Msg::WelcomeTipModel => "set the default model".into(),
         Msg::WelcomeTipResume => "resume your last session".into(),
         Msg::WelcomeTipSetup => "one-shot recommended setup".into(),
         Msg::WelcomeTipSkills => "browse available skills".into(),
@@ -428,8 +452,16 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Switched to Build mode (full execution).\n".into(),
         Msg::CmdNewSession =>
             "  New session started.\n".into(),
+        Msg::CmdSessionTransitionPending =>
+            "  Runtime is reconfiguring; your input is preserved until it is ready.\n".into(),
+        Msg::CmdSessionTransitionFailed { error } =>
+            format!("Session switch failed; the previous session is still active: {error}").into(),
+        Msg::CmdCapabilityReloadFailed { error } =>
+            format!("Runtime capability reload failed; the previous runtime is still active: {error}").into(),
         Msg::CmdNoProviders =>
             "  No providers configured.\n".into(),
+        Msg::CmdSessionListLoading =>
+            "  Loading sessions…\n".into(),
         Msg::CmdNoSessions =>
             "  No previous sessions found. Start a conversation first.\n".into(),
         Msg::CmdUnknownCommand { name } =>
@@ -462,10 +494,20 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Usage: /undo  or  /undo N  (N = turn number).\n".into(),
         Msg::CmdNoChanges =>
             "  (no changes)\n".into(),
+        Msg::CmdDiffTruncated =>
+            "  … diff output truncated\n".into(),
         Msg::CmdCheckingUpdate =>
             "  Checking for updates...\n".into(),
         Msg::CmdNoActiveProvider =>
             "No active provider configured. Use /provider to add one.".into(),
+        Msg::CmdProviderUnavailable =>
+            "Provider is unavailable. Use /login to sign in or /provider to configure one.".into(),
+        Msg::CmdProviderReloading =>
+            "Provider/model is switching. Send after the switch completes.".into(),
+        Msg::SubmitHeldUntilProviderReady =>
+            "  ↳ provider not ready yet — message queued, will send automatically once ready\n".into(),
+        Msg::SubmitHeldUntilLogin =>
+            "  ↳ not signed in — message queued; run /login and it will send automatically\n".into(),
 
         // ── Approval prompt ──
         Msg::ApprovalPromptAlt { tool, detail } =>
@@ -503,11 +545,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::UpgradeRolledBack { exe, backup } =>
             format!("\n✓ Rolled back. Current binary: {}; other version saved at {}\n  Restarting rolled-back version...\n", exe, backup).into(),
 
-        // ── Terminal keyboard hints ──
-        Msg::KbdHintMacos =>
-            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
-        Msg::KbdHintOther =>
-            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
 
         // ── /config ──
         Msg::ConfigProviderLabel { provider, path } =>
@@ -584,16 +621,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("    - {}  connecting...\n", name).into(),
         Msg::McpNoServersConfigured =>
             "  No MCP servers configured.\n".into(),
-        Msg::McpClearedReconnecting { removed } =>
-            format!("  ✓ Cleared {} MCP tools. Reconnecting in background...\n", removed).into(),
-        Msg::McpClearedNoServers { removed } =>
-            format!("  ✓ Cleared {} MCP tools. No servers to connect.\n", removed).into(),
+        Msg::McpClearedReconnecting =>
+            "  MCP reload requested. Old MCP tools are withdrawn before reconnecting in the background.\n".into(),
+        Msg::McpClearedNoServers =>
+            "  MCP reload requested. Old MCP tools are withdrawn; no servers are configured.\n".into(),
         Msg::McpToolsUsage =>
             "  Usage: /mcp tools <server>\n  Example: /mcp tools filesystem\n".into(),
-        Msg::McpToolsListing { server } =>
-            format!("  Listing MCP tools for '{}'...\n", server).into(),
-        Msg::McpNoRegistry =>
-            "  No MCP registry loaded. Run /mcp reload first.\n".into(),
         Msg::McpServersHeader =>
             "  MCP Servers:\n".into(),
         Msg::McpReloadFailed { error } =>
@@ -610,7 +643,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpOAuthStarting { server } =>
             format!("  Starting MCP OAuth for '{server}' in your browser...\n").into(),
         Msg::McpOAuthSaved { provider, server } =>
-            format!("  Saved {provider} OAuth token for MCP server '{server}'. Run /mcp reload to connect.\n").into(),
+            format!("  Saved {provider} OAuth token for MCP server '{server}'. Reloading MCP capabilities.\n").into(),
         Msg::McpOAuthFailed { error } =>
             format!("  MCP OAuth failed: {error}\n").into(),
         Msg::McpOAuthTokenRemoved { server } =>
@@ -619,11 +652,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  No saved OAuth token found for MCP server '{server}'.\n").into(),
         Msg::McpOAuthLogoutFailed { error } =>
             format!("  MCP OAuth logout failed: {error}\n").into(),
-        // MCP / LSP server connect feedback
-        Msg::McpServerConnected { name } =>
-            format!("✓ MCP server '{name}' connected").into(),
-        Msg::McpServerFailed { name, error } =>
-            format!("× MCP server '{name}' failed: {error}").into(),
+        Msg::McpProjectTrusted =>
+            "  Project trusted — reloading MCP servers.\n".into(),
+        Msg::McpProjectUntrusted =>
+            "  Project trust revoked.\n".into(),
+        Msg::McpProjectNotTrusted =>
+            "  This project was not trusted.\n".into(),
         Msg::LspServerStarted { name, ext } =>
             format!("✓ LSP server '{name}' started for .{ext}").into(),
         Msg::LspServerFailed { name, ext, error } =>
@@ -742,9 +776,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMarketplaceListFailed { error } =>
             format!("list marketplaces: {error}").into(),
         Msg::PluginAutoUpdateSkipped { detail } =>
-            format!("Marketplace auto-update skipped (chat unaffected): {detail}").into(),
+            format!("Marketplace sync skipped (chat unaffected): {detail}").into(),
         Msg::OfflineModeActive =>
             "Offline mode: web tools, telemetry, and auto-update are disabled.".into(),
+        Msg::PluginHooksUntrusted { count, names } => format!(
+            "{count} plugin(s) ship untrusted hooks ({names}) — they won't run. Trust: atomcode plugin trust <name>"
+        ).into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("installing `{plugin}@{marketplace}`…").into(),
         Msg::PluginInstallingByName { plugin } =>
@@ -833,12 +870,14 @@ Msg::CmdDescSetup =>
         Msg::CmdDescLogin => "Sign in with AtomGit OAuth and claim CodingPlan models".into(),
         Msg::CmdDescLogout => "Sign out of AtomGit".into(),
         Msg::CmdDescWhoami => "Show current logged-in user".into(),
-        Msg::CmdDescModel => "Switch provider / model".into(),
-        Msg::CmdDescProvider => "Manage providers (add / edit / delete)".into(),
+        Msg::CmdDescModel =>
+            "Set the default provider / model and switch this session".into(),
+        Msg::CmdDescProvider =>
+            "Manage providers (add / edit / delete / set global default)".into(),
         Msg::CmdDescStatus => "Show session status".into(),
         Msg::CmdDescConfig => "Show config path".into(),
         Msg::CmdDescReload => "Reload $ATOMCODE_HOME/config.toml from disk".into(),
-        Msg::CmdDescCd => "Change working directory".into(),
+        Msg::CmdDescCd => "Change working directory and start a new session".into(),
 Msg::CmdDescInit => "Analyze the project and generate AGENTS.md".into(),
 Msg::CmdDescBg => "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>".into(),
 Msg::CmdDescBackground => "Run a one-shot task in an isolated background context (read-only-ish tool subset)".into(),
@@ -889,7 +928,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescReview => "Code review the current changes (/review · /review staged · /review <base>)".into(),
         Msg::CmdDescGoal => "Set a completion goal (autonomous loop until met)".into(),
         Msg::CmdDescProxy => "Switch outbound proxy mode".into(),
-        Msg::CmdDescTodo => "Reprint the current todo list (derived from session transcript)".into(),
+        Msg::CmdDescTodo => "Show the current todo list; `/todo add <task>` appends one, `/todo clear` wipes it".into(),
         Msg::CmdDescDesktop =>
             "Open the AtomCode desktop app (launch it if installed, else show the download link)".into(),
         Msg::DesktopOpening { name, path } =>
@@ -900,11 +939,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             format!("Found the app but couldn't launch it: {}\n  {}\n", err, path).into(),
         Msg::TodoNoList => "No task list yet (the model hasn't created todos).".into(),
         Msg::TodoListHeader => "Current tasks:".into(),
-        Msg::ViewUsage => "Usage: /view <filepath>".into(),
+        Msg::TodoAddUsage => "Usage: /todo add <task description>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode Guide — type /guide <question>".into(),
         Msg::GuideMenuTopics => "Common topics:".into(),
         Msg::GuideMenuGettingStarted => "Getting started          First install, login, config".into(),
-        Msg::GuideMenuSwitchModel => "Switch models            /model /provider usage".into(),
+        Msg::GuideMenuSwitchModel => "Set default model        /model /provider usage".into(),
         Msg::GuideMenuMcp => "Using MCP                MCP server config & management".into(),
         Msg::GuideMenuSkills => "Skills and plugins       /skills /plugin usage".into(),
         Msg::GuideMenuMemory => "Memory feature           /remember /forget /memory".into(),
@@ -914,7 +953,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::GuideMenuConfig => "Configuration            config.toml reference".into(),
         Msg::GuideMenuTip => "
   Tip: type /guide <your question> for a specific answer.
-  Example: /guide How to switch models
+  Example: /guide How to set the default model
 ".into(),
         Msg::GuideMenuDocUrl => "  Full docs: https://atomcode.atomgit.com/docs/en/".into(),
         Msg::CmdGuideInstalling => "Installing ask skill, please wait...".into(),
@@ -970,14 +1009,18 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdWelcomeDescription => "Re-run the onboarding wizard".into(),
         Msg::VisionPreprocessSuccess { char_count } =>
             format!("✓ VL recognised image, returned {char_count} chars").into(),
+        Msg::VisionPreprocessFailed { reason } =>
+            format!("VL preprocessing failed: {reason} · continuing text-only this turn; images restored, retry to re-run recognition").into(),
         Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens, cached_pct } =>
             format!(
                 "✓ {done} · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens{}",
                 super::fmt_tokens(total_tokens),
                 cached_pct.map(|p| format!(" · {p}% cached")).unwrap_or_default(),
             ).into(),
-        Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✗ Stopped · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
+        Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens, reason } => {
+            let cause = reason.map(|r| format!(": {r}")).unwrap_or_default();
+            format!("✗ Stopped{cause} · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
+        }
         Msg::LoginQrHeader =>
             "  Sign in to AtomGit — scan the QR code with your WeChat:\n\n".into(),
         Msg::LoginUrlAfterQr =>
@@ -1230,7 +1273,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::UsageCodingPlanOnly =>
             "Usage is only available on CodingPlan — run /login.".into(),
 
-        // ── engine v2 provider init (atomcode-bridge) ──
+        // ── CodingRuntime provider init ──
         Msg::ProviderInitFailed { detail } =>
             format!("provider init failed: {detail}").into(),
         Msg::ProviderInitNeedsLogin =>

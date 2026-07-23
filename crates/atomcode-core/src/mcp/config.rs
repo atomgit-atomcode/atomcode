@@ -171,6 +171,92 @@ pub fn load_mcp_config(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
     Ok(merged.into_values().filter(|c| !c.disabled).collect())
 }
 
+/// Strip `//` line comments and `/* … */` block comments from a JSONC document,
+/// yielding a strict-JSON string `serde_json` accepts. Comment bytes become spaces
+/// and newlines are preserved, so serde_json's error LINE stays accurate (a byte
+/// column can drift only on a line whose comment text is multi-byte — negligible in
+/// practice). String literals are respected: a `//` or `/*` INSIDE a JSON string
+/// (critically, a `"url": "https://…"`) is content, not a comment. Block comments do
+/// NOT nest (JSON5/JS semantics: the first `*/` closes). Trailing commas are
+/// deliberately NOT accepted — this stays strict JSON apart from comments. Malformed
+/// input (unterminated string/comment) is passed through for serde_json to reject;
+/// this function never panics.
+fn strip_jsonc_comments(input: &str) -> String {
+    enum St {
+        Code,
+        Str,
+        Line,
+        Block,
+    }
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut st = St::Code;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match st {
+            St::Code => {
+                if c == '"' {
+                    out.push(c);
+                    st = St::Str;
+                    i += 1;
+                } else if c == '/' && next == Some('/') {
+                    out.push_str("  ");
+                    st = St::Line;
+                    i += 2;
+                } else if c == '/' && next == Some('*') {
+                    out.push_str("  ");
+                    st = St::Block;
+                    i += 2;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            St::Str => {
+                if c == '\\' {
+                    // Escape: keep the backslash AND the next char verbatim, so an
+                    // escaped quote (`\"`) does not end the string.
+                    out.push(c);
+                    if let Some(n) = next {
+                        out.push(n);
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                } else {
+                    if c == '"' {
+                        st = St::Code;
+                    }
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            St::Line => {
+                if c == '\n' {
+                    out.push(c); // keep the newline (line numbers)
+                    st = St::Code;
+                } else {
+                    out.push(' '); // blank the comment body
+                }
+                i += 1;
+            }
+            St::Block => {
+                if c == '*' && next == Some('/') {
+                    out.push_str("  ");
+                    st = St::Code;
+                    i += 2;
+                } else {
+                    out.push(if c == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn load_config_file(path: &Path, source: McpConfigSource) -> Result<Vec<McpServerConfig>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -178,6 +264,10 @@ fn load_config_file(path: &Path, source: McpConfigSource) -> Result<Vec<McpServe
 
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read MCP config from {}", path.display()))?;
+
+    // Accept JSONC: `//` and `/* */` comments are stripped before strict-JSON parse,
+    // so users can annotate or comment-out a whole server (a common way to disable one).
+    let content = strip_jsonc_comments(&content);
 
     let raw: McpConfigFile = serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse MCP config from {}", path.display()))?;
@@ -551,6 +641,87 @@ mod tests {
     use serde_json::Value;
 
     #[test]
+    fn jsonc_strips_line_and_block_comments() {
+        let src = "{\n  // a line comment\n  \"a\": 1, /* inline */ \"b\": 2\n  /* multi\n     line */\n}";
+        let stripped = strip_jsonc_comments(src);
+        let v: Value = serde_json::from_str(&stripped).expect("valid JSON after strip");
+        assert_eq!(v["a"], 1);
+        assert_eq!(v["b"], 2);
+    }
+
+    #[test]
+    fn jsonc_keeps_double_slash_inside_a_url_string() {
+        // THE critical case: an MCP HTTP server URL contains `//` that must NOT be
+        // treated as a comment.
+        let src = "{ \"url\": \"https://example.com/mcp\" }";
+        let stripped = strip_jsonc_comments(src);
+        let v: Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(v["url"], "https://example.com/mcp");
+    }
+
+    #[test]
+    fn jsonc_keeps_comment_tokens_inside_strings() {
+        let src = "{ \"a\": \"x // y\", \"b\": \"p /* q */ r\" }";
+        let v: Value = serde_json::from_str(&strip_jsonc_comments(src)).unwrap();
+        assert_eq!(v["a"], "x // y");
+        assert_eq!(v["b"], "p /* q */ r");
+    }
+
+    #[test]
+    fn jsonc_handles_escaped_quote_in_string() {
+        // `\"` must not end the string early, so the trailing `//` stays a comment.
+        let src = "{ \"a\": \"she said \\\"hi\\\"\" } // done";
+        let v: Value = serde_json::from_str(&strip_jsonc_comments(src)).unwrap();
+        assert_eq!(v["a"], "she said \"hi\"");
+    }
+
+    #[test]
+    fn jsonc_preserves_line_count_for_error_positions() {
+        // Newlines inside comments are kept so serde_json error lines stay accurate.
+        let src = "// c1\n// c2\n{ \"a\": 1 }";
+        let stripped = strip_jsonc_comments(src);
+        assert_eq!(stripped.matches('\n').count(), src.matches('\n').count());
+    }
+
+    #[test]
+    fn jsonc_malformed_inputs_never_panic_and_stay_strippable() {
+        // The stripper does NOT validate JSON — malformed input is passed through for
+        // serde_json to reject downstream. It must never panic. Locks the review's
+        // conclusions (dangling escape at EOF, unterminated string/comment, the fact
+        // that block comments don't nest so a stray `*/` leaks and then fails to parse).
+        for src in [
+            "{\"a\":\"text\\",       // trailing backslash right before EOF
+            "{\"a\":1}/*unclosed",   // unterminated block comment
+            "{\"a\":\"unterminated", // unterminated string
+            "/* a /* b */ c */",     // block comments do not nest
+            "",                      // empty
+            "// only a comment",     // comment-only
+            "/",                     // lone slash (invalid JSON, but no panic)
+        ] {
+            let _ = strip_jsonc_comments(src); // must not panic
+        }
+    }
+
+    #[test]
+    fn jsonc_block_comment_does_not_nest() {
+        // JSON5/JS semantics: the FIRST `*/` closes; a second one leaks and serde_json
+        // rejects it (rather than silently swallowing to the second `*/`).
+        let stripped = strip_jsonc_comments("{ \"a\": 1 } /* outer /* inner */ tail */");
+        assert!(
+            serde_json::from_str::<Value>(&stripped).is_err(),
+            "leftover `tail */` must fail to parse"
+        );
+    }
+
+    #[test]
+    fn jsonc_disabled_server_with_comment_still_parses() {
+        // End-to-end shape: a commented, `disabled: true` server round-trips.
+        let src = "{\n  \"mcpServers\": {\n    // temporarily off while ace-rs is under maintenance\n    \"ace-rs\": { \"url\": \"https://ace/mcp\", \"disabled\": true }\n  }\n}";
+        let raw: McpConfigFile = serde_json::from_str(&strip_jsonc_comments(src)).unwrap();
+        assert!(raw.mcp_servers.get("ace-rs").unwrap().disabled);
+    }
+
+    #[test]
     fn test_expand_env_vars_simple() {
         std::env::set_var("TEST_VAR", "test_value");
         let result = expand_env_vars("${TEST_VAR}");
@@ -769,19 +940,31 @@ mod tests {
         let dir = std::env::temp_dir().join("ac_autoapprove_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(".mcp.json"), r#"{"mcpServers":{"srv":{"command":"x"}}}"#).unwrap();
+        std::fs::write(
+            dir.join(".mcp.json"),
+            r#"{"mcpServers":{"srv":{"command":"x"}}}"#,
+        )
+        .unwrap();
 
         add_auto_approved_tool(&dir, "srv", "query").expect("write ok");
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
-        let arr = written["mcpServers"]["srv"]["autoApprove"].as_array().expect("autoApprove array");
+        let arr = written["mcpServers"]["srv"]["autoApprove"]
+            .as_array()
+            .expect("autoApprove array");
         assert!(arr.iter().any(|v| v == "query"));
 
         // Idempotent: second call must not duplicate.
         add_auto_approved_tool(&dir, "srv", "query").unwrap();
         let again: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
-        assert_eq!(again["mcpServers"]["srv"]["autoApprove"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            again["mcpServers"]["srv"]["autoApprove"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

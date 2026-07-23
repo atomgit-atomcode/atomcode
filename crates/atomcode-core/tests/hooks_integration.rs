@@ -60,7 +60,11 @@ async fn pre_hook_blocks_dangerous_command() {
     // Safe command → allowed
     let ctx_safe = test_ctx("bash", r#"{"command":"ls -la"}"#);
     let result = exec.run_pre_tool_use("bash", &ctx_safe).await;
-    assert_eq!(result, PreHookResult::Allow, "safe command should be allowed");
+    assert_eq!(
+        result,
+        PreHookResult::Allow,
+        "safe command should be allowed"
+    );
 }
 
 // ── Post-hook receives tool name via env ────────────────────────────

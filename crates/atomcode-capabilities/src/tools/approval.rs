@@ -53,13 +53,22 @@ pub struct ApprovalResponse {
 
 impl ApprovalResponse {
     pub fn allow() -> Self {
-        Self { decision: "allow".into(), remember: false }
+        Self {
+            decision: "allow".into(),
+            remember: false,
+        }
     }
     pub fn allow_always() -> Self {
-        Self { decision: "allow_always".into(), remember: false }
+        Self {
+            decision: "allow_always".into(),
+            remember: false,
+        }
     }
     pub fn deny() -> Self {
-        Self { decision: "deny".into(), remember: false }
+        Self {
+            decision: "deny".into(),
+            remember: false,
+        }
     }
 }
 
@@ -118,10 +127,16 @@ impl PermissionStore for InMemoryPermissionStore {
         // Poison-recover instead of unwrap: an approval gate runs in the tool path and
         // MUST NOT panic (the kernel runs panic=abort). The critical section only touches
         // an infallible HashSet, so the guarded set is never left inconsistent.
-        self.granted.lock().unwrap_or_else(|e| e.into_inner()).contains(key)
+        self.granted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(key)
     }
     fn grant(&self, key: &str) {
-        self.granted.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string());
+        self.granted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string());
     }
 }
 
@@ -135,7 +150,10 @@ impl ApprovalMiddleware {
     /// Build over an injected store. `kind` defaults to `"approval"` (the driver
     /// matches `AgentEvent::Request.kind` on it).
     pub fn new(store: Arc<dyn PermissionStore>) -> Self {
-        Self { store, kind: APPROVAL_KIND.to_string() }
+        Self {
+            store,
+            kind: APPROVAL_KIND.to_string(),
+        }
     }
     /// Convenience: gate with a fresh in-memory store.
     pub fn in_memory() -> Self {
@@ -152,8 +170,58 @@ impl ApprovalMiddleware {
     /// edit this session (v1 parity), while `bash` keeps the default per-command
     /// scope so approving one destructive command never blanket-approves others.
     fn grant_key(call: &ToolCall, tool: &dyn Tool) -> String {
-        format!("{}::{}", call.name, tool.always_grant_scope(&call.arguments))
+        format!(
+            "{}::{}",
+            call.name,
+            tool.always_grant_scope(&call.arguments)
+        )
     }
+}
+
+/// The fail-closed `Deny` for a DEGRADED approval round-trip — a `Null` response, which
+/// the kernel emits when the driver's oneshot sender was dropped, the bounded round-trip
+/// timed out, or the turn was cancelled (see `RequestCtx::request` / `cancel_pending`). A
+/// genuine user "deny" arrives as `{"decision":"deny"}` (non-null); this is NOT that. We
+/// fail closed either way, but surface the difference — on stderr AND in the deny reason
+/// the model/UI sees — so an internal channel failure can be told apart from a real user
+/// denial (issue #173). SHARED by every gate that round-trips the driver so the contract +
+/// wording can never drift between copies.
+pub fn approval_channel_failure_deny(tool_name: &str) -> BeforeOutcome {
+    eprintln!(
+        "[approval] no decision received for tool '{tool_name}' (driver disconnected, \
+         timed out, or cancelled); denying due to internal channel failure, not a user decision"
+    );
+    BeforeOutcome::deny(format!(
+        "approval unresolved for '{tool_name}': no decision received (driver disconnected, \
+         timed out, or cancelled) — internal channel failure, not a user denial"
+    ))
+}
+
+/// Round-trip the driver for an approval decision on `call` under request `kind`, built
+/// from the exported typed [`ApprovalRequest`] contract so the wire shape can never drift.
+/// Returns the parsed [`PermissionDecision`], or `Err(BeforeOutcome::Deny)` when the
+/// round-trip DEGRADED to `Null` (fail closed via [`approval_channel_failure_deny`]). The
+/// decision→outcome MAPPING stays with each caller (they diverge: the generic gate
+/// remembers `AllowAlways` in its store and maps allow→`Proceed`, while a hook-forced ask
+/// maps allow→`Allow` to short-circuit downstream gates), so only the shared round-trip +
+/// degraded-path handling is factored here.
+pub async fn request_approval_decision(
+    rt: &RequestCtx,
+    kind: &str,
+    call: &ToolCall,
+    tool_name: &str,
+) -> Result<PermissionDecision, BeforeOutcome> {
+    let payload = serde_json::to_value(ApprovalRequest {
+        call_id: call.id.clone(),
+        tool: tool_name.to_string(),
+        args: call.arguments.clone(),
+    })
+    .unwrap_or(serde_json::Value::Null);
+    let response = rt.request(kind, payload).await;
+    if response.is_null() {
+        return Err(approval_channel_failure_deny(tool_name));
+    }
+    Ok(PermissionDecision::from_value(&response))
 }
 
 #[async_trait]
@@ -173,43 +241,14 @@ impl ToolMiddleware for ApprovalMiddleware {
         if self.store.is_granted(&key) {
             return BeforeOutcome::Proceed;
         }
-        // Round-trip the driver for a decision (the oneshot lives in the kernel's
-        // RequestCtx, never in an event → events stay serializable). Built from the
-        // exported typed contract so the wire shape can never drift from it.
-        let payload = serde_json::to_value(ApprovalRequest {
-            call_id: call.id.clone(),
-            tool: tool.name().to_string(),
-            args: call.arguments.clone(),
-        })
-        .unwrap_or(serde_json::Value::Null);
-        let response = rt.request(&self.kind, payload).await;
-        // A `Null` response is the kernel's DEGRADED signal, not a user decision: the
-        // driver's oneshot sender was dropped, the bounded round-trip timed out, or the
-        // turn was cancelled (see `RequestCtx::request` / `cancel_pending`). A genuine
-        // user "deny" arrives as `{"decision":"deny"}` (non-null). We still fail closed,
-        // but surface the difference — on stderr AND in the deny reason the model/UI
-        // sees — so an internal channel failure can be told apart from a real user
-        // denial. (Issue #173: this path used to collapse both into a silent Deny.)
-        if response.is_null() {
-            eprintln!(
-                "[approval] no decision received for tool '{}' (driver disconnected, \
-                 timed out, or cancelled); denying due to internal channel failure, \
-                 not a user decision",
-                tool.name()
-            );
-            return BeforeOutcome::deny(format!(
-                "approval unresolved for '{}': no decision received (driver disconnected, \
-                 timed out, or cancelled) — internal channel failure, not a user denial",
-                tool.name()
-            ));
-        }
-        match PermissionDecision::from_value(&response) {
-            PermissionDecision::AllowOnce => BeforeOutcome::Proceed,
-            PermissionDecision::AllowAlways => {
+        match request_approval_decision(rt, &self.kind, call, tool.name()).await {
+            Err(degraded) => degraded, // Null → fail closed (channel failure, not a user deny).
+            Ok(PermissionDecision::AllowOnce) => BeforeOutcome::Proceed,
+            Ok(PermissionDecision::AllowAlways) => {
                 self.store.grant(&key);
                 BeforeOutcome::Proceed
             }
-            PermissionDecision::Deny => {
+            Ok(PermissionDecision::Deny) => {
                 // Deny reason goes back to the model as the tool result; it made the call, so
                 // don't echo its full arguments back (token waste + the arg preview already
                 // renders in the tool header). Name the tool and the policy — that's the signal.
@@ -238,7 +277,11 @@ mod tests {
     fn safe_call() -> ToolCall {
         // read_file is Safe; use a risk-Safe tool's args. We reuse the write tool's
         // risk via a Safe arg? No — write is always Risky. Use ReadFileTool instead.
-        ToolCall { id: "2".into(), name: "read_file".into(), arguments: r#"{"file_path":"a.txt"}"#.into() }
+        ToolCall {
+            id: "2".into(),
+            name: "read_file".into(),
+            arguments: r#"{"file_path":"a.txt"}"#.into(),
+        }
     }
 
     /// REGRESSION: "总是 / Always" must be tool-wide for file-mutation tools (v1
@@ -291,15 +334,30 @@ mod tests {
     #[test]
     fn decision_parsing_fails_closed() {
         use serde_json::json;
-        assert_eq!(PermissionDecision::from_value(&json!({"decision":"allow"})), PermissionDecision::AllowOnce);
+        assert_eq!(
+            PermissionDecision::from_value(&json!({"decision":"allow"})),
+            PermissionDecision::AllowOnce
+        );
         assert_eq!(
             PermissionDecision::from_value(&json!({"decision":"allow","remember":true})),
             PermissionDecision::AllowAlways
         );
-        assert_eq!(PermissionDecision::from_value(&json!({"decision":"allow_always"})), PermissionDecision::AllowAlways);
-        assert_eq!(PermissionDecision::from_value(&json!({"decision":"deny"})), PermissionDecision::Deny);
-        assert_eq!(PermissionDecision::from_value(&serde_json::Value::Null), PermissionDecision::Deny);
-        assert_eq!(PermissionDecision::from_value(&json!({})), PermissionDecision::Deny);
+        assert_eq!(
+            PermissionDecision::from_value(&json!({"decision":"allow_always"})),
+            PermissionDecision::AllowAlways
+        );
+        assert_eq!(
+            PermissionDecision::from_value(&json!({"decision":"deny"})),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            PermissionDecision::from_value(&serde_json::Value::Null),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            PermissionDecision::from_value(&json!({})),
+            PermissionDecision::Deny
+        );
     }
 
     #[tokio::test]
@@ -364,17 +422,29 @@ mod tests {
         // Older approval payloads without call_id still parse; they simply cannot
         // correlate a pre-execution prompt with a later ToolStarted row.
         let legacy: ApprovalRequest =
-            serde_json::from_value(serde_json::json!({ "tool": "bash", "args": "{}" }))
-                .unwrap();
+            serde_json::from_value(serde_json::json!({ "tool": "bash", "args": "{}" })).unwrap();
         assert_eq!(legacy.call_id, "");
 
         // Response side: each constructor round-trips through from_value exactly.
         let v = serde_json::to_value(ApprovalResponse::allow()).unwrap();
-        assert_eq!(PermissionDecision::from_value(&v), PermissionDecision::AllowOnce);
+        assert_eq!(
+            PermissionDecision::from_value(&v),
+            PermissionDecision::AllowOnce
+        );
         let v = serde_json::to_value(ApprovalResponse::allow_always()).unwrap();
-        assert_eq!(PermissionDecision::from_value(&v), PermissionDecision::AllowAlways);
-        let v = serde_json::to_value(ApprovalResponse { decision: "allow".into(), remember: true }).unwrap();
-        assert_eq!(PermissionDecision::from_value(&v), PermissionDecision::AllowAlways);
+        assert_eq!(
+            PermissionDecision::from_value(&v),
+            PermissionDecision::AllowAlways
+        );
+        let v = serde_json::to_value(ApprovalResponse {
+            decision: "allow".into(),
+            remember: true,
+        })
+        .unwrap();
+        assert_eq!(
+            PermissionDecision::from_value(&v),
+            PermissionDecision::AllowAlways
+        );
         let v = serde_json::to_value(ApprovalResponse::deny()).unwrap();
         assert_eq!(PermissionDecision::from_value(&v), PermissionDecision::Deny);
         assert_eq!(APPROVAL_KIND, "approval");

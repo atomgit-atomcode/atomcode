@@ -17,6 +17,7 @@ export function getToken(): string {
 }
 
 export type SSEEvent =
+  | { type: 'runtime_info'; provider: string; model: string }
   | { type: 'text'; content: string }
   | { type: 'reasoning'; content: string }
   | { type: 'tool_start'; id: string; name: string; arguments: unknown }
@@ -25,18 +26,19 @@ export type SSEEvent =
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
-  | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string }
+  | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
-  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean }
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   // Artifact events: the daemon's ArtifactDetector strips fenced code blocks from
   // TextDelta and emits them as separate artifact_start / artifact_content / artifact_end
   // events (see ArtifactDetector in crates/atomcode-daemon/src/lib.rs). Without handling
   // these, code block content is silently lost in the WebUI while the TUI sees it fine.
   | { type: 'artifact_start'; id: string; artifact_type: string; language?: string | null; title?: string | null }
   | { type: 'artifact_content'; id: string; content: string }
-  | { type: 'artifact_end'; id: string };
+  | { type: 'artifact_end'; id: string }
+  | { type: 'command_output'; text: string };
 
 export interface ModelInfo {
   provider: string;
@@ -52,7 +54,10 @@ export interface ModelInfo {
 
 export async function getModels(): Promise<ModelInfo[]> {
   const r = await fetch('/models', { headers: authHeaders() });
-  return r.json();
+  if (!r.ok) throw new Error(`list models failed: ${r.status}`);
+  const body: unknown = await r.json();
+  if (!Array.isArray(body)) throw new Error('list models returned an invalid payload');
+  return body as ModelInfo[];
 }
 
 /** A base64-encoded image attachment (no data-URL prefix). */
@@ -80,6 +85,32 @@ export async function stopChat(requestId: string): Promise<void> {
   if (!resp.ok) throw new Error(`stop chat failed: ${resp.status}`);
 }
 
+export async function getActiveChatSessions(): Promise<string[]> {
+  const resp = await fetch('/chat/active', { headers: authHeaders() });
+  if (!resp.ok) throw new Error(`active chats failed: ${resp.status}`);
+  const body: unknown = await resp.json();
+  if (!Array.isArray(body) || !body.every((entry) => typeof entry === 'string')) {
+    throw new Error('active chats returned an invalid payload');
+  }
+  return body;
+}
+
+/**
+ * Detach a local `/chat` stream without orphaning its daemon operation.
+ *
+ * Session switches cannot keep consuming the old SSE response, but aborting
+ * fetch alone does not prove the daemon turn stopped. Abort the local reader
+ * immediately, then use the existing cancellation endpoint; callers must
+ * surface rejection because the old turn may still own the runtime.
+ */
+export async function cancelDetachedChat(
+  requestId: string,
+  controller: AbortController,
+): Promise<void> {
+  controller.abort();
+  await stopChat(requestId);
+}
+
 export async function streamChat(
   body: StreamChatBody,
   onEvent: (event: SSEEvent) => void,
@@ -102,6 +133,14 @@ export async function streamChat(
   const reader = resp.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let terminalSeen = false;
+
+  const emit = (event: SSEEvent) => {
+    if (event.type === 'done' || event.type === 'stopped' || event.type === 'error') {
+      terminalSeen = true;
+    }
+    onEvent(event);
+  };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -126,7 +165,7 @@ export async function streamChat(
 
       try {
         const parsed = JSON.parse(jsonStr) as SSEEvent;
-        onEvent(parsed);
+        emit(parsed);
       } catch {
         // Ignore malformed lines (keep-alive comments, etc.)
       }
@@ -143,12 +182,21 @@ export async function streamChat(
       if (jsonStr) {
         try {
           const parsed = JSON.parse(jsonStr) as SSEEvent;
-          onEvent(parsed);
+          emit(parsed);
         } catch {
           // Ignore
         }
       }
     }
+  }
+
+  if (signal?.aborted) {
+    const error = new Error('chat stream aborted');
+    error.name = 'AbortError';
+    throw error;
+  }
+  if (!terminalSeen) {
+    throw new Error('chat stream ended before an authoritative terminal event');
   }
 }
 
@@ -331,6 +379,7 @@ export interface ProviderInfo {
   model: string;
   base_url?: string;
   has_api_key: boolean;
+  requires_login?: boolean;
   is_default: boolean;
   context_window?: number;
 }
@@ -370,7 +419,10 @@ export interface ProjectInfo {
 
 export async function getProjects(): Promise<ProjectInfo[]> {
   const resp = await fetch('/projects', { headers: authHeaders() });
-  return resp.json();
+  if (!resp.ok) throw new Error(`list projects failed: ${resp.status}`);
+  const body: unknown = await resp.json();
+  if (!Array.isArray(body)) throw new Error('list projects returned an invalid payload');
+  return body as ProjectInfo[];
 }
 
 // --- Current project state ---
@@ -403,11 +455,24 @@ export interface McpServerInfo {
 
 export interface McpStatusInfo {
   servers: McpServerInfo[];
+  /** Whether the current project is trusted for MCP. Absent on older daemons — treat as untrusted. */
+  trusted?: boolean;
+  /** Names of MCP servers withheld because the project is untrusted. Absent on older daemons — treat as empty. */
+  blocked?: string[];
 }
 
 export async function getMcpStatus(): Promise<McpStatusInfo> {
   const resp = await fetch('/mcp/status', { headers: authHeaders() });
   if (!resp.ok) throw new Error(`mcp status failed: ${resp.status}`);
+  return resp.json();
+}
+
+/** Trust the current project for MCP servers, then rebuild the MCP registry. */
+export async function postLiveMcpTrust(): Promise<{ ok: boolean; error?: string }> {
+  const resp = await fetch('/live/mcp/trust', {
+    method: 'POST',
+    headers: authHeaders(),
+  });
   return resp.json();
 }
 
@@ -574,8 +639,9 @@ export async function getSession(
 // --- Live session (multi-tab real-time sync) ---
 
 /** Approval mode: 'build' = interactive approval, 'plan' = read-only exploration,
- *  'bypass' = auto-approve everything (免审批). Mirrors the daemon `ApprovalMode`. */
-export type ApprovalMode = 'build' | 'plan' | 'bypass';
+ *  'bypass' = Auto (auto-approve everything). Mirrors the daemon `ApprovalMode`
+ *  while preserving the established wire value. */
+export type ApprovalMode = 'build' | 'plan' | 'bypass' | 'accept_edits';
 
 export interface ApprovalModeResponse {
   ok: boolean;
@@ -594,14 +660,16 @@ export type LiveWireEvent =
   | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
-  | { type: 'state'; running: boolean }
+  | { type: 'state'; running: boolean; stop_reason?: string; message?: string }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
-  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean }
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
+  | { type: 'user_input_request'; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_renamed'; session_id: string; name: string }
-  | { type: 'working_dir'; working_dir: string };
+  | { type: 'working_dir'; working_dir: string }
+  | { type: 'command_output'; text: string };
 
 export async function streamLive(
   onEvent: (e: LiveWireEvent) => void,
@@ -640,7 +708,7 @@ export async function postLiveMessage(
   provider?: string,
   sessionId?: string | null,
 ): Promise<void> {
-  await fetch('/live/message', {
+  const resp = await fetch('/live/message', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({
@@ -650,6 +718,9 @@ export async function postLiveMessage(
       ...(sessionId ? { session_id: sessionId } : {}),
     }),
   });
+  if (!resp.ok) throw new Error(`send live message failed: ${resp.status}`);
+  const body = await resp.json() as { accepted?: boolean; error?: string };
+  if (!body.accepted) throw new Error(body.error ?? 'live runtime rejected the message');
 }
 
 export async function postLiveStop(): Promise<void> {
@@ -658,28 +729,33 @@ export async function postLiveStop(): Promise<void> {
     headers: authHeaders(),
   });
   if (!resp.ok) throw new Error(`stop live chat failed: ${resp.status}`);
+  const body = await resp.json() as { accepted?: boolean };
+  if (!body.accepted) throw new Error('live runtime rejected the stop request');
 }
 
-/** Sync-mode session switch: notify the daemon when the user selects a
- *  different (existing) session in the sidebar, so the same-process TUI
- *  follows — loading that session's history. Broadcasts via the same path
- *  as new-session creation; a no-op server-side when no view is attached. */
+/** Ask the bound native runtime to resume an existing session. */
 export async function postLiveSwitchSession(sessionId: string): Promise<void> {
-  await fetch('/live/switch_session', {
+  const resp = await fetch('/live/switch_session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ session_id: sessionId }),
   });
+  if (!resp.ok) throw new Error(`switch live session failed: ${resp.status}`);
+  const body = await resp.json() as { ok?: boolean; error?: string };
+  if (!body.ok) throw new Error(body.error ?? 'live runtime rejected the session switch');
 }
 
 /** Sync-mode model switch: notify the daemon immediately when the dropdown
  *  changes (not just on send), so the TUI header and other tabs follow. */
-export async function postLiveProvider(provider: string): Promise<void> {
-  await fetch('/live/provider', {
+export async function postLiveProvider(provider: string, sessionId?: string | null): Promise<void> {
+  const resp = await fetch('/live/provider', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ provider }),
+    body: JSON.stringify({ provider, ...(sessionId ? { session_id: sessionId } : {}) }),
   });
+  if (!resp.ok) throw new Error(`switch live provider failed: ${resp.status}`);
+  const body = await resp.json() as { ok?: boolean; error?: string };
+  if (!body.ok) throw new Error(body.error ?? 'live runtime rejected the provider switch');
 }
 
 // --- /command endpoint ---
@@ -692,7 +768,7 @@ export type CommandResult =
   | { kind: 'context'; system_tokens: number; sent_tokens: number; total_messages: number; tool_defs_tokens: number; cold_zone_tokens: number; ctx_window: number; ctx_name: string }
   | { kind: 'compact'; applied: boolean; removed_messages: number; before_tokens: number; after_tokens: number }
   | { kind: 'whoami'; logged_in: boolean; username?: string; name?: string; email?: string }
-  | { kind: 'status'; logged_in: boolean; username?: string; provider: string; model: string; working_dir: string; config_path: string }
+  | { kind: 'status'; logged_in: boolean; username?: string; provider: string; model: string; working_dir: string; config_path: string; text: string }
   | { kind: 'config'; path: string; provider: string }
   | { kind: 'diff'; stat: string }
   | { kind: 'cost'; total_tokens: number; turn_count: number }
@@ -716,8 +792,9 @@ export async function postCommand(body: {
   return resp.json();
 }
 
-/** Switch the approval mode (build / plan / bypass). Runtime session state —
- *  the next turn's PermissionDecider follows it; broadcast to other tabs. */
+/** Switch the approval mode (build / accept_edits / bypass / plan). Runtime
+ *  session state — the next turn's PermissionDecider follows it; broadcast to
+ *  other tabs. */
 export async function postLiveMode(mode: ApprovalMode): Promise<ApprovalMode> {
   const resp = await fetch('/approval_mode', {
     method: 'POST',
@@ -726,6 +803,7 @@ export async function postLiveMode(mode: ApprovalMode): Promise<ApprovalMode> {
   });
   if (!resp.ok) throw new Error(`switch mode failed: ${resp.status}`);
   const body = (await resp.json()) as ApprovalModeResponse;
+  if (!body.ok) throw new Error('live runtime rejected the mode switch');
   return body.mode;
 }
 
@@ -743,7 +821,7 @@ export async function postLiveReasoningEffort(
   effort: string | null,
   provider?: string,
 ): Promise<void> {
-  await fetch('/live/reasoning_effort', {
+  const resp = await fetch('/live/reasoning_effort', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({
@@ -751,6 +829,9 @@ export async function postLiveReasoningEffort(
       ...(provider ? { provider } : {}),
     }),
   });
+  if (!resp.ok) throw new Error(`set live reasoning effort failed: ${resp.status}`);
+  const body = await resp.json() as { ok?: boolean; error?: string };
+  if (!body.ok) throw new Error(body.error ?? 'live runtime rejected reasoning effort');
 }
 
 export async function postLivePermission(
@@ -762,5 +843,49 @@ export async function postLivePermission(
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ decision, tool_name: toolName }),
   });
+  if (!resp.ok) throw new Error(`answer live permission failed: ${resp.status}`);
+  return resp.json();
+}
+
+export interface UserInputQuestion {
+  header: string;
+  question: string;
+  mode: 'single' | 'multiple' | 'text';
+  options: { label: string; description?: string }[];
+  /** Offer the "type your own answer" row (single/multiple). Absent ⇒ true. */
+  custom?: boolean;
+}
+
+export interface UserInputResponseBody {
+  declined: boolean;
+  selected: string[];
+  text: string | null;
+}
+
+export interface UserInputRequestEvent {
+  type: 'user_input_request';
+  request_id: number;
+  header: string;
+  question: string;
+  mode: 'single' | 'multiple' | 'text';
+  options: { label: string; description?: string }[];
+  /// Present for a multi-question batch; the webui steps through these and posts
+  /// one batched answer. Omitted for a single question (use the flat fields above).
+  questions?: UserInputQuestion[];
+  /// Offer the "type your own answer" row for a single question. Absent ⇒ true.
+  custom?: boolean;
+}
+
+export async function postLiveUserInput(
+  body:
+    | ({ request_id: number } & UserInputResponseBody)
+    | { request_id: number; responses: UserInputResponseBody[] },
+): Promise<{ accepted: boolean }> {
+  const resp = await fetch('/live/user-input', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) throw new Error(`answer live user input failed: ${resp.status}`);
   return resp.json();
 }

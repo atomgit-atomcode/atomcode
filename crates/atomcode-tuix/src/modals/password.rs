@@ -184,9 +184,15 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut m = PasswordModal::new("[sudo] password:".into(), tx);
         for c in ['p', 'w', '1'] {
-            assert_eq!(m.feed_for_test(KeyCode::Char(c), KeyModifiers::NONE), ModalActionTest::Continue);
+            assert_eq!(
+                m.feed_for_test(KeyCode::Char(c), KeyModifiers::NONE),
+                ModalActionTest::Continue
+            );
         }
-        assert_eq!(m.feed_for_test(KeyCode::Enter, KeyModifiers::NONE), ModalActionTest::Close);
+        assert_eq!(
+            m.feed_for_test(KeyCode::Enter, KeyModifiers::NONE),
+            ModalActionTest::Close
+        );
         assert_eq!(rx.blocking_recv().unwrap().as_deref(), Some("pw1"));
     }
 
@@ -195,7 +201,10 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut m = PasswordModal::new("p".into(), tx);
         m.feed_for_test(KeyCode::Char('x'), KeyModifiers::NONE);
-        assert_eq!(m.feed_for_test(KeyCode::Esc, KeyModifiers::NONE), ModalActionTest::Close);
+        assert_eq!(
+            m.feed_for_test(KeyCode::Esc, KeyModifiers::NONE),
+            ModalActionTest::Close
+        );
         assert_eq!(rx.blocking_recv().unwrap(), None);
     }
 

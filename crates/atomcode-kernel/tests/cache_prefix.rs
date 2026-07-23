@@ -79,7 +79,11 @@ fn is_strict_prefix(a: &str, b: &str) -> bool {
 }
 
 fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
-    ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args.into(),
+    }
 }
 
 /// Build a registry with two tools (Echo + bash) and mount BOTH. Mounting two
@@ -97,7 +101,13 @@ fn agent_handle(provider: Arc<RecordingProvider>) -> atomcode_kernel::agent::Age
 }
 
 async fn drive_one_turn(handle: &mut atomcode_kernel::agent::AgentHandle, text: &str) {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: text.into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -117,7 +127,10 @@ async fn wire_prefix_is_byte_stable_and_append_only_across_rounds() {
             StreamEvent::ToolCall(tool_call("c1", "echo", "{\"text\":\"hi\"}")),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("all done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("all done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
 
@@ -128,7 +141,11 @@ async fn wire_prefix_is_byte_stable_and_append_only_across_rounds() {
 
     let calls = calls.lock().unwrap();
     // (a) ≥2 recorded calls.
-    assert!(calls.len() >= 2, "a multi-round turn must record >=2 calls; got {}", calls.len());
+    assert!(
+        calls.len() >= 2,
+        "a multi-round turn must record >=2 calls; got {}",
+        calls.len()
+    );
 
     // sanity: the helper is discriminating — two different histories differ.
     assert_ne!(
@@ -163,7 +180,10 @@ async fn wire_prefix_is_byte_stable_and_append_only_across_rounds() {
             persona0,
             "leading persona/system message must be byte-identical on call {i}"
         );
-        assert!(matches!(msgs[0].role, Role::System), "call {i} must lead with the system persona");
+        assert!(
+            matches!(msgs[0].role, Role::System),
+            "call {i} must lead with the system persona"
+        );
     }
 }
 
@@ -179,9 +199,15 @@ async fn wire_prefix_append_only_across_turns() {
             StreamEvent::ToolCall(tool_call("c1", "echo", "{\"text\":\"one\"}")),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("first turn done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("first turn done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
         // Turn 2: round 1 → stop immediately (single round).
-        vec![StreamEvent::TextDelta("second turn done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("second turn done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
 
@@ -192,7 +218,11 @@ async fn wire_prefix_append_only_across_turns() {
     let _ = handle.task.await;
 
     let calls = calls.lock().unwrap();
-    assert!(calls.len() >= 3, "two turns (2-round + 1-round) must record >=3 calls; got {}", calls.len());
+    assert!(
+        calls.len() >= 3,
+        "two turns (2-round + 1-round) must record >=3 calls; got {}",
+        calls.len()
+    );
 
     // Turn boundary: turn 1 used calls[0..=1]; turn 2's first call is calls[2].
     let last_of_turn1 = history_repr(&calls[1].0);
@@ -214,8 +244,16 @@ async fn wire_prefix_append_only_across_turns() {
         );
     }
     for (i, (msgs, tools, _opts)) in calls.iter().enumerate() {
-        assert_eq!(tool_block_repr(tools), frozen_tools, "tool block must be frozen across turns on call {i}");
-        assert_eq!(history_repr(&msgs[..1]), persona0, "persona must be byte-identical across turns on call {i}");
+        assert_eq!(
+            tool_block_repr(tools),
+            frozen_tools,
+            "tool block must be frozen across turns on call {i}"
+        );
+        assert_eq!(
+            history_repr(&msgs[..1]),
+            persona0,
+            "persona must be byte-identical across turns on call {i}"
+        );
     }
 }
 
@@ -226,12 +264,27 @@ async fn wire_prefix_append_only_across_turns() {
 async fn tool_block_is_frozen_byte_for_byte_every_call() {
     let provider = Arc::new(RecordingProvider::new(vec![
         // Turn 1: 3 rounds (two tool calls then stop).
-        vec![StreamEvent::ToolCall(tool_call("a", "echo", "{}")), StreamEvent::Done { truncated: false }],
-        vec![StreamEvent::ToolCall(tool_call("b", "bash", "{\"cmd\":\"ls\"}")), StreamEvent::Done { truncated: false }],
-        vec![StreamEvent::TextDelta("done t1".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::ToolCall(tool_call("a", "echo", "{}")),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::ToolCall(tool_call("b", "bash", "{\"cmd\":\"ls\"}")),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("done t1".into()),
+            StreamEvent::Done { truncated: false },
+        ],
         // Turn 2: 2 rounds (one tool call then stop).
-        vec![StreamEvent::ToolCall(tool_call("c", "echo", "{}")), StreamEvent::Done { truncated: false }],
-        vec![StreamEvent::TextDelta("done t2".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::ToolCall(tool_call("c", "echo", "{}")),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("done t2".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
 
@@ -242,12 +295,22 @@ async fn tool_block_is_frozen_byte_for_byte_every_call() {
     let _ = handle.task.await;
 
     let calls = calls.lock().unwrap();
-    assert!(calls.len() >= 5, "multi-round multi-turn run must record >=5 calls; got {}", calls.len());
+    assert!(
+        calls.len() >= 5,
+        "multi-round multi-turn run must record >=5 calls; got {}",
+        calls.len()
+    );
 
     let first = tool_block_repr(&calls[0].1);
     // sanity: the tool block is non-empty (we mounted two tools) so "frozen" is meaningful.
-    assert!(!first.is_empty(), "tool block must be non-empty (two tools mounted)");
-    assert!(first.contains("echo") && first.contains("bash"), "both tools must be in the block");
+    assert!(
+        !first.is_empty(),
+        "tool block must be non-empty (two tools mounted)"
+    );
+    assert!(
+        first.contains("echo") && first.contains("bash"),
+        "both tools must be in the block"
+    );
     for (i, (_msgs, tools, _opts)) in calls.iter().enumerate() {
         assert_eq!(
             tool_block_repr(tools),

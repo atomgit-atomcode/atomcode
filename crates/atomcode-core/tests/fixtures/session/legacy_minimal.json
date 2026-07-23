@@ -1,0 +1,22 @@
+{
+  "id": "legacy-session-001",
+  "name": "default",
+  "working_dir": "/tmp/atomcode-legacy-project",
+  "created_at": 1600000000,
+  "updated_at": 1600000001,
+  "messages": [
+    {
+      "role": "User",
+      "content": { "Text": "old session message" }
+    },
+    {
+      "role": "Assistant",
+      "content": {
+        "AssistantWithToolCalls": {
+          "text": "old assistant message",
+          "tool_calls": []
+        }
+      }
+    }
+  ]
+}

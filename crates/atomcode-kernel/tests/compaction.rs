@@ -20,8 +20,8 @@ use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::message::{Role, SessionSnapshot};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
 use atomcode_kernel::testkit::{
-    EchoTool, InjectCommandTool, NeverShrinksStrategy, RecordingProvider,
-    StubToolResultsStrategy, SummarizeOldestStrategy,
+    EchoTool, InjectCommandTool, NeverShrinksStrategy, RecordingProvider, StubToolResultsStrategy,
+    SummarizeOldestStrategy,
 };
 use atomcode_kernel::tool::ToolRegistry;
 use std::sync::{Arc, Mutex};
@@ -48,7 +48,11 @@ impl CompactionCheckpoint for TestCheckpoint {
 fn high_pressure_turn() -> Vec<StreamEvent> {
     vec![
         StreamEvent::TextDelta("ok".into()),
-        StreamEvent::Usage(TokenUsage { prompt: 900, completion: 1, cached: 0 }),
+        StreamEvent::Usage(TokenUsage {
+            prompt: 900,
+            completion: 1,
+            cached: 0,
+        }),
         StreamEvent::Done { truncated: false },
     ]
 }
@@ -63,7 +67,13 @@ async fn drive_turn_collect(
     handle: &mut atomcode_kernel::agent::AgentHandle,
     text: &str,
 ) -> Vec<AgentEvent> {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: text.into(),
+            images: vec![],
+        })
+        .unwrap();
     let mut events = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         let done = matches!(ev, AgentEvent::TurnComplete { .. });
@@ -90,9 +100,14 @@ fn compacted_events(events: &[AgentEvent]) -> Vec<(u64, usize, usize, usize, boo
     events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::Compacted { epoch, removed, bytes_before, bytes_after, committed, .. } => {
-                Some((*epoch, *removed, *bytes_before, *bytes_after, *committed))
-            }
+            AgentEvent::Compacted {
+                epoch,
+                removed,
+                bytes_before,
+                bytes_after,
+                committed,
+                ..
+            } => Some((*epoch, *removed, *bytes_before, *bytes_after, *committed)),
             _ => None,
         })
         .collect()
@@ -105,8 +120,12 @@ fn compacted_events(events: &[AgentEvent]) -> Vec<(u64, usize, usize, usize, boo
 #[tokio::test]
 async fn default_kernel_never_compacts() {
     let provider = Arc::new(
-        RecordingProvider::new(vec![high_pressure_turn(), high_pressure_turn(), high_pressure_turn()])
-            .with_ctx_window(1000),
+        RecordingProvider::new(vec![
+            high_pressure_turn(),
+            high_pressure_turn(),
+            high_pressure_turn(),
+        ])
+        .with_ctx_window(1000),
     );
     let mut handle = atomcode_kernel::agent::Agent::builder()
         .provider(provider)
@@ -130,7 +149,10 @@ async fn default_kernel_never_compacts() {
 
     // Epoch never bumped; history only grew (3 turns → ≥ system+3*(user+assistant)).
     let snap = snapshot(&mut handle).await;
-    assert_eq!(snap.cache_epoch, 0, "neutral default must keep cache_epoch at 0");
+    assert_eq!(
+        snap.cache_epoch, 0,
+        "neutral default must keep cache_epoch at 0"
+    );
     assert!(
         snap.messages.len() >= 7,
         "history must only grow with no compaction; got {}",
@@ -160,7 +182,10 @@ async fn estimates_utilization_when_provider_omits_usage() {
                 // NOTE: no StreamEvent::Usage on purpose — usage.prompt stays 0.
                 StreamEvent::Done { truncated: false },
             ],
-            vec![StreamEvent::TextDelta("second".into()), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::TextDelta("second".into()),
+                StreamEvent::Done { truncated: false },
+            ],
         ])
         .with_ctx_window(100),
     );
@@ -213,7 +238,8 @@ async fn injected_strategy_compacts_at_task_boundary() {
                 StreamEvent::ToolCall(ToolCall {
                     id: "c1".into(),
                     name: "echo".into(),
-                    arguments: "{\"text\":\"a reasonably long first tool output to fill history\"}".into(),
+                    arguments: "{\"text\":\"a reasonably long first tool output to fill history\"}"
+                        .into(),
                 }),
                 StreamEvent::Done { truncated: false },
             ],
@@ -221,11 +247,18 @@ async fn injected_strategy_compacts_at_task_boundary() {
             // assistant message (which `should_compact` reads), then stop.
             vec![
                 StreamEvent::TextDelta("a long first assistant answer with content".into()),
-                StreamEvent::Usage(TokenUsage { prompt: 900, completion: 5, cached: 0 }),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 900,
+                    completion: 5,
+                    cached: 0,
+                }),
                 StreamEvent::Done { truncated: false },
             ],
             // Turn 2: just stop.
-            vec![StreamEvent::TextDelta("second".into()), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::TextDelta("second".into()),
+                StreamEvent::Done { truncated: false },
+            ],
         ])
         .with_ctx_window(1000),
     );
@@ -257,12 +290,22 @@ async fn injected_strategy_compacts_at_task_boundary() {
     // Turn 2: compaction fires at the boundary.
     let e2 = drive_turn_collect(&mut handle, "follow up").await;
     let comp = compacted_events(&e2);
-    assert_eq!(comp.len(), 1, "exactly one Compacted event at the turn-2 boundary");
+    assert_eq!(
+        comp.len(),
+        1,
+        "exactly one Compacted event at the turn-2 boundary"
+    );
     let (epoch, removed, bytes_before, bytes_after, committed) = comp[0];
     assert!(committed, "the injected strategy's plan must commit");
     assert_eq!(epoch, 1, "a committed compaction opens epoch 1 (was 0)");
-    assert!(removed > 0, "a summarize-oldest commit must remove messages");
-    assert!(bytes_after < bytes_before, "committed compaction must shrink bytes");
+    assert!(
+        removed > 0,
+        "a summarize-oldest commit must remove messages"
+    );
+    assert!(
+        bytes_after < bytes_before,
+        "committed compaction must shrink bytes"
+    );
 
     // The turn-2 first request history is SHORTER than the un-compacted history
     // WOULD have been (turn-1 end + the one new user message), leads with the
@@ -281,13 +324,19 @@ async fn injected_strategy_compacts_at_task_boundary() {
         );
         // Frozen system prefix preserved byte-identically across the compaction epoch.
         assert_eq!(turn2_first[0].role, Role::System);
-        assert_eq!(system_turn1.text, turn2_first[0].text, "System message must be byte-identical");
+        assert_eq!(
+            system_turn1.text, turn2_first[0].text,
+            "System message must be byte-identical"
+        );
         assert_eq!(turn2_first[0].text, PERSONA);
         // A synthetic Role::User summary is present.
         let has_synth_summary = turn2_first
             .iter()
             .any(|m| m.role == Role::User && m.synthetic && m.text.contains("summary of"));
-        assert!(has_synth_summary, "a synthetic Role::User summary must be present after compaction");
+        assert!(
+            has_synth_summary,
+            "a synthetic Role::User summary must be present after compaction"
+        );
     }
 
     handle.commands.send(AgentCommand::Shutdown).unwrap();
@@ -320,21 +369,33 @@ async fn manual_compact_command_triggers_regardless_of_threshold() {
     let _ = drive_turn_collect(&mut handle, "the task with several words to drain later").await;
 
     // Manual Compact at idle.
-    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::Compact { focus: None })
+        .unwrap();
     let mut comp = None;
     while let Some(ev) = handle.events.recv().await {
-        if let AgentEvent::Compacted { epoch, committed, .. } = ev {
+        if let AgentEvent::Compacted {
+            epoch, committed, ..
+        } = ev
+        {
             comp = Some((epoch, committed));
             break;
         }
     }
     let (epoch, committed) = comp.expect("manual Compact must emit a Compacted event");
-    assert!(committed, "the strategy shrinks → manual compaction commits");
+    assert!(
+        committed,
+        "the strategy shrinks → manual compaction commits"
+    );
     assert_eq!(epoch, 1, "manual committed compaction opens epoch 1");
 
     // Confirm epoch persisted on the conversation.
     let snap = snapshot(&mut handle).await;
-    assert_eq!(snap.cache_epoch, 1, "manual compaction bumped the conversation's cache_epoch");
+    assert_eq!(
+        snap.cache_epoch, 1,
+        "manual compaction bumped the conversation's cache_epoch"
+    );
 
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
@@ -350,7 +411,10 @@ async fn manual_compaction_success_is_checkpointed_before_event() {
         .with_ctx_window(1000),
     );
     let saved = Arc::new(Mutex::new(Vec::new()));
-    let checkpoint = Arc::new(TestCheckpoint { saved: saved.clone(), failure: None });
+    let checkpoint = Arc::new(TestCheckpoint {
+        saved: saved.clone(),
+        failure: None,
+    });
     let mut handle = atomcode_kernel::agent::Agent::builder()
         .provider(provider)
         .tools(registry().mount(&["echo"]))
@@ -361,11 +425,18 @@ async fn manual_compaction_success_is_checkpointed_before_event() {
         .spawn();
 
     let _ = drive_turn_collect(&mut handle, "the task with several words to drain later").await;
-    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::Compact { focus: None })
+        .unwrap();
 
     let committed = loop {
         match handle.events.recv().await {
-            Some(AgentEvent::Compacted { committed: true, snapshot: Some(snapshot), .. }) => {
+            Some(AgentEvent::Compacted {
+                committed: true,
+                snapshot: Some(snapshot),
+                ..
+            }) => {
                 break snapshot;
             }
             Some(AgentEvent::CompactionFailed { error, .. }) => {
@@ -412,7 +483,10 @@ async fn manual_compaction_checkpoint_failure_keeps_live_conversation_unchanged(
 
     let _ = drive_turn_collect(&mut handle, "the task with several words to drain later").await;
     let before = snapshot(&mut handle).await;
-    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::Compact { focus: None })
+        .unwrap();
 
     loop {
         match handle.events.recv().await {
@@ -429,7 +503,10 @@ async fn manual_compaction_checkpoint_failure_keeps_live_conversation_unchanged(
     }
 
     let after = snapshot(&mut handle).await;
-    assert_eq!(after, before, "checkpoint failure must not change messages, counters, or epoch");
+    assert_eq!(
+        after, before,
+        "checkpoint failure must not change messages, counters, or epoch"
+    );
 
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
@@ -458,7 +535,10 @@ async fn manual_compact_emits_started_before_compacted_when_summarizing() {
 
     let _ = drive_turn_collect(&mut handle, "the task with several words to drain later").await;
 
-    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::Compact { focus: None })
+        .unwrap();
     let mut events = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         let done = matches!(ev, AgentEvent::Compacted { .. });
@@ -476,9 +556,18 @@ async fn manual_compact_emits_started_before_compacted_when_summarizing() {
         .iter()
         .position(|e| matches!(e, AgentEvent::Compacted { .. }))
         .expect("and a terminal Compacted");
-    assert!(started < compacted, "CompactionStarted must precede Compacted");
     assert!(
-        matches!(events[compacted], AgentEvent::Compacted { committed: true, .. }),
+        started < compacted,
+        "CompactionStarted must precede Compacted"
+    );
+    assert!(
+        matches!(
+            events[compacted],
+            AgentEvent::Compacted {
+                committed: true,
+                ..
+            }
+        ),
         "the strategy shrinks → committed"
     );
 
@@ -510,7 +599,10 @@ async fn manual_compact_stays_silent_when_nothing_to_summarize() {
 
     let _ = drive_turn_collect(&mut handle, "the task").await;
 
-    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::Compact { focus: None })
+        .unwrap();
     let mut events = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         let done = matches!(ev, AgentEvent::Compacted { .. });
@@ -521,11 +613,19 @@ async fn manual_compact_stays_silent_when_nothing_to_summarize() {
     }
 
     assert!(
-        !events.iter().any(|e| matches!(e, AgentEvent::CompactionStarted { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::CompactionStarted { .. })),
         "a no-op /compact must NOT announce 'compacting…'"
     );
     assert!(
-        matches!(events.last(), Some(AgentEvent::Compacted { committed: false, .. })),
+        matches!(
+            events.last(),
+            Some(AgentEvent::Compacted {
+                committed: false,
+                ..
+            })
+        ),
         "a no-op /compact still emits a (refused) Compacted"
     );
 
@@ -556,22 +656,40 @@ async fn net_loss_plan_is_refused_no_epoch_bump() {
     let _ = drive_turn_collect(&mut handle, "the task").await;
     let before = snapshot(&mut handle).await;
 
-    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::Compact { focus: None })
+        .unwrap();
     let mut comp = None;
     while let Some(ev) = handle.events.recv().await {
-        if let AgentEvent::Compacted { epoch, committed, removed, .. } = ev {
+        if let AgentEvent::Compacted {
+            epoch,
+            committed,
+            removed,
+            ..
+        } = ev
+        {
             comp = Some((epoch, committed, removed));
             break;
         }
     }
     let (epoch, committed, removed) = comp.expect("a refused compaction still emits Compacted");
-    assert!(!committed, "a net-loss plan must be REFUSED (committed=false)");
+    assert!(
+        !committed,
+        "a net-loss plan must be REFUSED (committed=false)"
+    );
     assert_eq!(removed, 0, "a refused compaction removes nothing");
     assert_eq!(epoch, 0, "a refused compaction must NOT bump the epoch");
 
     let after = snapshot(&mut handle).await;
-    assert_eq!(after.cache_epoch, 0, "cache_epoch unchanged after a refused compaction");
-    assert_eq!(after.messages, before.messages, "history byte-identical after a refused compaction");
+    assert_eq!(
+        after.cache_epoch, 0,
+        "cache_epoch unchanged after a refused compaction"
+    );
+    assert_eq!(
+        after.messages, before.messages,
+        "history byte-identical after a refused compaction"
+    );
 
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
@@ -601,7 +719,10 @@ async fn replaceability_two_strategies_differ() {
                 }),
                 StreamEvent::Done { truncated: false },
             ],
-            vec![StreamEvent::TextDelta("done turn 1".into()), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::TextDelta("done turn 1".into()),
+                StreamEvent::Done { truncated: false },
+            ],
             vec![
                 StreamEvent::ToolCall(ToolCall {
                     id: "c2".into(),
@@ -610,12 +731,18 @@ async fn replaceability_two_strategies_differ() {
                 }),
                 StreamEvent::Done { truncated: false },
             ],
-            vec![StreamEvent::TextDelta("done turn 2".into()), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::TextDelta("done turn 2".into()),
+                StreamEvent::Done { truncated: false },
+            ],
         ]
     }
 
-    async fn run(strategy: Arc<dyn atomcode_kernel::message::CompactionStrategy>) -> SessionSnapshot {
-        let provider = Arc::new(RecordingProvider::new(build_history_turns()).with_ctx_window(1000));
+    async fn run(
+        strategy: Arc<dyn atomcode_kernel::message::CompactionStrategy>,
+    ) -> SessionSnapshot {
+        let provider =
+            Arc::new(RecordingProvider::new(build_history_turns()).with_ctx_window(1000));
         let mut handle = atomcode_kernel::agent::Agent::builder()
             .provider(provider)
             .tools(registry().mount(&["echo"]))
@@ -626,7 +753,10 @@ async fn replaceability_two_strategies_differ() {
         let _ = drive_turn_collect(&mut handle, "do the first thing").await;
         let _ = drive_turn_collect(&mut handle, "do the second thing").await;
         // Manual Compact.
-        handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+        handle
+            .commands
+            .send(AgentCommand::Compact { focus: None })
+            .unwrap();
         // Wait for the Compacted event, then snapshot.
         while let Some(ev) = handle.events.recv().await {
             if matches!(ev, AgentEvent::Compacted { .. }) {
@@ -642,14 +772,20 @@ async fn replaceability_two_strategies_differ() {
     // Baseline (no compaction) message count, to measure each strategy's delta.
     let baseline = run(Arc::new(atomcode_kernel::message::NoCompaction)).await;
     let baseline_count = baseline.messages.len();
-    assert_eq!(baseline.cache_epoch, 0, "NoCompaction baseline never bumps epoch");
+    assert_eq!(
+        baseline.cache_epoch, 0,
+        "NoCompaction baseline never bumps epoch"
+    );
 
     let summarized = run(Arc::new(SummarizeOldestStrategy { keep_recent: 1 })).await;
     let stubbed = run(Arc::new(StubToolResultsStrategy)).await;
 
     // SummarizeOldest → committed (epoch bumped), FEWER messages than baseline,
     // and a synthetic summary present.
-    assert_eq!(summarized.cache_epoch, 1, "SummarizeOldest commit bumps epoch");
+    assert_eq!(
+        summarized.cache_epoch, 1,
+        "SummarizeOldest commit bumps epoch"
+    );
     assert!(
         summarized.messages.len() < baseline_count,
         "SummarizeOldest must reduce message count: {} !< {}",
@@ -657,11 +793,17 @@ async fn replaceability_two_strategies_differ() {
         baseline_count
     );
     assert!(
-        summarized.messages.iter().any(|m| m.synthetic && m.text.contains("summary of")),
+        summarized
+            .messages
+            .iter()
+            .any(|m| m.synthetic && m.text.contains("summary of")),
         "SummarizeOldest must insert a synthetic summary"
     );
     let summarized_has_elided = summarized.messages.iter().any(|m| m.text == "[elided]");
-    assert!(!summarized_has_elided, "SummarizeOldest must NOT produce an [elided] stub");
+    assert!(
+        !summarized_has_elided,
+        "SummarizeOldest must NOT produce an [elided] stub"
+    );
 
     // StubToolResults → committed (epoch bumped), SAME message count as baseline,
     // and an older tool-result text rewritten to the [elided] stub.
@@ -676,9 +818,15 @@ async fn replaceability_two_strategies_differ() {
         .iter()
         .filter(|m| m.tool_call_id.is_some() && m.text == "[elided]")
         .count();
-    assert_eq!(stubbed_elided, 1, "StubToolResults must stub exactly the one older tool result");
+    assert_eq!(
+        stubbed_elided, 1,
+        "StubToolResults must stub exactly the one older tool result"
+    );
     assert!(
-        !stubbed.messages.iter().any(|m| m.synthetic && m.text.contains("summary of")),
+        !stubbed
+            .messages
+            .iter()
+            .any(|m| m.synthetic && m.text.contains("summary of")),
         "StubToolResults must NOT insert a summary"
     );
 
@@ -725,7 +873,11 @@ async fn committed_compaction_relieves_pressure_and_does_not_refire() {
             // 900/1000), then stop. This is the assistant `should_compact` reads.
             vec![
                 StreamEvent::TextDelta("ok".into()),
-                StreamEvent::Usage(TokenUsage { prompt: 900, completion: 1, cached: 0 }),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 900,
+                    completion: 1,
+                    cached: 0,
+                }),
                 StreamEvent::Done { truncated: false },
             ],
             // Turn 2: a mid-stream Error → the turn early-returns and pushes NO
@@ -737,7 +889,10 @@ async fn committed_compaction_relieves_pressure_and_does_not_refire() {
                 ..Default::default()
             })],
             // Turn 3: a normal short answer (only reached if turn 3 runs at all).
-            vec![StreamEvent::TextDelta("again".into()), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::TextDelta("again".into()),
+                StreamEvent::Done { truncated: false },
+            ],
         ])
         .with_ctx_window(1000),
     );
@@ -798,7 +953,10 @@ async fn mid_turn_snapshot_is_queued_and_delivered_after_turn() {
 
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(EchoTool));
-    reg.register(Arc::new(InjectCommandTool::new(deferred.clone(), AgentCommand::Snapshot)));
+    reg.register(Arc::new(InjectCommandTool::new(
+        deferred.clone(),
+        AgentCommand::Snapshot,
+    )));
 
     let provider = Arc::new(
         RecordingProvider::new(vec![
@@ -814,7 +972,10 @@ async fn mid_turn_snapshot_is_queued_and_delivered_after_turn() {
                 StreamEvent::Done { truncated: false },
             ],
             // Round 2: a final answer, then the turn completes.
-            vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::Done { truncated: false },
+            ],
         ])
         .with_ctx_window(1000),
     );
@@ -828,7 +989,13 @@ async fn mid_turn_snapshot_is_queued_and_delivered_after_turn() {
     // LATE-BIND the session's command sender into the tool now that it exists.
     *deferred.lock().unwrap() = Some(handle.commands.clone());
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     // Read events: the turn completes FIRST, then the queued Snapshot is drained
     // and an AgentEvent::Snapshot arrives. If the mid-turn Snapshot were dropped
@@ -872,7 +1039,10 @@ async fn mid_turn_send_message_is_folded_into_current_turn() {
     reg.register(Arc::new(EchoTool));
     reg.register(Arc::new(InjectCommandTool::new(
         deferred.clone(),
-        AgentCommand::SendMessage { text: "SECOND-PROMPT".into(), images: vec![] },
+        AgentCommand::SendMessage {
+            text: "SECOND-PROMPT".into(),
+            images: vec![],
+        },
     )));
 
     let provider = Arc::new(
@@ -889,7 +1059,10 @@ async fn mid_turn_send_message_is_folded_into_current_turn() {
             ],
             // Turn 1, round 2: SECOND-PROMPT has been folded in as a real user message.
             // Final answer → turn 1 completes. No turn 2 — the steer was handled here.
-            vec![StreamEvent::TextDelta("both done".into()), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::TextDelta("both done".into()),
+                StreamEvent::Done { truncated: false },
+            ],
         ])
         .with_ctx_window(1000),
     );
@@ -903,7 +1076,13 @@ async fn mid_turn_send_message_is_folded_into_current_turn() {
         .spawn();
     *deferred.lock().unwrap() = Some(handle.commands.clone());
 
-    handle.commands.send(AgentCommand::SendMessage { text: "FIRST-PROMPT".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "FIRST-PROMPT".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     // Expect exactly ONE TurnComplete: the steer is folded into turn 1's round 2,
     // so there is no separate turn 2. (Pre-Task-2 behavior was two turns; Task 2
@@ -915,20 +1094,30 @@ async fn mid_turn_send_message_is_folded_into_current_turn() {
             break; // one is all we need
         }
     }
-    assert_eq!(completes, 1, "the steered mid-turn SendMessage must be folded into the same turn");
+    assert_eq!(
+        completes, 1,
+        "the steered mid-turn SendMessage must be folded into the same turn"
+    );
 
     // The steered prompt actually entered history and was sent to the provider in
     // turn 1 round 2 — proof it was not lost.
     let second_prompt_reached = {
         let recorded = calls.lock().unwrap();
-        recorded
-            .iter()
-            .any(|call| call.0.iter().any(|m| m.role == Role::User && m.text == "SECOND-PROMPT"))
+        recorded.iter().any(|call| {
+            call.0
+                .iter()
+                .any(|m| m.role == Role::User && m.text == "SECOND-PROMPT")
+        })
     };
     assert!(
         second_prompt_reached,
         "the steered prompt must reach the provider within the same turn; calls={:?}",
-        calls.lock().unwrap().iter().map(|c| c.0.iter().map(|m| &m.text).collect::<Vec<_>>()).collect::<Vec<_>>()
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.0.iter().map(|m| &m.text).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
     );
 
     handle.commands.send(AgentCommand::Shutdown).unwrap();
@@ -962,16 +1151,32 @@ async fn compaction_opens_new_epoch_preserving_system_prefix() {
     let system_before = before.messages[0].clone();
     assert_eq!(system_before.role, Role::System);
 
-    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::Compact { focus: None })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
-        if matches!(ev, AgentEvent::Compacted { committed: true, .. }) {
+        if matches!(
+            ev,
+            AgentEvent::Compacted {
+                committed: true,
+                ..
+            }
+        ) {
             break;
         }
     }
     let after = snapshot(&mut handle).await;
 
-    assert_eq!(after.cache_epoch, before.cache_epoch + 1, "epoch goes N → N+1 on a committed compaction");
-    assert_eq!(after.messages[0], system_before, "system message[0] must be byte-identical across the epoch");
+    assert_eq!(
+        after.cache_epoch,
+        before.cache_epoch + 1,
+        "epoch goes N → N+1 on a committed compaction"
+    );
+    assert_eq!(
+        after.messages[0], system_before,
+        "system message[0] must be byte-identical across the epoch"
+    );
 
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
@@ -1024,7 +1229,13 @@ async fn mid_turn_compact_is_queued_and_runs_at_turn_boundary() {
         .spawn();
     *deferred.lock().unwrap() = Some(handle.commands.clone());
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     // The turn completes FIRST; the queued Compact then runs and emits Compacted.
     // With the old silent-drop arm this recv hangs until the test timeout.

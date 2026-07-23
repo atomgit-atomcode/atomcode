@@ -48,3 +48,16 @@ test('pending mode switch ignores a second user selection', () => {
 
   assert.deepEqual(beginModeSwitch(pending, 'bypass'), pending);
 });
+
+test('mode switch supports accept_edits', () => {
+  const pending = beginModeSwitch(initModeState('build'), 'accept_edits');
+  assert.deepEqual(pending, {
+    confirmedMode: 'build' satisfies ApprovalMode,
+    displayMode: 'accept_edits' satisfies ApprovalMode,
+    pendingMode: 'accept_edits' satisfies ApprovalMode,
+  });
+  assert.deepEqual(completeModeSwitch(pending, 'accept_edits'), {
+    confirmedMode: 'accept_edits' satisfies ApprovalMode,
+    displayMode: 'accept_edits' satisfies ApprovalMode,
+  });
+});

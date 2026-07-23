@@ -6,8 +6,8 @@
 //! own risk metadata already marks the mutating ones: write/edit/bash). Read-only
 //! tools (read_file, grep, list_*, symbols, web, …) stay available.
 //!
-//! The flag is an `Arc<AtomicBool>` so the driver can toggle it live (the bridge maps
-//! `SetPlanMode` onto it) without a respawn — like the shared cwd handle.
+//! The flag is an `Arc<AtomicBool>` so `CodingRuntime::set_mode` can toggle it live
+//! without a respawn — like the shared cwd handle.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -82,7 +82,9 @@ impl ToolMiddleware for PlanModeGate {
             // decision (returns Allow/Deny) so the generic ApprovalMiddleware after it
             // never double-prompts — same pattern as the write gate.
             if self.mcp_grants.is_granted(&call.name) {
-                return BeforeOutcome::Allow { reason: Some("approved this session".into()) };
+                return BeforeOutcome::Allow {
+                    reason: Some("approved this session".into()),
+                };
             }
             let payload = serde_json::to_value(ApprovalRequest {
                 call_id: call.id.clone(),
@@ -91,12 +93,14 @@ impl ToolMiddleware for PlanModeGate {
             })
             .unwrap_or(serde_json::Value::Null);
             return match PermissionDecision::from_value(&rt.request(APPROVAL_KIND, payload).await) {
-                PermissionDecision::AllowOnce => {
-                    BeforeOutcome::Allow { reason: Some("approved once (plan mode)".into()) }
-                }
+                PermissionDecision::AllowOnce => BeforeOutcome::Allow {
+                    reason: Some("approved once (plan mode)".into()),
+                },
                 PermissionDecision::AllowAlways => {
                     self.mcp_grants.grant(&call.name);
-                    BeforeOutcome::Allow { reason: Some("approved always (plan mode)".into()) }
+                    BeforeOutcome::Allow {
+                        reason: Some("approved always (plan mode)".into()),
+                    }
                 }
                 PermissionDecision::Deny => BeforeOutcome::deny(format!(
                     "plan mode: `{}` was not approved — present a plan and switch to build mode \
@@ -146,9 +150,9 @@ impl PlanModeReminderHook {
 impl LifecycleHooks for PlanModeReminderHook {
     async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
         if self.active.load(Ordering::Relaxed) {
-            messages.push(Message::user(atomcode_capabilities::reminder::system_reminder(
-                PLAN_MODE_REMINDER_BODY,
-            )));
+            messages.push(Message::user(
+                atomcode_capabilities::reminder::system_reminder(PLAN_MODE_REMINDER_BODY),
+            ));
         }
     }
 }
@@ -194,7 +198,12 @@ mod tests {
             true
         }
         async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-            ToolResult { call_id: String::new(), content: String::new(), is_error: false, images: vec![] }
+            ToolResult {
+                call_id: String::new(),
+                content: String::new(),
+                is_error: false,
+                images: vec![],
+            }
         }
     }
 
@@ -204,8 +213,11 @@ mod tests {
         let gate = PlanModeGate::new(flag.clone(), grants());
         let risky: Arc<dyn Tool> = Arc::new(RiskyWriteTool); // always Risky
         let safe: Arc<dyn Tool> = Arc::new(EchoTool); // Safe
-        let mut call =
-            ToolCall { id: "c".into(), name: "risky_write".into(), arguments: "{}".into() };
+        let mut call = ToolCall {
+            id: "c".into(),
+            name: "risky_write".into(),
+            arguments: "{}".into(),
+        };
 
         // Inactive: nothing blocked.
         assert!(!gate.before(&mut call, &risky, &rt()).await.is_deny());
@@ -213,7 +225,11 @@ mod tests {
         // Active: Risky blocked, Safe allowed.
         flag.store(true, Ordering::Relaxed);
         assert!(gate.before(&mut call, &risky, &rt()).await.is_deny());
-        let mut safe_call = ToolCall { id: "c".into(), name: "echo".into(), arguments: "{}".into() };
+        let mut safe_call = ToolCall {
+            id: "c".into(),
+            name: "echo".into(),
+            arguments: "{}".into(),
+        };
         assert!(!gate.before(&mut safe_call, &safe, &rt()).await.is_deny());
     }
 
@@ -224,10 +240,16 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(true));
         let gate = PlanModeGate::new(flag, grants());
         let ro: Arc<dyn Tool> = Arc::new(ReadOnlyMcpTool);
-        let mut call =
-            ToolCall { id: "c".into(), name: "mcp__docs__query".into(), arguments: "{}".into() };
+        let mut call = ToolCall {
+            id: "c".into(),
+            name: "mcp__docs__query".into(),
+            arguments: "{}".into(),
+        };
         let out = gate.before(&mut call, &ro, &rt()).await;
-        assert!(!out.is_deny(), "read-only MCP must be allowed in plan mode, got {out:?}");
+        assert!(
+            !out.is_deny(),
+            "read-only MCP must be allowed in plan mode, got {out:?}"
+        );
     }
 
     /// A mutating / unannotated MCP tool is NOT hard-blocked in plan mode — it PROMPTS
@@ -239,8 +261,11 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(true));
         let gate = PlanModeGate::new(flag, grants());
         let safe: Arc<dyn Tool> = Arc::new(EchoTool); // read_only_hint()==false, mcp__ name
-        let mut call =
-            ToolCall { id: "c".into(), name: "mcp__docs__delete".into(), arguments: "{}".into() };
+        let mut call = ToolCall {
+            id: "c".into(),
+            name: "mcp__docs__delete".into(),
+            arguments: "{}".into(),
+        };
         let out = gate.before(&mut call, &safe, &rt_timeout()).await;
         assert!(out.is_deny(), "un-answered prompt degrades to deny");
         assert!(
@@ -263,8 +288,11 @@ mod tests {
         // short-circuits BEFORE rt.request, so the no-timeout rt() can't hang.
         let gate = PlanModeGate::new(flag, store);
         let safe: Arc<dyn Tool> = Arc::new(EchoTool);
-        let mut call =
-            ToolCall { id: "c".into(), name: "mcp__docs__delete".into(), arguments: "{}".into() };
+        let mut call = ToolCall {
+            id: "c".into(),
+            name: "mcp__docs__delete".into(),
+            arguments: "{}".into(),
+        };
         let out = gate.before(&mut call, &safe, &rt()).await;
         assert!(
             matches!(out, BeforeOutcome::Allow { .. }),
@@ -287,8 +315,19 @@ mod tests {
         flag.store(true, Ordering::Relaxed);
         hook.pre_request(&mut msgs, &TurnCtx::default()).await;
         assert_eq!(msgs.len(), 3, "exactly one reminder tail appended");
-        assert_eq!(msgs[..2], before[..], "the cached prefix must be byte-identical");
-        assert!(msgs[2].text.contains("PLAN MODE"), "tail carries the plan reminder: {:?}", msgs[2].text);
-        assert!(msgs[2].text.to_lowercase().contains("stop"), "must tell the model to STOP after planning");
+        assert_eq!(
+            msgs[..2],
+            before[..],
+            "the cached prefix must be byte-identical"
+        );
+        assert!(
+            msgs[2].text.contains("PLAN MODE"),
+            "tail carries the plan reminder: {:?}",
+            msgs[2].text
+        );
+        assert!(
+            msgs[2].text.to_lowercase().contains("stop"),
+            "must tell the model to STOP after planning"
+        );
     }
 }

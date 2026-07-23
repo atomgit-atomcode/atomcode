@@ -218,7 +218,10 @@ impl WebSearchTool {
                     // Tokio timeout = curl couldn't complete the TCP handshake/DNS in time.
                     // This is a transport-level failure → signal the auto-offline verdict.
                     note_web_search_network_error();
-                    return fail(format!("Exa web search timed out after 30s for '{}'.", query))
+                    return fail(format!(
+                        "Exa web search timed out after 30s for '{}'.",
+                        query
+                    ));
                 }
             };
         let sse = match output {
@@ -234,7 +237,7 @@ impl WebSearchTool {
                     query,
                     o.status.code(),
                     String::from_utf8_lossy(&o.stderr).trim()
-                ))
+                ));
             }
             // Spawn failure = curl binary not found / OS error, NOT a network failure.
             // Do NOT call note_web_search_network_error() here.
@@ -290,20 +293,25 @@ impl WebSearchTool {
         // On Windows, prevent the spawned curl.exe from creating a visible console window.
         crate::process_utils::suppress_console_window(&mut cmd);
 
-        crate::ctrace!("TOOL", "web_search before cmd.output().await query={:?}", query);
+        crate::ctrace!(
+            "TOOL",
+            "web_search before cmd.output().await query={:?}",
+            query
+        );
         // tokio-level hard timeout (20s) on top of curl's own `--max-time 15`.
         // Belt-and-suspenders: if curl somehow doesn't honour its flag (DNS
         // wedge, broken pipe edge cases, child-reap stuck), the tokio future
         // still returns within 20s instead of hanging the agent indefinitely
         // — matches web_fetch's reqwest::timeout(20s) backstop.
-        let output = match tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            cmd.output(),
-        )
-        .await
+        let output = match tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output())
+            .await
         {
             Ok(r) => {
-                crate::ctrace!("TOOL", "web_search after cmd.output().await is_ok={}", r.is_ok());
+                crate::ctrace!(
+                    "TOOL",
+                    "web_search after cmd.output().await is_ok={}",
+                    r.is_ok()
+                );
                 r
             }
             Err(_) => {

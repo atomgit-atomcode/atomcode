@@ -28,8 +28,7 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
 /// Cooked terminal attributes captured before raw mode is enabled, restored
 /// verbatim from signal context (`tcsetattr` is async-signal-safe).
-static mut ORIG_TERMIOS: core::mem::MaybeUninit<libc::termios> =
-    core::mem::MaybeUninit::uninit();
+static mut ORIG_TERMIOS: core::mem::MaybeUninit<libc::termios> = core::mem::MaybeUninit::uninit();
 
 /// The bytes the signal handler emits to restore the terminal: the canonical
 /// `panic_restore_sequence` (Kitty-keyboard pop, mouse off, cursor show,
@@ -114,7 +113,10 @@ mod tests {
             text.contains("\x1b[?2004l"),
             "must disable bracketed paste (the panic sequence omits it): {text:?}"
         );
-        assert!(text.contains("\x1b[<1u"), "must pop Kitty keyboard: {text:?}");
+        assert!(
+            text.contains("\x1b[<1u"),
+            "must pop Kitty keyboard: {text:?}"
+        );
         assert!(text.contains("\x1b[?25h"), "must show the cursor: {text:?}");
     }
 }

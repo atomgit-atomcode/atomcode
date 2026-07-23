@@ -6,24 +6,21 @@
 //! - 自动重试
 //! - 自定义 Header（如认证 Token）
 
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::hook::{
-    Hook, HookResult,
-    OnMessageReceivedHook, OnTurnStartHook, OnTurnCompleteHook,
-    OnToolCallStartHook, OnModelResponseHook,
-    OnSessionStartHook, OnSessionEndHook, OnErrorHook,
-    PreToolExecutionHook, PostToolExecutionHook, PostTurnHook, SystemPromptHook,
-    UserMessageContext, TurnStartContext, TurnCompleteContext,
-    ToolCallStartContext, ToolResultContext, HookCtx,
-    ErrorContext, SessionContext,
-};
 use super::async_batcher::{AsyncWebhookBatcher, WebhookEvent};
+use crate::hook::{
+    ErrorContext, Hook, HookCtx, HookResult, OnErrorHook, OnMessageReceivedHook,
+    OnModelResponseHook, OnSessionEndHook, OnSessionStartHook, OnToolCallStartHook,
+    OnTurnCompleteHook, OnTurnStartHook, PostToolExecutionHook, PostTurnHook, PreToolExecutionHook,
+    SessionContext, SystemPromptHook, ToolCallStartContext, ToolResultContext, TurnCompleteContext,
+    TurnStartContext, UserMessageContext,
+};
 
 /// Webhook 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,9 +84,13 @@ impl WebhookHook {
             .unwrap_or_else(|_| Client::new());
 
         // 如果配置了批量处理，创建异步批处理器
-        let async_batcher = None;  // 默认使用同步模式
+        let async_batcher = None; // 默认使用同步模式
 
-        Self { config, client, async_batcher }
+        Self {
+            config,
+            client,
+            async_batcher,
+        }
     }
 
     /// 创建带异步批处理器的 WebhookHook
@@ -112,7 +113,11 @@ impl WebhookHook {
         // 如果启用了异步批处理，使用异步模式
         if let Some(ref batcher) = self.async_batcher {
             let event = WebhookEvent {
-                event: payload.get("event").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+                event: payload
+                    .get("event")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
                 hook_name: self.config.name.clone(),
                 trigger: self.config.trigger.clone(),
                 context: payload.clone(),
@@ -139,7 +144,9 @@ impl WebhookHook {
 
         // 构建请求
         let mut request = self.client.request(
-            method.parse().map_err(|e| format!("Invalid HTTP method: {}", e))?,
+            method
+                .parse()
+                .map_err(|e| format!("Invalid HTTP method: {}", e))?,
             url,
         );
 
@@ -158,7 +165,9 @@ impl WebhookHook {
         // 发送请求（带重试）
         let mut last_error = None;
         for attempt in 0..=self.config.retries {
-            let req = request.try_clone().ok_or_else(|| "Failed to clone request".to_string())?;
+            let req = request
+                .try_clone()
+                .ok_or_else(|| "Failed to clone request".to_string())?;
 
             match req.json(payload).send().await {
                 Ok(response) => {
@@ -178,7 +187,9 @@ impl WebhookHook {
                     } else {
                         last_error = Some(format!(
                             "HTTP {} at attempt {}: {}",
-                            status, attempt + 1, body
+                            status,
+                            attempt + 1,
+                            body
                         ));
                     }
                 }
@@ -270,7 +281,12 @@ impl OnTurnStartHook for WebhookHook {
 #[async_trait]
 impl OnToolCallStartHook for WebhookHook {
     async fn on_tool_call_start(&self, ctx: &ToolCallStartContext) -> HookResult {
-        if !self.config.trigger.to_lowercase().contains("tool_call_start") {
+        if !self
+            .config
+            .trigger
+            .to_lowercase()
+            .contains("tool_call_start")
+        {
             return HookResult::Ok;
         }
 
@@ -443,7 +459,12 @@ impl OnErrorHook for WebhookHook {
 #[async_trait]
 impl OnModelResponseHook for WebhookHook {
     async fn on_model_response(&self, response: &str, turn_ctx: &TurnStartContext) -> HookResult {
-        if !self.config.trigger.to_lowercase().contains("model_response") {
+        if !self
+            .config
+            .trigger
+            .to_lowercase()
+            .contains("model_response")
+        {
             return HookResult::Ok;
         }
 

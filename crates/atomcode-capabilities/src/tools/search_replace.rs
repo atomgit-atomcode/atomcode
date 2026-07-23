@@ -70,11 +70,17 @@ impl Tool for SearchReplaceTool {
             }
         };
         if a.search.is_empty() {
-            return err("search_replace: search is empty — an empty pattern would corrupt every file.".to_string());
+            return err(
+                "search_replace: search is empty — an empty pattern would corrupt every file."
+                    .to_string(),
+            );
         }
         let root = resolve_path(a.path.as_deref().unwrap_or("."), &ctx.working_dir);
         if !root.exists() {
-            return err(format!("search_replace: directory not found: {}", crate::pathnorm::to_display(&root)));
+            return err(format!(
+                "search_replace: directory not found: {}",
+                crate::pathnorm::to_display(&root)
+            ));
         }
 
         // Regex mode compiles the pattern; literal mode matches the raw string verbatim
@@ -101,7 +107,13 @@ impl Tool for SearchReplaceTool {
         let search = a.search.clone();
         let replace = a.replace.clone();
         let (modified, scanned) = tokio::task::spawn_blocking(move || {
-            sr_scan(&scan_root, re.as_ref(), &search, &replace, glob_filter.as_ref())
+            sr_scan(
+                &scan_root,
+                re.as_ref(),
+                &search,
+                &replace,
+                glob_filter.as_ref(),
+            )
         })
         .await
         .unwrap_or_else(|_| (Vec::new(), 0));
@@ -111,10 +123,16 @@ impl Tool for SearchReplaceTool {
         let mut report = Vec::new();
         for (path, new_content, count) in modified {
             if let Err(e) = tokio::fs::write(&path, &new_content).await {
-                return err(format!("search_replace: failed to write {}: {e}", crate::pathnorm::to_display(&path)));
+                return err(format!(
+                    "search_replace: failed to write {}: {e}",
+                    crate::pathnorm::to_display(&path)
+                ));
             }
             total += count;
-            report.push(format!("  {} ({count} replacements)", crate::pathnorm::to_display(&path)));
+            report.push(format!(
+                "  {} ({count} replacements)",
+                crate::pathnorm::to_display(&path)
+            ));
         }
 
         if report.is_empty() {
@@ -182,7 +200,10 @@ fn sr_scan(
                 if !re.is_match(&content) {
                     continue;
                 }
-                (re.replace_all(&content, replace).to_string(), re.find_iter(&content).count())
+                (
+                    re.replace_all(&content, replace).to_string(),
+                    re.find_iter(&content).count(),
+                )
             }
             None => {
                 // Literal mode. Match verbatim first; on a literal hit the search already
@@ -194,7 +215,11 @@ fn sr_scan(
                 let (needle, repl, count) = if literal > 0 {
                     (search.to_string(), replace.to_string(), literal)
                 } else {
-                    let file_eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
+                    let file_eol = if content.contains("\r\n") {
+                        "\r\n"
+                    } else {
+                        "\n"
+                    };
                     let n = coerce_eol(search, file_eol);
                     let c = content.matches(&n).count();
                     (n, coerce_eol(replace, file_eol), c)
@@ -232,7 +257,8 @@ impl FileGlob {
     fn is_match(&self, file_path: &Path, root: &Path) -> bool {
         if self.has_path {
             let rel = file_path.strip_prefix(root).unwrap_or(file_path);
-            self.matcher.is_match(rel.to_string_lossy().replace('\\', "/"))
+            self.matcher
+                .is_match(rel.to_string_lossy().replace('\\', "/"))
         } else {
             match file_path.file_name().and_then(|n| n.to_str()) {
                 Some(name) => self.matcher.is_match(name),
@@ -252,6 +278,7 @@ mod tests {
             working_dir: dir.to_path_buf(),
             cancel: CancellationToken::new(),
             progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
         }
     }
 
@@ -261,12 +288,27 @@ mod tests {
         std::fs::write(d.path().join("a.txt"), "foo bar foo").unwrap();
         std::fs::write(d.path().join("b.txt"), "no match here").unwrap();
         std::fs::write(d.path().join("c.txt"), "foo").unwrap();
-        let r = SearchReplaceTool.execute(r#"{"search":"foo","replace":"baz"}"#, &ctx(d.path())).await;
+        let r = SearchReplaceTool
+            .execute(r#"{"search":"foo","replace":"baz"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("3 replacements across 2 files"), "{}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "baz bar baz");
-        assert_eq!(std::fs::read_to_string(d.path().join("c.txt")).unwrap(), "baz");
-        assert_eq!(std::fs::read_to_string(d.path().join("b.txt")).unwrap(), "no match here");
+        assert!(
+            r.content.contains("3 replacements across 2 files"),
+            "{}",
+            r.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "baz bar baz"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("c.txt")).unwrap(),
+            "baz"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("b.txt")).unwrap(),
+            "no match here"
+        );
     }
 
     #[tokio::test]
@@ -275,11 +317,21 @@ mod tests {
         std::fs::write(d.path().join("keep.md"), "color").unwrap();
         std::fs::write(d.path().join("x.css"), "color").unwrap();
         let r = SearchReplaceTool
-            .execute(r#"{"search":"color","replace":"colour","glob":"*.css"}"#, &ctx(d.path()))
+            .execute(
+                r#"{"search":"color","replace":"colour","glob":"*.css"}"#,
+                &ctx(d.path()),
+            )
             .await;
         assert!(!r.is_error, "{}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("x.css")).unwrap(), "colour");
-        assert_eq!(std::fs::read_to_string(d.path().join("keep.md")).unwrap(), "color", "md untouched");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("x.css")).unwrap(),
+            "colour"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("keep.md")).unwrap(),
+            "color",
+            "md untouched"
+        );
     }
 
     #[tokio::test]
@@ -289,10 +341,16 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "alpha\r\nbeta\r\n").unwrap();
         let r = SearchReplaceTool
-            .execute(r#"{"search":"alpha\nbeta","replace":"ALPHA\nbeta"}"#, &ctx(d.path()))
+            .execute(
+                r#"{"search":"alpha\nbeta","replace":"ALPHA\nbeta"}"#,
+                &ctx(d.path()),
+            )
             .await;
         assert!(!r.is_error, "{}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "ALPHA\r\nbeta\r\n");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "ALPHA\r\nbeta\r\n"
+        );
     }
 
     #[tokio::test]
@@ -302,19 +360,35 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("m.txt"), "head\r\nfoo\nbar\n").unwrap();
         let r = SearchReplaceTool
-            .execute(r#"{"search":"foo\nbar","replace":"foo\nBAR"}"#, &ctx(d.path()))
+            .execute(
+                r#"{"search":"foo\nbar","replace":"foo\nBAR"}"#,
+                &ctx(d.path()),
+            )
             .await;
         assert!(!r.is_error, "{}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("m.txt")).unwrap(), "head\r\nfoo\nBAR\n");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("m.txt")).unwrap(),
+            "head\r\nfoo\nBAR\n"
+        );
     }
 
     #[tokio::test]
     async fn empty_search_is_rejected() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "abc").unwrap();
-        let r = SearchReplaceTool.execute(r#"{"search":"","replace":"X"}"#, &ctx(d.path())).await;
-        assert!(r.is_error, "empty search must be refused (would corrupt every file): {}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "abc", "unchanged");
+        let r = SearchReplaceTool
+            .execute(r#"{"search":"","replace":"X"}"#, &ctx(d.path()))
+            .await;
+        assert!(
+            r.is_error,
+            "empty search must be refused (would corrupt every file): {}",
+            r.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "abc",
+            "unchanged"
+        );
     }
 
     #[tokio::test]
@@ -322,9 +396,14 @@ mod tests {
         // Literal mode must treat `$1` in the replacement verbatim (not a capture ref).
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "key=val").unwrap();
-        let r = SearchReplaceTool.execute(r#"{"search":"val","replace":"$1x"}"#, &ctx(d.path())).await;
+        let r = SearchReplaceTool
+            .execute(r#"{"search":"val","replace":"$1x"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "key=$1x");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "key=$1x"
+        );
     }
 
     #[tokio::test]
@@ -332,10 +411,16 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("v.rs"), "let v1 = 1; let v2 = 2;").unwrap();
         let r = SearchReplaceTool
-            .execute(r#"{"search":"v(\\d)","replace":"w$1","regex":true}"#, &ctx(d.path()))
+            .execute(
+                r#"{"search":"v(\\d)","replace":"w$1","regex":true}"#,
+                &ctx(d.path()),
+            )
             .await;
         assert!(!r.is_error, "{}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("v.rs")).unwrap(), "let w1 = 1; let w2 = 2;");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("v.rs")).unwrap(),
+            "let w1 = 1; let w2 = 2;"
+        );
     }
 
     #[tokio::test]
@@ -343,16 +428,23 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "a.b a_b axb").unwrap();
         // "a.b" literal must match only "a.b", not "axb" (which `.` would match in regex).
-        let r = SearchReplaceTool.execute(r#"{"search":"a.b","replace":"Z"}"#, &ctx(d.path())).await;
+        let r = SearchReplaceTool
+            .execute(r#"{"search":"a.b","replace":"Z"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "Z a_b axb");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "Z a_b axb"
+        );
     }
 
     #[tokio::test]
     async fn no_matches_reports_and_is_not_error() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "nothing").unwrap();
-        let r = SearchReplaceTool.execute(r#"{"search":"zzz","replace":"x"}"#, &ctx(d.path())).await;
+        let r = SearchReplaceTool
+            .execute(r#"{"search":"zzz","replace":"x"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("No matches"), "{}", r.content);
     }
@@ -360,7 +452,12 @@ mod tests {
     #[tokio::test]
     async fn invalid_regex_errors() {
         let d = tempfile::tempdir().unwrap();
-        let r = SearchReplaceTool.execute(r#"{"search":"(unclosed","replace":"x","regex":true}"#, &ctx(d.path())).await;
+        let r = SearchReplaceTool
+            .execute(
+                r#"{"search":"(unclosed","replace":"x","regex":true}"#,
+                &ctx(d.path()),
+            )
+            .await;
         assert!(r.is_error);
         assert!(r.content.contains("invalid regex"), "{}", r.content);
     }
@@ -371,10 +468,19 @@ mod tests {
         std::fs::create_dir(d.path().join("target")).unwrap();
         std::fs::write(d.path().join("target/gen.rs"), "foo").unwrap();
         std::fs::write(d.path().join("src.rs"), "foo").unwrap();
-        let r = SearchReplaceTool.execute(r#"{"search":"foo","replace":"bar"}"#, &ctx(d.path())).await;
+        let r = SearchReplaceTool
+            .execute(r#"{"search":"foo","replace":"bar"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("src.rs")).unwrap(), "bar");
-        assert_eq!(std::fs::read_to_string(d.path().join("target/gen.rs")).unwrap(), "foo", "target/ skipped");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("src.rs")).unwrap(),
+            "bar"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("target/gen.rs")).unwrap(),
+            "foo",
+            "target/ skipped"
+        );
     }
 
     #[test]

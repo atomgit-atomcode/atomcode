@@ -12,9 +12,9 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
-pub mod uninstall;
 #[cfg(unix)]
 pub mod askpass;
+pub mod uninstall;
 
 /// ACP (Agent Client Protocol) stdio server — lets atomcode be driven by Zed /
 /// multi-agent orchestrators over stdin/stdout. Wired up by the `atomcode acp`

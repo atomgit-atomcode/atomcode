@@ -35,7 +35,11 @@ const TOOL_CALL_NDJSON: &str = concat!(
 
 fn provider_for(server_uri: &str) -> OllamaProvider {
     let mut cfg = OllamaConfig::new(server_uri, "qwen3");
-    cfg.retry = RetryPolicy { max_attempts: 3, base_delay: Duration::from_millis(1), max_delay: Duration::from_millis(5) };
+    cfg.retry = RetryPolicy {
+        max_attempts: 3,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    };
     OllamaProvider::new(cfg).expect("build provider")
 }
 
@@ -53,7 +57,12 @@ impl Tool for GetTimeTool {
         serde_json::json!({ "type": "object", "properties": {} })
     }
     async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "12:00".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "12:00".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -86,7 +95,11 @@ async fn retry_on_transient_500_then_succeeds() {
         }
     }
     assert_eq!(text, "It is noon.");
-    assert_eq!(server.received_requests().await.unwrap().len(), 2, "one 500 + one success");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        2,
+        "one 500 + one success"
+    );
 }
 
 #[tokio::test]
@@ -124,9 +137,18 @@ async fn multi_round_tool_call_then_final_answer() {
     assert_eq!(reqs.len(), 2, "round 1 (tool) + round 2 (final)");
     let round2 = String::from_utf8_lossy(&reqs[1].body);
     // The assistant tool_call (function get_time) is echoed back...
-    assert!(round2.contains("\"tool_calls\""), "round 2 echoes the assistant tool_calls: {round2}");
+    assert!(
+        round2.contains("\"tool_calls\""),
+        "round 2 echoes the assistant tool_calls: {round2}"
+    );
     assert!(round2.contains("get_time"), "with the tool name: {round2}");
     // ...and the kernel-supplied result is fed in as a role:"tool" message.
-    assert!(round2.contains("\"role\":\"tool\""), "round 2 carries a tool-role result: {round2}");
-    assert!(round2.contains("12:00"), "the tool's output is fed back: {round2}");
+    assert!(
+        round2.contains("\"role\":\"tool\""),
+        "round 2 carries a tool-role result: {round2}"
+    );
+    assert!(
+        round2.contains("12:00"),
+        "the tool's output is fed back: {round2}"
+    );
 }
