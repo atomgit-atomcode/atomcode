@@ -4801,11 +4801,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // (Cursor visibility is no longer coupled to the spinner — the
         // input box stays editable during streaming, so the caret is
         // always shown at the input position. See `paint_footer`.)
-        // After pop, the spinner row's screen slot is `next_body_emit_row`
-        // (1-indexed) — that's where the spinner was and where the next
-        // body emit will land. EL it now for immediate visual feedback;
-        // the next `paint_frame` cell-diff also redraws this region but
-        // the explicit erase removes any flash between pop and next tick.
+        // Capture the physical bottom BEFORE popping. With a full body,
+        // `next_body_emit_row()` saturates at the same last body row after
+        // the pop, so walking forward from it would erase the spinner and
+        // then the footer top rule while leaving the spacer untouched.
+        // The strip occupies the `remove` rows ending at this bottom.
+        let bottom_before_pop = self.body_bottom_row();
         crate::tuix_trace!(
             "BPOP",
             "site=spinner len_before={} n={} scrolled_off={}",
@@ -4816,14 +4817,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         for _ in 0..remove {
             self.body_lines.pop();
         }
-        let target = self.next_body_emit_row();
-        if target > 0 {
+        if bottom_before_pop > 0 {
+            let start = bottom_before_pop
+                .saturating_sub(remove as u16 - 1)
+                .max(1);
             let mut seq = String::new();
-            for offset in 0..remove as u16 {
-                let row = target.saturating_add(offset);
-                if row > self.screen.height() {
-                    break;
-                }
+            for row in start..=bottom_before_pop {
                 seq.push_str(&format!("\x1b[{};1H\x1b[K", row));
             }
             let _ = self.out.write_all(seq.as_bytes());
@@ -11921,6 +11920,54 @@ mod tests {
         );
         assert!(r.live_spinner_active);
         assert_eq!(r.body_lines.len(), body_capacity + 1);
+    }
+
+    #[test]
+    fn retained_full_body_clears_spinner_strip_without_touching_footer() {
+        let height = 8u16;
+        let (mut r, buf) = new_capturing(80, height);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        let body_capacity = (height as usize).saturating_sub(r.current_footer_rows());
+        for i in 0..body_capacity {
+            r.render(UiLine::AssistantText(format!("body-{i}\n")));
+        }
+        r.flush_deferred();
+
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Brewing".into(),
+            status,
+            menu: None,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        assert!(r.live_spinner_spacer_active);
+        let bottom = r.body_bottom_row();
+        assert_eq!(bottom as usize, body_capacity);
+
+        buf.lock().unwrap().clear();
+        assert!(r.clear_live_spinner());
+        let emitted = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let spacer_row = bottom - 1;
+        assert!(
+            emitted.contains(&format!("\x1b[{spacer_row};1H\x1b[K"))
+                && emitted.contains(&format!("\x1b[{bottom};1H\x1b[K")),
+            "clear must erase the spacer and spinner rows: {emitted:?}"
+        );
+        assert!(
+            !emitted.contains(&format!("\x1b[{};1H\x1b[K", bottom + 1)),
+            "clear must not erase the footer top row: {emitted:?}"
+        );
     }
 
     #[test]
