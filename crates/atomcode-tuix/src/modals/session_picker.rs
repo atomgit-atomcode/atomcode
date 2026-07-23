@@ -24,6 +24,14 @@ use crate::event_loop::{
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
+fn flatten_session_preparation<T>(
+    result: Result<Result<T, String>, tokio::task::JoinError>,
+) -> Result<T, String> {
+    result
+        .map_err(|error| format!("session preparation task failed: {error}"))
+        .and_then(|result| result)
+}
+
 pub struct SessionPicker {
     /// All sessions for the project, pre-filtered to message_count > 0.
     pub sessions: Vec<SessionMeta>,
@@ -271,8 +279,9 @@ impl Modal for SessionPicker {
                     // Filter matched nothing — ignore Enter, stay open.
                     return Ok(ModalAction::Continue);
                 };
-                let expected_bucket =
-                    atomcode_capabilities::session::SessionManager::project_hash(&ctx.working_dir);
+                let expected_bucket = ctx.current_session_project_bucket.clone().unwrap_or_else(|| {
+                    atomcode_capabilities::session::SessionManager::project_hash(&ctx.working_dir)
+                });
                 if self.replay_selected_current_session(
                     &ctx.current_session,
                     &expected_bucket,
@@ -288,7 +297,9 @@ impl Modal for SessionPicker {
                     renderer.flush();
                     return Ok(ModalAction::Continue);
                 }
-                if ctx.pending_session_resume.is_some() {
+                if ctx.pending_session_resume.is_some()
+                    || ctx.pending_session_resume_preparation.is_some()
+                {
                     renderer.render(UiLine::Error(
                         crate::i18n::t(crate::i18n::Msg::SessionLoadFailed {
                             error: "another session resume is still in progress",
@@ -299,49 +310,46 @@ impl Modal for SessionPicker {
                     return Ok(ModalAction::Close);
                 }
 
-                let result = (|| -> anyhow::Result<()> {
-                    if selected.project_bucket != expected_bucket {
-                        anyhow::bail!(
-                            "selected session moved from project bucket {} to {}",
-                            selected.project_bucket,
-                            expected_bucket
-                        );
-                    }
-                    let prepared =
+                let pending = crate::event_loop::PendingSessionResumePreparation {
+                    project_bucket: selected.project_bucket.clone(),
+                    session_id: selected.id.clone(),
+                    working_dir: ctx.working_dir.clone(),
+                };
+                ctx.pending_session_resume_preparation = Some(pending.clone());
+                let event_tx = ctx.runtime_event_tx.clone();
+                let runtime_id = ctx.foreground_runtime_id;
+                let preparation = pending.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
                         atomcode_daemon::legacy_convert::prepare_catalog_session_resume_in_project(
-                            &selected.project_bucket,
-                            &selected.id,
-                        )?
-                        .ok_or_else(|| anyhow::anyhow!("session {} not found", selected.id))?;
-                    let project_bucket = prepared.project_bucket;
-                    let session = Session::from_catalog_view(prepared.view)?;
-                    let working_dir = ctx.working_dir.clone();
-                    ctx.runtime
-                        .resume_session(
-                            session.id.clone(),
-                            working_dir.clone(),
-                            prepared.lease,
-                            ctx.foreground_runtime_id,
-                            ctx.runtime_event_tx.clone(),
+                            &preparation.project_bucket,
+                            &preparation.session_id,
                         )
-                        .map_err(|_| anyhow::anyhow!("coding runtime is unavailable"))?;
-                    ctx.pending_session_resume = Some(crate::event_loop::PendingSessionResume {
-                        project_bucket,
-                        session,
-                        working_dir,
-                        committed: None,
+                        .map_err(|error| error.to_string())
+                        .and_then(|prepared| {
+                            prepared.ok_or_else(|| {
+                                format!("session {} not found", preparation.session_id)
+                            })
+                        })
+                    })
+                    .await;
+                    let result = flatten_session_preparation(result);
+                    let _ = event_tx.send(crate::event_loop::bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: crate::event_loop::bg_runtime::RuntimeEventPayload::Driver(
+                            crate::event_loop::bg_runtime::DriverEvent::SessionResumePrepared {
+                                project_bucket: pending.project_bucket,
+                                session_id: pending.session_id,
+                                working_dir: pending.working_dir,
+                                result,
+                            },
+                        ),
                     });
-                    Ok(())
-                })();
-
-                if let Err(error) = result {
-                    let message = error.to_string();
-                    renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &message })
-                            .into_owned(),
-                    ));
-                    renderer.flush();
-                }
+                });
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
+                ));
+                renderer.flush();
                 Ok(ModalAction::Close)
             }
             KeyCode::Esc => {
@@ -1604,3 +1612,15 @@ mod tests {
         assert_eq!(context.ctx_window, 100);
     }
 }
+    #[tokio::test]
+    async fn preparation_join_failure_becomes_an_error_terminal() {
+        let joined = tokio::task::spawn_blocking(|| -> Result<(), String> {
+            panic!("preparation panic");
+        })
+        .await;
+
+        let error = flatten_session_preparation(joined).unwrap_err();
+
+        assert!(error.contains("session preparation task failed"));
+        assert!(error.contains("panicked"));
+    }

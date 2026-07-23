@@ -37,7 +37,7 @@ pub struct CatalogSessionView {
 /// Exact catalog selection prepared for a runtime resume. The importer and the
 /// replacement runtime share `lease`; dropping this value before handing the
 /// guard to `CodingRuntime` intentionally abandons the switch.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PreparedCatalogSessionResume {
     pub project_bucket: String,
     pub view: CatalogSessionView,
@@ -918,7 +918,10 @@ fn catalog_for_project_in_root(
     let mut entries: Vec<_> = scan
         .entries
         .into_iter()
-        .filter(|entry| entry.project_bucket == bucket)
+        .filter(|entry| {
+            entry.project_bucket == bucket
+                || working_dirs_equivalent(&entry.working_dir, working_dir)
+        })
         .collect();
     for entry in &mut entries {
         if !SessionMeta::name_needs_fallback(&entry.name, &entry.id) {
@@ -934,6 +937,11 @@ fn catalog_for_project_in_root(
         }
     }
     Ok(entries)
+}
+
+fn working_dirs_equivalent(left: &std::path::Path, right: &std::path::Path) -> bool {
+    atomcode_capabilities::pathnorm::path_case_key(left)
+        == atomcode_capabilities::pathnorm::path_case_key(right)
 }
 
 pub fn load_catalog_session_view(
@@ -3134,6 +3142,73 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "首次展示名称");
         assert_eq!(manager.read_meta(id).unwrap().name, "首次展示名称");
+    }
+
+    #[test]
+    fn project_catalog_includes_equivalent_working_dir_from_historical_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let working_dir = dir.path().join("project");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let current_bucket = SessionManager::project_hash(&working_dir);
+        let historical_bucket = "1111111111111111";
+
+        for (bucket, id, stored_working_dir) in [
+            (current_bucket.as_str(), "current", working_dir.clone()),
+            (historical_bucket, "historical", working_dir.clone()),
+        ] {
+            let manager = SessionManager::with_root(dir.path().join(bucket));
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot =
+                atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(id)]);
+            let mut meta = SessionMeta::new(id, stored_working_dir.to_string_lossy(), 1);
+            meta.name = id.into();
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+        }
+
+        let entries = catalog_for_project_in_root(dir.path(), &working_dir).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| {
+            entry.id == "historical" && entry.project_bucket == historical_bucket
+        }));
+    }
+
+    #[test]
+    fn project_catalog_excludes_other_working_dir_from_historical_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let working_dir = dir.path().join("project");
+        let other_dir = dir.path().join("other");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let historical_bucket = "2222222222222222";
+        let manager = SessionManager::with_root(dir.path().join(historical_bucket));
+        let lease = manager.acquire_lease("other").unwrap();
+        let snapshot =
+            atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user("other")]);
+        let mut meta = SessionMeta::new("other", other_dir.to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+
+        let entries = catalog_for_project_in_root(dir.path(), &working_dir).unwrap();
+
+        assert!(entries.is_empty());
     }
 
     #[test]

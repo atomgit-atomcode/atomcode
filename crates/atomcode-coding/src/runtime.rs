@@ -3109,13 +3109,22 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
-                        let (input, prepared_lease) = match resolve_reprepare_input(&runtime, target) {
+                        let resolved = match resolve_reprepare_input(&runtime, target) {
                             Ok(input) => input,
                             Err(error) => {
                                 resources = Some(runtime);
                                 let _ = done.send(Err(error));
                                 continue;
                             }
+                        };
+                        // A same-directory ChangeDirectory resolves to no input: the current
+                        // runtime remains authoritative, with no candidate session, generation
+                        // advance, or reconfiguration events.
+                        let Some((input, prepared_lease)) = resolved else {
+                            let unchanged = session_changed(generation, &runtime);
+                            resources = Some(runtime);
+                            let _ = done.send(Ok(unchanged));
+                            continue;
                         };
                         let operation = input.operation;
                         let reuses_current_session = runtime
@@ -4723,47 +4732,47 @@ async fn receive_agent_event(agent: &mut Option<AgentHandle>) -> Option<AgentEve
 fn resolve_reprepare_input(
     runtime: &RuntimeResources,
     target: ReprepareTarget,
-) -> Result<(ReprepareInput, Option<SessionLease>), RuntimeError> {
+) -> Result<Option<(ReprepareInput, Option<SessionLease>)>, RuntimeError> {
     match target {
-        ReprepareTarget::Exact(input) => Ok((input, None)),
+        ReprepareTarget::Exact(input) => Ok(Some((input, None))),
         ReprepareTarget::Reload => {
             let mut prepare = runtime.prepare.clone();
             prepare.session = match runtime.parts.session.as_ref() {
                 Some(binding) => crate::SessionMode::Resume(binding.id.clone()),
                 None => crate::SessionMode::Disabled,
             };
-            Ok((
+            Ok(Some((
                 ReprepareInput {
                     config: runtime.config.clone(),
                     prepare,
                     operation: ReconfigureKind::Reprepare,
                 },
                 None,
-            ))
+            )))
         }
         ReprepareTarget::Fresh => {
             let mut prepare = runtime.prepare.clone();
             prepare.session = crate::SessionMode::Fresh;
-            Ok((
+            Ok(Some((
                 ReprepareInput {
                     config: runtime.config.clone(),
                     prepare,
                     operation: ReconfigureKind::FreshSession,
                 },
                 None,
-            ))
+            )))
         }
         ReprepareTarget::Resume(id) => {
             let mut prepare = runtime.prepare.clone();
             prepare.session = crate::SessionMode::Resume(id);
-            Ok((
+            Ok(Some((
                 ReprepareInput {
                     config: runtime.config.clone(),
                     prepare,
                     operation: ReconfigureKind::ResumeSession,
                 },
                 None,
-            ))
+            )))
         }
         ReprepareTarget::ResumeWithLease {
             id,
@@ -4796,14 +4805,14 @@ fn resolve_reprepare_input(
             config.working_dir = working_dir;
             let mut prepare = runtime.prepare.clone();
             prepare.session = crate::SessionMode::Resume(id);
-            Ok((
+            Ok(Some((
                 ReprepareInput {
                     config,
                     prepare,
                     operation: ReconfigureKind::ResumeSession,
                 },
                 Some(lease),
-            ))
+            )))
         }
         ReprepareTarget::ChangeDirectory(directory) => {
             let target = if directory.is_absolute() {
@@ -4824,18 +4833,27 @@ fn resolve_reprepare_input(
                     canonical.display()
                 )));
             }
+            let current = atomcode_capabilities::pathnorm::canonicalize(
+                &runtime.config.working_dir,
+            )
+            .unwrap_or_else(|_| runtime.config.working_dir.clone());
+            if atomcode_capabilities::pathnorm::path_case_key(&canonical)
+                == atomcode_capabilities::pathnorm::path_case_key(&current)
+            {
+                return Ok(None);
+            }
             let mut config = runtime.config.clone();
             config.working_dir = canonical;
             let mut prepare = runtime.prepare.clone();
             prepare.session = crate::SessionMode::Fresh;
-            Ok((
+            Ok(Some((
                 ReprepareInput {
                     config,
                     prepare,
                     operation: ReconfigureKind::ChangeDirectory,
                 },
                 None,
-            ))
+            )))
         }
     }
 }
@@ -9327,6 +9345,33 @@ mod tests {
         assert_eq!(changed.generation, RuntimeGeneration(1));
         assert!(changed.session_id.as_ref().is_some_and(|id| !id.is_empty()));
         assert_eq!(runtime.handle.status().generation, 1);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn change_directory_to_current_path_is_a_runtime_noop() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let before = runtime.handle.status();
+
+        let unchanged = runtime
+            .handle
+            .change_directory(project.path().join("."))
+            .await
+            .unwrap();
+
+        assert_eq!(unchanged.generation, RuntimeGeneration(before.generation));
+        assert_eq!(unchanged.working_dir, project.path());
+        assert_eq!(runtime.handle.status(), before);
+        assert!(
+            runtime.events.try_recv().is_err(),
+            "a no-op directory change must not emit reconfiguration events"
+        );
         runtime.handle.shutdown().await.unwrap();
     }
 

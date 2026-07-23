@@ -196,6 +196,21 @@ impl UsageModal {
         rows
     }
 
+    /// Theme-aware snapshot of the Current tab for non-interactive surfaces.
+    ///
+    /// Streaming `/usage` cannot install the interactive modal because live
+    /// token redraws own the footer. Reusing these rows keeps its headings,
+    /// progress bars, plan status, and palette identical to the modal without
+    /// presenting tabs or key hints that cannot be operated there.
+    pub(crate) fn current_snapshot_text(&self) -> String {
+        self.current_rows()
+            .into_iter()
+            .map(|(line, _)| line)
+            .skip_while(String::is_empty)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Build Overview tab rows — calendar heatmap + stats block.
     pub fn overview_lines(&self) -> Vec<String> {
         let m = muted_open();

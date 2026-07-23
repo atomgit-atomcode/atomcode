@@ -2364,18 +2364,26 @@ fn execute_slash_command_impl(
             }
             let new_dir = resolve_cd(arg, &ctx.working_dir, ctx.previous_dir.as_deref());
             match new_dir {
-                Ok(path) => match apply_cd_with_effect(
-                    ctx,
-                    path,
-                    crate::event_loop::SessionTransitionEffect::CdCommand {
-                        echo: format!("/cd {arg}"),
-                    },
-                ) {
-                    Ok(_) => renderer.render(UiLine::CommandOutput(
-                        t(Msg::CmdSessionTransitionPending).into_owned(),
-                    )),
-                    Err(error) => renderer.render(UiLine::Error(error)),
-                },
+                Ok(path) if paths_same(&path, &ctx.working_dir) => {
+                    let cwd = ctx.working_dir.display().to_string();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::CdWorkingDir { cwd: &cwd }).into_owned(),
+                    ));
+                }
+                Ok(path) => {
+                    match apply_cd_with_effect(
+                        ctx,
+                        path,
+                        crate::event_loop::SessionTransitionEffect::CdCommand {
+                            echo: format!("/cd {arg}"),
+                        },
+                    ) {
+                        Ok(_) => renderer.render(UiLine::CommandOutput(
+                            t(Msg::CmdSessionTransitionPending).into_owned(),
+                        )),
+                        Err(error) => renderer.render(UiLine::Error(error)),
+                    }
+                }
                 Err(e) => {
                     renderer.render(UiLine::Error(e));
                 }
@@ -4331,7 +4339,7 @@ fn detect_current_branch(dir: &std::path::Path) -> Option<String> {
         })
 }
 
-fn paths_same(a: &std::path::Path, b: &std::path::Path) -> bool {
+pub(crate) fn paths_same(a: &std::path::Path, b: &std::path::Path) -> bool {
     if a == b {
         return true;
     }
@@ -5065,33 +5073,27 @@ fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Mod
     }
 }
 
-/// SCROLLBACK-text form of `/usage` for running it MID-TURN: the interactive modal
-/// would be repainted over by the live streaming box (`draw_spinner_now` on every
-/// token), so mid-stream we render a concise text snapshot instead — the plan line
-/// and the primary rate-limit window, reusing the exact i18n lines `/status` uses.
-/// (The modal's richer Overview/Models tabs stay modal-only, for the idle path.)
+/// Non-interactive Current-tab snapshot for running `/usage` MID-TURN.
+///
+/// The interactive modal would be repainted over by the live streaming box
+/// (`draw_spinner_now` on every token), so the footer reuses the modal's exact
+/// Current-tab rows instead. Overview/Models remain modal-only because tabs
+/// cannot safely own input while a turn is streaming.
 fn render_usage_text(data: &UsageData) -> String {
-    let mut out = String::new();
-    if let Some(plan) = &data.plan {
-        out.push_str(&t(Msg::StatusCpLine {
-            plan: &plan.plan_name,
-            expires_at: &plan.expires_at,
-            remaining_days: plan.remaining_days,
-            total_days: plan.total_days,
-        }));
-    }
-    if let Some(w) = &data.window {
-        out.push_str(&t(Msg::StatusCpUsage {
-            usage: &w.usage_status_desc,
-            reset_at: &w.reset_at_display,
-            duration: &atomcode_codingplan::setup::format_duration_secs(w.seconds_until_reset),
-        }));
-    }
+    let out = UsageModal::new(UsageData {
+        window: data.window.clone(),
+        plan: data.plan.clone(),
+        usage: None,
+        overview: None,
+        error: data.error.clone(),
+    })
+    .current_snapshot_text();
     if out.is_empty() {
         // Logged in but the gateway returned neither a plan nor a visible window.
-        out.push_str(&t(Msg::UsageCodingPlanOnly).into_owned());
+        t(Msg::UsageCodingPlanOnly).into_owned()
+    } else {
+        out
     }
-    out
 }
 
 /// `/cost` 的用量报告文本：本会话累计 token × 模型价目表。与 `/usage`（只查
@@ -5157,6 +5159,7 @@ pub(crate) fn reset_to_new_session(
     }
     if ctx.pending_session_transition.is_some()
         || ctx.pending_session_resume.is_some()
+        || ctx.pending_session_resume_preparation.is_some()
         || ctx.pending_capability_reload
     {
         renderer.render(UiLine::Warning(
@@ -5217,6 +5220,7 @@ fn apply_cd_with_effect(
     }
     if ctx.pending_session_transition.is_some()
         || ctx.pending_session_resume.is_some()
+        || ctx.pending_session_resume_preparation.is_some()
         || ctx.pending_capability_reload
     {
         return Err(t(Msg::CmdSessionTransitionPending).into_owned());
@@ -7159,7 +7163,8 @@ mod tests {
         .unwrap();
         let window: RateLimitWindow = serde_json::from_value(serde_json::json!({
             "usage_status_desc": "42% used", "reset_at_display": "12:00",
-            "seconds_until_reset": 3600, "window_hours": 5, "show_enable": 1
+            "usage_percent": 42.0, "seconds_until_reset": 3600,
+            "window_hours": 5, "show_enable": 1
         }))
         .unwrap();
         let data = UsageData {
@@ -7171,7 +7176,11 @@ mod tests {
         };
         let text = render_usage_text(&data);
         assert!(text.contains("AtomPlan-Pro"), "plan name present: {text}");
-        assert!(text.contains("42% used"), "window usage present: {text}");
+        assert!(text.contains("42.0%"), "window progress present: {text}");
+        assert!(
+            text.contains("\x1b[32m") && text.contains("\x1b[1m"),
+            "streaming snapshot must preserve modal colors and emphasis: {text:?}"
+        );
 
         // Logged in but empty gateway response → the CodingPlan-only notice, not blank.
         let empty = UsageData {

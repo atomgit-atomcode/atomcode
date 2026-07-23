@@ -425,6 +425,9 @@ impl LiveViewHub {
             .change_directory(working_dir)
             .await
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+        if session_change_is_noop(&binding, &changed) {
+            return Ok(changed);
+        }
         self.commit_changed_snapshot(&binding, &handle, &changed)
             .await?;
         Ok(changed)
@@ -804,6 +807,15 @@ impl LiveViewHub {
     }
 }
 
+fn session_change_is_noop(
+    binding: &LiveBinding,
+    changed: &atomcode_coding::SessionChanged,
+) -> bool {
+    changed.generation.0 == binding.generation
+        && changed.session_id.as_deref() == Some(binding.session_id.as_str())
+        && changed.working_dir == binding.working_dir
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -816,7 +828,10 @@ mod tests {
     use atomcode_kernel::event::AgentEvent;
     use atomcode_kernel::message::{Message, SessionSnapshot};
 
-    use super::{HubError, LiveRuntimeControl, LiveViewEvent, LiveViewHub};
+    use super::{
+        session_change_is_noop, HubError, LiveBinding, LiveRuntimeControl, LiveViewEvent,
+        LiveViewHub,
+    };
 
     #[derive(Clone)]
     struct FakeControl {
@@ -855,6 +870,30 @@ mod tests {
 
     fn snapshot(text: &str) -> SessionSnapshot {
         SessionSnapshot::new(vec![Message::user(text)])
+    }
+
+    #[test]
+    fn same_generation_and_identity_is_a_noop_session_change() {
+        let binding = LiveBinding {
+            id: 1,
+            generation: 7,
+            session_id: "session-1".into(),
+            working_dir: PathBuf::from("/project"),
+            provider: "test".into(),
+            provider_fingerprint: "test".into(),
+        };
+        let unchanged = atomcode_coding::SessionChanged {
+            generation: atomcode_coding::RuntimeGeneration(7),
+            session_id: Some("session-1".into()),
+            working_dir: PathBuf::from("/project"),
+        };
+        assert!(session_change_is_noop(&binding, &unchanged));
+
+        let changed = atomcode_coding::SessionChanged {
+            generation: atomcode_coding::RuntimeGeneration(8),
+            ..unchanged
+        };
+        assert!(!session_change_is_noop(&binding, &changed));
     }
 
     #[test]

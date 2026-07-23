@@ -865,6 +865,13 @@ pub(crate) struct PendingSessionResume {
     pub committed: Option<atomcode_coding::SessionChanged>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingSessionResumePreparation {
+    pub project_bucket: String,
+    pub session_id: String,
+    pub working_dir: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSessionTransition {
     pub operation: atomcode_coding::ReconfigureKind,
@@ -922,8 +929,6 @@ fn session_resume_matches(
 ) -> bool {
     changed.session_id.as_deref() == Some(pending.session.id.as_str())
         && changed.working_dir == pending.working_dir
-        && atomcode_capabilities::session::SessionManager::project_hash(&changed.working_dir)
-            == pending.project_bucket
 }
 
 fn session_transition_matches(
@@ -948,14 +953,12 @@ mod session_resume_tests {
     use std::path::PathBuf;
 
     #[test]
-    fn terminal_must_match_id_directory_and_project_bucket() {
+    fn terminal_must_match_id_and_directory() {
         let working_dir = PathBuf::from("/project");
         let mut session = Session::default_session(working_dir.clone());
         session.id = "target-session".into();
         let pending = PendingSessionResume {
-            project_bucket: atomcode_capabilities::session::SessionManager::project_hash(
-                &working_dir,
-            ),
+            project_bucket: "1111111111111111".into(),
             session,
             working_dir: working_dir.clone(),
             committed: None,
@@ -2971,9 +2974,15 @@ pub struct LoopCtx {
     /// Active session id once `/resume` has loaded one. Required by the
     /// `/rename` slash command to know which session file to update.
     pub current_session_id: Option<SessionId>,
+    /// Physical catalog bucket of the current session. This can intentionally
+    /// differ from the hash of `working_dir` for historical fragmented buckets.
+    pub current_session_project_bucket: Option<String>,
     /// Exact picker selection waiting for CodingRuntime's resume terminal.
     /// UI/session projections are committed only after this operation succeeds.
     pub(crate) pending_session_resume: Option<PendingSessionResume>,
+    /// Exact picker selection whose catalog convergence and lease acquisition run
+    /// off the input thread before the runtime resume is accepted.
+    pub(crate) pending_session_resume_preparation: Option<PendingSessionResumePreparation>,
     /// Fresh-session and directory transitions accepted by CodingRuntime but
     /// not yet committed. The input buffer remains authoritative while this is set.
     pub(crate) pending_session_transition: Option<PendingSessionTransition>,
@@ -9407,6 +9416,7 @@ fn menu_for_display(buf: &Buffer, ctx: &LoopCtx) -> Option<Vec<(String, String)>
 fn session_projection_pending(ctx: &LoopCtx) -> bool {
     ctx.pending_session_transition.is_some()
         || ctx.pending_session_resume.is_some()
+        || ctx.pending_session_resume_preparation.is_some()
         || ctx.pending_external_session_projection.is_some()
         || ctx.pending_capability_reload
 }
@@ -10892,6 +10902,7 @@ fn redraw_after_slash(
 pub(crate) fn request_capability_reload(ctx: &mut LoopCtx) -> Result<(), String> {
     if ctx.pending_session_transition.is_some()
         || ctx.pending_session_resume.is_some()
+        || ctx.pending_session_resume_preparation.is_some()
         || ctx.pending_capability_reload
     {
         return Err(crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned());
@@ -14955,6 +14966,87 @@ fn handle_runtime_event(
             renderer.flush();
         }
         bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionResumePrepared {
+                project_bucket,
+                session_id,
+                working_dir,
+                result,
+            },
+        ) => {
+            let expected = PendingSessionResumePreparation {
+                project_bucket,
+                session_id,
+                working_dir,
+            };
+            if ctx.pending_session_resume_preparation.as_ref() != Some(&expected) {
+                return;
+            }
+            ctx.pending_session_resume_preparation = None;
+            let prepared = match result {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &error })
+                            .into_owned(),
+                    ));
+                    renderer.flush();
+                    return;
+                }
+            };
+            let prepared_working_dir = std::path::Path::new(&prepared.view.meta.working_dir);
+            if prepared.project_bucket != expected.project_bucket
+                || atomcode_capabilities::pathnorm::path_case_key(prepared_working_dir)
+                    != atomcode_capabilities::pathnorm::path_case_key(&expected.working_dir)
+            {
+                let error = format!(
+                    "selected session moved outside project {} while resume was preparing",
+                    expected.working_dir.display()
+                );
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &error })
+                        .into_owned(),
+                ));
+                renderer.flush();
+                return;
+            }
+            let project_bucket = prepared.project_bucket;
+            let session = match Session::from_catalog_view(prepared.view) {
+                Ok(session) => session,
+                Err(error) => {
+                    let message = error.to_string();
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::SessionLoadFailed {
+                            error: &message,
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+                    return;
+                }
+            };
+            if let Err(error) = ctx.runtime.resume_session(
+                session.id.clone(),
+                expected.working_dir.clone(),
+                prepared.lease,
+                ctx.foreground_runtime_id,
+                ctx.runtime_event_tx.clone(),
+            ) {
+                let message = error.to_string();
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &message })
+                        .into_owned(),
+                ));
+                renderer.flush();
+                return;
+            }
+            ctx.pending_session_resume = Some(PendingSessionResume {
+                project_bucket,
+                session,
+                working_dir: expected.working_dir,
+                committed: None,
+            });
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
             bg_runtime::DriverEvent::SessionTransitionFinished { operation, result },
         ) => match result {
             Err(error) => {
@@ -15085,7 +15177,9 @@ fn retry_pending_session_projections(
                 state,
                 renderer,
                 ctx,
-            )
+            )?;
+            ctx.current_session_project_bucket = Some(pending.project_bucket.clone());
+            Ok::<(), String>(())
         });
         ctx.pending_session_resume = pending;
         result?;
@@ -15238,6 +15332,9 @@ fn commit_native_session_changed(
 
     commit_working_dir_projection(ctx, working_dir);
     ctx.current_session_id = Some(session_id.clone());
+    ctx.current_session_project_bucket = Some(
+        atomcode_capabilities::session::SessionManager::project_hash(&ctx.working_dir),
+    );
     ctx.loop_ctrl = None;
     state.loop_label = None;
     state.loop_round = 0;
@@ -16808,7 +16905,7 @@ fn handle_agent_event(
             // bound native runtime in sync mode). ChangeDirectory already means
             // "fresh session in the target directory" at the runtime boundary;
             // issuing a second FreshSession here would race two replacements.
-            if ctx.working_dir != new_dir {
+            if !commands::paths_same(&ctx.working_dir, &new_dir) {
                 match commands::apply_cd(ctx, new_dir) {
                     Ok(_) => renderer.render(UiLine::CommandOutput(
                         crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),

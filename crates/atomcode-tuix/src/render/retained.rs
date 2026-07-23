@@ -4217,14 +4217,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if content_width == 0 {
             return Vec::new();
         }
-        let style = self.style_faint(Role::Secondary);
-        let safe = scrub_controls(text);
+        // `/usage` reuses the trusted modal rows, including their theme-aware
+        // SGR spans. Plain reports such as `/cost` keep the existing faint
+        // treatment; styled reports start from the default foreground and
+        // drive their own emphasis exactly like the idle modal.
+        let has_sgr = text.contains("\x1b[");
+        let base_style = if has_sgr {
+            CellStyle::default()
+        } else {
+            self.style_faint(Role::Secondary)
+        };
+        let safe = crate::sanitize::scrub_controls_keep_sgr(text);
         let mut rows = Vec::new();
         for physical in safe.lines() {
             for chunk in crate::width::wrap_line_to_width(physical, content_width.max(1)) {
                 let mut row = Vec::new();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
-                push_str_cells(&mut row, &chunk, &style);
+                push_str_cells_sgr(&mut row, &chunk, base_style.clone());
                 rows.push(row);
             }
         }
@@ -8100,6 +8109,37 @@ mod tests {
 
         r.status.command_output = None;
         assert_eq!(r.current_footer_rows(), baseline_footer_rows);
+    }
+
+    #[test]
+    fn command_output_footer_preserves_trusted_usage_sgr() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.status = status_basic();
+        r.status.command_output =
+            Some("  \x1b[1mRate limit\x1b[22m\n  \x1b[32m████\x1b[39m  42.0%".into());
+
+        let rows = r.build_command_output_rows();
+        let bold = rows[0]
+            .iter()
+            .find(|cell| cell.ch == 'R')
+            .expect("heading cell");
+        let green = rows[1]
+            .iter()
+            .find(|cell| cell.ch == '█')
+            .expect("progress cell");
+
+        assert!(bold.style.bold, "usage heading should match modal emphasis");
+        assert_eq!(
+            green.style.fg,
+            Some(crossterm::style::Color::DarkGreen),
+            "usage progress should keep the modal's SGR 32"
+        );
+        assert!(
+            rows.iter()
+                .flatten()
+                .all(|cell| cell.ch != '\x1b' && cell.ch != '['),
+            "SGR must become cell style, never visible text"
+        );
     }
 
     #[test]

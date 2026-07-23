@@ -42,6 +42,15 @@ pub enum DriverEvent {
         operation: atomcode_coding::ReconfigureKind,
         result: Result<atomcode_coding::SessionChanged, atomcode_coding::RuntimeError>,
     },
+    SessionResumePrepared {
+        project_bucket: String,
+        session_id: String,
+        working_dir: PathBuf,
+        result: Result<
+            atomcode_daemon::legacy_convert::PreparedCatalogSessionResume,
+            String,
+        >,
+    },
     CapabilitiesReloadFinished {
         result: Result<atomcode_coding::SessionChanged, atomcode_coding::RuntimeError>,
     },
