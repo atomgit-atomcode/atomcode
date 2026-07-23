@@ -346,6 +346,8 @@ pub struct OnboardingWizard {
     /// no manual Enter required. `None` after a take, after an Esc,
     /// or when `start_login()` itself errored at construction.
     pub(super) pending_session: Option<atomcode_auth::oauth::LoginSession>,
+    /// Flags whether a delayed (150ms) terminal buffer re-alignment wake event has been scheduled.
+    pub(super) has_scheduled_delayed_refresh: std::sync::atomic::AtomicBool,
 }
 
 impl OnboardingWizard {
@@ -362,6 +364,7 @@ impl OnboardingWizard {
             qr_login_url: None,
             qr_login_error: None,
             pending_session: None,
+            has_scheduled_delayed_refresh: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -377,6 +380,7 @@ impl OnboardingWizard {
             qr_login_url: None,
             qr_login_error: None,
             pending_session: None,
+            has_scheduled_delayed_refresh: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -413,6 +417,7 @@ impl OnboardingWizard {
             qr_login_url,
             qr_login_error,
             pending_session,
+            has_scheduled_delayed_refresh: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1074,12 +1079,23 @@ impl crate::modals::Modal for OnboardingWizard {
     ) {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         if matches!(self.step, Step::QrLogin) {
-            // TODO(temporary): Trigger a full renderer reset before drawing QrLogin.
-            // On some Windows consoles, initial modal rendering without a screen reset
+            // TODO(temporary): Trigger a synthetic terminal resize refresh for Step::QrLogin.
+            // On some Windows consoles, initial modal rendering without a SIGWINCH/Resize event
             // leaves line buffer alignment artifacts that prevent QR scanners from reading the code.
-            // Calling renderer.reset() forces a complete terminal wipe (CUP+EL per row) and screen buffer reset
-            // so the QR code is immediately drawn on a pristine terminal canvas without requiring a manual window resize.
-            renderer.reset();
+            // Synchronous clear_screen + on_resize inside Modal::draw happens too fast (before the
+            // terminal window finishes rendering its initial frame).
+            // We do a synchronous refresh HERE, and ALSO schedule a 150ms delayed refresh via wake_tx
+            // so the terminal window re-aligns AFTER it has completely rendered and presented on screen.
+            renderer.clear_screen();
+            renderer.on_resize(cols, rows);
+
+            if !self.has_scheduled_delayed_refresh.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let wake_tx = ctx.wake_tx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    let _ = wake_tx.try_send(());
+                });
+            }
         }
         // The wizard panel is capped at MAX_PANEL_WIDTH cols by calc_panel_width;
         // use that as the centering anchor so the bordered box stays at the
@@ -2017,6 +2033,7 @@ mod tests {
             qr_login_url: Some(url.to_string()),
             qr_login_error: None,
             pending_session: None,
+            has_scheduled_delayed_refresh: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2029,6 +2046,7 @@ mod tests {
             qr_login_url: None,
             qr_login_error: Some(msg.to_string()),
             pending_session: None,
+            has_scheduled_delayed_refresh: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
