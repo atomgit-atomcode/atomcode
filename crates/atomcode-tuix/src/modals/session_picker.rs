@@ -147,7 +147,7 @@ impl SessionPicker {
     }
 
     /// The static key-legend hint advertising the picker's actions
-    /// (`↑↓ move · Enter open · Ctrl+D delete · Type to search · Esc cancel`),
+    /// (`↑↓ move · Enter open · Ctrl+D×2 delete · Type to search · Esc cancel`),
     /// or `None` for an empty list (nothing to act on). Existence of this legend
     /// is the reported gap: users couldn't tell how to delete a session because
     /// the picker showed no keys.

@@ -363,7 +363,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SessionNoneSelected =>
             "No session selected".into(),
         Msg::SessionPickerHint =>
-            "↑↓ move · Enter open · Ctrl+D delete · Type to search · Esc cancel".into(),
+            "↑↓ move · Enter open · Ctrl+D×2 delete · Type to search · Esc cancel".into(),
         Msg::SessionPickerTitle { n, total, project } =>
             format!("Resume session ({n}/{total} · {project})").into(),
         Msg::SessionPickerTitleBare =>
