@@ -56,7 +56,7 @@ fn ascii_fallback(s: &str) -> String {
             '○' => out.push('o'),
             '·' => out.push('-'),
             '←' => out.push('<'),
-            '→' => out.push('>'),
+            '→' | '▶' => out.push('>'),
             '↑' => out.push('^'),
             '↓' => out.push('v'),
             // Box-drawing glyphs in content (e.g. tables emitted by
@@ -345,6 +345,12 @@ pub struct OnboardingWizard {
     /// no manual Enter required. `None` after a take, after an Esc,
     /// or when `start_login()` itself errored at construction.
     pub(super) pending_session: Option<atomcode_auth::oauth::LoginSession>,
+    /// Transient "link copied" feedback for the QR step: flipped true
+    /// when the user presses `c` to copy `qr_login_url` to the
+    /// clipboard, swapping the `c 复制链接` legend hint for a
+    /// `链接已复制` confirmation on the next redraw. Reset whenever a
+    /// fresh login URL is produced (retry) so the hint returns.
+    pub(super) qr_url_copied: bool,
 }
 
 impl OnboardingWizard {
@@ -361,6 +367,7 @@ impl OnboardingWizard {
             qr_login_url: None,
             qr_login_error: None,
             pending_session: None,
+            qr_url_copied: false,
         }
     }
 
@@ -376,6 +383,7 @@ impl OnboardingWizard {
             qr_login_url: None,
             qr_login_error: None,
             pending_session: None,
+            qr_url_copied: false,
         }
     }
 
@@ -412,6 +420,7 @@ impl OnboardingWizard {
             qr_login_url,
             qr_login_error,
             pending_session,
+            qr_url_copied: false,
         }
     }
 
@@ -459,7 +468,7 @@ impl OnboardingWizard {
     /// the world. The Modal::handle_key wrapper (Task 6) calls this,
     /// then performs the i18n / config / flag side effects based on
     /// the returned `PureOutcome`.
-    pub(super) fn handle_key_pure(&mut self, code: KeyCode, _mods: KeyModifiers) -> PureOutcome {
+    pub(super) fn handle_key_pure(&mut self, code: KeyCode, mods: KeyModifiers) -> PureOutcome {
         use Step::*;
         match (self.step, code) {
             // Confirm
@@ -567,6 +576,15 @@ impl OnboardingWizard {
                 } else {
                     PureOutcome::Noop
                 }
+            }
+            // `c` copies the login URL to the clipboard so the user can
+            // paste it into a browser on the same or another machine. Guard
+            // against Ctrl+C (that stays a global cancel, never a copy) and
+            // only offer it when there IS a URL to copy.
+            (QrLogin, KeyCode::Char('c')) | (QrLogin, KeyCode::Char('C'))
+                if !mods.contains(KeyModifiers::CONTROL) && self.qr_login_url.is_some() =>
+            {
+                PureOutcome::CopyQrUrl
             }
             (QrLogin, KeyCode::Esc) => PureOutcome::Close,
 
@@ -850,10 +868,14 @@ impl OnboardingWizard {
             format!("{}{}", " ".repeat(pad), s)
         };
 
+        // Shared "scan to claim the plan" header for every state EXCEPT the
+        // no-QR fallback, which leads with its own link-first header instead.
+        let scan_header = "微信扫码登录,自动领取 CodingPlan 免费额度";
+
         let mut content: Vec<String> = Vec::new();
-        content.push(center("微信扫码登录,自动领取 CodingPlan 免费额度"));
 
         if let Some(reason) = &self.qr_login_error {
+            content.push(center(scan_header));
             content.push(String::new());
             content.push(center("× 无法生成登录链接"));
             content.push(format!("    {}", reason));
@@ -870,23 +892,52 @@ impl OnboardingWizard {
                 cell_w as usize,
                 qr_height_budget,
             );
-            let qr_visible = qr_rows.is_some();
-            if let Some(qr_rows) = qr_rows {
-                for row in qr_rows {
-                    content.push(center(&row));
+            match qr_rows {
+                Some(qr_rows) => {
+                    // Scannable QR available: keep the "扫码" framing.
+                    content.push(center(scan_header));
+                    for row in qr_rows {
+                        content.push(center(&row));
+                    }
+                    content.push(center("或在浏览器打开:"));
+                    content.push(center(url));
+                    content.push(center("扫码完成后自动跳转 · 按 Enter 浏览器打开"));
+                }
+                None => {
+                    // Terminal can't render a scannable QR. Drop the "扫码"
+                    // framing entirely (there is no code on screen to scan) and
+                    // lead with the actionable link — opening it in a browser IS
+                    // the login here. We deliberately do NOT promise WeChat-scan
+                    // or auto-continue in the copy: the short link lands on
+                    // atomgit.com's OAuth page (already-signed-in users skip
+                    // straight through without scanning anything), so a hard claim
+                    // would be wrong for a large share of users. The background
+                    // poll (see `event_loop::oauth_poll`) still advances the flow
+                    // silently either way.
+                    content.push(center("领取 CodingPlan 免费额度"));
+                    content.push(String::new());
+                    content.push(center(url));
+                    content.push(center("▶ 按 Enter 打开浏览器  ·  或手动复制上面的链接"));
+                    content.push(String::new());
                 }
             }
-            content.push(center(if qr_visible {
-                "或在浏览器打开:"
-            } else {
-                "当前终端无法可靠显示二维码 — 请在浏览器打开:"
-            }));
-            content.push(center(url));
-            content.push(center("扫码完成后自动跳转 · 按 Enter 浏览器打开"));
         } else {
+            content.push(center(scan_header));
             content.push(center("(状态未初始化)"));
         }
-        content.push(center("Esc 跳过 · /login 重试 · /provider 手动配置"));
+        // The `c 复制链接` hint only makes sense when there IS a URL to copy;
+        // once copied it becomes a `链接已复制` confirmation. The error /
+        // uninitialised states have nothing to copy, so they keep the bare
+        // legend. Only the prefix varies — the tail is shared so a future edit
+        // to the key list touches one string.
+        let legend_prefix = match (self.qr_login_url.is_some(), self.qr_url_copied) {
+            (true, true) => "链接已复制 · ",
+            (true, false) => "c 复制链接 · ",
+            (false, _) => "",
+        };
+        content.push(center(&format!(
+            "{legend_prefix}Esc 跳过 · /login 重试 · /provider 手动配置"
+        )));
 
         let mut out = Vec::new();
         out.push("扫码登录 · 领取CodingPlan".to_string());
@@ -977,6 +1028,19 @@ impl crate::modals::Modal for OnboardingWizard {
                 }
                 Ok(ModalAction::Continue)
             }
+            PureOutcome::CopyQrUrl => {
+                // Copy the login URL to the clipboard (arboard first, OSC 52
+                // fallback for SSH/headless — see the `/copy` path). Only flag
+                // "copied" on success so the legend never lies about a failed
+                // copy; then redraw so the confirmation replaces the `c` hint.
+                if let Some(url) = &self.qr_login_url {
+                    self.qr_url_copied =
+                        crate::event_loop::commands::copy_text_to_clipboard_osc52(url);
+                }
+                renderer.clear_screen();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
             PureOutcome::RetryQrLogin => {
                 // Re-run start_login() in-place so the user can recover
                 // from a transient network blip without restarting
@@ -988,6 +1052,9 @@ impl crate::modals::Modal for OnboardingWizard {
                     Ok(session) => {
                         self.qr_login_url = Some(session.url().to_string());
                         self.qr_login_error = None;
+                        // Fresh URL → the old "copied" confirmation no longer
+                        // applies; restore the `c 复制链接` hint.
+                        self.qr_url_copied = false;
                         // session is consumed by `spawn_oauth_poll`;
                         // `pending_session` stays None because the
                         // task owns it now.
@@ -1184,6 +1251,10 @@ pub(super) enum PureOutcome {
     /// missing, headless Linux, etc.); the QR + URL remain on screen
     /// as fallbacks, so the modal layout doesn't change.
     OpenQrUrlInBrowser,
+    /// QR step `c` — copy `qr_login_url` to the system clipboard and
+    /// flip `qr_url_copied` so the legend shows a confirmation. No-op
+    /// when there is no URL (error state).
+    CopyQrUrl,
     /// Close modal, no side effect.
     Close,
     /// Ignore the key.
@@ -1996,6 +2067,7 @@ mod tests {
             qr_login_url: Some(url.to_string()),
             qr_login_error: None,
             pending_session: None,
+            qr_url_copied: false,
         }
     }
 
@@ -2008,6 +2080,7 @@ mod tests {
             qr_login_url: None,
             qr_login_error: Some(msg.to_string()),
             pending_session: None,
+            qr_url_copied: false,
         }
     }
 
@@ -2023,6 +2096,51 @@ mod tests {
         let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
         let outcome = w.handle_key_pure(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(outcome, PureOutcome::OpenQrUrlInBrowser);
+    }
+
+    #[test]
+    fn qr_login_c_copies_url_and_ctrl_c_does_not() {
+        // `c` on the happy path signals a clipboard copy; Ctrl+C must stay a
+        // global cancel (Noop here) and never be swallowed as a copy.
+        let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        assert_eq!(
+            w.handle_key_pure(KeyCode::Char('c'), KeyModifiers::NONE),
+            PureOutcome::CopyQrUrl
+        );
+        assert_eq!(
+            w.handle_key_pure(KeyCode::Char('C'), KeyModifiers::NONE),
+            PureOutcome::CopyQrUrl
+        );
+        assert_eq!(
+            w.handle_key_pure(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            PureOutcome::Noop
+        );
+    }
+
+    #[test]
+    fn qr_login_c_in_error_state_is_noop() {
+        // No URL to copy in the error state — `c` must not offer a copy.
+        let mut w = qr_wizard_with_error("transport: connection refused");
+        assert_eq!(
+            w.handle_key_pure(KeyCode::Char('c'), KeyModifiers::NONE),
+            PureOutcome::Noop
+        );
+    }
+
+    #[test]
+    fn qr_login_legend_shows_copy_hint_then_copied_confirmation() {
+        // Before copy the legend advertises `c 复制链接`; once `qr_url_copied`
+        // is set (the wrapper flips it after a successful clipboard write) the
+        // hint becomes the `链接已复制` confirmation.
+        let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let before = w.draw_qr_login_lines(80, 24, true, true, false).join("\n");
+        assert!(before.contains("c 复制链接"));
+        assert!(!before.contains("链接已复制"));
+
+        w.qr_url_copied = true;
+        let after = w.draw_qr_login_lines(80, 24, true, true, false).join("\n");
+        assert!(after.contains("链接已复制"));
+        assert!(!after.contains("c 复制链接"));
     }
 
     #[test]
@@ -2148,11 +2266,16 @@ mod tests {
         let lines = w.draw_qr_login_lines(80, 24, false, false, false);
         let blob = lines.join("\n");
         assert!(blob.contains("https://acs.atomgit.com/s/AbC123"));
-        assert!(blob.contains("无法可靠显示二维码"));
+        // Fallback drops the QR and leads with the link + browser action.
+        assert!(blob.contains("手动复制上面的链接"));
+        // The "扫码" framing must NOT survive when there is no code to scan.
+        assert!(!blob.contains("扫码完成后自动跳转"));
         // Half-block glyphs must NOT leak through the ASCII fallback.
         assert!(!blob.contains('▀'));
         assert!(!blob.contains('▄'));
         assert!(!blob.contains('█'));
+        // The action-marker triangle must degrade to ASCII, not tofu.
+        assert!(!blob.contains('▶'));
     }
 
     #[test]
@@ -2160,7 +2283,7 @@ mod tests {
         let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
         let blob = w.draw_qr_login_lines(80, 24, false, true, false).join("\n");
 
-        assert!(blob.contains("无法可靠显示二维码"));
+        assert!(blob.contains("手动复制上面的链接"));
         assert!(blob.contains("https://acs.atomgit.com/s/AbC123"));
         assert!(!blob.contains('▀'));
         assert!(!blob.contains('▄'));
@@ -2176,7 +2299,7 @@ mod tests {
             .draw_qr_login_lines(80, 24, true, true, false)
             .join("\n");
 
-        assert!(blob.contains("无法可靠显示二维码"));
+        assert!(blob.contains("手动复制上面的链接"));
         assert!(blob.contains("https://acs.atomgit.com/s/AbC123"));
         assert!(!blob.contains('▀'));
         assert!(!blob.contains('▄'));
