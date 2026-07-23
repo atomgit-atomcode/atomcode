@@ -6,15 +6,15 @@
 
 #[cfg(test)]
 use std::collections::VecDeque;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(test)]
-use std::sync::{Barrier, Mutex};
+use std::sync::Barrier;
 
 use atomcode_kernel::message::{Message, Role, SessionSnapshot, SNAPSHOT_VERSION};
 use serde::{de::IgnoredAny, Deserialize, Serialize};
@@ -244,7 +244,7 @@ pub struct CatalogDiagnostic {
     pub message: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CatalogScan {
     pub entries: Vec<CatalogEntry>,
     pub diagnostics: Vec<CatalogDiagnostic>,
@@ -1914,7 +1914,7 @@ impl SessionManager {
     /// Scan every project bucket below an explicit sessions root. Missing roots are
     /// an empty catalog; malformed individual entries become diagnostics.
     pub fn scan_catalog(sessions_root: &Path) -> CatalogScan {
-        scan_catalog_root(sessions_root)
+        scan_catalog_cached(sessions_root)
     }
 
     pub fn scan_all() -> CatalogScan {
@@ -2041,6 +2041,110 @@ impl SessionManager {
             Err(error) => Err(error),
         }
     }
+}
+
+/// One cached whole-root scan, keyed by `sessions_root`. `sig` is the cheap
+/// directory fingerprint (see `catalog_signature`); when it matches, the scan
+/// hasn't changed on disk and we can hand back the cached copy instead of
+/// re-reading + re-parsing every `*.meta`. The scan is shared behind an `Arc`
+/// so a hit clones the (small) `CatalogScan` once rather than the map value.
+struct CachedCatalog {
+    sig: u64,
+    scan: Arc<CatalogScan>,
+}
+
+fn catalog_cache() -> &'static Mutex<HashMap<PathBuf, CachedCatalog>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedCatalog>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop the whole-root scan cache. Tests that mutate files under a root and
+/// re-scan within the same second (below mtime resolution, same file size)
+/// call this so the stale-detection edge case can't flake the assertion.
+#[cfg(test)]
+pub(crate) fn clear_catalog_cache() {
+    catalog_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+/// Cheap fingerprint of everything under `sessions_root` that could change the
+/// catalog: for every file in every bucket, fold `(bucket, filename, mtime,
+/// len)` into an order-independent accumulator. It `stat`s but never OPENS or
+/// PARSES a file — that's the whole point (the full scan reads + JSON-parses
+/// every `*.meta`). Any add / remove / rename / in-place rewrite (which bumps
+/// mtime and/or len) changes the fingerprint, so the cache self-invalidates on
+/// a change made by ANY process — no explicit invalidation wiring to forget.
+fn catalog_signature(sessions_root: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut acc: u64 = 0;
+    let Ok(buckets) = fs::read_dir(sessions_root) else {
+        return 0;
+    };
+    for bucket in buckets.flatten() {
+        if !bucket.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let bucket_name = bucket.file_name();
+        let Ok(files) = fs::read_dir(bucket.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let Ok(md) = file.metadata() else {
+                continue;
+            };
+            if !md.is_file() {
+                continue;
+            }
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bucket_name.hash(&mut h);
+            file.file_name().hash(&mut h);
+            mtime.hash(&mut h);
+            md.len().hash(&mut h);
+            // Commutative fold: read_dir order is not stable across calls, so
+            // the combine step must not depend on iteration order.
+            acc = acc.wrapping_add(h.finish());
+        }
+    }
+    acc
+}
+
+/// Cache wrapper around [`scan_catalog_root`]. On a fingerprint hit, returns a
+/// clone of the cached scan (skips reading + parsing every `*.meta`); on a
+/// miss, does the real scan and stores it. Kept out of the daemon serialize
+/// layer so every catalog consumer (TUI `/resume`, `/sessions`, search) shares
+/// one cache. Callers are unchanged — this is a transparent speedup.
+///
+/// NOTE: a hit still pays the `catalog_signature` walk (O(N `stat`s), NOT O(1))
+/// — it saves the read + JSON-parse of every `*.meta`, not the directory walk.
+/// Index-level (single-read) speed would need a persisted recency index.
+fn scan_catalog_cached(sessions_root: &Path) -> CatalogScan {
+    let sig = catalog_signature(sessions_root);
+    {
+        let cache = catalog_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cache.get(sessions_root) {
+            if cached.sig == sig {
+                return (*cached.scan).clone();
+            }
+        }
+    }
+    // Miss: the lock is intentionally NOT held across the (slow) scan.
+    let scan = scan_catalog_root(sessions_root);
+    let arc = Arc::new(scan.clone());
+    catalog_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(sessions_root.to_path_buf(), CachedCatalog { sig, scan: arc });
+    scan
 }
 
 fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
@@ -4006,6 +4110,54 @@ mod tests {
             serde_json::to_vec(&session).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn catalog_signature_is_stable_and_changes_on_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        let mgr = SessionManager::with_root(&bucket);
+        mgr.write_meta(&SessionMeta::new("a", "/p", 1_000)).unwrap();
+
+        let sig1 = catalog_signature(root.path());
+        // Same on-disk state → identical fingerprint (this is what makes a hit).
+        assert_eq!(sig1, catalog_signature(root.path()));
+
+        // Adding a session changes the fingerprint.
+        mgr.write_meta(&SessionMeta::new("b", "/p", 2_000)).unwrap();
+        let sig2 = catalog_signature(root.path());
+        assert_ne!(sig1, sig2, "adding a .meta must change the fingerprint");
+
+        // Removing it changes the fingerprint again.
+        std::fs::remove_file(bucket.join("b.meta")).unwrap();
+        let sig3 = catalog_signature(root.path());
+        assert_ne!(sig2, sig3, "removing a .meta must change the fingerprint");
+    }
+
+    #[test]
+    fn scan_catalog_cache_hit_returns_same_and_self_invalidates() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        let mgr = SessionManager::with_root(&bucket);
+        clear_catalog_cache();
+        mgr.write_meta(&SessionMeta::new("a", "/p", 1_000)).unwrap();
+
+        // First scan populates the cache; the second (no change) takes the
+        // cache-hit path and must return the same entries.
+        let first = SessionManager::scan_catalog(root.path());
+        let second = SessionManager::scan_catalog(root.path());
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(
+            first.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            second.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+        );
+
+        // Adding a session changes the fingerprint → the next scan reflects it
+        // WITHOUT any explicit cache clear (the signature self-invalidates).
+        mgr.write_meta(&SessionMeta::new("b", "/p", 2_000)).unwrap();
+        let third = SessionManager::scan_catalog(root.path());
+        assert_eq!(third.entries.len(), 2, "rescan must see the added session");
+        assert!(third.entries.iter().any(|e| e.id == "b"));
     }
 
     #[test]
