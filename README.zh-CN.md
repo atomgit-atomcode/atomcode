@@ -366,7 +366,7 @@ atomcode --prompt-file task.md
 | `/clear` | 开始新对话（清空上下文与屏幕） |
 | `/bg` | 将当前会话放到后台；子命令：`/bg list`、`/bg <N>`、`/bg drop <N>`、`/bg help` |
 | `/background <task>` | 兼容入口：在 `/bg` 槽位中启动一次性后台任务 |
-| `/cd` | 切换工作目录 |
+| `/cd` | 切换工作目录并开启新建对话 |
 | `/worktree` | Git worktree 隔离（`create` / `list` / `done` / `cleanup`） |
 | `/webui` | 启动浏览器 webui（子命令：`stop`、`lan`、`--host <地址>`） |
 | `/sync` | 连接到实时 webui 会话（`/sync off` 断开） |

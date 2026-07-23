@@ -371,7 +371,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/clear` | Start a new conversation (clears context + screen) |
 | `/bg` | Background current session; subcommands: `/bg list`, `/bg <N>`, `/bg drop <N>`, `/bg help` |
 | `/background <task>` | Compatibility alias: start a one-shot task in a `/bg` slot |
-| `/cd` | Change working directory |
+| `/cd` | Change working directory and start a new session |
 | `/worktree` | Git worktree isolation (`create` / `list` / `done` / `cleanup`) |
 | `/webui` | Launch the browser webui (subcommands: `stop`, `lan`, `--host <addr>`) |
 | `/sync` | Attach to the live webui session (`/sync off` to detach) |
