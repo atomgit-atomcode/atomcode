@@ -7725,15 +7725,43 @@ fn should_deactivate_for_missing_auth(
         && runtime_availability == RuntimeUiAvailability::Available
 }
 
-fn merge_persisted_config_preserving_active(current: &Config, mut persisted: Config) -> Config {
+/// Merge freshly-persisted config on top of the running one while keeping the
+/// pinned provider SELECTION. Ephemeral providers exist only at runtime (never
+/// on disk) so their runtime copy is always kept. The active named provider is
+/// normally kept from the runtime too — that's how an external default change
+/// can't retarget a pinned session — but when `adopt_active_edits` is set (an
+/// explicit `/reload`) its on-disk edits (`context_window`, model, …) are
+/// adopted so the settings of the model you're using actually take effect;
+/// the runtime copy is used only when disk lacks that provider entirely.
+/// `default_provider` is always pinned to the running selection.
+fn merge_persisted_config_preserving_active(
+    current: &Config,
+    mut persisted: Config,
+    adopt_active_edits: bool,
+) -> Config {
     let active_name = current.default_provider.clone();
     for (name, provider) in &current.providers {
-        if provider.ephemeral || name == &active_name {
+        let is_active = name == &active_name;
+        let keep_runtime_copy = provider.ephemeral
+            || (is_active && !(adopt_active_edits && persisted.providers.contains_key(name)));
+        if keep_runtime_copy {
             persisted.providers.insert(name.clone(), provider.clone());
         }
     }
     persisted.default_provider = active_name;
     persisted
+}
+
+/// Whether the active provider's resolved config differs between the running
+/// config and a desired one (ignoring ephemeral providers, which are never
+/// reloaded from disk). Used to decide whether an explicit `/reload` that keeps
+/// the same pinned provider must still reconfigure the runtime to apply edits.
+fn active_provider_config_changed(current: &Config, desired: &Config) -> bool {
+    !current
+        .providers
+        .get(&current.default_provider)
+        .is_some_and(|provider| provider.ephemeral)
+        && resolved_provider_fingerprint(current) != resolved_provider_fingerprint(desired)
 }
 
 fn config_for_persistence(
@@ -7899,12 +7927,54 @@ mod external_config_tests {
             .providers
             .insert("new-provider".into(), persisted.providers["main"].clone());
 
-        let merged = merge_persisted_config_preserving_active(&current, persisted);
+        let merged = merge_persisted_config_preserving_active(&current, persisted, false);
 
         assert_eq!(merged.default_provider, "main");
         assert_eq!(merged.providers["main"].model, "pinned-model");
         assert!(merged.providers.contains_key("new-provider"));
         assert_eq!(merged.language, Some(atomcode_config::locale::Locale::ZhCn));
+    }
+
+    #[test]
+    fn manual_reload_adopts_active_provider_window_edit_but_keeps_selection() {
+        // The reported bug: editing the ACTIVE provider's `context_window` in
+        // config.toml + /reload was silently ignored. With `adopt_active_edits`
+        // (manual /reload), the edited disk window is now applied while the
+        // pinned selection (`main`) is preserved.
+        let current = config("m", false); // running: window 128000
+        let mut persisted = config("m", false);
+        persisted.providers.get_mut("main").unwrap().context_window = 32_000; // disk edit
+
+        let merged = merge_persisted_config_preserving_active(&current, persisted, true);
+
+        assert_eq!(merged.default_provider, "main"); // selection preserved
+        assert_eq!(merged.providers["main"].context_window, 32_000); // edit applied
+        // And the change is detected, so the runtime is actually reconfigured.
+        assert!(active_provider_config_changed(&current, &merged));
+    }
+
+    #[test]
+    fn external_reload_preserves_active_provider_window() {
+        // Background external config polls must NOT disturb a pinned session:
+        // the active provider's runtime window is kept, edit or not.
+        let current = config("m", false); // running: window 128000
+        let mut persisted = config("m", false);
+        persisted.providers.get_mut("main").unwrap().context_window = 32_000;
+
+        let merged = merge_persisted_config_preserving_active(&current, persisted, false);
+
+        assert_eq!(merged.providers["main"].context_window, 128_000);
+        assert!(!active_provider_config_changed(&current, &merged));
+    }
+
+    #[test]
+    fn active_provider_change_ignores_ephemeral_active_provider() {
+        // An ephemeral (runtime-only, off-disk) active provider is never
+        // reloaded from disk, so a differing disk copy must not trigger a reload.
+        let current = config("m", true); // ephemeral active
+        let mut desired = config("m", false);
+        desired.providers.get_mut("main").unwrap().context_window = 32_000;
+        assert!(!active_provider_config_changed(&current, &desired));
     }
 
     #[test]
@@ -8006,7 +8076,7 @@ mod external_config_tests {
         );
         next_default.default_provider = "next".into();
 
-        let visible = merge_persisted_config_preserving_active(&opened, next_default.clone());
+        let visible = merge_persisted_config_preserving_active(&opened, next_default.clone(), false);
 
         assert_eq!(visible.default_provider, "main");
         assert_eq!(visible.providers["main"].model, "opened-model");
@@ -8395,7 +8465,14 @@ fn select_committed_provider(
     Some((config, model))
 }
 
-fn desired_config_from_snapshot(ctx: &LoopCtx, mut persisted: Config) -> Config {
+/// `manual_reload` is set for an explicit `/reload` (vs a background external
+/// config poll): only then does a pinned session adopt on-disk edits to its
+/// active provider (see `merge_persisted_config_preserving_active`).
+fn desired_config_from_snapshot(
+    ctx: &LoopCtx,
+    mut persisted: Config,
+    manual_reload: bool,
+) -> Config {
     let active_is_ephemeral = ctx
         .config
         .providers
@@ -8410,7 +8487,7 @@ fn desired_config_from_snapshot(ctx: &LoopCtx, mut persisted: Config) -> Config 
         }
     }
     if ctx.provider_selection_mode == crate::ProviderSelectionMode::Pinned || active_is_ephemeral {
-        merge_persisted_config_preserving_active(&ctx.config, persisted)
+        merge_persisted_config_preserving_active(&ctx.config, persisted, manual_reload)
     } else {
         persisted
     }
@@ -8421,16 +8498,23 @@ fn reconcile_persisted_config(
     snapshot: ConfigSnapshot,
     manual_reload_announce: bool,
 ) -> Result<PersistedConfigReload, anyhow::Error> {
-    let desired = desired_config_from_snapshot(ctx, snapshot.config);
+    let desired = desired_config_from_snapshot(ctx, snapshot.config, manual_reload_announce);
     let auth_available = AuthObservation::read().is_available();
 
-    if !should_reload_provider(
+    // An explicit `/reload` on a pinned session keeps the same provider but must
+    // still reconfigure the runtime when that provider's own settings were edited
+    // (e.g. `context_window`) — otherwise the running provider keeps the stale
+    // window and `/context` / the footer never update. `should_reload_provider`
+    // only follows shared-default changes, so add the manual-edit trigger here.
+    let wants_reload = should_reload_provider(
         ctx.provider_selection_mode,
         &ctx.config,
         &desired,
         ctx.runtime.ui_availability(),
         auth_available,
-    ) {
+    ) || (manual_reload_announce && active_provider_config_changed(&ctx.config, &desired));
+
+    if !wants_reload {
         let (provider, model) = resolved_provider_and_model(&desired);
         if ctx.config.language != desired.language {
             crate::i18n::set_locale(atomcode_config::i18n::resolve_initial_locale(
@@ -14449,7 +14533,9 @@ fn sync_provider_projection_from_snapshot(
     let runtime_model = observation.model.as_deref();
     let follows_persisted_default = config_commits_provider(&snapshot.config, provider);
     let revision = snapshot.revision;
-    let desired = desired_config_from_snapshot(ctx, snapshot.config);
+    // Post-reload UI projection, not an edit-application path — preserve the
+    // active provider as-is (no manual-edit adoption).
+    let desired = desired_config_from_snapshot(ctx, snapshot.config, false);
     let Some((config, configured_model)) =
         select_committed_provider(desired, provider, runtime_model)
     else {
