@@ -573,7 +573,7 @@ async fn open_stream(
                     let provider_code = envelope.as_ref().and_then(provider_error_code);
                     return Err(ProviderError {
                         retryable: retry::is_retryable_status(code),
-                        message: friendly_http_error(code, &detail),
+                        message: super::friendly_http_error(code, &detail),
                         http_status: Some(code),
                         code: provider_code,
                         retry_after_secs,
@@ -980,28 +980,8 @@ fn provider_error_code(envelope: &serde_json::Value) -> Option<String> {
         .or_else(|| envelope.get("code").and_then(error_code_value))
 }
 
-/// Concise, human-friendly Chinese headline for common BILLING / AUTH failures,
-/// so an external-model error surfaces an ACTIONABLE reason instead of a bare
-/// `HTTP 402: Insufficient Balance` the user can't act on. Deliberately DROPS the
-/// provider's raw English detail for these well-known codes — the headline
-/// already says it, and this short form folds cleanly into the interrupted-turn
-/// summary line (`✗ 已中断：账户余额不足（HTTP 402）`). The raw response is still
-/// captured in telemetry for diagnosis.
-///
-/// 429 is intentionally excluded: it flows through the kernel's rate-limit path
-/// (`rate_limit_server_message`), which strips a literal `HTTP 429: ` prefix to
-/// recover the server's own message, so its wording is owned there — wrapping it
-/// here would both defeat that strip and double the `HTTP 429` in the pause line.
-/// Any other status keeps the original `HTTP {code}: {detail}` shape (the detail
-/// IS the only signal there).
-fn friendly_http_error(code: u16, detail: &str) -> String {
-    let headline = match code {
-        401 => "API key 未授权或已失效",
-        402 => "账户余额不足",
-        _ => return format!("HTTP {code}: {detail}"),
-    };
-    format!("{headline}（HTTP {code}）")
-}
+// `friendly_http_error` (was here) moved to the shared `provider` module so
+// every protocol wraps auth/billing codes identically; see `super::friendly_http_error`.
 
 // ---------------------------------------------------------------------------
 // SSE decoding (unit-testable, no network)
@@ -2430,6 +2410,8 @@ mod tests {
 
     #[test]
     fn friendly_http_error_wraps_billing_and_auth_codes() {
+        // Shared across provider protocols; lives in the parent `provider` module.
+        use super::super::friendly_http_error;
         // 402 欠费: concise actionable headline + the code; raw English detail is
         // dropped (redundant, and this short form folds into the summary line).
         assert_eq!(

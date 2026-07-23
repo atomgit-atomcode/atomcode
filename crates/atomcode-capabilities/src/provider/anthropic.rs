@@ -302,7 +302,7 @@ async fn open_stream(
                     let provider_code = err_obj.and_then(error_type);
                     return Err(ProviderError {
                         retryable: retry::is_retryable_status(code),
-                        message: format!("HTTP {code}: {detail}"),
+                        message: super::friendly_http_error(code, &detail),
                         http_status: Some(code),
                         code: provider_code,
                         retry_after_secs,

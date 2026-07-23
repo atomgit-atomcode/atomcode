@@ -120,6 +120,29 @@ pub(crate) fn push_system_coalesced(out: &mut Vec<Value>, text: &str) {
     out.push(json!({ "role": "system", "content": text }));
 }
 
+/// Map an HTTP error status to a plain-language headline so the TUI shows the
+/// *cause*, not a bare `HTTP 401:` (which, when the server returns an empty
+/// body, carried no hint at all). Shared by every provider protocol
+/// (openai-compat, Anthropic/Claude, ollama, …) so the wording stays consistent
+/// regardless of which wire format hit the error.
+///
+/// Only 401/402 get a headline, and for those the provider's raw `detail` is
+/// deliberately DROPPED — the headline already says it and this short form folds
+/// cleanly into the interrupted-turn summary (`✗ 已中断：账户余额不足（HTTP 402）`).
+/// 403 is left raw — AtomGit reuses it for session-concurrency conflicts, so the
+/// structured reason must survive (see the test) — and 429 must keep the literal
+/// `HTTP 429: ` prefix the kernel rate-limit path (`rate_limit_server_message`)
+/// strips. Everything else keeps `HTTP {code}: {detail}` (the detail is the only
+/// signal there).
+pub(crate) fn friendly_http_error(code: u16, detail: &str) -> String {
+    let headline = match code {
+        401 => "API key 未授权或已失效",
+        402 => "账户余额不足",
+        _ => return format!("HTTP {code}: {detail}"),
+    };
+    format!("{headline}（HTTP {code}）")
+}
+
 #[cfg(test)]
 mod coalesce_tests {
     use super::push_system_coalesced;

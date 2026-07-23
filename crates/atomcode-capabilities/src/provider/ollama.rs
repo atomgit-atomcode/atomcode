@@ -264,7 +264,7 @@ async fn open_stream(
                         .unwrap_or_else(|| truncate_msg(&text));
                     return Err(ProviderError {
                         retryable: retry::is_retryable_status(code),
-                        message: format!("HTTP {code}: {detail}"),
+                        message: super::friendly_http_error(code, &detail),
                         http_status: Some(code),
                         code: None,
                         retry_after_secs,
