@@ -758,6 +758,11 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// When Some, `paint_frame` paints the overlay cells after the normal
     /// body+footer, so the diff sees the combined frame.
     modal_overlay: Option<ModalOverlayState>,
+    /// True while the `/diff` panel owns the frame. The panel is a borderless,
+    /// bottom-anchored overlay that covers the input box (and the rows above it),
+    /// so the terminal caret must be hidden — otherwise it blinks on top of the
+    /// panel at the now-covered input row.
+    diff_overlay_active: bool,
     /// Append-only log of the permanent body-producing `UiLine`s in
     /// render order — the semantic source needed to REFLOW the whole
     /// transcript when the terminal width changes. `body_lines` holds
@@ -916,6 +921,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             inflight_hint: None,
             live_group: None,
             modal_overlay: None,
+            diff_overlay_active: false,
             body_log: Vec::new(),
             replaying: false,
             body_log_truncated: false,
@@ -4050,6 +4056,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // hide the caret (user navigates with ↑↓/Enter/Tab).
         let suppress_cursor = self.inflight_tool.is_some()
             || approval_active
+            || self.diff_overlay_active
             || (hide_input_box && !is_add_url && !is_search_box_focused);
         self.screen.set_cursor_visible(!suppress_cursor);
     }
@@ -4504,60 +4511,114 @@ impl<W: Write + Send> RetainedRenderer<W> {
         ModalOverlayState { cells, x, y }
     }
 
+    /// Build a borderless `/diff` panel in the `/usage` house style: no box
+    /// frame, no input box — just a title row, a single horizontal rule
+    /// underneath, the content, a blank spacer, and a muted hint. The panel is
+    /// sized to its content and anchored to the bottom of the screen, so the
+    /// scrollback above stays visible and the input box below is covered (its
+    /// caret is hidden via `diff_overlay_active`).
+    ///
+    /// `win_width`/`win_height` are ignored; the overlay is laid out against the
+    /// live screen width and its own content height.
     fn build_diff_panel_overlay(
         &self,
-        title: &str,
+        title: &DiffPanelRow,
         rows: &[DiffPanelRow],
         footer: &str,
-        win_width: u16,
-        win_height: u16,
+        _win_width: u16,
+        _win_height: u16,
     ) -> ModalOverlayState {
-        let plain_rows: Vec<String> = rows
-            .iter()
-            .map(|row| row.spans.iter().map(|span| span.text.as_str()).collect())
-            .collect();
-        let mut overlay = self.build_modal_overlay(title, &plain_rows, 0, 1, win_width, win_height);
-        let content_height = overlay.cells.len().saturating_sub(5);
+        let width = (self.screen.width() as usize).max(1);
+        let screen_h = (self.screen.height() as usize).max(1);
+        let muted = self.style_for(Role::Muted);
 
-        for (index, row) in rows.iter().take(content_height).enumerate() {
-            self.paint_diff_panel_row(&mut overlay.cells[3 + index], row);
+        let make_row = |src: &DiffPanelRow| -> Vec<Cell> {
+            let mut target = vec![Cell::blank(); width];
+            self.paint_diff_panel_row(&mut target, src);
+            target
+        };
+        let blank_row = || vec![Cell::blank(); width];
+        let rule_row = || -> Vec<Cell> {
+            (0..width)
+                .map(|_| Cell {
+                    ch: '─',
+                    style: muted.clone(),
+                    width: 1,
+                })
+                .collect()
+        };
+
+        // Like `/usage`, this is NOT a full-screen takeover: the panel is only as
+        // tall as its content (title, rule, body, blank spacer, hint) and is
+        // anchored to the bottom of the screen, so the scrollback above stays
+        // visible and the input box below is covered. Chrome = 4 rows; the body
+        // is already capped to `screen_h - 4` by the caller, so the panel never
+        // exceeds the screen.
+        let content_cap = screen_h.saturating_sub(4);
+        let mut cells: Vec<Vec<Cell>> = Vec::new();
+        // Row 0: title (filename + counts, or "Uncommitted changes …").
+        cells.push(make_row(title));
+        // Row 1: the single horizontal rule the design keeps at the top.
+        cells.push(rule_row());
+        // Content strip (its natural length, capped to the viewport).
+        for row in rows.iter().take(content_cap) {
+            cells.push(make_row(row));
         }
-        if overlay.cells.len() >= 2 {
-            let footer_row =
-                DiffPanelRow::new(vec![DiffPanelSpan::new(footer, DiffPanelTone::Muted)]);
-            let footer_index = overlay.cells.len() - 2;
-            self.paint_diff_panel_row(&mut overlay.cells[footer_index], &footer_row);
+        // Blank spacer + the muted key hint, immediately below the content.
+        cells.push(blank_row());
+        let footer_row = DiffPanelRow::new(vec![DiffPanelSpan::new(footer, DiffPanelTone::Muted)]);
+        cells.push(make_row(&footer_row));
+        cells.truncate(screen_h);
+
+        // The normal footer (input box + rules + status/goal/attachments) is
+        // painted underneath before this overlay. Ensure the panel is at least
+        // as tall as that footer so its top rows can't peek out above a short
+        // panel — pad with blank rows at the top (over the scrollback), which
+        // only happens when the content is shorter than the footer.
+        let min_rows = self.current_footer_rows().min(screen_h);
+        if cells.len() < min_rows {
+            let mut padded = vec![blank_row(); min_rows - cells.len()];
+            padded.append(&mut cells);
+            cells = padded;
         }
-        overlay
+
+        // Anchor at the bottom: draw the panel over the last `cells.len()` rows.
+        let y = screen_h.saturating_sub(cells.len()) as u16;
+        ModalOverlayState { cells, x: 0, y }
     }
 
+    /// Paint one `/diff` row into a pre-sized, full-width blank `target`. The
+    /// row carries a one-column left pad, then its themed spans. Selection is
+    /// conveyed purely by span colour (`DiffPanelTone::Highlight`, the same
+    /// theme-aware foreground the `/resume` picker uses) — no reverse-video bar.
     fn paint_diff_panel_row(&self, target: &mut Vec<Cell>, row: &DiffPanelRow) {
-        if target.len() < 3 {
+        let total_width = target.len();
+        if total_width == 0 {
             return;
         }
-        let left_border = target.first().cloned().unwrap_or_else(Cell::blank);
-        let right_border = target.last().cloned().unwrap_or_else(Cell::blank);
-        let inner_width = target.len().saturating_sub(2);
-        let mut content = Vec::with_capacity(inner_width);
-        let mut leading_pad = Cell::blank();
-        leading_pad.style.reverse = row.selected;
-        content.push(leading_pad);
+        let mut content: Vec<Cell> = Vec::with_capacity(total_width);
+        content.push(Cell::blank());
 
         for span in &row.spans {
-            let role = match span.tone {
-                DiffPanelTone::Default => Role::Secondary,
-                DiffPanelTone::Muted => Role::Muted,
-                DiffPanelTone::Brand => Role::Brand,
-                DiffPanelTone::Add => Role::DiffAdd,
-                DiffPanelTone::Remove => Role::DiffRemove,
-                DiffPanelTone::Warning => Role::Warning,
-            };
-            let mut style = if span.bold {
-                self.style_bold(role)
+            let style = if matches!(span.tone, DiffPanelTone::Highlight) {
+                self.session_highlight_style()
             } else {
-                self.style_for(role)
+                let role = match span.tone {
+                    DiffPanelTone::Default => Role::Secondary,
+                    DiffPanelTone::Muted => Role::Muted,
+                    DiffPanelTone::Brand => Role::Brand,
+                    DiffPanelTone::Add => Role::DiffAdd,
+                    DiffPanelTone::Remove => Role::DiffRemove,
+                    DiffPanelTone::Warning => Role::Warning,
+                    // Handled above; the compiler needs an exhaustive arm.
+                    DiffPanelTone::Highlight => Role::Accent,
+                };
+                if span.bold {
+                    self.style_bold(role)
+                } else {
+                    self.style_for(role)
+                }
             };
-            style.reverse = row.selected;
             let safe = scrub_controls(&span.text);
             for ch in safe.chars() {
                 if matches!(ch, '\n' | '\r') {
@@ -4565,7 +4626,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
                 if ch == '\t' {
                     let spaces = crate::render::cell::SOFT_TAB_WIDTH
-                        .min(inner_width.saturating_sub(content.len()));
+                        .min(total_width.saturating_sub(content.len()));
                     for _ in 0..spaces {
                         content.push(Cell {
                             ch: ' ',
@@ -4576,7 +4637,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     continue;
                 }
                 let width = crate::width::cell_char_width(ch).unwrap_or(1);
-                if width == 0 || content.len().saturating_add(width) > inner_width {
+                if width == 0 || content.len().saturating_add(width) > total_width {
                     continue;
                 }
                 content.push(Cell {
@@ -4589,17 +4650,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
             }
         }
-        while content.len() < inner_width {
-            let mut blank = Cell::blank();
-            blank.style.reverse = row.selected;
-            content.push(blank);
+        while content.len() < total_width {
+            content.push(Cell::blank());
         }
-        content.truncate(inner_width);
-        let mut painted = Vec::with_capacity(target.len());
-        painted.push(left_border);
-        painted.extend(content);
-        painted.push(right_border);
-        *target = painted;
+        content.truncate(total_width);
+        *target = content;
     }
 
     /// Append-only model: copy the body_lines tail into screen.cells
@@ -7079,9 +7134,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.modal_overlay = Some(
                     self.build_diff_panel_overlay(&title, &rows, &footer, win_width, win_height),
                 );
+                self.diff_overlay_active = true;
             }
             UiLine::ModalOverlayClear => {
                 self.modal_overlay = None;
+                self.diff_overlay_active = false;
             }
         }
         // Phase 5: widget state updated → mark frame dirty. No
@@ -14635,13 +14692,19 @@ mod tests {
             ]),
             DiffPanelRow::new(vec![DiffPanelSpan::new(
                 "\tselected.rs",
-                DiffPanelTone::Brand,
-            )])
-            .selected(true),
+                DiffPanelTone::Highlight,
+            )]),
         ];
-        let overlay = r.build_diff_panel_overlay("Diff", &rows, "Esc close", 60, 20);
+        let title = DiffPanelRow::new(vec![DiffPanelSpan::new("Diff", DiffPanelTone::Default).bold()]);
+        let overlay = r.build_diff_panel_overlay(&title, &rows, "Esc close", 60, 20);
 
-        let stats = &overlay.cells[3];
+        // Borderless layout: [0]=title, [1]=rule, [2..]=content rows.
+        let rule = &overlay.cells[1];
+        assert!(
+            rule.iter().all(|cell| cell.ch == '─'),
+            "row 1 must be the full-width horizontal rule"
+        );
+        let stats = &overlay.cells[2];
         let add = stats.iter().find(|cell| cell.ch == '+').expect("add span");
         let remove = stats
             .iter()
@@ -14650,13 +14713,46 @@ mod tests {
         assert_eq!(add.style.fg, r.style_for(Role::DiffAdd).fg);
         assert_eq!(remove.style.fg, r.style_for(Role::DiffRemove).fg);
 
-        let selected = &overlay.cells[4];
+        // Selection: `/resume`-style highlight foreground, never reverse-video.
+        let selected = &overlay.cells[3];
         assert!(selected.iter().all(|cell| cell.ch != '\t'));
         assert!(
-            selected[1..selected.len() - 1]
-                .iter()
-                .all(|cell| cell.style.reverse),
-            "selection reverse-video must cover the full inner row"
+            selected.iter().all(|cell| !cell.style.reverse),
+            "selection must not use reverse-video"
+        );
+        let glyph = selected
+            .iter()
+            .find(|cell| cell.ch == 's')
+            .expect("highlighted filename glyph");
+        assert_eq!(glyph.style.fg, r.session_highlight_style().fg);
+    }
+
+    #[test]
+    fn diff_panel_is_bottom_anchored_and_content_sized() {
+        // The panel must NOT take over the whole screen: it is only as tall as
+        // its content (title + rule + body + blank + hint) and hugs the bottom
+        // of the terminal, so scrollback stays visible above it.
+        let (r, _buf) = new_capturing(80, 24);
+        let rows = vec![
+            DiffPanelRow::new(vec![DiffPanelSpan::new("summary", DiffPanelTone::Muted)]),
+            DiffPanelRow::new(Vec::new()),
+            DiffPanelRow::new(vec![DiffPanelSpan::new("a.rs", DiffPanelTone::Default)]),
+            DiffPanelRow::new(vec![DiffPanelSpan::new("b.rs", DiffPanelTone::Default)]),
+        ];
+        let title = DiffPanelRow::new(vec![DiffPanelSpan::new("Diff", DiffPanelTone::Default)]);
+        let overlay = r.build_diff_panel_overlay(&title, &rows, "Esc close", 0, 0);
+
+        // 4 content rows + title + rule + blank + hint = 8, well short of 24.
+        assert!(
+            overlay.cells.len() < 24,
+            "panel must be content-sized, not full-screen (got {} rows)",
+            overlay.cells.len()
+        );
+        assert!(overlay.y > 0, "panel must not start at the top of the screen");
+        assert_eq!(
+            overlay.y as usize + overlay.cells.len(),
+            24,
+            "panel must be anchored to the bottom edge"
         );
     }
 

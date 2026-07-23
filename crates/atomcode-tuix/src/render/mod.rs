@@ -247,7 +247,7 @@ pub enum UiLine {
     /// ANSI so retained rendering can clip safely and plain rendering can
     /// ignore the transient panel.
     DiffPanel {
-        title: String,
+        title: DiffPanelRow,
         rows: Vec<DiffPanelRow>,
         footer: String,
         win_width: u16,
@@ -265,6 +265,9 @@ pub enum DiffPanelTone {
     Add,
     Remove,
     Warning,
+    /// The `/resume`-picker selection colour: theme-aware bold foreground (cyan
+    /// on dark, magenta on light), no reverse-video and no background.
+    Highlight,
 }
 
 #[derive(Debug, Clone)]
@@ -292,20 +295,11 @@ impl DiffPanelSpan {
 #[derive(Debug, Clone)]
 pub struct DiffPanelRow {
     pub spans: Vec<DiffPanelSpan>,
-    pub selected: bool,
 }
 
 impl DiffPanelRow {
     pub fn new(spans: Vec<DiffPanelSpan>) -> Self {
-        Self {
-            spans,
-            selected: false,
-        }
-    }
-
-    pub fn selected(mut self, selected: bool) -> Self {
-        self.selected = selected;
-        self
+        Self { spans }
     }
 }
 

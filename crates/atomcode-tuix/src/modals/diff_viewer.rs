@@ -53,13 +53,15 @@ impl DiffViewer {
         ModalAction::Close
     }
 
+    /// Returns `(screen_w, screen_h, content_height)`. The panel is a
+    /// borderless, bottom-anchored overlay (`/usage` house style) that grows to
+    /// fit its content rather than taking over the screen. `content_height`
+    /// bounds the body: it leaves four chrome rows — the title, the horizontal
+    /// rule under it, a blank spacer, and the hint line beneath the content.
     fn dimensions() -> (u16, u16, usize) {
         let (screen_w, screen_h) = crossterm::terminal::size().unwrap_or((80, 24));
-        let max_w = screen_w.saturating_sub(4).max(20);
-        let max_h = screen_h.saturating_sub(4).max(6);
-        let win_w = (screen_w.saturating_mul(9) / 10).clamp(20, max_w);
-        let win_h = (screen_h.saturating_mul(4) / 5).clamp(6, max_h);
-        (win_w, win_h, win_h.saturating_sub(5).max(1) as usize)
+        let content_height = (screen_h as usize).saturating_sub(4).max(1);
+        (screen_w, screen_h, content_height)
     }
 
     fn list_rows(&self, selected: usize, height: usize, width: usize) -> Vec<DiffPanelRow> {
@@ -73,21 +75,9 @@ impl DiffViewer {
             )])];
         }
 
+        // The "Uncommitted changes …" heading is rendered as the panel title
+        // (above the rule); the body opens with the change summary.
         let mut rows = vec![
-            DiffPanelRow::new(vec![DiffPanelSpan::new(
-                match snapshot.base {
-                    DiffBase::Head => l(
-                        "Uncommitted changes  (git diff HEAD)",
-                        "未提交变更  (git diff HEAD)",
-                    ),
-                    DiffBase::Unborn => l(
-                        "Initial changes  (repository has no HEAD)",
-                        "初始变更  (仓库还没有 HEAD)",
-                    ),
-                },
-                DiffPanelTone::Brand,
-            )
-            .bold()]),
             DiffPanelRow::new(vec![
                 DiffPanelSpan::new(
                     match current_locale() {
@@ -136,7 +126,9 @@ impl DiffViewer {
         else {
             return Vec::new();
         };
-        let mut rows = vec![DiffPanelRow::new(file_summary_spans(file))];
+        // The "M path  +A -B" summary is rendered as the panel title (above the
+        // rule); the body opens with any rename note, then the hunks.
+        let mut rows: Vec<DiffPanelRow> = Vec::new();
         if let Some(old_path) = &file.old_path {
             rows.push(DiffPanelRow::new(vec![DiffPanelSpan::new(
                 match current_locale() {
@@ -203,41 +195,47 @@ impl DiffViewer {
 
     fn redraw(&self, renderer: &mut dyn Renderer) {
         let (win_width, win_height, content_height) = Self::dimensions();
-        let (title, rows, footer) = match &self.view {
+        let (title, rows, footer): (DiffPanelRow, Vec<DiffPanelRow>, String) = match &self.view {
             View::Loading => (
-                l("Diff", "差异").to_string(),
+                title_row(l("Diff", "差异")),
                 vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
                     l("Loading repository changes…", "正在读取仓库变更…"),
                     DiffPanelTone::Muted,
                 )])],
-                l("Esc/q close", "Esc/q 关闭").to_string(),
+                l("Esc to close", "Esc 关闭").to_string(),
             ),
             View::Error(error) => (
-                l("Diff", "差异").to_string(),
+                title_row(l("Diff", "差异")),
                 vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
                     error,
                     DiffPanelTone::Warning,
                 )])],
-                l("Esc/q close", "Esc/q 关闭").to_string(),
+                l("Esc to close", "Esc 关闭").to_string(),
             ),
             View::List { selected } => {
-                let title = self
-                    .snapshot
-                    .as_ref()
-                    .map(|snapshot| {
-                        format!(
-                            "{} · {}",
-                            l("Diff", "差异"),
-                            display_path(&snapshot.repo_root)
-                        )
-                    })
-                    .unwrap_or_else(|| l("Diff", "差异").to_string());
+                let snapshot = self.snapshot.as_ref();
+                let is_empty = snapshot.map(|s| s.files.is_empty()).unwrap_or(true);
+                let title = if is_empty {
+                    // Body reads "No uncommitted changes"; keep the title neutral
+                    // so it doesn't assert changes that aren't there.
+                    title_row(l("Diff", "差异"))
+                } else if matches!(snapshot.map(|s| s.base), Some(DiffBase::Unborn)) {
+                    title_row(l(
+                        "Initial changes  (repository has no HEAD)",
+                        "初始变更  (仓库还没有 HEAD)",
+                    ))
+                } else {
+                    title_row(l(
+                        "Uncommitted changes  (git diff HEAD)",
+                        "未提交变更  (git diff HEAD)",
+                    ))
+                };
                 (
                     title,
                     self.list_rows(*selected, content_height, win_width as usize),
                     l(
-                        "↑/↓ select · Enter view · Esc/q close",
-                        "↑/↓ 选择 · Enter 查看 · Esc/q 关闭",
+                        "↑/↓ to select · Enter to view · Esc to close",
+                        "↑/↓ 选择 · Enter 查看 · Esc 关闭",
                     )
                     .to_string(),
                 )
@@ -254,20 +252,16 @@ impl DiffViewer {
                     .snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.files.get(*file))
-                    .map(|file| format!("{} · {}", l("Diff", "差异"), display_path(&file.path)))
-                    .unwrap_or_else(|| l("Diff", "差异").to_string());
+                    .map(|file| DiffPanelRow::new(file_summary_spans(file)))
+                    .unwrap_or_else(|| title_row(l("Diff", "差异")));
                 (
                     title,
                     visible,
-                    format!(
-                        "{}  ({}/{})",
-                        l(
-                            "↑/↓ scroll · PgUp/PgDn · Esc back · q close",
-                            "↑/↓ 滚动 · PgUp/PgDn · Esc 返回 · q 关闭",
-                        ),
-                        scroll.saturating_add(1).min(all_rows.len().max(1)),
-                        all_rows.len().max(1)
-                    ),
+                    l(
+                        "↑/↓ to scroll · ← to back · Esc to back",
+                        "↑/↓ 滚动 · ← 返回 · Esc 返回",
+                    )
+                    .to_string(),
                 )
             }
         };
@@ -392,6 +386,12 @@ impl Modal for DiffViewer {
     }
 }
 
+/// A single-span, bold title row for the panel header in the terminal's
+/// default foreground (no accent colour).
+fn title_row(text: &str) -> DiffPanelRow {
+    DiffPanelRow::new(vec![DiffPanelSpan::new(text, DiffPanelTone::Default).bold()])
+}
+
 fn file_list_row(file: &DiffFile, selected: bool, width: usize) -> DiffPanelRow {
     let prefix = if selected { "› " } else { "  " };
     let status = status_label(file.status);
@@ -411,24 +411,28 @@ fn file_list_row(file: &DiffFile, selected: bool, width: usize) -> DiffPanelRow 
         + del.len()
         + 6;
     let padding = " ".repeat(width.saturating_sub(occupied).max(2));
-    DiffPanelRow::new(vec![
-        DiffPanelSpan::new(prefix, DiffPanelTone::Brand).bold(),
-        DiffPanelSpan::new(format!("{status} "), DiffPanelTone::Muted),
-        DiffPanelSpan::new(
-            path,
-            if selected {
-                DiffPanelTone::Brand
-            } else {
-                DiffPanelTone::Default
-            },
+    // Selection is shown by the `/resume`-style highlight foreground on the
+    // marker + filename only; everything else keeps its normal tone.
+    let (marker_tone, path_span) = if selected {
+        (
+            DiffPanelTone::Highlight,
+            DiffPanelSpan::new(path, DiffPanelTone::Highlight),
         )
-        .bold(),
+    } else {
+        (
+            DiffPanelTone::Default,
+            DiffPanelSpan::new(path, DiffPanelTone::Default),
+        )
+    };
+    DiffPanelRow::new(vec![
+        DiffPanelSpan::new(prefix, marker_tone),
+        DiffPanelSpan::new(format!("{status} "), DiffPanelTone::Muted),
+        path_span,
         DiffPanelSpan::new(padding, DiffPanelTone::Default),
         DiffPanelSpan::new(add, DiffPanelTone::Add),
         DiffPanelSpan::new(" ", DiffPanelTone::Default),
         DiffPanelSpan::new(del, DiffPanelTone::Remove),
     ])
-    .selected(selected)
 }
 
 fn file_summary_spans(file: &DiffFile) -> Vec<DiffPanelSpan> {
@@ -438,7 +442,7 @@ fn file_summary_spans(file: &DiffFile) -> Vec<DiffPanelSpan> {
             status_label(file.status),
             display_path(&file.path)
         ),
-        DiffPanelTone::Brand,
+        DiffPanelTone::Default,
     )
     .bold()];
     if let Some(additions) = file.additions {

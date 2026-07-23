@@ -69,7 +69,6 @@ pub(crate) struct DiffFile {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DiffSnapshot {
-    pub repo_root: PathBuf,
     pub base: DiffBase,
     pub files_changed: usize,
     pub additions: usize,
@@ -272,7 +271,6 @@ pub(crate) fn capture_diff_snapshot(working_dir: &Path) -> Result<DiffSnapshot, 
     }
 
     Ok(DiffSnapshot {
-        repo_root,
         base,
         files_changed,
         additions,
