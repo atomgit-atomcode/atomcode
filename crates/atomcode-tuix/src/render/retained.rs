@@ -738,11 +738,11 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// those lines on each spinner tick and to clean up on commit.
     inflight_tool_rows: usize,
     /// Optional ephemeral hint (e.g. the bash "Press Ctrl+o …" line) rendered
-    /// as the LAST row(s) of the inflight strip by `render_inflight_tool`, so
-    /// it's counted in `inflight_tool_rows` and cleared atomically with the
-    /// spinner on commit. Must NOT be pushed as a standalone body row — that
-    /// breaks the "inflight strip = body tail" invariant and orphans the
-    /// spinner glyph next to the committed `●` (bash-only, since the hint is).
+    /// inside the inflight strip by `render_inflight_tool`, so it's counted in
+    /// `inflight_tool_rows` and cleared atomically with the spinner on commit.
+    /// Must NOT be pushed as a standalone body row — that breaks the "inflight
+    /// strip = body tail" invariant and orphans the spinner glyph next to the
+    /// committed `●` (bash-only, since the hint is).
     inflight_hint: Option<String>,
     /// Active multi-row "live group" — the tail of `body_lines` is one
     /// header + N child rows for a parallel tool batch. Subsequent
@@ -1234,11 +1234,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             )
         };
 
-        // Append the ephemeral hint (bash "Press Ctrl+o …") as the LAST row of
-        // the strip. Kept INSIDE `new_rows` — hence counted in `inflight_tool_rows`
-        // — so the in-place spinner rewrite and `commit_inflight_tool`'s erase
-        // cover it atomically. Rendering it as a standalone body row instead
-        // orphaned the spinner glyph on commit (the reported bug).
+        // Append the ephemeral hint (bash "Press Ctrl+o …") inside the strip.
+        // Kept INSIDE `new_rows` — hence counted in `inflight_tool_rows` — so
+        // the in-place spinner rewrite and `commit_inflight_tool`'s erase cover
+        // it atomically. Rendering it as a standalone body row instead orphaned
+        // the spinner glyph on commit (the reported bug).
         if let Some(hint) = self.inflight_hint.clone() {
             let muted = if crate::highlight::theme::is_light_for_render() {
                 self.style_for(Role::Muted)
@@ -1266,6 +1266,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // (`build_spinner_body_row`: brand frame + bold label) so the two read
         // consistently. `meta` already carries the ` · 10.9s` suffix.
         if is_bash {
+            // Match the ordinary live-spinner spacing invariant: the liveness
+            // row gets exactly one blank row above it. This spacer belongs to
+            // the inflight strip so ticks replace it in place and commit/cancel
+            // erase it atomically together with the hint and Running row.
+            new_rows.push(Vec::new());
             let label = format!("Running{meta}");
             new_rows.push(self.build_spinner_body_row(icon, &label));
         }
@@ -9502,18 +9507,18 @@ mod tests {
         );
 
         // First render → fallback with prev_rows == 0. Bash renders one command
-        // row plus its `Running` spinner row = 2 rows.
+        // row, one spacer, and its `Running` spinner row = 3 rows.
         r.render_inflight_tool("\u{25cf}", "Bash", "short", "");
-        assert_eq!(r.inflight_tool_rows, 2);
+        assert_eq!(r.inflight_tool_rows, 3);
 
-        // A detail that WRAPS to more rows ⇒ prev_rows(2) != n(>2) ⇒ fallback re-push.
+        // A detail that WRAPS to more rows ⇒ prev_rows(3) != n(>3) ⇒ fallback re-push.
         // Bash wraps at shell boundaries (format_shell_command breaks at each `&&`),
         // so use a multi-segment command rather than one long unbreakable token.
         let long = "cd /tmp && echo one && echo two && echo three && echo four";
         r.render_inflight_tool("\u{25cf}", "Bash", long, "");
         assert!(
-            r.inflight_tool_rows > 2,
-            "wrapped strip should grow past 2 rows: {}",
+            r.inflight_tool_rows > 3,
+            "wrapped strip should grow past 3 rows: {}",
             r.inflight_tool_rows
         );
 
@@ -9557,6 +9562,7 @@ mod tests {
 
         // First render: pushes scroll-style (prev_rows=0 → fallback path).
         r.render_inflight_tool("⠋", "bash", detail, "");
+        let body_rows_after_first = r.body_lines.len();
         let bytes_after_first = buf.lock().unwrap().len();
         assert!(bytes_after_first > 0, "first render must emit some bytes");
 
@@ -9594,11 +9600,13 @@ mod tests {
         );
 
         // body_lines stays bounded too (existing invariant).
-        assert!(
-            r.body_lines.len() <= 4,
-            "body_lines grew to {} rows across 50 ticks — should stay at \
-             prev_rows count for in-place path",
-            r.body_lines.len()
+        assert_eq!(
+            r.body_lines.len(),
+            body_rows_after_first,
+            "body_lines grew from {} to {} rows across 50 ticks — should stay \
+             at the first render's row count for the in-place path",
+            body_rows_after_first,
+            r.body_lines.len(),
         );
     }
 
@@ -15606,6 +15614,18 @@ mod tests {
             "hint must be part of the inflight strip (rows>=2), got {}",
             r.inflight_tool_rows
         );
+        let hint_row = (0..24)
+            .find(|row| vterm.row_text(*row).contains("Press Ctrl+o"))
+            .expect("hint row must be visible");
+        let running_row = (0..24)
+            .find(|row| vterm.row_text(*row).contains("Running"))
+            .expect("Running row must be visible");
+        assert_eq!(
+            running_row - hint_row,
+            2,
+            "hint and Running must have exactly one blank row between them:\n{}",
+            vterm.dump()
+        );
 
         // Commit the tool (ToolCallResult → ToolCallCommit).
         r.render(UiLine::ToolCallCommit {
@@ -15624,6 +15644,36 @@ mod tests {
         assert!(
             !vterm.any_row(|row| row.contains("Press Ctrl+o")),
             "hint must be cleared on commit, not left orphaned:\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// Bash without the Ctrl+o hint follows the same live-spinner spacing
+    /// invariant: one blank row separates the command block from `Running`.
+    #[test]
+    fn retained_bash_inflight_without_hint_keeps_blank_above_running() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-1".into(),
+            name: "Bash".into(),
+            detail: "cargo test -p atomcode-tuix".into(),
+            hint: None,
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let command_row = (0..24)
+            .find(|row| vterm.row_text(*row).contains("cargo test"))
+            .unwrap_or_else(|| panic!("bash command missing:\n{}", vterm.dump()));
+        let running_row = (0..24)
+            .find(|row| vterm.row_text(*row).contains("Running"))
+            .unwrap_or_else(|| panic!("Running row missing:\n{}", vterm.dump()));
+        assert_eq!(
+            running_row - command_row,
+            2,
+            "command and Running must have exactly one blank row between them:\n{}",
             vterm.dump()
         );
     }
