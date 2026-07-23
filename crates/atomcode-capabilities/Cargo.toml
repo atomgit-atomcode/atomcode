@@ -218,7 +218,10 @@ zeroize = "1"
 [target.'cfg(target_os = "windows")'.dependencies]
 # `is_running_as_admin` (process_utils) calls CheckTokenMembership against the
 # BUILTIN\Administrators SID to detect elevation without depending on `core`.
-windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Foundation"] }
+# `Win32_System_JobObjects` (+ `Win32_System_Threading` for the IO_COUNTERS that
+# JOBOBJECT_EXTENDED_LIMIT_INFORMATION embeds): the Bash tool assigns each shell
+# child to a kill-on-close Job Object so timeout/cancel reaps the WHOLE process tree.
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "test-util"] }

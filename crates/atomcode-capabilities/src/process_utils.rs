@@ -41,6 +41,128 @@ pub fn suppress_console_window_sync(cmd: &mut std::process::Command) {
 #[cfg(not(target_os = "windows"))]
 pub fn suppress_console_window_sync(_cmd: &mut std::process::Command) {}
 
+/// RAII owner of a Windows Job Object configured with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Every process assigned to the job —
+/// and every process THOSE spawn — dies when either [`JobHandle::terminate`]
+/// runs or the last handle to the job closes (this guard dropping, INCLUDING
+/// when the atomcode process itself is killed and the OS closes its handles).
+///
+/// Why: on Windows the Bash tool's only cleanup is `kill_on_drop`, which
+/// terminates the direct child (`cmd.exe` / Git Bash) but NOT its descendants.
+/// A timed-out `mvn compile` orphans the `java` compiler JVM (and pipeline
+/// sub-shells / busybox applets); the JVM keeps burning CPU and holds `target/`
+/// locks, so the next compile is slower and also times out → a runaway that
+/// pins the machine. The job makes the whole tree reapable in one call and,
+/// via kill-on-close, guarantees nothing survives atomcode itself.
+#[cfg(target_os = "windows")]
+pub struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
+
+// The HANDLE is an opaque kernel handle; safe to move/share across the threads
+// of tokio's multithreaded runtime.
+#[cfg(target_os = "windows")]
+unsafe impl Send for JobHandle {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for JobHandle {}
+
+#[cfg(target_os = "windows")]
+impl JobHandle {
+    /// Terminate every process in the job (children and grandchildren).
+    /// Idempotent — a job whose processes already exited terminates to a no-op.
+    pub fn terminate(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        if !self.0.is_null() {
+            // Exit code 1: the tree was force-killed, not a clean exit.
+            unsafe { TerminateJobObject(self.0, 1) };
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        if !self.0.is_null() {
+            // KILL_ON_JOB_CLOSE: closing the last handle terminates whatever is
+            // still in the job — reaping the tree on cancel (the wait future is
+            // dropped) or on an atomcode crash/kill.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// Assign `child` (and everything it later spawns) to a fresh kill-on-close Job
+/// Object; return the guard to hold for the child's lifetime. `None` if any
+/// Win32 call fails — the caller then relies on the pre-existing direct-child
+/// `kill_on_drop`, which is no worse than before.
+///
+/// Tiny race: a grandchild spawned in the microseconds between `CreateProcess`
+/// (inside `spawn`) and `AssignProcessToJobObject` here escapes the job. In
+/// practice the shell takes milliseconds to initialise before it spawns
+/// `mvn`/pipeline children, so assigning immediately after spawn captures them.
+/// Fully closing the window would need `CREATE_SUSPENDED` + `ResumeThread`,
+/// which tokio's `Child` doesn't expose.
+#[cfg(target_os = "windows")]
+pub fn assign_child_to_kill_on_close_job(child: &tokio::process::Child) -> Option<JobHandle> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    let proc_handle = child.raw_handle()? as HANDLE;
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let set_ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if set_ok == 0 || AssignProcessToJobObject(job, proc_handle) == 0 {
+            CloseHandle(job);
+            return None;
+        }
+        Some(JobHandle(job))
+    }
+}
+
+/// Best-effort fallback tree-kill for the rare case the Job Object couldn't be
+/// created/assigned (so [`assign_child_to_kill_on_close_job`] returned `None`).
+/// `taskkill /T` walks the live parent→child tree and force-kills all of it —
+/// a defense-in-depth net so a job-setup failure still doesn't orphan a runaway
+/// `mvn`/`java`. Fire-and-forget: spawned console-suppressed and not awaited (on
+/// Windows a dropped `Child` handle leaves no zombie).
+#[cfg(target_os = "windows")]
+pub fn taskkill_tree(pid: u32) {
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+    suppress_console_window_sync(&mut cmd);
+    let _ = cmd.spawn();
+}
+
+/// Force-kill a shell's whole descendant tree on Windows: terminate the Job
+/// Object if it was set up, else fall back to `taskkill /T` rooted at `pid`
+/// (the direct child). The single entry point every Bash spawn path calls, so
+/// their Windows cleanup can't drift apart. `pid` is `None` only if the child
+/// was already reaped (nothing to kill).
+#[cfg(target_os = "windows")]
+pub fn kill_windows_tree(job: &Option<JobHandle>, pid: Option<u32>) {
+    match job {
+        Some(job) => job.terminate(),
+        None => {
+            if let Some(pid) = pid {
+                taskkill_tree(pid);
+            }
+        }
+    }
+}
+
 /// Build a shell command that runs `command` through the platform shell.
 ///
 /// - Windows: `cmd.exe /C <command>` — the command string is passed via

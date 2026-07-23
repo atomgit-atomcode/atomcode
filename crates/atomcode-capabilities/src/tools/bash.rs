@@ -189,12 +189,45 @@ impl Tool for BashTool {
             Ok(c) => c,
             Err(e) => return err(format!("bash: failed to spawn shell: {e}")),
         };
+        // Reap the WHOLE shell process tree (mvn → java, pipeline sub-shells,
+        // busybox applets) on timeout/cancel — not just the direct child, which
+        // is all `kill_on_drop` covers.
+        //
+        // Windows: a kill-on-close Job Object. Held until this fn returns; the
+        // cancel/timeout arms `terminate()` the job explicitly, and if that's
+        // skipped (or atomcode dies) dropping the guard closes the handle →
+        // KILL_ON_JOB_CLOSE reaps the tree anyway. (A process the command
+        // intentionally left running is in the job too, so it's reaped on
+        // return — consistent with this tool having no background path.)
+        //
+        // Unix: the setsid pre_exec made the shell its own pgroup leader
+        // (pgid == pid), so `killpg(pid)` reaches the grandchildren that
+        // `kill_on_drop` (direct child only) would otherwise orphan — the same
+        // leak, and the same fix, as Windows.
+        #[cfg(windows)]
+        let job_guard = crate::process_utils::assign_child_to_kill_on_close_job(&child);
+        // PID captured before `wait_with_output` consumes `child`. On Unix it is
+        // the pgid (setsid leader); on Windows it's the `taskkill /T` fallback
+        // root for when the Job Object couldn't be set up.
+        let child_pid = child.id();
         let wait = child.wait_with_output();
+
+        let kill_tree = || {
+            #[cfg(windows)]
+            crate::process_utils::kill_windows_tree(&job_guard, child_pid);
+            #[cfg(not(target_os = "windows"))]
+            if let Some(pgid) = child_pid {
+                // SIGKILL the whole group; `kill_on_drop` already SIGKILLs the
+                // direct child, this extends it to the detached grandchildren.
+                unsafe { killpg(pgid as i32, SIGKILL) };
+            }
+        };
 
         tokio::select! {
             biased;
             // Cooperative cancel: returning drops `wait` → kill_on_drop SIGKILLs the child.
             _ = ctx.cancel.cancelled() => {
+                kill_tree();
                 // The command itself is already shown in the `● Bash(…)`
                 // header above (for the user) and in the tool-call record
                 // (for the model), so don't echo it back — a long command
@@ -207,10 +240,13 @@ impl Tool for BashTool {
                 // Timed out: the timeout future drops `wait` → kill_on_drop SIGKILLs the child.
                 // Don't echo the command (see the cancel arm); point at the actionable
                 // knob — a larger `timeout` — the way the core bash tool does.
-                Err(_) => err(format!(
-                    "bash: timed out after {secs}s — pass a larger `timeout` if this command \
-                     legitimately needs longer."
-                )),
+                Err(_) => {
+                    kill_tree();
+                    err(format!(
+                        "bash: timed out after {secs}s — pass a larger `timeout` if this command \
+                         legitimately needs longer."
+                    ))
+                }
             }
         }
     }
@@ -2149,8 +2185,8 @@ pub async fn run_shell(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             // kill_on_drop covers the direct cmd.exe PID on `tokio::select!`
-            // cancel / hard timeout. NOTE: Windows process trees still leak
-            // grandchildren — that's #3's Job Object work.
+            // cancel / hard timeout. The descendant tree is reaped by the Job
+            // Object assigned below (see `job_guard`).
             .kill_on_drop(true);
         crate::process_utils::suppress_console_window(&mut cmd);
         match cmd.spawn() {
@@ -2238,6 +2274,17 @@ pub async fn run_shell(
         }
     };
 
+    // Windows: put the shell tree under a kill-on-close Job Object so the
+    // idle/timeout kill (and atomcode's own exit) reaps grandchildren
+    // (mvn → java, pipeline sub-shells, busybox applets) instead of orphaning
+    // them. Unix already reaps the pgroup via `PgroupChild::terminate` below.
+    // Held until this fn returns; `None` degrades to the direct-child kill.
+    #[cfg(target_os = "windows")]
+    let job_guard = crate::process_utils::assign_child_to_kill_on_close_job(&child);
+    // Fallback root for `taskkill /T` when the Job Object couldn't be set up.
+    #[cfg(target_os = "windows")]
+    let child_pid = child.id();
+
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let mut stdout_buf = Vec::new();
@@ -2312,21 +2359,24 @@ pub async fn run_shell(
         Ok(None) => {
             // Readers hit idle/EOF but the child never reaped — kill it.
             // terminate() on Unix walks the pgroup (SIGTERM → 200ms → SIGKILL);
-            // Windows keeps the direct-child kill (process-tree cleanup is #3).
+            // Windows terminates the Job Object tree (else `taskkill /T`), then
+            // reaps the direct child.
             #[cfg(not(target_os = "windows"))]
             child.terminate().await;
             #[cfg(target_os = "windows")]
             {
+                crate::process_utils::kill_windows_tree(&job_guard, child_pid);
                 let _ = child.kill().await;
             }
             ShellExit::KilledIdle
         }
         Err(_) => {
-            // Hard wall-clock timeout — same pgroup-aware path as idle.
+            // Hard wall-clock timeout — same tree-aware kill as idle.
             #[cfg(not(target_os = "windows"))]
             child.terminate().await;
             #[cfg(target_os = "windows")]
             {
+                crate::process_utils::kill_windows_tree(&job_guard, child_pid);
                 let _ = child.kill().await;
             }
             ShellExit::KilledTimeout
