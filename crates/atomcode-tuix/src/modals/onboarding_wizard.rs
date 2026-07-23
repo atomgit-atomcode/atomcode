@@ -59,7 +59,6 @@ fn ascii_fallback(s: &str) -> String {
             '→' => out.push('>'),
             '↑' => out.push('^'),
             '↓' => out.push('v'),
-            '█' => out.push('#'),
             // Box-drawing glyphs in content (e.g. tables emitted by
             // markdown into the panel) get the same swap as the
             // outer panel border.
@@ -346,8 +345,6 @@ pub struct OnboardingWizard {
     /// no manual Enter required. `None` after a take, after an Esc,
     /// or when `start_login()` itself errored at construction.
     pub(super) pending_session: Option<atomcode_auth::oauth::LoginSession>,
-    /// Flags whether a delayed (150ms) terminal buffer re-alignment wake event has been scheduled.
-    pub(super) has_scheduled_delayed_refresh: std::sync::atomic::AtomicBool,
 }
 
 impl OnboardingWizard {
@@ -364,7 +361,6 @@ impl OnboardingWizard {
             qr_login_url: None,
             qr_login_error: None,
             pending_session: None,
-            has_scheduled_delayed_refresh: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -380,7 +376,6 @@ impl OnboardingWizard {
             qr_login_url: None,
             qr_login_error: None,
             pending_session: None,
-            has_scheduled_delayed_refresh: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -417,7 +412,6 @@ impl OnboardingWizard {
             qr_login_url,
             qr_login_error,
             pending_session,
-            has_scheduled_delayed_refresh: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -856,30 +850,20 @@ impl OnboardingWizard {
         };
 
         let mut content: Vec<String> = Vec::new();
-        content.push(String::new());
         content.push(center("微信扫码登录,自动领取 CodingPlan 免费额度"));
-        content.push(String::new());
 
         if let Some(reason) = &self.qr_login_error {
-            // start_login failed at construction. Surface the cause
-            // so the user knows whether to check network, broker, or
-            // their own clock; offer Enter-to-retry below.
+            content.push(String::new());
             content.push(center("× 无法生成登录链接"));
-            content.push(String::new());
-            // Error reason may be long; just left-align with indent
-            // rather than centre — easier to scan.
             content.push(format!("    {}", reason));
-            content.push(String::new());
             content.push(center("按 Enter 重试 · Esc 跳过"));
         } else if let Some(url) = &self.qr_login_url {
-            // Render QR block (Unicode mode) or skip it (ASCII).
             if let Some(qr_rows) =
                 super::qr::render_for_terminal(url, unicode_symbols, colors, cell_w as usize)
             {
                 for row in qr_rows {
                     content.push(center(&row));
                 }
-                content.push(String::new());
             }
             content.push(center(if unicode_symbols || colors {
                 "或在浏览器打开:"
@@ -887,33 +871,14 @@ impl OnboardingWizard {
                 "无法显示二维码 — 请在浏览器打开:"
             }));
             content.push(center(url));
-            content.push(center("(按 Enter 自动打开)"));
-            content.push(String::new());
-            // Polling thread auto-closes the modal the moment AtomGit
-            // reports authorisation, so no force-continue Enter is
-            // needed. Enter is wired to a best-effort browser launch
-            // on the URL above (mirrors what /codingplan does); see
-            // handle_key_pure's QrLogin Enter arm for the rationale
-            // and the historical duplicate-QR bug that gates it.
-            content.push(center("扫码完成后自动跳转"));
+            content.push(center("扫码完成后自动跳转 · 按 Enter 浏览器打开"));
         } else {
-            // Shouldn't happen — `new_qr_fast_path` always populates
-            // exactly one of url / error. Defensive fallback so a
-            // broken constructor doesn't paint a blank panel.
             content.push(center("(状态未初始化)"));
         }
-        content.push(String::new());
         content.push(center("Esc 跳过 · /login 重试 · /provider 手动配置"));
-        content.push(String::new());
 
         let mut out = Vec::new();
         out.push("扫码登录 · 领取CodingPlan".to_string());
-        out.push(String::new());
-        // Panel title carries the running atomcode version so users
-        // reporting a screenshot tell us the build their bug landed
-        // in without having to /status first. CARGO_PKG_VERSION is
-        // workspace-bound (e.g. "4.23.2") — matches the convention
-        // used by the Step::Intro version line above.
         let panel_title = format!("AtomCode · v{}", env!("CARGO_PKG_VERSION"));
         out.extend(draw_panel(
             &panel_title,
@@ -1078,25 +1043,6 @@ impl crate::modals::Modal for OnboardingWizard {
         renderer: &mut dyn crate::render::Renderer,
     ) {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        if matches!(self.step, Step::QrLogin) {
-            // TODO(temporary): Trigger a synthetic terminal resize refresh for Step::QrLogin.
-            // On some Windows consoles, initial modal rendering without a SIGWINCH/Resize event
-            // leaves line buffer alignment artifacts that prevent QR scanners from reading the code.
-            // Synchronous clear_screen + on_resize inside Modal::draw happens too fast (before the
-            // terminal window finishes rendering its initial frame).
-            // We do a synchronous refresh HERE, and ALSO schedule a 150ms delayed refresh via wake_tx
-            // so the terminal window re-aligns AFTER it has completely rendered and presented on screen.
-            renderer.clear_screen();
-            renderer.on_resize(cols, rows);
-
-            if !self.has_scheduled_delayed_refresh.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let wake_tx = ctx.wake_tx.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                    let _ = wake_tx.try_send(());
-                });
-            }
-        }
         // The wizard panel is capped at MAX_PANEL_WIDTH cols by calc_panel_width;
         // use that as the centering anchor so the bordered box stays at the
         // canvas middle in wide terminals. Confirm is deliberately
@@ -2033,7 +1979,6 @@ mod tests {
             qr_login_url: Some(url.to_string()),
             qr_login_error: None,
             pending_session: None,
-            has_scheduled_delayed_refresh: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2046,7 +1991,6 @@ mod tests {
             qr_login_url: None,
             qr_login_error: Some(msg.to_string()),
             pending_session: None,
-            has_scheduled_delayed_refresh: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

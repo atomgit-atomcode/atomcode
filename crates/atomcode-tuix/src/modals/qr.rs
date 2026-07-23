@@ -38,7 +38,7 @@ use qrcode::QrCode;
 pub(super) fn render_for_terminal(
     data: &str,
     unicode_symbols: bool,
-    _colors: bool,
+    colors: bool,
     _max_width: usize,
 ) -> Option<Vec<String>> {
     let code = QrCode::new(data.as_bytes()).ok()?;
@@ -51,8 +51,10 @@ pub(super) fn render_for_terminal(
             .quiet_zone(true)
             .build();
         Some(rendered.lines().map(|l| l.to_string()).collect())
-    } else {
+    } else if colors {
         Some(render_block_spaces(&code))
+    } else {
+        None
     }
 }
 
