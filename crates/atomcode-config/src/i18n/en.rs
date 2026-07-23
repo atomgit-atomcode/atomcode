@@ -314,6 +314,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("load session failed: {error}").into(),
         Msg::SessionResumedLabel { name } =>
             format!("resumed: {name}").into(),
+        Msg::SessionBusyForked { source_id, fork_id } =>
+            format!(
+                "The latest session ({source_id}) is active in another window. \
+                 Created an independent fork ({fork_id}) from its last committed state."
+            ).into(),
 
         // ── Todo panel ──
         Msg::TodoPanelTitle => "Todos".into(),

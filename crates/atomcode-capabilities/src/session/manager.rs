@@ -1156,6 +1156,48 @@ impl SessionManager {
         })
     }
 
+    /// Clone one complete committed native aggregate under a new identity.
+    ///
+    /// The source may be owned by another active runtime: readers take the
+    /// short-lived metadata lock and observe one committed aggregate, while the
+    /// source runtime keeps its independent lifetime lease. The destination is
+    /// published under a new exclusive lease and returned to the caller for
+    /// direct transfer into its runtime.
+    pub fn fork_native_session(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+        now_ms: i64,
+    ) -> SessionResult<(LoadedSession, SessionLease)> {
+        let source = self.load_native_session(source_id)?;
+        let destination_lease = self.acquire_lease(destination_id)?;
+        let source_name_was_placeholder =
+            SessionMeta::name_needs_fallback(&source.meta.name, source_id);
+        let mut meta = source.meta.clone();
+        meta.id = destination_id.to_string();
+        meta.name = if source_name_was_placeholder {
+            format!("session-{destination_id}")
+        } else {
+            format!("{} (fork)", source.meta.name)
+        };
+        meta.created_at = now_ms;
+        meta.updated_at = now_ms;
+        meta.owner = StorageOwner::Native;
+        meta.import_info = None;
+        let forked = LoadedSession {
+            meta,
+            snapshot: source.snapshot,
+            presentation: source.presentation,
+        };
+        self.commit_native_import(
+            &destination_lease,
+            Some(&forked.snapshot),
+            Some(&forked.presentation),
+            &forked.meta,
+        )?;
+        Ok((forked, destination_lease))
+    }
+
     /// Publish a prepared legacy import under the caller's active session lease.
     /// Every payload is validated/serialized before the first target changes and
     /// `meta(owner=native)` is always the final reader-visible commit point.
@@ -3423,6 +3465,115 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn fork_native_session_clones_committed_aggregate_while_source_is_leased() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let source_lease = mgr.acquire_lease("source").unwrap();
+        let snapshot = snap(&["first", "second"]);
+        let presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![presentation_entry(DisplayAnchor::AtStart, "first")],
+        };
+        let mut source_meta = SessionMeta::new("source", "/project", 10);
+        source_meta.owner = StorageOwner::Native;
+        source_meta.name = "working session".into();
+        source_meta.user_renamed = true;
+        source_meta.turn_count = 2;
+        source_meta.message_count = 2;
+        source_meta.import_info = Some(ImportInfo {
+            legacy_schema: "legacy".into(),
+            source_sha256: "ab".repeat(32),
+            importer_version: 1,
+            kind: ImportKind::Full,
+        });
+        mgr.commit_native_import(
+            &source_lease,
+            Some(&snapshot),
+            Some(&presentation),
+            &source_meta,
+        )
+        .unwrap();
+
+        let (forked, fork_lease) = mgr
+            .fork_native_session("source", "destination", 20)
+            .unwrap();
+
+        assert_eq!(fork_lease.id(), "destination");
+        assert_eq!(forked.snapshot, snapshot);
+        assert_eq!(forked.presentation, presentation);
+        assert_eq!(forked.meta.id, "destination");
+        assert_eq!(forked.meta.name, "working session (fork)");
+        assert_eq!(forked.meta.working_dir, "/project");
+        assert_eq!(forked.meta.created_at, 20);
+        assert_eq!(forked.meta.updated_at, 20);
+        assert_eq!(forked.meta.turn_count, 2);
+        assert_eq!(forked.meta.message_count, 2);
+        assert_eq!(forked.meta.import_info, None);
+        assert_eq!(mgr.load_native_session("source").unwrap().meta, source_meta);
+        assert!(matches!(
+            mgr.acquire_lease("source"),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        assert!(matches!(
+            mgr.acquire_lease("destination"),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+    }
+
+    #[test]
+    fn fork_native_session_does_not_publish_destination_when_source_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+
+        assert!(matches!(
+            mgr.fork_native_session("missing", "destination", 20),
+            Err(SessionStoreError::NotFound { .. })
+        ));
+        assert!(!mgr.meta_path("destination").unwrap().exists());
+        assert!(!mgr.snapshot_path("destination").unwrap().exists());
+        assert!(!mgr.presentation_path("destination").unwrap().exists());
+    }
+
+    #[test]
+    fn fork_native_session_refuses_to_replace_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let source_lease = mgr.acquire_lease("source").unwrap();
+        let snapshot = snap(&["source"]);
+        let presentation = PresentationFile::default();
+        let mut source_meta = SessionMeta::new("source", "/project", 10);
+        source_meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &source_lease,
+            Some(&snapshot),
+            Some(&presentation),
+            &source_meta,
+        )
+        .unwrap();
+        let destination_lease = mgr.acquire_lease("destination").unwrap();
+        let destination_snapshot = snap(&["destination"]);
+        let mut destination_meta = SessionMeta::new("destination", "/project", 11);
+        destination_meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &destination_lease,
+            Some(&destination_snapshot),
+            Some(&presentation),
+            &destination_meta,
+        )
+        .unwrap();
+        drop(destination_lease);
+
+        assert!(matches!(
+            mgr.fork_native_session("source", "destination", 20),
+            Err(SessionStoreError::OwnershipConflict { .. })
+        ));
+        assert_eq!(
+            mgr.load_native_session("destination").unwrap().snapshot,
+            destination_snapshot
+        );
     }
 
     #[test]

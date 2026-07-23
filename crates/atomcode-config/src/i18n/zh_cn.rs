@@ -303,6 +303,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("加载会话失败：{error}").into(),
         Msg::SessionResumedLabel { name } =>
             format!("已恢复：{name}").into(),
+        Msg::SessionBusyForked { source_id, fork_id } =>
+            format!(
+                "最近会话（{source_id}）正在另一个窗口运行，已从其最后提交状态创建独立分支（{fork_id}）。"
+            ).into(),
 
         // ── 待办面板 ──
         Msg::TodoPanelTitle => "待办".into(),

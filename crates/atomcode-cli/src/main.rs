@@ -1540,14 +1540,21 @@ async fn run() -> Result<i32> {
     } else {
         atomcode_coding::ProviderBootstrap::RecoverAuthentication
     };
-    let (native_runtime, native_coding_cfg) =
-        spawn_native_cli_runtime(&runtime_cfg, resume_session_id.clone(), provider_bootstrap)
-            .await?;
+    let (native_runtime, native_coding_cfg, continued_session) = spawn_native_cli_runtime(
+        &runtime_cfg,
+        resume_session_id,
+        provider_bootstrap,
+        !is_headless,
+    )
+    .await?;
     // TUI replay remains a presentation projection during S4; runtime resume above
     // has already converged and loaded the native snapshot under one lease.
     let resume_project_bucket =
         atomcode_capabilities::session::SessionManager::project_hash(&working_dir);
-    let session_to_continue = match resume_session_id.as_deref() {
+    let session_to_continue = match continued_session
+        .as_ref()
+        .map(|session| session.id.as_str())
+    {
         Some(id) => atomcode_daemon::legacy_convert::load_catalog_session_view_in_project(
             &resume_project_bucket,
             id,
@@ -1556,6 +1563,21 @@ async fn run() -> Result<i32> {
     }
     .map(atomcode_tuix::session::Session::from_catalog_view)
     .transpose()?;
+    let startup_notice = continued_session
+        .as_ref()
+        .and_then(|session| {
+            session
+                .forked_from
+                .as_deref()
+                .map(|source_id| (source_id, session.id.as_str()))
+        })
+        .map(|(source_id, fork_id)| {
+            atomcode_tuix::i18n::t(atomcode_tuix::i18n::Msg::SessionBusyForked {
+                source_id,
+                fork_id,
+            })
+            .into_owned()
+        });
     let (mut native_headless_runtime, mut native_tui_runtime) = if is_headless {
         (Some(native_runtime), None)
     } else {
@@ -1735,6 +1757,7 @@ async fn run() -> Result<i32> {
                 runtime_spawn_override,
                 working_dir,
                 session_to_continue,
+                startup_notice,
                 telemetry.clone(),
                 cli.dangerously_skip_permissions,
                 is_admin,
@@ -2031,20 +2054,49 @@ async fn spawn_native_cli_runtime(
     cfg: &atomcode_coding::CodingRuntimeConfig,
     resume_session_id: Option<String>,
     bootstrap: atomcode_coding::ProviderBootstrap,
+    fork_on_session_in_use: bool,
 ) -> anyhow::Result<(
     atomcode_coding::CodingRuntime,
     atomcode_coding::CodingAgentConfig,
+    Option<ContinuedCliSession>,
 )> {
     let agent = cfg.agent_config();
-    let (session, imported_lease) = match resume_session_id {
+    let (session, imported_lease, continued_session) = match resume_session_id {
         Some(id) => {
             let manager =
                 atomcode_capabilities::session::SessionManager::for_project(&agent.working_dir);
-            let lease = manager.acquire_lease(&id)?;
-            atomcode_daemon::legacy_convert::converge_session(&manager, &lease)?;
-            (atomcode_coding::SessionMode::Resume(id), Some(lease))
+            match manager.acquire_lease(&id) {
+                Ok(lease) => {
+                    atomcode_daemon::legacy_convert::converge_session(&manager, &lease)?;
+                    (
+                        atomcode_coding::SessionMode::Resume(id.clone()),
+                        Some(lease),
+                        Some(ContinuedCliSession {
+                            id,
+                            forked_from: None,
+                        }),
+                    )
+                }
+                Err(error) if should_fork_busy_continue(fork_on_session_in_use, &error) => {
+                    let fork_id = uuid::Uuid::new_v4().to_string();
+                    let (forked, lease) = manager.fork_native_session(
+                        &id,
+                        &fork_id,
+                        atomcode_capabilities::session::now_ms(),
+                    )?;
+                    (
+                        atomcode_coding::SessionMode::Resume(forked.meta.id.clone()),
+                        Some(lease),
+                        Some(ContinuedCliSession {
+                            id: forked.meta.id,
+                            forked_from: Some(id),
+                        }),
+                    )
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
-        None => (atomcode_coding::SessionMode::Fresh, None),
+        None => (atomcode_coding::SessionMode::Fresh, None, None),
     };
     let prepare = atomcode_coding::PrepareOptions {
         session,
@@ -2077,7 +2129,24 @@ async fn spawn_native_cli_runtime(
             .await
             .map_err(anyhow::Error::new)?;
     }
-    Ok((runtime, agent))
+    Ok((runtime, agent, continued_session))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContinuedCliSession {
+    id: String,
+    forked_from: Option<String>,
+}
+
+fn should_fork_busy_continue(
+    fork_on_session_in_use: bool,
+    error: &atomcode_capabilities::session::SessionStoreError,
+) -> bool {
+    fork_on_session_in_use
+        && matches!(
+            error,
+            atomcode_capabilities::session::SessionStoreError::SessionInUse { .. }
+        )
 }
 
 async fn run_native_headless(
@@ -3679,7 +3748,7 @@ mod tests {
         apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
         headless_completion_notify_reason, resolve_working_dir, runtime_config_from,
-        truncate_log_line, DEFAULT_LOG_DIRECTIVES,
+        should_fork_busy_continue, truncate_log_line, DEFAULT_LOG_DIRECTIVES,
     };
     use std::path::PathBuf;
 
@@ -3699,6 +3768,21 @@ mod tests {
         // A malformed default would silently disable ALL logging via the fallback
         // path in `init_file_logging`; pin that it is a valid EnvFilter directive.
         assert!(tracing_subscriber::EnvFilter::try_new(DEFAULT_LOG_DIRECTIVES).is_ok());
+    }
+
+    #[test]
+    fn busy_continue_forks_only_for_interactive_session_contention() {
+        let busy = atomcode_capabilities::session::SessionStoreError::SessionInUse {
+            id: "source".into(),
+            path: PathBuf::from("/sessions/source.lease"),
+        };
+        let missing = atomcode_capabilities::session::SessionStoreError::NotFound {
+            path: PathBuf::from("/sessions/source.meta"),
+        };
+
+        assert!(should_fork_busy_continue(true, &busy));
+        assert!(!should_fork_busy_continue(false, &busy));
+        assert!(!should_fork_busy_continue(true, &missing));
     }
 
     #[test]

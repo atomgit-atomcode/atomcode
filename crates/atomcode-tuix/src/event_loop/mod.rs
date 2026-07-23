@@ -2993,6 +2993,10 @@ pub struct LoopCtx {
     /// runtime model context through native restore on first
     /// `run_loop` entry, then dropped — matching `/resume` behaviour.
     pub replay_on_start: Option<Session>,
+    /// One-shot launch notice produced by the CLI when interactive `-c` had to
+    /// fork a session owned by another runtime. Kept separate from replay data
+    /// so presentation-only diagnostics never enter the provider snapshot.
+    pub startup_notice: Option<String>,
     /// Lazy file/dir index for `@`-mention popup. Built on first `@`
     /// keystroke via `FileIndex::filter`; session-life cache.
     pub file_index: file_index::FileIndex,
@@ -6721,11 +6725,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // /resume reuse the SAME id. The -c replay block below rebinds if present.
     commands::bind_telemetry_to_session(&ctx, &ctx.current_session);
 
+    if let Some(notice) = ctx.startup_notice.take() {
+        renderer.render(UiLine::Warning(notice));
+    }
+
     // Auto-continue: if the CLI loaded the most recent session for this
     // working dir (via `atomcode -c` / `--continue`), replay its messages
-    // into scrollback AND restore the agent's model context so follow-up
-    // questions can reference prior conversation. This mirrors the `/resume`
-    // slash command's behaviour: visual replay + native snapshot restoration.
+    // into scrollback. The runtime already restored the same native snapshot;
+    // when the source was busy, both values identify the independently
+    // persisted fork instead. This mirrors `/resume` visually without ever
+    // allowing two runtimes to own one session id.
     if let Some(session) = ctx.replay_on_start.take() {
         if !session.messages.is_empty() {
             crate::modals::session_picker::replay_session(
@@ -6736,10 +6745,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             );
             // The runtime was prepared against this exact external session id and
             // snapshot before the TUI started; replay here is display-only.
-            // Continue accumulating into the same session file — future
-            // TurnComplete saves overwrite it instead of creating a new one.
-            // Header + telemetry = this continued session's persistent id, so
-            // `-c` reuses the saved session's id (not a fresh per-process one).
+            // Continue accumulating into the runtime-owned session file. That
+            // is the original id after an uncontended resume or the new fork id
+            // after contention; header and telemetry must follow that exact id.
             commands::bind_telemetry_to_session(&ctx, &session);
             ctx.current_session = session;
             app.state.on_turn_complete();

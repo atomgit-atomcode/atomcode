@@ -355,6 +355,10 @@ pub enum Msg<'a> {
     SessionResumedLabel {
         name: &'a str,
     },
+    SessionBusyForked {
+        source_id: &'a str,
+        fork_id: &'a str,
+    },
 
     // ── Todo panel ──
     TodoPanelTitle,
