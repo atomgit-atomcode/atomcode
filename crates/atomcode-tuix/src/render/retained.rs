@@ -17150,6 +17150,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn on_resize_preserves_transcript_under_menu_picker_modal() {
+        // The transcript-loss-on-resize bug hit EVERY modal, not just /view and
+        // /diff: the handler's `clear_screen()` fired for any `active_modal`. The
+        // menu pickers (/model, /resume, /provider, /proxy, …) render via
+        // `InputPrompt` into the footer of the Screen model — NOT the separate
+        // `modal_overlay` — so they never had the #1158 duplication and removing
+        // `clear_screen()` is safe for them, while it fixes their transcript loss
+        // too. This pins both halves.
+        let (mut r, buf) = new_capturing(60, 20);
+        for i in 0..5 {
+            r.render(UiLine::AssistantText(format!("history row {i}\n")));
+        }
+        // A /model-style picker: input box + a selection menu in the footer.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(MenuPayload {
+                items: vec![
+                    ("glm-5".into(), "".into()),
+                    ("deepseek".into(), "".into()),
+                ],
+                selected: 0,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        // A menu picker never installs the diff overlay.
+        assert!(
+            r.modal_overlay.is_none(),
+            "menu pickers must not use the diff modal_overlay path"
+        );
+        buf.lock().unwrap().clear();
+
+        r.on_resize(60, 12);
+
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        assert!(
+            out.contains("history row 4"),
+            "resize under a menu picker must preserve+repaint the transcript: {out:?}"
+        );
+    }
+
     /// Regression for the reasoning-text SGR-in-cells corruption: when
     /// `UiLine::ReasoningText` arrived, the handler wrapped the payload
     /// in `\x1b[2m...\x1b[0m` and routed it through `push_body_text` →
