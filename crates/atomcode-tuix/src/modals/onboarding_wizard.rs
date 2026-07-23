@@ -1074,13 +1074,12 @@ impl crate::modals::Modal for OnboardingWizard {
     ) {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         if matches!(self.step, Step::QrLogin) {
-            // TODO(temporary): Trigger a synthetic terminal resize refresh before drawing QrLogin.
-            // On some Windows terminals, initial modal rendering without a SIGWINCH/Resize event
+            // TODO(temporary): Trigger a full renderer reset before drawing QrLogin.
+            // On some Windows consoles, initial modal rendering without a screen reset
             // leaves line buffer alignment artifacts that prevent QR scanners from reading the code.
-            // Manually re-issuing clear_screen + on_resize forces a full buffer re-alignment so the QR code
-            // is immediately scannable without requiring the user to manually resize the window.
-            renderer.clear_screen();
-            renderer.on_resize(cols, rows);
+            // Calling renderer.reset() forces a complete terminal wipe (CUP+EL per row) and screen buffer reset
+            // so the QR code is immediately drawn on a pristine terminal canvas without requiring a manual window resize.
+            renderer.reset();
         }
         // The wizard panel is capped at MAX_PANEL_WIDTH cols by calc_panel_width;
         // use that as the centering anchor so the bordered box stays at the
