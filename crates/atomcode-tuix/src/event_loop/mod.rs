@@ -8952,6 +8952,20 @@ fn handle_input(
                 .as_ref()
                 .is_some_and(|m| m.captures_all_keys())
             {
+                // Ctrl+C is a global exit shortcut and must NOT be trappable by a
+                // capturing modal either — but only for the ones that open while
+                // Idle (the `/view` file viewer, the `/diff` panel). The password
+                // prompt captures mid-turn (Streaming) and legitimately needs
+                // Ctrl+C to cancel the turn, not quit; the Idle gate excludes it.
+                // Mirrors the non-capturing Ctrl+C guard just below.
+                if matches!(app.state.phase, UiPhase::Idle)
+                    && code == KeyCode::Char('c')
+                    && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                {
+                    app.active_modal = None;
+                    arm_shutdown_watchdog(ctx);
+                    return Ok(());
+                }
                 let streaming = matches!(app.state.phase, UiPhase::Streaming);
                 if let Some(modal) = app.active_modal.as_mut() {
                     let action = modal.handle_key(

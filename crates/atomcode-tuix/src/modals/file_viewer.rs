@@ -1,17 +1,22 @@
 // crates/atomcode-tuix/src/modals/file_viewer.rs
 //
-// `/view` — a borderless, bottom-anchored file viewer (the `/diff` house
-// style), NOT a centred floating popup.
+// `/view` — a borderless, fixed-height inline file viewer (the `/diff` house
+// style): the panel is drawn where the input box sits, covering it, NOT a
+// centred floating popup and NOT a full-screen takeover.
 //
-// Two internal views, mirroring `DiffViewer`'s List→Detail shape:
+// Two internal views, mirroring `DiffViewer`'s List→Detail shape and sizing:
 //   - `Picker`  : `/view` with no argument opens a files-only fuzzy selector,
 //                 reusing the `@`-mention `FileIndex`. Type to filter, ↑↓ to
 //                 select, Enter to open, Esc to cancel. Directories are never
-//                 listed (you can't `/view` a directory).
+//                 listed (you can't `/view` a directory). Given a stable
+//                 fixed-height panel (~45%) rather than `/diff`'s content-fit
+//                 list — a fuzzy search wants a steady size and many matches
+//                 visible, not a panel that resizes as you type.
 //   - `Content` : the selected file (or `/view <path>`) rendered with line
-//                 numbers in a bottom-anchored panel. ↑↓/PgUp/Home/End scroll;
-//                 Esc backs out to the picker (or closes for a direct `/view
-//                 <path>`).
+//                 numbers in a taller panel (~75%, matching the `/diff` detail
+//                 view) so a long file has room to scroll. ↑↓/PgUp/Home/End
+//                 scroll; Esc backs out to the picker (or closes for a direct
+//                 `/view <path>`).
 //
 // `/view <path>` accepts absolute, `~`-prefixed, and project-relative paths
 // (resolved by the caller in `commands.rs`), so files OUTSIDE the project open
@@ -46,12 +51,25 @@ fn l(en: &'static str, zh: &'static str) -> &'static str {
     }
 }
 
-/// Full-screen-width, bottom-anchored dimensions: `(win_width, win_height,
-/// content_height)`. Same math as `DiffViewer::dimensions`.
-fn dimensions() -> (u16, u16, usize) {
+/// Returns `(screen_w, panel_height, content_height)`: a FIXED-height panel
+/// drawn inline where the input box sits (covering it), NOT a full-screen
+/// takeover. The content view uses the ~75% height matching `DiffViewer`'s
+/// file-detail view so a long file has room to scroll; the picker uses a
+/// steadier ~45% so a fuzzy search doesn't resize as you type. `content_height`
+/// is the body area — `panel_height` minus four chrome rows (top rule, title,
+/// blank spacer, hint).
+fn geometry(is_content: bool) -> (u16, u16, usize) {
     let (screen_w, screen_h) = crossterm::terminal::size().unwrap_or((80, 24));
-    let content_height = (screen_h as usize).saturating_sub(4).max(1);
-    (screen_w, screen_h, content_height)
+    let h = screen_h as usize;
+    // `.max(lo).min(h)` rather than `clamp(lo, h)` — the latter PANICS when the
+    // terminal is shorter than `lo` (min > max).
+    let panel_height = if is_content {
+        (h * 3 / 4).max(10).min(h)
+    } else {
+        (h * 9 / 20).max(8).min(h)
+    };
+    let content_height = panel_height.saturating_sub(4).max(1);
+    (screen_w, panel_height as u16, content_height)
 }
 
 /// Loaded file content backing the `Content` view.
@@ -219,7 +237,7 @@ impl FileViewer {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
-        let (_, _, page) = dimensions();
+        let (_, _, page) = geometry(true);
         match code {
             KeyCode::Up | KeyCode::Char('k') => self.content_scroll_up(1),
             KeyCode::Down | KeyCode::Char('j') => self.content_scroll_down(1),
@@ -261,7 +279,7 @@ impl FileViewer {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
-        let (_, _, page) = dimensions();
+        let (_, _, page) = geometry(false);
         // Enter is handled specially (mutates `self.content`), so keep the
         // picker borrow scoped to the navigation/edit keys only.
         if let KeyCode::Enter = code {
@@ -459,7 +477,9 @@ impl Modal for FileViewer {
     }
 
     fn draw(&self, _buf: &Buffer, _state: &UiState, _ctx: &LoopCtx, renderer: &mut dyn Renderer) {
-        let (win_w, win_h, content_height) = dimensions();
+        // Content view uses the taller (~75%) detail geometry; the picker uses
+        // the shorter (~45%) list geometry — the same split as `/diff`.
+        let (win_w, win_h, content_height) = geometry(self.content.is_some());
         let line = if let Some(c) = &self.content {
             build_content_panel(c, self.picker.is_some(), content_height, win_w, win_h)
         } else if let Some(p) = &self.picker {
@@ -482,6 +502,14 @@ impl Modal for FileViewer {
         // File viewer doesn't accept paste.
         Ok(ModalAction::Continue)
     }
+
+    /// Like `DiffViewer`, the panel replaces the input box, so it must own every
+    /// keystroke — otherwise (e.g. a background `/loop` turn flips the phase to
+    /// Streaming) typed characters leak into the input buffer and pop a slash
+    /// menu behind the panel.
+    fn captures_all_keys(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -491,6 +519,37 @@ mod tests {
 
     fn content_of(v: &FileViewer) -> &Content {
         v.content.as_ref().expect("content view active")
+    }
+
+    #[test]
+    fn geometry_matches_diff_list_detail_split() {
+        // The `/view` panel mirrors `/diff`: a fixed-height inline panel (never a
+        // full-screen takeover), with the picker on the shorter file-list height
+        // and file content on the taller detail height. Assert the relationship
+        // rather than exact rows so it holds at any terminal size.
+        let (_, picker_h, picker_body) = geometry(false);
+        let (_, content_h, content_body) = geometry(true);
+        let (_, screen_h) = crossterm::terminal::size().unwrap_or((80, 24));
+        // Universal invariant: detail is never shorter than the list. (On a tiny
+        // terminal both collapse to the screen height, so this is `>=`, not `>`.)
+        assert!(
+            content_h >= picker_h,
+            "content panel ({content_h}) must be at least as tall as the picker ({picker_h})"
+        );
+        // On any realistic terminal the detail view is strictly taller.
+        if screen_h >= 20 {
+            assert!(
+                content_h > picker_h,
+                "at a normal size the detail panel must be strictly taller than the picker"
+            );
+        }
+        assert!(
+            content_h <= screen_h && picker_h <= screen_h,
+            "neither panel may exceed the screen ({screen_h})"
+        );
+        // Four chrome rows (top rule, title, blank spacer, hint) are reserved.
+        assert_eq!(picker_body, (picker_h as usize).saturating_sub(4).max(1));
+        assert_eq!(content_body, (content_h as usize).saturating_sub(4).max(1));
     }
 
     #[test]
