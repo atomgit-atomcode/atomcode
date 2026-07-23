@@ -113,8 +113,8 @@ mod tests {
     #[test]
     fn newer_major_version_returns_some() {
         assert_eq!(
-            parse_and_compare("v4.15.3", &manifest_body("v5.0.0")),
-            Some("v5.0.0".to_string())
+            parse_and_compare("v4.15.3", &manifest_body("v5.0.1")),
+            Some("v5.0.1".to_string())
         );
     }
 
