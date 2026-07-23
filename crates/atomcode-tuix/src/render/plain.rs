@@ -275,7 +275,11 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 self.drop_transient();
                 let _ = writeln!(self.out, "{}", self.dg(&text));
             }
-            UiLine::ToolResult { success, summary } => {
+            UiLine::ToolResult {
+                success,
+                summary,
+                diff_stats,
+            } => {
                 self.drop_transient();
                 let icon = if self.caps.unicode_symbols {
                     if success {
@@ -298,13 +302,17 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     ""
                 };
                 let reset = if self.caps.colors { SGR_RESET } else { "" };
+                let stats = diff_stats
+                    .map(|(added, removed)| format!(" (+{added} -{removed})"))
+                    .unwrap_or_default();
                 let _ = writeln!(
                     self.out,
-                    "{}{}{} {}",
+                    "{}{}{} {}{}",
                     icon_color,
                     icon,
                     reset,
-                    scrub_controls(&summary)
+                    scrub_controls(&summary),
+                    stats
                 );
             }
             UiLine::DiffLine { added, text } => {
@@ -330,6 +338,28 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 );
             }
             UiLine::DiffBlock(entries) => {
+                self.drop_transient();
+                let gutter = crate::render::diff::diff_gutter_width(&entries);
+                for entry in &entries {
+                    let color = if self.caps.colors {
+                        match entry.kind {
+                            crate::render::DiffKind::Add => SGR_GREEN,
+                            crate::render::DiffKind::Del => SGR_RED,
+                            _ => "",
+                        }
+                    } else {
+                        ""
+                    };
+                    let reset = if self.caps.colors && !color.is_empty() {
+                        SGR_RESET
+                    } else {
+                        ""
+                    };
+                    let body = crate::render::diff::diff_row_text(entry, gutter);
+                    let _ = writeln!(self.out, "{}{}{}", color, scrub_controls(&body), reset);
+                }
+            }
+            UiLine::EditDiffBlock(entries) => {
                 self.drop_transient();
                 let gutter = crate::render::diff::diff_gutter_width(&entries);
                 for entry in &entries {
@@ -635,6 +665,7 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: true,
             summary: "done".into(),
+            diff_stats: None,
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
@@ -666,6 +697,7 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: false,
             summary: "boom".into(),
+            diff_stats: None,
         });
         r.render(UiLine::Error("kaboom".into()));
         r.flush();

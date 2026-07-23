@@ -3660,6 +3660,25 @@ mod buffer_tests {
     }
 
     #[test]
+    fn footer_report_esc_is_consumed_without_changing_streaming_phase() {
+        let mut state = UiState::new();
+        state.phase = UiPhase::Streaming;
+        state.footer_command_output = Some("usage report".into());
+
+        assert!(dismiss_footer_command_output(&mut state));
+        assert!(state.footer_command_output.is_none());
+        assert_eq!(
+            state.phase,
+            UiPhase::Streaming,
+            "dismissing the report must not cancel or otherwise end the turn"
+        );
+        assert!(
+            !dismiss_footer_command_output(&mut state),
+            "a second Esc must fall through to the normal streaming action"
+        );
+    }
+
+    #[test]
     fn spinner_label_never_shows_stall_hint() {
         // The "· esc to cancel" stall hint was removed by request: even a model
         // stream silent well past the threshold must NOT advertise it in the
@@ -4382,6 +4401,64 @@ mod menu_tests {
                 "crates/atomcode-bridge/src/",
                 "crates/atomcode-bridge/Cargo.toml",
             ]
+        );
+    }
+
+    /// Guards the streaming-phase `@`-mention selection arm added to
+    /// `handle_streaming_key` (mod.rs ~11386). That arm's trigger condition
+    /// is `detect_at_mention_range(buf, cursor).is_some()`, so verifying
+    /// these two boundary behaviours pins the arm's reach without spinning
+    /// up a full App + ctx + renderer (the streaming handler's integration
+    /// test would be disproportionate).
+    #[test]
+    fn streaming_at_mention_selection_arm_guard_boundaries() {
+        // `@`-mention menu active: bare `@<partial>` token at cursor —
+        // the new arm MUST match (Enter completes, not submits).
+        let buf = "@crates";
+        let cursor = buf.len();
+        assert!(
+            file_index::detect_at_mention_range(buf, cursor).is_some(),
+            "@-mention token at cursor must satisfy the new arm guard"
+        );
+        // Cursor positioned INSIDE the token (mid-token Enter) also
+        // matches — the arm should complete at any cursor within the
+        // @-token, mirroring idle behaviour.
+        assert!(
+            file_index::detect_at_mention_range(buf, buf.len() - 2).is_some(),
+            "cursor inside an @-token must still satisfy the guard"
+        );
+
+        // Slash command menu: buffer starts with `/` — the new arm
+        // MUST NOT match, so slash selection falls through to the
+        // existing commit arm's "slash commands are disabled while a
+        // turn is running" hint. Bug would be silently swallowing slash
+        // Enter mid-stream.
+        let slash_buf = "/he";
+        assert!(
+            file_index::detect_at_mention_range(slash_buf, slash_buf.len()).is_none(),
+            "slash command buffer must NOT satisfy the @-mention guard"
+        );
+
+        // Empty buffer / no `@` at all — arm must not match.
+        assert!(
+            file_index::detect_at_mention_range("", 0).is_none(),
+            "empty buffer must not satisfy the @-mention guard"
+        );
+        assert!(
+            file_index::detect_at_mention_range("plain text", 9).is_none(),
+            "buffer with no @ must not satisfy the guard"
+        );
+
+        // Replacement format: directory selections keep the trailing
+        // slash so the token stays drill-down-ready. This is the exact
+        // shape the arm writes into the buffer on Enter/Tab.
+        assert_eq!(
+            file_index::format_at_mention_replacement("crates/atomcode-tuix/"),
+            "@crates/atomcode-tuix/",
+        );
+        assert_eq!(
+            file_index::format_at_mention_replacement("Cargo.toml"),
+            "@Cargo.toml",
         );
     }
 
@@ -6097,6 +6174,13 @@ fn intercept_empty_bare_esc(
         *pending = Some(now);
         EmptyEscIntercept::Consumed
     }
+}
+
+/// Consume the footer report owned by `/usage` or `/cost`. Key handlers call
+/// this before their normal Esc action; `true` means the key was fully handled
+/// and must not reach turn cancellation or double-Esc undo.
+fn dismiss_footer_command_output(state: &mut UiState) -> bool {
+    state.footer_command_output.take().is_some()
 }
 
 /// Grace period after a quit request before the force-exit watchdog fires. The
@@ -9733,6 +9817,12 @@ fn handle_idle_key(
         return Ok(());
     }
 
+    if code == KeyCode::Esc && modifiers.is_empty() && dismiss_footer_command_output(&mut app.state)
+    {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
     if code == KeyCode::Esc
         && modifiers.is_empty()
         && menu_items.is_none()
@@ -10730,7 +10820,15 @@ mod streaming_slash_tests {
     #[test]
     fn mutating_and_modal_commands_stay_blocked_mid_stream() {
         // Conversation-mutating / turn-boundary commands must still wait.
-        for line in ["/clear", "/compact", "/new", "/resume", "/model gpt", "/undo", "/context"] {
+        for line in [
+            "/clear",
+            "/compact",
+            "/new",
+            "/resume",
+            "/model gpt",
+            "/undo",
+            "/context",
+        ] {
             assert_eq!(exec(line), None, "line={line}");
         }
     }
@@ -11201,15 +11299,17 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
             return Some(("loop".to_string(), arg.trim().to_string()));
         }
     }
-    // READ-ONLY / METADATA commands that are SAFE mid-turn — they only render to
-    // SCROLLBACK (never open an interactive modal, which the live streaming box would
-    // paint over) and don't mutate the running conversation. This is the reported
+    // READ-ONLY / METADATA commands that are SAFE mid-turn — they don't mutate
+    // the running conversation. This is the reported
     // request: rename the session or check usage without waiting for the turn to end.
-    //   /status, /cost, /diff, /usage — read-only reports (no args). `/usage` detects
-    //   the Streaming phase and renders a TEXT snapshot to scrollback instead of its
-    //   interactive modal (which the streaming redraws would paint over).
-    if matches!(cmd.to_ascii_lowercase().as_str(), "status" | "cost" | "diff" | "usage")
-        && arg.trim().is_empty()
+    //   /status, /diff — read-only scrollback reports (no args).
+    //   /cost, /usage — transient footer reports below the input box; Esc dismisses
+    //   the report without cancelling the live turn. `/usage` avoids its interactive
+    //   modal here because streaming redraws would paint over that overlay.
+    if matches!(
+        cmd.to_ascii_lowercase().as_str(),
+        "status" | "cost" | "diff" | "usage"
+    ) && arg.trim().is_empty()
     {
         return Some((cmd.to_ascii_lowercase(), String::new()));
     }
@@ -11281,6 +11381,22 @@ fn handle_streaming_key(
             app.state.spinner_label
         );
         restore_cancelled_message_to_buf(app, renderer, ctx);
+        return Ok(());
+    }
+
+    // A visible read-only report owns the first bare Esc. Dismiss it and
+    // consume the key before the cancellation path below so inspecting
+    // `/usage` or `/cost` can never make Esc stop the running response.
+    if code == KeyCode::Esc && modifiers.is_empty() && dismiss_footer_command_output(&mut app.state)
+    {
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
         return Ok(());
     }
 
@@ -11366,6 +11482,46 @@ fn handle_streaming_key(
                 app.buf.text.clear();
                 app.buf.cursor = 0;
                 app.menu.selected = 0;
+                draw_spinner_now(
+                    &mut app.state,
+                    &app.buf,
+                    ctx,
+                    renderer,
+                    app.message_queue.len(),
+                    app.menu.selected,
+                );
+                return Ok(());
+            }
+            // `@`-mention selection mid-stream: insert `@<full_path>` at the
+            // token range and STAY in the input box. Without this arm Enter
+            // fell through to `classify` → `Action::Submit` → `BufferResult::Commit`,
+            // which mid-stream steers/queues the half-finished `@…` token as a
+            // message — the user's selection was "sent" instead of completed.
+            // Mirrors `handle_idle_key`'s selection arm (mod.rs:9418) but ONLY
+            // the @-mention complete branch: slash commands stay disabled
+            // mid-stream (they fall through to the commit arm's "slash commands
+            // are disabled while a turn is running" hint below).
+            //
+            // Xshell over SSH reproduces this most readily (the streaming-phase
+            // menu is the only path where @-mention + Enter lands here), but
+            // the bug is terminal-agnostic — any terminal that opens the
+            // streaming @-mention menu hits the same missing arm.
+            KeyCode::Enter | KeyCode::Tab
+                if !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+                    && !items.is_empty()
+                    && file_index::detect_at_mention_range(&app.buf.text, app.buf.cursor)
+                        .is_some() =>
+            {
+                let (at_pos, end) =
+                    file_index::detect_at_mention_range(&app.buf.text, app.buf.cursor)
+                        .expect("guarded above");
+                let selected_path = items[app.menu.selected].0.clone();
+                let replacement = file_index::format_at_mention_replacement(&selected_path);
+                app.buf.text.replace_range(at_pos..end, &replacement);
+                app.buf.cursor = at_pos + replacement.len();
+                app.menu.selected = 0;
+                // Menu shape may have changed — surface on next redraw via
+                // draw_spinner_now (the streaming footer stays visible).
                 draw_spinner_now(
                     &mut app.state,
                     &app.buf,
@@ -11478,7 +11634,7 @@ fn handle_streaming_key(
                 // Only the TURN-ENDING commands (bg backgrounds it; quit/exit kill it;
                 // goal/loop halt the driver that owns the stream) tear down the turn's
                 // live UI state. Everything else the allowlist admits is a read-only
-                // report that renders to scrollback and MUST preserve that state (the
+                // report that MUST preserve that state (the
                 // type-ahead queue, in-flight tools, thinking/reasoning buffers). Framed
                 // as "read-only is the safe default" so a future allowlisted report can't
                 // silently corrupt a running turn by being forgotten in this list.
@@ -11507,8 +11663,9 @@ fn handle_streaming_key(
                 app.buf.cursor = 0;
                 app.menu.selected = 0;
                 if readonly {
-                    // Restore the streaming footer/spinner beneath the report so the live
-                    // turn keeps animating (the report landed in scrollback above it).
+                    // Restore the streaming footer/spinner after executing the report.
+                    // `/usage` and `/cost` are carried in the footer snapshot itself;
+                    // `/status` and `/diff` land in scrollback above it.
                     draw_spinner_now(
                         &mut app.state,
                         &app.buf,
@@ -13275,7 +13432,10 @@ mod turn_error_reason_tests {
         let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "3.2s");
         // Reason folded into the separator label (not a separate line).
         assert!(label.contains("账户余额不足（HTTP 402）"), "{label}");
-        assert!(label.contains("已中断") || label.contains("Stopped"), "{label}");
+        assert!(
+            label.contains("已中断") || label.contains("Stopped"),
+            "{label}"
+        );
         // Consumed: cannot leak into the next turn.
         assert!(state.last_turn_error.is_none());
     }
@@ -15090,6 +15250,7 @@ fn commit_native_session_changed(
     state.pending_context_render = None;
     state.thinking_idx = 0;
     state.on_turn_complete();
+    state.on_session_replaced();
     state.active_todos = None;
     sync_todo_titles(state);
     state.approval_panel = None;
@@ -16083,7 +16244,45 @@ fn handle_agent_event(
                     } else {
                         summarise(&output)
                     };
-                    renderer.render(UiLine::ToolResult { success, summary });
+                    // The inline colored `(+N -N)` is the edit result's only
+                    // metadata. Drop the tool's older parenthesized replacement
+                    // label so the count sits directly after the file name.
+                    let summary = if name == "edit_file" && success {
+                        summary
+                            .split_once(" (")
+                            .map(|(file, _)| file.to_string())
+                            .unwrap_or(summary)
+                    } else {
+                        summary
+                    };
+                    let diff_entries = if matches!(
+                        name.as_str(),
+                        "edit_file" | "write_file" | "create_file" | "search_replace"
+                    ) {
+                        let entries = crate::render::diff::parse_unified_diff(&output, 120);
+                        (!entries.is_empty()).then_some(entries)
+                    } else {
+                        None
+                    };
+                    let diff_stats = diff_entries.as_ref().map(|entries| {
+                        let added = entries
+                            .iter()
+                            .filter(|entry| entry.kind == crate::render::DiffKind::Add)
+                            .count();
+                        let removed = entries
+                            .iter()
+                            .filter(|entry| entry.kind == crate::render::DiffKind::Del)
+                            .count();
+                        (added, removed)
+                    });
+                    renderer.render(UiLine::ToolResult {
+                        success,
+                        summary,
+                        diff_stats,
+                    });
+                    if let Some(entries) = diff_entries {
+                        renderer.render(UiLine::EditDiffBlock(entries));
+                    }
                 }
             }
             // Collect diff lines into a single batch — N individual
@@ -16101,16 +16300,6 @@ fn handle_agent_event(
             // tools that actually emit diff payloads (`edit_file`,
             // `write_file`, `create_file`, `search_replace`) closes
             // that without losing the diff render where it's wanted.
-            let emits_diff = matches!(
-                name.as_str(),
-                "edit_file" | "write_file" | "create_file" | "search_replace"
-            );
-            if emits_diff {
-                let diff_entries = crate::render::diff::parse_unified_diff(&output, 120);
-                if !diff_entries.is_empty() {
-                    renderer.render(UiLine::DiffBlock(diff_entries));
-                }
-            }
             // Flush any pending diff renders before the next event.
             renderer.flush();
             let _ = name;
@@ -16441,6 +16630,7 @@ fn handle_agent_event(
                 renderer.render(UiLine::ToolResult {
                     success: false,
                     summary: "(cancelled)".into(),
+                    diff_stats: None,
                 });
             }
             renderer.render(UiLine::TurnCancelled);
@@ -17752,6 +17942,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     crate::render::StatusLine {
         model,
         cwd,
+        command_output: state.footer_command_output.clone(),
         ctx_used,
         ctx_window,
         hint,

@@ -164,6 +164,7 @@ fn ensure_bg_foreground_switch_allowed(
 }
 
 fn apply_resumed_runtime_state(state: &mut UiState, runtime_state: bg_runtime::RuntimeState) {
+    state.on_session_replaced();
     if matches!(runtime_state, bg_runtime::RuntimeState::Running) {
         state.on_submit();
     } else {
@@ -223,8 +224,9 @@ mod bg_live_guard_tests {
     use std::path::PathBuf;
 
     use super::{
-        apply_resumed_runtime_state, detach_live_binding_with, ensure_bg_foreground_switch_allowed,
-        finalize_background_submission, foreground_turn_replay_events,
+        apply_resumed_runtime_state, command_output_should_mirror, detach_live_binding_with,
+        ensure_bg_foreground_switch_allowed, finalize_background_submission,
+        foreground_turn_replay_events,
         schedule_resumed_runtime_replay,
     };
     use crate::event_loop::bg_runtime::{BgRuntimeManager, RuntimeEventPayload, RuntimeState};
@@ -250,13 +252,41 @@ mod bg_live_guard_tests {
     }
 
     #[test]
+    fn streaming_footer_reports_are_desktop_local_even_with_live_sync() {
+        assert!(!command_output_should_mirror(
+            true,
+            UiPhase::Streaming,
+            "usage"
+        ));
+        assert!(!command_output_should_mirror(
+            true,
+            UiPhase::Streaming,
+            "cost"
+        ));
+        assert!(
+            command_output_should_mirror(true, UiPhase::Idle, "cost"),
+            "idle /cost keeps its existing command-output mirroring"
+        );
+        assert!(command_output_should_mirror(
+            true,
+            UiPhase::Streaming,
+            "status"
+        ));
+    }
+
+    #[test]
     fn running_background_resume_keeps_the_foreground_streaming() {
         let mut state = UiState::with_unicode(true);
         state.on_turn_complete();
+        state.footer_command_output = Some("old session cost".into());
 
         apply_resumed_runtime_state(&mut state, RuntimeState::Running);
 
         assert_eq!(state.phase, UiPhase::Streaming);
+        assert!(
+            state.footer_command_output.is_none(),
+            "resuming another foreground runtime must drop the old session report"
+        );
     }
 
     #[test]
@@ -586,6 +616,14 @@ impl Renderer for CaptureRenderer<'_> {
 /// （二维码、浏览器地址、同步提示），对手机端没有意义甚至是噪音。
 const MIRROR_EXCLUDED: &[&str] = &["app", "webui", "sync", "login", "logout"];
 
+fn command_output_should_mirror(live_binding: bool, phase: crate::state::UiPhase, cmd: &str) -> bool {
+    let local_footer_report = matches!(phase, crate::state::UiPhase::Streaming)
+        && matches!(cmd.to_ascii_lowercase().as_str(), "usage" | "cost");
+    live_binding
+        && !local_footer_report
+        && !MIRROR_EXCLUDED.contains(&cmd.to_ascii_lowercase().as_str())
+}
+
 /// 提交一条「由斜杠命令合成的用户回合」（如 /skills、/review、/guide、自定义命令展开的
 /// 模板）到当前生效的对话引擎。
 ///
@@ -755,8 +793,11 @@ pub(super) fn execute_slash_command(
     active_modal: &mut Option<Box<dyn Modal>>,
     setup_pending: &mut bool,
 ) -> Result<()> {
-    let mirror =
-        ctx.live_binding.is_some() && !MIRROR_EXCLUDED.contains(&cmd.to_ascii_lowercase().as_str());
+    // Streaming `/usage` and `/cost` are desktop-local footer panels, not
+    // conversation output. Do not broadcast them to phone/WebUI merely because
+    // live sync is attached. A command initiated by the remote client still
+    // uses `run_remote_command` and gets its explicitly requested response.
+    let mirror = command_output_should_mirror(ctx.live_binding.is_some(), state.phase, cmd);
     if !mirror {
         return execute_slash_command_impl(
             cmd,
@@ -1729,16 +1770,17 @@ fn execute_slash_command_impl(
             dispatch_undo(arg, state, ctx, renderer);
         }
         "usage" => {
-            // Mid-turn (Streaming): render a text snapshot to scrollback — the modal
-            // fights the live streaming box. Idle: open the interactive modal.
+            // Mid-turn (Streaming): keep a text snapshot in the footer directly
+            // below the input box. It must not enter conversation scrollback,
+            // and Esc dismisses it without cancelling the running turn.
+            // Idle: open the interactive modal.
             if matches!(state.phase, crate::state::UiPhase::Streaming) {
                 // `false` = skip the heavier `usage()` round-trip (overview/models) the
                 // text snapshot doesn't render — one gateway call, not two, mid-stream.
                 let text = fetch_usage_data(false)
                     .map(|d| render_usage_text(&d))
                     .unwrap_or_else(|| t(Msg::UsageCodingPlanOnly).into_owned());
-                renderer.render(UiLine::CommandOutput(text));
-                renderer.flush();
+                state.footer_command_output = Some(text);
             } else {
                 open_usage(renderer, active_modal);
             }
@@ -1746,13 +1788,18 @@ fn execute_slash_command_impl(
         "cost" => {
             // Local session token cost (any model, incl. self-integrated) — as
             // opposed to `/usage`, which queries the CodingPlan gateway only.
-            renderer.render(UiLine::CommandOutput(build_cost_text(
+            let text = build_cost_text(
                 &ctx.model_name,
                 state.prompt_tokens,
                 state.completion_tokens,
                 state.cached_tokens,
-            )));
-            renderer.flush();
+            );
+            if matches!(state.phase, crate::state::UiPhase::Streaming) {
+                state.footer_command_output = Some(text);
+            } else {
+                renderer.render(UiLine::CommandOutput(text));
+                renderer.flush();
+            }
         }
         "context" => {
             // `/context` = breakdown only.
@@ -2399,6 +2446,7 @@ fn execute_slash_command_impl(
                     ctx.current_session = new_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
                     state.on_turn_complete();
+                    state.on_session_replaced();
                     // The todo panel is per-session and is NOT cleared at turn end;
                     // this fresh foreground session has no todos, so drop the prior
                     // session's list (mirrors reset_to_new_session / native SessionChanged).
@@ -5009,7 +5057,9 @@ fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Mod
     match fetch_usage_data(true) {
         Some(data) => *active_modal = Some(Box::new(UsageModal::new(data))),
         None => {
-            renderer.render(UiLine::CommandOutput(t(Msg::UsageCodingPlanOnly).into_owned()));
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::UsageCodingPlanOnly).into_owned(),
+            ));
             renderer.flush();
         }
     }
@@ -7131,7 +7181,10 @@ mod tests {
             overview: None,
             error: None,
         };
-        assert!(!render_usage_text(&empty).is_empty(), "empty data must not render blank");
+        assert!(
+            !render_usage_text(&empty).is_empty(),
+            "empty data must not render blank"
+        );
     }
 
     #[test]

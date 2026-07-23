@@ -431,8 +431,14 @@ mod user_input_custom_tests {
             question: "Q?".into(),
             mode,
             options: vec![
-                UserInputOption { label: "A".into(), description: None },
-                UserInputOption { label: "B".into(), description: None },
+                UserInputOption {
+                    label: "A".into(),
+                    description: None,
+                },
+                UserInputOption {
+                    label: "B".into(),
+                    description: None,
+                },
             ],
             custom,
         }
@@ -441,19 +447,39 @@ mod user_input_custom_tests {
     #[test]
     fn single_last_row_gates_on_custom() {
         let with = UserInputPanel::new(1, &req(UserInputMode::Single, true));
-        assert_eq!(with.last_row(), 2, "single, custom → Other row is last (idx 2)");
+        assert_eq!(
+            with.last_row(),
+            2,
+            "single, custom → Other row is last (idx 2)"
+        );
         let without = UserInputPanel::new(1, &req(UserInputMode::Single, false));
-        assert_eq!(without.last_row(), 1, "single, no custom → last option (idx 1)");
+        assert_eq!(
+            without.last_row(),
+            1,
+            "single, no custom → last option (idx 1)"
+        );
     }
 
     #[test]
     fn multiple_submit_index_and_checked_gate_on_custom() {
         let with = UserInputPanel::new(1, &req(UserInputMode::Multiple, true));
         assert_eq!(with.submit_index(), Some(3), "custom → other@2, submit@3");
-        assert_eq!(with.checked.len(), 3, "custom → Other checkbox slot present");
+        assert_eq!(
+            with.checked.len(),
+            3,
+            "custom → Other checkbox slot present"
+        );
         let without = UserInputPanel::new(1, &req(UserInputMode::Multiple, false));
-        assert_eq!(without.submit_index(), Some(2), "no custom → submit right after options@2");
-        assert_eq!(without.checked.len(), 2, "no custom → no Other checkbox slot");
+        assert_eq!(
+            without.submit_index(),
+            Some(2),
+            "no custom → submit right after options@2"
+        );
+        assert_eq!(
+            without.checked.len(),
+            2,
+            "no custom → no Other checkbox slot"
+        );
     }
 }
 
@@ -680,6 +706,11 @@ pub struct UiState {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub cached_tokens: usize,
+    /// Read-only command report shown in the footer directly below the input
+    /// box while a turn is streaming. `/usage` and `/cost` use this instead of
+    /// appending their multi-line report to conversation scrollback. Cleared
+    /// explicitly by Esc; the Esc press is consumed before turn cancellation.
+    pub footer_command_output: Option<String>,
     /// Per-turn token tallies (reset at turn end). Feed the footer's billable
     /// token count + cache-hit annotation via [`turn_token_summary`]; kept
     /// separate from the session-cumulative `*_tokens` above.
@@ -1009,6 +1040,7 @@ impl UiState {
             prompt_tokens: 0,
             completion_tokens: 0,
             cached_tokens: 0,
+            footer_command_output: None,
             turn_prompt_tokens: 0,
             turn_completion_tokens: 0,
             turn_cached_tokens: 0,
@@ -1373,6 +1405,13 @@ impl UiState {
         // panel could never rebuild — it stayed gone while the model kept
         // executing. Only a session switch / new session / explicit clear drops
         // `active_todos` + `todo_titles`.
+    }
+
+    /// Drop presentation state that belongs to the outgoing session. Unlike a
+    /// normal turn terminal, a session replacement must not keep `/usage` or
+    /// `/cost` from the previous foreground session visible.
+    pub fn on_session_replaced(&mut self) {
+        self.footer_command_output = None;
     }
 
     /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting
@@ -1972,6 +2011,23 @@ mod tests {
     fn new_state_is_idle() {
         let s = UiState::new();
         assert_eq!(s.phase, UiPhase::Idle);
+    }
+
+    #[test]
+    fn footer_report_survives_turn_terminal_but_not_session_replacement() {
+        let mut s = UiState::new();
+        s.footer_command_output = Some("current session usage".into());
+        s.on_turn_complete();
+        assert!(
+            s.footer_command_output.is_some(),
+            "normal turn completion keeps the report until Esc"
+        );
+
+        s.on_session_replaced();
+        assert!(
+            s.footer_command_output.is_none(),
+            "a new foreground session must not inherit the old report"
+        );
     }
 
     /// Regression for the cross-turn `[Image #N]` ambiguity: the marker

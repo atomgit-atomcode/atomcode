@@ -115,6 +115,9 @@ pub enum UiLine {
     ToolResult {
         success: bool,
         summary: String,
+        /// Optional edit statistics appended to the first summary row.
+        /// Renderers color additions/removals with the active diff theme.
+        diff_stats: Option<(usize, usize)>,
     },
     DiffLine {
         added: bool,
@@ -128,6 +131,9 @@ pub enum UiLine {
     /// event loop long enough to freeze the spinner. `DiffBlock` does
     /// one erase + N writes + one redraw.
     DiffBlock(Vec<DiffEntry>),
+    /// Edit-tool diff rows whose statistics are already shown inline in
+    /// the preceding `ToolResult`; avoids a duplicate standalone summary.
+    EditDiffBlock(Vec<DiffEntry>),
     Error(String),
     /// Non-fatal advisory line (yellow). Visually distinct from `Error`
     /// so the user can tell "we saw something fishy and want you to
@@ -497,6 +503,9 @@ pub struct ModeBadge {
 pub struct StatusLine {
     pub model: String,
     pub cwd: String, // HOME replaced with "~"
+    /// Optional read-only command report rendered as a transient multi-line
+    /// footer panel directly below the input box. It never enters scrollback.
+    pub command_output: Option<String>,
     /// Tokens currently in the model's context (last turn's `sent_tokens`).
     /// Pre-first-turn this is 0; the renderer hides the field then.
     pub ctx_used: usize,

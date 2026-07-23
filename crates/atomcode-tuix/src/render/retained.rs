@@ -3414,6 +3414,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // backed by real bytes survive), so we trust it directly here
         // and don't re-validate against `input_buf`.
         let attachment_rows = self.input_attachments.len();
+        let command_output_cells = self.build_command_output_rows();
+        let command_output_rows = command_output_cells.len();
         let has_status = !self.status.model.is_empty()
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
@@ -3448,7 +3450,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             h,
             attachment_rows,
             menu_rows,
-            status_rows + goal_rows + todo_rows + approval_rows,
+            status_rows + goal_rows + todo_rows + approval_rows + command_output_rows,
         );
         let input_view_start = if lines.len() > max_input_rows {
             cursor_row_in_middle
@@ -3479,6 +3481,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .unwrap_or(false);
         let total_rows = self.footer_total_rows(
             middle_rows,
+            command_output_rows,
             attachment_rows,
             menu_rows,
             goal_rows,
@@ -3925,9 +3928,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
             bot_rule_row + 1
         };
 
-        // Shared drawing: attachments → menu → goal|loop row → status row.
+        // Shared drawing: command report → attachments → menu → goal|loop → status.
         // (Status row is suppressed when approval is active since eff_status == 0.)
-        let attach_top = post_approval;
+        let command_output_top = post_approval;
+        if !approval_active && !hide_input_box {
+            for (i, row) in command_output_cells.into_iter().enumerate() {
+                let mut padded = row;
+                Self::pad_row_to_width(&mut padded, w, CellStyle::default());
+                self.screen.draw_row(command_output_top + i, 0, &padded);
+            }
+        }
+        let attach_top = post_approval
+            + if approval_active || hide_input_box {
+                0
+            } else {
+                command_output_rows
+            };
         for (i, r) in attachment_cells.into_iter().enumerate() {
             let mut padded = r;
             Self::pad_row_to_width(&mut padded, w, CellStyle::default());
@@ -4062,6 +4078,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     fn footer_total_rows(
         &self,
         middle: usize,
+        command_output: usize,
         attachment: usize,
         menu: usize,
         goal: usize,
@@ -4090,6 +4107,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         eff_top_rule
             + eff_middle
             + eff_bot_rule
+            + if approval_active || hide_input_box {
+                0
+            } else {
+                command_output
+            }
             + attachment
             + menu
             + goal
@@ -4134,13 +4156,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .unwrap_or(0);
         let approval_rows = self.modal_panel_rows();
         let attachment_rows = self.input_attachments.len();
+        let command_output_rows = self.build_command_output_rows().len();
         // Cap the input height (mirrors paint_footer) so a long paste / typed
         // input can't make the footer exceed the screen.
         let capped_middle = middle_rows.min(Self::max_input_rows(
             h,
             attachment_rows,
             menu_rows,
-            status_rows + goal_rows + todo_rows + approval_rows,
+            status_rows + goal_rows + todo_rows + approval_rows + command_output_rows,
         ));
         // 1 top rule + middle + 1 bot rule + attachments + menu + goal/loop + todo + approval + status.
         // (Spinner used to reserve a row here but now lives in body as
@@ -4156,6 +4179,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         );
         self.footer_total_rows(
             capped_middle,
+            command_output_rows,
             attachment_rows,
             menu_rows,
             goal_rows,
@@ -4180,6 +4204,31 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // top rule + bot rule + chrome, plus one reserved body row.
         let reserved = 2 + attachment_rows + menu_rows + status_rows + 1;
         h.saturating_sub(reserved).min(MAX_INPUT_ROWS).max(1)
+    }
+
+    /// Build a transient read-only command report directly below the input
+    /// box. These rows are derived from footer state and never enter
+    /// `body_lines`, `body_log`, or terminal scrollback.
+    fn build_command_output_rows(&self) -> Vec<Vec<Cell>> {
+        let Some(text) = self.status.command_output.as_deref() else {
+            return Vec::new();
+        };
+        let content_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+        if content_width == 0 {
+            return Vec::new();
+        }
+        let style = self.style_faint(Role::Secondary);
+        let safe = scrub_controls(text);
+        let mut rows = Vec::new();
+        for physical in safe.lines() {
+            for chunk in crate::width::wrap_line_to_width(physical, content_width.max(1)) {
+                let mut row = Vec::new();
+                push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
+                push_str_cells(&mut row, &chunk, &style);
+                rows.push(row);
+            }
+        }
+        rows
     }
 
     /// Bottom rule of the input box. When `hidden_rows > 0` (the input is
@@ -6445,7 +6494,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     }
                 }
             }
-            UiLine::ToolResult { success, summary } => {
+            UiLine::ToolResult {
+                success,
+                summary,
+                diff_stats,
+            } => {
                 self.mark_message(crate::render::MarkKind::ToolResult);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
@@ -6569,11 +6622,31 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     } else {
                         &continuation_style
                     };
-                    for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
+                    for (chunk_idx, chunk) in crate::width::wrap_line_to_width(phys, row_w.max(1))
+                        .into_iter()
+                        .enumerate()
+                    {
                         let mut row = Vec::new();
                         let prefix = if first_visual { leaf } else { "    " };
                         push_str_cells(&mut row, prefix, &prefix_style);
                         push_str_cells(&mut row, &chunk, line_style);
+                        if line_idx == 0 && chunk_idx == 0 {
+                            if let Some((added, removed)) = diff_stats {
+                                push_str_cells(&mut row, " (", &summary_style);
+                                push_str_cells(
+                                    &mut row,
+                                    &format!("+{added}"),
+                                    &self.style_for(Role::DiffAdd),
+                                );
+                                push_str_cells(&mut row, " ", &summary_style);
+                                push_str_cells(
+                                    &mut row,
+                                    &format!("-{removed}"),
+                                    &self.style_for(Role::DiffRemove),
+                                );
+                                push_str_cells(&mut row, ")", &summary_style);
+                            }
+                        }
                         self.push_body_row(row);
                         first_visual = false;
                     }
@@ -6635,6 +6708,48 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     if shown >= MAX_DIFF_DISPLAY {
                         let more = content_total - shown;
                         self.push_body_text(&format!("  {ellipsis} +{more} more lines"), &muted);
+                        break;
+                    }
+                    let style = match entry.kind {
+                        DiffKind::Add => &add_style,
+                        DiffKind::Del => &del_style,
+                        _ => &secondary,
+                    };
+                    let body = crate::render::diff::diff_row_text(entry, gutter);
+                    self.push_body_text(&scrub_controls(&body), style);
+                    shown += 1;
+                }
+            }
+            UiLine::EditDiffBlock(entries) => {
+                use crate::render::DiffKind;
+                let gutter = crate::render::diff::diff_gutter_width(&entries);
+                let muted = self.style_for(Role::Muted);
+                let add_style = self.style_for(Role::DiffAdd);
+                let del_style = self.style_for(Role::DiffRemove);
+                let secondary = self.style_for(Role::Secondary);
+                let unicode = self.caps.unicode_symbols;
+                const MAX_DIFF_DISPLAY: usize = 25;
+                let content_total = entries
+                    .iter()
+                    .filter(|entry| entry.kind != DiffKind::Separator)
+                    .count();
+                let ellipsis = if unicode { "\u{2026}" } else { "..." };
+                let mut shown = 0usize;
+                for entry in &entries {
+                    if entry.kind == DiffKind::Separator {
+                        let separator = if unicode {
+                            crate::render::diff::diff_row_text(entry, gutter)
+                        } else {
+                            format!("  {:>gutter$} ...", "")
+                        };
+                        self.push_body_text(&separator, &muted);
+                        continue;
+                    }
+                    if shown >= MAX_DIFF_DISPLAY {
+                        self.push_body_text(
+                            &format!("  {ellipsis} +{} more lines", content_total - shown),
+                            &muted,
+                        );
                         break;
                     }
                     let style = match entry.kind {
@@ -7949,6 +8064,7 @@ mod tests {
         StatusLine {
             model: "glm-5".into(),
             cwd: "~/project/atomcode".into(),
+            command_output: None,
             ctx_used: 0,
             ctx_window: 0,
             hint: None,
@@ -7962,6 +8078,81 @@ mod tests {
             approval: None,
             user_input: None,
         }
+    }
+
+    #[test]
+    fn command_output_is_transient_footer_rows_below_input() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.status = status_basic();
+        let baseline_footer_rows = r.current_footer_rows();
+        r.status.command_output = Some("Prompt tokens: 120\nTotal tokens: 150".into());
+
+        let rows = r.build_command_output_rows();
+        let text = |row: &Vec<Cell>| row.iter().map(|cell| cell.ch).collect::<String>();
+        assert_eq!(rows.len(), 2);
+        assert!(text(&rows[0]).contains("Prompt tokens: 120"));
+        assert!(text(&rows[1]).contains("Total tokens: 150"));
+        assert_eq!(r.current_footer_rows(), baseline_footer_rows + 2);
+        assert!(
+            r.body_lines.is_empty() && r.body_log.is_empty(),
+            "footer command output must never enter transcript scrollback"
+        );
+
+        r.status.command_output = None;
+        assert_eq!(r.current_footer_rows(), baseline_footer_rows);
+    }
+
+    #[test]
+    fn command_output_physically_sits_below_input_and_is_erased() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut status = status_basic();
+        status.command_output = Some("Prompt tokens: 120\nTotal tokens: 150".into());
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let input_row = (0..24)
+            .find(|&row| {
+                let text = vterm.row_text(row);
+                text.starts_with("> ") || text.starts_with("\u{276f} ")
+            })
+            .expect("input row");
+        let prompt_row = (0..24)
+            .find(|&row| vterm.row_text(row).contains("Prompt tokens: 120"))
+            .expect("footer report row");
+        assert!(
+            prompt_row > input_row,
+            "report must be below input:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            r.body_lines.is_empty() && r.body_log.is_empty(),
+            "footer report must not enter scrollback"
+        );
+
+        status.command_output = None;
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            !vterm.any_row(|row| row.contains("Prompt tokens: 120")),
+            "closing the report must erase its physical rows:\n{}",
+            vterm.dump()
+        );
     }
 
     #[test]
@@ -8058,6 +8249,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            command_output: None,
             ctx_used: 0,
             ctx_window: 0,
             hint: None,
@@ -8107,6 +8299,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            command_output: None,
             ctx_used: 0,
             ctx_window: 0,
             hint: None,
@@ -8175,6 +8368,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            command_output: None,
             ctx_used: 0,
             ctx_window: 0,
             hint: None,
@@ -8219,6 +8413,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            command_output: None,
             ctx_used: 0,
             ctx_window: 0,
             hint: None,
@@ -8267,6 +8462,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            command_output: None,
             ctx_used: 0,
             ctx_window: 0,
             hint: None,
@@ -8315,6 +8511,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            command_output: None,
             ctx_used: 0,
             ctx_window: 0,
             hint: None,
@@ -8350,6 +8547,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            command_output: None,
             ctx_used: 0,
             ctx_window: 0,
             hint: None,
@@ -10759,6 +10957,7 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: true,
             summary: "3 files changed".into(),
+            diff_stats: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -10796,6 +10995,7 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: true,
             summary: "3 files changed".into(),
+            diff_stats: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -10883,6 +11083,7 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: true,
             summary: "3 files changed".into(),
+            diff_stats: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -10954,6 +11155,7 @@ mod tests {
             r.render(UiLine::ToolResult {
                 success: true,
                 summary: (*summary).into(),
+                diff_stats: None,
             });
             r.render(UiLine::InputPrompt {
                 buf: String::new(),
@@ -11029,6 +11231,7 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: false,
             summary: "old_string not found in foo.rs\n759| line content\n760| more code".into(),
+            diff_stats: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -11092,6 +11295,7 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: true,
             summary: long_summary.into(),
+            diff_stats: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -11178,6 +11382,72 @@ mod tests {
         let has_removed = vterm.any_row(|r| r.contains("-") && r.contains("old line"));
         assert!(has_added, "added row missing\ndump:\n{}", vterm.dump());
         assert!(has_removed, "removed row missing\ndump:\n{}", vterm.dump());
+    }
+
+    #[test]
+    fn edit_result_renders_colored_stats_inline_without_summary_row() {
+        use crate::render::{DiffEntry, DiffKind};
+        let (mut r, buf) = new_capturing(100, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(100, 24);
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "Edited crates/example.rs".into(),
+            diff_stats: Some((2, 1)),
+        });
+        r.render(UiLine::EditDiffBlock(vec![
+            DiffEntry {
+                kind: DiffKind::Add,
+                old_lineno: None,
+                new_lineno: Some(1),
+                text: "new".into(),
+            },
+            DiffEntry {
+                kind: DiffKind::Del,
+                old_lineno: Some(1),
+                new_lineno: None,
+                text: "old".into(),
+            },
+        ]));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let header_row = (0..vterm.height() as usize)
+            .find(|&row| {
+                vterm
+                    .row_text(row)
+                    .contains("Edited crates/example.rs (+2 -1)")
+            })
+            .unwrap_or_else(|| panic!("inline edit stats missing\n{}", vterm.dump()));
+        let header = vterm.row_text(header_row);
+        let add_col = header
+            .chars()
+            .position(|ch| ch == '+')
+            .expect("addition count");
+        let remove_col = header
+            .chars()
+            .position(|ch| ch == '-')
+            .expect("removal count");
+        assert_eq!(
+            vterm.cell_at(header_row, add_col).fg,
+            Some(crate::render::theme::diff_add_for_current_theme())
+        );
+        assert_eq!(
+            vterm.cell_at(header_row, remove_col).fg,
+            Some(crate::render::theme::diff_remove_for_current_theme())
+        );
+        assert!(
+            !(0..vterm.height() as usize).any(|row| vterm.row_text(row).trim() == "+2 -1"),
+            "edit diff must not render a second statistics row\n{}",
+            vterm.dump()
+        );
     }
 
     #[test]
@@ -14153,6 +14423,7 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: true,
             summary: "sources: weather.com.cn".into(),
+            diff_stats: None,
         });
         r.render(UiLine::AssistantText("今天长沙的天气情况如下：\n".into()));
 
@@ -15169,6 +15440,7 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: true,
             summary: "Edited /path/numbers.txt (1 replacement)".into(),
+            diff_stats: None,
         });
         r.flush_deferred();
 
@@ -15282,6 +15554,7 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: true,
             summary: "Edited /path/numbers.txt (1 replacement)".into(),
+            diff_stats: None,
         });
         r.flush_deferred();
 
@@ -16902,6 +17175,7 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: true,
             summary: "file.txt".into(),
+            diff_stats: None,
         });
         // Second tool call — previous mark was a ToolResult, NOT assistant text
         r.render(UiLine::ToolCall {
@@ -17127,6 +17401,7 @@ mod tests {
         let mut status = StatusLine {
             model: String::new(), // no status row (has_status=false → status_rows=0)
             cwd: String::new(),
+            command_output: None,
             ctx_used: 0,
             ctx_window: 0,
             hint: None,

@@ -411,6 +411,7 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::ToolResult { .. } => "ToolResult",
         UiLine::DiffLine { .. } => "DiffLine",
         UiLine::DiffBlock(_) => "DiffBlock",
+        UiLine::EditDiffBlock(_) => "EditDiffBlock",
         UiLine::Error(_) => "Error",
         UiLine::Warning(_) => "Warning",
         UiLine::Muted(_) => "Muted",

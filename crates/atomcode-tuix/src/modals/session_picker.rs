@@ -744,6 +744,7 @@ pub(crate) fn replay_session(
                     renderer.render(UiLine::ToolResult {
                         success: r.success,
                         summary: summarise(&r.output),
+                        diff_stats: None,
                     });
                 }
             }
@@ -752,6 +753,7 @@ pub(crate) fn replay_session(
                     renderer.render(UiLine::ToolResult {
                         success: true,
                         summary: summarise(&r.summary),
+                        diff_stats: None,
                     });
                 }
             }
