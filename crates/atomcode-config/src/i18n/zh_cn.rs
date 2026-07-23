@@ -173,8 +173,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── 输入 ──
     Enter                            发送消息
-    Ctrl+J                           插入换行（所有终端通用）
-    \ 后接 Enter                     插入换行（atomcode 兜底，所有终端通用）
+    \ 后接 Enter                     插入换行（所有终端通用）
     Alt+Enter                        插入换行 *
     Shift+Enter                      插入换行 **
     /                                打开斜杠命令菜单
@@ -217,7 +216,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
      Kitty / WezTerm / iTerm2（启用 Report Modifiers）/
      Windows Terminal / Ghostty / Warp。其他终端（包括 macOS
      Apple Terminal、默认 xterm、GNOME Terminal、VS Code 集成
-     终端）不区分 Shift+Enter 与 Enter，请用 Ctrl+J 或 \ + Enter。
+     终端）不区分 Shift+Enter 与 Enter，请用 \ + Enter。
 
   提示：输入 /help 查看完整斜杠命令列表。
 "#.into(),
@@ -526,11 +525,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::UpgradeRolledBack { exe, backup } =>
             format!("\n✓ 已回滚。当前二进制: {}；另一版本保存在 {}\n  正在重启回滚版本...\n", exe, backup).into(),
 
-        // ── 终端键盘提示 ──
-        Msg::KbdHintMacos =>
-            "  ⚠ 终端不支持增强键盘协议。\n    请使用 Ctrl+Enter 插入换行（Shift+Enter 不可用）。\n\n".into(),
-        Msg::KbdHintOther =>
-            "  ⚠ 终端不支持增强键盘协议。\n    请使用 Alt+Enter 或 Ctrl+Enter 插入换行（Shift+Enter 不可用）。\n\n".into(),
 
         // ── /config ──
         Msg::ConfigProviderLabel { provider, path } =>

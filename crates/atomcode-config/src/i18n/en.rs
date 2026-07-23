@@ -181,8 +181,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── Input ──
     Enter                            Send message
-    Ctrl+J                           Insert newline (universal)
-    \ then Enter                     Insert newline (atomcode fallback, universal)
+    \ then Enter                     Insert newline (works in every terminal)
     Alt+Enter                        Insert newline *
     Shift+Enter                      Insert newline **
     /                                Open slash command menu
@@ -227,7 +226,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
      enabled) / Windows Terminal / Ghostty / Warp. Other terminals
      (macOS Apple Terminal, default xterm, GNOME Terminal, VS Code's
      integrated terminal) collapse Shift+Enter into plain Enter —
-     use Ctrl+J or \ + Enter instead.
+     use \ + Enter instead.
 
   Tip: run /help for the full slash command list.
 "#.into(),
@@ -541,11 +540,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::UpgradeRolledBack { exe, backup } =>
             format!("\n✓ Rolled back. Current binary: {}; other version saved at {}\n  Restarting rolled-back version...\n", exe, backup).into(),
 
-        // ── Terminal keyboard hints ──
-        Msg::KbdHintMacos =>
-            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
-        Msg::KbdHintOther =>
-            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
 
         // ── /config ──
         Msg::ConfigProviderLabel { provider, path } =>

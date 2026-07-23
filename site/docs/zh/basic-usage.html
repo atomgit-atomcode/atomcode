@@ -161,7 +161,8 @@ atomcode --dangerously-skip-permissions</code></pre>
       <p>在 TUI 中:</p>
       <ul>
         <li><code>Enter</code> 发送消息</li>
-        <li><code>Shift+Enter</code> / <code>Ctrl+Enter</code> / <code>Ctrl+J</code> 换行(需要 Kitty 键盘协议: kitty / WezTerm / Alacritty / iTerm2 ≥3.5 / Windows Terminal ≥1.21)</li>
+        <li><code>\</code> 后接 <code>Enter</code> 换行 —— 所有终端通用(行尾反斜杠会被识别为续行)</li>
+        <li><code>Shift+Enter</code> / <code>Ctrl+Enter</code> 换行(需要 Kitty 键盘协议: kitty / WezTerm / Alacritty / iTerm2 ≥3.5 / Windows Terminal ≥1.21;Windows 上不可用)</li>
         <li><code>Alt+Enter</code> 换行(多数终端可用,但 Windows Terminal 默认绑给"切换全屏",需在设置里解绑)</li>
         <li>输入框高度会随内容自动增长</li>
       </ul>

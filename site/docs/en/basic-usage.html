@@ -161,7 +161,8 @@ atomcode --dangerously-skip-permissions</code></pre>
       <p>In the TUI:</p>
       <ul>
         <li><code>Enter</code> sends the message.</li>
-        <li><code>Shift+Enter</code> / <code>Ctrl+Enter</code> / <code>Ctrl+J</code> insert a newline (requires Kitty keyboard protocol: kitty / WezTerm / Alacritty / iTerm2 ≥3.5 / Windows Terminal ≥1.21).</li>
+        <li><code>\</code> then <code>Enter</code> inserts a newline — works in every terminal (a trailing backslash makes the line a continuation).</li>
+        <li><code>Shift+Enter</code> / <code>Ctrl+Enter</code> insert a newline (requires Kitty keyboard protocol: kitty / WezTerm / Alacritty / iTerm2 ≥3.5 / Windows Terminal ≥1.21; not available on Windows).</li>
         <li><code>Alt+Enter</code> inserts a newline (works in most terminals, but Windows Terminal binds it to "toggle fullscreen" by default — unbind in settings).</li>
         <li>The input area grows with content.</li>
       </ul>

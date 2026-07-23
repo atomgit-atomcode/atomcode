@@ -318,7 +318,6 @@ atomcode --prompt-file task.md
 | `Enter` | 发送消息 |
 | `Shift+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
 | `Ctrl+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
-| `Ctrl+J` | 换行（需要终端支持 Kitty 键盘协议） |
 | `Alt+Enter` | 换行（多数终端可用，见下方兼容性说明） |
 | `\` + `Enter` | 换行（所有终端通用——输入一个 `\` 后按回车，`\` 会被自动删除） |
 | `Esc` | 清空输入 / 取消流式输出 |
@@ -331,7 +330,7 @@ atomcode --prompt-file task.md
 | `Ctrl+V` | 从剪贴板粘贴图片（Windows 下请改用 `/paste`，见下方说明） |
 
 > **换行快捷键的终端兼容性：**
-> - `Shift+Enter`、`Ctrl+Enter`、`Ctrl+J` 都需要终端支持 Kitty 键盘协议 — kitty、WezTerm、Alacritty、iTerm2 ≥3.5、Windows Terminal ≥1.21。不支持的终端会把它们都退化成普通 `Enter`（直接发送消息）。
+> - `Shift+Enter`、`Ctrl+Enter` 需要终端支持 Kitty 键盘协议 — kitty、WezTerm、Alacritty、iTerm2 ≥3.5、Windows Terminal ≥1.21。不支持的终端（以及 Windows，atomcode 在其上不启用该协议）会把它们退化成普通 `Enter`（直接发送消息）—— 请改用 `\` + `Enter`，它在所有终端都生效。
 > - `Alt+Enter` 在多数终端的字节层面就能工作，但 **Windows Terminal 默认把它绑给"切换全屏"** — 在 设置 → 操作 中删掉那条绑定即可释放。
 > - Xshell 不支持 Kitty 协议；可在键盘映射设置中把某个空闲组合映射为发送 `ESC, Enter`（`\x1b\r`）达到同样效果，或直接从剪贴板粘贴多行文本（已启用 bracketed paste）。
 

@@ -323,7 +323,6 @@ Then just type what you want:
 | `Enter` | Send message |
 | `Shift+Enter` | New line (requires Kitty keyboard protocol) |
 | `Ctrl+Enter` | New line (requires Kitty keyboard protocol) |
-| `Ctrl+J` | New line (requires Kitty keyboard protocol) |
 | `Alt+Enter` | New line (most terminals; see compatibility note below) |
 | `\` + `Enter` | New line (works on all terminals — type a `\` and press Enter; the `\` is consumed) |
 | `Esc` | Clear input / Cancel stream |
@@ -336,7 +335,7 @@ Then just type what you want:
 | `Ctrl+V` | Paste image from clipboard (Windows: use `/paste`, see below) |
 
 > **Terminal compatibility for newline chords:**
-> - `Shift+Enter`, `Ctrl+Enter`, and `Ctrl+J` all need a terminal that speaks the Kitty keyboard protocol — kitty, WezTerm, Alacritty, iTerm2 ≥3.5, Windows Terminal ≥1.21. Older terminals collapse them to plain `Enter` (which sends the message).
+> - `Shift+Enter` and `Ctrl+Enter` need a terminal that speaks the Kitty keyboard protocol — kitty, WezTerm, Alacritty, iTerm2 ≥3.5, Windows Terminal ≥1.21. Older terminals (and Windows, where atomcode doesn't enable the protocol) collapse them to plain `Enter` (which sends the message) — use `\` + `Enter`, which works everywhere.
 > - `Alt+Enter` works at the byte level on most terminals, but **Windows Terminal binds it to "toggle full screen" by default** — remove that binding under Settings → Actions to free it up.
 > - Xshell does not support the Kitty protocol; in its keymap settings, map a free chord to send `ESC, Enter` (`\x1b\r`) to get the same effect, or paste multi-line text via the clipboard (bracketed paste is enabled).
 

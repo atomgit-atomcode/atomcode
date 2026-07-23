@@ -642,10 +642,6 @@ pub enum Msg<'a> {
         backup: &'a str,
     },
 
-    // ── Terminal keyboard hints ──
-    KbdHintMacos,
-    KbdHintOther,
-
     // ── /config command ──
     ConfigProviderLabel {
         provider: &'a str,
