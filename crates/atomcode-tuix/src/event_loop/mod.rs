@@ -6767,7 +6767,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             buf: String::new(),
             cursor_byte: 0,
             menu: None,
-            status: build_status(&app.state, &ctx),
+            status: build_input_status(&app.state, &ctx, &app.buf),
             attachments: Vec::new(),
         });
         renderer.flush();
@@ -10596,7 +10596,7 @@ fn redraw_with_menu(
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
         menu: Some(payload),
-        status: build_status(state, ctx),
+        status: build_input_status(state, ctx, buf),
         attachments,
     });
     // Footer-only UiLines (InputPrompt / StreamingBox) update widget
@@ -10835,7 +10835,7 @@ pub(crate) fn set_agent_mode(
 
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
     let attachments = compute_input_attachments(state, &buf.text);
-    let mut status = build_status(state, ctx);
+    let mut status = build_input_status(state, ctx, buf);
     // Discoverability: while composing a `!` shell command, surface a brand-purple
     // footer hint (bare `!` → "! for shell mode"; `!cmd` → "Enter to run…").
     // Fill the slot only when it's free, so the shell hint still yields to any
@@ -18441,6 +18441,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     crate::render::StatusLine {
         model,
         cwd,
+        history: None,
         command_output: state.footer_command_output.clone(),
         ctx_used,
         ctx_window,
@@ -18458,6 +18459,56 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         todo,
         approval,
         user_input,
+    }
+}
+
+fn build_input_status(state: &UiState, ctx: &LoopCtx, buf: &Buffer) -> crate::render::StatusLine {
+    let mut status = build_status(state, ctx);
+    status.history = input_history_position(buf, ctx.history.entries().len());
+    status
+}
+
+fn input_history_position(buf: &Buffer, total: usize) -> Option<crate::render::HistoryPosition> {
+    buf.history_idx()
+        .filter(|index| *index < total)
+        .map(|index| crate::render::HistoryPosition {
+            current: index + 1,
+            total,
+        })
+}
+
+#[cfg(test)]
+mod input_history_position_tests {
+    use super::{input_history_position, Buffer};
+
+    #[test]
+    fn visible_only_while_recalling_history() {
+        let mut buf = Buffer::new();
+        assert_eq!(input_history_position(&buf, 100), None);
+
+        buf.history_idx = Some(99);
+        let latest = input_history_position(&buf, 100).expect("history position");
+        assert_eq!((latest.current, latest.total), (100, 100));
+
+        buf.history_idx = Some(42);
+        let older = input_history_position(&buf, 100).expect("history position");
+        assert_eq!((older.current, older.total), (43, 100));
+
+        buf.history_idx = None;
+        assert_eq!(
+            input_history_position(&buf, 100),
+            None,
+            "returning to the draft hides the indicator"
+        );
+    }
+
+    #[test]
+    fn stale_or_empty_index_is_hidden() {
+        let mut buf = Buffer::new();
+        buf.history_idx = Some(0);
+        assert_eq!(input_history_position(&buf, 0), None);
+        buf.history_idx = Some(3);
+        assert_eq!(input_history_position(&buf, 2), None);
     }
 }
 
@@ -18487,7 +18538,7 @@ fn draw_spinner_now(
         None
     };
     let label = format_spinner_label(state, queue_len, effort);
-    let status = build_status(state, ctx);
+    let status = build_input_status(state, ctx, buf);
     let menu = menu_for_display(buf, ctx).map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
         let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {

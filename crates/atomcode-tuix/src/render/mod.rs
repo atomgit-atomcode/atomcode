@@ -549,6 +549,9 @@ pub struct ModeBadge {
 pub struct StatusLine {
     pub model: String,
     pub cwd: String, // HOME replaced with "~"
+    /// Current recalled input-history position, shown on the input box's
+    /// top rule only while Up/Down navigation is active.
+    pub history: Option<HistoryPosition>,
     /// Optional read-only command report rendered as a transient multi-line
     /// footer panel directly below the input box. It never enters scrollback.
     pub command_output: Option<String>,
@@ -614,6 +617,12 @@ pub struct StatusLine {
     /// footer loop row (its own full-width line, shown instead of the goal row
     /// — only one of goal/loop is active at a time). `None` ⇒ no loop running.
     pub loop_status: Option<LoopStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryPosition {
+    pub current: usize,
+    pub total: usize,
 }
 
 /// Renderer-facing snapshot of the approval panel (mirrors how `TodoProgress`

@@ -1569,7 +1569,39 @@ impl<W: Write + Send> RetainedRenderer<W> {
         session_name: Option<&str>,
         shell: bool,
     ) -> Vec<Cell> {
+        self.build_top_rule_with_context(rule_width, session_name, None, shell)
+    }
+
+    fn build_top_rule_with_context(
+        &self,
+        rule_width: usize,
+        session_name: Option<&str>,
+        history: Option<super::HistoryPosition>,
+        shell: bool,
+    ) -> Vec<Cell> {
         let mut row = self.build_rule_row(rule_width, shell);
+        const LEFT_MARGIN: usize = 2;
+        const BADGE_GAP: usize = 2;
+        let history_end = history
+            .filter(|position| position.total > 0 && position.current <= position.total)
+            .map(|position| {
+                let text = format!(" History {}/{} ", position.current, position.total);
+                let cells = {
+                    let mut cells = Vec::new();
+                    push_str_cells(&mut cells, &text, &self.style_faint(Role::Muted));
+                    cells
+                };
+                if LEFT_MARGIN + cells.len() + BADGE_GAP <= rule_width {
+                    for (offset, cell) in cells.into_iter().enumerate() {
+                        row[LEFT_MARGIN + offset] = cell;
+                    }
+                    LEFT_MARGIN + crate::width::display_width(&text)
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+
         let Some(name) = session_name else {
             return row;
         };
@@ -1579,7 +1611,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         const RIGHT_MARGIN: usize = 2;
         const PILL_PADDING: usize = 2;
         const MIN_RULE_LEFT: usize = 8;
-        let chrome = RIGHT_MARGIN + PILL_PADDING + MIN_RULE_LEFT;
+        let min_rule_left = MIN_RULE_LEFT.max(history_end.saturating_add(BADGE_GAP));
+        let chrome = RIGHT_MARGIN + PILL_PADDING + min_rule_left;
         if rule_width <= chrome {
             return row;
         }
@@ -3523,9 +3556,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // arms/reverts with the leading `!` (no persistent mode state).
         let shell = super::input_shell_mode(&self.input_buf);
         // Pre-build every row vector (immutable borrows of self).
-        let top_rule = self.build_top_rule_with_badge(
+        let top_rule = self.build_top_rule_with_context(
             input_rule_width,
             self.status.session_name.as_deref(),
+            self.status.history,
             shell,
         );
         let middle_cells: Vec<Vec<Cell>> = lines[input_view_start..input_view_start + middle_rows]
@@ -8074,6 +8108,7 @@ mod tests {
         StatusLine {
             model: "glm-5".into(),
             cwd: "~/project/atomcode".into(),
+            history: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -8290,6 +8325,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            history: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -8340,6 +8376,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            history: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -8409,6 +8446,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            history: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -8454,6 +8492,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            history: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -8503,6 +8542,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            history: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -8552,6 +8592,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            history: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -8588,6 +8629,7 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
+            history: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -8640,6 +8682,54 @@ mod tests {
             any_reverse,
             "at least one cell of the pill must carry reverse-video style"
         );
+    }
+
+    #[test]
+    fn build_top_rule_shows_history_position_on_left() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let row = r.build_top_rule_with_context(
+            80,
+            None,
+            Some(crate::render::HistoryPosition {
+                current: 100,
+                total: 100,
+            }),
+            false,
+        );
+        let visible: String = row
+            .iter()
+            .filter(|cell| cell.width > 0)
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(
+            visible.contains("History 100/100"),
+            "history position must appear on the top rule: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn history_position_and_session_badge_coexist() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let row = r.build_top_rule_with_context(
+            80,
+            Some("release/v5.0.1"),
+            Some(crate::render::HistoryPosition {
+                current: 999,
+                total: 1000,
+            }),
+            false,
+        );
+        let visible: String = row
+            .iter()
+            .filter(|cell| cell.width > 0)
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(visible.contains("History 999/1000"), "{visible:?}");
+        assert!(visible.contains("release/v5.0.1"), "{visible:?}");
     }
 
     #[test]
@@ -17827,6 +17917,7 @@ mod tests {
         let mut status = StatusLine {
             model: String::new(), // no status row (has_status=false → status_rows=0)
             cwd: String::new(),
+            history: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
