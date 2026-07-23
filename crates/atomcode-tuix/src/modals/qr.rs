@@ -27,18 +27,67 @@ use qrcode::QrCode;
 /// Errors are coarse-grained on purpose: the only failure mode the
 /// onboarding flow cares about is "show URL instead of QR." The exact
 /// reason is irrelevant to the user and would just clutter the UI.
-pub(super) fn render_for_terminal(data: &str, unicode_symbols: bool) -> Option<Vec<String>> {
-    if !unicode_symbols {
-        return None;
-    }
+/// Render `data` as a QR code suitable for terminal display.
+/// Each returned row is one terminal line; callers can pad / centre
+/// each row inside the wizard panel without re-splitting the string.
+///
+/// Rendering strategy:
+///   - `unicode_symbols == true`: Dense1x2 half-blocks (`▀`, `▄`, `█`, ` `)
+///   - `unicode_symbols == false` and `colors == true`: ANSI reverse-video spaces (`\x1b[7m  \x1b[0m`)
+///   - Both `false`: returns `None` (fall back to text URL)
+pub(super) fn render_for_terminal(
+    data: &str,
+    unicode_symbols: bool,
+    _colors: bool,
+    _max_width: usize,
+) -> Option<Vec<String>> {
     let code = QrCode::new(data.as_bytes()).ok()?;
-    let rendered = code
-        .render::<Dense1x2>()
-        .module_dimensions(1, 1)
-        .dark_color(Dense1x2::Dark)
-        .light_color(Dense1x2::Light)
-        .build();
-    Some(rendered.lines().map(|l| l.to_string()).collect())
+    if unicode_symbols {
+        let rendered = code
+            .render::<Dense1x2>()
+            .module_dimensions(1, 1)
+            .dark_color(Dense1x2::Dark)
+            .light_color(Dense1x2::Light)
+            .quiet_zone(true)
+            .build();
+        Some(rendered.lines().map(|l| l.to_string()).collect())
+    } else {
+        Some(render_block_spaces(&code))
+    }
+}
+
+fn render_block_spaces(code: &QrCode) -> Vec<String> {
+    let width = code.width();
+    let colors = code.to_colors();
+    const QUIET: usize = 2;
+    let total_width = width + 2 * QUIET;
+    let mut lines = Vec::new();
+
+    let quiet_line = " ".repeat(total_width * 2);
+    for _ in 0..QUIET {
+        lines.push(quiet_line.clone());
+    }
+
+    for y in 0..width {
+        let mut line = String::with_capacity(total_width * 6);
+        line.push_str(&" ".repeat(QUIET * 2));
+        for x in 0..width {
+            let is_dark = matches!(colors[x + y * width], qrcode::Color::Dark);
+            if is_dark {
+                line.push_str("██");
+            } else {
+                line.push_str("  ");
+            }
+        }
+        line.push_str(&" ".repeat(QUIET * 2));
+        lines.push(line);
+    }
+
+    for _ in 0..QUIET {
+        lines.push(quiet_line.clone());
+    }
+
+    lines
 }
 
 #[cfg(test)]
@@ -46,13 +95,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_returns_none_when_unicode_disabled() {
-        // ASCII-only / dumb terminals get None so the caller falls
-        // back to text URL rendering. Half-block glyphs (▀ / ▄ / █)
-        // render as `□` tofu on Windows conhost / `TERM=dumb` /
-        // `LANG=C` — a tofu QR would silently break the only thing
-        // this screen exists to do (let the user scan and log in).
-        assert!(render_for_terminal("https://example.com", false).is_none());
+    fn render_produces_block_spaces_when_unicode_disabled() {
+        let lines = render_for_terminal("https://example.com", false, true, 80)
+            .expect("block space rendering must succeed");
+        assert!(!lines.is_empty());
+        assert!(lines.iter().any(|l| l.contains("  ")));
     }
 
     #[test]
@@ -61,7 +108,7 @@ mod tests {
         // 32-char URL encodes to roughly a 25x25-module QR; Dense1x2
         // packs two rows per cell so ~13 terminal rows. Use 8 as a
         // safe floor — any non-trivial input should clear it.
-        let lines = render_for_terminal("https://acs.atomgit.com/s/AbC123", true)
+        let lines = render_for_terminal("https://acs.atomgit.com/s/AbC123", true, true, 80)
             .expect("Unicode-capable render must succeed for a short URL");
         assert!(
             lines.len() >= 8,
@@ -82,7 +129,8 @@ mod tests {
         // QR as a parallelogram and break phone scanning. Pin
         // uniform width so any future renderer swap can't silently
         // regress this.
-        let lines = render_for_terminal("https://example.com", true).expect("render must succeed");
+        let lines =
+            render_for_terminal("https://example.com", true, true, 80).expect("render must succeed");
         let first = lines[0].chars().count();
         for (i, row) in lines.iter().enumerate() {
             assert_eq!(

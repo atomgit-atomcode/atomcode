@@ -831,7 +831,12 @@ impl OnboardingWizard {
     /// so the user can paste it into a browser on a different machine.
     /// QR glyphs render as `□` tofu on Windows legacy conhost / `LANG=C`
     /// and a tofu QR is silently unscannable — better to show nothing.
-    pub(super) fn draw_qr_login_lines(&self, term_cols: u16, unicode_symbols: bool) -> Vec<String> {
+    pub(super) fn draw_qr_login_lines(
+        &self,
+        term_cols: u16,
+        unicode_symbols: bool,
+        colors: bool,
+    ) -> Vec<String> {
         let panel_width = calc_panel_width(term_cols);
         let inner_width = panel_width.saturating_sub(4);
         // Cells available for content inside the panel's `│ <2sp> ... <2sp> │`
@@ -839,7 +844,8 @@ impl OnboardingWizard {
         // trailing pad to inner_width-2.
         let cell_w = inner_width.saturating_sub(2);
         let center = |s: &str| -> String {
-            let w = UnicodeWidthStr::width(s);
+            let plain = strip_sgr(s);
+            let w = UnicodeWidthStr::width(plain.as_str());
             let pad = cell_w.saturating_sub(w) / 2;
             format!("{}{}", " ".repeat(pad), s)
         };
@@ -862,13 +868,15 @@ impl OnboardingWizard {
             content.push(center("按 Enter 重试 · Esc 跳过"));
         } else if let Some(url) = &self.qr_login_url {
             // Render QR block (Unicode mode) or skip it (ASCII).
-            if let Some(qr_rows) = super::qr::render_for_terminal(url, unicode_symbols) {
+            if let Some(qr_rows) =
+                super::qr::render_for_terminal(url, unicode_symbols, colors, cell_w as usize)
+            {
                 for row in qr_rows {
                     content.push(center(&row));
                 }
                 content.push(String::new());
             }
-            content.push(center(if unicode_symbols {
+            content.push(center(if unicode_symbols || colors {
                 "或在浏览器打开:"
             } else {
                 "无法显示二维码 — 请在浏览器打开:"
@@ -1065,6 +1073,15 @@ impl crate::modals::Modal for OnboardingWizard {
         renderer: &mut dyn crate::render::Renderer,
     ) {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        if matches!(self.step, Step::QrLogin) {
+            // TODO(temporary): Trigger a synthetic terminal resize refresh before drawing QrLogin.
+            // On some Windows terminals, initial modal rendering without a SIGWINCH/Resize event
+            // leaves line buffer alignment artifacts that prevent QR scanners from reading the code.
+            // Manually re-issuing clear_screen + on_resize forces a full buffer re-alignment so the QR code
+            // is immediately scannable without requiring the user to manually resize the window.
+            renderer.clear_screen();
+            renderer.on_resize(cols, rows);
+        }
         // The wizard panel is capped at MAX_PANEL_WIDTH cols by calc_panel_width;
         // use that as the centering anchor so the bordered box stays at the
         // canvas middle in wide terminals. Confirm is deliberately
@@ -1102,7 +1119,7 @@ impl crate::modals::Modal for OnboardingWizard {
                 rows,
             ),
             Step::QrLogin => center_lines(
-                self.draw_qr_login_lines(cols, unicode),
+                self.draw_qr_login_lines(cols, unicode, state.colors),
                 panel_width,
                 cols,
                 rows,
@@ -1139,6 +1156,26 @@ impl crate::modals::Modal for OnboardingWizard {
         });
         renderer.flush();
     }
+}
+
+/// Strip every SGR escape so we can assert on or measure visible glyphs.
+fn strip_sgr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            while let Some(&n) = chars.peek() {
+                chars.next();
+                if n == 'm' || n.is_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Outcome of `handle_key_pure` — what the Modal-trait wrapper should
@@ -2075,7 +2112,7 @@ mod tests {
     #[test]
     fn qr_login_draw_with_url_includes_url_in_output() {
         let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
-        let lines = w.draw_qr_login_lines(80, true);
+        let lines = w.draw_qr_login_lines(80, true, true);
         let blob = lines.join("\n");
         assert!(
             blob.contains("https://acs.atomgit.com/s/AbC123"),
@@ -2092,7 +2129,7 @@ mod tests {
     #[test]
     fn qr_login_draw_with_error_surfaces_reason() {
         let w = qr_wizard_with_error("transport: timeout after 10s");
-        let lines = w.draw_qr_login_lines(80, true);
+        let lines = w.draw_qr_login_lines(80, true, true);
         let blob = lines.join("\n");
         assert!(blob.contains("无法生成登录链接"));
         assert!(blob.contains("transport: timeout after 10s"));
@@ -2107,13 +2144,13 @@ mod tests {
         // and ASCII renderings carry the hint since the action is
         // available in either layout.
         let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
-        let unicode_blob = w.draw_qr_login_lines(80, true).join("\n");
+        let unicode_blob = w.draw_qr_login_lines(80, true, true).join("\n");
         assert!(
             unicode_blob.contains("Enter"),
             "Unicode QR step missing Enter-to-open affordance:\n{}",
             unicode_blob
         );
-        let ascii_blob = w.draw_qr_login_lines(80, false).join("\n");
+        let ascii_blob = w.draw_qr_login_lines(80, false, false).join("\n");
         assert!(
             ascii_blob.contains("Enter"),
             "ASCII QR step missing Enter-to-open affordance:\n{}",
@@ -2123,12 +2160,12 @@ mod tests {
 
     #[test]
     fn qr_login_draw_ascii_fallback_drops_qr_keeps_url() {
-        // Half-block glyphs render as tofu on ASCII-only terminals,
+        // Half-block glyphs render as tofu on ASCII-only terminals without color,
         // so the QR is dropped entirely and we tell the user to use
         // the URL instead. URL itself MUST stay — otherwise the
         // screen has nothing actionable.
         let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
-        let lines = w.draw_qr_login_lines(80, false);
+        let lines = w.draw_qr_login_lines(80, false, false);
         let blob = lines.join("\n");
         assert!(blob.contains("https://acs.atomgit.com/s/AbC123"));
         assert!(blob.contains("无法显示二维码"));
@@ -2149,7 +2186,7 @@ mod tests {
             wizard.draw_intro_lines(80, 24, true),
             wizard.draw_language_lines(80, true),
             wizard.draw_setup_lines(80, true),
-            wizard.draw_qr_login_lines(80, true),
+            wizard.draw_qr_login_lines(80, true, true),
         ];
 
         for (idx, raw_lines) in steps_lines.into_iter().enumerate() {

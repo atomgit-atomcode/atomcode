@@ -702,6 +702,8 @@ pub struct UiState {
     /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
     /// Windows legacy conhost) don't show `□` tofu.
     pub unicode_symbols: bool,
+    /// Mirrors `TerminalCaps::colors` — frozen at construction.
+    pub colors: bool,
     pub total_tokens: usize,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
@@ -1033,6 +1035,11 @@ impl UiState {
     /// Production code calls this from `App::new` with the value the
     /// terminal-capability probe produced; tests stick with `new()`.
     pub fn with_unicode(unicode_symbols: bool) -> Self {
+        Self::with_caps(unicode_symbols, true)
+    }
+
+    /// Construct a `UiState` with explicit Unicode and color capabilities.
+    pub fn with_caps(unicode_symbols: bool, colors: bool) -> Self {
         Self {
             phase: UiPhase::Idle,
             agent_mode: AgentMode::default(),
@@ -1043,6 +1050,7 @@ impl UiState {
             compaction_forced_streaming: false,
             subagent_activity: None,
             unicode_symbols,
+            colors,
             total_tokens: 0,
             prompt_tokens: 0,
             completion_tokens: 0,

@@ -6413,7 +6413,7 @@ const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(8);
 impl App {
     fn new(caps: &crate::terminal::TerminalCaps) -> Self {
         Self {
-            state: UiState::with_unicode(caps.unicode_symbols),
+            state: UiState::with_caps(caps.unicode_symbols, caps.colors),
             buf: Buffer::new(),
             menu: MenuState::new(),
             active_modal: None,
