@@ -3358,6 +3358,12 @@ impl Buffer {
                 if line.is_empty() {
                     return BufferResult::Redraw;
                 }
+                // A committed entry is no longer being browsed, even when it
+                // originated from HistoryPrev. Both idle submission and the
+                // streaming type-ahead path render again after Commit, so
+                // clearing the navigation marker here keeps the input rule
+                // from showing a stale `History N/N` during output.
+                self.history_idx = None;
                 BufferResult::Commit(line)
             }
             Action::InsertNewline => {
@@ -4377,6 +4383,34 @@ mod buffer_tests {
             BufferResult::Commit(s) => assert_eq!(s, "ship it"),
             _ => panic!("expected Commit"),
         }
+    }
+
+    #[test]
+    fn submitting_recalled_history_exits_history_mode() {
+        use crate::input::history::HistoryEntry;
+
+        let reg = CommandRegistry::builtin();
+        let history = vec![HistoryEntry {
+            text: "recalled prompt".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
+        let mut b = Buffer::new();
+
+        assert!(matches!(
+            b.apply(Action::HistoryPrev, &history, &reg),
+            BufferResult::Redraw
+        ));
+        assert!(b.is_in_history());
+
+        assert!(matches!(
+            b.apply(Action::Submit, &history, &reg),
+            BufferResult::Commit(line) if line == "recalled prompt"
+        ));
+        assert!(
+            !b.is_in_history(),
+            "committing recalled input must hide the history position"
+        );
     }
 
     #[test]
