@@ -4458,7 +4458,7 @@ mod menu_tests {
         );
         assert_eq!(
             file_index::format_at_mention_replacement("Cargo.toml"),
-            "@Cargo.toml",
+            "@Cargo.toml ",
         );
     }
 

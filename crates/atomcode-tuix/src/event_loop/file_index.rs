@@ -72,7 +72,11 @@ pub fn detect_at_mention(buf: &str, cursor: usize) -> Option<String> {
 }
 
 pub fn format_at_mention_replacement(selected_path: &str) -> String {
-    format!("@{}", selected_path)
+    if selected_path.ends_with('/') {
+        format!("@{}", selected_path)
+    } else {
+        format!("@{} ", selected_path)
+    }
 }
 
 /// Companion to `detect_at_mention`. Returns the byte range
@@ -654,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn at_mention_replacement_keeps_token_active() {
+    fn directory_at_mention_replacement_keeps_token_active() {
         let replacement = format_at_mention_replacement("crates/atomcode-bridge/");
 
         assert_eq!(replacement, "@crates/atomcode-bridge/");
@@ -662,6 +666,14 @@ mod tests {
             detect_at_mention(&replacement, replacement.len()),
             Some("crates/atomcode-bridge/".to_string())
         );
+    }
+
+    #[test]
+    fn file_at_mention_replacement_finalizes_token() {
+        let replacement = format_at_mention_replacement("latest.json");
+
+        assert_eq!(replacement, "@latest.json ");
+        assert_eq!(detect_at_mention(&replacement, replacement.len()), None);
     }
 
     // ---- split_token ----
