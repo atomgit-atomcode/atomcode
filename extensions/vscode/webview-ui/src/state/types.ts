@@ -94,6 +94,13 @@ export interface ToolCallData {
   status: 'queued' | 'running' | 'waiting_approval' | 'done' | 'error' | 'incomplete';
 }
 
+export type TodoStatus = 'pending' | 'in_progress' | 'completed';
+
+export interface TodoItemData {
+  content: string;
+  status: TodoStatus;
+}
+
 export interface ArtifactData {
   id: string;
   artifactType: string;
@@ -172,6 +179,7 @@ export interface SearchState {
 export interface ChatState {
   messages: ChatMessage[];
   queuedMessages: ChatMessage[];
+  activeTodos: TodoItemData[];
   isGenerating: boolean;
   recoveryLocked: boolean;
   isSessionList: boolean;

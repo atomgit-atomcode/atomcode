@@ -4,6 +4,7 @@ import { formatTokenCount } from '../utils/format';
 import { SlashPicker } from './SlashPicker';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
+import { TodoPanel } from './TodoPanel';
 import { postMessage } from '../vscode';
 import { ImageData, SkillInfo } from '../state/types';
 import { useT } from '../i18n';
@@ -474,6 +475,7 @@ export function InputArea() {
 
   return (
     <div className="input-container" ref={containerRef}>
+      {state.activeTodos.length > 0 && <TodoPanel items={state.activeTodos} />}
       <div className="input-box" ref={inputBoxRef}>
         {showSlash && (
           <SlashPicker

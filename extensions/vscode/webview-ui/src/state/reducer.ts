@@ -14,6 +14,7 @@ import type {
   SessionTerminalState,
 } from './types';
 import { blocksFromLegacyMessage } from './blocks';
+import { applyTodoCall, reduceTodosFromMessages } from './todo';
 import { buildSearchMatches } from '../utils/search';
 
 let _msgCounter = 0;
@@ -437,6 +438,7 @@ function recomputeSearch(
 export const initialState: ChatState = {
   messages: [],
   queuedMessages: [],
+  activeTodos: [],
   isGenerating: false,
   recoveryLocked: false,
   isSessionList: document.body.dataset.viewMode === 'sidebar',
@@ -623,16 +625,23 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       const msgs = [...state.messages];
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      let shouldApplyTodo = false;
       if (assistant) {
         const existingIndex = assistant.toolCalls?.findIndex((t) => t.id === action.id);
         if (existingIndex !== undefined && existingIndex >= 0) {
-          // Tool was already announced via TOOL_BATCH_START — transition to running
-          const updated = assistant.toolCalls!.map((t, i) =>
-            i === existingIndex ? { ...t, args: action.args, status: 'running' as const } : t,
-          );
-          const updatedTool = updated[existingIndex];
-          msgs[assistantIndex] = upsertToolBlock({ ...assistant, toolCalls: updated }, updatedTool);
+          const existingStatus = assistant.toolCalls![existingIndex].status;
+          shouldApplyTodo = existingStatus === 'queued' || existingStatus === 'waiting_approval';
+          if (shouldApplyTodo) {
+            // Tool was already announced via TOOL_BATCH_START — transition to running.
+            // Replayed starts must not reopen terminal calls.
+            const updated = assistant.toolCalls!.map((t, i) =>
+              i === existingIndex ? { ...t, args: action.args, status: 'running' as const } : t,
+            );
+            const updatedTool = updated[existingIndex];
+            msgs[assistantIndex] = upsertToolBlock({ ...assistant, toolCalls: updated }, updatedTool);
+          }
         } else {
+          shouldApplyTodo = true;
           // Legacy path: tool wasn't in a batch, add it directly as running
           const tool: ToolCallData = {
             id: action.id,
@@ -647,7 +656,13 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
           msgs[assistantIndex] = upsertToolBlock(msgs[assistantIndex], tool);
         }
       }
-      return { ...state, messages: msgs };
+      return {
+        ...state,
+        messages: msgs,
+        activeTodos: shouldApplyTodo
+          ? applyTodoCall(state.activeTodos, action.name, action.args)
+          : state.activeTodos,
+      };
     }
 
     case 'TOOL_PROGRESS': {
@@ -862,7 +877,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
 
     // ─── Session management ─────────────────────────
     case 'CLEAR_CHAT':
-      return { ...state, messages: [], queuedMessages: [], tokenCount: undefined, contextFiles: [], isGenerating: false, recoveryLocked: false };
+      return { ...state, messages: [], queuedMessages: [], activeTodos: [], tokenCount: undefined, contextFiles: [], isGenerating: false, recoveryLocked: false };
 
     case 'SET_MODELS': {
       const hasCurrent = action.models.some((m) => m.provider === state.currentProvider);
@@ -954,6 +969,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         activeSessionId: action.sessionId,
+        activeTodos: action.sessionId === state.activeSessionId ? state.activeTodos : [],
         activeProjectHash: action.projectHash
           ?? (action.sessionId === state.activeSessionId ? state.activeProjectHash : undefined),
       };
@@ -1081,9 +1097,11 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
         };
         messages.push({ ...message, blocks: role === 'assistant' ? blocksFromLegacyMessage(message) : undefined });
       }
+      const mergedMessages = mergeTerminalIntoHistory(messages, action.terminal);
       return {
         ...state,
-        messages: mergeTerminalIntoHistory(messages, action.terminal),
+        messages: mergedMessages,
+        activeTodos: reduceTodosFromMessages(mergedMessages),
         isGenerating: false,
       };
     }
@@ -1181,20 +1199,23 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
     }
 
     // ─── Init ───────────────────────────────────────
-    case 'INIT':
+    case 'INIT': {
+      const activeSessionId = action.activeSessionId ?? state.activeSessionId;
       return {
         ...state,
         isGenerating: action.generating,
         recoveryLocked: action.recoveryLocked ?? false,
         currentModel: action.currentModel ?? state.currentModel,
         viewMode: action.viewMode ?? state.viewMode,
-        activeSessionId: action.activeSessionId ?? state.activeSessionId,
+        activeSessionId,
+        activeTodos: activeSessionId === state.activeSessionId ? state.activeTodos : [],
         activeProjectHash: action.projectHash ?? state.activeProjectHash,
         isSessionList: action.isSessionList ?? state.isSessionList,
         locale: action.locale ?? state.locale,
         approvalMode: action.approvalMode ?? state.approvalMode,
         approvalModePending: action.approvalModePending ?? state.approvalModePending,
       };
+    }
 
     default:
       return state;

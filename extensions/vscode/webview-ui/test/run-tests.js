@@ -22,6 +22,7 @@ async function main() {
     'mode-selector-style.test.ts',
     'session-list-regression.test.ts',
     'search.test.ts',
+    'todo-regression.test.ts',
   ];
 
   try {

@@ -5,6 +5,7 @@ import { ToolCall } from './ToolCall';
 import { PermissionRequest } from './PermissionRequest';
 import { ArtifactCodeView } from './ArtifactCodeView';
 import { blocksFromLegacyMessage } from '../state/blocks';
+import { shouldRenderToolCall } from '../state/todo';
 import { classifyArtifactRenderKind, normalizeMarkdownArtifactContent, shouldRenderArtifactChrome } from './artifactRendering';
 import { useT } from '../i18n';
 
@@ -95,9 +96,10 @@ function getDotClass(isStreaming: boolean, hasError: boolean): string {
 export function AssistantMessage({ message, className = '', searchQuery, isCurrentMatch }: AssistantMessageProps) {
   const t = useT();
   const contentRef = useRef<HTMLDivElement>(null);
-  const blocks = message.blocks && message.blocks.length > 0 ? message.blocks : blocksFromLegacyMessage(message);
-  const hasError = blocks.some((block) => block.type === 'tool' && (block.tool.status === 'error' || block.tool.status === 'incomplete'))
-    || Boolean(message.toolCalls?.some((t) => t.status === 'error' || t.status === 'incomplete'));
+  const allBlocks = message.blocks && message.blocks.length > 0 ? message.blocks : blocksFromLegacyMessage(message);
+  const blocks = allBlocks.filter((block) => block.type !== 'tool' || shouldRenderToolCall(block.tool));
+  const hasError = blocks.some((block) =>
+    block.type === 'tool' && (block.tool.status === 'error' || block.tool.status === 'incomplete'));
   const isStreaming = Boolean(message.streaming);
   const dotClass = getDotClass(isStreaming, hasError);
   const [copied, setCopied] = useState(false);
@@ -124,6 +126,9 @@ export function AssistantMessage({ message, className = '', searchQuery, isCurre
   }, [blocks]);
 
   const hasContent = blocks.length > 0;
+  const onlyHiddenTodoBlocks = allBlocks.length > 0 && blocks.length === 0;
+
+  if (onlyHiddenTodoBlocks) return null;
 
   return (
     <div className={`timeline-message ${dotClass}${className}${isCurrentMatch ? ' search-current' : ''}`}>

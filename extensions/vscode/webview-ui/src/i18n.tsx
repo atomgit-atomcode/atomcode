@@ -122,6 +122,14 @@ const zh = {
   'tool.waitingApproval': '待审批',
   'tool.incomplete': '未完成',
 
+  'todo.title': '任务',
+  'todo.progress': '{completed}/{total} 已完成',
+  'todo.pending': '待处理',
+  'todo.inProgress': '进行中',
+  'todo.completed': '已完成',
+  'todo.expand': '展开任务清单',
+  'todo.collapse': '收起任务清单',
+
   'stream.rateLimitedRetrying': '触发限流，{seconds} 秒后重试…',
   'stream.rateLimitedPaused': '触发限流，等待恢复…',
   'stream.idleNotice': '仍在等待模型响应…',
@@ -290,6 +298,14 @@ const en: Record<MsgKey, string> = {
   'tool.destructive': 'destructive',
   'tool.waitingApproval': 'waiting approval',
   'tool.incomplete': 'incomplete',
+
+  'todo.title': 'Tasks',
+  'todo.progress': '{completed}/{total} completed',
+  'todo.pending': 'Pending',
+  'todo.inProgress': 'In progress',
+  'todo.completed': 'Completed',
+  'todo.expand': 'Expand task list',
+  'todo.collapse': 'Collapse task list',
 
   'stream.rateLimitedRetrying': 'Rate limited. Retrying in {seconds}s...',
   'stream.rateLimitedPaused': 'Rate limited. Waiting to resume...',
