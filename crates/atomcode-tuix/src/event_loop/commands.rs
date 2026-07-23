@@ -1477,10 +1477,12 @@ fn execute_slash_command_impl(
         "view" => {
             let trimmed = arg.trim();
             if trimmed.is_empty() {
-                renderer.render(UiLine::Error(t(Msg::ViewUsage).into_owned()));
-                renderer.flush();
+                // No path → open the files-only fuzzy picker.
+                *active_modal = Some(Box::new(FileViewer::open_picker(ctx.working_dir.clone())));
             } else {
-                let path = ctx.working_dir.join(trimmed);
+                // Resolve `~`, absolute, and project-relative paths so files
+                // OUTSIDE the project open too.
+                let path = resolve_view_path(trimmed, &ctx.working_dir);
                 match FileViewer::open(&path) {
                     Ok(viewer) => {
                         *active_modal = Some(Box::new(viewer));
@@ -4755,6 +4757,29 @@ pub(super) fn build_whoami_text() -> String {
         )
     } else {
         t(Msg::CmdWhoamiNotSignedIn).into_owned()
+    }
+}
+
+/// Resolve a user-typed `/view <path>` argument to an absolute-ish path.
+/// Expands a leading `~`/`~/` to the home dir and accepts absolute paths as-is;
+/// anything else is joined onto the working dir. This is what lets `/view` open
+/// files OUTSIDE the project (`/view ~/x`, `/view /abs/x`).
+fn resolve_view_path(input: &str, working_dir: &std::path::Path) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    let expanded: PathBuf = if input == "~" {
+        crate::platform::home_dir().unwrap_or_else(|| PathBuf::from(input))
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        match crate::platform::home_dir() {
+            Some(home) => home.join(rest),
+            None => PathBuf::from(input),
+        }
+    } else {
+        PathBuf::from(input)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        working_dir.join(expanded)
     }
 }
 

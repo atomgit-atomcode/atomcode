@@ -4304,229 +4304,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Build a modal overlay cell grid from the given title + content lines.
-    /// The window is centred on the current screen and bounded to fit.
-    fn build_modal_overlay(
-        &self,
-        title: &str,
-        lines: &[String],
-        scroll: usize,
-        total: usize,
-        win_width: u16,
-        win_height: u16,
-    ) -> ModalOverlayState {
-        let screen_w = self.screen.width();
-        let screen_h = self.screen.height();
-
-        // Clamp to screen bounds with a small margin.
-        let win_w = win_width.min(screen_w.saturating_sub(4)).max(20);
-        let win_h = win_height.min(screen_h.saturating_sub(4)).max(6);
-        let x = (screen_w.saturating_sub(win_w)) / 2;
-        let y = (screen_h.saturating_sub(win_h)) / 2;
-
-        let mut cells: Vec<Vec<Cell>> = Vec::with_capacity(win_h as usize);
-        let border_style = self.style_for(Role::Muted);
-        let title_style = self.style_bold(Role::Brand);
-        let text_style = CellStyle::default();
-        let hint_style = self.style_for(Role::Muted);
-
-        // Helper to build a full-width row padded with spaces.
-        let build_row = |content: Vec<Cell>| -> Vec<Cell> {
-            let mut row = Vec::with_capacity(win_w as usize);
-            row.push(Cell {
-                ch: '│',
-                style: border_style.clone(),
-                width: 1,
-            });
-            row.extend(content);
-            let filled: usize = row.iter().map(|c| c.width as usize).sum();
-            let pad = (win_w as usize).saturating_sub(filled).saturating_sub(1); // -1 for right border
-            for _ in 0..pad {
-                row.push(Cell::blank());
-            }
-            row.push(Cell {
-                ch: '│',
-                style: border_style.clone(),
-                width: 1,
-            });
-            row
-        };
-
-        // Inner text width: window minus the 2 borders and the 1-col left
-        // pad every row carries. ALL variable-text rows (title, content,
-        // hint) clip to this so none can overflow the frame and shove the
-        // right border out of alignment.
-        let max_inner = (win_w as usize).saturating_sub(3);
-        let clip_cells = |text: &str, style: &CellStyle| -> Vec<Cell> {
-            let mut out = Vec::new();
-            let mut used = 0usize;
-            for ch in text.chars() {
-                if used >= max_inner {
-                    break;
-                }
-                // Normalise control chars exactly like `push_str_cells`
-                // so the cell model stays column-aligned with the
-                // terminal: drop CR/LF, expand TAB to spaces (a raw TAB
-                // would jump the terminal to its hardware tab stop and
-                // shove the right border out of alignment), skip
-                // zero-width combining marks.
-                match ch {
-                    '\n' | '\r' => continue,
-                    '\t' => {
-                        let n = crate::render::cell::SOFT_TAB_WIDTH.min(max_inner - used);
-                        for _ in 0..n {
-                            out.push(Cell {
-                                ch: ' ',
-                                style: style.clone(),
-                                width: 1,
-                            });
-                        }
-                        used += n;
-                    }
-                    _ => {
-                        let w = crate::width::cell_char_width(ch).unwrap_or(1);
-                        if w == 0 {
-                            continue;
-                        }
-                        if used + w > max_inner {
-                            break;
-                        }
-                        out.push(Cell {
-                            ch,
-                            style: style.clone(),
-                            width: w as u8,
-                        });
-                        used += w;
-                        for _ in 1..w {
-                            out.push(Cell::continuation());
-                        }
-                    }
-                }
-            }
-            out
-        };
-
-        // Top border: ┌─────┐
-        {
-            let mut row = Vec::with_capacity(win_w as usize);
-            row.push(Cell {
-                ch: '┌',
-                style: border_style.clone(),
-                width: 1,
-            });
-            for _ in 0..(win_w as usize).saturating_sub(2) {
-                row.push(Cell {
-                    ch: '─',
-                    style: border_style.clone(),
-                    width: 1,
-                });
-            }
-            row.push(Cell {
-                ch: '┐',
-                style: border_style.clone(),
-                width: 1,
-            });
-            cells.push(row);
-        }
-
-        // Title row (clipped so a long filename can't overflow the frame).
-        {
-            let safe_title = crate::sanitize::scrub_controls(title);
-            let mut content = Vec::new();
-            content.push(Cell::blank());
-            content.extend(clip_cells(&format!(" {}", safe_title), &title_style));
-            cells.push(build_row(content));
-        }
-
-        // Separator line
-        {
-            let mut row = Vec::with_capacity(win_w as usize);
-            row.push(Cell {
-                ch: '├',
-                style: border_style.clone(),
-                width: 1,
-            });
-            for _ in 0..(win_w as usize).saturating_sub(2) {
-                row.push(Cell {
-                    ch: '─',
-                    style: border_style.clone(),
-                    width: 1,
-                });
-            }
-            row.push(Cell {
-                ch: '┤',
-                style: border_style.clone(),
-                width: 1,
-            });
-            cells.push(row);
-        }
-
-        // Content rows
-        let content_height = (win_h as usize).saturating_sub(5); // top + title + sep + hint + bottom
-        for line in lines.iter().take(content_height) {
-            let safe = crate::sanitize::scrub_controls(line);
-            let mut content = Vec::new();
-            content.push(Cell::blank());
-            content.extend(clip_cells(&safe, &text_style));
-            cells.push(build_row(content));
-        }
-
-        // Pad remaining content rows with blank lines
-        for _ in lines.len()..content_height {
-            cells.push(build_row(vec![Cell::blank()]));
-        }
-
-        // Bottom hint row: "Line X/Y · Esc/q to close" (clipped to width).
-        {
-            let hint = format!("Line {}/{} · Esc/q to close", scroll + 1, total);
-            let mut content = Vec::new();
-            content.push(Cell::blank());
-            content.extend(clip_cells(&hint, &hint_style));
-            cells.push(build_row(content));
-        }
-
-        // Bottom border: └─────┘
-        {
-            let mut row = Vec::with_capacity(win_w as usize);
-            row.push(Cell {
-                ch: '└',
-                style: border_style.clone(),
-                width: 1,
-            });
-            for _ in 0..(win_w as usize).saturating_sub(2) {
-                row.push(Cell {
-                    ch: '─',
-                    style: border_style.clone(),
-                    width: 1,
-                });
-            }
-            row.push(Cell {
-                ch: '┘',
-                style: border_style.clone(),
-                width: 1,
-            });
-            cells.push(row);
-        }
-
-        ModalOverlayState { cells, x, y }
-    }
-
     /// Build a borderless `/diff` panel in the `/usage` house style: no box
-    /// frame, no input box — just a title row, a single horizontal rule
-    /// underneath, the content, a blank spacer, and a muted hint. The panel is
-    /// sized to its content and anchored to the bottom of the screen, so the
-    /// scrollback above stays visible and the input box below is covered (its
-    /// caret is hidden via `diff_overlay_active`).
-    ///
-    /// `win_width`/`win_height` are ignored; the overlay is laid out against the
-    /// live screen width and its own content height.
+    /// frame, no input box — a top rule (the separator that stands in for the
+    /// input box's top border), the title, the content, a blank spacer, and a
+    /// muted hint. The panel has a FIXED height (`win_height`, chosen per view —
+    /// taller for the file detail) and renders inline where the input box sits,
+    /// right after the conversation, so it follows the scrollback rather than
+    /// pinning to the screen bottom. It slides up only when it can't fit below
+    /// the body. `win_width` is ignored (laid out against the live screen width).
     fn build_diff_panel_overlay(
         &self,
         title: &DiffPanelRow,
         rows: &[DiffPanelRow],
         footer: &str,
         _win_width: u16,
-        _win_height: u16,
+        win_height: u16,
     ) -> ModalOverlayState {
         let width = (self.screen.width() as usize).max(1);
         let screen_h = (self.screen.height() as usize).max(1);
@@ -6029,7 +5821,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             | UiLine::Spinner { .. }
             | UiLine::ClearTransient
             | UiLine::InputCommit
-            | UiLine::ModalOverlay { .. }
             | UiLine::DiffPanel { .. }
             | UiLine::ModalOverlayClear => return,
             _ => {}
@@ -7111,18 +6902,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let prefix = format!("{msg}  ");
                 self.push_body_prefixed(&prefix, &default_style, &model, &model_style);
                 self.push_body_row(Vec::new());
-            }
-            UiLine::ModalOverlay {
-                title,
-                lines,
-                scroll,
-                total,
-                win_width,
-                win_height,
-            } => {
-                self.modal_overlay = Some(
-                    self.build_modal_overlay(&title, &lines, scroll, total, win_width, win_height),
-                );
             }
             UiLine::DiffPanel {
                 title,
@@ -14647,39 +14426,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn modal_overlay_expands_tabs_no_raw_tab_cells() {
-        // A file line with a leading tab (Go / Makefiles / tab-indented C)
-        // must render as spaces in the overlay cell grid. A raw '\t' cell
-        // would make the terminal jump to its hardware tab stop while the
-        // cell model only advances 1 col, shoving the right border (and
-        // everything after the tab) out of alignment.
-        let (r, _buf) = new_capturing(80, 24);
-        let lines = vec!["\tfn main() {}".to_string()];
-        let overlay = r.build_modal_overlay("t.rs", &lines, 0, 1, 60, 20);
-
-        // No cell anywhere in the overlay may carry a raw tab.
-        for row in &overlay.cells {
-            assert!(
-                row.iter().all(|c| c.ch != '\t'),
-                "overlay cell grid must not contain a raw '\\t'"
-            );
-        }
-
-        // cells: [0]=top border, [1]=title, [2]=separator, [3]=first
-        // content row = │ + leading pad blank + clip_cells(line) + … + │.
-        let content = &overlay.cells[3];
-        let tab_w = crate::render::cell::SOFT_TAB_WIDTH;
-        let tab_region: String = content[2..2 + tab_w].iter().map(|c| c.ch).collect();
-        assert_eq!(
-            tab_region,
-            " ".repeat(tab_w),
-            "leading tab should expand to {tab_w} spaces"
-        );
-        // The first real glyph follows the expanded tab.
-        assert_eq!(content[2 + tab_w].ch, 'f');
     }
 
     #[test]

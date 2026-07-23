@@ -1189,8 +1189,6 @@ pub enum Msg<'a> {
     TodoListHeader,
     /// `/todo add` used without any task text after it.
     TodoAddUsage,
-    /// Error shown when `/view` is used without a filepath argument.
-    ViewUsage,
     /// `/guide` menu header: "📖 AtomCode Guide — type /guide <question>"
     GuideMenuHeader,
     /// `/guide` menu: "Common topics:" section label

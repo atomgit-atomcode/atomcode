@@ -941,7 +941,6 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::TodoNoList => "No task list yet (the model hasn't created todos).".into(),
         Msg::TodoListHeader => "Current tasks:".into(),
         Msg::TodoAddUsage => "Usage: /todo add <task description>".into(),
-        Msg::ViewUsage => "Usage: /view <filepath>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode Guide — type /guide <question>".into(),
         Msg::GuideMenuTopics => "Common topics:".into(),
         Msg::GuideMenuGettingStarted => "Getting started          First install, login, config".into(),
