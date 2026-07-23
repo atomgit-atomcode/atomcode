@@ -19,6 +19,8 @@ function testTranslatorFallsBackToEnglishAndInterpolatesValues() {
   assert.equal(zh('welcome.quick.intro'), '了解 AtomCode');
   assert.equal(en('welcome.quick.intro'), 'Learn AtomCode');
   assert.equal(zh('setup.providersConfigured', { count: 3 }), '已配置 3 个 Provider');
+  assert.equal(zh('mode.auto'), 'Auto');
+  assert.equal(en('mode.auto'), 'Auto');
 }
 
 function testCatalogsHaveMatchingKeys() {

@@ -466,8 +466,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const followDefaultProvider = useCallback((name: string) => {
     if (!providerPinnedRef.current) setProvider(name);
   }, []);
-  // 审批模式（build / plan / bypass）。进程级 runtime 状态，由 /live snapshot +
-  // 'mode' 事件同步，切换调 postLiveMode（下一轮生效）。confirmedMode 是 daemon 已确认值。
+  // 审批模式（build / accept_edits / bypass / plan）。进程级 runtime 状态，
+  // 由 /live snapshot + 'mode' 事件同步，切换调 postLiveMode（下一轮生效）。
+  // confirmedMode 是 daemon 已确认值。
   const [modeState, setModeState] = useState(() => initModeState('build' as ApprovalMode));
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
@@ -1064,7 +1065,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         providerPinnedRef.current = false;
         setProvider(e.provider);
       }
-      // 同步当前审批模式，让新 tab 显示正确的模式 pill（含别的 tab 切成的 Bypass/Plan）。
+      // 同步当前审批模式，让新 tab 显示正确的模式 pill（含别的 tab 切成的 Auto/Plan）。
       if (e.mode) setModeState(initModeState(e.mode));
       // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
       // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，

@@ -179,13 +179,15 @@ data class ChatRequest(
 
 enum class ApprovalMode(val wire: String) {
     Build("build"),
-    Plan("plan"),
-    Bypass("bypass");
+    AcceptEdits("accept_edits"),
+    Auto("bypass"),
+    Plan("plan");
 
     override fun toString(): String = when (this) {
         Build -> "Build"
+        AcceptEdits -> "Accept Edits"
+        Auto -> "Auto"
         Plan -> "Plan"
-        Bypass -> "Bypass"
     }
 }
 

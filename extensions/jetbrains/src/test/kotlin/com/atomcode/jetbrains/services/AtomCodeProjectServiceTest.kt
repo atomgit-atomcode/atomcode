@@ -50,7 +50,7 @@ class AtomCodeProjectServiceTest {
         assertEquals(ApprovalMode.Plan, state.displayMode)
         assertEquals(ApprovalMode.Plan, state.pendingMode)
 
-        assertEquals(false, state.beginSwitch(ApprovalMode.Bypass))
+        assertEquals(false, state.beginSwitch(ApprovalMode.Auto))
         assertEquals(ApprovalMode.Build, state.confirmedMode)
         assertEquals(ApprovalMode.Plan, state.displayMode)
         assertEquals(ApprovalMode.Plan, state.pendingMode)
@@ -61,7 +61,7 @@ class AtomCodeProjectServiceTest {
         val state = ApprovalModeRuntimeState()
 
         state.beginSwitch(ApprovalMode.Plan)
-        state.refreshFromDaemon(ApprovalMode.Bypass.wire)
+        state.refreshFromDaemon(ApprovalMode.Auto.wire)
 
         assertEquals(ApprovalMode.Build, state.confirmedMode)
         assertEquals(ApprovalMode.Plan, state.displayMode)
@@ -78,10 +78,35 @@ class AtomCodeProjectServiceTest {
         assertEquals(ApprovalMode.Plan, state.displayMode)
         assertNull(state.pendingMode)
 
-        state.beginSwitch(ApprovalMode.Bypass)
-        assertEquals(ApprovalMode.Plan, state.failSwitch(ApprovalMode.Bypass))
+        state.beginSwitch(ApprovalMode.Auto)
+        assertEquals(ApprovalMode.Plan, state.failSwitch(ApprovalMode.Auto))
         assertEquals(ApprovalMode.Plan, state.confirmedMode)
         assertEquals(ApprovalMode.Plan, state.displayMode)
+        assertNull(state.pendingMode)
+    }
+
+    @Test
+    fun `approval mode runtime state parses accept edits and auto wire values`() {
+        val state = ApprovalModeRuntimeState()
+
+        assertEquals(ApprovalMode.AcceptEdits, state.refreshFromDaemon("accept_edits"))
+        assertEquals(ApprovalMode.AcceptEdits, state.confirmedMode)
+
+        assertEquals(ApprovalMode.Auto, state.refreshFromDaemon("bypass"))
+        assertEquals(ApprovalMode.Auto, state.confirmedMode)
+    }
+
+    @Test
+    fun `approval mode runtime state rolls back when daemon response mode is unknown`() {
+        val state = ApprovalModeRuntimeState()
+
+        state.beginSwitch(ApprovalMode.AcceptEdits)
+        assertEquals(
+            ApprovalMode.Build,
+            state.completeSwitch(ApprovalMode.AcceptEdits, "unsupported_mode"),
+        )
+        assertEquals(ApprovalMode.Build, state.confirmedMode)
+        assertEquals(ApprovalMode.Build, state.displayMode)
         assertNull(state.pendingMode)
     }
 

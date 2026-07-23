@@ -4,6 +4,18 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 
 class AtomCodeDaemonTypesTest {
+    @Test
+    fun `approval modes keep canonical order display names and wire values`() {
+        assertEquals(
+            listOf(
+                Triple(ApprovalMode.Build, "Build", "build"),
+                Triple(ApprovalMode.AcceptEdits, "Accept Edits", "accept_edits"),
+                Triple(ApprovalMode.Auto, "Auto", "bypass"),
+                Triple(ApprovalMode.Plan, "Plan", "plan"),
+            ),
+            ApprovalMode.values().map { Triple(it, it.toString(), it.wire) },
+        )
+    }
 
     @Test
     fun `ProviderInfo toString with default provider`() {

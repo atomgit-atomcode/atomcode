@@ -44,13 +44,16 @@ class InputPanelTest {
             onPasteFromClipboard = { false },
         )
 
-        assertEquals(listOf("Build", "Plan", "Bypass"), panel.approvalModeOptionsForTest())
+        assertEquals(
+            listOf("Build", "Accept Edits", "Auto", "Plan"),
+            panel.approvalModeOptionsForTest(),
+        )
 
-        panel.setApprovalMode(ApprovalMode.Plan)
-        assertEquals("Plan ▾", panel.approvalModeDisplayTextForTest())
+        panel.setApprovalMode(ApprovalMode.AcceptEdits)
+        assertEquals("Accept Edits ▾", panel.approvalModeDisplayTextForTest())
 
-        panel.selectApprovalModeForTest(ApprovalMode.Bypass)
-        assertEquals(listOf(ApprovalMode.Bypass), selected)
+        panel.selectApprovalModeForTest(ApprovalMode.Auto)
+        assertEquals(listOf(ApprovalMode.Auto), selected)
     }
 
     private fun findButton(container: Container, predicate: (JButton) -> Boolean): JButton? {

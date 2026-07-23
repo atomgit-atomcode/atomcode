@@ -2701,9 +2701,9 @@ body {
 
 .model-item:hover { background: var(--app-list-hover-background); }
 
-/* ── Approval mode selector (Build / Plan / Bypass) ──────────────────────
+/* ── Approval mode selector (Build / Accept Edits / Auto / Plan) ────────
    Reuses .model-selector / .model-dropdown / .model-item chrome. Each option
-   stacks a bold label over a muted one-line description. Bypass (免审批) is a
+   stacks a bold label over a muted one-line description. Auto is a
    safety-consequential toggle → warning accent on both the option and, while
    active, the trigger pill (mirrors the TUI red BYPASS badge). */
 .mode-item {

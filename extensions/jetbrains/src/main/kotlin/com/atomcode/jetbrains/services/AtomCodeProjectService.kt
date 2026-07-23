@@ -85,7 +85,7 @@ internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode
     @Synchronized
     fun completeSwitch(requested: ApprovalMode, responseMode: String): ApprovalMode {
         if (pendingMode != requested) return displayMode
-        val applied = parseApprovalMode(responseMode, requested)
+        val applied = parseApprovalMode(responseMode, confirmedMode)
         confirmedMode = applied
         displayMode = applied
         pendingMode = null
@@ -111,8 +111,9 @@ internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode
 
     private fun parseApprovalMode(wire: String, fallback: ApprovalMode): ApprovalMode =
         when (wire) {
+            ApprovalMode.AcceptEdits.wire -> ApprovalMode.AcceptEdits
+            ApprovalMode.Auto.wire -> ApprovalMode.Auto
             ApprovalMode.Plan.wire -> ApprovalMode.Plan
-            ApprovalMode.Bypass.wire -> ApprovalMode.Bypass
             ApprovalMode.Build.wire -> ApprovalMode.Build
             else -> fallback
         }

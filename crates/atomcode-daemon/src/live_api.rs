@@ -34,14 +34,12 @@ use crate::CachedMcpRegistry;
 
 pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
     match mode {
-        ApprovalMode::Plan => PermissionDecision::Deny,
-        // AcceptEdits groups with Build here: this coarse daemon/webui fallback has no
-        // per-tool granularity yet (webui 4th-mode support is deferred). The real
-        // AcceptEdits enforcement (edits auto-approve, bash still prompts) is the
-        // WriteApprovalGate middleware on the interactive path.
-        ApprovalMode::Build | ApprovalMode::Auto | ApprovalMode::AcceptEdits => {
-            PermissionDecision::Allow
-        }
+        // AcceptEdits auto-approval is implemented by WriteApprovalGate. Any
+        // request that still reaches the driver requires a real approver
+        // (for example bash or a sensitive path), so missing responders must
+        // fail closed.
+        ApprovalMode::AcceptEdits | ApprovalMode::Plan => PermissionDecision::Deny,
+        ApprovalMode::Build | ApprovalMode::Auto => PermissionDecision::Allow,
     }
 }
 
@@ -63,7 +61,8 @@ fn native_runtime_mode(mode: ApprovalMode) -> atomcode_coding::RuntimeMode {
     }
 }
 
-/// 当前审批模式的线格字符串（"build" / "plan" / "bypass"），供 Snapshot / 广播使用。
+/// 当前审批模式的线格字符串（"build" / "accept_edits" / "bypass" / "plan"），
+/// 供 Snapshot / 广播使用。
 fn live_current_mode_wire() -> String {
     live_current_approval_mode().wire().to_string()
 }
@@ -485,8 +484,9 @@ pub(crate) fn chat_runtime_config(
         thinking_enabled: p.and_then(|p| p.thinking_enabled),
         thinking_type: p.and_then(|p| p.thinking_type.clone()),
         thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
-        // The daemon answers `/chat` approvals at its own seam (interactive perm_rx),
-        // so the runtime must keep the round-trip rather than auto-approving here.
+        // The daemon answers `/chat` approvals at its own seam when an interactive
+        // responder is registered; otherwise run_chat_turn_v2 applies the mode-specific,
+        // fail-closed fallback. Keep the runtime round-trip enabled here.
         dangerously_skip_permissions: false,
         // Keep the fail-closed approval timeout for the daemon (current behavior).
         interactive: false,
@@ -516,8 +516,8 @@ fn send_chat_runtime_error(
 
 /// Drive a native runtime over `conv` and forward its native events to the shared
 /// `/chat` consumer. `perm_rx` carries interactive approval decisions from `/chat/permission`
-/// (`None` = auto-approve / standalone). The kernel snapshot is written back to `conv`
-/// so the caller persists the completed turn.
+/// (`None` = apply [`fallback_approval_decision`] for the selected mode). The kernel
+/// snapshot is written back to `conv` so the caller persists the completed turn.
 pub(crate) async fn run_chat_turn_v2(
     session_id: String,
     conv: Arc<Mutex<Conversation>>,
@@ -528,7 +528,7 @@ pub(crate) async fn run_chat_turn_v2(
     approval_mode: ApprovalMode,
 ) {
     use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
-    use atomcode_coding::{CodingRuntime, RuntimeMode, TurnCompletion};
+    use atomcode_coding::{CodingRuntime, TurnCompletion};
 
     // Split the just-submitted user input from the persisted prefix before runtime
     // startup. The prefix is imported/initialized under the target session's lease.
@@ -581,12 +581,7 @@ pub(crate) async fn run_chat_turn_v2(
     } else {
         user_images
     };
-    let mode = if approval_mode == ApprovalMode::Plan {
-        RuntimeMode::Plan
-    } else {
-        RuntimeMode::Build
-    };
-    if let Err(error) = handle.set_mode(mode).await {
+    if let Err(error) = handle.set_mode(native_runtime_mode(approval_mode)).await {
         send_chat_runtime_error(&runtime_event_tx, format!("切换模式失败：{error}"));
         return;
     }
@@ -749,7 +744,8 @@ pub(crate) enum LiveWireEvent {
         session_name: String,
         project_hash: String,
         provider: String,
-        /// 当前审批模式（build / plan / bypass），让新连上的 tab 立刻显示正确的模式 pill。
+        /// 当前审批模式（build / accept_edits / bypass / plan），
+        /// 让新连上的 tab 立刻显示正确的模式 pill。
         mode: String,
         /// 当前工作目录，让 App 端能展示项目名。
         #[serde(rename = "working_dir")]
@@ -757,7 +753,8 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "provider")]
     Provider { provider: String },
-    /// 审批模式切换（build / plan / bypass）——webui 各 tab 的「模式」pill 据此同步。
+    /// 审批模式切换（build / accept_edits / bypass / plan）——
+    /// webui 各 tab 的「模式」pill 据此同步。
     #[serde(rename = "mode")]
     Mode { mode: String },
     /// 斜杠命令的文本输出（如 /status 报告）。`text` 首行即 `/cmd` 标头，
@@ -1572,7 +1569,7 @@ pub(crate) async fn live_provider(
 
 #[derive(serde::Deserialize)]
 pub(crate) struct LiveModeReq {
-    /// "build" | "plan" | "bypass"
+    /// "build" | "accept_edits" | "bypass" | "plan"
     pub mode: ApprovalMode,
 }
 
@@ -1610,13 +1607,14 @@ pub(crate) async fn approval_mode_set(Json(req): Json<LiveModeReq>) -> impl Into
     })
 }
 
-/// POST /live/mode — webui 底栏「模式」pill 切换审批模式（build / plan / bypass）。
+/// POST /live/mode — webui 底栏「模式」pill 切换审批模式
+/// （build / accept_edits / bypass / plan）。
 ///
 /// 更新进程级 LIVE_APPROVAL_MODE；若当前已有 live 会话，则广播 ModeChanged 让
 /// 其他 webui tab / TUI 实时跟随。没有 live 会话时不为一次普通模式切换创建会话。
 /// 下一轮实际用哪个 PermissionDecider 由 run_turn 读 LIVE_APPROVAL_MODE 决定。
 /// 模式是运行时会话状态，不写入 config（与 provider 持久化为默认不同）——避免
-/// 「免审批」这种危险态被静默持久化。
+/// Auto（wire: bypass）这种危险态被静默持久化。
 pub(crate) async fn live_mode(Json(req): Json<LiveModeReq>) -> impl IntoResponse {
     let ok = apply_live_mode(req.mode).await;
     Json(ApprovalModeResp {
@@ -1994,12 +1992,13 @@ mod tests {
     }
 
     /// The webui `/live/mode` body + `mode`/`snapshot` SSE events serialize the
-    /// mode as lowercase `build`/`plan`/`bypass`. The frontend `ApprovalMode`
+    /// mode as lowercase `build`/`accept_edits`/`bypass`/`plan`. The frontend `ApprovalMode`
     /// union depends on these EXACT strings — lock the wire contract.
     #[test]
     fn approval_mode_wire_strings_are_lowercase() {
         let cases = [
             (ApprovalMode::Build, "build"),
+            (ApprovalMode::AcceptEdits, "accept_edits"),
             (ApprovalMode::Plan, "plan"),
             (ApprovalMode::Auto, "bypass"),
         ];
@@ -2015,9 +2014,13 @@ mod tests {
     }
 
     #[test]
-    fn fallback_approval_is_closed_for_plan_mode() {
+    fn fallback_approval_is_closed_for_prompt_required_modes() {
         assert!(matches!(
             fallback_approval_decision(ApprovalMode::Plan),
+            PermissionDecision::Deny
+        ));
+        assert!(matches!(
+            fallback_approval_decision(ApprovalMode::AcceptEdits),
             PermissionDecision::Deny
         ));
         assert!(matches!(
@@ -2028,6 +2031,23 @@ mod tests {
             fallback_approval_decision(ApprovalMode::Auto),
             PermissionDecision::Allow
         ));
+    }
+
+    #[test]
+    fn native_runtime_mode_preserves_all_approval_modes() {
+        let cases = [
+            (ApprovalMode::Build, atomcode_coding::RuntimeMode::Build),
+            (
+                ApprovalMode::AcceptEdits,
+                atomcode_coding::RuntimeMode::AcceptEdits,
+            ),
+            (ApprovalMode::Auto, atomcode_coding::RuntimeMode::Auto),
+            (ApprovalMode::Plan, atomcode_coding::RuntimeMode::Plan),
+        ];
+
+        for (approval_mode, runtime_mode) in cases {
+            assert_eq!(native_runtime_mode(approval_mode), runtime_mode);
+        }
     }
 
     #[tokio::test]

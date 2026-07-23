@@ -38,3 +38,20 @@ test('input dropdown descriptions remain readable in active menu items', () => {
     /\.slash-item\.active\s+\.slash-item-desc\s*\{[^}]*color:\s*var\(--app-command-menu-active-foreground\);/s,
   );
 });
+
+test('approval modes use canonical order while keeping the bypass wire value', () => {
+  const selector = readFileSync(
+    join(root, 'webview-ui/src/components/ModeSelector.tsx'),
+    'utf8',
+  );
+  const build = selector.indexOf("value: 'build'");
+  const acceptEdits = selector.indexOf("value: 'accept_edits'");
+  const auto = selector.indexOf("value: 'bypass', labelKey: 'mode.auto'");
+  const plan = selector.indexOf("value: 'plan'");
+
+  assert.ok(build >= 0);
+  assert.ok(build < acceptEdits);
+  assert.ok(acceptEdits < auto);
+  assert.ok(auto < plan);
+  assert.doesNotMatch(selector, /labelKey:\s*'mode\.bypass'/);
+});

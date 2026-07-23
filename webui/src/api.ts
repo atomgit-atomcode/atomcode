@@ -639,7 +639,8 @@ export async function getSession(
 // --- Live session (multi-tab real-time sync) ---
 
 /** Approval mode: 'build' = interactive approval, 'plan' = read-only exploration,
- *  'bypass' = auto-approve everything (免审批). Mirrors the daemon `ApprovalMode`. */
+ *  'bypass' = Auto (auto-approve everything). Mirrors the daemon `ApprovalMode`
+ *  while preserving the established wire value. */
 export type ApprovalMode = 'build' | 'plan' | 'bypass' | 'accept_edits';
 
 export interface ApprovalModeResponse {
@@ -791,8 +792,9 @@ export async function postCommand(body: {
   return resp.json();
 }
 
-/** Switch the approval mode (build / plan / bypass). Runtime session state —
- *  the next turn's PermissionDecider follows it; broadcast to other tabs. */
+/** Switch the approval mode (build / accept_edits / bypass / plan). Runtime
+ *  session state — the next turn's PermissionDecider follows it; broadcast to
+ *  other tabs. */
 export async function postLiveMode(mode: ApprovalMode): Promise<ApprovalMode> {
   const resp = await fetch('/approval_mode', {
     method: 'POST',

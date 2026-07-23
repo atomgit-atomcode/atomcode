@@ -1368,6 +1368,14 @@ fn effective_chat_approval_mode(
 ) -> crate::approval_mode::ApprovalMode {
     request_mode.unwrap_or_else(live_api::live_current_approval_mode)
 }
+
+fn approval_mode_requires_responder(mode: crate::approval_mode::ApprovalMode) -> bool {
+    matches!(
+        mode,
+        crate::approval_mode::ApprovalMode::Build | crate::approval_mode::ApprovalMode::AcceptEdits
+    )
+}
+
 /// Map a working directory to its physical session-bucket name.
 ///
 /// Delegates to the native store so API project ids and physical buckets stay
@@ -3564,12 +3572,13 @@ async fn process_chat_request(
         }
     }
     // Interactive approval bridged over HTTP: interactive local clients (WebUI,
-    // channel, VSCode, JetBrains) in Build mode route `/chat/permission`
+    // channel, VSCode, JetBrains) in Build and Accept Edits modes route
+    // `/chat/permission`
     // decisions back to the native runtime producer via `pending_permissions` (see
-    // the registration in the turn task below). Plan and Bypass are explicit
+    // the registration in the turn task below). Plan and Auto are explicit
     // modes and never depend on an approver.
     let registered_permission_responder =
-        interactive_permission && approval_mode == crate::approval_mode::ApprovalMode::Build;
+        interactive_permission && approval_mode_requires_responder(approval_mode);
     // Native runtime observations stay native until this daemon driver projects
     // them to the HTTP ChatEvent wire model.
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel::<CodingRuntimeEvent>();
@@ -3592,7 +3601,7 @@ async fn process_chat_request(
         }
         let _ = event_tx.send(ChatEvent::Stopped);
         // Turn never ran — the turn task (which registers the responder) never
-        // spawned, so this is a defensive no-op cleanup for interactive Build mode.
+        // spawned, so this is a defensive no-op cleanup for interactive modes.
         if registered_permission_responder {
             pending_permissions.unregister(&perm_session_key);
         }
@@ -3691,7 +3700,7 @@ async fn process_chat_request(
 
     // Turn finished (the forwarding loop above exits when runtime_event_rx closes).
     // Drop the permission
-    // registration so it doesn't leak. Only registered in interactive Build mode.
+    // registration so it doesn't leak. Only registered in interactive prompt modes.
     if registered_permission_responder {
         pending_permissions.unregister(&perm_session_key);
     }
@@ -6348,6 +6357,16 @@ mod channel_mode_tests {
             effective_chat_approval_mode(None),
             crate::approval_mode::ApprovalMode::Auto
         );
+    }
+
+    #[test]
+    fn interactive_responder_is_required_for_prompt_required_modes() {
+        use crate::approval_mode::ApprovalMode;
+
+        assert!(approval_mode_requires_responder(ApprovalMode::Build));
+        assert!(approval_mode_requires_responder(ApprovalMode::AcceptEdits));
+        assert!(!approval_mode_requires_responder(ApprovalMode::Auto));
+        assert!(!approval_mode_requires_responder(ApprovalMode::Plan));
     }
 
     // ---- Offline parity: build_api_system_prompt must emit OFFLINE ENVIRONMENT ----
