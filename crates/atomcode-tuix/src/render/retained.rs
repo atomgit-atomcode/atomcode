@@ -4918,9 +4918,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.body_lines.pop();
         }
         if bottom_before_pop > 0 {
-            let start = bottom_before_pop
-                .saturating_sub(remove as u16 - 1)
-                .max(1);
+            let start = bottom_before_pop.saturating_sub(remove as u16 - 1).max(1);
             let mut seq = String::new();
             for row in start..=bottom_before_pop {
                 seq.push_str(&format!("\x1b[{};1H\x1b[K", row));

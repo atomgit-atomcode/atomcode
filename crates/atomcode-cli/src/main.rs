@@ -28,8 +28,8 @@ fn _isolate_atomcode_home() {
 
 use atomcode_capabilities::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
-    merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthLoginOptions, McpRegistry,
-    McpTokenStore, McpTransportConfig,
+    merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthLoginOptions, McpTokenStore,
+    McpTransportConfig,
 };
 use atomcode_config::config::Config;
 
@@ -1502,31 +1502,6 @@ async fn run() -> Result<i32> {
     // Headless mode requires MCP tools immediately; TUI can load them in background.
     let is_headless = cli.prompt.is_some() || cli.prompt_file.is_some();
 
-    // Load MCP servers from .mcp.json (project) and ~/.atomcode/mcp.json (user).
-    // CodingRuntime builds the agent's tool registry from config; here we only
-    // build the shared `McpRegistry` the TUI uses (status panel / mgmt)
-    // and, for TUI mode, an event channel so connection status surfaces in
-    // scrollback.
-    let (mcp_registry, mcp_connect_rx) = if is_headless {
-        // Headless: wait for connections so the registry is populated up front.
-        let registry = McpRegistry::from_config(&working_dir).await;
-        let mcp_tools = registry.list_all_tools().await;
-        let mcp_registry = if !mcp_tools.is_empty() {
-            Some(std::sync::Arc::new(registry))
-        } else {
-            None
-        };
-        (mcp_registry, None)
-    } else {
-        // TUI: start in background; the event channel lets the TUI display
-        // connection status in scrollback as servers connect.
-        use atomcode_capabilities::mcp::McpConnectEvent;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
-        let registry = McpRegistry::from_config_background_with_events(&working_dir, Some(tx));
-        let mcp_registry = std::sync::Arc::new(registry);
-        (Some(mcp_registry), Some(rx))
-    };
-
     // Continue the previous session only when the user explicitly opts
     // in via `-c` / `--continue`. Bare `atomcode` starts a fresh
     // session — no auto-resume, no scrollback replay. Users who want to
@@ -1747,11 +1722,10 @@ async fn run() -> Result<i32> {
             // Same as the headless arm: don't `?` — a TUI run that ends in an
             // error must still reach the shutdown/flush below. Ok(()) → exit 0;
             // the error propagates only after telemetry is drained.
-            let provider_selection_mode = if cli.provider.is_some() || cli.model.is_some() {
-                atomcode_tuix::ProviderSelectionMode::Pinned
-            } else {
-                atomcode_tuix::ProviderSelectionMode::FollowGlobalDefault
-            };
+            // A running session owns its resolved provider/model. Shared config
+            // changes only define the default for sessions opened afterwards;
+            // they must not retarget an already-open runtime.
+            let provider_selection_mode = atomcode_tuix::ProviderSelectionMode::Pinned;
             match atomcode_tuix::run(
                 config,
                 model_name,
@@ -1761,8 +1735,6 @@ async fn run() -> Result<i32> {
                 runtime_spawn_override,
                 working_dir,
                 session_to_continue,
-                mcp_registry,
-                mcp_connect_rx,
                 telemetry.clone(),
                 cli.dangerously_skip_permissions,
                 is_admin,
@@ -2140,6 +2112,10 @@ async fn run_native_headless(
         task,
         ..
     } = runtime;
+    handle
+        .wait_mcp_ready(atomcode_capabilities::mcp::CONNECT_TIMEOUT)
+        .await
+        .map_err(anyhow::Error::new)?;
     handle
         .submit(UserInput::from(prompt))
         .await

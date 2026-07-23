@@ -343,6 +343,10 @@ pub enum Msg<'a> {
         provider: &'a str,
         model: &'a str,
     },
+    ModelSwitchedAndDefault {
+        provider: &'a str,
+        model: &'a str,
+    },
 
     // ── Session picker ──
     SessionLoadFailed {
@@ -725,17 +729,9 @@ pub enum Msg<'a> {
         name: &'a str,
     },
     McpNoServersConfigured,
-    McpClearedReconnecting {
-        removed: usize,
-    },
-    McpClearedNoServers {
-        removed: usize,
-    },
+    McpClearedReconnecting,
+    McpClearedNoServers,
     McpToolsUsage,
-    McpToolsListing {
-        server: &'a str,
-    },
-    McpNoRegistry,
     McpServersHeader,
     McpReloadFailed {
         error: &'a str,
@@ -768,19 +764,10 @@ pub enum Msg<'a> {
     McpOAuthLogoutFailed {
         error: &'a str,
     },
-    // MCP / LSP server connect feedback (event handler output)
-    McpServerConnected {
-        name: &'a str,
-    },
-    McpServerFailed {
-        name: &'a str,
-        error: &'a str,
-    },
     // /mcp trust / untrust
     McpProjectTrusted,
     McpProjectUntrusted,
     McpProjectNotTrusted,
-    McpBlockedUntrusted,
     LspServerStarted {
         name: &'a str,
         ext: &'a str,

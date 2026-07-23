@@ -74,8 +74,8 @@ impl ProviderError {
                 "prompt is too long",
                 "reduce the length",
                 "too many tokens",
-                "range of input length", // Bailian / Tencent gateway
-                "maximum prompt length", // Anthropic-style variant
+                "range of input length",     // Bailian / Tencent gateway
+                "maximum prompt length",     // Anthropic-style variant
                 "too large for model with ", // trailing space: don't match "...without..."
             ];
             if NEEDLES.iter().any(|n| m.contains(n)) {
@@ -270,6 +270,11 @@ mod overflow_tests {
         // Unrelated 400s stay false — including near-miss substrings of the tightened needles.
         assert!(!err(Some(400), Some("model_not_found"), "no such model").is_context_overflow());
         assert!(!err(Some(400), None, "input length must be positive").is_context_overflow());
-        assert!(!err(Some(400), None, "payload too large for model without streaming").is_context_overflow());
+        assert!(!err(
+            Some(400),
+            None,
+            "payload too large for model without streaming"
+        )
+        .is_context_overflow());
     }
 }

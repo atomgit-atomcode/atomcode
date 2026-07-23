@@ -73,9 +73,7 @@ pub fn stop_reason(r: KStop) -> Result<AcpStop, &'static str> {
         KStop::MaxRounds
         | KStop::MaxContinuations
         | KStop::RepeatLoop
-        | KStop::ToolLoopDetected => {
-            Ok(AcpStop::MaxTurnRequests)
-        }
+        | KStop::ToolLoopDetected => Ok(AcpStop::MaxTurnRequests),
         KStop::Cancelled => Ok(AcpStop::Cancelled),
         KStop::PromptRejected => Ok(AcpStop::Refusal),
         KStop::ProviderError => Err("provider error"),

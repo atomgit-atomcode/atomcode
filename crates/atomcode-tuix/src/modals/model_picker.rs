@@ -12,7 +12,7 @@ use atomcode_config::config::Config;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{build_status, select_provider_and_reload, Buffer, LoopCtx};
+use crate::event_loop::{build_status, set_default_provider_and_reload, Buffer, LoopCtx};
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
@@ -142,8 +142,12 @@ impl Modal for ModelPicker {
                     Some(p) => p.to_string(),
                     None => return Ok(ModalAction::Close),
                 };
-                select_provider_and_reload(ctx, &chosen, renderer);
-                Ok(ModalAction::Close)
+                if set_default_provider_and_reload(ctx, &chosen, renderer) {
+                    Ok(ModalAction::Close)
+                } else {
+                    self.draw(buf, state, ctx, renderer);
+                    Ok(ModalAction::Continue)
+                }
             }
             KeyCode::Esc => Ok(ModalAction::Close),
             _ => Ok(ModalAction::Continue),

@@ -236,7 +236,7 @@ base_url = "https://api.deepseek.com/v1"
 type = "ollama"
 model = "qwen2.5:14b"
 base_url = "http://localhost:11434"</code></pre>
-      <p>In the TUI, switch between entries with <code>/provider</code>, or switch only the model under the current provider with <code>/model</code>. The CLI also accepts one-shot overrides:</p>
+      <p>In the TUI, use <code>/provider</code> to manage provider entries. Use <code>/model</code> to switch the current session and save the selected entry as the default for sessions opened later; other already-open sessions are unchanged. The CLI also accepts one-shot overrides:</p>
       <pre><code>atomcode --provider deepseek --model deepseek-reasoner</code></pre>
 
       <h2 id="vision-preprocessor">Vision preprocessor</h2>

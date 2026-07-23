@@ -156,11 +156,10 @@ pub fn load_mcp_config(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
     let user_config = load_config_file(
         &crate::mcp::util::config_dir().join("mcp.json"),
         McpConfigSource::User,
-    )
-    .unwrap_or_default();
+    )?;
 
-    let project_config = load_config_file(&project_dir.join(".mcp.json"), McpConfigSource::Project)
-        .unwrap_or_default();
+    let project_config =
+        load_config_file(&project_dir.join(".mcp.json"), McpConfigSource::Project)?;
 
     // Merge: project overrides user
     let mut merged: BTreeMap<String, McpServerConfig> = BTreeMap::new();
@@ -590,6 +589,16 @@ mod tests {
         let raw: McpConfigFile =
             serde_json::from_str(r#"{"servers":{"b":{"command":"echo","args":[]}}}"#).unwrap();
         assert!(raw.mcp_servers.contains_key("b"));
+    }
+
+    #[test]
+    fn load_mcp_config_reports_malformed_project_file() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join(".mcp.json"), "{not-json").unwrap();
+
+        let error = load_mcp_config(project.path()).unwrap_err();
+
+        assert!(error.to_string().contains("Failed to parse MCP config"));
     }
 
     #[test]

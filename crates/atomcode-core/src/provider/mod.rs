@@ -154,7 +154,9 @@ pub(super) fn build_http_client(
     // With the infallible webpki base + graceful root loading above, `.build()`
     // no longer fails on cert config; it can still fail on other builder state
     // (e.g. a bad proxy), so surface that as a clear error rather than panicking.
-    builder.build().map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
 }
 
 /// Add the OS native root store and `SSL_CERT_FILE` (if set) to the builder's
@@ -201,7 +203,9 @@ fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuil
             tracing::info!("Loaded {count} TLS root(s) from SSL_CERT_FILE={path:?} (issue #514)");
         }
         Err(e) => {
-            tracing::warn!("SSL_CERT_FILE={path:?} is not a valid PEM bundle: {e}; ignoring (issue #514)");
+            tracing::warn!(
+                "SSL_CERT_FILE={path:?} is not a valid PEM bundle: {e}; ignoring (issue #514)"
+            );
         }
     }
     builder
@@ -507,11 +511,18 @@ mod build_http_client_tls_tests {
         // leaves every other client build in the workspace unaffected. See #514.
         let tmp = tempfile::tempdir().unwrap();
         let cert_path = tmp.path().join("roots.pem");
-        std::fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(
+            &cert_path,
+            "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
         std::env::set_var("SSL_CERT_FILE", &cert_path);
         let built = build_http_client(None, false);
         std::env::remove_var("SSL_CERT_FILE");
-        assert!(built.is_err(), "a malformed SSL_CERT_FILE must surface as Err, not panic");
+        assert!(
+            built.is_err(),
+            "a malformed SSL_CERT_FILE must surface as Err, not panic"
+        );
     }
 
     #[test]

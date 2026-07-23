@@ -188,6 +188,34 @@ pub(crate) struct TurnParts {
     pub system_prompt: String,
 }
 
+pub(crate) fn commit_mcp_cache_miss(
+    cache: &mut HashMap<PathBuf, CachedMcpRegistry>,
+    working_dir: PathBuf,
+    candidate: Arc<McpRegistry>,
+) -> Arc<McpRegistry> {
+    if let Some(current) = cache.get_mut(&working_dir) {
+        current.last_used = std::time::Instant::now();
+        return current.registry.clone();
+    }
+    if cache.len() >= crate::MCP_CACHE_MAX {
+        if let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, value)| value.last_used)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest_key);
+        }
+    }
+    cache.insert(
+        working_dir,
+        CachedMcpRegistry {
+            registry: candidate.clone(),
+            last_used: std::time::Instant::now(),
+        },
+    );
+    candidate
+}
+
 /// 独立构造 turn 组件（与 process_chat_request 等价，但不复用其代码）。
 /// `provider_name` 为 None 时用 config.default_provider。
 pub(crate) async fn build_turn_parts(
@@ -269,26 +297,10 @@ pub(crate) async fn build_turn_parts(
             new_registry
                 .wait_for_initial_connections(Duration::from_secs(5))
                 .await;
-            // Store in cache
+            // Store only if another reload/cache-miss did not win while the
+            // connection attempt was in flight.
             let mut cache = mcp_cache.write().await;
-            // Evict LRU if cache is full
-            if cache.len() >= crate::MCP_CACHE_MAX {
-                if let Some(oldest_key) = cache
-                    .iter()
-                    .min_by_key(|(_, v)| v.last_used)
-                    .map(|(k, _)| k.clone())
-                {
-                    cache.remove(&oldest_key);
-                }
-            }
-            cache.insert(
-                working_dir_buf.clone(),
-                CachedMcpRegistry {
-                    registry: new_registry.clone(),
-                    last_used: std::time::Instant::now(),
-                },
-            );
-            new_registry
+            commit_mcp_cache_miss(&mut cache, working_dir_buf.clone(), new_registry)
         }
     };
     // Update last_used timestamp
@@ -1481,7 +1493,7 @@ pub(crate) struct LiveProviderReq {
 /// POST /live/provider — webui 切换模型即时同步。
 ///
 /// 与"发送消息才带 provider"不同，下拉框一变就调本端点，让对端立即跟随而无需先发消息。
-/// 行为与 TUI 的 /model 选择器对齐：只重装当前绑定 runtime，不修改共享启动默认。
+/// 该端点仍是 live runtime 的即时切换接口；TUI `/model` 另会更新新会话默认值。
 pub(crate) async fn live_provider(
     State(state): State<AppState>,
     Json(req): Json<LiveProviderReq>,
@@ -1878,7 +1890,7 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
     match atomcode_core::mcp::trust::trust_project(&working_dir) {
         Ok(()) => {
             let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir));
-            *state.mcp_registry.write().await = new_registry;
+            crate::replace_project_mcp_registry(&state, &working_dir, new_registry).await;
             // Re-prepare the persistent native runtime so it mounts the newly
             // trusted project servers immediately. Best-effort: before the first
             // turn there is no runtime yet, and its first prepare reads trust

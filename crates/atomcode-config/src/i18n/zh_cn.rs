@@ -295,7 +295,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
-            format!("  已切换到 {provider} · {model}\n").into(),
+            format!("  当前会话已切换到 {provider} · {model}\n").into(),
+        Msg::ModelSwitchedAndDefault { provider, model } =>
+            format!("  已切换到 {provider} · {model}；已设为新会话默认\n").into(),
 
         // ── 会话选择器 ──
         Msg::SessionLoadFailed { error } =>
@@ -409,7 +411,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeTipsHeading => "上手提示".into(),
         Msg::WelcomeTipLogin => "领取免费额度".into(),
         Msg::WelcomeTipProvider => "添加自定义模型".into(),
-        Msg::WelcomeTipModel => "切换模型".into(),
+        Msg::WelcomeTipModel => "设置默认模型".into(),
         Msg::WelcomeTipResume => "恢复上次会话".into(),
         Msg::WelcomeTipSetup => "一键推荐配置".into(),
         Msg::WelcomeTipSkills => "浏览可用技能".into(),
@@ -605,16 +607,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("    - {}  连接中...\n", name).into(),
         Msg::McpNoServersConfigured =>
             "  未配置 MCP 服务器。\n".into(),
-        Msg::McpClearedReconnecting { removed } =>
-            format!("  ✓ 已清除 {} 个 MCP 工具。正在后台重新连接...\n", removed).into(),
-        Msg::McpClearedNoServers { removed } =>
-            format!("  ✓ 已清除 {} 个 MCP 工具。无需连接。\n", removed).into(),
+        Msg::McpClearedReconnecting =>
+            "  已请求重载 MCP；旧 MCP 工具会先撤下，再在后台重新连接。\n".into(),
+        Msg::McpClearedNoServers =>
+            "  已请求重载 MCP；旧 MCP 工具会先撤下，当前没有已配置的服务器。\n".into(),
         Msg::McpToolsUsage =>
             "  用法：/mcp tools <服务器名>\n  示例：/mcp tools filesystem\n".into(),
-        Msg::McpToolsListing { server } =>
-            format!("  正在列出 '{}' 的 MCP 工具...\n", server).into(),
-        Msg::McpNoRegistry =>
-            "  MCP 注册表未加载。请先运行 /mcp reload。\n".into(),
         Msg::McpServersHeader =>
             "  MCP 服务器：\n".into(),
         Msg::McpReloadFailed { error } =>
@@ -631,7 +629,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpOAuthStarting { server } =>
             format!("  正在浏览器中启动 '{server}' 的 MCP OAuth 流程...\n").into(),
         Msg::McpOAuthSaved { provider, server } =>
-            format!("  已保存 MCP 服务 '{server}' 的 {provider} OAuth Token。运行 /mcp reload 完成连接。\n").into(),
+            format!("  已保存 MCP 服务 '{server}' 的 {provider} OAuth Token。正在重载 MCP 能力。\n").into(),
         Msg::McpOAuthFailed { error } =>
             format!("  MCP OAuth 失败：{error}\n").into(),
         Msg::McpOAuthTokenRemoved { server } =>
@@ -640,19 +638,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  未找到 MCP 服务 '{server}' 保存的 OAuth Token。\n").into(),
         Msg::McpOAuthLogoutFailed { error } =>
             format!("  MCP OAuth 登出失败：{error}\n").into(),
-        // MCP / LSP 服务连接反馈
-        Msg::McpServerConnected { name } =>
-            format!("✓ MCP 服务 '{name}' 已连接").into(),
-        Msg::McpServerFailed { name, error } =>
-            format!("× MCP 服务 '{name}' 失败：{error}").into(),
         Msg::McpProjectTrusted =>
             "  已信任本项目 — 正在重连 MCP。\n".into(),
         Msg::McpProjectUntrusted =>
             "  已撤销本项目信任。\n".into(),
         Msg::McpProjectNotTrusted =>
             "  本项目未被信任。\n".into(),
-        Msg::McpBlockedUntrusted =>
-            "⚠ 已拦截来自不受信任项目的 MCP server。运行 /mcp trust 信任本项目，再 /mcp reload。\n".into(),
         Msg::LspServerStarted { name, ext } =>
             format!("✓ LSP 服务 '{name}' 已为 .{ext} 启动").into(),
         Msg::LspServerFailed { name, ext, error } =>
@@ -864,7 +855,7 @@ Msg::CmdDescSetup =>
         Msg::CmdDescLogin => "使用 AtomGit OAuth 登录并领取 CodingPlan 模型".into(),
         Msg::CmdDescLogout => "退出 AtomGit 登录".into(),
         Msg::CmdDescWhoami => "显示当前登录用户".into(),
-        Msg::CmdDescModel => "切换当前会话的 Provider / 模型".into(),
+        Msg::CmdDescModel => "设置默认 Provider / 模型，并切换当前会话".into(),
         Msg::CmdDescProvider => "管理 Provider（添加、编辑、删除、设为全局默认）".into(),
         Msg::CmdDescStatus => "显示会话状态".into(),
         Msg::CmdDescConfig => "显示配置文件路径".into(),
@@ -936,7 +927,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::GuideMenuHeader => "📖 AtomCode 使用指南 — 输入 /guide <问题> 提问".into(),
         Msg::GuideMenuTopics => "常用话题：".into(),
         Msg::GuideMenuGettingStarted => "怎么开始使用          首次安装、登录、配置".into(),
-        Msg::GuideMenuSwitchModel => "怎么切换模型          /model /provider 操作".into(),
+        Msg::GuideMenuSwitchModel => "怎么设置默认模型       /model /provider 操作".into(),
         Msg::GuideMenuMcp => "怎么用 MCP            MCP 服务器配置与管理".into(),
         Msg::GuideMenuSkills => "怎么用技能和插件       /skills /plugin 使用".into(),
         Msg::GuideMenuMemory => "怎么用记忆功能         /remember /forget /memory".into(),
@@ -946,7 +937,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::GuideMenuConfig => "怎么配置               config.toml 配置说明".into(),
         Msg::GuideMenuTip => "
   提示：输入 /guide <你的问题> 获取具体回答。
-  例如：/guide 怎么切换模型
+  例如：/guide 怎么设置默认模型
 ".into(),
         Msg::GuideMenuDocUrl => "  完整文档：https://atomcode.atomgit.com/docs/zh/".into(),
         Msg::CmdGuideInstalling => "正在安装 ask skill，请稍候...".into(),

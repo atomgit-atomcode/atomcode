@@ -564,6 +564,41 @@ mod tests {
     }
 
     #[test]
+    fn model_copy_explains_default_and_current_session_scope() {
+        let en_desc = t_with(Locale::En, Msg::CmdDescModel);
+        let zh_desc = t_with(Locale::ZhCn, Msg::CmdDescModel);
+        assert!(en_desc.contains("default") && en_desc.contains("this session"));
+        assert!(zh_desc.contains("默认") && zh_desc.contains("当前会话"));
+
+        let en_switched = t_with(
+            Locale::En,
+            Msg::ModelSwitchedAndDefault {
+                provider: "provider",
+                model: "model",
+            },
+        );
+        let zh_switched = t_with(
+            Locale::ZhCn,
+            Msg::ModelSwitchedAndDefault {
+                provider: "provider",
+                model: "model",
+            },
+        );
+        assert!(en_switched.contains("default for new sessions"));
+        assert!(zh_switched.contains("新会话默认"));
+
+        let ephemeral = t_with(
+            Locale::En,
+            Msg::ModelSwitched {
+                provider: "provider",
+                model: "model",
+            },
+        );
+        assert!(ephemeral.contains("this session"));
+        assert!(!ephemeral.contains("default"));
+    }
+
+    #[test]
     fn usage_modal_i18n_present_both_langs() {
         macro_rules! check {
             ($variant:expr) => {{
@@ -614,7 +649,13 @@ mod tests {
         assert!(!en.trim().is_empty(), "en hint must be non-empty");
         assert!(!zh.trim().is_empty(), "zh hint must be non-empty");
         // Mentions the actionable knobs so the hint is useful.
-        assert!(en.contains("/proxy") && en.contains("HTTPS_PROXY"), "en: {en}");
-        assert!(zh.contains("/proxy") && zh.contains("HTTPS_PROXY"), "zh: {zh}");
+        assert!(
+            en.contains("/proxy") && en.contains("HTTPS_PROXY"),
+            "en: {en}"
+        );
+        assert!(
+            zh.contains("/proxy") && zh.contains("HTTPS_PROXY"),
+            "zh: {zh}"
+        );
     }
 }

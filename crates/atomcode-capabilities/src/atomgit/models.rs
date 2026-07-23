@@ -161,11 +161,17 @@ mod label_shape_tests {
     use super::Repo;
     #[test]
     fn project_labels_tolerates_all_wire_shapes() {
-        let strs: Repo = serde_json::from_value(serde_json::json!({"name":"w","project_labels":["a","b"]})).unwrap();
-        assert_eq!(strs.project_labels, vec!["a".to_string(),"b".to_string()]);
-        let objs: Repo = serde_json::from_value(serde_json::json!({"name":"w","project_labels":[{"name":"a"},{"name":"b"}]})).unwrap();
-        assert_eq!(objs.project_labels, vec!["a".to_string(),"b".to_string()]);
-        let nul: Repo = serde_json::from_value(serde_json::json!({"name":"w","project_labels":null})).unwrap();
+        let strs: Repo =
+            serde_json::from_value(serde_json::json!({"name":"w","project_labels":["a","b"]}))
+                .unwrap();
+        assert_eq!(strs.project_labels, vec!["a".to_string(), "b".to_string()]);
+        let objs: Repo = serde_json::from_value(
+            serde_json::json!({"name":"w","project_labels":[{"name":"a"},{"name":"b"}]}),
+        )
+        .unwrap();
+        assert_eq!(objs.project_labels, vec!["a".to_string(), "b".to_string()]);
+        let nul: Repo =
+            serde_json::from_value(serde_json::json!({"name":"w","project_labels":null})).unwrap();
         assert!(nul.project_labels.is_empty());
         let absent: Repo = serde_json::from_value(serde_json::json!({"name":"w"})).unwrap();
         assert!(absent.project_labels.is_empty());

@@ -127,8 +127,12 @@ pub(crate) fn parse_scutil_proxy(raw: &str) -> SystemProxy {
         }
     };
     SystemProxy {
-        http: enabled("HTTPEnable").then(|| endpoint("HTTPProxy", "HTTPPort")).flatten(),
-        https: enabled("HTTPSEnable").then(|| endpoint("HTTPSProxy", "HTTPSPort")).flatten(),
+        http: enabled("HTTPEnable")
+            .then(|| endpoint("HTTPProxy", "HTTPPort"))
+            .flatten(),
+        https: enabled("HTTPSEnable")
+            .then(|| endpoint("HTTPSProxy", "HTTPSPort"))
+            .flatten(),
         no_proxy: if exceptions.is_empty() {
             None
         } else {
@@ -181,7 +185,11 @@ fn resolve_windows() -> Option<SystemProxy> {
         .get_value::<String, _>("ProxyOverride")
         .ok()
         .and_then(|o| parse_win_bypass(&o));
-    Some(SystemProxy { http, https, no_proxy })
+    Some(SystemProxy {
+        http,
+        https,
+        no_proxy,
+    })
 }
 
 #[cfg(target_os = "macos")]

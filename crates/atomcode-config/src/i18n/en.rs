@@ -306,7 +306,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── Model picker ──
         Msg::ModelSwitched { provider, model } =>
-            format!("  Switched to {provider} · {model}\n").into(),
+            format!("  Switched to {provider} · {model} for this session\n").into(),
+        Msg::ModelSwitchedAndDefault { provider, model } =>
+            format!("  Switched to {provider} · {model}; set as default for new sessions\n").into(),
 
         // ── Session picker ──
         Msg::SessionLoadFailed { error } =>
@@ -424,7 +426,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeTipsHeading => "Tips for getting started".into(),
         Msg::WelcomeTipLogin => "claim a free token quota".into(),
         Msg::WelcomeTipProvider => "add a custom model".into(),
-        Msg::WelcomeTipModel => "switch the active model".into(),
+        Msg::WelcomeTipModel => "set the default model".into(),
         Msg::WelcomeTipResume => "resume your last session".into(),
         Msg::WelcomeTipSetup => "one-shot recommended setup".into(),
         Msg::WelcomeTipSkills => "browse available skills".into(),
@@ -620,16 +622,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("    - {}  connecting...\n", name).into(),
         Msg::McpNoServersConfigured =>
             "  No MCP servers configured.\n".into(),
-        Msg::McpClearedReconnecting { removed } =>
-            format!("  ✓ Cleared {} MCP tools. Reconnecting in background...\n", removed).into(),
-        Msg::McpClearedNoServers { removed } =>
-            format!("  ✓ Cleared {} MCP tools. No servers to connect.\n", removed).into(),
+        Msg::McpClearedReconnecting =>
+            "  MCP reload requested. Old MCP tools are withdrawn before reconnecting in the background.\n".into(),
+        Msg::McpClearedNoServers =>
+            "  MCP reload requested. Old MCP tools are withdrawn; no servers are configured.\n".into(),
         Msg::McpToolsUsage =>
             "  Usage: /mcp tools <server>\n  Example: /mcp tools filesystem\n".into(),
-        Msg::McpToolsListing { server } =>
-            format!("  Listing MCP tools for '{}'...\n", server).into(),
-        Msg::McpNoRegistry =>
-            "  No MCP registry loaded. Run /mcp reload first.\n".into(),
         Msg::McpServersHeader =>
             "  MCP Servers:\n".into(),
         Msg::McpReloadFailed { error } =>
@@ -646,7 +644,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpOAuthStarting { server } =>
             format!("  Starting MCP OAuth for '{server}' in your browser...\n").into(),
         Msg::McpOAuthSaved { provider, server } =>
-            format!("  Saved {provider} OAuth token for MCP server '{server}'. Run /mcp reload to connect.\n").into(),
+            format!("  Saved {provider} OAuth token for MCP server '{server}'. Reloading MCP capabilities.\n").into(),
         Msg::McpOAuthFailed { error } =>
             format!("  MCP OAuth failed: {error}\n").into(),
         Msg::McpOAuthTokenRemoved { server } =>
@@ -655,19 +653,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  No saved OAuth token found for MCP server '{server}'.\n").into(),
         Msg::McpOAuthLogoutFailed { error } =>
             format!("  MCP OAuth logout failed: {error}\n").into(),
-        // MCP / LSP server connect feedback
-        Msg::McpServerConnected { name } =>
-            format!("✓ MCP server '{name}' connected").into(),
-        Msg::McpServerFailed { name, error } =>
-            format!("× MCP server '{name}' failed: {error}").into(),
         Msg::McpProjectTrusted =>
             "  Project trusted — reloading MCP servers.\n".into(),
         Msg::McpProjectUntrusted =>
             "  Project trust revoked.\n".into(),
         Msg::McpProjectNotTrusted =>
             "  This project was not trusted.\n".into(),
-        Msg::McpBlockedUntrusted =>
-            "⚠ Blocked MCP server(s) from an untrusted project. Run /mcp trust to allow, then /mcp reload.\n".into(),
         Msg::LspServerStarted { name, ext } =>
             format!("✓ LSP server '{name}' started for .{ext}").into(),
         Msg::LspServerFailed { name, ext, error } =>
@@ -880,7 +871,8 @@ Msg::CmdDescSetup =>
         Msg::CmdDescLogin => "Sign in with AtomGit OAuth and claim CodingPlan models".into(),
         Msg::CmdDescLogout => "Sign out of AtomGit".into(),
         Msg::CmdDescWhoami => "Show current logged-in user".into(),
-        Msg::CmdDescModel => "Switch this session's provider / model".into(),
+        Msg::CmdDescModel =>
+            "Set the default provider / model and switch this session".into(),
         Msg::CmdDescProvider =>
             "Manage providers (add / edit / delete / set global default)".into(),
         Msg::CmdDescStatus => "Show session status".into(),
@@ -953,7 +945,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::GuideMenuHeader => "📖 AtomCode Guide — type /guide <question>".into(),
         Msg::GuideMenuTopics => "Common topics:".into(),
         Msg::GuideMenuGettingStarted => "Getting started          First install, login, config".into(),
-        Msg::GuideMenuSwitchModel => "Switch models            /model /provider usage".into(),
+        Msg::GuideMenuSwitchModel => "Set default model        /model /provider usage".into(),
         Msg::GuideMenuMcp => "Using MCP                MCP server config & management".into(),
         Msg::GuideMenuSkills => "Skills and plugins       /skills /plugin usage".into(),
         Msg::GuideMenuMemory => "Memory feature           /remember /forget /memory".into(),
@@ -963,7 +955,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::GuideMenuConfig => "Configuration            config.toml reference".into(),
         Msg::GuideMenuTip => "
   Tip: type /guide <your question> for a specific answer.
-  Example: /guide How to switch models
+  Example: /guide How to set the default model
 ".into(),
         Msg::GuideMenuDocUrl => "  Full docs: https://atomcode.atomgit.com/docs/en/".into(),
         Msg::CmdGuideInstalling => "Installing ask skill, please wait...".into(),

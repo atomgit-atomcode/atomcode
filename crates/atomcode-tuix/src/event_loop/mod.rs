@@ -849,15 +849,6 @@ mod compute_input_attachments_tests {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct McpReloadProgress {
-    pub total: usize,
-    pub done: usize,
-    pub connected: usize,
-    pub failed: usize,
-    pub started_at: std::time::Instant,
-}
-
 pub(crate) struct PendingSessionResume {
     pub project_bucket: String,
     pub session: Session,
@@ -2033,6 +2024,43 @@ impl DeferredRuntimeControl {
 }
 
 impl RuntimeControl {
+    fn active_handle(&self) -> Option<CodingRuntimeHandle> {
+        match self {
+            Self::Ready(ready) => Some(ready.handle.clone()),
+            Self::Deferred(deferred) => match &*deferred.state.borrow() {
+                atomcode_coding::DeferredRuntimeState::Ready(handle) => Some(handle.clone()),
+                atomcode_coding::DeferredRuntimeState::Starting
+                | atomcode_coding::DeferredRuntimeState::Failed(_) => None,
+            },
+        }
+    }
+
+    pub async fn mcp_status(
+        &self,
+    ) -> Result<atomcode_coding::McpStatusSnapshot, atomcode_coding::RuntimeError> {
+        let handle = self
+            .active_handle()
+            .ok_or(atomcode_coding::RuntimeError::Unavailable)?;
+        handle.mcp_status().await
+    }
+
+    pub async fn mcp_tools(
+        &self,
+        server: String,
+    ) -> Result<atomcode_coding::McpToolsSnapshot, atomcode_coding::RuntimeError> {
+        let handle = self
+            .active_handle()
+            .ok_or(atomcode_coding::RuntimeError::Unavailable)?;
+        handle.mcp_tools(server).await
+    }
+
+    pub async fn withdraw_mcp_tools(&self) -> Result<(), atomcode_coding::RuntimeError> {
+        let handle = self
+            .active_handle()
+            .ok_or(atomcode_coding::RuntimeError::Unavailable)?;
+        handle.withdraw_mcp_tools().await
+    }
+
     fn current_generation(&self) -> Option<atomcode_coding::RuntimeGeneration> {
         match self {
             Self::Ready(ready) => Some(atomcode_coding::RuntimeGeneration(
@@ -2463,8 +2491,8 @@ pub type RuntimeSpawnOverride =
 #[cfg(test)]
 mod local_restore_scope_tests {
     use super::{
-        bg_runtime, bg_runtime::RuntimeId, request_context_stats_render, RuntimeControl,
-        RuntimeUiAvailability,
+        bg_runtime, bg_runtime::RuntimeId, complete_mcp_reload_notice,
+        request_context_stats_render, RuntimeControl, RuntimeUiAvailability,
     };
     use atomcode_coding::runtime::{
         coding_runtime_control_channel, noop_agent_handle, spawn_runtime_owner,
@@ -2537,6 +2565,17 @@ mod local_restore_scope_tests {
                 ),
             }) if received_id == runtime_id && result == changed
         ));
+    }
+
+    #[test]
+    fn mcp_reload_success_notice_requires_a_successful_runtime_terminal() {
+        let mut pending = Some(1);
+        assert!(complete_mcp_reload_notice(&mut pending, false).is_none());
+        assert!(pending.is_none());
+
+        let mut pending = Some(0);
+        assert!(complete_mcp_reload_notice(&mut pending, true).is_some());
+        assert!(pending.is_none());
     }
 
     #[tokio::test]
@@ -2924,24 +2963,6 @@ pub struct LoopCtx {
     /// Modal-to-Modal transition that needs mutable `active_modal`
     /// access only the event loop has.
     pub pending_open_provider_wizard: bool,
-    /// MCP server registry for `/mcp` status display. `None` when no MCP
-    /// servers are configured or all failed to connect.
-    pub mcp_registry: Option<std::sync::Arc<atomcode_capabilities::mcp::McpRegistry>>,
-    /// Channel for receiving MCP connection status events (Connected/Failed).
-    /// Events are rendered into scrollback as they arrive during startup.
-    pub mcp_connect_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_capabilities::mcp::McpConnectEvent>>,
-    /// When `/mcp reload` is invoked, we track progress until every configured
-    /// server reports Connected/Failed, then emit a one-line summary.
-    pub mcp_reload: Option<McpReloadProgress>,
-    /// Names of MCP servers withheld because the project is untrusted.
-    /// Accumulated across `BlockedUntrusted` events; cleared when a reload
-    /// begins so a fresh `/mcp trust` → `/mcp reload` shows a clean count.
-    pub mcp_blocked_untrusted: Vec<String>,
-    /// Set to `true` after the first coalesced blocked-server notice is emitted
-    /// during startup (when `mcp_reload` is not armed). Reset to `false` when a
-    /// `/mcp reload` begins so the next batch can emit its own notice.
-    pub mcp_blocked_notice_emitted: bool,
     /// Telemetry handle — used to emit `UseCommand` at each slash dispatch.
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Original working dir before `/worktree create`, for `/worktree done`.
@@ -2988,8 +3009,10 @@ pub struct LoopCtx {
     /// Carries the dir the scan was for so install can drop a result the user has
     /// navigated away from — the working dir can change (async transition) between
     /// stash and install while the install is deferred behind another modal.
-    pub(crate) pending_session_picker:
-        Option<(std::path::PathBuf, Result<Vec<crate::session::SessionMeta>, String>)>,
+    pub(crate) pending_session_picker: Option<(
+        std::path::PathBuf,
+        Result<Vec<crate::session::SessionMeta>, String>,
+    )>,
     /// Fresh-session and directory transitions accepted by CodingRuntime but
     /// not yet committed. The input buffer remains authoritative while this is set.
     pub(crate) pending_session_transition: Option<PendingSessionTransition>,
@@ -2999,6 +3022,9 @@ pub struct LoopCtx {
     /// Capability rebuild is also an awaitable runtime replacement. While it
     /// is pending, prompts remain buffered instead of racing Reconfiguring.
     pub(crate) pending_capability_reload: bool,
+    /// Server count captured by an explicit `/mcp reload`. Its success message
+    /// is emitted only after the correlated runtime terminal succeeds.
+    pub(crate) pending_mcp_reload_server_count: Option<usize>,
     /// Successful capability terminal waiting for the live binding generation
     /// and snapshot projection to commit.
     pub(crate) pending_capability_projection: Option<atomcode_coding::SessionChanged>,
@@ -7053,108 +7079,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 }
             }
 
-            // ── MCP connection events ──
-            // Render connection success/failure into scrollback as they arrive.
-            // Also register tools dynamically when servers connect.
-            Some(ev) = async {
-                if let Some(rx) = ctx.mcp_connect_rx.as_mut() {
-                    rx.recv().await
-                } else {
-                    None
-                }
-            }, if ctx.mcp_connect_rx.is_some() => {
-                use atomcode_capabilities::mcp::McpConnectEvent;
-                match &ev {
-                    McpConnectEvent::Connected { name: _ } => {
-                        // Silent on success (parity with codex/opencode: they never
-                        // print a per-server "connected" line in scrollback). Failures
-                        // and warnings below are still surfaced; `/mcp` shows the full
-                        // inventory on demand.
-                    }
-                    McpConnectEvent::Failed { name, error } => {
-                        renderer.render(UiLine::Error(
-                            crate::i18n::t(crate::i18n::Msg::McpServerFailed { name, error }).into_owned(),
-                        ));
-                    }
-                    McpConnectEvent::Warning { name, message } => {
-                        // Default: keep MCP startup/runtime noise out of scrollback.
-                        //
-                        // Exception: `/mcp tools <server>` uses Warning events to return the tool list
-                        // (and related timeouts) from a background task. Those should be user-visible.
-                        if message.starts_with("tools:\n")
-                            || message.contains("tools/list timed out")
-                            || message.contains("tools/list failed")
-                        {
-                            renderer.render(UiLine::CommandOutput(format!(
-                                "  [mcp:{}] {}\n",
-                                name,
-                                message.trim_end()
-                            )));
-                        } else {
-                            // Route to the opt-in tuix trace log instead (safe for raw-mode TUI).
-                            crate::tuix_trace!("MCP", "server='{}' warning: {}", name, message);
-                        }
-                    }
-                    McpConnectEvent::BlockedUntrusted { name } => {
-                        ctx.mcp_blocked_untrusted.push(name.clone());
-                        // During a `/mcp reload` the coalesced notice is emitted when the
-                        // batch settles (p.done >= p.total below). During startup there is
-                        // no explicit settle point, so we emit ONE notice on the first
-                        // blocked event (flag prevents duplicates for the same batch).
-                        // The message is count-free so it is always accurate even when
-                        // multiple servers are blocked and arrive over time.
-                        if ctx.mcp_reload.is_none() && !ctx.mcp_blocked_notice_emitted {
-                            ctx.mcp_blocked_notice_emitted = true;
-                            renderer.render(UiLine::Warning(
-                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted).into_owned(),
-                            ));
-                        }
-                    }
-                }
-
-                // `/mcp reload` progress: once every configured server has reported a
-                // terminal state (Connected/Failed/BlockedUntrusted), emit a summary line.
-                if let Some(p) = ctx.mcp_reload.as_mut() {
-                    match &ev {
-                        McpConnectEvent::Connected { .. } => {
-                            p.done = p.done.saturating_add(1);
-                            p.connected = p.connected.saturating_add(1)
-                        }
-                        McpConnectEvent::Failed { .. } => {
-                            p.done = p.done.saturating_add(1);
-                            p.failed = p.failed.saturating_add(1)
-                        }
-                        McpConnectEvent::Warning { .. } => {}
-                        // BlockedUntrusted is a terminal outcome — count it so the progress
-                        // counter can reach total even when all servers are blocked.
-                        McpConnectEvent::BlockedUntrusted { .. } => {
-                            p.done = p.done.saturating_add(1);
-                        }
-                    }
-                    if p.done >= p.total {
-                        let elapsed_ms = p.started_at.elapsed().as_millis();
-                        let blocked = ctx.mcp_blocked_untrusted.len();
-                        if blocked > 0 {
-                            renderer.render(UiLine::CommandOutput(format!(
-                                "  MCP reload complete: {} connected, {} failed, {} blocked ({}ms)\n",
-                                p.connected, p.failed, blocked, elapsed_ms
-                            )));
-                            renderer.render(UiLine::Warning(
-                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted).into_owned(),
-                            ));
-                        } else {
-                            renderer.render(UiLine::CommandOutput(format!(
-                                "  MCP reload complete: {} connected, {} failed ({}ms)\n",
-                                p.connected, p.failed, elapsed_ms
-                            )));
-                        }
-                        ctx.mcp_reload = None;
-                    }
-                }
-                renderer.flush();
-            }
-
-
             // ── /upgrade progress ──
             Some(ev) = ctx.upgrade_rx.recv() => {
                 handle_upgrade_event(ev, &mut upgrade_last_pct, &mut upgrade_done, &mut ctx, renderer);
@@ -7516,107 +7440,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     }
                 }
             }
-
-            // ── MCP connection events ──
-            // Render connection success/failure into scrollback as they arrive.
-            // Also register tools dynamically when servers connect.
-            Some(ev) = async {
-                if let Some(rx) = ctx.mcp_connect_rx.as_mut() {
-                    rx.recv().await
-                } else {
-                    None
-                }
-            }, if ctx.mcp_connect_rx.is_some() => {
-                use atomcode_capabilities::mcp::McpConnectEvent;
-                match &ev {
-                    McpConnectEvent::Connected { name } => {
-                        renderer.render(UiLine::CommandOutput(
-                            crate::i18n::t(crate::i18n::Msg::McpServerConnected { name }).into_owned(),
-                        ));
-                    }
-                    McpConnectEvent::Failed { name, error } => {
-                        renderer.render(UiLine::Error(
-                            crate::i18n::t(crate::i18n::Msg::McpServerFailed { name, error }).into_owned(),
-                        ));
-                    }
-                    McpConnectEvent::Warning { name, message } => {
-                        // Default: keep MCP startup/runtime noise out of scrollback.
-                        //
-                        // Exception: `/mcp tools <server>` uses Warning events to return the tool list
-                        // (and related timeouts) from a background task. Those should be user-visible.
-                        if message.starts_with("tools:\n")
-                            || message.contains("tools/list timed out")
-                            || message.contains("tools/list failed")
-                        {
-                            renderer.render(UiLine::CommandOutput(format!(
-                                "  [mcp:{}] {}\n",
-                                name,
-                                message.trim_end()
-                            )));
-                        } else {
-                            // Route to the opt-in tuix trace log instead (safe for raw-mode TUI).
-                            crate::tuix_trace!("MCP", "server='{}' warning: {}", name, message);
-                        }
-                    }
-                    McpConnectEvent::BlockedUntrusted { name } => {
-                        ctx.mcp_blocked_untrusted.push(name.clone());
-                        // During a `/mcp reload` the coalesced notice is emitted when the
-                        // batch settles (p.done >= p.total below). During startup there is
-                        // no explicit settle point, so we emit ONE notice on the first
-                        // blocked event (flag prevents duplicates for the same batch).
-                        // The message is count-free so it is always accurate even when
-                        // multiple servers are blocked and arrive over time.
-                        if ctx.mcp_reload.is_none() && !ctx.mcp_blocked_notice_emitted {
-                            ctx.mcp_blocked_notice_emitted = true;
-                            renderer.render(UiLine::Warning(
-                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted).into_owned(),
-                            ));
-                        }
-                    }
-                }
-
-                // `/mcp reload` progress: once every configured server has reported a
-                // terminal state (Connected/Failed/BlockedUntrusted), emit a summary line.
-                if let Some(p) = ctx.mcp_reload.as_mut() {
-                    match &ev {
-                        McpConnectEvent::Connected { .. } => {
-                            p.done = p.done.saturating_add(1);
-                            p.connected = p.connected.saturating_add(1)
-                        }
-                        McpConnectEvent::Failed { .. } => {
-                            p.done = p.done.saturating_add(1);
-                            p.failed = p.failed.saturating_add(1)
-                        }
-                        McpConnectEvent::Warning { .. } => {}
-                        // BlockedUntrusted is a terminal outcome — count it so the progress
-                        // counter can reach total even when all servers are blocked.
-                        McpConnectEvent::BlockedUntrusted { .. } => {
-                            p.done = p.done.saturating_add(1);
-                        }
-                    }
-                    if p.done >= p.total {
-                        let elapsed_ms = p.started_at.elapsed().as_millis();
-                        let blocked = ctx.mcp_blocked_untrusted.len();
-                        if blocked > 0 {
-                            renderer.render(UiLine::CommandOutput(format!(
-                                "  MCP reload complete: {} connected, {} failed, {} blocked ({}ms)\n",
-                                p.connected, p.failed, blocked, elapsed_ms
-                            )));
-                            renderer.render(UiLine::Warning(
-                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted).into_owned(),
-                            ));
-                        } else {
-                            renderer.render(UiLine::CommandOutput(format!(
-                                "  MCP reload complete: {} connected, {} failed ({}ms)\n",
-                                p.connected, p.failed, elapsed_ms
-                            )));
-                        }
-                        ctx.mcp_reload = None;
-                    }
-                }
-                renderer.flush();
-            }
-
 
             // ── /upgrade progress ──
             Some(ev) = ctx.upgrade_rx.recv() => {
@@ -8072,6 +7895,28 @@ mod external_config_tests {
         let saved = config_for_persistence(&desired, &persisted, true);
 
         assert_eq!(saved.default_provider, "next");
+    }
+
+    #[test]
+    fn persisted_default_update_does_not_retarget_a_pinned_open_session() {
+        let opened = config("opened-model", false);
+        let mut next_default = opened.clone();
+        next_default.providers.insert(
+            "next".into(),
+            ProviderConfig {
+                model: "next-model".into(),
+                ..opened.providers["main"].clone()
+            },
+        );
+        next_default.default_provider = "next".into();
+
+        let visible = merge_persisted_config_preserving_active(&opened, next_default.clone());
+
+        assert_eq!(visible.default_provider, "main");
+        assert_eq!(visible.providers["main"].model, "opened-model");
+        assert_eq!(visible.providers["next"].model, "next-model");
+        assert_eq!(next_default.default_provider, "next");
+        assert_eq!(next_default.providers["next"].model, "next-model");
     }
 
     #[test]
@@ -8554,9 +8399,10 @@ pub(crate) fn reload_persisted_config(
     }
 }
 
-/// Observe the shared config at an idle boundary. Explicit CLI overrides stay
-/// pinned; ordinary interactive sessions follow global provider/model changes.
-/// The visible config is committed only after the runtime reload terminal.
+/// Observe the shared config at an idle boundary. Normal interactive sessions
+/// keep their opened provider/model; shared defaults apply to sessions opened
+/// afterwards. The visible config is committed only after any requested runtime
+/// reload terminal.
 fn poll_external_config(ctx: &mut LoopCtx) -> bool {
     if provider_transition_pending(ctx) {
         return false;
@@ -11167,6 +11013,44 @@ pub(crate) fn request_capability_reload(ctx: &mut LoopCtx) -> Result<(), String>
     Ok(())
 }
 
+/// Fail-closed barrier for MCP config, trust, and auth changes. The TUI must
+/// await this before mutating disk so a rejected reload cannot leave the old
+/// model-facing authority mounted.
+pub(crate) fn withdraw_mcp_tools(ctx: &mut LoopCtx) -> Result<(), String> {
+    if ctx.pending_session_transition.is_some()
+        || ctx.pending_session_resume.is_some()
+        || ctx.pending_session_resume_preparation.is_some()
+        || ctx.pending_capability_reload
+        || provider_transition_pending(ctx)
+    {
+        return Err(crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned());
+    }
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(ctx.runtime.withdraw_mcp_tools())
+            .map_err(|error| {
+                crate::i18n::t(crate::i18n::Msg::CmdCapabilityReloadFailed {
+                    error: &error.to_string(),
+                })
+                .into_owned()
+            })
+    })
+}
+
+fn complete_mcp_reload_notice(
+    pending_server_count: &mut Option<usize>,
+    succeeded: bool,
+) -> Option<String> {
+    let configured = pending_server_count.take()?;
+    succeeded.then(|| {
+        if configured == 0 {
+            crate::i18n::t(crate::i18n::Msg::McpClearedNoServers).into_owned()
+        } else {
+            crate::i18n::t(crate::i18n::Msg::McpClearedReconnecting).into_owned()
+        }
+    })
+}
+
 pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
     let mut loaded = 0usize;
     let mut warnings = Vec::new();
@@ -11365,8 +11249,9 @@ pub(crate) fn select_provider_and_reload(
     true
 }
 
-/// Persist an explicit provider-management "set default" action and reload this
-/// runtime transactionally. This is intentionally separate from `/model`.
+/// Persist the new default provider and reload only this runtime transactionally.
+/// Other opened runtimes remain pinned; sessions opened afterwards use the new
+/// default. Ephemeral providers remain current-runtime-only.
 pub(crate) fn set_default_provider_and_reload(
     ctx: &mut LoopCtx,
     provider_name: &str,
@@ -11455,14 +11340,14 @@ pub(crate) fn set_default_provider_and_reload(
         rollback_runtime_config: Some(ctx.config.clone()),
         previous_model_name: Some(ctx.model_name.clone()),
         announce: Some(
-            crate::i18n::t(crate::i18n::Msg::ModelSwitched {
+            crate::i18n::t(crate::i18n::Msg::ModelSwitchedAndDefault {
                 provider: provider_name,
                 model: &selected_model,
             })
             .into_owned(),
         ),
         manual_reload_announce: false,
-        selection_mode_after_success: Some(crate::ProviderSelectionMode::FollowGlobalDefault),
+        selection_mode_after_success: Some(crate::ProviderSelectionMode::Pinned),
     });
     true
 }
@@ -11822,12 +11707,9 @@ fn handle_streaming_key(
                     .find(&name)
                     .map(|command| command.needs_args)
                     .unwrap_or(false);
-                if let Some((completed, submit)) = streaming_top_level_slash_selection(
-                    &app.buf.text,
-                    &name,
-                    needs_args,
-                    code,
-                ) {
+                if let Some((completed, submit)) =
+                    streaming_top_level_slash_selection(&app.buf.text, &name, needs_args, code)
+                {
                     app.buf.text = completed;
                     app.buf.cursor = app.buf.text.len();
                     app.menu.selected = 0;
@@ -13381,10 +13263,8 @@ pub(super) fn handle_plugin_job_event(
         PluginJobEvent::MarketplaceAdded(info) => {
             // Marketplace add by itself doesn't load any skills (those come
             // from installed plugins) — show only the marketplace summary.
-            // `✓` prefix + col-0 alignment mirrors the MCP-connect toast
-            // (`McpServerConnected`) emitted from the same body region, so
-            // every "background install completed" line lands at the same
-            // left edge regardless of which subsystem owns it.
+            // Keep the completion line aligned at column 0 with other
+            // background-operation results.
             let _ = reload_plugins(ctx);
             let short_commit = &info.git_commit[..7.min(info.git_commit.len())];
             // Adding a marketplace does NOT install its plugins — list them + the install
@@ -14463,11 +14343,7 @@ fn retry_pending_provider_projection(
 /// Install a `/resume` picker once its catalog has loaded off the UI thread.
 /// Runs in the main loop where `app.active_modal` is reachable (the event handler
 /// that received the result cannot touch it). No-op unless a result is pending.
-fn install_pending_session_picker(
-    app: &mut App,
-    ctx: &mut LoopCtx,
-    renderer: &mut dyn Renderer,
-) {
+fn install_pending_session_picker(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     if ctx.pending_session_picker.is_none() {
         return;
     }
@@ -14503,8 +14379,7 @@ fn install_pending_session_picker(
         }
         Err(error) => {
             renderer.render(UiLine::Error(
-                crate::i18n::t(crate::i18n::Msg::SessionListFailed { error: &error })
-                    .into_owned(),
+                crate::i18n::t(crate::i18n::Msg::SessionListFailed { error: &error }).into_owned(),
             ));
             renderer.flush();
         }
@@ -15370,10 +15245,8 @@ fn handle_runtime_event(
                 Err(error) => {
                     let message = error.to_string();
                     renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::SessionLoadFailed {
-                            error: &message,
-                        })
-                        .into_owned(),
+                        crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &message })
+                            .into_owned(),
                     ));
                     renderer.flush();
                     return;
@@ -15457,6 +15330,7 @@ fn handle_runtime_event(
             Err(error) => {
                 ctx.pending_capability_reload = false;
                 ctx.pending_capability_projection = None;
+                complete_mcp_reload_notice(&mut ctx.pending_mcp_reload_server_count, false);
                 let message = error.to_string();
                 renderer.render(UiLine::Error(
                     crate::i18n::t(crate::i18n::Msg::CmdCapabilityReloadFailed { error: &message })
@@ -15465,6 +15339,12 @@ fn handle_runtime_event(
                 renderer.flush();
             }
             Ok(changed) => {
+                if let Some(message) =
+                    complete_mcp_reload_notice(&mut ctx.pending_mcp_reload_server_count, true)
+                {
+                    renderer.render(UiLine::CommandOutput(message));
+                    renderer.flush();
+                }
                 ctx.pending_capability_projection = Some(changed);
                 if let Err(error) = retry_pending_session_projections(state, renderer, ctx) {
                     renderer.render(UiLine::Error(error));
@@ -15698,9 +15578,8 @@ fn commit_native_session_changed(
 
     commit_working_dir_projection(ctx, working_dir);
     ctx.current_session_id = Some(session_id.clone());
-    ctx.current_session_project_bucket = Some(
-        atomcode_capabilities::session::SessionManager::project_hash(&ctx.working_dir),
-    );
+    ctx.current_session_project_bucket =
+        Some(atomcode_capabilities::session::SessionManager::project_hash(&ctx.working_dir));
     ctx.loop_ctrl = None;
     state.loop_label = None;
     state.loop_round = 0;

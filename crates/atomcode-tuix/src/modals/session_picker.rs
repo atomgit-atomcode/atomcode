@@ -279,9 +279,14 @@ impl Modal for SessionPicker {
                     // Filter matched nothing — ignore Enter, stay open.
                     return Ok(ModalAction::Continue);
                 };
-                let expected_bucket = ctx.current_session_project_bucket.clone().unwrap_or_else(|| {
-                    atomcode_capabilities::session::SessionManager::project_hash(&ctx.working_dir)
-                });
+                let expected_bucket =
+                    ctx.current_session_project_bucket
+                        .clone()
+                        .unwrap_or_else(|| {
+                            atomcode_capabilities::session::SessionManager::project_hash(
+                                &ctx.working_dir,
+                            )
+                        });
                 if self.replay_selected_current_session(
                     &ctx.current_session,
                     &expected_bucket,
@@ -494,10 +499,8 @@ fn build_menu_payload(
         } else if p.query.is_empty() {
             crate::i18n::t(crate::i18n::Msg::SessionPickerEmptyFilter).into_owned()
         } else {
-            crate::i18n::t(crate::i18n::Msg::SessionPickerEmptyFilterQuery {
-                query: &p.query,
-            })
-            .into_owned()
+            crate::i18n::t(crate::i18n::Msg::SessionPickerEmptyFilterQuery { query: &p.query })
+                .into_owned()
         };
         items.push((label, String::new()));
         items.push((format!("— {} —", hint), String::new()));
@@ -517,9 +520,9 @@ fn build_menu_payload(
             count: s.message_count,
         });
         let mut metadata = format!("{} · {}", msgs, humanize_age(s.updated_at));
-        if current_session.is_some_and(|(id, project_bucket)| {
-            s.id == id && s.project_bucket == project_bucket
-        }) {
+        if current_session
+            .is_some_and(|(id, project_bucket)| s.id == id && s.project_bucket == project_bucket)
+        {
             metadata.push_str(" · ");
             metadata.push_str(&crate::i18n::t(crate::i18n::Msg::DirCurrent));
         }
@@ -1049,7 +1052,10 @@ mod tests {
         assert_eq!(p.selected, 0, "up from second lands on first session");
         assert!(!p.search_focused, "still on a session row, not the box");
         p.up();
-        assert!(p.search_focused, "up from first session focuses the search box");
+        assert!(
+            p.search_focused,
+            "up from first session focuses the search box"
+        );
         assert_eq!(p.selected, 0);
         p.up();
         assert!(p.search_focused, "up again stays in the search box");
@@ -1072,7 +1078,10 @@ mod tests {
         p.update_filter();
         assert!(p.filtered.is_empty());
         p.up();
-        assert!(p.search_focused, "up with no matches parks focus on the box");
+        assert!(
+            p.search_focused,
+            "up with no matches parks focus on the box"
+        );
         p.down();
         assert!(!p.search_focused);
     }
@@ -1287,11 +1296,7 @@ mod tests {
         let current_bucket = sessions[0].project_bucket.clone();
         let p = SessionPicker::open(sessions);
 
-        let payload = build_menu_payload(
-            &p,
-            "atomcode",
-            Some((&current_id, &current_bucket)),
-        );
+        let payload = build_menu_payload(&p, "atomcode", Some((&current_id, &current_bucket)));
 
         assert!(
             payload.items[HEADER_ROWS].1.contains("current")
@@ -1612,15 +1617,15 @@ mod tests {
         assert_eq!(context.ctx_window, 100);
     }
 }
-    #[tokio::test]
-    async fn preparation_join_failure_becomes_an_error_terminal() {
-        let joined = tokio::task::spawn_blocking(|| -> Result<(), String> {
-            panic!("preparation panic");
-        })
-        .await;
+#[tokio::test]
+async fn preparation_join_failure_becomes_an_error_terminal() {
+    let joined = tokio::task::spawn_blocking(|| -> Result<(), String> {
+        panic!("preparation panic");
+    })
+    .await;
 
-        let error = flatten_session_preparation(joined).unwrap_err();
+    let error = flatten_session_preparation(joined).unwrap_err();
 
-        assert!(error.contains("session preparation task failed"));
-        assert!(error.contains("panicked"));
-    }
+    assert!(error.contains("session preparation task failed"));
+    assert!(error.contains("panicked"));
+}

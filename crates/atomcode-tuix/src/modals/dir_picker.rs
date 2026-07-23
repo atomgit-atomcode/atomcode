@@ -143,10 +143,7 @@ impl Modal for DirPicker {
                         ctx.previous_dir.as_deref(),
                     ) {
                         Ok(path) => {
-                            if !crate::event_loop::commands::paths_same(
-                                &path,
-                                &ctx.working_dir,
-                            ) {
+                            if !crate::event_loop::commands::paths_same(&path, &ctx.working_dir) {
                                 match apply_cd(ctx, path) {
                                     Ok(_) => renderer.render(UiLine::CommandOutput(
                                         crate::i18n::t(

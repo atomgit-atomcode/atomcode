@@ -86,7 +86,8 @@ impl StdioClient {
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
 
         for (key, value) in &self.env {
             cmd.env(key, value);

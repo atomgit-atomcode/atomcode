@@ -272,7 +272,11 @@ fn reanchored_replacement(new_lines: &[&str], original_line: &str) -> Vec<String
                 let total_indent = if signed_relative >= 0 {
                     // Same/deeper than anchor: keep the file's indent prefix (preserves the
                     // tab/space mix) and extend with plain spaces.
-                    format!("{}{}", file_indent_str, " ".repeat(signed_relative as usize))
+                    format!(
+                        "{}{}",
+                        file_indent_str,
+                        " ".repeat(signed_relative as usize)
+                    )
                 } else {
                     // Outdented from anchor: drop chars from the tail of the file's indent.
                     let drop = (-signed_relative) as usize;
@@ -795,7 +799,11 @@ mod tests {
             )
             .await;
         assert!(!r.is_error, "block-anchor must succeed: {}", r.content);
-        assert!(r.content.contains("anchored block"), "should report an anchored match: {}", r.content);
+        assert!(
+            r.content.contains("anchored block"),
+            "should report an anchored match: {}",
+            r.content
+        );
         assert_eq!(
             std::fs::read_to_string(d.path().join("f.rs")).unwrap(),
             "fn f() {\n\tlet a = 1;\n\tlet b = 99;\n\tlet c = 3;\n}\n",
@@ -817,7 +825,11 @@ mod tests {
                 &ctx(d.path()),
             )
             .await;
-        assert!(r.is_error, "a low-similarity block must be refused: {}", r.content);
+        assert!(
+            r.is_error,
+            "a low-similarity block must be refused: {}",
+            r.content
+        );
         assert_eq!(
             std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
             original,
@@ -840,8 +852,15 @@ mod tests {
                 &ctx(d.path()),
             )
             .await;
-        assert!(r.is_error, "two drifted interior lines must be refused: {}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), original);
+        assert!(
+            r.is_error,
+            "two drifted interior lines must be refused: {}",
+            r.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            original
+        );
     }
 
     // Coverage: the OUTDENTED-line re-anchor path (`signed_relative < 0`) — a new line less
@@ -863,7 +882,11 @@ mod tests {
                 &ctx(d.path()),
             )
             .await;
-        assert!(!r.is_error, "outdented re-anchor must succeed: {}", r.content);
+        assert!(
+            !r.is_error,
+            "outdented re-anchor must succeed: {}",
+            r.content
+        );
         assert_eq!(
             std::fs::read_to_string(d.path().join("f.rs")).unwrap(),
             "fn f() {\n\tlet a = 1;\ndone();\n}\n",
@@ -875,7 +898,8 @@ mod tests {
     #[tokio::test]
     async fn block_anchor_rejects_ambiguous_windows() {
         let d = tempfile::tempdir().unwrap();
-        let original = "open block\n  middle here\nclose block\n\nopen block\n  other mid\nclose block\n";
+        let original =
+            "open block\n  middle here\nclose block\n\nopen block\n  other mid\nclose block\n";
         std::fs::write(d.path().join("a.txt"), original).unwrap();
         let r = EditFileTool
             .execute(
@@ -883,8 +907,15 @@ mod tests {
                 &ctx(d.path()),
             )
             .await;
-        assert!(r.is_error, "ambiguous anchored windows must be refused: {}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), original);
+        assert!(
+            r.is_error,
+            "ambiguous anchored windows must be refused: {}",
+            r.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            original
+        );
     }
 
     // Guard: bare-brace anchors (`{` / `}`, < 3 trimmed chars) can't anchor a block.
@@ -899,8 +930,15 @@ mod tests {
                 &ctx(d.path()),
             )
             .await;
-        assert!(r.is_error, "short brace anchors must not fire: {}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.rs")).unwrap(), original);
+        assert!(
+            r.is_error,
+            "short brace anchors must not fire: {}",
+            r.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.rs")).unwrap(),
+            original
+        );
     }
 
     #[tokio::test]

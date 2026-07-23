@@ -68,6 +68,12 @@ pub mod write_approval;
 #[cfg(feature = "memory")]
 pub use memory::MemoryTool;
 
+#[cfg(feature = "atomgit")]
+pub use crate::atomgit::push_label_mw::GitPushLabelMiddleware;
+#[cfg(feature = "atomgit")]
+pub use crate::atomgit::{
+    AtomgitClient, AtomgitConfig, LiveTokenProvider, StaticTokenProvider, TokenProvider,
+};
 pub use approval::{
     request_approval_decision, ApprovalMiddleware, ApprovalRequest, ApprovalResponse,
     InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
@@ -77,10 +83,6 @@ pub use ast_grep::AstGrepTool;
 pub use atomgit::{
     atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, AtomgitPrTool, AtomgitRepoTool,
 };
-#[cfg(feature = "atomgit")]
-pub use crate::atomgit::{AtomgitClient, AtomgitConfig, LiveTokenProvider, StaticTokenProvider, TokenProvider};
-#[cfg(feature = "atomgit")]
-pub use crate::atomgit::push_label_mw::GitPushLabelMiddleware;
 pub use bash::{normalize_command_for_grant, run_shell, BashTool, ShellExit, ShellOutcome};
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;

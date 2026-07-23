@@ -57,6 +57,9 @@ pub mod subagent_tiers;
 mod todo;
 
 pub use assemble::{build_coding_agent, build_coding_agent_with};
+/// The image type carried by [`UserInput`] / [`ImagePreprocessor`], re-exported
+/// so driver crates can implement the hook without naming `atomcode_kernel`.
+pub use atomcode_kernel::message::ImageContent;
 pub use config::{
     apply_provider_config, resolve_loop_max_rounds, CodingAgentConfig, CodingRuntimeConfig,
     SubagentProvider, TierProvider,
@@ -79,16 +82,14 @@ pub use provider_factory::{
 pub use rate_limit::{RateLimitWindow, RateLimitWindowSource};
 pub use runtime::{
     CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
-    CodingRuntimeStart, DeferredRuntimeState, DriverCommand, ImagePreprocessor, VisionNotice, LocalContextInput,
-    ProviderBootstrap, ProviderUnavailableReason, ReconfigureKind, ReprepareInput,
-    RuntimeContextStats, RuntimeError, RuntimeExit, RuntimeExitReason, RuntimeGeneration,
-    RuntimeMode, RuntimePhase, RuntimeRequest, RuntimeSessionInfo, RuntimeSnapshotError,
-    RuntimeStartError, RuntimeStatus, RuntimeTurnStats, RuntimeUnavailable, SequencedRuntimeEvent,
-    SessionChanged, SubmitReceipt, TurnCompletion, UndoResult, UserInput,
+    CodingRuntimeStart, DeferredRuntimeState, DriverCommand, ImagePreprocessor, LocalContextInput,
+    McpStatusSnapshot, McpToolsSnapshot, ProviderBootstrap, ProviderUnavailableReason,
+    ReconfigureKind, ReprepareInput, RuntimeContextStats, RuntimeError, RuntimeExit,
+    RuntimeExitReason, RuntimeGeneration, RuntimeMode, RuntimePhase, RuntimeRequest,
+    RuntimeSessionInfo, RuntimeSnapshotError, RuntimeStartError, RuntimeStatus, RuntimeTurnStats,
+    RuntimeUnavailable, SequencedRuntimeEvent, SessionChanged, SubmitReceipt, TurnCompletion,
+    UndoResult, UserInput, VisionNotice,
 };
-/// The image type carried by [`UserInput`] / [`ImagePreprocessor`], re-exported
-/// so driver crates can implement the hook without naming `atomcode_kernel`.
-pub use atomcode_kernel::message::ImageContent;
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use todo::TodoHook;
 

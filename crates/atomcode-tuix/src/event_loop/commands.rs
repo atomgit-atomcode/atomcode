@@ -226,8 +226,7 @@ mod bg_live_guard_tests {
     use super::{
         apply_resumed_runtime_state, command_output_should_mirror, detach_live_binding_with,
         ensure_bg_foreground_switch_allowed, finalize_background_submission,
-        foreground_turn_replay_events,
-        schedule_resumed_runtime_replay,
+        foreground_turn_replay_events, schedule_resumed_runtime_replay,
     };
     use crate::event_loop::bg_runtime::{BgRuntimeManager, RuntimeEventPayload, RuntimeState};
     use crate::session::Session;
@@ -616,7 +615,11 @@ impl Renderer for CaptureRenderer<'_> {
 /// （二维码、浏览器地址、同步提示），对手机端没有意义甚至是噪音。
 const MIRROR_EXCLUDED: &[&str] = &["app", "webui", "sync", "login", "logout"];
 
-fn command_output_should_mirror(live_binding: bool, phase: crate::state::UiPhase, cmd: &str) -> bool {
+fn command_output_should_mirror(
+    live_binding: bool,
+    phase: crate::state::UiPhase,
+    cmd: &str,
+) -> bool {
     let local_footer_report = matches!(phase, crate::state::UiPhase::Streaming)
         && matches!(cmd.to_ascii_lowercase().as_str(), "usage" | "cost");
     live_binding
@@ -1769,9 +1772,7 @@ fn execute_slash_command_impl(
             renderer.flush();
         }
         "diff" => {
-            if ctx.is_plain_renderer
-                || !matches!(state.phase, crate::state::UiPhase::Idle)
-            {
+            if ctx.is_plain_renderer || !matches!(state.phase, crate::state::UiPhase::Idle) {
                 match build_diff_stat_text(ctx) {
                     Ok(text) => renderer.render(UiLine::CommandOutput(text)),
                     Err(error) => renderer.render(UiLine::Error(error)),
@@ -2786,13 +2787,25 @@ fn execute_slash_command_impl(
                         )
                     });
                     match result {
-                        Ok(token) => renderer.render(UiLine::CommandOutput(
-                            t(Msg::McpOAuthSaved {
-                                provider: &token.provider,
-                                server,
-                            })
-                            .into_owned(),
-                        )),
+                        Ok(token) => {
+                            renderer.render(UiLine::CommandOutput(
+                                t(Msg::McpOAuthSaved {
+                                    provider: &token.provider,
+                                    server,
+                                })
+                                .into_owned(),
+                            ));
+                            renderer.flush();
+                            return execute_slash_command_impl(
+                                "mcp",
+                                "reload",
+                                state,
+                                ctx,
+                                renderer,
+                                active_modal,
+                                setup_pending,
+                            );
+                        }
                         Err(e) => renderer.render(UiLine::Error(
                             t(Msg::McpOAuthFailed {
                                 error: &format!("{:#}", e),
@@ -2813,11 +2826,48 @@ fn execute_slash_command_impl(
                         renderer.flush();
                         return Ok(());
                     }
-                    match atomcode_capabilities::mcp::McpTokenStore::default().delete_token(server)
-                    {
-                        Ok(true) => renderer.render(UiLine::CommandOutput(
-                            t(Msg::McpOAuthTokenRemoved { server }).into_owned(),
-                        )),
+                    let token_store = atomcode_capabilities::mcp::McpTokenStore::default();
+                    match token_store.load_token(server) {
+                        Ok(None) => {
+                            renderer.render(UiLine::CommandOutput(
+                                t(Msg::McpOAuthNoToken { server }).into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            renderer.render(UiLine::Error(
+                                t(Msg::McpOAuthLogoutFailed {
+                                    error: &format!("{:#}", e),
+                                })
+                                .into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Ok(Some(_)) => {}
+                    }
+                    if let Err(error) = super::withdraw_mcp_tools(ctx) {
+                        renderer.render(UiLine::Error(error));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    match token_store.delete_token(server) {
+                        Ok(true) => {
+                            renderer.render(UiLine::CommandOutput(
+                                t(Msg::McpOAuthTokenRemoved { server }).into_owned(),
+                            ));
+                            renderer.flush();
+                            return execute_slash_command_impl(
+                                "mcp",
+                                "reload",
+                                state,
+                                ctx,
+                                renderer,
+                                active_modal,
+                                setup_pending,
+                            );
+                        }
                         Ok(false) => renderer.render(UiLine::CommandOutput(
                             t(Msg::McpOAuthNoToken { server }).into_owned(),
                         )),
@@ -2859,10 +2909,34 @@ fn execute_slash_command_impl(
                 }
 
                 Some(McpSub::Untrust) => {
+                    if !atomcode_capabilities::mcp::trust::is_project_trusted(&ctx.working_dir) {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpProjectNotTrusted).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    if let Err(error) = super::withdraw_mcp_tools(ctx) {
+                        renderer.render(UiLine::Error(error));
+                        renderer.flush();
+                        return Ok(());
+                    }
                     match atomcode_capabilities::mcp::trust::untrust_project(&ctx.working_dir) {
-                        Ok(true) => renderer.render(UiLine::CommandOutput(
-                            t(Msg::McpProjectUntrusted).into_owned(),
-                        )),
+                        Ok(true) => {
+                            renderer.render(UiLine::CommandOutput(
+                                t(Msg::McpProjectUntrusted).into_owned(),
+                            ));
+                            renderer.flush();
+                            return execute_slash_command_impl(
+                                "mcp",
+                                "reload",
+                                state,
+                                ctx,
+                                renderer,
+                                active_modal,
+                                setup_pending,
+                            );
+                        }
                         Ok(false) => renderer.render(UiLine::CommandOutput(
                             t(Msg::McpProjectNotTrusted).into_owned(),
                         )),
@@ -2873,10 +2947,14 @@ fn execute_slash_command_impl(
                 }
 
                 Some(McpSub::Reload) => {
-                    // Clear accumulated blocked-server list and reset the notice flag so
-                    // a re-trust + reload shows a fresh coalesced count.
-                    ctx.mcp_blocked_untrusted.clear();
-                    ctx.mcp_blocked_notice_emitted = false;
+                    // Withdraw first. Config parse and replacement prepare both read
+                    // mutable security inputs and may fail; neither failure may leave
+                    // the previous MCP authority mounted.
+                    if let Err(error) = super::withdraw_mcp_tools(ctx) {
+                        renderer.render(UiLine::Error(error));
+                        renderer.flush();
+                        return Ok(());
+                    }
                     // Preflight: parse merged MCP config so we can show progress immediately.
                     // (Connection attempts happen in background and may take up to timeout_ms.)
                     let configs =
@@ -2922,57 +3000,15 @@ fn execute_slash_command_impl(
                     renderer.render(UiLine::CommandOutput(header));
                     renderer.flush();
 
-                    // CodingRuntime owns the model-facing tool registry. ReloadCapabilities
-                    // replaces the prepared capability set, so the TUI has no parallel
-                    // model-facing registry to mutate or count here.
-                    let removed = 0;
-
-                    // 2) Drop old registry + event receiver (stop consuming old events).
-                    ctx.mcp_connect_rx = None;
-                    ctx.mcp_registry = None;
-                    ctx.mcp_reload = None;
-
-                    // If no servers are configured, we're done after cleanup.
-                    if configs.is_empty() {
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::McpClearedNoServers { removed }).into_owned(),
-                        ));
+                    // Every MCP mutation converges here. CodingRuntime owns the
+                    // model-facing catalog, including the empty-config case where
+                    // all previously mounted MCP tools must be removed.
+                    if let Err(error) = super::request_capability_reload(ctx) {
+                        renderer.render(UiLine::Error(error));
                         renderer.flush();
                         return Ok(());
                     }
-
-                    // 2.5) Arm progress tracker (event loop prints a summary once all results land).
-                    ctx.mcp_reload = Some(super::McpReloadProgress {
-                        total: configs.len(),
-                        done: 0,
-                        connected: 0,
-                        failed: 0,
-                        started_at: std::time::Instant::now(),
-                    });
-
-                    // 3) Recreate registry and event channel. Connections happen in background
-                    // and will stream Connected/Failed events into scrollback (event loop select!).
-                    use atomcode_capabilities::mcp::McpConnectEvent;
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
-                    let registry =
-                        atomcode_capabilities::mcp::McpRegistry::from_config_background_with_events(
-                            &ctx.working_dir,
-                            Some(tx),
-                        );
-                    ctx.mcp_registry = Some(std::sync::Arc::new(registry));
-                    ctx.mcp_connect_rx = Some(rx);
-
-                    // The driver registry above feeds the palette; CodingRuntime binds its own
-                    // MCP set at prepare time. Re-prepare the current session so the reloaded
-                    // servers are re-mounted together with skills and hooks.
-                    if let Err(error) = super::request_capability_reload(ctx) {
-                        renderer.render(UiLine::Error(error));
-                    }
-
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpClearedReconnecting { removed }).into_owned(),
-                    ));
-                    renderer.flush();
+                    ctx.pending_mcp_reload_server_count = Some(configs.len());
                     return Ok(());
                 }
 
@@ -2985,60 +3021,28 @@ fn execute_slash_command_impl(
                         renderer.flush();
                         return Ok(());
                     }
-                    if let Some(registry) = &ctx.mcp_registry {
-                        let server = server.to_string();
-                        let server_for_msg = server.clone();
-                        let registry = registry.clone();
-                        let tx = registry.event_sender();
-                        tokio::spawn(async move {
-                            let list_timeout = registry.list_tools_timeout(&server).await;
-                            let tools = match tokio::time::timeout(
-                                list_timeout,
-                                registry.list_tools_for_server(&server),
-                            )
-                            .await
-                            {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    if let Some(tx) = &tx {
-                                        let _ = tx.send(atomcode_capabilities::mcp::McpConnectEvent::Warning {
-                                            name: server.clone(),
-                                            message: format!(
-                                                "tools/list timed out after {}s (server connected but tools not listed yet)",
-                                                list_timeout.as_secs()
-                                            ),
-                                        });
+                    let result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(ctx.runtime.mcp_tools(server.to_string()))
+                    });
+                    match result {
+                        Ok(snapshot) => {
+                            let mut message = String::from("tools:\n");
+                            if snapshot.tools.is_empty() {
+                                match snapshot.status {
+                                    Some(status) => {
+                                        message.push_str(&format!("  (none — {status})\n"));
                                     }
-                                    return;
+                                    None => message.push_str("  (none — server not configured)\n"),
                                 }
-                            };
-                            let mut msg = format!("tools:\n");
-                            if tools.is_empty() {
-                                msg.push_str("  (none — tools/list may have failed, timed out, or returned empty)\n");
                             } else {
-                                for t in tools {
-                                    msg.push_str(&format!(
-                                        "  - mcp__{}__{}\n",
-                                        server, t.tool_name
-                                    ));
+                                for tool in snapshot.tools {
+                                    message.push_str(&format!("  - {tool}\n"));
                                 }
                             }
-                            if let Some(tx) = tx {
-                                let _ =
-                                    tx.send(atomcode_capabilities::mcp::McpConnectEvent::Warning {
-                                        name: server,
-                                        message: msg.trim_end().to_string(),
-                                    });
-                            }
-                        });
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::McpToolsListing {
-                                server: &server_for_msg,
-                            })
-                            .into_owned(),
-                        ));
-                    } else {
-                        renderer.render(UiLine::CommandOutput(t(Msg::McpNoRegistry).into_owned()));
+                            renderer.render(UiLine::CommandOutput(message.trim_end().to_string()));
+                        }
+                        Err(error) => renderer.render(UiLine::Error(error.to_string())),
                     }
                     renderer.flush();
                     return Ok(());
@@ -3048,25 +3052,23 @@ fn execute_slash_command_impl(
             }
 
             // Default: show status.
-            if let Some(registry) = &ctx.mcp_registry {
-                let statuses = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(registry.server_statuses())
-                });
-                if statuses.is_empty() {
+            let status = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(ctx.runtime.mcp_status())
+            });
+            match status {
+                Ok(status) if status.servers.is_empty() => {
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::McpNoServersConfigured).into_owned(),
                     ));
-                } else {
+                }
+                Ok(status) => {
                     let mut txt = t(Msg::McpServersHeader).into_owned();
-                    for (name, status) in statuses {
-                        txt.push_str(&format!("    {}  {}\n", name, status));
+                    for (name, server_status) in status.servers {
+                        txt.push_str(&format!("    {}  {}\n", name, server_status));
                     }
                     renderer.render(UiLine::CommandOutput(txt));
                 }
-            } else {
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::McpNoServersConfigured).into_owned(),
-                ));
+                Err(error) => renderer.render(UiLine::Error(error.to_string())),
             }
             renderer.flush();
         }
@@ -4760,9 +4762,8 @@ pub(super) fn build_whoami_text() -> String {
 /// Compact `/diff` summary used by the phone/remote command surface. The
 /// interactive TUI renders file-scoped unified hunks instead.
 pub(super) fn build_diff_stat_text(ctx: &LoopCtx) -> Result<String, String> {
-    let snapshot = crate::git_diff::capture_diff_snapshot(&ctx.working_dir).map_err(|error| {
-        t(Msg::DiffFailed { error: &error }).into_owned()
-    })?;
+    let snapshot = crate::git_diff::capture_diff_snapshot(&ctx.working_dir)
+        .map_err(|error| t(Msg::DiffFailed { error: &error }).into_owned())?;
     if snapshot.files.is_empty() {
         return Ok(t(Msg::CmdNoChanges).into_owned());
     }

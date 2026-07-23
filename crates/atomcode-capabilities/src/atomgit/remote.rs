@@ -31,7 +31,11 @@ pub fn parse_push_target(remote_url: &str) -> Option<PushTarget> {
     let base_url = base_url_for(&lower)?;
     // Locate the host, then take the path after it. The separator is ':' for
     // scp-form (git@host:owner/repo) or '/' for URL-form (…host/owner/repo).
-    let host = if lower.contains("atomgit.com") { "atomgit.com" } else { "gitcode.com" };
+    let host = if lower.contains("atomgit.com") {
+        "atomgit.com"
+    } else {
+        "gitcode.com"
+    };
     let idx = lower.find(host)?;
     let rest = &remote_url[idx + host.len()..];
     let rest = rest.trim_start_matches([':', '/']);
@@ -43,7 +47,11 @@ pub fn parse_push_target(remote_url: &str) -> Option<PushTarget> {
     if owner.is_empty() || repo.is_empty() {
         return None;
     }
-    Some(PushTarget { base_url, owner, repo })
+    Some(PushTarget {
+        base_url,
+        owner,
+        repo,
+    })
 }
 
 /// Run `git -C <cwd> remote get-url origin` and parse it. `None` when there's no
@@ -69,11 +77,36 @@ mod tests {
     #[test]
     fn parses_ssh_and_https_for_both_hosts() {
         let cases = [
-            ("git@atomgit.com:acme/widget.git", "https://api.atomgit.com/api/v5", "acme", "widget"),
-            ("https://atomgit.com/acme/widget.git", "https://api.atomgit.com/api/v5", "acme", "widget"),
-            ("https://atomgit.com/acme/widget", "https://api.atomgit.com/api/v5", "acme", "widget"),
-            ("ssh://git@gitcode.com/acme/widget.git", "https://api.gitcode.com/api/v5", "acme", "widget"),
-            ("https://gitcode.com/acme/widget/", "https://api.gitcode.com/api/v5", "acme", "widget"),
+            (
+                "git@atomgit.com:acme/widget.git",
+                "https://api.atomgit.com/api/v5",
+                "acme",
+                "widget",
+            ),
+            (
+                "https://atomgit.com/acme/widget.git",
+                "https://api.atomgit.com/api/v5",
+                "acme",
+                "widget",
+            ),
+            (
+                "https://atomgit.com/acme/widget",
+                "https://api.atomgit.com/api/v5",
+                "acme",
+                "widget",
+            ),
+            (
+                "ssh://git@gitcode.com/acme/widget.git",
+                "https://api.gitcode.com/api/v5",
+                "acme",
+                "widget",
+            ),
+            (
+                "https://gitcode.com/acme/widget/",
+                "https://api.gitcode.com/api/v5",
+                "acme",
+                "widget",
+            ),
         ];
         for (url, base, owner, repo) in cases {
             let t = parse_push_target(url).unwrap_or_else(|| panic!("expected Some for {url}"));
@@ -115,12 +148,31 @@ mod tests {
         assert!(detect_push_target(p).is_none(), "no origin → None");
 
         // A gitcode origin → Some, parsed to owner/repo.
-        git(p, &["remote", "add", "origin", "https://gitcode.com/saulcy/order_a_meal.git"]);
+        git(
+            p,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://gitcode.com/saulcy/order_a_meal.git",
+            ],
+        );
         let t = detect_push_target(p).expect("gitcode origin → Some");
-        assert_eq!((t.owner.as_str(), t.repo.as_str()), ("saulcy", "order_a_meal"));
+        assert_eq!(
+            (t.owner.as_str(), t.repo.as_str()),
+            ("saulcy", "order_a_meal")
+        );
 
         // A non-atomgit origin (github) → None: the middleware skips labelling.
-        git(p, &["remote", "set-url", "origin", "git@github.com:acme/widget.git"]);
+        git(
+            p,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:acme/widget.git",
+            ],
+        );
         assert!(detect_push_target(p).is_none(), "github origin → None");
     }
 }

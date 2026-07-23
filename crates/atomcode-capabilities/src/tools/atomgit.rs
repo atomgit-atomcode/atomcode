@@ -946,8 +946,8 @@ mod tests {
 #[cfg(test)]
 mod label_action_tests {
     use super::*;
-    use atomcode_kernel::tool::RiskLevel;
     use crate::atomgit::TokenProvider;
+    use atomcode_kernel::tool::RiskLevel;
 
     struct FixedTok(String);
     impl TokenProvider for FixedTok {
@@ -963,7 +963,8 @@ mod label_action_tests {
                 base_url: "https://api.atomgit.com/api/v5".into(),
                 user_agent: "t".into(),
                 token: std::sync::Arc::new(FixedTok("t".into())),
-            }).unwrap(),
+            })
+            .unwrap(),
         );
         AtomgitRepoTool::new(client)
     }

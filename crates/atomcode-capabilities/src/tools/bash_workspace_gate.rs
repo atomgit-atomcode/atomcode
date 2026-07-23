@@ -832,9 +832,13 @@ mod tests {
     fn git_subcommand_detects_push_across_shapes() {
         assert!(runs_push("git push"));
         assert!(runs_push("git push origin main"));
-        assert!(runs_push("cd ~/r && git add -A && git commit -m x && git push origin main"));
+        assert!(runs_push(
+            "cd ~/r && git add -A && git commit -m x && git push origin main"
+        ));
         assert!(runs_push("env GIT_SSH_COMMAND=\"ssh -i k\" git push"));
-        assert!(runs_push("git -c http.sslVerify=false -C /repo push origin HEAD"));
+        assert!(runs_push(
+            "git -c http.sslVerify=false -C /repo push origin HEAD"
+        ));
         assert!(runs_push("git push origin main 2>&1 | tail -4"));
         // Line-continuation join: a wrapped push is still one command.
         assert!(runs_push("cd ~/r \\\n && git push"));

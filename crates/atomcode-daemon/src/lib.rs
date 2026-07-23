@@ -4101,13 +4101,50 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
     })
 }
 
+/// Replace the daemon fallback registry and invalidate the per-project cache
+/// under one cache write barrier. The replacement also occupies the cache key
+/// so a concurrent cache-miss build cannot resurrect its stale registry after
+/// this cutover.
+pub(crate) async fn replace_project_mcp_registry(
+    state: &AppState,
+    project_dir: &std::path::Path,
+    replacement: Arc<McpRegistry>,
+) {
+    let mut cache = state.mcp_cache.write().await;
+    if !cache.contains_key(project_dir) && cache.len() >= MCP_CACHE_MAX {
+        if let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, value)| value.last_used)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest_key);
+        }
+    }
+    cache.insert(
+        project_dir.to_path_buf(),
+        CachedMcpRegistry {
+            registry: replacement.clone(),
+            last_used: std::time::Instant::now(),
+        },
+    );
+    *state.mcp_registry.write().await = replacement;
+}
+
 async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
     let project = state.project.read().await;
     let project_dir = project.working_dir.clone();
     drop(project);
-    let new_registry = McpRegistry::from_config_background(&project_dir);
-    *state.mcp_registry.write().await = Arc::new(new_registry);
-    Json(serde_json::json!({"status": "reloading"}))
+    let new_registry = Arc::new(McpRegistry::from_config_background(&project_dir));
+    replace_project_mcp_registry(&state, &project_dir, new_registry).await;
+    let runtime_reloaded = match crate::native_live::binding() {
+        Ok(_) => crate::native_live::reload_capabilities().await.is_ok(),
+        Err(_) => true,
+    };
+    Json(serde_json::json!({
+        "ok": runtime_reloaded,
+        "status": "reloading",
+        "runtime_reloaded": runtime_reloaded,
+    }))
 }
 
 /// Wait for the first shutdown signal (Ctrl-C, SIGTERM on Unix, or watch channel).
@@ -5420,6 +5457,62 @@ mod tests {
             bind_port: 13456,
             webui_cookie_name: auth_token::webui_cookie_name(13456),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replacing_project_mcp_registry_invalidates_the_cached_registry() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let working_dir = state.project.read().await.working_dir.clone();
+        let stale = Arc::new(McpRegistry::new());
+        state.mcp_cache.write().await.insert(
+            working_dir.clone(),
+            CachedMcpRegistry {
+                registry: stale,
+                last_used: std::time::Instant::now(),
+            },
+        );
+        let replacement = Arc::new(McpRegistry::new());
+
+        replace_project_mcp_registry(&state, &working_dir, replacement.clone()).await;
+
+        let cached = state
+            .mcp_cache
+            .read()
+            .await
+            .get(&working_dir)
+            .expect("replacement must occupy the cache key")
+            .registry
+            .clone();
+        assert!(Arc::ptr_eq(&cached, &replacement));
+        let current = state.mcp_registry.read().await;
+        assert!(Arc::ptr_eq(&*current, &replacement));
+    }
+
+    #[test]
+    fn concurrent_mcp_cache_miss_cannot_overwrite_a_reload_replacement() {
+        let working_dir = PathBuf::from("/project");
+        let replacement = Arc::new(McpRegistry::new());
+        let stale_candidate = Arc::new(McpRegistry::new());
+        let mut cache = HashMap::from([(
+            working_dir.clone(),
+            CachedMcpRegistry {
+                registry: replacement.clone(),
+                last_used: std::time::Instant::now(),
+            },
+        )]);
+
+        let selected = crate::live_api::commit_mcp_cache_miss(
+            &mut cache,
+            working_dir.clone(),
+            stale_candidate,
+        );
+
+        assert!(Arc::ptr_eq(&selected, &replacement));
+        assert!(Arc::ptr_eq(
+            &cache.get(&working_dir).unwrap().registry,
+            &replacement
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

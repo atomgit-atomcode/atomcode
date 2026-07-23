@@ -294,8 +294,16 @@ mod tests {
             no_proxy: None,
         };
         let out = follow_system_env(&snap, &sys);
-        assert!(out.http.is_none(), "system must not fill http when ALL_PROXY set: {:?}", out.http);
-        assert!(out.https.is_none(), "system must not fill https when ALL_PROXY set: {:?}", out.https);
+        assert!(
+            out.http.is_none(),
+            "system must not fill http when ALL_PROXY set: {:?}",
+            out.http
+        );
+        assert!(
+            out.https.is_none(),
+            "system must not fill https when ALL_PROXY set: {:?}",
+            out.https
+        );
         assert_eq!(out.all.as_deref(), Some("http://env-all:7"));
     }
 

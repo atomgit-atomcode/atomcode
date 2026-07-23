@@ -198,17 +198,6 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     })
     .await
     .context("runtime start failed")?;
-    for ev in &runtime.mcp_events {
-        use atomcode_capabilities::mcp::McpConnectEvent as E;
-        match ev {
-            E::Connected { name } => eprintln!("  mcp ✓ {name}"),
-            E::Failed { name, error } => eprintln!("  mcp ✗ {name}: {error}"),
-            E::Warning { name, message } => eprintln!("  mcp ! {name}: {message}"),
-            E::BlockedUntrusted { name } => eprintln!(
-                "  mcp ⊘ {name}: withheld (untrusted project; run `/mcp trust` in atomcode)"
-            ),
-        }
-    }
     let session_id = runtime.session.as_ref().map(|session| session.id.clone());
     let resumed = runtime
         .session
@@ -240,6 +229,9 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     // One-shot: a single turn, then exit (still persisted). A failed turn must
     // exit NON-ZERO — `--yolo -p` is the CI mode, and CI needs the signal.
     if let Some(p) = args.prompt {
+        handle
+            .wait_mcp_ready(atomcode_capabilities::mcp::CONNECT_TIMEOUT)
+            .await?;
         handle.submit(UserInput::from(p)).await?;
         let outcome = drive_turn(&handle, &mut events, &mut input, args.yolo, &mut sigint).await;
         finish(handle, task, session_id).await?;

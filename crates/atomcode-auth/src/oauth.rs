@@ -104,7 +104,9 @@ fn apply_blocking_proxy_policy(
 /// browser may still work — usually a proxy/firewall difference.
 fn network_connect_hint(err: &reqwest::Error) -> Option<std::borrow::Cow<'static, str>> {
     if err.is_connect() || err.is_timeout() {
-        Some(atomcode_config::i18n::t(atomcode_config::i18n::Msg::NetworkConnectHint))
+        Some(atomcode_config::i18n::t(
+            atomcode_config::i18n::Msg::NetworkConnectHint,
+        ))
     } else {
         None
     }
@@ -1069,7 +1071,8 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
             user: Option<PlatformUserInfo>,
         }
 
-        let broker_resp: BrokerResponse = response.json().context("Failed to parse broker response")?;
+        let broker_resp: BrokerResponse =
+            response.json().context("Failed to parse broker response")?;
 
         // Pre-1970 wall clock would otherwise panic on `unwrap` and lose
         // the refresh result. Falling back to 0 forces the next token
@@ -1555,7 +1558,13 @@ mod tests {
         let res = client.get("http://203.0.113.1:81/").send();
         let err = super::with_login_context(res, "Failed to call /auth/test").unwrap_err();
         let chain = format!("{err:#}");
-        assert!(chain.starts_with("Failed to call /auth/test"), "ctx must lead: {chain}");
-        assert!(chain.contains("/proxy") || chain.contains("HTTPS_PROXY"), "hint present: {chain}");
+        assert!(
+            chain.starts_with("Failed to call /auth/test"),
+            "ctx must lead: {chain}"
+        );
+        assert!(
+            chain.contains("/proxy") || chain.contains("HTTPS_PROXY"),
+            "hint present: {chain}"
+        );
     }
 }

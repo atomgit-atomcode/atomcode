@@ -67,9 +67,11 @@ use crate::terminal::TerminalCaps;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderSelectionMode {
     /// Follow changes to the shared default provider in `config.toml`.
+    /// Callers must opt into this explicitly; normal interactive sessions are
+    /// pinned once opened.
     FollowGlobalDefault,
-    /// Keep this runtime's explicit provider selection. This includes launch-time
-    /// `--provider` / `--model` overrides and successful interactive `/model` switches.
+    /// Keep this runtime's provider selection. This includes ordinary opened
+    /// sessions, launch-time overrides, and successful interactive `/model` switches.
     Pinned,
 }
 
@@ -301,10 +303,6 @@ pub async fn run(
     runtime_spawn_override: RuntimeSpawnOverride,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<crate::session::Session>,
-    mcp_registry: Option<std::sync::Arc<atomcode_capabilities::mcp::McpRegistry>>,
-    mcp_connect_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<atomcode_capabilities::mcp::McpConnectEvent>,
-    >,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     dangerously_skip_permissions: bool,
     is_admin: bool,
@@ -780,11 +778,6 @@ pub async fn run(
         plugin_job_rx,
         pending_run_login_setup: false,
         pending_open_provider_wizard: false,
-        mcp_registry,
-        mcp_connect_rx,
-        mcp_reload: None,
-        mcp_blocked_untrusted: Vec::new(),
-        mcp_blocked_notice_emitted: false,
         telemetry,
         worktree_original_dir: None,
         custom_commands,
@@ -800,6 +793,7 @@ pub async fn run(
         pending_session_transition: None,
         pending_external_session_projection: None,
         pending_capability_reload: false,
+        pending_mcp_reload_server_count: None,
         pending_capability_projection: None,
         clipboard_check: std::sync::Arc::new(std::sync::Mutex::new(
             crate::event_loop::ClipboardCheckState::default(),

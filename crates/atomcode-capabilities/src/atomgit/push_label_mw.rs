@@ -45,22 +45,26 @@ impl GitPushLabelMiddleware {
 
     async fn ensure(&self, t: PushTarget) {
         let key = format!("{}/{}@{}", t.owner, t.repo, t.base_url);
-        if self.ensured.lock().unwrap_or_else(|p| p.into_inner()).contains(&key) {
+        if self
+            .ensured
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&key)
+        {
             return;
         }
         // Fetch the token OFF the async runtime (blocking auth I/O).
-        let token =
-            match tokio::task::spawn_blocking(atomcode_auth::oauth::get_valid_token).await {
-                Ok(Ok(tok)) => tok,
-                Ok(Err(e)) => {
-                    tracing::warn!("atomcode-label: no token: {e:#}");
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!("atomcode-label: token task failed: {e}");
-                    return;
-                }
-            };
+        let token = match tokio::task::spawn_blocking(atomcode_auth::oauth::get_valid_token).await {
+            Ok(Ok(tok)) => tok,
+            Ok(Err(e)) => {
+                tracing::warn!("atomcode-label: no token: {e:#}");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("atomcode-label: token task failed: {e}");
+                return;
+            }
+        };
         let client = match AtomgitClient::new(AtomgitConfig {
             base_url: t.base_url.to_string(),
             user_agent: format!("atomcode/{}", env!("CARGO_PKG_VERSION")),
@@ -83,7 +87,10 @@ impl GitPushLabelMiddleware {
                     t.repo,
                     if added { "added" } else { "already present" }
                 );
-                self.ensured.lock().unwrap_or_else(|p| p.into_inner()).insert(key);
+                self.ensured
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(key);
             }
             Err(e) => tracing::warn!(
                 "atomcode-label: ensure failed for {}/{}: {e}",
@@ -105,7 +112,10 @@ impl ToolMiddleware for GitPushLabelMiddleware {
         if tool.name() == "bash" {
             let matched = is_git_push(&call.arguments);
             if matched {
-                self.pending.lock().unwrap_or_else(|p| p.into_inner()).insert(call.id.clone());
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(call.id.clone());
             }
             // DEBUG (not default `info`): shows whether the git-push detector fired for each
             // bash call, so a "label never set" report can be traced to detection vs. push
@@ -116,7 +126,11 @@ impl ToolMiddleware for GitPushLabelMiddleware {
     }
 
     async fn after(&self, result: &mut ToolResult) -> AfterOutcome {
-        let was_push = self.pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&result.call_id);
+        let was_push = self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&result.call_id);
         if !was_push {
             return AfterOutcome::Proceed; // not a git push we're tracking
         }
@@ -175,7 +189,9 @@ mod tests {
             r#"{"command":"cd ~/repo && GIT_SSH_COMMAND=\"ssh -i k\" git push origin main 2>&1 | tail -4"}"#
         ));
         // git global option (`-c key=val`) before the subcommand.
-        assert!(is_git_push(r#"{"command":"git -c http.sslVerify=false push"}"#));
+        assert!(is_git_push(
+            r#"{"command":"git -c http.sslVerify=false push"}"#
+        ));
     }
 
     #[test]

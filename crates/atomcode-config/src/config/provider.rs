@@ -160,7 +160,8 @@ pub fn expand_env_vars(s: &str) -> String {
                 let mut has_default = false;
 
                 while i < chars.len() && chars[i] != '}' {
-                    if !has_default && chars[i] == ':' && i + 1 < chars.len() && chars[i + 1] == '-' {
+                    if !has_default && chars[i] == ':' && i + 1 < chars.len() && chars[i + 1] == '-'
+                    {
                         has_default = true;
                         i += 2;
                         continue;
@@ -176,7 +177,9 @@ pub fn expand_env_vars(s: &str) -> String {
                     i += 1; // skip }
                 }
 
-                let val = std::env::var(&var_name).ok().filter(|v| !v.trim().is_empty());
+                let val = std::env::var(&var_name)
+                    .ok()
+                    .filter(|v| !v.trim().is_empty());
                 if let Some(v) = val {
                     result.push_str(&v);
                 } else if has_default {

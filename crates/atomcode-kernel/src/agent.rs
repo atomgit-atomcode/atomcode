@@ -1582,7 +1582,10 @@ impl RunningAgent {
     ) {
         self.hooks.turn_start(convo).await;
         self.rt.emit(AgentEvent::TurnStarted);
-        let defs = self.tools.defs();
+        // A turn must execute against the exact same tool set advertised to the
+        // provider. Runtime catalog updates become visible on the next turn.
+        let turn_tools = self.tools.snapshot();
+        let defs = turn_tools.defs();
         // Mint this turn's id ONCE — constant across all rounds (incl. offer_continuation
         // continuations) of this turn. Monotonic counter ⇒ deterministic.
         let turn_id = self.turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2717,7 +2720,7 @@ impl RunningAgent {
                     continue;
                 }
 
-                match self.tools.get(&call.name) {
+                match turn_tools.get(&call.name) {
                     None => {
                         // Unknown / unmounted tool: a ready error result. Record the
                         // id (mode A) but NOT the (name,args) key — a later distinct

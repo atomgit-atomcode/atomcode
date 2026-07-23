@@ -114,11 +114,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_for_glm_frontier_and_empty_catalog() {
-        for (model, has_skills) in [
-            ("glm-5.2", true),
-            ("m", true),
-            ("deepseek-v4-flash", false),
-        ] {
+        for (model, has_skills) in [("glm-5.2", true), ("m", true), ("deepseek-v4-flash", false)] {
             let hook = SkillFirstHook::new(model, has_skills);
             let mut msgs = vec![Message::user("hi")];
             let before = msgs.clone();

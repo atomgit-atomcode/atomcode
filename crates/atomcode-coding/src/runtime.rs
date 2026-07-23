@@ -120,6 +120,20 @@ pub enum ReconfigureKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeGeneration(pub u64);
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpStatusSnapshot {
+    pub generation: RuntimeGeneration,
+    pub servers: Vec<(String, atomcode_capabilities::mcp::ServerStatus)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpToolsSnapshot {
+    pub generation: RuntimeGeneration,
+    pub server: String,
+    pub status: Option<atomcode_capabilities::mcp::ServerStatus>,
+    pub tools: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionChanged {
     pub generation: RuntimeGeneration,
@@ -519,7 +533,6 @@ pub struct CodingRuntime {
     pub events: CodingRuntimeEvents,
     pub task: tokio::task::JoinHandle<RuntimeExit>,
     pub session: Option<RuntimeSessionInfo>,
-    pub mcp_events: Vec<atomcode_capabilities::mcp::McpConnectEvent>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1049,6 +1062,61 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// Explicit headless readiness policy. Interactive callers should let MCP
+    /// connect in the background and observe new tools from the next turn.
+    pub async fn wait_mcp_ready(&self, timeout: std::time::Duration) -> Result<(), RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::WaitMcpReady {
+                generation: runtime_state_generation(state),
+                timeout,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    pub async fn mcp_status(&self) -> Result<McpStatusSnapshot, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::McpStatus {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    pub async fn mcp_tools(&self, server: String) -> Result<McpToolsSnapshot, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::McpTools {
+                generation: runtime_state_generation(state),
+                server,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Remove every MCP tool from the model-facing catalog without reading
+    /// mutable config, trust, or auth state. Security-reducing mutations must
+    /// await this terminal before changing those inputs.
+    pub async fn withdraw_mcp_tools(&self) -> Result<(), RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::WithdrawMcpTools {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     pub async fn queue_local_context(&self, input: LocalContextInput) -> Result<(), RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
@@ -1103,6 +1171,7 @@ impl CodingRuntimeHandle {
     }
 
     pub async fn reload_capabilities(&self) -> Result<SessionChanged, RuntimeError> {
+        self.withdraw_mcp_tools().await?;
         self.reprepare_target(ReprepareTarget::Reload).await
     }
 
@@ -1342,7 +1411,6 @@ impl CodingRuntime {
             id: binding.id.clone(),
             resumed: binding.resume.is_some(),
         });
-        let mcp_events = parts.mcp_events.clone();
         let (kernel_agent, unavailable_reason) = match bootstrap {
             ProviderBootstrap::Unavailable(reason) => (None, Some(reason)),
             ProviderBootstrap::Required | ProviderBootstrap::RecoverAuthentication => {
@@ -1482,7 +1550,6 @@ impl CodingRuntime {
             events,
             task,
             session,
-            mcp_events,
         })
     }
 }
@@ -1577,6 +1644,24 @@ pub enum CodingRuntimeControl {
     ContextStats {
         generation: u64,
         done: oneshot::Sender<Result<RuntimeContextStats, RuntimeError>>,
+    },
+    WaitMcpReady {
+        generation: u64,
+        timeout: std::time::Duration,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    McpStatus {
+        generation: u64,
+        done: oneshot::Sender<Result<McpStatusSnapshot, RuntimeError>>,
+    },
+    McpTools {
+        generation: u64,
+        server: String,
+        done: oneshot::Sender<Result<McpToolsSnapshot, RuntimeError>>,
+    },
+    WithdrawMcpTools {
+        generation: u64,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
     },
     QueueLocalContext {
         generation: u64,
@@ -2773,6 +2858,102 @@ fn spawn_runtime_owner_with_optional_agent(
                             working_dir: runtime.config.working_dir.clone(),
                         }));
                     }
+                    Some(CodingRuntimeControl::WaitMcpReady {
+                        generation: request_generation,
+                        timeout,
+                        done,
+                    }) => {
+                        if request_generation != generation
+                            || active_turn.is_some()
+                            || compaction_suspended
+                        {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let mut readiness = runtime.parts.mcp_readiness_receiver();
+                        // Waiting for supplemental MCP readiness must not stop the
+                        // runtime owner from processing cancel/reload/shutdown.
+                        tokio::spawn(async move {
+                            if !*readiness.borrow_and_update() {
+                                let wait = async {
+                                    while !*readiness.borrow_and_update() {
+                                        if readiness.changed().await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                };
+                                let _ = tokio::time::timeout(timeout, wait).await;
+                            }
+                            let _ = done.send(Ok(()));
+                        });
+                    }
+                    Some(CodingRuntimeControl::McpStatus {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let servers = runtime.parts.mcp_statuses().await;
+                        let _ = done.send(Ok(McpStatusSnapshot {
+                            generation: RuntimeGeneration(generation),
+                            servers,
+                        }));
+                    }
+                    Some(CodingRuntimeControl::McpTools {
+                        generation: request_generation,
+                        server,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let tools = runtime.parts.mcp_tools_for_server(&server);
+                        let status = runtime
+                            .parts
+                            .mcp_statuses()
+                            .await
+                            .into_iter()
+                            .find_map(|(name, status)| (name == server).then_some(status));
+                        let _ = done.send(Ok(McpToolsSnapshot {
+                            generation: RuntimeGeneration(generation),
+                            server,
+                            status,
+                            tools,
+                        }));
+                    }
+                    Some(CodingRuntimeControl::WithdrawMcpTools {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if request_generation != generation
+                            || compaction_suspended
+                            || active_turn.is_some()
+                        {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_mut() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        runtime.parts.withdraw_mcp_tools().await;
+                        let _ = done.send(Ok(()));
+                    }
                     Some(CodingRuntimeControl::QueueLocalContext {
                         generation: request_generation,
                         input,
@@ -3109,6 +3290,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        let withdraws_mcp = matches!(&target, ReprepareTarget::Reload);
                         let resolved = match resolve_reprepare_input(&runtime, target) {
                             Ok(input) => input,
                             Err(error) => {
@@ -3141,6 +3323,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             resources = Some(runtime);
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
+                        }
+                        if withdraws_mcp {
+                            // Config, trust, and auth are mutable security inputs.
+                            // Remove the old scope before reading them so a failed
+                            // replacement cannot leave revoked MCP authority mounted.
+                            runtime.parts.withdraw_mcp_tools().await;
                         }
                         let previous_phase = runtime_status(
                             controls.state.load(Ordering::Acquire),
@@ -4666,6 +4854,7 @@ fn reject_runtime_control(
         CodingRuntimeControl::Respond { done, .. }
         | CodingRuntimeControl::Cancel { done, .. }
         | CodingRuntimeControl::SetMode { done, .. }
+        | CodingRuntimeControl::WaitMcpReady { done, .. }
         | CodingRuntimeControl::QueueLocalContext { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
@@ -4673,6 +4862,15 @@ fn reject_runtime_control(
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::ContextStats { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::McpStatus { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::McpTools { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::WithdrawMcpTools { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::ReassembleProvider { done, .. }
@@ -4736,10 +4934,6 @@ fn resolve_reprepare_input(
     match target {
         ReprepareTarget::Exact(input) => Ok(Some((input, None))),
         ReprepareTarget::Reload => {
-            // `/mcp reload` means "re-spawn the servers" — drop the cached
-            // registry for this dir so the reprepare below reconnects instead of
-            // reusing the live connections it would otherwise keep.
-            atomcode_capabilities::mcp::invalidate_registry_cache(&runtime.config.working_dir);
             let mut prepare = runtime.prepare.clone();
             prepare.session = match runtime.parts.session.as_ref() {
                 Some(binding) => crate::SessionMode::Resume(binding.id.clone()),
@@ -4837,10 +5031,9 @@ fn resolve_reprepare_input(
                     canonical.display()
                 )));
             }
-            let current = atomcode_capabilities::pathnorm::canonicalize(
-                &runtime.config.working_dir,
-            )
-            .unwrap_or_else(|_| runtime.config.working_dir.clone());
+            let current =
+                atomcode_capabilities::pathnorm::canonicalize(&runtime.config.working_dir)
+                    .unwrap_or_else(|_| runtime.config.working_dir.clone());
             if atomcode_capabilities::pathnorm::path_case_key(&canonical)
                 == atomcode_capabilities::pathnorm::path_case_key(&current)
             {
@@ -9163,7 +9356,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    async fn same_session_capability_reload_rejects_an_active_turn() {
+    async fn mcp_withdrawal_and_same_session_reload_reject_an_active_turn() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMCODE_HOME", home.path());
         let (agent, mut kernel_commands, _kernel_events) = fake_agent();
@@ -9208,6 +9401,7 @@ mod tests {
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
         ));
+        assert_eq!(handle.withdraw_mcp_tools().await, Err(RuntimeError::Busy));
         assert_eq!(handle.reload_capabilities().await, Err(RuntimeError::Busy));
         assert_eq!(handle.status().phase, RuntimePhase::InTurn);
         assert!(runtime_events.try_recv().is_err());

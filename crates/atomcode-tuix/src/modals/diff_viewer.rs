@@ -8,8 +8,8 @@ use tokio::sync::mpsc::Sender;
 use super::{Modal, ModalAction};
 use crate::event_loop::{Buffer, LoopCtx};
 use crate::git_diff::{
-    capture_diff_snapshot, display_path, DiffBase, DiffContent, DiffFile, DiffFileStatus, DiffScope,
-    DiffSnapshot,
+    capture_diff_snapshot, display_path, DiffBase, DiffContent, DiffFile, DiffFileStatus,
+    DiffScope, DiffSnapshot,
 };
 use crate::i18n::{current_locale, Locale};
 use crate::render::diff::{diff_gutter_width, diff_row_text};

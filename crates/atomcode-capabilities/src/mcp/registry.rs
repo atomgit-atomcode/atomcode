@@ -5,13 +5,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::{mpsc, RwLock};
+use futures::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::{mpsc, watch, RwLock};
 
 use super::client::{McpClient, McpToolInfo};
 use super::config::{load_mcp_config, McpServerConfig};
 use super::transport_http::HttpClient;
 use super::transport_stdio::StdioClient;
 use super::types::ServerStatus;
+
+async fn wait_for_true(receiver: &mut watch::Receiver<bool>) {
+    while !*receiver.borrow_and_update() {
+        if receiver.changed().await.is_err() {
+            break;
+        }
+    }
+}
 
 /// Connection status event sent to listeners when servers connect or fail.
 #[derive(Debug, Clone)]
@@ -111,14 +120,18 @@ pub struct McpRegistry {
     /// doesn't silently disappear from the list (#300). Cleared when a
     /// subsequent `add_server(name)` succeeds.
     failed_servers: Arc<RwLock<BTreeMap<String, String>>>,
+    /// Statuses that are not represented by a live client, or that must override
+    /// a client's transport status (for example a failed `tools/list`).
+    status_overrides: Arc<std::sync::RwLock<BTreeMap<String, ServerStatus>>>,
+    /// Allowed configured servers, including those still inside initialize().
+    configured_servers: Arc<std::sync::RwLock<HashSet<String>>>,
     /// Channel for connection status events (used by TUI to display in scrollback).
     connect_events: Option<mpsc::UnboundedSender<McpConnectEvent>>,
-    /// Signals when all initial background connections have completed (or failed).
-    initial_ready: Arc<tokio::sync::Notify>,
-    /// LEVEL-triggered mirror of the signal above: the Notify permit is single-use
-    /// (the first `wait_for_initial_connections` consumes it), so repeat callers
-    /// check this flag and return immediately instead of burning their timeout.
-    initial_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Level-triggered, broadcast readiness for all initial connection attempts.
+    initial_ready: watch::Sender<bool>,
+    /// Broadcast cancellation for connection and discovery work owned by this
+    /// registry. Dropped/replaced runtime candidates cancel their pending work.
+    cancelled: watch::Sender<bool>,
     /// Servers marked `trust: true` in config ⇒ every tool from them is auto-approved.
     /// `std::sync` (not tokio) RwLock because `Tool::risk` is sync and can't `.await`.
     trusted_servers: Arc<std::sync::RwLock<HashSet<String>>>,
@@ -134,9 +147,11 @@ impl McpRegistry {
             servers: Arc::new(RwLock::new(BTreeMap::new())),
             server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
             failed_servers: Arc::new(RwLock::new(BTreeMap::new())),
+            status_overrides: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            configured_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
             connect_events: None,
-            initial_ready: Arc::new(tokio::sync::Notify::new()),
-            initial_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            initial_ready: watch::channel(false).0,
+            cancelled: watch::channel(false).0,
             trusted_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
             auto_approved_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
         }
@@ -150,9 +165,11 @@ impl McpRegistry {
                 servers: Arc::new(RwLock::new(BTreeMap::new())),
                 server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
                 failed_servers: Arc::new(RwLock::new(BTreeMap::new())),
+                status_overrides: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+                configured_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
                 connect_events: Some(tx),
-                initial_ready: Arc::new(tokio::sync::Notify::new()),
-                initial_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                initial_ready: watch::channel(false).0,
+                cancelled: watch::channel(false).0,
                 trusted_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
                 auto_approved_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             },
@@ -260,19 +277,19 @@ impl McpRegistry {
         let configs = match load_mcp_config(project_dir) {
             Ok(c) => c,
             Err(e) => {
+                let message = format!("Failed to load config: {}", e);
                 if let Some(tx) = &combined_tx {
                     let _ = tx.send(McpConnectEvent::Failed {
                         name: "config".to_string(),
-                        error: format!("Failed to load config: {}", e),
+                        error: message.clone(),
                     });
                 }
-                // Nothing will ever connect — mark done + store the ready permit so
-                // a later `wait_for_initial_connections` returns immediately instead
-                // of burning its whole timeout (same as the no-server path below).
                 registry
-                    .initial_done
-                    .store(true, std::sync::atomic::Ordering::Release);
-                registry.initial_ready.notify_one();
+                    .status_overrides
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert("config".to_string(), ServerStatus::Failed(message));
+                registry.finish_initial_connections();
                 return registry;
             }
         };
@@ -280,6 +297,11 @@ impl McpRegistry {
         // Gate: withhold project-source servers from untrusted projects.
         let (configs, blocked) = Self::partition_by_trust(configs, project_dir);
         for b in &blocked {
+            registry
+                .status_overrides
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(b.name.clone(), ServerStatus::BlockedUntrusted);
             if let Some(tx) = &combined_tx {
                 let _ = tx.send(McpConnectEvent::BlockedUntrusted {
                     name: b.name.clone(),
@@ -293,13 +315,21 @@ impl McpRegistry {
         for config in &configs {
             registry.apply_trust_from_config(config);
         }
+        {
+            let mut names = match registry.configured_servers.write() {
+                Ok(names) => names,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            names.extend(configs.iter().map(|config| config.name.clone()));
+        }
 
         if !configs.is_empty() {
             let servers = registry.servers.clone();
             let server_timeouts_ms = registry.server_timeouts_ms.clone();
             let failed_servers = registry.failed_servers.clone();
+            let status_overrides = registry.status_overrides.clone();
             let initial_ready = registry.initial_ready.clone();
-            let initial_done = registry.initial_done.clone();
+            let cancelled = registry.cancelled.clone();
             tokio::spawn(async move {
                 // Connect servers in parallel
                 let tasks: Vec<_> = configs
@@ -308,6 +338,8 @@ impl McpRegistry {
                         let servers = servers.clone();
                         let server_timeouts_ms = server_timeouts_ms.clone();
                         let failed_servers = failed_servers.clone();
+                        let status_overrides = status_overrides.clone();
+                        let cancelled = cancelled.clone();
                         let tx = combined_tx.clone();
                         async move {
                             let name = config.name.clone();
@@ -339,7 +371,16 @@ impl McpRegistry {
                                 )),
                             };
 
-                            match client.initialize().await {
+                            let mut cancel_rx = cancelled.subscribe();
+                            let initialization = tokio::select! {
+                                result = client.initialize() => Some(result),
+                                _ = wait_for_true(&mut cancel_rx) => None,
+                            };
+                            let Some(initialization) = initialization else {
+                                return;
+                            };
+
+                            match initialization {
                                 Ok(_result) => {
                                     let mut servers = servers.write().await;
                                     servers.insert(name.clone(), Arc::from(client));
@@ -349,6 +390,10 @@ impl McpRegistry {
                                     let mut failed = failed_servers.write().await;
                                     failed.remove(&name);
                                     drop(failed);
+                                    status_overrides
+                                        .write()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .remove(&name);
                                     if let Some(tx) = tx {
                                         let _ = tx.send(McpConnectEvent::Connected {
                                             name: name.clone(),
@@ -374,22 +419,10 @@ impl McpRegistry {
 
                 // Wait for all connections to complete (each has its own timeout)
                 futures::future::join_all(tasks).await;
-                // Signal that initial connections are done. `notify_one` (NOT
-                // `notify_waiters`): it STORES a permit when nobody is waiting yet,
-                // so a `wait_for_initial_connections` that starts AFTER this still
-                // returns immediately. `notify_waiters` only wakes CURRENT waiters —
-                // with the eager construct-then-wait call pattern (connect_and_adapt)
-                // the signal would fire before the waiter subscribed and every
-                // no-op wait would burn the full timeout.
-                initial_done.store(true, std::sync::atomic::Ordering::Release);
-                initial_ready.notify_one();
+                initial_ready.send_replace(true);
             });
         } else {
-            // No servers configured — signal immediately (permit-storing, see above).
-            registry
-                .initial_done
-                .store(true, std::sync::atomic::Ordering::Release);
-            registry.initial_ready.notify_one();
+            registry.finish_initial_connections();
         }
 
         registry
@@ -425,6 +458,14 @@ impl McpRegistry {
 
     /// Add a server to the registry.
     pub async fn add_server(&self, config: McpServerConfig) -> Result<()> {
+        match self.configured_servers.write() {
+            Ok(mut names) => {
+                names.insert(config.name.clone());
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().insert(config.name.clone());
+            }
+        }
         // Trust is config-based, not connection-based: record it up front so a tool's
         // risk() can consult it (and so a reconnect after a transient failure is still
         // trusted).
@@ -472,6 +513,10 @@ impl McpRegistry {
         timeouts.insert(config.name.clone(), config.timeout_ms());
         let mut failed = self.failed_servers.write().await;
         failed.remove(&config.name);
+        self.status_overrides
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&config.name);
 
         Ok(())
     }
@@ -500,11 +545,22 @@ impl McpRegistry {
                 .map(|(name, client)| (name.clone(), Arc::clone(client)))
                 .collect()
         };
+        let mut pending: FuturesUnordered<_> = server_snapshot
+            .into_iter()
+            .map(|(server_name, client)| async move {
+                let result = client.list_tools().await;
+                (server_name, result)
+            })
+            .collect();
         let mut all_tools = Vec::new();
 
-        for (server_name, client) in server_snapshot {
-            match client.list_tools().await {
+        while let Some((server_name, result)) = pending.next().await {
+            match result {
                 Ok(result) => {
+                    self.status_overrides
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&server_name);
                     for tool in result.tools {
                         let read_only = tool.is_read_only();
                         all_tools.push(McpToolInfo {
@@ -517,10 +573,15 @@ impl McpRegistry {
                     }
                 }
                 Err(e) => {
+                    let message = format!("tools/list failed: {}", e);
+                    self.status_overrides
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(server_name.clone(), ServerStatus::Failed(message.clone()));
                     if let Some(tx) = &self.connect_events {
                         let _ = tx.send(McpConnectEvent::Warning {
                             name: server_name.clone(),
-                            message: format!("tools/list failed: {}", e),
+                            message,
                         });
                     } else {
                         eprintln!("[mcp] Failed to list tools from {}: {}", server_name, e);
@@ -529,6 +590,9 @@ impl McpRegistry {
             }
         }
 
+        all_tools.sort_by(|left, right| {
+            (&left.server_name, &left.tool_name).cmp(&(&right.server_name, &right.tool_name))
+        });
         all_tools
     }
 
@@ -549,25 +613,39 @@ impl McpRegistry {
         };
 
         match client.list_tools().await {
-            Ok(result) => result
-                .tools
-                .into_iter()
-                .map(|tool| {
-                    let read_only = tool.is_read_only();
-                    McpToolInfo {
-                        server_name: server_name.to_string(),
-                        tool_name: tool.name,
-                        description: tool.description,
-                        input_schema: tool.input_schema,
-                        read_only,
-                    }
-                })
-                .collect(),
+            Ok(result) => {
+                self.status_overrides
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(server_name);
+                result
+                    .tools
+                    .into_iter()
+                    .map(|tool| {
+                        let read_only = tool.is_read_only();
+                        McpToolInfo {
+                            server_name: server_name.to_string(),
+                            tool_name: tool.name,
+                            description: tool.description,
+                            input_schema: tool.input_schema,
+                            read_only,
+                        }
+                    })
+                    .collect()
+            }
             Err(e) => {
+                let message = format!("tools/list failed: {}", e);
+                self.status_overrides
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        server_name.to_string(),
+                        ServerStatus::Failed(message.clone()),
+                    );
                 if let Some(tx) = &self.connect_events {
                     let _ = tx.send(McpConnectEvent::Warning {
                         name: server_name.to_string(),
-                        message: format!("tools/list failed: {}", e),
+                        message,
                     });
                 } else {
                     eprintln!("[mcp] Failed to list tools from {}: {}", server_name, e);
@@ -620,26 +698,63 @@ impl McpRegistry {
             .iter()
             .map(|(name, client)| (name.clone(), client.status()))
             .collect();
+        let configured = match self.configured_servers.read() {
+            Ok(names) => names,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for name in configured.iter() {
+            out.entry(name.clone()).or_insert(ServerStatus::Connecting);
+        }
         for (name, err) in failed.iter() {
-            // Connected wins if both somehow exist — a successful
-            // reconnect should already have cleared the failed entry,
-            // but be defensive against races.
-            out.entry(name.clone())
-                .or_insert_with(|| ServerStatus::Failed(err.clone()));
+            // A terminal failure overrides the configured/connecting placeholder.
+            // A live connected client still wins defensively during reconnect races.
+            if !matches!(out.get(name), Some(ServerStatus::Connected)) {
+                out.insert(name.clone(), ServerStatus::Failed(err.clone()));
+            }
+        }
+        let overrides = self
+            .status_overrides
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (name, status) in overrides.iter() {
+            out.insert(name.clone(), status.clone());
         }
         out.into_iter().collect()
     }
 
     /// Wait for initial background connections to complete (or timeout).
-    /// Returns immediately if no background connections are pending.
-    pub async fn wait_for_initial_connections(&self, timeout: Duration) {
-        // Level check first: the Notify permit is single-use, so a SECOND caller
-        // (the registry is handed to drivers) must not burn its timeout re-waiting
-        // for a signal that already fired.
-        if self.initial_done.load(std::sync::atomic::Ordering::Acquire) {
-            return;
+    /// Returns whether completion was observed before the timeout.
+    pub async fn wait_for_initial_connections(&self, timeout: Duration) -> bool {
+        let mut ready = self.initial_ready.subscribe();
+        if *ready.borrow_and_update() {
+            return true;
         }
-        let _ = tokio::time::timeout(timeout, self.initial_ready.notified()).await;
+        tokio::time::timeout(timeout, wait_for_true(&mut ready))
+            .await
+            .is_ok()
+            && *ready.borrow()
+    }
+
+    /// Wait without a deadline. The background publisher uses this so a server
+    /// that connects after a driver's startup timeout is still published.
+    pub async fn wait_until_initial_connections_done(&self) {
+        let mut ready = self.initial_ready.subscribe();
+        wait_for_true(&mut ready).await;
+    }
+
+    fn finish_initial_connections(&self) {
+        self.initial_ready.send_replace(true);
+    }
+
+    /// Cancel connection/discovery work associated with this registry.
+    pub fn cancel_pending_work(&self) {
+        self.cancelled.send_replace(true);
+    }
+
+    /// Completes when the registry owner cancels its pending work.
+    pub async fn wait_for_cancellation(&self) {
+        let mut cancelled = self.cancelled.subscribe();
+        wait_for_true(&mut cancelled).await;
     }
 
     /// Get an Arc clone for sharing across threads.
@@ -648,9 +763,11 @@ impl McpRegistry {
             servers: self.servers.clone(),
             server_timeouts_ms: self.server_timeouts_ms.clone(),
             failed_servers: self.failed_servers.clone(),
+            status_overrides: self.status_overrides.clone(),
+            configured_servers: self.configured_servers.clone(),
             connect_events: self.connect_events.clone(),
             initial_ready: self.initial_ready.clone(),
-            initial_done: self.initial_done.clone(),
+            cancelled: self.cancelled.clone(),
             trusted_servers: self.trusted_servers.clone(),
             auto_approved_tools: self.auto_approved_tools.clone(),
         })
@@ -677,6 +794,39 @@ impl Default for McpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BarrierListClient {
+        name: String,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl McpClient for BarrierListClient {
+        async fn initialize(&mut self) -> Result<super::super::types::InitializeResult> {
+            anyhow::bail!("not used")
+        }
+
+        async fn list_tools(&self) -> Result<super::super::types::ListToolsResult> {
+            self.barrier.wait().await;
+            Ok(super::super::types::ListToolsResult { tools: Vec::new() })
+        }
+
+        async fn call_tool(
+            &self,
+            _tool_name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<super::super::types::CallToolResult> {
+            anyhow::bail!("not used")
+        }
+
+        fn server_name(&self) -> &str {
+            &self.name
+        }
+
+        fn status(&self) -> ServerStatus {
+            ServerStatus::Connected
+        }
+    }
 
     /// SECURITY: an untrusted project's `.mcp.json` stdio server must never be
     /// connected or spawned. The registry must emit `BlockedUntrusted` and leave
@@ -720,6 +870,10 @@ mod tests {
             }
         }
         assert!(saw_blocked, "expected BlockedUntrusted for evil");
+        assert_eq!(
+            reg.server_statuses().await,
+            vec![("evil".to_string(), ServerStatus::BlockedUntrusted)]
+        );
     }
 
     /// `add_server` against a stdio command that cannot be spawned must
@@ -824,5 +978,136 @@ mod tests {
             ServerStatus::Failed(_) => {}
             other => panic!("expected Failed status, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn configured_server_is_visible_while_connecting() {
+        let registry = McpRegistry::new();
+        registry
+            .configured_servers
+            .write()
+            .unwrap()
+            .insert("slow".to_string());
+
+        assert_eq!(
+            registry.server_statuses().await,
+            vec![("slow".to_string(), ServerStatus::Connecting)]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_all_tools_queries_servers_concurrently() {
+        let registry = McpRegistry::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut servers = registry.servers.write().await;
+        for name in ["a", "b", "c"] {
+            servers.insert(
+                name.to_string(),
+                Arc::new(BarrierListClient {
+                    name: name.to_string(),
+                    barrier: Arc::clone(&barrier),
+                }),
+            );
+        }
+        drop(servers);
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), registry.list_all_tools()).await;
+
+        assert!(
+            result.is_ok(),
+            "sequential tools/list would deadlock on the first server"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_readiness_wakes_every_concurrent_waiter() {
+        let registry = Arc::new(McpRegistry::new());
+        let first_registry = Arc::clone(&registry);
+        let second_registry = Arc::clone(&registry);
+        let first = tokio::spawn(async move {
+            first_registry
+                .wait_for_initial_connections(Duration::from_millis(100))
+                .await
+        });
+        let second = tokio::spawn(async move {
+            second_registry
+                .wait_for_initial_connections(Duration::from_millis(100))
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        registry.finish_initial_connections();
+
+        assert!(first.await.unwrap());
+        assert!(second.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn readiness_timeout_is_distinct_from_eventual_completion() {
+        let registry = McpRegistry::new();
+
+        assert!(
+            !registry
+                .wait_for_initial_connections(Duration::from_millis(1))
+                .await
+        );
+        registry.finish_initial_connections();
+        assert!(
+            registry
+                .wait_for_initial_connections(Duration::from_millis(1))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn malformed_config_is_visible_in_status() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join(".mcp.json"), "{not-json").unwrap();
+
+        let registry = McpRegistry::from_config_background(project.path());
+
+        assert!(
+            registry
+                .wait_for_initial_connections(Duration::from_millis(50))
+                .await
+        );
+        assert!(matches!(
+            registry.server_statuses().await.as_slice(),
+            [(name, ServerStatus::Failed(error))]
+                if name == "config" && error.contains("Failed to load config")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelling_registry_ends_initial_connection_wait() {
+        let trust_store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(
+                "ATOMCODE_MCP_TRUST_STORE",
+                trust_store.path().join("trust.json"),
+            );
+        }
+        super::super::trust::trust_project(project.path()).unwrap();
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"slow":{"command":"sh","args":["-c","sleep 5"],"timeout_ms":5000}}}"#,
+        )
+        .unwrap();
+        let registry = McpRegistry::from_config_background(project.path());
+        tokio::task::yield_now().await;
+
+        registry.cancel_pending_work();
+
+        assert!(
+            registry
+                .wait_for_initial_connections(Duration::from_millis(250))
+                .await,
+            "cancelling a discarded runtime candidate must end its connection scope"
+        );
     }
 }

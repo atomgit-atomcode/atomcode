@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use atomcode_capabilities::mcp::config::{McpConfigSource, McpServerConfig, McpTransportConfig};
-use atomcode_capabilities::mcp::{connect_and_adapt, McpRegistry, McpToolAdapter};
+use atomcode_capabilities::mcp::{McpRegistry, McpToolAdapter, CONNECT_TIMEOUT};
 use atomcode_kernel::conformance;
 use atomcode_kernel::tool::{ProgressSink, RiskLevel, Tool, ToolContext};
 use tokio_util::sync::CancellationToken;
@@ -131,13 +131,11 @@ fn write_trusted_store(store_path: &std::path::Path, project_dir: &std::path::Pa
     std::fs::write(store_path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
 }
 
-/// The high-level integration entry: `connect_and_adapt` loads a project `.mcp.json`,
-/// connects, and returns ready-to-mount adapters. Isolates `$ATOMCODE_HOME` to an
-/// empty temp dir so only the project config is read (hermetic). The project is
-/// pre-trusted so the security gate allows its servers through.
+/// Background config loading discovers a trusted project's tools without imposing
+/// session-transition policy on the capability layer.
 #[tokio::test]
 #[serial_test::serial]
-async fn connect_and_adapt_reads_project_mcp_json() {
+async fn background_registry_reads_project_mcp_json() {
     let home = tempfile::tempdir().unwrap();
     // SAFETY: edition 2021; this is the only test that reads global MCP config, and
     // it only ever points ATOMCODE_HOME at an empty dir (no user mcp.json), so a
@@ -162,116 +160,23 @@ async fn connect_and_adapt_reads_project_mcp_json() {
     });
     std::fs::write(project.path().join(".mcp.json"), mcp_json.to_string()).unwrap();
 
-    let (registry, adapters, _events) = connect_and_adapt(project.path()).await;
+    let registry = McpRegistry::from_config_background(project.path()).share();
+    registry.wait_for_initial_connections(CONNECT_TIMEOUT).await;
+    let adapters: Vec<Arc<dyn Tool>> = registry
+        .list_all_tools()
+        .await
+        .into_iter()
+        .map(|info| Arc::new(McpToolAdapter::new(registry.clone(), info)) as Arc<dyn Tool>)
+        .collect();
 
     let names: Vec<String> = adapters.iter().map(|a| a.name().to_string()).collect();
     assert!(
         names.iter().any(|n| n == "mcp__proj__echo"),
-        "connect_and_adapt should surface the project server's echo tool; got {names:?}"
+        "background discovery should surface the project server's echo tool; got {names:?}"
     );
     let statuses = registry.server_statuses().await;
     assert!(
         statuses.iter().any(|(n, _)| n == "proj"),
         "the connected server should appear in server_statuses"
-    );
-}
-
-/// A second `connect_and_adapt` for the SAME project dir + config must REUSE the
-/// live registry instead of re-spawning the server — this is what makes
-/// `/session`/`/resume` in an unchanged working dir instant instead of paying an
-/// MCP cold-start every time. `/mcp reload` (modelled by `invalidate_registry_cache`)
-/// drops the cached entry so the next connect reconnects fresh.
-#[tokio::test]
-#[serial_test::serial]
-async fn connect_and_adapt_reuses_cached_registry_for_same_dir() {
-    let home = tempfile::tempdir().unwrap();
-    // SAFETY: #[serial] serialises the env mutation against other MCP tests.
-    unsafe {
-        std::env::set_var("ATOMCODE_HOME", home.path());
-    }
-
-    let project = tempfile::tempdir().unwrap();
-    let trust_store = home.path().join("mcp_trust.json");
-    // SAFETY: test-only env mutation guarded by #[serial].
-    unsafe {
-        std::env::set_var("ATOMCODE_MCP_TRUST_STORE", &trust_store);
-    }
-    write_trusted_store(&trust_store, project.path());
-
-    let server = env!("CARGO_BIN_EXE_mcp-test-server");
-    let mcp_json = serde_json::json!({
-        "mcpServers": { "proj": { "command": server, "args": [], "timeout_ms": 5000 } }
-    });
-    std::fs::write(project.path().join(".mcp.json"), mcp_json.to_string()).unwrap();
-
-    // Start from a clean cache for this dir so the assertion is deterministic.
-    atomcode_capabilities::mcp::invalidate_registry_cache(project.path());
-
-    let (reg1, adapters1, _) = connect_and_adapt(project.path()).await;
-    let (reg2, adapters2, events2) = connect_and_adapt(project.path()).await;
-
-    assert!(
-        Arc::ptr_eq(&reg1, &reg2),
-        "same dir + config must reuse the live registry, not reconnect"
-    );
-    assert!(
-        events2.is_empty(),
-        "a reused registry emits no fresh connect events"
-    );
-    // Adapters are rebuilt cheaply from the reused registry — tools still present.
-    for adapters in [&adapters1, &adapters2] {
-        assert!(
-            adapters.iter().any(|a| a.name() == "mcp__proj__echo"),
-            "reused registry must still surface the echo tool"
-        );
-    }
-
-    // `/mcp reload` semantics: eviction forces a fresh connection next time.
-    atomcode_capabilities::mcp::invalidate_registry_cache(project.path());
-    let (reg3, _, _) = connect_and_adapt(project.path()).await;
-    assert!(
-        !Arc::ptr_eq(&reg1, &reg3),
-        "after invalidation the next connect must reconnect fresh"
-    );
-}
-
-/// A registry with a failed server must NOT be reused: pre-cache, every session
-/// switch rebuilt the registry and thus re-attempted the failed server, so a
-/// transient failure self-healed. Reuse only when EVERY configured server is
-/// connected, otherwise reconnect so the failed one gets another try.
-#[tokio::test]
-#[serial_test::serial]
-async fn connect_and_adapt_does_not_reuse_when_a_server_failed() {
-    let home = tempfile::tempdir().unwrap();
-    // SAFETY: #[serial] serialises the env mutation against other MCP tests.
-    unsafe {
-        std::env::set_var("ATOMCODE_HOME", home.path());
-    }
-
-    let project = tempfile::tempdir().unwrap();
-    let trust_store = home.path().join("mcp_trust.json");
-    // SAFETY: test-only env mutation guarded by #[serial].
-    unsafe {
-        std::env::set_var("ATOMCODE_MCP_TRUST_STORE", &trust_store);
-    }
-    write_trusted_store(&trust_store, project.path());
-
-    let server = env!("CARGO_BIN_EXE_mcp-test-server");
-    // One server connects; a second points at a bogus binary and fails to spawn.
-    let mcp_json = serde_json::json!({
-        "mcpServers": {
-            "good": { "command": server, "args": [], "timeout_ms": 5000 },
-            "bad": { "command": "/nonexistent/mcp-binary-xyz", "args": [], "timeout_ms": 2000 }
-        }
-    });
-    std::fs::write(project.path().join(".mcp.json"), mcp_json.to_string()).unwrap();
-
-    atomcode_capabilities::mcp::invalidate_registry_cache(project.path());
-    let (reg1, _, _) = connect_and_adapt(project.path()).await;
-    let (reg2, _, _) = connect_and_adapt(project.path()).await;
-
-    assert!(
-        !Arc::ptr_eq(&reg1, &reg2),
-        "a registry with a failed server must be reconnected, not reused"
     );
 }

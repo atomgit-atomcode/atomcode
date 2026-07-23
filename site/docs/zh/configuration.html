@@ -236,7 +236,7 @@ base_url = "https://api.deepseek.com/v1"
 type = "ollama"
 model = "qwen2.5:14b"
 base_url = "http://localhost:11434"</code></pre>
-      <p>在 TUI 中可以用 <code>/provider</code> 在这些条目之间切换,用 <code>/model</code> 只切换当前 provider 下的模型。命令行启动时也支持一次性覆盖:</p>
+      <p>在 TUI 中用 <code>/provider</code> 管理 provider 条目。用 <code>/model</code> 切换当前会话，并把所选条目保存为后续新会话的默认值；其他已经打开的会话不变。命令行启动时也支持一次性覆盖:</p>
       <pre><code>atomcode --provider deepseek --model deepseek-reasoner</code></pre>
 
       <h2 id="vision-preprocessor">视觉预处理器</h2>
