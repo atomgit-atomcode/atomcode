@@ -825,16 +825,17 @@ impl OnboardingWizard {
     /// instruction line below reads "按 Enter 重试" — handled by
     /// `RetryQrLogin` in `handle_key_pure`.
     ///
-    /// ASCII-only terminals (`unicode_symbols == false`): QR is
-    /// omitted entirely; URL is shown as the only login affordance
-    /// so the user can paste it into a browser on a different machine.
-    /// QR glyphs render as `□` tofu on Windows legacy conhost / `LANG=C`
-    /// and a tofu QR is silently unscannable — better to show nothing.
+    /// Terminals without reliable half-block geometry use a font-independent
+    /// background-space renderer when the complete QR fits. Otherwise the URL
+    /// is shown as the login affordance; a clipped or distorted QR is worse
+    /// than no QR because it looks actionable but cannot be scanned.
     pub(super) fn draw_qr_login_lines(
         &self,
         term_cols: u16,
+        term_rows: u16,
         unicode_symbols: bool,
         colors: bool,
+        reliable_qr_half_blocks: bool,
     ) -> Vec<String> {
         let panel_width = calc_panel_width(term_cols);
         let inner_width = panel_width.saturating_sub(4);
@@ -858,17 +859,27 @@ impl OnboardingWizard {
             content.push(format!("    {}", reason));
             content.push(center("按 Enter 重试 · Esc 跳过"));
         } else if let Some(url) = &self.qr_login_url {
-            if let Some(qr_rows) =
-                super::qr::render_for_terminal(url, unicode_symbols, colors, cell_w as usize)
-            {
+            // Header, borders, copy and action hints consume eight rows. Never
+            // return a partial QR: a clipped finder/quiet zone looks plausible
+            // but is unscannable.
+            let qr_height_budget = (term_rows as usize).saturating_sub(8);
+            let qr_rows = super::qr::render_for_terminal(
+                url,
+                reliable_qr_half_blocks,
+                colors,
+                cell_w as usize,
+                qr_height_budget,
+            );
+            let qr_visible = qr_rows.is_some();
+            if let Some(qr_rows) = qr_rows {
                 for row in qr_rows {
                     content.push(center(&row));
                 }
             }
-            content.push(center(if unicode_symbols || colors {
+            content.push(center(if qr_visible {
                 "或在浏览器打开:"
             } else {
-                "无法显示二维码 — 请在浏览器打开:"
+                "当前终端无法可靠显示二维码 — 请在浏览器打开:"
             }));
             content.push(center(url));
             content.push(center("扫码完成后自动跳转 · 按 Enter 浏览器打开"));
@@ -1080,7 +1091,13 @@ impl crate::modals::Modal for OnboardingWizard {
                 rows,
             ),
             Step::QrLogin => center_lines(
-                self.draw_qr_login_lines(cols, unicode, state.colors),
+                self.draw_qr_login_lines(
+                    cols,
+                    rows,
+                    unicode,
+                    state.colors,
+                    unicode && !ctx.caps.legacy_conhost,
+                ),
                 panel_width,
                 cols,
                 rows,
@@ -2073,7 +2090,7 @@ mod tests {
     #[test]
     fn qr_login_draw_with_url_includes_url_in_output() {
         let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
-        let lines = w.draw_qr_login_lines(80, true, true);
+        let lines = w.draw_qr_login_lines(80, 24, true, true, true);
         let blob = lines.join("\n");
         assert!(
             blob.contains("https://acs.atomgit.com/s/AbC123"),
@@ -2090,7 +2107,7 @@ mod tests {
     #[test]
     fn qr_login_draw_with_error_surfaces_reason() {
         let w = qr_wizard_with_error("transport: timeout after 10s");
-        let lines = w.draw_qr_login_lines(80, true, true);
+        let lines = w.draw_qr_login_lines(80, 24, true, true, true);
         let blob = lines.join("\n");
         assert!(blob.contains("无法生成登录链接"));
         assert!(blob.contains("transport: timeout after 10s"));
@@ -2105,13 +2122,15 @@ mod tests {
         // and ASCII renderings carry the hint since the action is
         // available in either layout.
         let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
-        let unicode_blob = w.draw_qr_login_lines(80, true, true).join("\n");
+        let unicode_blob = w.draw_qr_login_lines(80, 24, true, true, true).join("\n");
         assert!(
             unicode_blob.contains("Enter"),
             "Unicode QR step missing Enter-to-open affordance:\n{}",
             unicode_blob
         );
-        let ascii_blob = w.draw_qr_login_lines(80, false, false).join("\n");
+        let ascii_blob = w
+            .draw_qr_login_lines(80, 24, false, false, false)
+            .join("\n");
         assert!(
             ascii_blob.contains("Enter"),
             "ASCII QR step missing Enter-to-open affordance:\n{}",
@@ -2126,11 +2145,39 @@ mod tests {
         // the URL instead. URL itself MUST stay — otherwise the
         // screen has nothing actionable.
         let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
-        let lines = w.draw_qr_login_lines(80, false, false);
+        let lines = w.draw_qr_login_lines(80, 24, false, false, false);
         let blob = lines.join("\n");
         assert!(blob.contains("https://acs.atomgit.com/s/AbC123"));
-        assert!(blob.contains("无法显示二维码"));
+        assert!(blob.contains("无法可靠显示二维码"));
         // Half-block glyphs must NOT leak through the ASCII fallback.
+        assert!(!blob.contains('▀'));
+        assert!(!blob.contains('▄'));
+        assert!(!blob.contains('█'));
+    }
+
+    #[test]
+    fn qr_login_win10_sized_color_console_falls_back_instead_of_clipping() {
+        let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let blob = w.draw_qr_login_lines(80, 24, false, true, false).join("\n");
+
+        assert!(blob.contains("无法可靠显示二维码"));
+        assert!(blob.contains("https://acs.atomgit.com/s/AbC123"));
+        assert!(!blob.contains('▀'));
+        assert!(!blob.contains('▄'));
+        assert!(!blob.contains('█'));
+    }
+
+    #[test]
+    fn qr_login_legacy_console_ignores_forced_unicode_for_qr_geometry() {
+        let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let blob = w
+            // Unicode remains enabled for the surrounding UI, but legacy
+            // conhost is not allowed onto the compact half-block QR path.
+            .draw_qr_login_lines(80, 24, true, true, false)
+            .join("\n");
+
+        assert!(blob.contains("无法可靠显示二维码"));
+        assert!(blob.contains("https://acs.atomgit.com/s/AbC123"));
         assert!(!blob.contains('▀'));
         assert!(!blob.contains('▄'));
         assert!(!blob.contains('█'));
@@ -2147,7 +2194,7 @@ mod tests {
             wizard.draw_intro_lines(80, 24, true),
             wizard.draw_language_lines(80, true),
             wizard.draw_setup_lines(80, true),
-            wizard.draw_qr_login_lines(80, true, true),
+            wizard.draw_qr_login_lines(80, 24, true, true, true),
         ];
 
         for (idx, raw_lines) in steps_lines.into_iter().enumerate() {

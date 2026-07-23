@@ -56,21 +56,6 @@ pub struct EnvView {
     /// launchers that don't propagate `TERMINAL_EMULATOR` into our process
     /// (so auto-detect misses), and (b) A/B testing the path on-device.
     pub force_jediterm: Option<bool>,
-    /// `true` when running on Windows and console output codepage is 65001 (UTF-8).
-    pub is_utf8_console: bool,
-}
-
-#[cfg(target_os = "windows")]
-fn is_windows_utf8_codepage() -> bool {
-    extern "system" {
-        fn GetConsoleOutputCP() -> u32;
-    }
-    unsafe { GetConsoleOutputCP() == 65001 }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn is_windows_utf8_codepage() -> bool {
-    false
 }
 
 impl EnvView {
@@ -91,7 +76,6 @@ impl EnvView {
             force_jediterm: std::env::var("ATOMCODE_JEDITERM")
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true")),
-            is_utf8_console: is_windows_utf8_codepage(),
         }
     }
 }
@@ -192,8 +176,12 @@ impl TerminalCaps {
         // Users on conhost who installed a Unicode-capable font
         // (Cascadia Code / JetBrains Mono / etc.) can opt back in
         // with `ATOMCODE_UNICODE=1`.
-        let on_modern_emulator =
-            env.wt_session.is_some() || env.term_program.is_some() || env.is_utf8_console;
+        // UTF-8 output only proves that the console accepts the code points; it
+        // says nothing about the active font's block-glyph geometry. In
+        // particular, pwsh7 on Win10 conhost commonly runs code page 65001 but
+        // renders `▀/▄/█` with seams that destroy terminal QR codes. Only an
+        // actual emulator marker is strong enough to enable Unicode artwork.
+        let on_modern_emulator = env.wt_session.is_some() || env.term_program.is_some();
         let windows_legacy_console = env.is_windows && !on_modern_emulator;
 
         let unicode_symbols = if env.force_unicode {
@@ -278,7 +266,6 @@ mod tests {
             term_program: None,
             terminal_emulator: None,
             force_jediterm: None,
-            is_utf8_console: false,
         }
     }
 
@@ -484,6 +471,10 @@ mod tests {
             ..env()
         });
         assert!(caps.unicode_symbols);
+        assert!(
+            caps.legacy_conhost,
+            "the Unicode preference must not reclassify legacy conhost"
+        );
     }
 
     // ── JediTerm detection (DevEco Studio / IntelliJ-platform terminals) ──
