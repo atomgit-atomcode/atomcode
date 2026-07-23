@@ -2880,10 +2880,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             ph_budget,
                         );
                         let ph_style = self.style_faint(Role::Muted);
-                        push_str_cells(&mut row, &ph, &ph_style);
+                        // Caret at the FRONT (the insertion point of an empty field),
+                        // with the placeholder trailing as a hint — so typing begins
+                        // where the caret sits rather than after the hint text.
                         if on_cursor {
                             push_str_cells(&mut row, cursor_glyph, &chrome_style);
                         }
+                        push_str_cells(&mut row, &ph, &ph_style);
                     } else {
                         // Show the typed text.  Append a cursor indicator when
                         // this is the active row.
@@ -13806,6 +13809,55 @@ mod tests {
                 "text input row\n{dump}"
             );
         }
+    }
+
+    #[test]
+    fn custom_answer_cursor_renders_before_the_placeholder() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+
+        // When the empty custom-answer row is on the cursor, the caret ▏ must sit
+        // at the FRONT (where typing begins), with the placeholder trailing as a
+        // hint — not after the placeholder text.
+        let (mut r, buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut status = status_basic();
+        let view = crate::render::UserInputPanelView {
+            header: "Library".into(),
+            question: "Which?".into(),
+            mode: UserInputMode::Single,
+            options: vec![("date-fns".into(), None), ("Day.js".into(), None)],
+            cursor: 2, // the custom-answer row (after the 2 options)
+            checked: vec![false, false, false],
+            text: String::new(),
+            custom_text: String::new(), // empty → placeholder shown
+            custom: true,
+            batch: None,
+        };
+        status.user_input = Some(view);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+
+        let row = (0..24)
+            .map(|y| vterm.row_text(y))
+            .find(|s| s.contains('输'))
+            .unwrap_or_else(|| panic!("custom-answer row not found\n{dump}"));
+        let caret = row
+            .find('\u{258f}')
+            .unwrap_or_else(|| panic!("caret ▏ not rendered\nrow={row:?}\n{dump}"));
+        let placeholder = row.find('输').expect("placeholder present");
+        assert!(
+            caret < placeholder,
+            "caret ▏ must render BEFORE the placeholder (输入自己的答案…)\nrow={row:?}\n{dump}"
+        );
     }
 
     #[test]
