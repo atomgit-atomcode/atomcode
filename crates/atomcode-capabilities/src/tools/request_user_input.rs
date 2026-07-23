@@ -212,7 +212,11 @@ impl Tool for RequestUserInputTool {
         "Ask the user structured question(s) and wait for their answer before continuing. \
          Use ONLY for decisions that are genuinely the user's to make — a preference, a \
          confirmation, a choice between approaches — NOT for anything you can decide, look \
-         up, or verify yourself. For ONE question, set `header`, `question`, `mode` \
+         up, or verify yourself. When the user explicitly asks you to recommend, compare, or \
+         offer choices for THEM to pick/select from (e.g. \"recommend a few X for me to \
+         choose\", \"let me pick one\"), surface the concrete options HERE (set \
+         `mode`=\"multiple\" when they may want to select several) instead of writing the \
+         list as prose. For ONE question, set `header`, `question`, `mode` \
          (\"single\"=pick one, \"multiple\"=pick any, \"text\"=free-form) and `options` \
          (non-empty for single/multiple). To ask up to 4 related questions answered in ONE \
          interaction, pass a `questions` array of those same objects instead. A free-text \

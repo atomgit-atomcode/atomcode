@@ -348,7 +348,12 @@ or a choice between approaches where no option is clearly correct from the code 
 call `request_user_input` to ask instead of guessing. Prefer `single` or `multiple` with \
 concrete `options` when you can enumerate the choices; use `text` for an open answer. Ask ONLY \
 for what you genuinely cannot decide, look up, or verify yourself — never for something the \
-code, the task, or a quick check already answers. Keep each question focused. If you have MORE \
+code, the task, or a quick check already answers. Keep each question focused. \
+When the user EXPLICITLY asks you to recommend, compare, or give them options to pick from \
+(for example 'recommend a few X for me to choose', 'let me pick', 'let me select', '让我勾选', \
+'选一个'), that request itself IS a decision that is theirs to make: enumerate the concrete \
+options via `single` or `multiple` (use `multiple` when they may want to select several) so \
+they choose in the UI, instead of writing the list out as prose. If you have MORE \
 THAN ONE question for the user at this point, put them ALL into ONE `request_user_input` call's \
 `questions` array — do NOT make several `request_user_input` calls in the same turn, and never \
 write a multiple-choice question as prose; the user answers them together in one form. Never ask \
@@ -358,8 +363,9 @@ When a skill (for example brainstorming) is driving a round of clarifying, inter
 questions to refine a design, surface ITS questions through this tool too: use `single` or \
 `multiple` with concrete `options` for choice questions and `text` for an open answer, so the \
 user answers in the UI instead of reading a prose question. The 'ask sparingly, only for what \
-you cannot decide yourself' guidance above governs YOUR OWN ad-hoc questions; it does not \
-constrain a skill's structured interview.";
+you cannot decide yourself' guidance above governs YOUR OWN unprompted ad-hoc questions; it \
+does not constrain a skill's structured interview, nor a choice the user explicitly asked you \
+to offer.";
 
 /// Always-present workflow guidance for the failure mode behind issue #1169.
 /// It deliberately does not name the optional structured input tool.
@@ -509,6 +515,29 @@ mod tests {
         assert!(
             off.contains("explicit wait condition, interval, or observable progress"),
             "legitimate bounded polling must be distinguished from no-progress repetition"
+        );
+    }
+
+    #[test]
+    fn explicit_choice_request_routes_to_the_tool_when_enabled() {
+        // Issue: "recommend a few X for me to pick" produced a prose list instead of the
+        // structured picker, because the scarcity framing suppressed it. The guidance now
+        // carves out an EXPLICIT user request to choose from the "ask sparingly" rule.
+        let on = coding_persona("deepseek-v4-flash", false, true);
+        assert!(
+            on.contains("EXPLICITLY asks you to recommend, compare, or give them options to pick"),
+            "enabled → explicit choice-request carve-out present"
+        );
+        assert!(
+            on.contains("nor a choice the user explicitly asked you to offer"),
+            "enabled → scarcity rule explicitly does not constrain an explicit choice request"
+        );
+        // Gated with the tool: when the tool is unmounted the carve-out disappears too, so we
+        // never nudge toward an unavailable tool.
+        let off = coding_persona("deepseek-v4-flash", false, false);
+        assert!(
+            !off.contains("EXPLICITLY asks you to recommend"),
+            "disabled → carve-out gone with the rest of the ASKING THE USER block"
         );
     }
 
