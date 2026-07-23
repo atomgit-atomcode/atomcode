@@ -17156,11 +17156,9 @@ fn handle_agent_event(
             // "fresh session in the target directory" at the runtime boundary;
             // issuing a second FreshSession here would race two replacements.
             if !commands::paths_same(&ctx.working_dir, &new_dir) {
-                match commands::apply_cd(ctx, new_dir) {
-                    Ok(_) => renderer.render(UiLine::CommandOutput(
-                        crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
-                    )),
-                    Err(error) => renderer.render(UiLine::Error(error)),
+                // Silent on success (fast transition); status only via guards.
+                if let Err(error) = commands::apply_cd(ctx, new_dir) {
+                    renderer.render(UiLine::Error(error));
                 }
                 renderer.flush();
             }

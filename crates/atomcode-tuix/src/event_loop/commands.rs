@@ -2414,9 +2414,10 @@ fn execute_slash_command_impl(
                             echo: format!("/cd {arg}"),
                         },
                     ) {
-                        Ok(_) => renderer.render(UiLine::CommandOutput(
-                            t(Msg::CmdSessionTransitionPending).into_owned(),
-                        )),
+                        // Success path stays silent: the transition is fast and its
+                        // terminal updates the cwd; the "reconfiguring…" status is
+                        // only shown by the guards when an action races a pending one.
+                        Ok(_) => {}
                         Err(error) => renderer.render(UiLine::Error(error)),
                     }
                 }
@@ -4184,9 +4185,8 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                         branch: current_branch,
                     },
                 ) {
-                    Ok(_) => renderer.render(UiLine::CommandOutput(
-                        t(Msg::CmdSessionTransitionPending).into_owned(),
-                    )),
+                    // Silent on success (fast transition); status only via guards.
+                    Ok(_) => {}
                     Err(error) => renderer.render(UiLine::Error(error)),
                 }
             } else {
@@ -4249,9 +4249,8 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                         force,
                     },
                 ) {
-                    Ok(_) => renderer.render(UiLine::CommandOutput(
-                        t(Msg::CmdSessionTransitionPending).into_owned(),
-                    )),
+                    // Silent on success (fast transition); status only via guards.
+                    Ok(_) => {}
                     Err(error) => renderer.render(UiLine::Error(error)),
                 }
                 renderer.flush();
@@ -4907,9 +4906,10 @@ pub(crate) fn reset_to_new_session(
                 committed: None,
                 effect: crate::event_loop::SessionTransitionEffect::None,
             });
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CmdSessionTransitionPending).into_owned(),
-            ));
+            // Success is fast (the reconfigure connects MCP in the background and
+            // never blocks): the transition terminal wipes the screen / re-renders
+            // shortly, so the "reconfiguring…" status is just noise here. It's still
+            // shown by the guards above / on submit while a transition is pending.
         }
         Err(error) => renderer.render(UiLine::Error(
             t(Msg::CmdSessionTransitionFailed {
