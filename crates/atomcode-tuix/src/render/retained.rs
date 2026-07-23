@@ -700,6 +700,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// the row (flag flips to false) so the last animation frame
     /// stays frozen as a historical paragraph header.
     live_spinner_active: bool,
+    /// True when the row immediately before the live spinner is a transient
+    /// spacer inserted by `push_or_update_live_spinner`. It is removed with
+    /// the spinner and never enters terminal scrollback.
+    live_spinner_spacer_active: bool,
     /// Set by `emit_body_line_inner` when an overflow LF scrolled the whole
     /// viewport (footer included) up one row; consumed (cleared) by
     /// `take_pending_scroll_flush` so the render worker repaints the footer
@@ -902,6 +906,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             welcome_tip_indices: None,
             welcome_line_count: 0,
             live_spinner_active: false,
+            live_spinner_spacer_active: false,
             pending_scroll_flush: false,
             in_sync_batch: false,
             inflight_tool: None,
@@ -4791,6 +4796,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return false;
         }
         self.live_spinner_active = false;
+        let remove = 1 + usize::from(self.live_spinner_spacer_active);
+        self.live_spinner_spacer_active = false;
         // (Cursor visibility is no longer coupled to the spinner — the
         // input box stays editable during streaming, so the caret is
         // always shown at the input position. See `paint_footer`.)
@@ -4801,14 +4808,24 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // the explicit erase removes any flash between pop and next tick.
         crate::tuix_trace!(
             "BPOP",
-            "site=spinner len_before={} n=1 scrolled_off={}",
+            "site=spinner len_before={} n={} scrolled_off={}",
             self.body_lines.len(),
+            remove,
             self.scrolled_off
         );
-        self.body_lines.pop();
+        for _ in 0..remove {
+            self.body_lines.pop();
+        }
         let target = self.next_body_emit_row();
         if target > 0 {
-            let seq = format!("\x1b[{};1H\x1b[K", target);
+            let mut seq = String::new();
+            for offset in 0..remove as u16 {
+                let row = target.saturating_add(offset);
+                if row > self.screen.height() {
+                    break;
+                }
+                seq.push_str(&format!("\x1b[{};1H\x1b[K", row));
+            }
             let _ = self.out.write_all(seq.as_bytes());
         }
         true
@@ -5003,8 +5020,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             // The spinner is transient: append it to the retained model
             // without `push_body_row`, whose eager LF is reserved for
-            // permanent transcript rows. `flush_deferred` paints this new
-            // tail in the same synchronized cell-diff frame as the footer.
+            // permanent transcript rows. Keep exactly one blank row above
+            // it; reuse an existing trailing blank when the preceding body
+            // block already supplied one.
+            self.live_spinner_spacer_active = self
+                .body_lines
+                .last()
+                .is_some_and(|row| !row.iter().all(|cell| cell.ch == ' '));
+            if self.live_spinner_spacer_active {
+                self.body_lines.push(Vec::new());
+            }
             self.body_lines.push(row_cells);
             self.live_spinner_active = true;
             self.dirty = true;
@@ -5912,6 +5937,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.inflight_tool_rows = 0;
         self.inflight_hint = None;
         self.live_spinner_active = false;
+        self.live_spinner_spacer_active = false;
         self.last_mark_was_assistant = false;
         self.skip_body_scroll_count = 0;
         // Take the log out so `render()` can borrow `self` mutably; the
@@ -11895,6 +11921,75 @@ mod tests {
         );
         assert!(r.live_spinner_active);
         assert_eq!(r.body_lines.len(), body_capacity + 1);
+    }
+
+    #[test]
+    fn retained_tool_group_then_spinner_has_one_stable_blank_row() {
+        use crate::render::ToolGroupChild;
+
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::ToolGroupRender {
+            batch_id: "batch-spacing".into(),
+            header: "● Running 2 bash calls".into(),
+            children: vec![
+                ToolGroupChild {
+                    call_id: "call-1".into(),
+                    text: "└ Bash(first)".into(),
+                },
+                ToolGroupChild {
+                    call_id: "call-2".into(),
+                    text: "└ Bash(second)".into(),
+                },
+            ],
+        });
+        let before_spinner = r.body_lines.len();
+
+        for frame in ["⠋", "⠙", "⠹"] {
+            r.render(UiLine::StreamingBox {
+                buf: String::new(),
+                cursor_byte: 0,
+                frame,
+                label: "Percolating · 1m2s · ↑ 552 tokens".into(),
+                status: status.clone(),
+                menu: None,
+                attachments: Vec::new(),
+            });
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let child_row = (0..24)
+            .find(|row| vterm.row_text(*row).contains("Bash(second)"))
+            .unwrap_or_else(|| panic!("last tool child missing:\n{}", vterm.dump()));
+        let spinner_row = (0..24)
+            .find(|row| vterm.row_text(*row).contains("Percolating"))
+            .unwrap_or_else(|| panic!("spinner missing:\n{}", vterm.dump()));
+        assert_eq!(
+            spinner_row - child_row,
+            2,
+            "tool output and spinner must have exactly one blank row between them:\n{}",
+            vterm.dump()
+        );
+        assert_eq!(
+            r.body_lines.len(),
+            before_spinner + 2,
+            "spinner ticks must reuse one transient spacer plus one live row"
+        );
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        assert_eq!(
+            r.body_lines.len(),
+            before_spinner,
+            "clearing the spinner must also remove its transient spacer"
+        );
     }
 
     /// AssistantText arriving after a live spinner COVERS the

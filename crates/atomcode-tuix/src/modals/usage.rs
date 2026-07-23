@@ -196,19 +196,23 @@ impl UsageModal {
         rows
     }
 
-    /// Theme-aware snapshot of the Current tab for non-interactive surfaces.
+    /// Theme-aware snapshot of the tab bar and Current tab for non-interactive surfaces.
     ///
     /// Streaming `/usage` cannot install the interactive modal because live
     /// token redraws own the footer. Reusing these rows keeps its headings,
-    /// progress bars, plan status, and palette identical to the modal without
-    /// presenting tabs or key hints that cannot be operated there.
+    /// progress bars, plan status, and palette identical to the modal. The
+    /// three tab labels remain visible to preserve the modal's information
+    /// hierarchy; Overview/Models bodies remain modal-only because streaming
+    /// input cannot safely operate those tabs.
     pub(crate) fn current_snapshot_text(&self) -> String {
-        self.current_rows()
-            .into_iter()
-            .map(|(line, _)| line)
-            .skip_while(String::is_empty)
-            .collect::<Vec<_>>()
-            .join("\n")
+        let mut lines = vec![self.tab_bar(), String::new()];
+        lines.extend(
+            self.current_rows()
+                .into_iter()
+                .map(|(line, _)| line)
+                .skip_while(String::is_empty),
+        );
+        lines.join("\n")
     }
 
     /// Build Overview tab rows — calendar heatmap + stats block.
@@ -1060,6 +1064,19 @@ mod tests {
         assert!(
             !bar.contains("\x1b[90m") && !bar.contains("\x1b[37m") && !bar.contains("\x1b[1;39m"),
             "tabs must not rely on palette-dependent SGR 90/37/39; got: {bar}"
+        );
+    }
+
+    #[test]
+    fn streaming_snapshot_keeps_all_three_tab_labels() {
+        let text = sample_modal().current_snapshot_text();
+
+        assert!(text.contains(t(Msg::UsageTabCurrent).as_ref()));
+        assert!(text.contains(t(Msg::UsageTabOverview).as_ref()));
+        assert!(text.contains(t(Msg::UsageTabModels).as_ref()));
+        assert!(
+            text.contains(t(Msg::UsageWindowUnavailable).as_ref()),
+            "snapshot should still render the Current body"
         );
     }
 

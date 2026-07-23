@@ -4308,6 +4308,36 @@ mod menu_tests {
     }
 
     #[test]
+    fn streaming_slash_enter_commits_the_highlighted_command() {
+        assert_eq!(
+            streaming_top_level_slash_selection("/usa", "usage", false, KeyCode::Enter),
+            Some(("/usage".into(), true))
+        );
+    }
+
+    #[test]
+    fn streaming_slash_tab_and_arg_commands_only_complete() {
+        assert_eq!(
+            streaming_top_level_slash_selection("/usa", "usage", false, KeyCode::Tab),
+            Some(("/usage ".into(), false))
+        );
+        assert_eq!(
+            streaming_top_level_slash_selection("/sk", "skills", true, KeyCode::Enter),
+            Some(("/skills ".into(), false))
+        );
+        assert_eq!(
+            streaming_top_level_slash_selection(
+                "/skills br",
+                "brainstorming",
+                false,
+                KeyCode::Enter
+            ),
+            None,
+            "second-level palettes must keep their dedicated routing"
+        );
+    }
+
+    #[test]
     fn non_slash_input_returns_no_menu() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
@@ -9435,6 +9465,23 @@ fn menu_handles_selection_key(
         && !(code == KeyCode::Enter && commit_gate_pending)
 }
 
+fn streaming_top_level_slash_selection(
+    buffer: &str,
+    selected_name: &str,
+    needs_args: bool,
+    code: KeyCode,
+) -> Option<(String, bool)> {
+    let prefix = buffer.strip_prefix('/')?;
+    if prefix.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let submit = code == KeyCode::Enter && !needs_args;
+    Some((
+        format!("/{selected_name}{}", if submit { "" } else { " " }),
+        submit,
+    ))
+}
+
 fn handle_idle_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -11508,10 +11555,9 @@ fn handle_streaming_key(
             // fell through to `classify` → `Action::Submit` → `BufferResult::Commit`,
             // which mid-stream steers/queues the half-finished `@…` token as a
             // message — the user's selection was "sent" instead of completed.
-            // Mirrors `handle_idle_key`'s selection arm (mod.rs:9418) but ONLY
-            // the @-mention complete branch: slash commands stay disabled
-            // mid-stream (they fall through to the commit arm's "slash commands
-            // are disabled while a turn is running" hint below).
+            // Mirrors `handle_idle_key`'s @-mention completion branch. Slash
+            // menu selection is handled separately below so its highlighted
+            // command reaches the common streaming command gate.
             //
             // Xshell over SSH reproduces this most readily (the streaming-phase
             // menu is the only path where @-mention + Enter lands here), but
@@ -11542,6 +11588,41 @@ fn handle_streaming_key(
                     app.menu.selected,
                 );
                 return Ok(());
+            }
+            KeyCode::Enter | KeyCode::Tab
+                if !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+                    && !items.is_empty() =>
+            {
+                let name = items[app.menu.selected].0.clone();
+                let needs_args = ctx
+                    .commands
+                    .find(&name)
+                    .map(|command| command.needs_args)
+                    .unwrap_or(false);
+                if let Some((completed, submit)) = streaming_top_level_slash_selection(
+                    &app.buf.text,
+                    &name,
+                    needs_args,
+                    code,
+                ) {
+                    app.buf.text = completed;
+                    app.buf.cursor = app.buf.text.len();
+                    app.menu.selected = 0;
+                    if !submit {
+                        draw_spinner_now(
+                            &mut app.state,
+                            &app.buf,
+                            ctx,
+                            renderer,
+                            app.message_queue.len(),
+                            app.menu.selected,
+                        );
+                        return Ok(());
+                    }
+                    // Enter on an argument-free command continues through the
+                    // common Commit path below. The buffer now contains the
+                    // highlighted command rather than the typed prefix.
+                }
             }
             _ => {} // fall through to buffer edits
         }
