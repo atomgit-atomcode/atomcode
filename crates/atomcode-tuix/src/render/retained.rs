@@ -4967,12 +4967,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     /// Push or update the live spinner body row. On the first call of a
-    /// run it pushes fresh via `push_body_row` and marks the row live.
+    /// run it appends only to the retained cell model and marks the row live.
     /// On subsequent calls (every tick), it REPLACES `body_lines.last()`
-    /// and re-emits at absolute `body_bottom_row()` without the
-    /// `\n`-scroll — that way 80ms animation frames don't each push a
-    /// new row into scrollback and don't scroll the user's real history
-    /// off-screen.
+    /// without using the permanent body's eager `\n`/scrollback feed. A
+    /// spinner can be cleared and recreated repeatedly while tool status
+    /// changes; treating each recreation as a body push would promote one
+    /// row into terminal scrollback every time and leave an ever-growing
+    /// blank gap above the spinner.
     fn push_or_update_live_spinner(&mut self, row_cells: Vec<Cell>) {
         if self.live_spinner_active {
             // Update body_lines in place; the next `flush_deferred`
@@ -5000,11 +5001,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
             self.dirty = true;
         } else {
-            // `push_body_row` clears `live_spinner_active`; set it back
-            // afterwards so the next tick takes the update-in-place
-            // branch above.
-            self.push_body_row(row_cells);
+            // The spinner is transient: append it to the retained model
+            // without `push_body_row`, whose eager LF is reserved for
+            // permanent transcript rows. `flush_deferred` paints this new
+            // tail in the same synchronized cell-diff frame as the footer.
+            self.body_lines.push(row_cells);
             self.live_spinner_active = true;
+            self.dirty = true;
         }
         // (Cursor visibility is driven by `paint_footer` reading
         // `inflight_tool` only — the spinner no longer hides the input
@@ -11861,6 +11864,39 @@ mod tests {
         );
     }
 
+    /// A live spinner is transient even on its first frame. When the body
+    /// already fills the viewport, creating it must not use the permanent
+    /// row path's LF and promote history into native scrollback. Tool updates
+    /// can clear/recreate this row many times during one turn.
+    #[test]
+    fn retained_first_spinner_frame_does_not_advance_scrollback() {
+        let (mut r, buf) = new_capturing(80, 8);
+        r.status = status_basic();
+        let body_capacity = 8usize.saturating_sub(r.current_footer_rows());
+        r.body_lines = vec![Vec::new(); body_capacity];
+
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Brewing · 10s · ↑ 762 tokens".into(),
+            status: status_basic(),
+            menu: None,
+            attachments: Vec::new(),
+        });
+
+        assert_eq!(
+            r.scrolled_off, 0,
+            "transient spinner creation must not promote a body row into scrollback"
+        );
+        assert!(
+            !buf.lock().unwrap().contains(&b'\n'),
+            "first spinner frame must not emit the permanent body path's eager LF"
+        );
+        assert!(r.live_spinner_active);
+        assert_eq!(r.body_lines.len(), body_capacity + 1);
+    }
+
     /// AssistantText arriving after a live spinner COVERS the
     /// spinner row (it's a transient indicator, not a historical
     /// paragraph header). Answer text appears exactly where
@@ -14744,10 +14780,9 @@ mod tests {
     /// re-exposing R at viewport row 0. The next push that overflows
     /// then LFs R into scrollback a SECOND time — duplicate.
     ///
-    /// Repro sequence: fill body to exactly `cap`, push spinner
-    /// (overflow #1 — promotes the oldest body row), clear spinner via
-    /// InputPrompt (pops the spinner), push one more body row
-    /// (overflow #2 — under the bug, re-promotes the same oldest row).
+    /// Repro sequence: fill body to exactly `cap`, push and clear a
+    /// transient spinner (neither operation may promote history), then
+    /// push one permanent body row (the first and only promotion).
     #[test]
     fn retained_spinner_pop_does_not_duplicate_scrollback() {
         let w: u16 = 80;
@@ -14779,9 +14814,8 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Spinner push: body_lines.len() == cap, so emit_body_line_inner
-        // takes the overflow branch and LFs the PROBE row into native
-        // scrollback. Count after this should be exactly 1.
+        // Spinner push is transient even though body_lines.len() == cap:
+        // it must not LF the PROBE row into native scrollback.
         r.render(UiLine::Spinner {
             frame: "⠋".into(),
             label: "Pondering…".into(),
@@ -14797,16 +14831,15 @@ mod tests {
         };
         assert_eq!(
             count_probe(&vterm),
-            1,
-            "after first overflow PROBE should be in scrollback exactly once; got {}.\nscrollback:\n{}",
+            0,
+            "transient spinner must not promote PROBE into scrollback; got {}.\nscrollback:\n{}",
             count_probe(&vterm),
             vterm.scrollback_texts().join("\n")
         );
 
         // Idle InputPrompt triggers clear_live_spinner → pops the
-        // transient spinner row. body_lines.len() now drops from cap+1
-        // back to cap. With the bug, the next push will treat the front
-        // row (still PROBE) as if it had never been promoted.
+        // transient spinner row. body_lines.len() drops from cap+1 back
+        // to cap without changing the scrollback boundary.
         r.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
@@ -14817,9 +14850,8 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Next body push — overflow #2. With the bug, viewport row 0
-        // is PROBE again (because start went from 1 back to 0 after the
-        // spinner pop), so the LF re-promotes it.
+        // The next permanent body push performs the one legitimate
+        // overflow and promotes PROBE exactly once.
         r.render(UiLine::AssistantText("after-pop\n".into()));
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
