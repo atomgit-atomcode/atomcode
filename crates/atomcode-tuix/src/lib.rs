@@ -796,6 +796,7 @@ pub async fn run(
         current_session_project_bucket: None,
         pending_session_resume: None,
         pending_session_resume_preparation: None,
+        pending_session_picker: None,
         pending_session_transition: None,
         pending_external_session_projection: None,
         pending_capability_reload: false,

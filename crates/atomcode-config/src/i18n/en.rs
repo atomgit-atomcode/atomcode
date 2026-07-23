@@ -454,6 +454,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Runtime capability reload failed; the previous runtime is still active: {error}").into(),
         Msg::CmdNoProviders =>
             "  No providers configured.\n".into(),
+        Msg::CmdSessionListLoading =>
+            "  Loading sessions…\n".into(),
         Msg::CmdNoSessions =>
             "  No previous sessions found. Start a conversation first.\n".into(),
         Msg::CmdUnknownCommand { name } =>

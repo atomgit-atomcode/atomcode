@@ -439,6 +439,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Runtime 能力重载失败，原 Runtime 仍可用：{error}").into(),
         Msg::CmdNoProviders =>
             "  未配置任何 Provider。\n".into(),
+        Msg::CmdSessionListLoading =>
+            "  正在加载会话列表…\n".into(),
         Msg::CmdNoSessions =>
             "  未找到历史会话。请先开始一段对话。\n".into(),
         Msg::CmdUnknownCommand { name } =>

@@ -550,6 +550,7 @@ pub enum Msg<'a> {
         error: &'a str,
     },
     CmdNoProviders,
+    CmdSessionListLoading,
     CmdNoSessions,
     CmdUnknownCommand {
         name: &'a str,

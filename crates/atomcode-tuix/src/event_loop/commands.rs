@@ -30,7 +30,7 @@ use crate::i18n::{t, Msg};
 use crate::modals::usage::{UsageData, UsageModal};
 use crate::modals::{
     DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProviderWizard,
-    ProxyPicker, SessionPicker,
+    ProxyPicker,
 };
 use crate::render::{Renderer, UiLine};
 use crate::session::{Session, SessionId};
@@ -1669,31 +1669,47 @@ fn execute_slash_command_impl(
                 }
             }
         }
-        "resume" => match atomcode_daemon::legacy_convert::catalog_for_project(&ctx.working_dir) {
-            Ok(all) => {
-                let sessions: Vec<_> = all
-                    .iter()
-                    .filter(|entry| entry.message_count > 0)
-                    .cloned()
-                    .map(crate::session::SessionMeta::from)
-                    .collect();
-                if sessions.is_empty() {
-                    renderer.render(UiLine::CommandOutput(t(Msg::CmdNoSessions).into_owned()));
-                    renderer.flush();
-                } else {
-                    *active_modal = Some(Box::new(SessionPicker::open(sessions)));
-                }
-            }
-            Err(e) => {
-                renderer.render(UiLine::Error(
-                    t(Msg::SessionListFailed {
-                        error: &e.to_string(),
-                    })
-                    .into_owned(),
-                ));
-                renderer.flush();
-            }
-        },
+        "resume" => {
+            // The catalog scan reads/parses every session file, which froze the UI
+            // when done inline (thousands of files across projects). Offload it to a
+            // blocking thread and install the picker via an event when it lands —
+            // mirroring the async session-resume path. `install_pending_session_picker`
+            // in the main loop consumes the result.
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::CmdSessionListLoading).into_owned(),
+            ));
+            renderer.flush();
+            let working_dir = ctx.working_dir.clone();
+            let event_working_dir = working_dir.clone();
+            let event_tx = ctx.runtime_event_tx.clone();
+            let runtime_id = ctx.foreground_runtime_id;
+            tokio::spawn(async move {
+                let scanned = tokio::task::spawn_blocking(move || {
+                    atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)
+                        .map(|all| {
+                            all.into_iter()
+                                .filter(|entry| entry.message_count > 0)
+                                .map(crate::session::SessionMeta::from)
+                                .collect::<Vec<_>>()
+                        })
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+                let result = match scanned {
+                    Ok(inner) => inner,
+                    Err(join) => Err(join.to_string()),
+                };
+                let _ = event_tx.send(crate::event_loop::bg_runtime::RuntimeEvent {
+                    runtime_id,
+                    event: crate::event_loop::bg_runtime::RuntimeEventPayload::Driver(
+                        crate::event_loop::bg_runtime::DriverEvent::SessionCatalogLoaded {
+                            working_dir: event_working_dir,
+                            result,
+                        },
+                    ),
+                });
+            });
+        }
         "rename" => {
             // Rename targets `ctx.current_session` (the in-flight conversation),
             // not whichever id `/resume` last loaded — the user expects /rename

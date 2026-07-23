@@ -2983,6 +2983,13 @@ pub struct LoopCtx {
     /// Exact picker selection whose catalog convergence and lease acquisition run
     /// off the input thread before the runtime resume is accepted.
     pub(crate) pending_session_resume_preparation: Option<PendingSessionResumePreparation>,
+    /// `/resume` catalog scan result loaded off the UI thread, waiting to be
+    /// installed into the session picker by the main loop (which owns `app`).
+    /// Carries the dir the scan was for so install can drop a result the user has
+    /// navigated away from — the working dir can change (async transition) between
+    /// stash and install while the install is deferred behind another modal.
+    pub(crate) pending_session_picker:
+        Option<(std::path::PathBuf, Result<Vec<crate::session::SessionMeta>, String>)>,
     /// Fresh-session and directory transitions accepted by CodingRuntime but
     /// not yet committed. The input buffer remains authoritative while this is set.
     pub(crate) pending_session_transition: Option<PendingSessionTransition>,
@@ -7730,6 +7737,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         }
 
         drain_foreground_replay_events(&mut app, &mut ctx, renderer);
+        install_pending_session_picker(&mut app, &mut ctx, renderer);
 
         // ── Fixed-interval /loop decision (turn-completion driven) ──
         // Runs after EVERY select! wakeup, so it sees both edges that matter:
@@ -14452,6 +14460,57 @@ fn retry_pending_provider_projection(
     }
 }
 
+/// Install a `/resume` picker once its catalog has loaded off the UI thread.
+/// Runs in the main loop where `app.active_modal` is reachable (the event handler
+/// that received the result cannot touch it). No-op unless a result is pending.
+fn install_pending_session_picker(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+) {
+    if ctx.pending_session_picker.is_none() {
+        return;
+    }
+    // The user has another modal open (opened one while the scan ran, or an
+    // askpass prompt appeared) — DEFER: leave the result stashed so it installs
+    // once the modal closes, rather than dropping it and stranding the user on a
+    // stale "Loading…" line.
+    if app.active_modal.is_some() {
+        return;
+    }
+    let (scanned_dir, result) = ctx
+        .pending_session_picker
+        .take()
+        .expect("pending_session_picker checked Some above");
+    // Re-validate here, not just at stash time: while deferred behind a modal the
+    // working dir can change (async session/dir transition), and the picker must
+    // not show the previous project's sessions.
+    if scanned_dir != ctx.working_dir {
+        return;
+    }
+    match result {
+        Ok(sessions) if sessions.is_empty() => {
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::CmdNoSessions).into_owned(),
+            ));
+            renderer.flush();
+        }
+        Ok(sessions) => {
+            let picker: Box<dyn crate::modals::Modal> =
+                Box::new(crate::modals::SessionPicker::open(sessions));
+            picker.draw(&app.buf, &app.state, ctx, renderer);
+            app.active_modal = Some(picker);
+        }
+        Err(error) => {
+            renderer.render(UiLine::Error(
+                crate::i18n::t(crate::i18n::Msg::SessionListFailed { error: &error })
+                    .into_owned(),
+            ));
+            renderer.flush();
+        }
+    }
+}
+
 fn drain_foreground_replay_events(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     while let Some(event) = ctx.foreground_replay_events.pop_front() {
         handle_runtime_event(
@@ -15341,6 +15400,17 @@ fn handle_runtime_event(
                 working_dir: expected.working_dir,
                 committed: None,
             });
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionCatalogLoaded {
+                working_dir,
+                result,
+            },
+        ) => {
+            // Stash for the app-owning main loop to install (this handler has no
+            // `active_modal`). Carry `working_dir` so install can re-validate — it
+            // may be deferred behind a modal past a later dir change.
+            ctx.pending_session_picker = Some((working_dir, result));
         }
         bg_runtime::RuntimeEventPayload::Driver(
             bg_runtime::DriverEvent::SessionTransitionFinished { operation, result },

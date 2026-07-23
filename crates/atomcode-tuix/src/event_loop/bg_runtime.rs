@@ -54,6 +54,15 @@ pub enum DriverEvent {
     CapabilitiesReloadFinished {
         result: Result<atomcode_coding::SessionChanged, atomcode_coding::RuntimeError>,
     },
+    /// The `/resume` session catalog finished loading off the UI thread (the scan
+    /// reads/parses every session file, which froze the event loop when done
+    /// inline). Carries the current-project session list ready to install into the
+    /// picker; `working_dir` lets the handler drop a result the user has navigated
+    /// away from.
+    SessionCatalogLoaded {
+        working_dir: PathBuf,
+        result: Result<Vec<crate::session::SessionMeta>, String>,
+    },
 }
 
 pub fn spawn_event_forwarder(

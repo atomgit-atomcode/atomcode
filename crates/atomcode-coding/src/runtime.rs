@@ -4736,6 +4736,10 @@ fn resolve_reprepare_input(
     match target {
         ReprepareTarget::Exact(input) => Ok(Some((input, None))),
         ReprepareTarget::Reload => {
+            // `/mcp reload` means "re-spawn the servers" — drop the cached
+            // registry for this dir so the reprepare below reconnects instead of
+            // reusing the live connections it would otherwise keep.
+            atomcode_capabilities::mcp::invalidate_registry_cache(&runtime.config.working_dir);
             let mut prepare = runtime.prepare.clone();
             prepare.session = match runtime.parts.session.as_ref() {
                 Some(binding) => crate::SessionMode::Resume(binding.id.clone()),
