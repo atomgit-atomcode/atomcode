@@ -128,7 +128,7 @@ impl DiffViewer {
         if total > window {
             let above = start;
             let below = total - (start + window);
-            rows.push(more_files_row(above, below));
+            rows.push(super::more_files_row(above, below));
         }
         rows
     }
@@ -520,24 +520,6 @@ fn file_summary_spans(file: &DiffFile) -> Vec<DiffPanelSpan> {
 
 fn notice_row(text: &str) -> DiffPanelRow {
     DiffPanelRow::new(vec![DiffPanelSpan::new(text, DiffPanelTone::Muted)])
-}
-
-/// The "N more files" indicator shown below the visible window when the change
-/// set is larger than `MAX_VISIBLE_FILES`. Arrows hint which direction the
-/// hidden files are and that ↑/↓ scrolls to them.
-fn more_files_row(above: usize, below: usize) -> DiffPanelRow {
-    let hidden = above + below;
-    let arrow = match (above > 0, below > 0) {
-        (true, true) => "↕",
-        (true, false) => "↑",
-        (false, true) => "↓",
-        (false, false) => "",
-    };
-    let text = match current_locale() {
-        Locale::ZhCn => format!("{arrow} 还有 {hidden} 个文件 (↑/↓ 滚动)"),
-        Locale::En => format!("{arrow} {hidden} more files (↑/↓ to scroll)"),
-    };
-    DiffPanelRow::new(vec![DiffPanelSpan::new(text.trim(), DiffPanelTone::Muted)])
 }
 
 fn status_label(status: DiffFileStatus) -> &'static str {

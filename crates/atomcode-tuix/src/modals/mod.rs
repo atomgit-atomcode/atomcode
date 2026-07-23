@@ -71,6 +71,29 @@ pub(crate) fn tab_chip(label: &str, active: bool) -> String {
     }
 }
 
+/// The "N more files" indicator row shared by the `/diff` and `/view` panels:
+/// shown below a scrolled file window when the list is longer than the visible
+/// cap. `above`/`below` are the hidden-file counts on each side; the arrow hints
+/// which way ↑/↓ scrolls to reach them.
+pub(crate) fn more_files_row(above: usize, below: usize) -> crate::render::DiffPanelRow {
+    use crate::render::{DiffPanelRow, DiffPanelSpan, DiffPanelTone};
+    let hidden = above + below;
+    let arrow = match (above > 0, below > 0) {
+        (true, true) => "↕",
+        (true, false) => "↑",
+        (false, true) => "↓",
+        (false, false) => "",
+    };
+    let text = match crate::i18n::current_locale() {
+        crate::i18n::Locale::ZhCn => format!("{arrow} 还有 {hidden} 个文件 (↑/↓ 滚动)"),
+        _ => format!("{arrow} {hidden} more files (↑/↓ to scroll)"),
+    };
+    DiffPanelRow::new(vec![DiffPanelSpan::new(
+        text.trim().to_string(),
+        DiffPanelTone::Muted,
+    )])
+}
+
 /// Result of a modal consuming one key event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalAction {
