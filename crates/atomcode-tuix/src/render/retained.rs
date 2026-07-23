@@ -1563,15 +1563,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Name truncated with `…` when display_width exceeds budget; if
     /// the rule is too narrow for chrome + 1 cell, the badge is
     /// skipped entirely and a plain rule is returned.
-    fn build_top_rule_with_badge(
-        &self,
-        rule_width: usize,
-        session_name: Option<&str>,
-        shell: bool,
-    ) -> Vec<Cell> {
-        self.build_top_rule_with_context(rule_width, session_name, None, shell)
-    }
-
     fn build_top_rule_with_context(
         &self,
         rule_width: usize,
@@ -8667,7 +8658,7 @@ mod tests {
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
-        let row = r.build_top_rule_with_badge(60, Some("atomcode加解密"), false);
+        let row = r.build_top_rule_with_context(60, Some("atomcode加解密"), None, false);
         // Skip continuation cells (width 0 placeholders that follow a
         // wide glyph) — they carry `ch = ' '` and would break a naive
         // substring check on a CJK name.
@@ -8779,7 +8770,7 @@ mod tests {
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
-        let row = r.build_top_rule_with_badge(60, None, false);
+        let row = r.build_top_rule_with_context(60, None, None, false);
         assert_eq!(row.len(), 60, "rule width must be preserved");
         assert!(
             row.iter().all(|c| c.ch == '─'),
@@ -8800,7 +8791,7 @@ mod tests {
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
         let long = "这是一个非常非常非常非常长的会话名字应当被截断省略";
-        let row = r.build_top_rule_with_badge(40, Some(long), false);
+        let row = r.build_top_rule_with_context(40, Some(long), None, false);
         // Same continuation-cell filter rationale as the badge-render
         // test above: width-0 cells carry ' ' and would obscure the
         // substring assertions on CJK names.
