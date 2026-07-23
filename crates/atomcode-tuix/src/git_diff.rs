@@ -16,7 +16,11 @@ const METADATA_LIMIT: usize = 512 * 1024;
 const PATCH_LIMIT: usize = 2 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
 const MAX_FILES: usize = 2_000;
-const MAX_ENTRIES_PER_FILE: usize = 400;
+// Rendered diff lines per file (added + removed + context + hunk separators).
+// The viewer scrolls, so this is generous — it exists only to bound a
+// pathologically huge single-file diff, not normal refactors. A low cap made
+// the "snapshot truncated" notice fire on everyday file edits.
+const MAX_ENTRIES_PER_FILE: usize = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiffBase {

@@ -759,7 +759,7 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// body+footer, so the diff sees the combined frame.
     modal_overlay: Option<ModalOverlayState>,
     /// True while the `/diff` panel owns the frame. The panel is a borderless,
-    /// bottom-anchored overlay that covers the input box (and the rows above it),
+    /// fixed-height overlay drawn inline where the input box sits, covering it,
     /// so the terminal caret must be hidden — otherwise it blinks on top of the
     /// panel at the now-covered input row.
     diff_overlay_active: bool,
@@ -4343,42 +4343,41 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .collect()
         };
 
-        // Like `/usage`, this is NOT a full-screen takeover: the panel is only as
-        // tall as its content (title, rule, body, blank spacer, hint) and is
-        // anchored to the bottom of the screen, so the scrollback above stays
-        // visible and the input box below is covered. Chrome = 4 rows; the body
-        // is already capped to `screen_h - 4` by the caller, so the panel never
-        // exceeds the screen.
-        let content_cap = screen_h.saturating_sub(4);
-        let mut cells: Vec<Vec<Cell>> = Vec::new();
-        // Row 0: title (filename + counts, or "Uncommitted changes …").
-        cells.push(make_row(title));
-        // Row 1: the single horizontal rule the design keeps at the top.
+        // Panel height, chosen by the caller (`DiffViewer::redraw` — the list,
+        // loading and error views fit their content; the file-detail view uses a
+        // tall ~75%-of-screen fixed height so a diff has room to scroll) and only
+        // clamped to the live screen here. Chrome = 4 rows (rule, title, blank
+        // spacer, hint); the rest is the content area. Bound to the screen so `y`
+        // below can never push the panel off the bottom.
+        let panel_h = (win_height as usize).clamp(1, screen_h);
+        let content_cap = panel_h.saturating_sub(4);
+
+        let mut cells: Vec<Vec<Cell>> = Vec::with_capacity(panel_h);
+        // Row 0: the horizontal rule separating the panel from the conversation
+        // above (stands in for the input box's top border).
         cells.push(rule_row());
-        // Content strip (its natural length, capped to the viewport).
+        // Row 1: title (filename + counts, or "Uncommitted changes …").
+        cells.push(make_row(title));
+        // Content area, padded with blanks to the fixed height so the hint
+        // always parks at the bottom edge of the panel.
+        let mut used = 0usize;
         for row in rows.iter().take(content_cap) {
             cells.push(make_row(row));
+            used += 1;
         }
-        // Blank spacer + the muted key hint, immediately below the content.
+        for _ in used..content_cap {
+            cells.push(blank_row());
+        }
+        // Blank spacer + the muted key hint at the bottom of the fixed panel.
         cells.push(blank_row());
         let footer_row = DiffPanelRow::new(vec![DiffPanelSpan::new(footer, DiffPanelTone::Muted)]);
         cells.push(make_row(&footer_row));
-        cells.truncate(screen_h);
+        cells.truncate(panel_h);
 
-        // The normal footer (input box + rules + status/goal/attachments) is
-        // painted underneath before this overlay. Ensure the panel is at least
-        // as tall as that footer so its top rows can't peek out above a short
-        // panel — pad with blank rows at the top (over the scrollback), which
-        // only happens when the content is shorter than the footer.
-        let min_rows = self.current_footer_rows().min(screen_h);
-        if cells.len() < min_rows {
-            let mut padded = vec![blank_row(); min_rows - cells.len()];
-            padded.append(&mut cells);
-            cells = padded;
-        }
-
-        // Anchor at the bottom: draw the panel over the last `cells.len()` rows.
-        let y = screen_h.saturating_sub(cells.len()) as u16;
+        // Anchor inline where the input box sits (right after the body); slide up
+        // only when the fixed-height panel can't fit below the body.
+        let body_bottom = self.body_bottom_row() as usize;
+        let y = body_bottom.min(screen_h.saturating_sub(cells.len())) as u16;
         ModalOverlayState { cells, x: 0, y }
     }
 
@@ -14496,11 +14495,11 @@ mod tests {
         let title = DiffPanelRow::new(vec![DiffPanelSpan::new("Diff", DiffPanelTone::Default).bold()]);
         let overlay = r.build_diff_panel_overlay(&title, &rows, "Esc close", 60, 20);
 
-        // Borderless layout: [0]=title, [1]=rule, [2..]=content rows.
-        let rule = &overlay.cells[1];
+        // Borderless layout: [0]=top rule, [1]=title, [2..]=content rows.
+        let rule = &overlay.cells[0];
         assert!(
             rule.iter().all(|cell| cell.ch == '─'),
-            "row 1 must be the full-width horizontal rule"
+            "row 0 must be the full-width top rule"
         );
         let stats = &overlay.cells[2];
         let add = stats.iter().find(|cell| cell.ch == '+').expect("add span");
@@ -14526,31 +14525,37 @@ mod tests {
     }
 
     #[test]
-    fn diff_panel_is_bottom_anchored_and_content_sized() {
-        // The panel must NOT take over the whole screen: it is only as tall as
-        // its content (title + rule + body + blank + hint) and hugs the bottom
-        // of the terminal, so scrollback stays visible above it.
+    fn diff_panel_is_fixed_height_and_inline() {
+        // The panel is a FIXED height (not content-sized) and renders inline
+        // right after the body (here empty → y == 0), never a full-screen
+        // takeover. It also pads a short content list to the fixed height.
         let (r, _buf) = new_capturing(80, 24);
         let rows = vec![
             DiffPanelRow::new(vec![DiffPanelSpan::new("summary", DiffPanelTone::Muted)]),
             DiffPanelRow::new(Vec::new()),
             DiffPanelRow::new(vec![DiffPanelSpan::new("a.rs", DiffPanelTone::Default)]),
-            DiffPanelRow::new(vec![DiffPanelSpan::new("b.rs", DiffPanelTone::Default)]),
         ];
         let title = DiffPanelRow::new(vec![DiffPanelSpan::new("Diff", DiffPanelTone::Default)]);
-        let overlay = r.build_diff_panel_overlay(&title, &rows, "Esc close", 0, 0);
+        // Ask for a fixed 12-row panel even though there are only 3 content rows.
+        let overlay = r.build_diff_panel_overlay(&title, &rows, "Esc close", 0, 12);
 
-        // 4 content rows + title + rule + blank + hint = 8, well short of 24.
+        assert_eq!(
+            overlay.cells.len(),
+            12,
+            "panel must honour its fixed height, padding short content"
+        );
         assert!(
             overlay.cells.len() < 24,
-            "panel must be content-sized, not full-screen (got {} rows)",
-            overlay.cells.len()
+            "fixed-height panel must not take over the whole screen"
         );
-        assert!(overlay.y > 0, "panel must not start at the top of the screen");
-        assert_eq!(
-            overlay.y as usize + overlay.cells.len(),
-            24,
-            "panel must be anchored to the bottom edge"
+        // Empty body → the panel hugs the top (row 0), following the conversation
+        // rather than pinning to the screen bottom.
+        assert_eq!(overlay.y, 0, "panel must anchor inline after the body");
+        // Last row is the muted key hint, not blank padding.
+        let hint = &overlay.cells[overlay.cells.len() - 1];
+        assert!(
+            hint.iter().any(|cell| cell.ch == 'E'),
+            "hint row must sit at the bottom edge of the fixed panel"
         );
     }
 

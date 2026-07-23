@@ -16,6 +16,11 @@ use crate::render::diff::{diff_gutter_width, diff_row_text};
 use crate::render::{DiffKind, DiffPanelRow, DiffPanelSpan, DiffPanelTone, Renderer, UiLine};
 use crate::state::UiState;
 
+/// The file list shows at most this many rows at once; when the change set is
+/// larger, a "more files" indicator appears and ↑/↓ scrolls the window so the
+/// panel stays compact instead of ballooning to fill the screen.
+const MAX_VISIBLE_FILES: usize = 5;
+
 enum View {
     Loading,
     List { selected: usize },
@@ -53,30 +58,36 @@ impl DiffViewer {
         ModalAction::Close
     }
 
-    /// Returns `(screen_w, screen_h, content_height)`. The panel is a
-    /// borderless, bottom-anchored overlay (`/usage` house style) that grows to
-    /// fit its content rather than taking over the screen. `content_height`
-    /// bounds the body: it leaves four chrome rows — the title, the horizontal
-    /// rule under it, a blank spacer, and the hint line beneath the content.
-    fn dimensions() -> (u16, u16, usize) {
+    /// Fixed geometry for the file-detail view: `(screen_w, panel_height,
+    /// content_height)`. The panel renders inline right after the conversation
+    /// (where the input box sits), replacing it — not a full-screen or
+    /// bottom-pinned overlay. The detail view keeps a tall FIXED height (~75% of
+    /// the screen) so a diff has room to scroll; the list/loading/error views
+    /// instead fit their content (see `redraw`). `content_height` is the body
+    /// area: `panel_height` minus four chrome rows — a top rule, the title, a
+    /// blank spacer, and the hint line.
+    fn geometry(_is_detail: bool) -> (u16, u16, usize) {
         let (screen_w, screen_h) = crossterm::terminal::size().unwrap_or((80, 24));
-        let content_height = (screen_h as usize).saturating_sub(4).max(1);
-        (screen_w, screen_h, content_height)
+        let h = screen_h as usize;
+        // ~75% of the screen. Use `.max(lo).min(h)` rather than `clamp(lo, h)` —
+        // the latter PANICS when the terminal is shorter than `lo` (min > max).
+        let panel_height = (h * 3 / 4).max(10).min(h);
+        let content_height = panel_height.saturating_sub(4).max(1);
+        (screen_w, panel_height as u16, content_height)
     }
 
-    fn list_rows(&self, selected: usize, height: usize, width: usize) -> Vec<DiffPanelRow> {
+    /// Build the file-list body. At most `max_files` file rows are shown at
+    /// once; when there are more, the window scrolls to keep `selected` in view
+    /// and a "more files" indicator row is appended so the extra files are
+    /// discoverable.
+    fn list_rows(&self, selected: usize, max_files: usize, width: usize) -> Vec<DiffPanelRow> {
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();
         };
-        if snapshot.files.is_empty() {
-            return vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
-                l("No uncommitted changes", "没有未提交变更"),
-                DiffPanelTone::Muted,
-            )])];
-        }
 
         // The "Uncommitted changes …" heading is rendered as the panel title
-        // (above the rule); the body opens with the change summary.
+        // (above the rule); the body always opens with the change summary — even
+        // when there are no changes, the framed panel still shows (like CC).
         let mut rows = vec![
             DiffPanelRow::new(vec![
                 DiffPanelSpan::new(
@@ -92,6 +103,10 @@ impl DiffViewer {
             ]),
             DiffPanelRow::new(Vec::new()),
         ];
+        if snapshot.files.is_empty() {
+            rows.push(notice_row(l("No changes yet", "暂无变更")));
+            return rows;
+        }
         if snapshot.truncated {
             rows.push(DiffPanelRow::new(vec![DiffPanelSpan::new(
                 l(
@@ -101,19 +116,19 @@ impl DiffViewer {
                 DiffPanelTone::Warning,
             )]));
         }
-        let available = height.saturating_sub(rows.len()).max(1);
+        let total = snapshot.files.len();
+        let window = max_files.min(total).max(1);
         let start = selected
             .saturating_add(1)
-            .saturating_sub(available)
-            .min(snapshot.files.len().saturating_sub(available));
-        for (index, file) in snapshot
-            .files
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(available)
-        {
+            .saturating_sub(window)
+            .min(total.saturating_sub(window));
+        for (index, file) in snapshot.files.iter().enumerate().skip(start).take(window) {
             rows.push(file_list_row(file, index == selected, width));
+        }
+        if total > window {
+            let above = start;
+            let below = total - (start + window);
+            rows.push(more_files_row(above, below));
         }
         rows
     }
@@ -194,77 +209,112 @@ impl DiffViewer {
     }
 
     fn redraw(&self, renderer: &mut dyn Renderer) {
-        let (win_width, win_height, content_height) = Self::dimensions();
-        let (title, rows, footer): (DiffPanelRow, Vec<DiffPanelRow>, String) = match &self.view {
-            View::Loading => (
-                title_row(l("Diff", "差异")),
-                vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
-                    l("Loading repository changes…", "正在读取仓库变更…"),
-                    DiffPanelTone::Muted,
-                )])],
-                l("Esc to close", "Esc 关闭").to_string(),
-            ),
-            View::Error(error) => (
-                title_row(l("Diff", "差异")),
-                vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
-                    error,
-                    DiffPanelTone::Warning,
-                )])],
-                l("Esc to close", "Esc 关闭").to_string(),
-            ),
-            View::List { selected } => {
-                let snapshot = self.snapshot.as_ref();
-                let is_empty = snapshot.map(|s| s.files.is_empty()).unwrap_or(true);
-                let title = if is_empty {
-                    // Body reads "No uncommitted changes"; keep the title neutral
-                    // so it doesn't assert changes that aren't there.
-                    title_row(l("Diff", "差异"))
-                } else if matches!(snapshot.map(|s| s.base), Some(DiffBase::Unborn)) {
-                    title_row(l(
-                        "Initial changes  (repository has no HEAD)",
-                        "初始变更  (仓库还没有 HEAD)",
-                    ))
-                } else {
-                    title_row(l(
-                        "Uncommitted changes  (git diff HEAD)",
-                        "未提交变更  (git diff HEAD)",
-                    ))
-                };
-                (
-                    title,
-                    self.list_rows(*selected, content_height, win_width as usize),
-                    l(
-                        "↑/↓ to select · Enter to view · Esc to close",
-                        "↑/↓ 选择 · Enter 查看 · Esc 关闭",
-                    )
-                    .to_string(),
-                )
-            }
-            View::Detail { file, scroll } => {
-                let all_rows = self.detail_rows(*file);
-                let visible = all_rows
-                    .iter()
-                    .skip(*scroll)
-                    .take(content_height)
-                    .cloned()
-                    .collect();
-                let title = self
-                    .snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.files.get(*file))
-                    .map(|file| DiffPanelRow::new(file_summary_spans(file)))
-                    .unwrap_or_else(|| title_row(l("Diff", "差异")));
-                (
-                    title,
-                    visible,
-                    l(
-                        "↑/↓ to scroll · ← to back · Esc to back",
-                        "↑/↓ 滚动 · ← 返回 · Esc 返回",
-                    )
-                    .to_string(),
-                )
-            }
+        let (screen_w, screen_h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let win_width = screen_w;
+        // Chrome around the content = 4 rows (rule, title, blank spacer, hint).
+        // The Loading/Error/List panels fit their content instead of reserving a
+        // fixed slab of screen; only the file-detail view keeps a tall fixed
+        // height so a diff has room to scroll.
+        let fit = |rows: &[DiffPanelRow]| {
+            ((rows.len() + 4).min(screen_h as usize)).max(1) as u16
         };
+        let (title, rows, footer, win_height): (DiffPanelRow, Vec<DiffPanelRow>, String, u16) =
+            match &self.view {
+                View::Loading => {
+                    let rows = vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
+                        l("Loading repository changes…", "正在读取仓库变更…"),
+                        DiffPanelTone::Muted,
+                    )])];
+                    let h = fit(&rows);
+                    (
+                        title_row(l("Diff", "差异")),
+                        rows,
+                        l("Esc to close", "Esc 关闭").to_string(),
+                        h,
+                    )
+                }
+                View::Error(error) => {
+                    let rows = vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
+                        error,
+                        DiffPanelTone::Warning,
+                    )])];
+                    let h = fit(&rows);
+                    (
+                        title_row(l("Diff", "差异")),
+                        rows,
+                        l("Esc to close", "Esc 关闭").to_string(),
+                        h,
+                    )
+                }
+                View::List { selected } => {
+                    let is_empty = self
+                        .snapshot
+                        .as_ref()
+                        .map(|s| s.files.is_empty())
+                        .unwrap_or(true);
+                    let title = if is_empty {
+                        // Body reads "No changes yet"; keep the title neutral so it
+                        // doesn't assert changes that aren't there.
+                        title_row(l("Diff", "差异"))
+                    } else if matches!(
+                        self.snapshot.as_ref().map(|s| s.base),
+                        Some(DiffBase::Unborn)
+                    ) {
+                        title_row(l(
+                            "Initial changes  (repository has no HEAD)",
+                            "初始变更  (仓库还没有 HEAD)",
+                        ))
+                    } else {
+                        title_row(l(
+                            "Uncommitted changes  (git diff HEAD)",
+                            "未提交变更  (git diff HEAD)",
+                        ))
+                    };
+                    // Cap the window at MAX_VISIBLE_FILES, but never more than the
+                    // screen can hold once chrome + summary/blank rows are taken.
+                    let max_files = MAX_VISIBLE_FILES
+                        .min((screen_h as usize).saturating_sub(6))
+                        .max(1);
+                    let rows = self.list_rows(*selected, max_files, win_width as usize);
+                    let h = fit(&rows);
+                    (
+                        title,
+                        rows,
+                        l(
+                            "↑/↓ to select · Enter to view · Esc to close",
+                            "↑/↓ 选择 · Enter 查看 · Esc 关闭",
+                        )
+                        .to_string(),
+                        h,
+                    )
+                }
+                View::Detail { file, scroll } => {
+                    let (_, panel_h, content_height) = Self::geometry(true);
+                    let all_rows = self.detail_rows(*file);
+                    let visible = all_rows
+                        .iter()
+                        .skip(*scroll)
+                        .take(content_height)
+                        .cloned()
+                        .collect();
+                    let title = self
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.files.get(*file))
+                        .map(|file| DiffPanelRow::new(file_summary_spans(file)))
+                        .unwrap_or_else(|| title_row(l("Diff", "差异")));
+                    (
+                        title,
+                        visible,
+                        l(
+                            "↑/↓ to scroll · ← to back · Esc to back",
+                            "↑/↓ 滚动 · ← 返回 · Esc 返回",
+                        )
+                        .to_string(),
+                        panel_h,
+                    )
+                }
+            };
         renderer.render(UiLine::DiffPanel {
             title,
             rows,
@@ -289,7 +339,8 @@ impl Modal for DiffViewer {
         if matches!(code, KeyCode::Char('q')) {
             return Ok(Self::close(renderer));
         }
-        let (_, _, page) = Self::dimensions();
+        // Page size = the detail view's content area (PgUp/PgDn scroll amount).
+        let (_, _, page) = Self::geometry(true);
         let detail_total = match &self.view {
             View::Detail { file, .. } => self.detail_rows(*file).len(),
             _ => 0,
@@ -356,6 +407,13 @@ impl Modal for DiffViewer {
         _renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
         Ok(ModalAction::Continue)
+    }
+
+    /// The panel replaces the input box, so it must own every keystroke —
+    /// otherwise typed characters leak into the input buffer (and pop a slash
+    /// menu) behind the panel.
+    fn captures_all_keys(&self) -> bool {
+        true
     }
 
     fn poll_background(&mut self) -> bool {
@@ -464,6 +522,24 @@ fn notice_row(text: &str) -> DiffPanelRow {
     DiffPanelRow::new(vec![DiffPanelSpan::new(text, DiffPanelTone::Muted)])
 }
 
+/// The "N more files" indicator shown below the visible window when the change
+/// set is larger than `MAX_VISIBLE_FILES`. Arrows hint which direction the
+/// hidden files are and that ↑/↓ scrolls to them.
+fn more_files_row(above: usize, below: usize) -> DiffPanelRow {
+    let hidden = above + below;
+    let arrow = match (above > 0, below > 0) {
+        (true, true) => "↕",
+        (true, false) => "↑",
+        (false, true) => "↓",
+        (false, false) => "",
+    };
+    let text = match current_locale() {
+        Locale::ZhCn => format!("{arrow} 还有 {hidden} 个文件 (↑/↓ 滚动)"),
+        Locale::En => format!("{arrow} {hidden} more files (↑/↓ to scroll)"),
+    };
+    DiffPanelRow::new(vec![DiffPanelSpan::new(text.trim(), DiffPanelTone::Muted)])
+}
+
 fn status_label(status: DiffFileStatus) -> &'static str {
     match status {
         DiffFileStatus::Modified => "M",
@@ -471,7 +547,7 @@ fn status_label(status: DiffFileStatus) -> &'static str {
         DiffFileStatus::Deleted => "D",
         DiffFileStatus::Renamed => "R",
         DiffFileStatus::ModeChanged => "T",
-        DiffFileStatus::Untracked => "?",
+        DiffFileStatus::Untracked => "U",
     }
 }
 
