@@ -339,6 +339,10 @@ export class DaemonClient {
     return this.get<SessionMeta[]>(`/sessions/by-working-dir?working_dir=${encodeURIComponent(workingDir)}`);
   }
 
+  resolveSession(id: string): Promise<SessionMeta> {
+    return this.get<SessionMeta>(`/sessions/resolve/${encodeURIComponent(id)}`);
+  }
+
   getSession(projectHash: string, id: string): Promise<SessionDetail> {
     return this.get<SessionDetail>(`/projects/${projectHash}/sessions/${id}`);
   }

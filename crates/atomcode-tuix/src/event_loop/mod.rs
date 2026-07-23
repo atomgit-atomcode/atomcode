@@ -6782,18 +6782,24 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // Preserve an active `/` command menu — don't blindly call
             // `redraw_idle_plain(menu: None)` which would erase it.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
-                let items = menu_for_display(&app.buf, &ctx);
-                if let Some(items) = items {
-                    redraw_with_menu(
-                        &app.buf,
-                        &items,
-                        app.menu.selected,
-                        &app.state,
-                        &ctx,
-                        renderer,
-                    );
+                if let Some(modal) = app.active_modal.as_mut() {
+                    if modal.poll_background() {
+                        modal.draw(&app.buf, &app.state, &ctx, renderer);
+                    }
                 } else {
-                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    let items = menu_for_display(&app.buf, &ctx);
+                    if let Some(items) = items {
+                        redraw_with_menu(
+                            &app.buf,
+                            &items,
+                            app.menu.selected,
+                            &app.state,
+                            &ctx,
+                            renderer,
+                        );
+                    } else {
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    }
                 }
             }
 
@@ -7240,18 +7246,24 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // `redraw_idle_plain` — otherwise the menu gets erased when
             // this fires a second or two after the user types `/`.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
-                let items = menu_for_display(&app.buf, &ctx);
-                if let Some(items) = items {
-                    redraw_with_menu(
-                        &app.buf,
-                        &items,
-                        app.menu.selected,
-                        &app.state,
-                        &ctx,
-                        renderer,
-                    );
+                if let Some(modal) = app.active_modal.as_mut() {
+                    if modal.poll_background() {
+                        modal.draw(&app.buf, &app.state, &ctx, renderer);
+                    }
                 } else {
-                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    let items = menu_for_display(&app.buf, &ctx);
+                    if let Some(items) = items {
+                        redraw_with_menu(
+                            &app.buf,
+                            &items,
+                            app.menu.selected,
+                            &app.state,
+                            &ctx,
+                            renderer,
+                        );
+                    } else {
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    }
                 }
             }
 

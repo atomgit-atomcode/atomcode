@@ -14,6 +14,7 @@ pub mod commands;
 pub mod custom_commands;
 pub mod event_loop;
 pub mod git;
+pub(crate) mod git_diff;
 pub mod glyph;
 pub mod highlight;
 pub mod i18n;

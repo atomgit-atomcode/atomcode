@@ -574,6 +574,9 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             UiLine::ModalOverlay { .. } => {
                 // No overlay rendering in plain mode.
             }
+            UiLine::DiffPanel { .. } => {
+                // No overlay rendering in plain mode.
+            }
             UiLine::ModalOverlayClear => {
                 // No-op in plain mode.
             }

@@ -19,6 +19,7 @@ use crate::event_loop::{Buffer, LoopCtx};
 use crate::render::Renderer;
 use crate::state::UiState;
 
+pub mod diff_viewer;
 pub mod dir_picker;
 pub mod file_viewer;
 pub mod language_picker;
@@ -32,6 +33,7 @@ mod qr;
 pub mod session_picker;
 pub mod usage;
 pub mod usage_render;
+pub use diff_viewer::DiffViewer;
 pub use dir_picker::DirPicker;
 pub use file_viewer::FileViewer;
 pub use language_picker::LanguagePicker;
@@ -138,6 +140,12 @@ pub trait Modal: Send {
     /// interactive `/plugin` manager overrides this. The event loop calls it
     /// before rendering the job result and before redrawing the modal.
     fn on_plugin_event(&mut self, _ev: &atomcode_capabilities::plugin::PluginJobEvent) {}
+
+    /// Poll modal-owned background work after the shared wake channel fires.
+    /// Returns true when visible state changed and the modal should be redrawn.
+    fn poll_background(&mut self) -> bool {
+        false
+    }
 
     /// Whether this modal has requested to close. The event loop checks this
     /// to clean up the modal asynchronously.

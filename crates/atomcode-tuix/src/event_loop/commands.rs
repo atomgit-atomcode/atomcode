@@ -29,8 +29,8 @@ use super::{
 use crate::i18n::{t, Msg};
 use crate::modals::usage::{UsageData, UsageModal};
 use crate::modals::{
-    DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProviderWizard, ProxyPicker,
-    SessionPicker,
+    DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProviderWizard,
+    ProxyPicker, SessionPicker,
 };
 use crate::render::{Renderer, UiLine};
 use crate::session::{Session, SessionId};
@@ -1753,18 +1753,20 @@ fn execute_slash_command_impl(
             renderer.flush();
         }
         "diff" => {
-            match build_interactive_diff(&ctx.working_dir) {
-                Ok(None) => {
-                    renderer.render(UiLine::CommandOutput(t(Msg::CmdNoChanges).into_owned()))
+            if ctx.is_plain_renderer
+                || !matches!(state.phase, crate::state::UiPhase::Idle)
+            {
+                match build_diff_stat_text(ctx) {
+                    Ok(text) => renderer.render(UiLine::CommandOutput(text)),
+                    Err(error) => renderer.render(UiLine::Error(error)),
                 }
-                Ok(Some(parsed)) => {
-                    for line in interactive_diff_lines(parsed) {
-                        renderer.render(line);
-                    }
-                }
-                Err(e) => renderer.render(UiLine::Error(e)),
+                renderer.flush();
+            } else {
+                *active_modal = Some(Box::new(DiffViewer::open(
+                    ctx.working_dir.clone(),
+                    ctx.wake_tx.clone(),
+                )));
             }
-            renderer.flush();
         }
         "undo" => {
             dispatch_undo(arg, state, ctx, renderer);
@@ -4722,298 +4724,16 @@ pub(super) fn build_whoami_text() -> String {
     }
 }
 
-const MAX_INTERACTIVE_DIFF_BYTES: usize = 512 * 1024;
-const MAX_INTERACTIVE_DIFF_ENTRIES: usize = 120;
-const MAX_REMOTE_DIFF_BYTES: usize = 128 * 1024;
-const MAX_DIFF_STDERR_BYTES: usize = 64 * 1024;
-
-struct GitDiffCapture {
-    stdout: String,
-    truncated: bool,
-}
-
-fn diff_failed(error: impl std::fmt::Display) -> String {
-    let error = error.to_string();
-    t(Msg::DiffFailed { error: &error }).into_owned()
-}
-
-fn run_git_diff_bounded(
-    working_dir: &std::path::Path,
-    args: &[&str],
-    max_stdout_bytes: usize,
-) -> Result<GitDiffCapture, String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new("git")
-        .args(args)
-        .current_dir(working_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(diff_failed)?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| diff_failed("git diff stdout was not captured"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| diff_failed("git diff stderr was not captured"))?;
-
-    // Drain stderr concurrently so a repository hook/configuration error cannot
-    // fill that pipe and deadlock while stdout is being read. Keep only a bounded
-    // prefix for the user-visible error, but continue draining the rest.
-    let stderr_reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
-        let mut kept = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            let read = stderr.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            if kept.len() < MAX_DIFF_STDERR_BYTES {
-                let remaining = MAX_DIFF_STDERR_BYTES - kept.len();
-                kept.extend_from_slice(&chunk[..read.min(remaining)]);
-            }
-        }
-        Ok(kept)
-    });
-
-    let mut stdout_bytes = Vec::with_capacity(max_stdout_bytes.min(64 * 1024));
-    let mut limited = stdout.take(max_stdout_bytes.saturating_add(1) as u64);
-    if let Err(error) = limited.read_to_end(&mut stdout_bytes) {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = stderr_reader.join();
-        return Err(diff_failed(error));
-    }
-    let truncated = stdout_bytes.len() > max_stdout_bytes;
-    if truncated {
-        stdout_bytes.truncate(max_stdout_bytes);
-        if let Some(last_newline) = stdout_bytes.iter().rposition(|byte| *byte == b'\n') {
-            stdout_bytes.truncate(last_newline + 1);
-        }
-        let _ = child.kill();
-    }
-
-    let status = child.wait().map_err(diff_failed)?;
-    let stderr_bytes = stderr_reader
-        .join()
-        .map_err(|_| diff_failed("git diff stderr reader panicked"))?
-        .map_err(diff_failed)?;
-    if !truncated && !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
-        return Err(diff_failed(if stderr.is_empty() {
-            format!("git diff exited with {status}")
-        } else {
-            stderr
-        }));
-    }
-
-    Ok(GitDiffCapture {
-        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
-        truncated,
-    })
-}
-
-fn build_interactive_diff(
-    working_dir: &std::path::Path,
-) -> Result<Option<crate::render::diff::ParsedDiff>, String> {
-    let capture = run_git_diff_bounded(
-        working_dir,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "--unified=3",
-            "--",
-        ],
-        MAX_INTERACTIVE_DIFF_BYTES,
-    )?;
-    if capture.stdout.trim().is_empty() {
-        return Ok(None);
-    }
-
-    let mut parsed = crate::render::diff::parse_unified_diff_files(
-        &capture.stdout,
-        MAX_INTERACTIVE_DIFF_ENTRIES,
-    );
-    parsed.truncated |= capture.truncated;
-    Ok(Some(parsed))
-}
-
-/// Convert parsed diff files into stable replay units. Consecutive
-/// `CommandOutput` values are coalesced by the retained renderer, so file
-/// headers and non-hunk summaries must carry their line boundaries inside one
-/// value; otherwise a resize can replay them as one concatenated row.
-fn interactive_diff_lines(parsed: crate::render::diff::ParsedDiff) -> Vec<UiLine> {
-    fn append_text(pending: &mut String, text: &str) {
-        let text = text.trim_end_matches('\n');
-        if text.is_empty() {
-            return;
-        }
-        if !pending.is_empty() {
-            pending.push('\n');
-        }
-        pending.push_str(text);
-    }
-
-    fn flush_text(lines: &mut Vec<UiLine>, pending: &mut String) {
-        if !pending.is_empty() {
-            lines.push(UiLine::CommandOutput(std::mem::take(pending)));
-        }
-    }
-
-    let mut lines = Vec::new();
-    let mut pending_text = String::new();
-    for file in parsed.files {
-        append_text(&mut pending_text, &file.header);
-        if !file.entries.is_empty() {
-            flush_text(&mut lines, &mut pending_text);
-            lines.push(UiLine::DiffBlock(file.entries));
-        }
-        if let Some(summary) = file.summary {
-            append_text(&mut pending_text, &summary);
-        }
-    }
-    if parsed.truncated {
-        append_text(&mut pending_text, t(Msg::CmdDiffTruncated).as_ref());
-    }
-    flush_text(&mut lines, &mut pending_text);
-    lines
-}
-
 /// Compact `/diff` summary used by the phone/remote command surface. The
 /// interactive TUI renders file-scoped unified hunks instead.
 pub(super) fn build_diff_stat_text(ctx: &LoopCtx) -> Result<String, String> {
-    let capture = run_git_diff_bounded(
-        &ctx.working_dir,
-        &[
-            "diff",
-            "--stat",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "--",
-        ],
-        MAX_REMOTE_DIFF_BYTES,
-    )?;
-    if capture.stdout.is_empty() {
+    let snapshot = crate::git_diff::capture_diff_snapshot(&ctx.working_dir).map_err(|error| {
+        t(Msg::DiffFailed { error: &error }).into_owned()
+    })?;
+    if snapshot.files.is_empty() {
         return Ok(t(Msg::CmdNoChanges).into_owned());
     }
-    if capture.truncated {
-        Ok(format!("{}{}", capture.stdout, t(Msg::CmdDiffTruncated)))
-    } else {
-        Ok(capture.stdout)
-    }
-}
-
-#[cfg(test)]
-mod interactive_diff_tests {
-    use super::{build_interactive_diff, interactive_diff_lines};
-    use crate::render::diff::{ParsedDiff, ParsedDiffFile};
-    use crate::render::{DiffKind, UiLine};
-
-    fn git(repo: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .output()
-            .expect("run git fixture command");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn clean_repo() -> tempfile::TempDir {
-        let repo = tempfile::tempdir().expect("temp git repo");
-        git(repo.path(), &["init"]);
-        std::fs::write(repo.path().join("README.md"), "original\n").expect("write fixture");
-        git(repo.path(), &["add", "README.md"]);
-        git(
-            repo.path(),
-            &[
-                "-c",
-                "user.email=tuix@local",
-                "-c",
-                "user.name=tuix",
-                "commit",
-                "-m",
-                "init",
-            ],
-        );
-        repo
-    }
-
-    #[test]
-    fn interactive_diff_distinguishes_clean_and_dirty_repositories() {
-        let repo = clean_repo();
-        assert!(build_interactive_diff(repo.path()).unwrap().is_none());
-
-        std::fs::write(repo.path().join("README.md"), "modified\n").expect("dirty fixture");
-        let parsed = build_interactive_diff(repo.path())
-            .unwrap()
-            .expect("dirty repository should produce a patch");
-
-        assert_eq!(parsed.files.len(), 1);
-        assert!(parsed.files[0].header.starts_with("diff --git "));
-        assert!(parsed.files[0]
-            .entries
-            .iter()
-            .any(|entry| entry.kind == DiffKind::Del && entry.text == "original"));
-        assert!(parsed.files[0]
-            .entries
-            .iter()
-            .any(|entry| entry.kind == DiffKind::Add && entry.text == "modified"));
-    }
-
-    #[test]
-    fn interactive_diff_reports_non_git_directory_as_an_error() {
-        let dir = tempfile::tempdir().expect("plain tempdir");
-        assert!(build_interactive_diff(dir.path()).is_err());
-    }
-
-    #[test]
-    fn interactive_diff_groups_adjacent_text_for_resize_replay() {
-        let lines = interactive_diff_lines(ParsedDiff {
-            files: vec![
-                ParsedDiffFile {
-                    header: "diff --git a/image.png b/image.png".into(),
-                    entries: Vec::new(),
-                    summary: Some("Binary files a/image.png and b/image.png differ".into()),
-                },
-                ParsedDiffFile {
-                    header: "diff --git a/script.sh b/script.sh".into(),
-                    entries: Vec::new(),
-                    summary: Some("old mode 100644\nnew mode 100755".into()),
-                },
-            ],
-            truncated: false,
-        });
-
-        assert_eq!(
-            lines.len(),
-            1,
-            "adjacent command text must be one replay unit"
-        );
-        let UiLine::CommandOutput(text) = &lines[0] else {
-            panic!("expected grouped command output, got {lines:?}");
-        };
-        assert_eq!(
-            text.lines().collect::<Vec<_>>(),
-            vec![
-                "diff --git a/image.png b/image.png",
-                "Binary files a/image.png and b/image.png differ",
-                "diff --git a/script.sh b/script.sh",
-                "old mode 100644",
-                "new mode 100755",
-            ]
-        );
-    }
+    Ok(crate::git_diff::format_compact_snapshot(&snapshot))
 }
 
 /// Fetch CodingPlan usage from the gateway (BLOCKING network call). `None` when the

@@ -51,6 +51,12 @@ type PendingPanelMessage = {
   generation?: number;
 };
 
+type PanelHistoryLoad = {
+  sessionId: string;
+  projectHash: string;
+  promise: Promise<MessageInfo[] | undefined>;
+};
+
 type SessionMetaLike = SessionMeta & {
   isGenerating?: boolean;
   hasUnread?: boolean;
@@ -149,6 +155,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _panels = new Map<string, vscode.WebviewPanel>();
   private _webviewPanels = new Map<vscode.Webview, vscode.WebviewPanel>();
   private _sessionBindingPromises = new Map<vscode.Webview, Promise<string | undefined>>();
+  private _panelHistoryLoads = new WeakMap<vscode.WebviewPanel, PanelHistoryLoad>();
   private _panelSessions = new Map<string, PanelSessionInfo>();
   private _panelReady = new Map<string, boolean>();
   private _activeSessionId?: string;
@@ -191,8 +198,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _broadcastChromeFont() {
     const msg = { type: 'chromeFont', value: resolveChatFontFamily() ?? null };
     this._view?.webview.postMessage(msg);
-    for (const panel of this._panels.values()) {
-      panel.webview.postMessage(msg);
+    for (const webview of this._webviewPanels.keys()) {
+      webview.postMessage(msg);
     }
   }
 
@@ -215,7 +222,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     const globalSessions = await this._client.listSessions() as SessionMetaLike[];
-    return { sessions: globalSessions };
+    if (!workspaceFolder) return { sessions: globalSessions };
+
+    // Older daemons may not expose the scoped endpoint. Their global fallback
+    // is still usable, but must not leak sessions from unrelated workspaces
+    // into the current sidebar.
+    const resolvedWorkspace = path.resolve(workspaceFolder);
+    const currentProjectSessions = globalSessions.filter((session) =>
+      session.working_dir
+        ? path.resolve(session.working_dir) === resolvedWorkspace
+        : false
+    );
+    return {
+      sessions: currentProjectSessions,
+      currentProjectHash: currentProjectSessions.find((session) => session.project_hash)?.project_hash,
+      workspaceFolder,
+    };
   }
 
   public dispose() {
@@ -272,9 +294,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       light: vscode.Uri.joinPath(this._extensionUri, 'resources', 'icon.svg'),
       dark: vscode.Uri.joinPath(this._extensionUri, 'resources', 'icon.svg'),
     };
-    panel.webview.html = this._getHtml(panel.webview, 'tab');
-    this._webviewPanels.set(panel.webview, panel);
-    this._setupWebviewMessageHandler(panel.webview, 'tab');
+    const webview = panel.webview;
+    this._webviewPanels.set(webview, panel);
 
     // Track the panel — required for message routing, size check, and lookup
     if (sessionId) {
@@ -283,10 +304,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._activeSessionId = sessionId;
     }
 
+    // Bind the ready listener only after the panel/session indexes exist, but
+    // before assigning HTML. The webview may boot quickly enough to emit its
+    // one-shot ready event as soon as the document is installed.
+    this._setupWebviewMessageHandler(webview, 'tab');
+    webview.html = this._getHtml(webview, 'tab');
+
     // When user switches to this tab in VS Code, sync sidebar selection
     panel.onDidChangeViewState((e) => {
       if (e.webviewPanel.active) {
-        void this._sendSetupState(panel.webview);
+        void this._sendSetupState(webview);
         const activeSid = this._findSessionIdByPanel(panel);
         if (activeSid) {
           this._focusedPanelId = activeSid;
@@ -297,37 +324,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     panel.onDidDispose(() => {
-      this._webviewPanels.delete(panel.webview);
-      this._sessionBindingPromises.delete(panel.webview);
-      const disposedSid = this._findSessionIdByPanel(panel);
-      if (disposedSid) {
-        const rt = this._sessionRuntimes.get(disposedSid);
-        if (rt) rt.queuedMessages = [];
-        if (rt?.isGenerating || rt?.recoveryLocked) {
-          rt.terminalSeen = true;
-          rt.isGenerating = false;
-          rt.recoveryLocked = true;
-          rt.terminal = { type: 'stopped', generation: rt.streamGeneration ?? 0 };
-          rt.abortController?.abort();
-          rt.abortController = undefined;
-          const generation = rt.streamGeneration ?? 0;
-          void this._client.stopGeneration(disposedSid).then((result) => {
-            if (!result.success) throw new Error(result.message || 'stop request failed');
-            const current = this._sessionRuntimes.get(disposedSid);
-            if (current?.streamGeneration === generation) current.recoveryLocked = false;
-          }).catch(() => {
-            const current = this._sessionRuntimes.get(disposedSid);
-            if (current?.streamGeneration === generation) current.recoveryLocked = true;
-          });
-        }
-        this._panels.delete(disposedSid);
-        this._panelReady.delete(disposedSid);
-        this._pendingMessages.delete(disposedSid);
-        this._panelSessions.delete(disposedSid);
-        if (this._focusedPanelId === disposedSid) {
-          this._focusedPanelId = undefined;
-        }
-      }
+      this._handlePanelDisposed(panel, webview);
     });
   }
 
@@ -339,10 +336,44 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private _sessionIdForWebview(webview: vscode.Webview): string | undefined {
-    for (const [sid, panel] of this._panels) {
-      if (panel.webview === webview) return sid;
+    const panel = this._webviewPanels.get(webview);
+    return panel ? this._findSessionIdByPanel(panel) : undefined;
+  }
+
+  private _handlePanelDisposed(panel: vscode.WebviewPanel, webview: vscode.Webview) {
+    const disposedSid = this._findSessionIdByPanel(panel);
+    this._webviewPanels.delete(webview);
+    this._sessionBindingPromises.delete(webview);
+    this._panelHistoryLoads.delete(panel);
+    if (!disposedSid) return;
+
+    const rt = this._sessionRuntimes.get(disposedSid);
+    this._panels.delete(disposedSid);
+    this._panelReady.delete(disposedSid);
+    this._pendingMessages.delete(disposedSid);
+    this._panelSessions.delete(disposedSid);
+    if (this._focusedPanelId === disposedSid) {
+      this._focusedPanelId = undefined;
     }
-    return undefined;
+
+    if (rt) rt.queuedMessages = [];
+    if (rt?.isGenerating || rt?.recoveryLocked) {
+      rt.terminalSeen = true;
+      rt.isGenerating = false;
+      rt.recoveryLocked = true;
+      rt.terminal = { type: 'stopped', generation: rt.streamGeneration ?? 0 };
+      rt.abortController?.abort();
+      rt.abortController = undefined;
+      const generation = rt.streamGeneration ?? 0;
+      void this._client.stopGeneration(disposedSid).then((result) => {
+        if (!result.success) throw new Error(result.message || 'stop request failed');
+        const current = this._sessionRuntimes.get(disposedSid);
+        if (current?.streamGeneration === generation) current.recoveryLocked = false;
+      }).catch(() => {
+        const current = this._sessionRuntimes.get(disposedSid);
+        if (current?.streamGeneration === generation) current.recoveryLocked = true;
+      });
+    }
   }
 
   private _selectSession(sessionId?: string, projectHash?: string) {
@@ -419,46 +450,135 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await new Promise(resolve => setTimeout(resolve, 500));
   }
 
+  private _loadPanelHistory(
+    panel: vscode.WebviewPanel,
+    sessionId: string,
+    projectHash: string,
+  ): Promise<MessageInfo[] | undefined> {
+    const currentLoad = this._panelHistoryLoads.get(panel);
+    if (
+      currentLoad?.sessionId === sessionId
+      && currentLoad.projectHash === projectHash
+      && this._panels.get(sessionId) === panel
+    ) {
+      return currentLoad.promise;
+    }
+
+    const startGeneration = this._sessionRuntimes.get(sessionId)?.streamGeneration ?? 0;
+    let promise!: Promise<MessageInfo[] | undefined>;
+    promise = this._client.getSession(projectHash, sessionId)
+      .then((detail) => {
+        const activeLoad = this._panelHistoryLoads.get(panel);
+        const runtime = this._sessionRuntimes.get(sessionId);
+        if (
+          activeLoad?.promise !== promise
+          || this._panels.get(sessionId) !== panel
+          || (runtime?.streamGeneration ?? 0) !== startGeneration
+          || runtime?.isGenerating
+        ) {
+          return undefined;
+        }
+
+        const info = this._panelSessions.get(sessionId);
+        if (
+          info?.messagesPromise !== promise
+          || (info.projectHash && info.projectHash !== projectHash)
+        ) {
+          return undefined;
+        }
+
+        const messages = detail.messages;
+        this._panelSessions.set(sessionId, {
+          ...info,
+          sessionId,
+          projectHash,
+          messages,
+          messagesPromise: undefined,
+        });
+        const targetRuntime = this._getRuntime(sessionId);
+        targetRuntime.projectHash = projectHash;
+        targetRuntime.messages = messages;
+        this._postOrQueueToPanel(sessionId, {
+          type: 'sessionMessages',
+          messages,
+          terminal: this._terminalForWebview(targetRuntime.terminal),
+        }, targetRuntime.streamGeneration ?? 0);
+        return messages;
+      })
+      .finally(() => {
+        if (this._panelHistoryLoads.get(panel)?.promise === promise) {
+          this._panelHistoryLoads.delete(panel);
+        }
+        const info = this._panelSessions.get(sessionId);
+        if (info?.messagesPromise === promise) {
+          this._panelSessions.set(sessionId, {
+            ...info,
+            messagesPromise: undefined,
+          });
+        }
+      });
+
+    this._panelHistoryLoads.set(panel, { sessionId, projectHash, promise });
+    const info = this._panelSessions.get(sessionId);
+    this._panelSessions.set(sessionId, {
+      ...info,
+      sessionId,
+      projectHash,
+      messages: info?.projectHash === projectHash ? info.messages : undefined,
+      messagesPromise: promise,
+    });
+    return promise;
+  }
+
+  private async _restorePanelHistory(
+    panel: vscode.WebviewPanel,
+    sessionId: string,
+    projectHash?: string,
+  ): Promise<void> {
+    try {
+      const resolvedProjectHash = await this._resolveSessionProjectHash(sessionId, projectHash);
+      if (!resolvedProjectHash) return;
+      if (this._panels.get(sessionId) !== panel) return;
+      await this._loadPanelHistory(panel, sessionId, resolvedProjectHash);
+    } catch {
+      // Keep the restored tab retryable. A later session-list click carries an
+      // explicit project hash and re-enters the same guarded loader.
+    }
+  }
+
   public setupPanelForRestore(panel: vscode.WebviewPanel, sessionId?: string, projectHash?: string) {
-    panel.webview.options = {
+    const webview = panel.webview;
+    webview.options = {
       enableScripts: true,
       localResourceRoots: [
         vscode.Uri.joinPath(this._extensionUri, 'webview'),
         vscode.Uri.joinPath(this._extensionUri, 'node_modules', 'highlight.js'),
       ],
     };
-    panel.webview.html = this._getHtml(panel.webview, 'tab');
     panel.iconPath = {
       light: vscode.Uri.joinPath(this._extensionUri, 'resources', 'icon.svg'),
       dark: vscode.Uri.joinPath(this._extensionUri, 'resources', 'icon.svg'),
     };
-    this._webviewPanels.set(panel.webview, panel);
-    this._setupWebviewMessageHandler(panel.webview, 'tab');
+    this._webviewPanels.set(webview, panel);
 
     // Track the panel
     if (sessionId) {
       this._panels.set(sessionId, panel);
     }
 
-    if (sessionId && projectHash) {
-      const messagesPromise = this._client.getSession(projectHash, sessionId)
-        .then(detail => detail?.messages)
-        .catch(() => undefined);
-      this._panelSessions.set(sessionId, { sessionId, projectHash, messagesPromise });
-      messagesPromise.then(messages => {
-        const info = this._panelSessions.get(sessionId);
-        if (info) {
-          info.messages = messages;
-          info.messagesPromise = undefined;
-        }
-        if (messages) this._getRuntime(sessionId).messages = messages;
-      });
+    if (sessionId) {
+      void this._restorePanelHistory(panel, sessionId, projectHash);
     }
+
+    // Complete the restored session binding before the document can emit
+    // `ready`, otherwise initial history can be requested without an owner.
+    this._setupWebviewMessageHandler(webview, 'tab');
+    webview.html = this._getHtml(webview, 'tab');
 
     // When user switches to this tab in VS Code, sync sidebar selection
     panel.onDidChangeViewState((e) => {
       if (e.webviewPanel.active) {
-        void this._sendSetupState(panel.webview);
+        void this._sendSetupState(webview);
         const activeSid = this._findSessionIdByPanel(panel);
         if (activeSid) {
           this._focusedPanelId = activeSid;
@@ -469,37 +589,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     panel.onDidDispose(() => {
-      this._webviewPanels.delete(panel.webview);
-      this._sessionBindingPromises.delete(panel.webview);
-      const disposedSid = this._findSessionIdByPanel(panel);
-      if (disposedSid) {
-        const rt = this._sessionRuntimes.get(disposedSid);
-        if (rt) rt.queuedMessages = [];
-        if (rt?.isGenerating || rt?.recoveryLocked) {
-          rt.terminalSeen = true;
-          rt.isGenerating = false;
-          rt.recoveryLocked = true;
-          rt.terminal = { type: 'stopped', generation: rt.streamGeneration ?? 0 };
-          rt.abortController?.abort();
-          rt.abortController = undefined;
-          const generation = rt.streamGeneration ?? 0;
-          void this._client.stopGeneration(disposedSid).then((result) => {
-            if (!result.success) throw new Error(result.message || 'stop request failed');
-            const current = this._sessionRuntimes.get(disposedSid);
-            if (current?.streamGeneration === generation) current.recoveryLocked = false;
-          }).catch(() => {
-            const current = this._sessionRuntimes.get(disposedSid);
-            if (current?.streamGeneration === generation) current.recoveryLocked = true;
-          });
-        }
-        this._panels.delete(disposedSid);
-        this._panelReady.delete(disposedSid);
-        this._pendingMessages.delete(disposedSid);
-        this._panelSessions.delete(disposedSid);
-        if (this._focusedPanelId === disposedSid) {
-          this._focusedPanelId = undefined;
-        }
-      }
+      this._handlePanelDisposed(panel, webview);
     });
   }
 
@@ -1661,7 +1751,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._broadcastMessage(msg);
       const tracked = webview && (
         this._view?.webview === webview
-        || Array.from(this._panels.values()).some((panel) => panel.webview === webview)
+        || this._webviewPanels.has(webview)
       );
       if (webview && !tracked) this._postMessage(msg, webview);
     };
@@ -2056,21 +2146,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const existing = this._panels.get(sessionId);
     if (existing) {
+      const cached = this._panelSessions.get(sessionId);
+      let hash = projectHash
+        ?? cached?.projectHash
+        ?? this._sessionRuntimes.get(sessionId)?.projectHash;
+      const cachedForProject = !projectHash || cached?.projectHash === projectHash
+        ? cached
+        : undefined;
+      let messages = cachedForProject?.messages;
+
+      if (messages === undefined) {
+        hash ??= await this._resolveSessionProjectHash(sessionId);
+        if (this._panels.get(sessionId) !== existing) return;
+        if (!hash) {
+          vscode.window.showErrorMessage(vscode.l10n.t('Unable to open session: missing project hash.'));
+          return;
+        }
+        try {
+          const pendingForProject = cachedForProject?.messagesPromise;
+          messages = await (pendingForProject
+            ?? this._loadPanelHistory(existing, sessionId, hash));
+          if (this._panels.get(sessionId) !== existing) return;
+          if (this._panelSessions.get(sessionId)?.projectHash !== hash) return;
+          if (messages === undefined) {
+            existing.reveal();
+            this._focusedPanelId = sessionId;
+            this._activeSessionId = sessionId;
+            this._selectSession(sessionId, hash);
+            return;
+          }
+        } catch (e) {
+          if (this._panels.get(sessionId) !== existing) return;
+          if (this._panelSessions.get(sessionId)?.projectHash !== hash) return;
+          vscode.window.showErrorMessage(`Unable to load session: ${this._messageFromError(e)}`);
+          return;
+        }
+      }
+
       existing.reveal();
       this._focusedPanelId = sessionId;
       this._activeSessionId = sessionId;
+      this._selectSession(sessionId, hash);
       return;
     }
 
-    let hash = projectHash;
-    if (!hash) {
-      try {
-        const allSessions = await this._client.listSessions();
-        const match = (allSessions as Array<{ project_hash?: string; meta?: { id?: string }; id?: string }>)
-          .find(s => (s.meta?.id || s.id) === sessionId);
-        hash = match?.project_hash ?? this._sessionRuntimes.get(sessionId)?.projectHash;
-      } catch { /* proceed without hash */ }
-    }
+    const hash = await this._resolveSessionProjectHash(sessionId, projectHash);
 
     if (!hash) {
       vscode.window.showErrorMessage(vscode.l10n.t('Unable to open session: missing project hash.'));
@@ -2333,13 +2453,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async _resolveSessionProjectHash(sessionId: string, projectHash?: string): Promise<string | undefined> {
     if (projectHash) return projectHash;
+    const boundProjectHash = this._panelSessions.get(sessionId)?.projectHash
+      ?? this._sessionRuntimes.get(sessionId)?.projectHash;
+    if (boundProjectHash) return boundProjectHash;
     try {
-      const sessions = await this._client.listSessions();
-      const match = (sessions as Array<{ project_hash?: string; meta?: { id?: string }; id?: string }>)
-        .find(s => (s.meta?.id || s.id) === sessionId);
-      return match?.project_hash;
+      return (await this._client.resolveSession(sessionId)).project_hash;
     } catch {
-      return undefined;
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!workspaceFolder) return undefined;
+      try {
+        const scoped = await this._client.listSessionsForWorkingDir(workspaceFolder);
+        return scoped.find((session) => session.id === sessionId)?.project_hash;
+      } catch {
+        try {
+          const resolvedWorkspace = path.resolve(workspaceFolder);
+          const matches = (await this._client.listSessions()).filter((session) =>
+            session.id === sessionId
+            && Boolean(session.project_hash)
+            && (session.working_dir
+              ? path.resolve(session.working_dir) === resolvedWorkspace
+              : false)
+          );
+          const projectHashes = new Set(matches.map((session) => session.project_hash));
+          return projectHashes.size === 1 ? matches[0]?.project_hash : undefined;
+        } catch {
+          return undefined;
+        }
+      }
     }
   }
 
@@ -2771,8 +2911,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private _broadcastToPanels(msg: any) {
-    for (const panel of this._panels.values()) {
-      panel.webview.postMessage(msg);
+    for (const webview of this._webviewPanels.keys()) {
+      webview.postMessage(msg);
     }
   }
 
@@ -2782,21 +2922,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private _markPanelReady(webview: vscode.Webview) {
-    for (const [sid, panel] of this._panels) {
-      if (panel.webview === webview) {
-        this._panelReady.set(sid, true);
-        return;
-      }
-    }
+    const sid = this._sessionIdForWebview(webview);
+    if (sid) this._panelReady.set(sid, true);
   }
 
   private _markPanelNotReady(webview: vscode.Webview) {
-    for (const [sid, panel] of this._panels) {
-      if (panel.webview === webview) {
-        this._panelReady.set(sid, false);
-        return;
-      }
-    }
+    const sid = this._sessionIdForWebview(webview);
+    if (sid) this._panelReady.set(sid, false);
   }
 
   private _messageFromError(e: unknown): string {

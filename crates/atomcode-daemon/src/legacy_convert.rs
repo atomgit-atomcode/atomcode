@@ -923,7 +923,18 @@ fn catalog_for_project_in_root(
                 || working_dirs_equivalent(&entry.working_dir, working_dir)
         })
         .collect();
-    for entry in &mut entries {
+    repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
+    Ok(entries)
+}
+
+/// Hydrate only placeholder names for catalog display. Native repairs are
+/// persisted by the strict aggregate loader; legacy-only views stay read-only.
+/// A damaged entry keeps its scanned name and never hides healthy sessions.
+pub(crate) fn repair_catalog_names_for_display_in_root(
+    sessions_root: &std::path::Path,
+    entries: &mut [atomcode_capabilities::session::CatalogEntry],
+) {
+    for entry in entries {
         if !SessionMeta::name_needs_fallback(&entry.name, &entry.id) {
             continue;
         }
@@ -936,7 +947,6 @@ fn catalog_for_project_in_root(
             ),
         }
     }
-    Ok(entries)
 }
 
 fn working_dirs_equivalent(left: &std::path::Path, right: &std::path::Path) -> bool {

@@ -1508,28 +1508,65 @@ fn catalog_entry_with_project(
     }
 }
 
+static SESSION_CATALOG_IO: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Run bulk catalog scans off the async runtime and serialize them so queued
+/// refreshes rescan after any durable placeholder-name repairs.
+async fn run_session_catalog_io<T>(
+    operation: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T>
+where
+    T: Send + 'static,
+{
+    let permit = SESSION_CATALOG_IO.acquire().await.map_err(|error| {
+        std::io::Error::other(format!("session catalog coordinator closed: {error}"))
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("session catalog task failed: {error}")))?
+}
+
 /// List sessions for a project
 fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionSummary>> {
-    Ok(
-        catalog_scan_in_root(&NativeSessionManager::sessions_root())?
-            .entries
-            .iter()
-            .filter(|entry| entry.project_bucket == project_hash && entry.message_count > 0)
-            .map(catalog_entry_to_session_summary)
-            .collect(),
-    )
+    list_sessions_in_root(&NativeSessionManager::sessions_root(), project_hash)
+}
+
+fn list_sessions_in_root(
+    sessions_root: &std::path::Path,
+    project_hash: &str,
+) -> std::io::Result<Vec<SessionSummary>> {
+    let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
+        .entries
+        .into_iter()
+        .filter(|entry| entry.project_bucket == project_hash && entry.message_count > 0)
+        .collect();
+    crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
+    Ok(entries
+        .iter()
+        .map(catalog_entry_to_session_summary)
+        .collect())
 }
 
 /// List all sessions across all projects
 fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
-    let mut all_sessions: Vec<_> = catalog_scan_in_root(&NativeSessionManager::sessions_root())?
+    list_all_sessions_in_root(&NativeSessionManager::sessions_root())
+}
+
+fn list_all_sessions_in_root(
+    sessions_root: &std::path::Path,
+) -> std::io::Result<Vec<SessionMetaWithProject>> {
+    let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
         .entries
-        .iter()
+        .into_iter()
         .filter(|entry| entry.message_count > 0)
-        .map(catalog_entry_with_project)
         .collect();
-    all_sessions.truncate(50);
-    Ok(all_sessions)
+    // Bound snapshot hydration to the same newest-50 surface the API returns.
+    entries.truncate(50);
+    crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
+    Ok(entries.iter().map(catalog_entry_with_project).collect())
 }
 
 /// Resolve a (possibly short) session id to its full record by scanning bucket
@@ -1876,7 +1913,7 @@ async fn change_dir(
 
 /// GET /projects - List all projects (historical, from sessions directory)
 async fn get_projects() -> impl IntoResponse {
-    match list_projects() {
+    match run_session_catalog_io(list_projects).await {
         Ok(projects) => Json(projects).into_response(),
         Err(e) => {
             let msg = format!("Failed to list projects: {}", e);
@@ -1887,7 +1924,7 @@ async fn get_projects() -> impl IntoResponse {
 
 /// GET /projects/:hash/sessions - List sessions for a project
 async fn get_project_sessions(Path(hash): Path<String>) -> impl IntoResponse {
-    match list_sessions(&hash) {
+    match run_session_catalog_io(move || list_sessions(&hash)).await {
         Ok(sessions) => Json(sessions).into_response(),
         Err(e) => {
             let msg = format!("Failed to list sessions: {}", e);
@@ -1916,7 +1953,8 @@ async fn get_sessions_by_working_dir(
     Query(query): Query<SessionsByWorkingDirQuery>,
 ) -> impl IntoResponse {
     let hash = hash_path(&query.working_dir);
-    match list_sessions(&hash) {
+    let list_hash = hash.clone();
+    match run_session_catalog_io(move || list_sessions(&list_hash)).await {
         Ok(sessions) => {
             let sessions: Vec<SessionMetaWithProject> = sessions
                 .into_iter()
@@ -2047,7 +2085,7 @@ fn merge_catalog_session_messages_for_display(
 
 /// GET /sessions - List all sessions across all projects
 async fn get_all_sessions() -> impl IntoResponse {
-    match list_all_sessions() {
+    match run_session_catalog_io(list_all_sessions).await {
         Ok(sessions) => Json(sessions).into_response(),
         Err(e) => {
             let msg = format!("Failed to list sessions: {}", e);
@@ -2186,24 +2224,33 @@ async fn append_session_messages(
 
 /// Search sessions by name across all projects
 fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWithProject>> {
+    search_sessions_by_name_in_root(&NativeSessionManager::sessions_root(), keyword)
+}
+
+fn search_sessions_by_name_in_root(
+    sessions_root: &std::path::Path,
+    keyword: &str,
+) -> std::io::Result<Vec<SessionMetaWithProject>> {
     let keyword_lower = keyword.to_lowercase();
-    Ok(
-        catalog_scan_in_root(&NativeSessionManager::sessions_root())?
-            .entries
-            .iter()
-            .filter(|entry| {
-                entry.message_count > 0
-                    && (entry.name.to_lowercase().contains(&keyword_lower)
-                        || entry
-                            .working_dir
-                            .to_string_lossy()
-                            .to_lowercase()
-                            .contains(&keyword_lower)
-                        || entry.id.to_lowercase().starts_with(&keyword_lower))
-            })
-            .map(catalog_entry_with_project)
-            .collect(),
-    )
+    let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
+        .entries
+        .into_iter()
+        .filter(|entry| entry.message_count > 0)
+        .collect();
+    crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
+    Ok(entries
+        .iter()
+        .filter(|entry| {
+            entry.name.to_lowercase().contains(&keyword_lower)
+                || entry
+                    .working_dir
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&keyword_lower)
+                || entry.id.to_lowercase().starts_with(&keyword_lower)
+        })
+        .map(catalog_entry_with_project)
+        .collect())
 }
 
 /// GET /sessions/search?q=keyword - Search sessions by name
@@ -2216,7 +2263,8 @@ async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse 
             .into_response();
     }
 
-    match search_sessions_by_name(&query.q) {
+    let keyword = query.q;
+    match run_session_catalog_io(move || search_sessions_by_name(&keyword)).await {
         Ok(sessions) => Json(sessions).into_response(),
         Err(e) => {
             let msg = format!("Failed to search sessions: {}", e);
@@ -5781,6 +5829,185 @@ mod tests {
         assert!(scan.diagnostics[0]
             .message
             .contains("sidecars but no metadata"));
+    }
+
+    #[test]
+    fn daemon_project_listing_repairs_placeholder_session_names() {
+        use atomcode_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let session_id = "historical-session";
+        let manager = SessionManager::with_root(tmp.path().join(project_bucket));
+        let lease = manager.acquire_lease(session_id).unwrap();
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            atomcode_kernel::message::Message::user("修复 VS Code 历史标题"),
+        ]);
+        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "修复 VS Code 历史标题");
+        assert_eq!(
+            manager.read_meta(session_id).unwrap().name,
+            "修复 VS Code 历史标题"
+        );
+    }
+
+    #[test]
+    fn daemon_global_listing_and_search_use_repaired_session_names() {
+        use atomcode_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let session_id = "searchable-history";
+        let manager = SessionManager::with_root(tmp.path().join(project_bucket));
+        let lease = manager.acquire_lease(session_id).unwrap();
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            atomcode_kernel::message::Message::user("可搜索的历史标题"),
+        ]);
+        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+
+        let global = list_all_sessions_in_root(tmp.path()).unwrap();
+        let search = search_sessions_by_name_in_root(tmp.path(), "可搜索").unwrap();
+
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].meta.name, "可搜索的历史标题");
+        assert_eq!(search.len(), 1);
+        assert_eq!(search[0].meta.id, session_id);
+    }
+
+    #[test]
+    fn daemon_legacy_listing_repairs_name_without_cutting_over_storage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let project = tmp.path().join(project_bucket);
+        std::fs::create_dir_all(&project).unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../atomcode-core/tests/fixtures/session/legacy_full.json"
+        ))
+        .unwrap();
+        let session_id = legacy["id"].as_str().unwrap().to_string();
+        legacy["name"] = serde_json::Value::String(format!("session-{session_id}"));
+        legacy["user_renamed"] = serde_json::Value::Bool(false);
+        legacy["ai_named"] = serde_json::Value::Bool(false);
+        std::fs::write(
+            project.join(format!("{session_id}.json")),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "inspect this image");
+        assert!(!project.join(format!("{session_id}.meta")).exists());
+        assert!(!project.join(format!("{session_id}.snapshot")).exists());
+        assert!(!project.join(format!("{session_id}.ui.json")).exists());
+    }
+
+    #[test]
+    fn daemon_global_listing_keeps_latest_fifty_sessions() {
+        use atomcode_capabilities::session::{SessionManager, SessionMeta};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(tmp.path().join("0123456789abcdef"));
+        for index in 0..51 {
+            let id = format!("history-{index:02}");
+            let mut meta = SessionMeta::new(&id, "/project", index);
+            meta.name = format!("history title {index:02}");
+            meta.message_count = 1;
+            manager.write_meta(&meta).unwrap();
+        }
+
+        let sessions = list_all_sessions_in_root(tmp.path()).unwrap();
+
+        assert_eq!(sessions.len(), 50);
+        assert_eq!(sessions[0].meta.id, "history-50");
+        assert!(!sessions
+            .iter()
+            .any(|session| session.meta.id == "history-00"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_catalog_io_is_offloaded_and_single_flight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let first_started = std::sync::Arc::new(AtomicBool::new(false));
+        let first_started_in_task = std::sync::Arc::clone(&first_started);
+        let (release_first, wait_for_release) = std::sync::mpsc::channel();
+        let first = tokio::spawn(run_session_catalog_io(move || {
+            first_started_in_task.store(true, Ordering::SeqCst);
+            wait_for_release.recv().map_err(std::io::Error::other)?;
+            Ok("first")
+        }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !first_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking catalog work should start off the runtime thread");
+
+        let runtime_progressed = std::sync::Arc::new(AtomicBool::new(false));
+        let runtime_progressed_in_task = std::sync::Arc::clone(&runtime_progressed);
+        tokio::spawn(async move {
+            runtime_progressed_in_task.store(true, Ordering::SeqCst);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !runtime_progressed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("catalog file IO must not block the current-thread runtime");
+
+        let second_started = std::sync::Arc::new(AtomicBool::new(false));
+        let second_started_in_task = std::sync::Arc::clone(&second_started);
+        let second = tokio::spawn(run_session_catalog_io(move || {
+            second_started_in_task.store(true, Ordering::SeqCst);
+            Ok("second")
+        }));
+        let overlapped = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            while !second_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+
+        release_first.send(()).unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), "first");
+        assert_eq!(second.await.unwrap().unwrap(), "second");
+        assert!(!overlapped, "catalog scans must execute one at a time");
     }
 
     // 回归：webui URL 刷新恢复只带短 id,必须能跨桶按 id 定位会话(且不受 /sessions

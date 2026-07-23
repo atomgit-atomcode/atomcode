@@ -28,7 +28,9 @@ use crossterm::execute;
 use super::cell::{push_str_cells, push_str_cells_sgr, serialize_row, Cell, CellStyle};
 use super::screen::Screen;
 use super::theme::{role, Role};
-use super::{MenuPayload, Renderer, StatusLine, UiLine};
+use super::{
+    DiffPanelRow, DiffPanelSpan, DiffPanelTone, MenuPayload, Renderer, StatusLine, UiLine,
+};
 use crate::i18n::{t, Msg};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
@@ -4502,6 +4504,104 @@ impl<W: Write + Send> RetainedRenderer<W> {
         ModalOverlayState { cells, x, y }
     }
 
+    fn build_diff_panel_overlay(
+        &self,
+        title: &str,
+        rows: &[DiffPanelRow],
+        footer: &str,
+        win_width: u16,
+        win_height: u16,
+    ) -> ModalOverlayState {
+        let plain_rows: Vec<String> = rows
+            .iter()
+            .map(|row| row.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        let mut overlay = self.build_modal_overlay(title, &plain_rows, 0, 1, win_width, win_height);
+        let content_height = overlay.cells.len().saturating_sub(5);
+
+        for (index, row) in rows.iter().take(content_height).enumerate() {
+            self.paint_diff_panel_row(&mut overlay.cells[3 + index], row);
+        }
+        if overlay.cells.len() >= 2 {
+            let footer_row =
+                DiffPanelRow::new(vec![DiffPanelSpan::new(footer, DiffPanelTone::Muted)]);
+            let footer_index = overlay.cells.len() - 2;
+            self.paint_diff_panel_row(&mut overlay.cells[footer_index], &footer_row);
+        }
+        overlay
+    }
+
+    fn paint_diff_panel_row(&self, target: &mut Vec<Cell>, row: &DiffPanelRow) {
+        if target.len() < 3 {
+            return;
+        }
+        let left_border = target.first().cloned().unwrap_or_else(Cell::blank);
+        let right_border = target.last().cloned().unwrap_or_else(Cell::blank);
+        let inner_width = target.len().saturating_sub(2);
+        let mut content = Vec::with_capacity(inner_width);
+        let mut leading_pad = Cell::blank();
+        leading_pad.style.reverse = row.selected;
+        content.push(leading_pad);
+
+        for span in &row.spans {
+            let role = match span.tone {
+                DiffPanelTone::Default => Role::Secondary,
+                DiffPanelTone::Muted => Role::Muted,
+                DiffPanelTone::Brand => Role::Brand,
+                DiffPanelTone::Add => Role::DiffAdd,
+                DiffPanelTone::Remove => Role::DiffRemove,
+                DiffPanelTone::Warning => Role::Warning,
+            };
+            let mut style = if span.bold {
+                self.style_bold(role)
+            } else {
+                self.style_for(role)
+            };
+            style.reverse = row.selected;
+            let safe = scrub_controls(&span.text);
+            for ch in safe.chars() {
+                if matches!(ch, '\n' | '\r') {
+                    continue;
+                }
+                if ch == '\t' {
+                    let spaces = crate::render::cell::SOFT_TAB_WIDTH
+                        .min(inner_width.saturating_sub(content.len()));
+                    for _ in 0..spaces {
+                        content.push(Cell {
+                            ch: ' ',
+                            style: style.clone(),
+                            width: 1,
+                        });
+                    }
+                    continue;
+                }
+                let width = crate::width::cell_char_width(ch).unwrap_or(1);
+                if width == 0 || content.len().saturating_add(width) > inner_width {
+                    continue;
+                }
+                content.push(Cell {
+                    ch,
+                    style: style.clone(),
+                    width: width as u8,
+                });
+                for _ in 1..width {
+                    content.push(Cell::continuation());
+                }
+            }
+        }
+        while content.len() < inner_width {
+            let mut blank = Cell::blank();
+            blank.style.reverse = row.selected;
+            content.push(blank);
+        }
+        content.truncate(inner_width);
+        let mut painted = Vec::with_capacity(target.len());
+        painted.push(left_border);
+        painted.extend(content);
+        painted.push(right_border);
+        *target = painted;
+    }
+
     /// Append-only model: copy the body_lines tail into screen.cells
     /// at rows `[0, body_rows_on_screen)`. Width-clipped to the screen
     /// width. Mirrors the geometry math in `paint_footer` so the
@@ -5877,6 +5977,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             | UiLine::ClearTransient
             | UiLine::InputCommit
             | UiLine::ModalOverlay { .. }
+            | UiLine::DiffPanel { .. }
             | UiLine::ModalOverlayClear => return,
             _ => {}
         }
@@ -6968,6 +7069,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             } => {
                 self.modal_overlay = Some(
                     self.build_modal_overlay(&title, &lines, scroll, total, win_width, win_height),
+                );
+            }
+            UiLine::DiffPanel {
+                title,
+                rows,
+                footer,
+                win_width,
+                win_height,
+            } => {
+                self.modal_overlay = Some(
+                    self.build_diff_panel_overlay(&title, &rows, &footer, win_width, win_height),
                 );
             }
             UiLine::ModalOverlayClear => {
@@ -14513,6 +14625,41 @@ mod tests {
         );
         // The first real glyph follows the expanded tab.
         assert_eq!(content[2 + tab_w].ch, 'f');
+    }
+
+    #[test]
+    fn diff_panel_preserves_semantic_styles_and_expands_tabs() {
+        let (r, _buf) = new_capturing(80, 24);
+        let rows = vec![
+            DiffPanelRow::new(vec![
+                DiffPanelSpan::new("+1", DiffPanelTone::Add),
+                DiffPanelSpan::new("  -2", DiffPanelTone::Remove),
+            ]),
+            DiffPanelRow::new(vec![DiffPanelSpan::new(
+                "\tselected.rs",
+                DiffPanelTone::Brand,
+            )])
+            .selected(true),
+        ];
+        let overlay = r.build_diff_panel_overlay("Diff", &rows, "Esc close", 60, 20);
+
+        let stats = &overlay.cells[3];
+        let add = stats.iter().find(|cell| cell.ch == '+').expect("add span");
+        let remove = stats
+            .iter()
+            .find(|cell| cell.ch == '-')
+            .expect("remove span");
+        assert_eq!(add.style.fg, r.style_for(Role::DiffAdd).fg);
+        assert_eq!(remove.style.fg, r.style_for(Role::DiffRemove).fg);
+
+        let selected = &overlay.cells[4];
+        assert!(selected.iter().all(|cell| cell.ch != '\t'));
+        assert!(
+            selected[1..selected.len() - 1]
+                .iter()
+                .all(|cell| cell.style.reverse),
+            "selection reverse-video must cover the full inner row"
+        );
     }
 
     // --- width-aware truncation tests (Bug B) ---

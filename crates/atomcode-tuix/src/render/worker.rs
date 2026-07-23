@@ -428,6 +428,7 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::VisionPreprocessSuccess { .. } => "VisionPreprocessSuccess",
         UiLine::TurnSeparator { .. } => "TurnSeparator",
         UiLine::ModalOverlay { .. } => "ModalOverlay",
+        UiLine::DiffPanel { .. } => "DiffPanel",
         UiLine::ModalOverlayClear => "ModalOverlayClear",
     }
 }

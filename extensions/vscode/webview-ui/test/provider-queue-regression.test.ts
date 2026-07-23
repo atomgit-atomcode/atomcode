@@ -76,6 +76,288 @@ function testReadyMarksPanelOnlyAfterInitialReplay() {
   );
 }
 
+function testPanelReadyHandlerIsInstalledBeforeWebviewBoots() {
+  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const openStart = source.indexOf('public openInTab(');
+  const openEnd = source.indexOf('private _findSessionIdByPanel', openStart);
+  const openInTab = source.slice(openStart, openEnd);
+  const restoreStart = source.indexOf('public setupPanelForRestore(');
+  const restoreEnd = source.indexOf('resolveWebviewView(', restoreStart);
+  const restorePanel = source.slice(restoreStart, restoreEnd);
+
+  for (const [label, method] of [
+    ['new session tab', openInTab],
+    ['restored session tab', restorePanel],
+  ] as const) {
+    assert.ok(method.includes('_setupWebviewMessageHandler'));
+    assert.ok(method.includes('.html ='));
+    assert.ok(
+      method.indexOf('_setupWebviewMessageHandler') < method.indexOf('.html ='),
+      `${label} must install the ready listener before assigning HTML, or the one-shot ready event can be lost`,
+    );
+  }
+}
+
+async function testOpeningAnExistingUnhydratedSessionTabLoadsItsHistory() {
+  const history = [{ role: 'user', content: 'persisted prompt' }];
+  let detailRequests = 0;
+  let revealCount = 0;
+  const posted: Array<{ type?: string; messages?: unknown[] }> = [];
+  const webview = {
+    postMessage: (message: { type?: string; messages?: unknown[] }) => {
+      posted.push(message);
+    },
+  };
+  const panel = {
+    webview,
+    reveal: () => {
+      revealCount += 1;
+    },
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {
+    getSession: async (projectHash: string, sessionId: string) => {
+      detailRequests += 1;
+      assert.equal(projectHash, 'project-a');
+      assert.equal(sessionId, 'session-a');
+      return { messages: history };
+    },
+  } as never);
+  const unsafeProvider = provider as unknown as {
+    _panels: Map<string, typeof panel>;
+    _panelReady: Map<string, boolean>;
+    _panelSessions: Map<string, { projectHash?: string; messages?: unknown[] }>;
+  };
+  unsafeProvider._panels.set('session-a', panel);
+  unsafeProvider._panelReady.set('session-a', true);
+
+  await provider.openSessionInTab('session-a', 'project-a');
+
+  assert.equal(detailRequests, 1);
+  assert.equal(revealCount, 1);
+  assert.deepEqual(unsafeProvider._panelSessions.get('session-a')?.messages, history);
+  assert.deepEqual(
+    posted.find((message) => message.type === 'sessionMessages')?.messages,
+    history,
+  );
+}
+
+async function testClosingAnExistingTabCancelsItsPendingHistoryHydration() {
+  let resolveHistory!: (detail: { messages: unknown[] }) => void;
+  const historyRequest = new Promise<{ messages: unknown[] }>((resolve) => {
+    resolveHistory = resolve;
+  });
+  let revealCount = 0;
+  const webview = { postMessage: (_message: unknown) => undefined };
+  const panel = { webview, reveal: () => { revealCount += 1; } };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {
+    getSession: () => historyRequest,
+  } as never);
+  const unsafeProvider = provider as unknown as {
+    _panels: Map<string, typeof panel>;
+    _panelReady: Map<string, boolean>;
+    _panelSessions: Map<string, { projectHash?: string; messages?: unknown[] }>;
+    _sessionRuntimes: Map<string, { messages?: unknown[] }>;
+  };
+  unsafeProvider._panels.set('session-a', panel);
+  unsafeProvider._panelReady.set('session-a', true);
+
+  const opening = provider.openSessionInTab('session-a', 'project-a');
+  unsafeProvider._panels.delete('session-a');
+  unsafeProvider._panelReady.delete('session-a');
+  unsafeProvider._panelSessions.delete('session-a');
+  resolveHistory({ messages: [{ role: 'user', content: 'late history' }] });
+  await opening;
+
+  assert.equal(revealCount, 0);
+  assert.equal(unsafeProvider._panelSessions.has('session-a'), false);
+  assert.equal(unsafeProvider._sessionRuntimes.has('session-a'), false);
+}
+
+async function testNewGenerationRejectsHistoryLoadedForAnOlderGeneration() {
+  let resolveHistory!: (detail: { messages: unknown[] }) => void;
+  const historyRequest = new Promise<{ messages: unknown[] }>((resolve) => {
+    resolveHistory = resolve;
+  });
+  const posted: Array<{ type?: string }> = [];
+  const webview = { postMessage: (message: { type?: string }) => { posted.push(message); } };
+  const panel = { webview, reveal: () => undefined };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {
+    getSession: () => historyRequest,
+  } as never);
+  const unsafeProvider = provider as unknown as {
+    _panels: Map<string, typeof panel>;
+    _panelReady: Map<string, boolean>;
+    _sessionRuntimes: Map<string, {
+      isGenerating: boolean;
+      streamGeneration: number;
+      queuedMessages: unknown[];
+      eventBuffer: unknown[];
+      messages?: unknown[];
+    }>;
+  };
+  unsafeProvider._panels.set('session-a', panel);
+  unsafeProvider._panelReady.set('session-a', true);
+  unsafeProvider._sessionRuntimes.set('session-a', {
+    isGenerating: false,
+    streamGeneration: 0,
+    queuedMessages: [],
+    eventBuffer: [],
+  });
+
+  const opening = provider.openSessionInTab('session-a', 'project-a');
+  const runtime = unsafeProvider._sessionRuntimes.get('session-a')!;
+  runtime.streamGeneration = 1;
+  runtime.isGenerating = true;
+  resolveHistory({ messages: [{ role: 'user', content: 'stale history' }] });
+  await opening;
+
+  assert.equal(runtime.messages, undefined);
+  assert.equal(posted.some((message) => message.type === 'sessionMessages'), false);
+}
+
+async function testRepeatedOpenSharesOneHistoryRequestAndPublishesOnce() {
+  let resolveHistory!: (detail: { messages: unknown[] }) => void;
+  const historyRequest = new Promise<{ messages: unknown[] }>((resolve) => {
+    resolveHistory = resolve;
+  });
+  let requests = 0;
+  const posted: Array<{ type?: string }> = [];
+  const webview = { postMessage: (message: { type?: string }) => { posted.push(message); } };
+  const panel = { webview, reveal: () => undefined };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {
+    getSession: () => {
+      requests += 1;
+      return historyRequest;
+    },
+  } as never);
+  const unsafeProvider = provider as unknown as {
+    _panels: Map<string, typeof panel>;
+    _panelReady: Map<string, boolean>;
+  };
+  unsafeProvider._panels.set('session-a', panel);
+  unsafeProvider._panelReady.set('session-a', true);
+
+  const first = provider.openSessionInTab('session-a', 'project-a');
+  const second = provider.openSessionInTab('session-a', 'project-a');
+  resolveHistory({ messages: [{ role: 'user', content: 'persisted' }] });
+  await Promise.all([first, second]);
+
+  assert.equal(requests, 1);
+  assert.equal(posted.filter((message) => message.type === 'sessionMessages').length, 1);
+}
+
+async function testProjectRebindRejectsThePreviousProjectsLateHistory() {
+  let resolveProjectA!: (detail: { messages: unknown[] }) => void;
+  let resolveProjectB!: (detail: { messages: unknown[] }) => void;
+  const projectA = new Promise<{ messages: unknown[] }>((resolve) => { resolveProjectA = resolve; });
+  const projectB = new Promise<{ messages: unknown[] }>((resolve) => { resolveProjectB = resolve; });
+  const posted: Array<{ type?: string; messages?: unknown[]; projectHash?: string }> = [];
+  const webview = {
+    postMessage: (message: { type?: string; messages?: unknown[]; projectHash?: string }) => {
+      posted.push(message);
+    },
+  };
+  const panel = { webview, reveal: () => undefined };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {
+    getSession: (projectHash: string) => projectHash === 'project-a' ? projectA : projectB,
+  } as never);
+  const unsafeProvider = provider as unknown as {
+    _panels: Map<string, typeof panel>;
+    _panelReady: Map<string, boolean>;
+    _panelSessions: Map<string, { projectHash?: string; messages?: unknown[] }>;
+  };
+  unsafeProvider._panels.set('shared-session', panel);
+  unsafeProvider._panelReady.set('shared-session', true);
+
+  const openingA = provider.openSessionInTab('shared-session', 'project-a');
+  const openingB = provider.openSessionInTab('shared-session', 'project-b');
+  resolveProjectA({ messages: [{ role: 'user', content: 'history A' }] });
+  await openingA;
+  resolveProjectB({ messages: [{ role: 'user', content: 'history B' }] });
+  await openingB;
+
+  assert.equal(unsafeProvider._panelSessions.get('shared-session')?.projectHash, 'project-b');
+  assert.deepEqual(unsafeProvider._panelSessions.get('shared-session')?.messages, [
+    { role: 'user', content: 'history B' },
+  ]);
+  const histories = posted.filter((message) => message.type === 'sessionMessages');
+  assert.equal(histories.length, 1);
+  assert.deepEqual(histories[0].messages, [{ role: 'user', content: 'history B' }]);
+  const selections = posted.filter((message) => message.type === 'sessionSelected');
+  assert.equal(selections.some((message) => message.projectHash === 'project-a'), false);
+}
+
+async function testRestoredPanelWithoutProjectHashResolvesBeforeLoadingHistory() {
+  const calls: string[] = [];
+  const history = [{ role: 'user', content: 'restored history' }];
+  const posted: Array<{ type?: string; messages?: unknown[] }> = [];
+  const webview = { postMessage: (message: { type?: string; messages?: unknown[] }) => { posted.push(message); } };
+  const panel = { webview };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {
+    resolveSession: async (sessionId: string) => {
+      calls.push(`resolve:${sessionId}`);
+      return { id: sessionId, project_hash: 'project-a' };
+    },
+    getSession: async (projectHash: string, sessionId: string) => {
+      calls.push(`detail:${projectHash}:${sessionId}`);
+      return { messages: history };
+    },
+  } as never);
+  const unsafeProvider = provider as unknown as {
+    _panels: Map<string, typeof panel>;
+    _panelReady: Map<string, boolean>;
+    _restorePanelHistory: (
+      panel: typeof panel,
+      sessionId: string,
+      projectHash?: string,
+    ) => Promise<void>;
+  };
+  unsafeProvider._panels.set('session-a', panel);
+  unsafeProvider._panelReady.set('session-a', true);
+
+  await unsafeProvider._restorePanelHistory(panel, 'session-a');
+
+  assert.deepEqual(calls, [
+    'resolve:session-a',
+    'detail:project-a:session-a',
+  ]);
+  assert.deepEqual(
+    posted.find((message) => message.type === 'sessionMessages')?.messages,
+    history,
+  );
+}
+
+async function testProjectHashResolutionFallsBackOnlyWithinTheCurrentWorkspace() {
+  vscodeMock.workspace.workspaceFolders = [{ uri: { fsPath: '/repo/current' } }];
+  const calls: string[] = [];
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {
+    resolveSession: async () => {
+      calls.push('resolve');
+      throw new Error('unsupported endpoint');
+    },
+    listSessionsForWorkingDir: async (workingDir: string) => {
+      calls.push(`scoped:${workingDir}`);
+      return [{
+        id: 'session-a',
+        project_hash: 'project-a',
+        working_dir: '/repo/current',
+      }];
+    },
+  } as never);
+  const unsafeProvider = provider as unknown as {
+    _resolveSessionProjectHash: (
+      sessionId: string,
+      projectHash?: string,
+    ) => Promise<string | undefined>;
+  };
+
+  const projectHash = await unsafeProvider._resolveSessionProjectHash('session-a');
+
+  assert.equal(projectHash, 'project-a');
+  assert.deepEqual(calls, ['resolve', 'scoped:/repo/current']);
+  vscodeMock.workspace.workspaceFolders = [];
+}
+
 function testLiveStreamEventsWaitForPanelReadiness() {
   const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {} as never);
   const unsafeProvider = provider as unknown as {
@@ -99,8 +381,10 @@ function testLiveStreamEventsWaitForPanelReadiness() {
 function testReadyCatchUpReplaysEventsThatArrivedDuringInitialization() {
   const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {} as never);
   const webview = { postMessage: (message: unknown) => { posted.push(message); } };
+  const panel = { webview };
   const unsafeProvider = provider as unknown as {
-    _panels: Map<string, { webview: typeof webview }>;
+    _panels: Map<string, typeof panel>;
+    _webviewPanels: Map<typeof webview, typeof panel>;
     _panelReady: Map<string, boolean>;
     _sessionRuntimes: Map<string, {
       isGenerating: boolean;
@@ -114,7 +398,8 @@ function testReadyCatchUpReplaysEventsThatArrivedDuringInitialization() {
     ) => void;
   };
   const posted: unknown[] = [];
-  unsafeProvider._panels.set('session-a', { webview });
+  unsafeProvider._panels.set('session-a', panel);
+  unsafeProvider._webviewPanels.set(webview, panel);
   unsafeProvider._panelReady.set('session-a', false);
   unsafeProvider._sessionRuntimes.set('session-a', {
     isGenerating: true,
@@ -140,8 +425,10 @@ function testReadyCatchUpReplaysReplacementGenerationFromStart() {
   const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {} as never);
   const posted: unknown[] = [];
   const webview = { postMessage: (message: unknown) => { posted.push(message); } };
+  const panel = { webview };
   const unsafeProvider = provider as unknown as {
-    _panels: Map<string, { webview: typeof webview }>;
+    _panels: Map<string, typeof panel>;
+    _webviewPanels: Map<typeof webview, typeof panel>;
     _panelReady: Map<string, boolean>;
     _sessionRuntimes: Map<string, {
       isGenerating: boolean;
@@ -154,7 +441,8 @@ function testReadyCatchUpReplaysReplacementGenerationFromStart() {
       cursor: { sessionId?: string; streamGeneration: number; replayedEvents: number },
     ) => void;
   };
-  unsafeProvider._panels.set('session-a', { webview });
+  unsafeProvider._panels.set('session-a', panel);
+  unsafeProvider._webviewPanels.set(webview, panel);
   unsafeProvider._panelReady.set('session-a', false);
   unsafeProvider._sessionRuntimes.set('session-a', {
     isGenerating: true,
@@ -184,8 +472,10 @@ function testTerminalArrivingDuringReadyReplayIsDeliveredOnceAfterCatchUp() {
   const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {} as never);
   const posted: unknown[] = [];
   const webview = { postMessage: (message: unknown) => { posted.push(message); } };
+  const panel = { webview };
   const unsafeProvider = provider as unknown as {
-    _panels: Map<string, { webview: typeof webview }>;
+    _panels: Map<string, typeof panel>;
+    _webviewPanels: Map<typeof webview, typeof panel>;
     _panelReady: Map<string, boolean>;
     _pendingMessages: Map<string, Array<{ message: unknown; generation?: number }>>;
     _sessionRuntimes: Map<string, {
@@ -201,7 +491,8 @@ function testTerminalArrivingDuringReadyReplayIsDeliveredOnceAfterCatchUp() {
     ) => void;
     _flushPendingMessages: (sessionId: string) => void;
   };
-  unsafeProvider._panels.set('session-a', { webview });
+  unsafeProvider._panels.set('session-a', panel);
+  unsafeProvider._webviewPanels.set(webview, panel);
   unsafeProvider._panelReady.set('session-a', false);
   unsafeProvider._sessionRuntimes.set('session-a', {
     isGenerating: false,
@@ -226,8 +517,10 @@ function testReadyDoesNotFlushHistoryAlreadyDeliveredByItsAtomicSnapshot() {
   const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {} as never);
   const posted: unknown[] = [];
   const webview = { postMessage: (message: unknown) => { posted.push(message); } };
+  const panel = { webview };
   const unsafeProvider = provider as unknown as {
-    _panels: Map<string, { webview: typeof webview }>;
+    _panels: Map<string, typeof panel>;
+    _webviewPanels: Map<typeof webview, typeof panel>;
     _panelReady: Map<string, boolean>;
     _pendingMessages: Map<string, Array<{ message: unknown; generation?: number }>>;
     _sessionRuntimes: Map<string, {
@@ -246,7 +539,8 @@ function testReadyDoesNotFlushHistoryAlreadyDeliveredByItsAtomicSnapshot() {
       },
     ) => void;
   };
-  unsafeProvider._panels.set('session-a', { webview });
+  unsafeProvider._panels.set('session-a', panel);
+  unsafeProvider._webviewPanels.set(webview, panel);
   unsafeProvider._panelReady.set('session-a', false);
   unsafeProvider._sessionRuntimes.set('session-a', {
     isGenerating: false,
@@ -279,23 +573,25 @@ function testClosingTheLastSessionTabStopsTheUnobservableTurn() {
   for (const disposeHandler of disposeHandlers) {
     assert.match(
       disposeHandler,
-      /abortController\?\.abort\(\)/,
-      'closing the last observable view must close its local SSE request',
+      /this\._handlePanelDisposed\(panel, webview\)/,
+      'new and restored tabs must share the same disposal lifecycle',
     );
-    assert.match(
-      disposeHandler,
-      /this\._client\.stopGeneration\(disposedSid\)/,
-      'closing the last observable view must stop the daemon turn instead of orphaning it',
-    );
-    assert.ok(
-      disposeHandler.indexOf('abortController?.abort()') < disposeHandler.indexOf('_panels.delete(disposedSid)'),
-      'the local stream must be invalidated before the panel binding is removed',
-    );
-    assert.ok(
-      disposeHandler.indexOf('rt.queuedMessages = []') < disposeHandler.indexOf('if (rt?.isGenerating || rt?.recoveryLocked)'),
-      'closing a tab must clear queued follow-up prompts even after the current turn already reached terminal',
-    );
+    assert.doesNotMatch(disposeHandler, /panel\.webview/);
   }
+
+  const cleanupStart = source.indexOf('private _handlePanelDisposed');
+  const cleanupEnd = source.indexOf('private async _ensureSessionForWebview', cleanupStart);
+  const cleanup = source.slice(cleanupStart, cleanupEnd);
+  assert.match(cleanup, /abortController\?\.abort\(\)/);
+  assert.match(cleanup, /this\._client\.stopGeneration\(disposedSid\)/);
+  assert.ok(
+    cleanup.indexOf('_panels.delete(disposedSid)') < cleanup.indexOf('abortController?.abort()'),
+    'panel indexes must be cleaned before stopping the runtime so cleanup cannot be skipped',
+  );
+  assert.ok(
+    cleanup.indexOf('rt.queuedMessages = []') < cleanup.indexOf('if (rt?.isGenerating || rt?.recoveryLocked)'),
+    'closing a tab must clear queued follow-up prompts even after the current turn already reached terminal',
+  );
 }
 
 function testSessionBoundMessageNeverFallsBackToAnotherPanel() {
@@ -498,9 +794,11 @@ async function testSecondReadyStillRestoresCompleteHistory() {
   const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
   const posted: Array<{ type?: string; messages?: unknown[] }> = [];
   const webview = { postMessage: (message: { type?: string; messages?: unknown[] }) => { posted.push(message); } };
+  const panel = { webview };
   const history = [{ role: 'user', content: 'persisted prompt' }];
   const unsafeProvider = provider as unknown as {
-    _panels: Map<string, { webview: typeof webview }>;
+    _panels: Map<string, typeof panel>;
+    _webviewPanels: Map<typeof webview, typeof panel>;
     _panelSessions: Map<string, { sessionId: string; projectHash?: string; messages?: unknown[] }>;
     _sendSetupState: () => Promise<void>;
     _loadSessionsForDisplay: () => Promise<{ sessions: unknown[] }>;
@@ -508,7 +806,8 @@ async function testSecondReadyStillRestoresCompleteHistory() {
     _sendEditorContext: () => void;
     _sendInitialState: (webview: typeof webview, mode: 'tab') => Promise<unknown>;
   };
-  unsafeProvider._panels.set('session-a', { webview });
+  unsafeProvider._panels.set('session-a', panel);
+  unsafeProvider._webviewPanels.set(webview, panel);
   unsafeProvider._panelSessions.set('session-a', {
     sessionId: 'session-a',
     projectHash: 'project-a',
@@ -578,8 +877,10 @@ async function testReadyDoesNotPublishHistoryCapturedFromAnOlderGeneration() {
   const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
   const posted: Array<{ type?: string }> = [];
   const webview = { postMessage: (message: { type?: string }) => { posted.push(message); } };
+  const panel = { webview };
   const unsafeProvider = provider as unknown as {
-    _panels: Map<string, { webview: typeof webview }>;
+    _panels: Map<string, typeof panel>;
+    _webviewPanels: Map<typeof webview, typeof panel>;
     _panelSessions: Map<string, { sessionId: string; projectHash?: string; messagesPromise?: Promise<unknown[]> }>;
     _sessionRuntimes: Map<string, { isGenerating: boolean; streamGeneration: number; queuedMessages: unknown[]; eventBuffer: unknown[] }>;
     _sendSetupState: () => Promise<void>;
@@ -588,7 +889,8 @@ async function testReadyDoesNotPublishHistoryCapturedFromAnOlderGeneration() {
     _sendEditorContext: () => void;
     _sendInitialState: (webview: typeof webview, mode: 'tab') => Promise<unknown>;
   };
-  unsafeProvider._panels.set('session-a', { webview });
+  unsafeProvider._panels.set('session-a', panel);
+  unsafeProvider._webviewPanels.set(webview, panel);
   unsafeProvider._panelSessions.set('session-a', {
     sessionId: 'session-a',
     projectHash: 'project-a',
@@ -926,6 +1228,127 @@ async function testStaleSetupRefreshCannotOverwriteNewerAuthState() {
   assert.equal(authMessages.at(-1)?.auth?.logged_in, true);
   assert.equal(authMessages.some((message) => message.auth?.logged_in === false), false);
   provider.dispose();
+}
+
+async function testDisposedPanelCannotBlockNewPanelSetupState() {
+  type FakeWebview = {
+    html: string;
+    options?: unknown;
+    postMessage: (message: unknown) => Promise<boolean>;
+    onDidReceiveMessage: (listener: (message: unknown) => void) => { dispose(): void };
+  };
+  type FakePanel = {
+    readonly webview: FakeWebview;
+    iconPath?: unknown;
+    title: string;
+    onDidChangeViewState: (listener: (event: unknown) => void) => { dispose(): void };
+    onDidDispose: (listener: () => void) => { dispose(): void };
+    reveal(): void;
+    dispose(): void;
+  };
+
+  function createPanel(posted: unknown[]) {
+    let disposed = false;
+    let disposeListener: (() => void) | undefined;
+    const webview: FakeWebview = {
+      html: '',
+      postMessage: async (message) => {
+        posted.push(message);
+        return true;
+      },
+      onDidReceiveMessage: () => ({ dispose() {} }),
+    };
+    const panel: FakePanel = {
+      get webview() {
+        if (disposed) throw new Error('Webview is disposed');
+        return webview;
+      },
+      title: 'AtomCode',
+      onDidChangeViewState: () => ({ dispose() {} }),
+      onDidDispose: (listener) => {
+        disposeListener = listener;
+        return { dispose() {} };
+      },
+      reveal() {},
+      dispose() {
+        disposed = true;
+        disposeListener?.();
+      },
+    };
+    return { panel, webview };
+  }
+
+  const client = {
+    authStatus: async () => ({
+      logged_in: true,
+      expired: false,
+      auth_path: '/tmp/atomcode/auth.toml',
+      user: { id: 'user-1' },
+    }),
+    listProviders: async () => ({
+      default_provider: 'main',
+      providers: [{
+        name: 'main', type: 'openai', model: 'model-1', has_api_key: false,
+        requires_login: true, is_default: true, context_window: 128_000,
+        skip_tls_verify: false,
+      }],
+    }),
+    getConfig: async () => ({
+      path: '/tmp/atomcode/config.toml', default_provider: 'main', provider_count: 1,
+      providers: [], network: {}, telemetry: {},
+    }),
+    listModels: async () => [],
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const unsafeProvider = provider as unknown as {
+    _getHtml: () => string;
+    _panels: Map<string, FakePanel>;
+    _webviewPanels: Map<FakeWebview, FakePanel>;
+    _sendSetupState: (webview: FakeWebview) => Promise<void>;
+    setupPanelForRestore: (panel: FakePanel, sessionId?: string) => void;
+  };
+  unsafeProvider._getHtml = () => '<html></html>';
+
+  const mutableWindow = vscodeMock.window as {
+    tabGroups?: { all: unknown[] };
+    createWebviewPanel?: () => FakePanel;
+  };
+  const previousTabGroups = mutableWindow.tabGroups;
+  const previousCreateWebviewPanel = mutableWindow.createWebviewPanel;
+  mutableWindow.tabGroups = { all: [] };
+
+  try {
+    const oldPosted: unknown[] = [];
+    const old = createPanel(oldPosted);
+    mutableWindow.createWebviewPanel = () => old.panel;
+    provider.openInTab('old-session');
+
+    assert.doesNotThrow(() => old.panel.dispose());
+    assert.equal(unsafeProvider._panels.has('old-session'), false);
+    assert.equal(unsafeProvider._webviewPanels.has(old.webview), false);
+
+    const newPosted: unknown[] = [];
+    const current = createPanel(newPosted);
+    mutableWindow.createWebviewPanel = () => current.panel;
+    provider.openInTab('new-session');
+    await unsafeProvider._sendSetupState(current.webview);
+
+    const messageTypes = newPosted.map((message) => (message as { type?: string }).type);
+    assert.ok(messageTypes.includes('authStatus'));
+    assert.ok(messageTypes.includes('providers'));
+    assert.ok(messageTypes.includes('setupState'));
+    current.panel.dispose();
+
+    const restored = createPanel([]);
+    unsafeProvider.setupPanelForRestore(restored.panel, 'restored-session');
+    assert.doesNotThrow(() => restored.panel.dispose());
+    assert.equal(unsafeProvider._panels.has('restored-session'), false);
+    assert.equal(unsafeProvider._webviewPanels.has(restored.webview), false);
+  } finally {
+    mutableWindow.tabGroups = previousTabGroups;
+    mutableWindow.createWebviewPanel = previousCreateWebviewPanel;
+    provider.dispose();
+  }
 }
 
 async function testQueuedMessageDrainsForCompletedSessionWithoutFocusedPanel() {
@@ -1700,7 +2123,22 @@ async function testLoadSessionsForDisplayFallsBackToGlobalWhenWorkspaceRequestFa
   const client = {
     listSessions: async () => {
       calls.push('listSessions');
-      return [{ id: 'global', name: 'Global fallback', project_hash: 'fallback-hash', updated_at: 300 }];
+      return [
+        {
+          id: 'current',
+          name: 'Current fallback',
+          project_hash: 'current-hash',
+          working_dir: '/repo/atomcode',
+          updated_at: 200,
+        },
+        {
+          id: 'other',
+          name: 'Other project',
+          project_hash: 'other-hash',
+          working_dir: '/repo/other',
+          updated_at: 300,
+        },
+      ];
     },
     listSessionsForWorkingDir: async (workingDir: string) => {
       calls.push(`listSessionsForWorkingDir:${workingDir}`);
@@ -1718,7 +2156,8 @@ async function testLoadSessionsForDisplayFallsBackToGlobalWhenWorkspaceRequestFa
     'listSessionsForWorkingDir:/repo/atomcode',
     'listSessions',
   ]);
-  assert.deepEqual(loaded.sessions.map((s) => s.id), ['global']);
+  assert.deepEqual(loaded.sessions.map((s) => s.id), ['current']);
+  assert.equal(loaded.currentProjectHash, 'current-hash');
 
   vscodeMock.workspace.workspaceFolders = [];
 }
@@ -1810,6 +2249,14 @@ function testMergeSessionsForDisplayShowsOnlyCurrentProjectSessionsWhenProjectIs
 
 Promise.resolve()
   .then(testReadyMarksPanelOnlyAfterInitialReplay)
+  .then(testPanelReadyHandlerIsInstalledBeforeWebviewBoots)
+  .then(testOpeningAnExistingUnhydratedSessionTabLoadsItsHistory)
+  .then(testClosingAnExistingTabCancelsItsPendingHistoryHydration)
+  .then(testNewGenerationRejectsHistoryLoadedForAnOlderGeneration)
+  .then(testRepeatedOpenSharesOneHistoryRequestAndPublishesOnce)
+  .then(testProjectRebindRejectsThePreviousProjectsLateHistory)
+  .then(testRestoredPanelWithoutProjectHashResolvesBeforeLoadingHistory)
+  .then(testProjectHashResolutionFallsBackOnlyWithinTheCurrentWorkspace)
   .then(testLiveStreamEventsWaitForPanelReadiness)
   .then(testReadyCatchUpReplaysEventsThatArrivedDuringInitialization)
   .then(testReadyCatchUpReplaysReplacementGenerationFromStart)
@@ -1835,6 +2282,7 @@ Promise.resolve()
   .then(testRecoveryLockRemainsVisibleAndCannotQueueAnotherTurn)
   .then(testAuthFileWatcherRefreshesSetupState)
   .then(testStaleSetupRefreshCannotOverwriteNewerAuthState)
+  .then(testDisposedPanelCannotBlockNewPanelSetupState)
   .then(testQueuedMessageDrainsForCompletedSessionWithoutFocusedPanel)
   .then(testQueuedMessageDoesNotDrainWhileApprovalModeIsPending)
   .then(testAbnormalDoneDoesNotDrainQueuedMessages)

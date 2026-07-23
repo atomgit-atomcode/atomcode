@@ -243,8 +243,70 @@ pub enum UiLine {
         win_width: u16,
         win_height: u16,
     },
+    /// Semantic `/diff` overlay. Spans carry theme roles instead of embedded
+    /// ANSI so retained rendering can clip safely and plain rendering can
+    /// ignore the transient panel.
+    DiffPanel {
+        title: String,
+        rows: Vec<DiffPanelRow>,
+        footer: String,
+        win_width: u16,
+        win_height: u16,
+    },
     /// Clear the overlay modal and restore the underlying frame.
     ModalOverlayClear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffPanelTone {
+    Default,
+    Muted,
+    Brand,
+    Add,
+    Remove,
+    Warning,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffPanelSpan {
+    pub text: String,
+    pub tone: DiffPanelTone,
+    pub bold: bool,
+}
+
+impl DiffPanelSpan {
+    pub fn new(text: impl Into<String>, tone: DiffPanelTone) -> Self {
+        Self {
+            text: text.into(),
+            tone,
+            bold: false,
+        }
+    }
+
+    pub fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffPanelRow {
+    pub spans: Vec<DiffPanelSpan>,
+    pub selected: bool,
+}
+
+impl DiffPanelRow {
+    pub fn new(spans: Vec<DiffPanelSpan>) -> Self {
+        Self {
+            spans,
+            selected: false,
+        }
+    }
+
+    pub fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
 }
 
 pub trait Renderer: Send {

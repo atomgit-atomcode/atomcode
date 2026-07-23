@@ -6,7 +6,6 @@ use crate::render::{DiffEntry, DiffKind};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedDiffFile {
-    pub header: String,
     pub entries: Vec<DiffEntry>,
     pub summary: Option<String>,
 }
@@ -17,22 +16,19 @@ pub(crate) struct ParsedDiff {
     pub truncated: bool,
 }
 
-/// Split a regular `git diff` stream into file-scoped blocks while preserving
-/// each `diff --git …` header. The existing hunk parser remains the single
-/// source of line-number and separator semantics; this wrapper only restores
-/// the file boundary that [`parse_unified_diff`] intentionally ignores for
-/// tool-output rendering.
+/// Split a regular `git diff` stream into file-scoped blocks. The existing
+/// hunk parser remains the single source of line-number and separator semantics.
 pub(crate) fn parse_unified_diff_files(diff: &str, max_entries: usize) -> ParsedDiff {
-    let mut chunks: Vec<(String, String)> = Vec::new();
-    let mut current: Option<(String, String)> = None;
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
 
     for line in diff.lines() {
         if line.starts_with("diff --git ") {
             if let Some(chunk) = current.take() {
                 chunks.push(chunk);
             }
-            current = Some((line.to_string(), String::new()));
-        } else if let Some((_, body)) = current.as_mut() {
+            current = Some(String::new());
+        } else if let Some(body) = current.as_mut() {
             body.push_str(line);
             body.push('\n');
         }
@@ -41,13 +37,13 @@ pub(crate) fn parse_unified_diff_files(diff: &str, max_entries: usize) -> Parsed
         chunks.push(chunk);
     }
     if chunks.is_empty() && !diff.trim().is_empty() {
-        chunks.push((String::new(), diff.to_string()));
+        chunks.push(diff.to_string());
     }
 
     let mut files = Vec::with_capacity(chunks.len());
     let mut total_entries = 0usize;
     let mut truncated = false;
-    for (header, body) in chunks {
+    for body in chunks {
         let remaining = max_entries.saturating_sub(total_entries);
         let has_hunk = body.lines().any(|line| line.starts_with("@@"));
         let mut entries = if remaining == 0 {
@@ -80,11 +76,7 @@ pub(crate) fn parse_unified_diff_files(diff: &str, max_entries: usize) -> Parsed
             .collect();
         let summary = (!summary_lines.is_empty()).then(|| summary_lines.join("\n"));
 
-        files.push(ParsedDiffFile {
-            header,
-            entries,
-            summary,
-        });
+        files.push(ParsedDiffFile { entries, summary });
     }
 
     ParsedDiff { files, truncated }
@@ -312,7 +304,7 @@ Edited a.rs (1 replacement)
     }
 
     #[test]
-    fn splits_git_diff_by_file_and_preserves_headers() {
+    fn splits_git_diff_by_file() {
         let diff = "\
 diff --git a/a.txt b/a.txt
 index 7898192..6178079 100644
@@ -333,8 +325,6 @@ index 6178079..f2ad6c7 100644
 
         assert!(!parsed.truncated);
         assert_eq!(parsed.files.len(), 2);
-        assert_eq!(parsed.files[0].header, "diff --git a/a.txt b/a.txt");
-        assert_eq!(parsed.files[1].header, "diff --git a/b.txt b/b.txt");
         assert_eq!(parsed.files[0].entries.len(), 2);
         assert_eq!(parsed.files[0].entries[0].text, "old-a");
         assert_eq!(parsed.files[0].entries[1].text, "new-a");
