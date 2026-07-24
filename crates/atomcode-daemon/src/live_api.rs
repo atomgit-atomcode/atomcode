@@ -1285,26 +1285,27 @@ pub(crate) async fn live_message(
 }
 
 /// Split a submitted live message into the input fed to the model (`runtime`) vs the
-/// input echoed to the live view (`echo`). When VL preprocessing rewrote the text
-/// (`runtime_text` differs from the user's `message`, i.e. a caption was produced for
-/// a text-only model), the raw image bytes are dropped from the RUNTIME input — the
-/// adapter would 400 on them — but the ECHO always keeps the user's ORIGINAL text +
-/// images so the webui / synchronized TUI display shows what the user typed instead
-/// of the machine caption overwriting it.
+/// input echoed to the live view (`echo`). BOTH keep the user's original image: the
+/// runtime conversation must carry it so the image PERSISTS and reappears after a page
+/// refresh (previously the sync path stripped it here, so the saved session had no
+/// image). The raw bytes never reach a text-only model anyway — the provider adapter
+/// degrades images at the wire when the model lacks vision (openai_compat
+/// `supports_vision`). The two inputs differ only in TEXT: the runtime gets the VL
+/// caption (the image description the text model needs) while the echo keeps the
+/// user's ORIGINAL words, so the machine caption never overwrites what the user typed.
+///
+/// NOTE: relies on the active adapter degrading images for a non-vision model. That
+/// holds for the default openai_compat providers; a non-degrading adapter (ollama with
+/// a text-only model) would need its own `supports_vision` gate — tracked separately.
 fn split_live_inputs(
     message: String,
     original_images: Vec<atomcode_kernel::message::ImageContent>,
     runtime_text: String,
 ) -> (atomcode_coding::UserInput, atomcode_coding::UserInput) {
-    let runtime_images = if text_carries_vl_caption(&runtime_text) {
-        Vec::new()
-    } else {
-        original_images.clone()
-    };
     (
         atomcode_coding::UserInput {
             text: runtime_text,
-            images: runtime_images,
+            images: original_images.clone(),
         },
         atomcode_coding::UserInput {
             text: message,
@@ -1789,18 +1790,23 @@ mod tests {
     }
 
     #[test]
-    fn split_live_inputs_echoes_original_when_vl_preprocessed() {
-        // A text-only model preprocessed the image into a caption. The RUNTIME gets
-        // the caption with NO image bytes (the adapter would 400 on them); the ECHO —
-        // what the webui / synced TUI displays — keeps the user's ORIGINAL text +
-        // image so the caption never overwrites the user's message. (The reported bug.)
+    fn split_live_inputs_keeps_image_in_runtime_for_persistence_when_vl_preprocessed() {
+        // A text-only model preprocessed the image into a caption. The RUNTIME gets the
+        // caption text BUT keeps the original image so it persists (survives a refresh);
+        // the adapter degrades the image at the wire for the text-only model. The ECHO
+        // keeps the user's ORIGINAL text + image so the caption never overwrites the
+        // user's message. (Fixes: image gone after refresh + caption-overwrite.)
         let (runtime, echo) = split_live_inputs(
             "look at this".into(),
             vec![img("orig-bytes")],
             "look at this\n\n[图片内容（由 vl 识别）]\na chart".into(),
         );
         assert_eq!(runtime.text, "look at this\n\n[图片内容（由 vl 识别）]\na chart");
-        assert!(runtime.images.is_empty(), "raw image must not reach a text-only model");
+        assert_eq!(
+            runtime.images,
+            vec![img("orig-bytes")],
+            "runtime conversation must KEEP the image so it persists across a refresh"
+        );
         assert_eq!(echo.text, "look at this", "display must show the user's original text");
         assert_eq!(echo.images, vec![img("orig-bytes")], "display must keep the image");
     }
@@ -1815,24 +1821,6 @@ mod tests {
         assert_eq!(runtime.images, vec![img("orig-bytes")]);
         assert_eq!(echo.text, "hi");
         assert_eq!(echo.images, vec![img("orig-bytes")]);
-    }
-
-    #[test]
-    fn split_live_inputs_keys_off_the_vl_marker_not_text_inequality() {
-        // The image-drop decision keys off the VL caption MARKER (the daemon's
-        // canonical signal), NOT a brittle `runtime_text != message`. A rewrite that
-        // changed the text WITHOUT a marker (not something the preprocessor produces,
-        // but the guard must be marker-based) keeps the image for the model.
-        let (runtime, _) = split_live_inputs(
-            "hi".into(),
-            vec![img("orig-bytes")],
-            "hi (edited, no marker)".into(),
-        );
-        assert_eq!(
-            runtime.images,
-            vec![img("orig-bytes")],
-            "no VL marker ⇒ not a caption ⇒ image is NOT dropped"
-        );
     }
 
     #[test]
