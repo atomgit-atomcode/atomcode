@@ -19,6 +19,22 @@
 // 如有指定文件则只审查: $ARGUMENTS
 // ```
 //
+// The `args` field controls the command's argument expectation:
+//
+//   `none`     (default) — No argument required. Selecting from the slash menu
+//                          executes immediately, same as a built-in command.
+//   `optional`           — Argument may be supplied. Menu selection completes
+//                          to `/name ` so the user can type an argument before
+//                          pressing Enter again to execute.
+//   `required`           — Argument is mandatory. Menu selection completes to
+//                          `/name `, and submitting with an empty argument is
+//                          rejected with an error message.
+//
+// Template variables:
+//
+//   `$ARGUMENTS`  /  `${ARGUMENTS}`   — Replaced with the user-provided text
+//                                        after the command name (if any).
+//
 // The registry is loaded once at startup (or on `/mcp reload`-style events)
 // and queried by the TUI dispatch loop. Custom commands are NOT LLM-invocable
 // — they are user-invocable via `/command_name` in the input, sending the
@@ -38,7 +54,38 @@ pub struct CustomCommand {
     pub namespace: Option<String>,
 }
 
-/// Whether a custom command expects arguments from the user.
+impl CustomCommand {
+    /// The lookup key used in the registry — `"plugin:name"` when namespaced,
+    /// otherwise just `"name"`.
+    pub fn key(&self) -> String {
+        match &self.namespace {
+            Some(ns) => format!("{}:{}", ns, self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Render the template, replacing `$ARGUMENTS` / `${ARGUMENTS}` with `args`.
+    ///
+    /// Normalizes `${ARGUMENTS}` → `$ARGUMENTS` first so the chained
+    /// `.replace()` never re-scans the interpolated `args` for the other
+    /// placeholder — otherwise user input containing a literal
+    /// `${ARGUMENTS}` or `$ARGUMENTS` would cause recursive replacement
+    /// and corrupt the output.
+    pub fn render(&self, args: &str) -> String {
+        self.template
+            .replace("${ARGUMENTS}", "$ARGUMENTS")
+            .replace("$ARGUMENTS", args)
+    }
+}
+
+/// Whether a custom command expects arguments from the user, controlling
+/// both the slash-menu Enter behaviour and dispatch validation:
+///
+/// | Value      | Menu Enter          | Empty-arg submit |
+/// |------------|---------------------|------------------|
+/// | `None`     | Execute immediately | Accepted         |
+/// | `Optional` | Complete to `/name `| Accepted         |
+/// | `Required` | Complete to `/name `| Rejected (error) |
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArgsRequirement {
     Required,
@@ -82,6 +129,14 @@ impl CustomCommandRegistry {
         }
     }
 
+    /// Register a single command into the registry. Used by tests and
+    /// plugin installers that build commands programmatically rather than
+    /// reading `.md` files from disk.
+    pub fn register(&mut self, cmd: CustomCommand) {
+        let key = cmd.key();
+        self.commands.insert(key, cmd);
+    }
+
     fn load_from_dir(
         dir: &Path,
         namespace: Option<&str>,
@@ -100,10 +155,7 @@ impl CustomCommandRegistry {
                 if let Some(ns) = namespace {
                     cmd.namespace = Some(ns.to_string());
                 }
-                let key = match &cmd.namespace {
-                    Some(ns) => format!("{}:{}", ns, cmd.name),
-                    None => cmd.name.clone(),
-                };
+                let key = cmd.key();
                 commands.insert(key, cmd);
             }
         }
@@ -194,13 +246,13 @@ impl CustomCommandRegistry {
     /// Render the template for `name`, replacing `$ARGUMENTS` /
     /// `${ARGUMENTS}` with the provided args string. Name resolution follows
     /// [`resolve`].
+    ///
+    /// Note: this method does NOT validate `args_requirement` — it always
+    /// performs the substitution. Empty-arg validation for `Required` happens
+    /// in the dispatch layer (`execute_slash_command_impl`).
     pub fn render(&self, name: &str, args: &str) -> Option<String> {
         let cmd = self.resolve(name)?;
-        Some(
-            cmd.template
-                .replace("$ARGUMENTS", args)
-                .replace("${ARGUMENTS}", args),
-        )
+        Some(cmd.render(args))
     }
 
     /// All commands, sorted by name.
