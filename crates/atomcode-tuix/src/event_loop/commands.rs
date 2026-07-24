@@ -3460,22 +3460,52 @@ fn execute_slash_command_impl(
                 }
                 renderer.flush();
             } else {
-                let mut parts = arg_trim.splitn(2, char::is_whitespace);
-                let skill_name = parts.next().unwrap_or("");
-                let skill_args = parts.next().unwrap_or("").trim_start();
-                // Pass the bare name straight through — `SkillRegistry::get`
-                // falls back to a unique `:name` suffix match, which resolves
-                // both loose skills (`skills:foo`) and plugin-contributed
-                // skills (`<plugin>:foo`) without us needing to guess the
-                // prefix here. A user-typed qualified name (`foo:bar`) still
-                // works because exact match runs first.
-                if let Some(rendered) = expand_skill(ctx, skill_name, skill_args) {
-                    submit_agent_turn(ctx, state, rendered);
-                } else {
+                // 贪婪多 skill 解析：前缀是一串已知 skill 名，其余是任务描述，
+                // 任务描述会传给每个 skill（保留 $ARGUMENTS 占位符语义）。单个
+                // skill（无第二个 skill 词）解析结果与旧 splitn(2) 一致，零回归。
+                let resolve = |name: &str| {
+                    ctx.skill_registry
+                        .read()
+                        .ok()
+                        .and_then(|r| r.get(name).map(|s| s.user_invocable))
+                        .unwrap_or(false)
+                };
+                let (skills, skill_args) = split_skill_names(arg_trim, resolve);
+                if skills.is_empty() {
+                    // 首词不是 skill —— 沿用旧的 unknown 报错，指名第一个词。
+                    let first = arg_trim.split_whitespace().next().unwrap_or("");
                     renderer.render(UiLine::Error(
-                        t(Msg::SkillUnknown { name: skill_name }).into_owned(),
+                        t(Msg::SkillUnknown { name: first }).into_owned(),
                     ));
                     renderer.flush();
+                } else {
+                    // 按顺序展开每个 skill；expand_skill 可能因竞态返回 None。
+                    let blocks: Vec<String> = skills
+                        .iter()
+                        .filter_map(|name| expand_skill(ctx, name.as_str(), &skill_args))
+                        .collect();
+                    if blocks.is_empty() {
+                        renderer.render(UiLine::Error(
+                            t(Msg::SkillUnknown {
+                                name: skills[0].as_str(),
+                            })
+                            .into_owned(),
+                        ));
+                        renderer.flush();
+                    } else {
+                        // 回显已加载 skill：第二个及以后的 skill 名若打错字会静默
+                        // 落进任务描述，这行让用户一眼看出"只加载了 N 个"。
+                        let names = skills.join(" · ");
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::SkillsLoaded {
+                                names: names.as_str(),
+                            })
+                            .into_owned(),
+                        ));
+                        renderer.flush();
+                        let rendered = blocks.join("\n\n---\n\n");
+                        submit_agent_turn(ctx, state, rendered);
+                    }
                 }
             }
         }

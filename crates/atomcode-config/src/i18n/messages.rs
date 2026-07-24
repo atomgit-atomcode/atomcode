@@ -719,6 +719,9 @@ pub enum Msg<'a> {
     SkillUnknown {
         name: &'a str,
     },
+    SkillsLoaded {
+        names: &'a str,
+    },
 
     // ── /mcp ──
     McpReloading {

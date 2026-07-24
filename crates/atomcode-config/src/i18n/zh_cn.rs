@@ -595,6 +595,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  可用技能：\n".into(),
         Msg::SkillUnknown { name } =>
             format!("未知技能：{}（输入 /skills 查看列表）", name).into(),
+        Msg::SkillsLoaded { names } =>
+            format!("  已加载 skills：{}\n", names).into(),
 
         // ── /mcp ──
         Msg::McpReloading { count } =>
