@@ -221,18 +221,22 @@ pub async fn resume_session(
     }
     let project_bucket =
         atomcode_capabilities::session::SessionManager::project_hash(&binding.working_dir);
-    let prepared = crate::legacy_convert::prepare_catalog_session_resume_in_project(
+    let prepared = match crate::legacy_convert::prepare_catalog_session_resume_in_project(
         &project_bucket,
         &session_id,
-    )
-    .map_err(|error| HubError::RuntimeRejected(error.to_string()))?
-    .ok_or_else(|| {
-        HubError::RuntimeRejected(format!(
-            "session {session_id:?} not found in project bucket {project_bucket}"
-        ))
-    })?;
+    ) {
+        Ok(Some(prepared)) => prepared,
+        _ => crate::legacy_convert::prepare_catalog_session_resume_any_project(&session_id)
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?
+            .ok_or_else(|| {
+                HubError::RuntimeRejected(format!(
+                    "session {session_id:?} not found in catalog"
+                ))
+            })?,
+    };
+    let target_dir = PathBuf::from(&prepared.view.meta.working_dir);
     hub()
-        .resume_session_with_lease(session_id, binding.working_dir, prepared.lease)
+        .resume_session_with_lease(session_id, target_dir, prepared.lease)
         .await
 }
 
