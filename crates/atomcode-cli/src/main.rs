@@ -963,6 +963,18 @@ fn real_main() {
     rt.block_on(async_main());
 }
 
+fn merge_startup_notices(
+    config_notice: Option<String>,
+    session_notice: Option<String>,
+) -> Option<String> {
+    match (config_notice, session_notice) {
+        (Some(config), Some(session)) => Some(format!("{config}\n{session}")),
+        (Some(config), None) => Some(config),
+        (None, Some(session)) => Some(session),
+        (None, None) => None,
+    }
+}
+
 async fn async_main() {
     // Wire `tracing::` diagnostics to `<config_dir>/logs/atomcode.log` (file-only,
     // TUI-safe). Must run before anything that emits traces so nothing is lost.
@@ -1460,14 +1472,35 @@ async fn run() -> Result<i32> {
         _ => {}
     }
 
-    let mut config = if config_path.exists() {
-        Config::load(&config_path).unwrap_or_else(|e| {
-            eprintln!("Warning: failed to load config ({}), using defaults", e);
-            Config::default()
-        })
+    let (mut config, config_startup_notice) = if config_path.exists() {
+        match Config::load_with_diagnostics(&config_path) {
+            Ok((config, warnings)) if warnings.is_empty() => (config, None),
+            Ok((config, warnings)) => {
+                let warning_list = warnings
+                    .iter()
+                    .map(|warning| format!("  - {warning}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let notice = format!(
+                    "Some provider sections in {} could not be loaded:\n{}",
+                    config_path.display(),
+                    warning_list
+                );
+                eprintln!("Warning: {notice}");
+                (config, Some(notice))
+            }
+            Err(error) => {
+                let notice = format!(
+                    "Failed to load {} ({error}); using default configuration.",
+                    config_path.display()
+                );
+                eprintln!("Warning: {notice}");
+                (Config::default(), Some(notice))
+            }
+        }
     } else {
         // No config yet — TUI Welcome screen will guide first-run setup
-        Config::default()
+        (Config::default(), None)
     };
     atomcode_config::proxy::apply_process_proxy_config(&config.network.proxy);
 
@@ -1563,7 +1596,7 @@ async fn run() -> Result<i32> {
     }
     .map(atomcode_tuix::session::Session::from_catalog_view)
     .transpose()?;
-    let startup_notice = continued_session
+    let session_startup_notice = continued_session
         .as_ref()
         .and_then(|session| {
             session
@@ -1578,6 +1611,7 @@ async fn run() -> Result<i32> {
             })
             .into_owned()
         });
+    let startup_notice = merge_startup_notices(config_startup_notice, session_startup_notice);
     let (mut native_headless_runtime, mut native_tui_runtime) = if is_headless {
         (Some(native_runtime), None)
     } else {
@@ -3747,8 +3781,8 @@ mod tests {
     use super::{
         apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
-        headless_completion_notify_reason, resolve_working_dir, runtime_config_from,
-        should_fork_busy_continue, truncate_log_line, DEFAULT_LOG_DIRECTIVES,
+        headless_completion_notify_reason, merge_startup_notices, resolve_working_dir,
+        runtime_config_from, should_fork_busy_continue, truncate_log_line, DEFAULT_LOG_DIRECTIVES,
     };
     use std::path::PathBuf;
 
@@ -3768,6 +3802,18 @@ mod tests {
         // A malformed default would silently disable ALL logging via the fallback
         // path in `init_file_logging`; pin that it is a valid EnvFilter directive.
         assert!(tracing_subscriber::EnvFilter::try_new(DEFAULT_LOG_DIRECTIVES).is_ok());
+    }
+
+    #[test]
+    fn config_and_session_startup_notices_are_both_preserved() {
+        assert_eq!(
+            merge_startup_notices(
+                Some("bad provider ignored".into()),
+                Some("busy session forked".into())
+            )
+            .as_deref(),
+            Some("bad provider ignored\nbusy session forked")
+        );
     }
 
     #[test]

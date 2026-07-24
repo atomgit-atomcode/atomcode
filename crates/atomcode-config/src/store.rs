@@ -59,7 +59,7 @@ impl ConfigStore {
 
     /// Read one internally-consistent config + revision snapshot.
     pub fn read(&self) -> Result<ConfigSnapshot> {
-        read_snapshot(&self.path)
+        read_snapshot_tolerant(&self.path)
     }
 
     /// Apply one delta to the latest disk snapshot while holding the process-shared lock.
@@ -134,7 +134,7 @@ impl ConfigStore {
         let disk = if tolerate_invalid_disk {
             read_snapshot_for_replace(&self.path)?
         } else {
-            match read_snapshot(&self.path) {
+            match read_snapshot_strict(&self.path) {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) if is_not_found(&error) => None,
                 Err(error) => return Err(error),
@@ -202,7 +202,19 @@ fn ensure_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_snapshot(path: &Path) -> Result<ConfigSnapshot> {
+fn read_snapshot_tolerant(path: &Path) -> Result<ConfigSnapshot> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read config: {}", path.display()))?;
+    let content = std::str::from_utf8(&bytes)
+        .with_context(|| format!("Config is not UTF-8: {}", path.display()))?;
+    let (config, _warnings) = Config::parse_disk_content_tolerant(content, path)?;
+    Ok(ConfigSnapshot {
+        config,
+        revision: ConfigRevision::from_bytes(&bytes),
+    })
+}
+
+fn read_snapshot_strict(path: &Path) -> Result<ConfigSnapshot> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read config: {}", path.display()))?;
     let content = std::str::from_utf8(&bytes)

@@ -153,6 +153,42 @@ fn failed_transaction_leaves_the_previous_snapshot_unchanged() {
 }
 
 #[test]
+fn tolerant_read_does_not_make_transactions_overwrite_an_invalid_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let content = r#"
+default_provider = "valid"
+
+[providers.valid]
+type = "openai"
+model = "working"
+
+[providers.invalid]
+model = "missing-type"
+"#;
+    std::fs::write(&path, content).unwrap();
+    let store = ConfigStore::new(&path);
+
+    let snapshot = store.read().expect("runtime reads should isolate bad providers");
+    assert_eq!(snapshot.config.default_provider, "valid");
+    assert!(snapshot.config.providers.contains_key("valid"));
+    assert!(!snapshot.config.providers.contains_key("invalid"));
+
+    let error = store
+        .update(|config| {
+            config.default_provider = "valid".into();
+            Ok(())
+        })
+        .expect_err("transactions must strictly reject malformed disk state");
+    assert!(error.to_string().contains("Failed to parse config"));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        content,
+        "a rejected transaction must leave the original provider section untouched"
+    );
+}
+
+#[test]
 fn incremental_update_never_overwrites_a_corrupt_config() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");

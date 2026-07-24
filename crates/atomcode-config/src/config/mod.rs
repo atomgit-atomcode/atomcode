@@ -807,9 +807,28 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
+        Self::load_with_diagnostics(path).map(|(config, _warnings)| config)
+    }
+
+    /// Strictly validate every section in a config file.
+    ///
+    /// Use this at persistence and seed-import boundaries where accepting a
+    /// partially valid document would incorrectly bless malformed input.
+    pub fn load_strict(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
         Self::parse_disk_content(&content, path)
+    }
+
+    /// Load a user-edited config while isolating invalid provider sections.
+    ///
+    /// The strict [`Self::load_strict`] path remains the validation boundary
+    /// for seeds and writes. Interactive startup uses the diagnostics so one
+    /// malformed `[providers.<name>]` table cannot silently disappear.
+    pub fn load_with_diagnostics(path: &Path) -> Result<(Self, Vec<String>)> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config: {}", path.display()))?;
+        Self::parse_disk_content_tolerant(&content, path)
     }
 
     pub(crate) fn parse_disk_content(content: &str, path: &Path) -> Result<Self> {
@@ -817,6 +836,55 @@ impl Config {
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         migrate_legacy_lsp_default(&mut config);
         Ok(config)
+    }
+
+    pub(crate) fn parse_disk_content_tolerant(
+        content: &str,
+        path: &Path,
+    ) -> Result<(Self, Vec<String>)> {
+        let mut document: toml::Value = toml::from_str(content)
+            .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+        let mut warnings = Vec::new();
+        let mut skipped_providers = Vec::new();
+
+        if let Some(providers) = document
+            .get_mut("providers")
+            .and_then(toml::Value::as_table_mut)
+        {
+            let names: Vec<String> = providers.keys().cloned().collect();
+            for name in names {
+                let Some(value) = providers.get(&name).cloned() else {
+                    continue;
+                };
+                if let Err(error) = value.try_into::<ProviderConfig>() {
+                    providers.remove(&name);
+                    warnings.push(format!("[providers.{name}] was ignored: {error}"));
+                    skipped_providers.push(name);
+                }
+            }
+        }
+
+        let mut config: Config = document
+            .try_into()
+            .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+        migrate_legacy_lsp_default(&mut config);
+        if skipped_providers
+            .iter()
+            .any(|name| name == &config.default_provider)
+        {
+            let unavailable = config.default_provider.clone();
+            if let Some(fallback) = config.providers.keys().min().cloned() {
+                config.default_provider = fallback.clone();
+                warnings.push(format!(
+                    "default_provider \"{unavailable}\" was unavailable; using \"{fallback}\""
+                ));
+            } else {
+                warnings.push(format!(
+                    "default_provider \"{unavailable}\" was unavailable; no valid providers remain"
+                ));
+            }
+        }
+        Ok((config, warnings))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -925,7 +993,7 @@ impl Config {
         };
         // Validate by loading (read + toml parse + migrations) before adopting, so a
         // malformed seed can't wedge the user into a broken config.
-        let seed = match Config::load(src) {
+        let seed = match Config::load_strict(src) {
             Ok(c) => c,
             Err(e) => return SeedOutcome::Invalid(e.to_string()),
         };
@@ -1033,6 +1101,83 @@ mod tests {
         let outcome = Config::seed_user_config(&target, Some(&seed));
         assert!(matches!(outcome, SeedOutcome::Invalid(_)));
         assert!(!target.exists(), "a bad seed must not create a config");
+    }
+
+    #[test]
+    fn tolerant_load_skips_only_the_invalid_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+default_provider = "AtomGit"
+auto_update = false
+
+[providers.AtomGit]
+type = "openai"
+base_url = "https://example.com/v1"
+api_key = "valid"
+model = "glm-5.2"
+
+[providers.MyDeepSeek]
+base_url = "https://api.siliconflow.cn/v1"
+api_key = "also-secret"
+model = "deepseek-ai/DeepSeek-V4-Pro"
+capable_model = 1
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            Config::load_strict(&path).is_err(),
+            "strict validation must continue rejecting the malformed file"
+        );
+
+        let default_load = Config::load(&path).unwrap();
+        assert!(default_load.providers.contains_key("AtomGit"));
+        assert!(!default_load.providers.contains_key("MyDeepSeek"));
+
+        let (config, warnings) = Config::load_with_diagnostics(&path).unwrap();
+        assert_eq!(config.default_provider, "AtomGit");
+        assert!(!config.auto_update);
+        assert_eq!(config.providers.len(), 1);
+        assert!(config.providers.contains_key("AtomGit"));
+        assert!(!config.providers.contains_key("MyDeepSeek"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("[providers.MyDeepSeek]"));
+        assert!(warnings[0].contains("missing field"));
+        assert!(
+            !warnings[0].contains("also-secret"),
+            "diagnostics must not expose provider credentials"
+        );
+    }
+
+    #[test]
+    fn tolerant_load_replaces_a_skipped_default_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+default_provider = "Broken"
+
+[providers.Valid]
+type = "openai"
+model = "working-model"
+
+[providers.Broken]
+model = "missing-type"
+"#,
+        )
+        .unwrap();
+
+        let (config, warnings) = Config::load_with_diagnostics(&path).unwrap();
+        assert_eq!(config.default_provider, "Valid");
+        assert_eq!(config.providers.len(), 1);
+        assert!(
+            warnings.iter().any(|warning| warning
+                == "default_provider \"Broken\" was unavailable; using \"Valid\"")
+        );
     }
 
     #[test]
