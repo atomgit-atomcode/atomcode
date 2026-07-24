@@ -5451,10 +5451,12 @@ mod menu_tests {
         let items = build_menu_items("/myr", 0, &reg, &custom, None, None)
             .expect("should find myreview");
         let name = &items[0].0;
-        let needs_args = reg.find(name).map(|c| c.needs_args)
-            .or_else(|| custom.resolve(name).map(|c| c.args_requirement != ArgsRequirement::None))
-            .unwrap_or(false);
-        assert!(needs_args, "Required custom command must trigger needs_args");
+        // Assert the contract directly: Required custom command must resolve
+        // to ArgsRequirement::Required (which implies needs_args = true).
+        // Hardcode the expected variant instead of recomputing needs_args
+        // from the same production logic under test.
+        let resolved = custom.resolve(name).expect("myreview must resolve");
+        assert_eq!(resolved.args_requirement, ArgsRequirement::Required);
     }
 
     #[test]
@@ -5472,10 +5474,12 @@ mod menu_tests {
         let items = build_menu_items("/myr", 0, &reg, &custom, None, None)
             .expect("should find myreview");
         let name = &items[0].0;
-        let needs_args = reg.find(name).map(|c| c.needs_args)
-            .or_else(|| custom.resolve(name).map(|c| c.args_requirement != ArgsRequirement::None))
-            .unwrap_or(false);
-        assert!(needs_args, "Optional custom command must trigger needs_args");
+        // Assert the contract directly: Optional custom command must resolve
+        // to ArgsRequirement::Optional (which implies needs_args = true).
+        // Hardcode the expected variant instead of recomputing needs_args
+        // from the same production logic under test.
+        let resolved = custom.resolve(name).expect("myreview must resolve");
+        assert_eq!(resolved.args_requirement, ArgsRequirement::Optional);
     }
 
     #[test]
@@ -5493,10 +5497,12 @@ mod menu_tests {
         let items = build_menu_items("/myr", 0, &reg, &custom, None, None)
             .expect("should find myreview");
         let name = &items[0].0;
-        let needs_args = reg.find(name).map(|c| c.needs_args)
-            .or_else(|| custom.resolve(name).map(|c| c.args_requirement != ArgsRequirement::None))
-            .unwrap_or(false);
-        assert!(!needs_args, "None custom command must NOT trigger needs_args");
+        // Assert the contract directly: None custom command must resolve
+        // to ArgsRequirement::None (which implies needs_args = false).
+        // Hardcode the expected variant instead of recomputing needs_args
+        // from the same production logic under test.
+        let resolved = custom.resolve(name).expect("myreview must resolve");
+        assert_eq!(resolved.args_requirement, ArgsRequirement::None);
     }
 }
 
