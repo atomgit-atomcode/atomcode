@@ -18968,7 +18968,7 @@ pub(crate) fn enrich_todo_detail(
     if name != "todo" && name != "todowrite" {
         return base.to_string();
     }
-    let repaired = atomcode_core::turn::json_repair::repair_tool_args(name, args_json);
+    let repaired = atomcode_capabilities::tools::repair::repair_tool_args(name, args_json);
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) else {
         return base.to_string();
     };
@@ -18991,7 +18991,7 @@ pub(crate) fn enrich_todo_detail(
 }
 
 pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
-    let repaired_args = atomcode_core::turn::json_repair::repair_tool_args(name, args_json);
+    let repaired_args = atomcode_capabilities::tools::repair::repair_tool_args(name, args_json);
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired_args) else {
         return String::new();
     };
