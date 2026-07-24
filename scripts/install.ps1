@@ -153,8 +153,21 @@ Move-Item -Path $TmpFile -Destination $Dest
 
 # --- add to PATH ---
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($UserPath -notlike "*$Prefix*") {
-    $NewPath = "$Prefix;$UserPath"
+# Compare COMPLETE, normalized PATH entries — never a substring of the raw string.
+# A raw `-like "*$Prefix*"` false-positives when another entry merely CONTAINS the
+# prefix (e.g. "...\AtomCodeBackup" for prefix "...\AtomCode"), silently skipping the
+# real add so atomcode isn't on PATH in a new terminal. Split on ';', trim trailing
+# '\' + whitespace, match case-insensitively (Windows paths are case-insensitive).
+# Also avoids `-like` treating the prefix as a wildcard pattern (e.g. a literal '[').
+$PrefixNorm = $Prefix.TrimEnd('\').Trim()
+$InPath = $false
+if ($UserPath) {
+    foreach ($entry in ($UserPath -split ';')) {
+        if ($entry.TrimEnd('\').Trim() -ieq $PrefixNorm) { $InPath = $true; break }
+    }
+}
+if (-not $InPath) {
+    $NewPath = if ($UserPath) { "$Prefix;$UserPath" } else { $Prefix }
     [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
     # Also update current session so user can use it immediately
     $env:Path = "$Prefix;$env:Path"
