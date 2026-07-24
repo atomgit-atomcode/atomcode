@@ -211,6 +211,15 @@ pub struct Config {
     /// registry, Maven internal repo) so the model doesn't over-restrict itself.
     #[serde(default)]
     pub offline_note: Option<String>,
+
+    /// Provider sections that failed strict validation during a *tolerant* load
+    /// (see [`Self::parse_disk_content_tolerant`]). Held verbatim as raw TOML so
+    /// a later write-back (`/model`, theme change, …) re-emits the user's
+    /// malformed `[providers.<name>]` text unchanged instead of silently
+    /// dropping it — they can repair it in place later. Never (de)serialized by
+    /// serde (`skip`); populated on load and re-emitted by `serialize_for_disk`.
+    #[serde(skip)]
+    pub quarantined_providers: std::collections::BTreeMap<String, toml::Value>,
 }
 
 /// Web search backend configuration. Persisted as the `[web_search]` table.
@@ -407,6 +416,7 @@ impl Default for Config {
             keep_interrupted_context: true,
             offline_mode: offline::OfflineMode::default(),
             offline_note: None,
+            quarantined_providers: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -656,6 +666,44 @@ fn render_datalog_section(cfg: &DatalogConfig) -> String {
     out
 }
 
+/// Re-emit provider tables that failed strict validation on load, verbatim,
+/// so a write-back preserves the user's malformed `[providers.<name>]` text
+/// rather than silently dropping it (see [`Config::quarantined_providers`]).
+/// Rendered through the toml serializer so key quoting round-trips exactly to
+/// what the loader reads back.
+///
+/// All entries are serialized in a SINGLE pass. Emitting them one at a time
+/// produced a separate `[providers]` header for every *non-table* value (e.g.
+/// `providers.Foo = "bar"`), and two such headers are a duplicate-table TOML
+/// error that would corrupt the file on write-back. Serializing the whole map
+/// at once groups any scalar entries under one `[providers]` header while each
+/// table entry still gets its own `[providers.<name>]`.
+fn render_quarantined_providers(
+    quarantined: &std::collections::BTreeMap<String, toml::Value>,
+) -> String {
+    if quarantined.is_empty() {
+        return String::new();
+    }
+    let mut providers = toml::map::Map::new();
+    for (name, value) in quarantined {
+        providers.insert(name.clone(), value.clone());
+    }
+    let mut wrapper = toml::map::Map::new();
+    wrapper.insert("providers".to_string(), toml::Value::Table(providers));
+    // Values we deserialized from disk always re-serialize; if the batch somehow
+    // can't, drop it rather than write a corrupt file.
+    let Ok(section) = toml::to_string_pretty(&toml::Value::Table(wrapper)) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    out.push_str("\n# The provider section(s) below failed validation on load and were\n");
+    out.push_str("# kept as-is so nothing you wrote is lost. Fix or delete them; until\n");
+    out.push_str("# then they are ignored (see the startup warning for the reason).\n\n");
+    out.push_str(section.trim_end());
+    out.push('\n');
+    out
+}
+
 fn render_notifications_section(cfg: &NotificationConfig) -> String {
     let mut out = String::new();
     out.push_str("\n# Long-running task completion notifications.\n");
@@ -845,7 +893,8 @@ impl Config {
         let mut document: toml::Value = toml::from_str(content)
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         let mut warnings = Vec::new();
-        let mut skipped_providers = Vec::new();
+        let mut quarantined: std::collections::BTreeMap<String, toml::Value> =
+            std::collections::BTreeMap::new();
 
         if let Some(providers) = document
             .get_mut("providers")
@@ -856,10 +905,12 @@ impl Config {
                 let Some(value) = providers.get(&name).cloned() else {
                     continue;
                 };
-                if let Err(error) = value.try_into::<ProviderConfig>() {
+                // Validate against a clone so the original raw value survives to
+                // be quarantined verbatim on the error path.
+                if let Err(error) = value.clone().try_into::<ProviderConfig>() {
                     providers.remove(&name);
                     warnings.push(format!("[providers.{name}] was ignored: {error}"));
-                    skipped_providers.push(name);
+                    quarantined.insert(name, value);
                 }
             }
         }
@@ -867,10 +918,11 @@ impl Config {
         let mut config: Config = document
             .try_into()
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+        config.quarantined_providers = quarantined;
         migrate_legacy_lsp_default(&mut config);
-        if skipped_providers
-            .iter()
-            .any(|name| name == &config.default_provider)
+        if config
+            .quarantined_providers
+            .contains_key(&config.default_provider)
         {
             let unavailable = config.default_provider.clone();
             if let Some(fallback) = config.providers.keys().min().cloned() {
@@ -915,6 +967,7 @@ impl Config {
         content.push_str(&render_telemetry_section(&self.telemetry));
         content.push_str(&render_instructions_section());
         content.push_str(&render_hooks_json_section());
+        content.push_str(&render_quarantined_providers(&self.quarantined_providers));
         Ok(content)
     }
 
@@ -1150,6 +1203,75 @@ capable_model = 1
             !warnings[0].contains("also-secret"),
             "diagnostics must not expose provider credentials"
         );
+
+        // The invalid section is quarantined verbatim (not discarded) so a
+        // write-back can preserve it.
+        assert!(config.quarantined_providers.contains_key("MyDeepSeek"));
+        assert!(!config.quarantined_providers.contains_key("AtomGit"));
+    }
+
+    #[test]
+    fn serialize_round_trip_preserves_a_quarantined_provider() {
+        let source = r#"
+default_provider = "Valid"
+
+[providers.Valid]
+type = "openai"
+model = "working-model"
+
+[providers.Broken]
+model = "missing-type"
+api_key = "keep-me-secret"
+"#;
+        let (config, warnings) = Config::parse_disk_content_tolerant(source, Path::new("x")).unwrap();
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(warnings.len(), 1);
+
+        // Serialize (as a write-back would) then reload: the Broken section and
+        // its fields survive, and it is still isolated from the typed view.
+        let rendered = config.serialize_for_disk(None).unwrap();
+        assert!(rendered.contains("[providers.Broken]"));
+        assert!(rendered.contains("missing-type"));
+        assert!(rendered.contains("keep-me-secret"));
+
+        let (reloaded, rewarnings) =
+            Config::parse_disk_content_tolerant(&rendered, Path::new("x")).unwrap();
+        assert_eq!(reloaded.default_provider, "Valid");
+        assert!(reloaded.providers.contains_key("Valid"));
+        assert!(!reloaded.providers.contains_key("Broken"));
+        assert!(reloaded.quarantined_providers.contains_key("Broken"));
+        assert_eq!(rewarnings.len(), 1);
+    }
+
+    #[test]
+    fn serialize_round_trip_survives_multiple_non_table_providers() {
+        // Two providers written as inline scalars (`providers.Foo = "..."`) both
+        // fail validation. Emitting them one-per-`to_string_pretty` call produced
+        // two `[providers]` headers — a duplicate-table TOML error that corrupted
+        // the file on write-back. A single serialize pass must round-trip cleanly.
+        let source = r#"
+default_provider = "V"
+
+[providers.V]
+type = "openai"
+model = "m"
+
+[providers]
+Foo = "one"
+Baz = "two"
+"#;
+        let (config, warnings) =
+            Config::parse_disk_content_tolerant(source, Path::new("x")).unwrap();
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(warnings.len(), 2);
+
+        let rendered = config.serialize_for_disk(None).unwrap();
+        // The critical assertion: the written file must re-parse (not corrupt).
+        let (reloaded, _) = Config::parse_disk_content_tolerant(&rendered, Path::new("x"))
+            .expect("write-back must produce valid TOML for multiple non-table providers");
+        assert!(reloaded.providers.contains_key("V"));
+        assert!(reloaded.quarantined_providers.contains_key("Foo"));
+        assert!(reloaded.quarantined_providers.contains_key("Baz"));
     }
 
     #[test]
@@ -1585,6 +1707,7 @@ model = "missing-type"
             keep_interrupted_context: false,
             offline_mode: Default::default(),
             offline_note: None,
+            quarantined_providers: std::collections::BTreeMap::new(),
         };
         cfg.providers.insert(
             "p".to_string(),

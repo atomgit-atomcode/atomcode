@@ -153,7 +153,7 @@ fn failed_transaction_leaves_the_previous_snapshot_unchanged() {
 }
 
 #[test]
-fn tolerant_read_does_not_make_transactions_overwrite_an_invalid_provider() {
+fn tolerant_update_preserves_the_invalid_provider_section() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let content = r#"
@@ -174,18 +174,29 @@ model = "missing-type"
     assert!(snapshot.config.providers.contains_key("valid"));
     assert!(!snapshot.config.providers.contains_key("invalid"));
 
-    let error = store
+    // A malformed provider on disk must NOT block unrelated config writes
+    // (e.g. `/model`). The transaction succeeds…
+    let commit = store
         .update(|config| {
             config.default_provider = "valid".into();
             Ok(())
         })
-        .expect_err("transactions must strictly reject malformed disk state");
-    assert!(error.to_string().contains("Failed to parse config"));
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        content,
-        "a rejected transaction must leave the original provider section untouched"
+        .expect("a malformed provider must not block unrelated config writes");
+    assert_eq!(commit.snapshot.config.default_provider, "valid");
+    assert!(!commit.snapshot.config.providers.contains_key("invalid"));
+
+    // …while the malformed section is preserved verbatim on disk so the user
+    // can repair it in place later (never silently dropped).
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("[providers.invalid]") && on_disk.contains("missing-type"),
+        "the malformed provider section must survive the write:\n{on_disk}"
     );
+
+    // And it still round-trips as quarantined (isolated) on the next read.
+    let reread = store.read().unwrap();
+    assert!(!reread.config.providers.contains_key("invalid"));
+    assert!(reread.config.quarantined_providers.contains_key("invalid"));
 }
 
 #[test]
