@@ -548,6 +548,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 是否已为「当前会话」上报过乐观侧栏条目。每次切换/新建会话时复位，
   // 避免同一会话第二条消息（尤其 sync 路径本地不落消息）重复上报、改写标题。
   const optimisticFiredRef = useRef(false);
+  // Sync path: text of a message THIS tab just optimistically appended (so the
+  // view leaves the "new conversation" landing page instantly instead of waiting
+  // for the server `user` echo, which only arrives after VL preprocessing). The
+  // matching self-echo is deduped in the `user` case so we don't render it twice.
+  // Turns are serialized (hub `turn_active`), so the next `user` echo after a send
+  // is this tab's own; a peer's message (different text, or after the ref clears)
+  // still appends normally.
+  const pendingSelfEchoRef = useRef<string | null>(null);
   // Artifact (code block) streaming: the daemon's ArtifactDetector strips fenced
   // code blocks from TextDelta and emits them as artifact_start / content / end.
   // These refs accumulate the language tag and code body for each artifact so
@@ -574,6 +582,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       providerPinnedRef.current = false;
       loadedForRef.current = null;
       optimisticFiredRef.current = false;
+      pendingSelfEchoRef.current = null;
       // An existing session stays send-locked until `/chat/active` proves it
       // has no detached operation. Its canonical id is already a safe stop
       // alias, including while the discovery request is pending or unavailable.
@@ -1156,6 +1165,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         });
         liveLifecycleRef.current = lifecycle.state;
         setBusy(lifecycle.state.running);
+        // Dedup THIS tab's own echo: we already optimistically appended it on send
+        // (leaving the landing page instantly). Consume the marker and skip the
+        // re-append; a peer's message still falls through and renders.
+        if (pendingSelfEchoRef.current !== null && e.text === pendingSelfEchoRef.current) {
+          pendingSelfEchoRef.current = null;
+          break;
+        }
         // Append the peer's user message + empty assistant placeholder
         const now = Date.now();
         setMessages((prev) => [
@@ -1165,6 +1181,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         ]);
         break;
       }
+
       case 'state': {
         const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
           type: 'state',
@@ -1772,9 +1789,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }
 
     if (sync) {
-      // ── Sync path: send to /live/message; do NOT locally append (the user
-      //    event will arrive back via the live stream, keeping all tabs in sync).
+      // ── Sync path: send to /live/message. Optimistically append the user
+      //    message NOW so the view leaves the "new conversation" landing page
+      //    immediately (the server `user` echo — which keeps OTHER tabs in sync —
+      //    only arrives after VL preprocessing, so waiting for it leaves the
+      //    sender stuck on the empty page). Our own echo is deduped in the `user`
+      //    case via `pendingSelfEchoRef`.
       setBusy(true);
+      const now = Date.now();
+      pendingSelfEchoRef.current = text;
+      setMessages((prev) => [
+        ...prev,
+        { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now },
+        { role: 'assistant', parts: [], ts: now },
+      ]);
       try {
         await postLiveMessage(
           text,
@@ -1783,6 +1811,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           activeIdRef.current,
         );
       } catch (error) {
+        // Roll back the optimistic append — the send never reached the server.
+        pendingSelfEchoRef.current = null;
+        setMessages((prev) => prev.slice(0, -2));
         setBusy(false);
         setQueued([]);
         setHistoryHint(t('chat.connError', { msg: String(error) }));
