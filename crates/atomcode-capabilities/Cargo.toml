@@ -173,7 +173,10 @@ skills = []
 # CC-compatible external hooks: run the user's hooks.json commands on the kernel
 # seams (LifecycleHooks + ToolMiddleware). Spawns subprocesses, so it pulls the
 # process/io tokio features; `dirs` resolves $ATOMCODE_HOME. Opt-in (NOT default).
-cc-hooks = ["dep:dirs", "tokio/process", "tokio/io-util"]
+# `cc_hooks` uses `crate::tools::{request_approval_decision, PermissionDecision, …}`,
+# so it needs `tools` — without this it only compiled when a consumer happened to enable
+# `tools` transitively (e.g. via `atomgit`).
+cc-hooks = ["tools", "dep:dirs", "tokio/process", "tokio/io-util"]
 # E2E tests that hit a REAL provider (network + API key). Separate from the default
 # suite; run on demand: `cargo test -p atomcode-capabilities --features e2e --test e2e`.
 e2e = ["provider"]

@@ -2660,7 +2660,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
 /// `<project>/.hooks.json`). The legacy v1 engine (TOML script / webhook / built-in
 /// hooks) no longer fires at runtime, so it is intentionally not surfaced here.
 async fn handle_hooks(cmd: HookCommands) -> Result<()> {
-    use atomcode_capabilities::cc_hooks::{load_hooks_config, run_hook_for_test, HookEvent};
+    use atomcode_capabilities::cc_hooks::{
+        global_hooks_path, load_hooks_config, project_hooks_path, run_hook_for_test, HookEvent,
+    };
     HEADLESS_MODE.store(true, Ordering::Relaxed);
 
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -2676,12 +2678,18 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
         }
     }
 
-    // The exact config files cc_hooks loads (same ones the live runtime reads).
-    let global_hooks = atomcode_config::config::Config::config_dir().join("hooks.json");
-    let project_hooks = cwd.join(".hooks.json");
+    // Display the EXACT files cc_hooks loads — via cc_hooks' own resolver, not
+    // `Config::config_dir()` (which is sudo-aware and would diverge from what the
+    // hook loader actually reads under `sudo`, turning the diagnostic into a lie).
+    let project_hooks = project_hooks_path(&cwd);
     let print_paths = || {
-        let g = if global_hooks.exists() { "✓" } else { "✗" };
-        println!("  {} Global:   {}", g, global_hooks.display());
+        match global_hooks_path() {
+            Some(g) => {
+                let mark = if g.exists() { "✓" } else { "✗" };
+                println!("  {} Global:   {}", mark, g.display());
+            }
+            None => println!("  ✗ Global:   (no home directory)"),
+        }
         let p = if project_hooks.exists() { "✓" } else { "✗" };
         println!("  {} Project:  {}", p, project_hooks.display());
     };
@@ -2760,29 +2768,48 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         println!("  Matcher:   {}", m);
                     }
                     println!();
-                    // CC stdin payload — the SAME contract the live runtime pipes.
-                    let payload = serde_json::json!({
-                        "hook_event_name": event_name(hook.event),
-                        "session_id": "test-session-0000",
-                        "cwd": cwd.display().to_string(),
-                        "tool_name": "bash",
-                        "tool_input": { "command": "echo hello" },
-                    });
+                    // CC stdin payload — event-shaped to MATCH what the live runtime pipes
+                    // (see cc_hooks lifecycle methods): only tool events carry tool fields,
+                    // PostToolUse carries `tool_response`, UserPromptSubmit carries `prompt`.
+                    let sid = "test-session-0000";
+                    let cwd_s = cwd.display().to_string();
+                    let payload = match hook.event {
+                        HookEvent::PreToolUse => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "PreToolUse", "cwd": cwd_s,
+                            "tool_name": "bash", "tool_input": { "command": "echo hello" },
+                        }),
+                        HookEvent::PostToolUse => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "PostToolUse", "cwd": cwd_s,
+                            "tool_name": "bash", "tool_response": "hello\n",
+                        }),
+                        HookEvent::UserPromptSubmit => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "UserPromptSubmit",
+                            "cwd": cwd_s, "prompt": "test prompt",
+                        }),
+                        HookEvent::SessionStart => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "SessionStart", "cwd": cwd_s,
+                        }),
+                        HookEvent::SessionEnd => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "SessionEnd", "cwd": cwd_s,
+                        }),
+                    };
                     let start = std::time::Instant::now();
                     match run_hook_for_test(hook, &payload).await {
                         Some(out) => {
-                            let ok = out.exit_code == Some(0);
                             println!("📋 Result:");
                             println!("  Duration:  {:?}", start.elapsed());
-                            let status = out
-                                .exit_code
-                                .map(|c| format!("exit code {}", c))
-                                .unwrap_or_else(|| "terminated by signal".into());
-                            println!(
-                                "  Status:    {} ({})",
-                                if ok { "✅ SUCCESS" } else { "❌ FAILURE" },
-                                status
-                            );
+                            // CC exit-code contract: 0 = ok, 2 = DELIBERATE block (not a
+                            // failure), other/signal = the hook broke.
+                            let (label, detail) = match out.exit_code {
+                                Some(0) => ("✅ SUCCESS", "exit code 0".to_string()),
+                                Some(2) => (
+                                    "⛔ BLOCK",
+                                    "exit code 2 — hook requested a block (CC contract)".to_string(),
+                                ),
+                                Some(c) => ("❌ FAILURE", format!("exit code {}", c)),
+                                None => ("❌ FAILURE", "terminated by signal".to_string()),
+                            };
+                            println!("  Status:    {} ({})", label, detail);
                             if !out.stdout.is_empty() {
                                 println!("  ── stdout ──");
                                 for l in out.stdout.trim_end().lines() {
@@ -2799,7 +2826,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         None => {
                             println!("📋 Result:");
                             println!(
-                                "  ⏱ TIMEOUT or spawn failure (after {} ms)",
+                                "  ❌ Hook did not complete: it timed out (>{} ms) or failed to spawn.",
                                 hook.timeout_ms
                             );
                         }

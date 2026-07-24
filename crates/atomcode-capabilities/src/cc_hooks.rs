@@ -184,13 +184,27 @@ fn atomcode_home() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".atomcode"))
 }
 
+/// The GLOBAL hooks file `load_hooks_config` reads
+/// (`$ATOMCODE_HOME`/`~/.atomcode` + `/hooks.json`), or `None` when no home resolves.
+/// Exposed so diagnostics (`atomcode hooks paths`/`list`) show EXACTLY the file that is
+/// loaded — which under `sudo` is NOT the sudo-aware `Config::config_dir()` this module
+/// deliberately does not use.
+pub fn global_hooks_path() -> Option<PathBuf> {
+    atomcode_home().map(|h| h.join("hooks.json"))
+}
+
+/// The PROJECT hooks file `load_hooks_config` reads (`<root>/.hooks.json`).
+pub fn project_hooks_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(".hooks.json")
+}
+
 /// Load user (`$ATOMCODE_HOME/hooks.json`) + project (`<root>/.hooks.json`) hooks.
 pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
     let mut out = Vec::new();
-    if let Some(home) = atomcode_home() {
-        out.extend(load_hooks_file(&home.join("hooks.json")));
+    if let Some(p) = global_hooks_path() {
+        out.extend(load_hooks_file(&p));
     }
-    out.extend(load_hooks_file(&project_dir.join(".hooks.json")));
+    out.extend(load_hooks_file(&project_hooks_path(project_dir)));
     out
 }
 
