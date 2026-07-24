@@ -18,7 +18,6 @@ pub mod process_utils;
 pub mod conversation;
 pub mod ctx;
 pub mod graph;
-pub mod hook;
 // `i18n` fully lives in the leaf `atomcode-config` crate now (it only needs
 // `locale::Locale`); re-export it so core's own `crate::i18n::…` uses and any
 // external `atomcode_core::i18n` consumers keep working during the transition.
