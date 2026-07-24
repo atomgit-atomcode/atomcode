@@ -3716,6 +3716,8 @@ fn split_skill_names(
         rest = rest[token_end..].trim_start();
     }
     (skills, rest.to_string())
+}
+
 /// Decision returned by [`decide_custom_command`] for the `other` arm of
 /// [`execute_slash_command_impl`]. Separating the pure decision from its
 /// side effects (rendering an error line, submitting an agent turn) lets
