@@ -31,7 +31,7 @@ use crate::i18n::{t, Msg};
 use crate::modals::usage::{UsageData, UsageModal};
 use crate::modals::{
     DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProviderWizard,
-    ProxyPicker, SessionPicker,
+    ProxyPicker,
 };
 use crate::render::{Renderer, UiLine};
 use crate::session::{Session, SessionId};
