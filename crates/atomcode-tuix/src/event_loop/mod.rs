@@ -2977,7 +2977,7 @@ pub struct LoopCtx {
     /// without extra plumbing. Used by the slash-command palette to
     /// surface user-invocable skills, and by the dispatcher to expand
     /// `/skill_name [args]` into a SendMessage.
-    pub skill_registry: std::sync::Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+    pub skill_registry: std::sync::Arc<std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
     /// Snapshot of the terminal's rendering capabilities. Probed once at
     /// startup in `lib.rs`; threaded into `App::new` so `UiState` knows
     /// whether to use Unicode or ASCII fallbacks for the spinner glyph
@@ -4715,14 +4715,12 @@ mod menu_tests {
         );
     }
 
-    fn skill_fixture(name: &str, desc: &str, user_invocable: bool) -> atomcode_core::skill::Skill {
-        atomcode_core::skill::Skill {
+    fn skill_fixture(name: &str, desc: &str, user_invocable: bool) -> atomcode_capabilities::skills::Skill {
+        atomcode_capabilities::skills::Skill {
             name: name.to_string(),
             description: desc.to_string(),
             template: "do thing".to_string(),
-            disable_model_invocation: false,
             user_invocable,
-            argument_hint: None,
             allowed_tools: vec![],
             skill_dir: std::path::PathBuf::new(),
             source_path: std::path::PathBuf::new(),
@@ -4736,7 +4734,7 @@ mod menu_tests {
         // the `/skills` gateway so the top palette stays uncluttered.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
@@ -4770,7 +4768,7 @@ mod menu_tests {
         // as `/skills <name>`.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
@@ -4792,7 +4790,7 @@ mod menu_tests {
         // to web-access. /skills zz returns no menu at all.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
@@ -4816,7 +4814,7 @@ mod menu_tests {
         // menu should disappear so arrow keys don't navigate stale entries.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
 
@@ -4837,7 +4835,7 @@ mod menu_tests {
         // either — they're LLM-only via the use_skill tool.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:visible", "shown", true));
         skills.register(skill_fixture("skills:hidden", "hidden", false));
         let lock = std::sync::RwLock::new(skills);
@@ -4894,7 +4892,7 @@ mod menu_tests {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
         let with_none = build_menu_items("/", 0, &reg, &custom, None, None).unwrap();
-        let empty_skills = std::sync::RwLock::new(atomcode_core::skill::SkillRegistry::new());
+        let empty_skills = std::sync::RwLock::new(atomcode_capabilities::skills::SkillRegistry::new());
         let with_empty =
             build_menu_items("/", 0, &reg, &custom, Some(&empty_skills), None).unwrap();
         assert_eq!(
@@ -4906,7 +4904,7 @@ mod menu_tests {
 
     #[test]
     fn build_skill_menu_items_lists_unique_bare_names() {
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
         skills.register(skill_fixture("skills:hidden", "no", false));
@@ -4929,7 +4927,7 @@ mod menu_tests {
     fn dollar_trigger_lists_all_user_invocable_skills() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
         skills.register(skill_fixture("skills:hidden", "no", false));
@@ -4949,7 +4947,7 @@ mod menu_tests {
     fn dollar_trigger_filters_and_parity_with_skills_submode() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
@@ -4970,7 +4968,7 @@ mod menu_tests {
     fn dollar_trigger_only_at_start_and_closes_on_space() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
 
@@ -9580,7 +9578,7 @@ fn strip_pasted_prompt_prefix(line: &str) -> Option<&str> {
 /// qualified name is shown to disambiguate. Sorted for stable navigation.
 /// Shared by the `/skills ` sub-mode and the `$` trigger so both stay in lockstep.
 fn build_skill_menu_items(
-    skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+    skill_registry: Option<&std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
     prefix_lower: &str,
 ) -> Vec<(String, String)> {
     let mut items: Vec<(String, String)> = Vec::new();
@@ -9629,7 +9627,7 @@ fn build_menu_items(
     cursor: usize,
     commands: &CommandRegistry,
     custom: &crate::custom_commands::CustomCommandRegistry,
-    skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+    skill_registry: Option<&std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
     file_index: Option<&file_index::FileIndex>,
 ) -> Option<Vec<(String, String)>> {
     // `@`-mention branch — checked first so it takes priority over any

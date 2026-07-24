@@ -611,7 +611,7 @@ pub async fn run(
     // skills without re-plumbing.
     let foreground_runtime_id = event_loop::bg_runtime::RuntimeId::new(1);
     let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(
-        atomcode_core::skill::SkillRegistry::new(),
+        atomcode_capabilities::skills::SkillRegistry::new(),
     ));
     if let Ok(mut registry) = skill_registry.write() {
         let _ = registry.reload(&working_dir);

@@ -77,7 +77,7 @@ fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientB
 pub async fn check_latest(current: &str) -> Option<String> {
     let client = apply_async_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(5))
-        .user_agent(atomcode_core::ATOMCODE_USER_AGENT)
+        .user_agent(atomcode_auth::ATOMCODE_USER_AGENT)
         .build()
         .ok()?;
     let resp = client.get(MANIFEST_URL).send().await.ok()?;

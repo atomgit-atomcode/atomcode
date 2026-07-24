@@ -90,6 +90,43 @@ impl SkillRegistry {
             .collect()
     }
 
+    /// Clear and reload from the standard home+project skill dirs (the `/skills`
+    /// slash-menu source), under the `skills:` namespace — matching the driver's
+    /// slash-command convention. Mirrors core `SkillRegistry::reload`.
+    ///
+    /// Returns per-skill load warnings for signature compatibility with core's
+    /// `reload` (driver call sites surface them). Currently always empty: this loader
+    /// silently skips unparseable skills — the SAME behavior the runtime skill path
+    /// uses — so no parse warnings are collected.
+    pub fn reload(&mut self, working_dir: &Path) -> Vec<String> {
+        self.skills.clear();
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        for dir in standard_skill_dirs(&home, working_dir) {
+            self.load_dir(&dir, Some("skills"));
+        }
+        Vec::new()
+    }
+
+    /// Skills a user can invoke from the `/` menu (frontmatter `user-invocable` not
+    /// `false`), sorted by name.
+    pub fn user_invocable(&self) -> impl Iterator<Item = &Skill> {
+        self.skills
+            .values()
+            .map(|s| s.as_ref())
+            .filter(|s| s.user_invocable)
+    }
+
+    /// Insert a skill programmatically (same-name replaces). Mirrors core
+    /// `SkillRegistry::register`; used by drivers injecting non-file skills and by tests.
+    pub fn register(&mut self, skill: Skill) {
+        self.skills.insert(skill.name.clone(), Arc::new(skill));
+    }
+
+    /// Every loaded skill, sorted by name.
+    pub fn all(&self) -> impl Iterator<Item = &Skill> {
+        self.skills.values().map(|s| s.as_ref())
+    }
+
     /// Render the `=== AVAILABLE SKILLS ===` system-prompt section (budget-gated,
     /// source-ranked), or `None` when no skills are installed. See
     /// [`super::render`].
