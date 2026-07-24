@@ -34,7 +34,11 @@ impl ClaudeProvider {
         let thinking_enabled = config.thinking_enabled.unwrap_or(false);
         let thinking_budget = config.thinking_budget.unwrap_or(10_000);
         Ok(Self {
-            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify)?,
+            client: super::build_http_client(
+                config.user_agent.as_deref(),
+                config.skip_tls_verify,
+                false,
+            )?,
             api_key,
             model: config.model.clone(),
             base_url: config

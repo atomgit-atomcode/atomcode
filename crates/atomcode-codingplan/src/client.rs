@@ -21,14 +21,22 @@ use atomcode_auth as auth;
 /// reqwest's env-based proxy detection intact otherwise. Fail-open (any non-NoProxy → builder).
 fn apply_blocking_proxy_policy(
     builder: reqwest::blocking::ClientBuilder,
+    force_tls12: bool,
 ) -> reqwest::blocking::ClientBuilder {
     atomcode_config::proxy::ensure_runtime_initialized();
-    if std::env::var(atomcode_config::proxy::MODE_ENV)
+    let builder = if std::env::var(atomcode_config::proxy::MODE_ENV)
         .ok()
         .as_deref()
         == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
     {
         builder.no_proxy()
+    } else {
+        builder
+    };
+    // Cap at TLS 1.2 when a TLS-1.3-hostile network has been detected/requested
+    // (some paths RST the TLS 1.3 handshake to *.atomgit.com → os error 10054).
+    if force_tls12 {
+        builder.max_tls_version(reqwest::tls::Version::TLS_1_2)
     } else {
         builder
     }
@@ -99,11 +107,67 @@ pub fn is_auth_expired(err: &anyhow::Error) -> bool {
 
 /// Token-authenticated blocking REST client for CodingPlan endpoints.
 pub struct Client {
-    http: reqwest::blocking::Client,
+    /// Replaced once when a connect-level failure latches the TLS 1.2 fallback.
+    /// `reqwest::blocking::Client` is cheap to clone; the lock is held only long
+    /// enough to take that clone, never across network I/O.
+    http: std::sync::RwLock<reqwest::blocking::Client>,
     token: String,
 }
 
 impl Client {
+    fn build_http_client(force_tls12: bool) -> reqwest::Result<reqwest::blocking::Client> {
+        apply_blocking_proxy_policy(reqwest::blocking::Client::builder(), force_tls12)
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent(atomcode_auth::ATOMCODE_USER_AGENT)
+            .build()
+    }
+
+    fn http(&self) -> reqwest::blocking::Client {
+        self.http
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Send once with the current client. For a managed-service connect failure,
+    /// try a freshly built TLS-1.2 client exactly once; only a successful
+    /// transport round-trip proves the downgrade and latches it process-wide.
+    fn send_with_tls_fallback<F>(
+        &self,
+        url: &str,
+        fallback_attempted: &std::cell::Cell<bool>,
+        build_request: F,
+    ) -> reqwest::Result<reqwest::blocking::Response>
+    where
+        F: Fn(reqwest::blocking::Client) -> reqwest::blocking::RequestBuilder,
+    {
+        let was_capped = atomcode_config::tls::should_cap_url(url);
+        match build_request(self.http()).send() {
+            Err(first)
+                if atomcode_config::tls::should_try_fallback(
+                    url,
+                    was_capped,
+                    first.is_connect(),
+                ) && !fallback_attempted.replace(true) =>
+            {
+                let fresh = Self::build_http_client(true)?;
+                match build_request(fresh.clone()).send() {
+                    Ok(response) => {
+                        atomcode_config::tls::latch_managed_tls12();
+                        *self
+                            .http
+                            .write()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh;
+                        Ok(response)
+                    }
+                    Err(fallback) => Err(fallback),
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Build a client using the currently-stored OAuth token. Refreshes
     /// the token if expired. Errors with a user-facing message if the
     /// user isn't logged in.
@@ -141,13 +205,12 @@ impl Client {
         // error. `builder().build()` returns the same failure as a catchable
         // `Err`, so propagate it and let the orchestrator render a clean
         // "status fetch failed" line.
-        let http = apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent(atomcode_auth::ATOMCODE_USER_AGENT)
-            .build()
+        let http = Self::build_http_client(atomcode_config::tls::should_cap_url(&api_base_url()))
             .context("failed to build CodingPlan HTTP client")?;
-        Ok(Self { http, token })
+        Ok(Self {
+            http: std::sync::RwLock::new(http),
+            token,
+        })
     }
 
     /// `POST /coding-plan/claim-v2` — claim a specific CodingPlan tier.
@@ -162,15 +225,16 @@ impl Client {
     pub fn claim_v2(&self, plan_type: PlanType) -> Result<ClaimResponse> {
         let url = format!("{}/coding-plan/claim-v2", api_base_url());
         let body_str = format!(r#"{{"plan_type":"{}"}}"#, plan_type.as_str());
+        let fallback_attempted = std::cell::Cell::new(false);
         // Retry transient transport failures ("error sending request"): the POST never
         // reached the server on a send error, so re-sending cannot double-claim.
         let resp = with_retries(&CODING_PLAN_RETRY_BACKOFFS, is_transient_send_error, || {
-            self.http
-                .post(&url)
-                .bearer_auth(&self.token)
-                .header("Content-Type", "application/json")
-                .body(body_str.clone())
-                .send()
+            self.send_with_tls_fallback(&url, &fallback_attempted, |http| {
+                http.post(&url)
+                    .bearer_auth(&self.token)
+                    .header("Content-Type", "application/json")
+                    .body(body_str.clone())
+            })
         })
         .with_context(|| format!("POST {} failed", url))?;
 
@@ -204,8 +268,11 @@ impl Client {
             api_base_url(),
             plan_type.as_str()
         );
+        let fallback_attempted = std::cell::Cell::new(false);
         let resp = with_retries(&CODING_PLAN_RETRY_BACKOFFS, is_transient_send_error, || {
-            self.http.get(&url).bearer_auth(&self.token).send()
+            self.send_with_tls_fallback(&url, &fallback_attempted, |http| {
+                http.get(&url).bearer_auth(&self.token)
+            })
         })
         .with_context(|| format!("GET {} failed", url))?;
 
@@ -231,8 +298,11 @@ impl Client {
     /// uses the shared [`StatusResponse`] envelope.
     pub fn status_v2(&self) -> Result<StatusResponse> {
         let url = format!("{}/coding-plan/status-v2", api_base_url());
+        let fallback_attempted = std::cell::Cell::new(false);
         let resp = with_retries(&CODING_PLAN_RETRY_BACKOFFS, is_transient_send_error, || {
-            self.http.get(&url).bearer_auth(&self.token).send()
+            self.send_with_tls_fallback(&url, &fallback_attempted, |http| {
+                http.get(&url).bearer_auth(&self.token)
+            })
         })
         .with_context(|| format!("GET {} failed", url))?;
 
@@ -259,8 +329,11 @@ impl Client {
     /// timeout + retry + auth-error promotion.
     pub fn usage(&self) -> Result<crate::usage::UsageResponse> {
         let url = format!("{}/coding-plan/usage", api_base_url());
+        let fallback_attempted = std::cell::Cell::new(false);
         let resp = with_retries(&CODING_PLAN_RETRY_BACKOFFS, is_transient_send_error, || {
-            self.http.get(&url).bearer_auth(&self.token).send()
+            self.send_with_tls_fallback(&url, &fallback_attempted, |http| {
+                http.get(&url).bearer_auth(&self.token)
+            })
         })
         .with_context(|| format!("GET {} failed", url))?;
 

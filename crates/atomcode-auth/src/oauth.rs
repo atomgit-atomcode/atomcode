@@ -85,14 +85,22 @@ pub fn user_url() -> String {
 /// env contract (no HTTP-stack glue that would pull in core).
 fn apply_blocking_proxy_policy(
     builder: reqwest::blocking::ClientBuilder,
+    force_tls12: bool,
 ) -> reqwest::blocking::ClientBuilder {
     atomcode_config::proxy::ensure_runtime_initialized();
-    if std::env::var(atomcode_config::proxy::MODE_ENV)
+    let builder = if std::env::var(atomcode_config::proxy::MODE_ENV)
         .ok()
         .as_deref()
         == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
     {
         builder.no_proxy()
+    } else {
+        builder
+    };
+    // Cap at TLS 1.2 when a TLS-1.3-hostile network has been detected/requested
+    // (some paths RST the TLS 1.3 handshake to acs.atomgit.com → os error 10054).
+    if force_tls12 {
+        builder.max_tls_version(reqwest::tls::Version::TLS_1_2)
     } else {
         builder
     }
@@ -128,6 +136,10 @@ fn with_login_context<T>(result: reqwest::Result<T>, ctx: &'static str) -> Resul
 }
 
 fn blocking_client() -> Result<reqwest::blocking::Client> {
+    blocking_client_with_tls12(atomcode_config::tls::should_cap_url(platform_base_url()))
+}
+
+fn blocking_client_with_tls12(force_tls12: bool) -> Result<reqwest::blocking::Client> {
     // Hard timeouts here too — the `get_valid_token` path calls
     // `refresh_access_token` synchronously whenever a stored token
     // looks expired, and that runs on the main TUI thread (via
@@ -139,7 +151,7 @@ fn blocking_client() -> Result<reqwest::blocking::Client> {
     // helper *panics* on TLS/resolver init failure, and with `panic =
     // "abort"` that takes down the whole process. `build()` reports the
     // same failure as a catchable `Err` — propagate it.
-    apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
+    apply_blocking_proxy_policy(reqwest::blocking::Client::builder(), force_tls12)
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
         .user_agent(crate::ATOMCODE_USER_AGENT)
@@ -533,26 +545,69 @@ impl LoginSession {
 /// before yielding control to the wait loop.
 pub fn start_login() -> Result<LoginSession> {
     std::thread::spawn(move || {
-        // `Client::new()` panics on TLS/resolver init failure; with `panic =
-        // "abort"` that aborts the process before the QR can even render.
-        // Build fallibly and surface a recoverable error instead.
-        let client = blocking_client()?;
-        let sent = client
-            .get(platform_login_url())
-            .query(&[("provider", "atomgit")])
-            .send();
-        let resp = with_login_context(sent, "Failed to call /auth/login")?;
-        let resp: PlatformLoginResponse = resp
-            .json()
-            .context("Failed to parse /auth/login response")?;
-        Ok(LoginSession {
-            state: resp.state,
-            login_url: strip_force_login(&resp.login_url),
-            client: Some(client),
-        })
+        // First attempt uses the current TLS policy (TLS 1.3 by default). If the
+        // connection is RST at the handshake — the signature of a middlebox that
+        // resets TLS 1.3 to acs.atomgit.com (Windows `os error 10054`) — retry
+        // once with a fresh TLS-1.2 client. Only a successful retry latches the
+        // managed-endpoint policy for later auth/codingplan/provider clients.
+        // Third-party endpoints remain unaffected.
+        let login_url = platform_login_url();
+        let was_capped = atomcode_config::tls::should_cap_url(&login_url);
+        match attempt_login(was_capped) {
+            Err(first)
+                if atomcode_config::tls::should_try_fallback(
+                    &login_url,
+                    was_capped,
+                    is_connect_error(&first),
+                ) =>
+            {
+                match attempt_login(true) {
+                    Ok(session) => {
+                        atomcode_config::tls::latch_managed_tls12();
+                        Ok(session)
+                    }
+                    Err(fallback) => Err(fallback.context(format!(
+                        "TLS 1.2 fallback also failed after initial error: {first:#}"
+                    ))),
+                }
+            }
+            other => other,
+        }
     })
     .join()
     .map_err(|_| anyhow::anyhow!("start_login thread panicked"))?
+}
+
+/// One `/auth/login` round-trip with a freshly built client (so a retry picks up
+/// a changed TLS policy). `Client::new()` panics on TLS/resolver init failure;
+/// with `panic = "abort"` that aborts the process before the QR can even render,
+/// so `blocking_client()` builds fallibly and we surface a recoverable error.
+fn attempt_login(force_tls12: bool) -> Result<LoginSession> {
+    let client = blocking_client_with_tls12(force_tls12)?;
+    let sent = client
+        .get(platform_login_url())
+        .query(&[("provider", "atomgit")])
+        .send();
+    let resp = with_login_context(sent, "Failed to call /auth/login")?;
+    let resp: PlatformLoginResponse = resp
+        .json()
+        .context("Failed to parse /auth/login response")?;
+    Ok(LoginSession {
+        state: resp.state,
+        login_url: strip_force_login(&resp.login_url),
+        client: Some(client),
+    })
+}
+
+/// True iff the error chain carries a reqwest connect-level failure — the class
+/// that includes a TLS-handshake RST (`os error 10054`). Used to decide whether a
+/// TLS 1.2 downgrade retry is worth attempting; a status/parse error is not.
+fn is_connect_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_connect())
+    })
 }
 
 /// Drop `force_login=true` from the broker-supplied OAuth URL. The

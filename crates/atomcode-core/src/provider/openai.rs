@@ -114,7 +114,10 @@ fn build_codingplan_headers(
 }
 
 pub struct OpenAiProvider {
-    client: Client,
+    client: std::sync::Arc<std::sync::RwLock<Client>>,
+    /// Rebuild seam used for the endpoint-scoped TLS-1.2 fallback. The bool
+    /// forces the cap for the probe; all other client settings stay identical.
+    build_client: std::sync::Arc<dyn Fn(bool) -> anyhow::Result<Client> + Send + Sync + 'static>,
     /// Shared so `chat_stream` can refresh the OAuth access_token in-place
     /// when an AtomGit-gateway request comes back 401, without rebuilding
     /// the whole provider. For non-AtomGit providers this stays as the
@@ -189,14 +192,25 @@ impl OpenAiProvider {
                 ),
             },
         };
+        let base_url = config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let user_agent = config.user_agent.clone();
+        let skip_tls_verify = config.skip_tls_verify;
+        let build_client: std::sync::Arc<
+            dyn Fn(bool) -> anyhow::Result<Client> + Send + Sync + 'static,
+        > = std::sync::Arc::new(move |force_tls12| {
+            super::build_http_client(user_agent.as_deref(), skip_tls_verify, force_tls12)
+        });
+        let initial_tls12 = atomcode_config::tls::should_cap_url(&base_url);
+        let client = build_client(initial_tls12)?;
         Ok(Self {
-            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify)?,
+            client: std::sync::Arc::new(std::sync::RwLock::new(client)),
+            build_client,
             api_key: std::sync::Arc::new(tokio::sync::RwLock::new(api_key)),
             model: config.model.clone(),
-            base_url: config
-                .base_url
-                .clone()
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            base_url,
             // Cap at 16K: prevents models from spending 250s on thinking
             // with zero visible output. CC uses fixed 16-32K, not proportional.
             max_tokens: config
@@ -643,7 +657,8 @@ impl LlmProvider for OpenAiProvider {
         // Move the pieces needed to rebuild the request into the task — the
         // outer mid-stream retry loop reconstructs the builder on each
         // attempt because `RequestBuilder` is single-use.
-        let client = self.client.clone();
+        let client_slot = self.client.clone();
+        let build_client = self.build_client.clone();
         let api_key = self.api_key.clone();
         let provider_label = self.model.clone();
         let base_url_for_signing = self.base_url.clone();
@@ -691,8 +706,18 @@ impl LlmProvider for OpenAiProvider {
             // dead-loop is theoretically possible if the broker's
             // refresh response still leaves us 401-able.
             let mut auth_retry_used = false;
+            let mut tls12_probe = false;
             'retry: loop {
                 attempt += 1;
+                let client = client_slot
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                // Sample before sending: another managed client may latch while
+                // this request is in flight, but this client would still need
+                // rebuilding because it began with the old TLS policy.
+                let was_capped =
+                    tls12_probe || atomcode_config::tls::should_cap_url(&base_url_for_signing);
                 // Serialize once per outer-loop iteration. The body content
                 // does NOT change between inner retries — only the signing
                 // headers do (fresh nonce/ts/sig per attempt to avoid
@@ -751,15 +776,44 @@ impl LlmProvider for OpenAiProvider {
                     req
                 };
 
-                let response =
-                    match crate::provider::retry::send_with_retry_resign(resign, &policy).await {
-                        Ok(resp) => resp,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Ok(StreamEvent::Error(format!("Connection failed: {}", e))));
-                            return;
+                let response = match crate::provider::retry::send_with_retry_resign(resign, &policy)
+                    .await
+                {
+                    Ok(resp) => {
+                        if tls12_probe {
+                            atomcode_config::tls::latch_managed_tls12();
+                            tls12_probe = false;
                         }
-                    };
+                        resp
+                    }
+                    Err(e) => {
+                        if atomcode_config::tls::should_try_fallback(
+                            &base_url_for_signing,
+                            was_capped,
+                            e.is_connect(),
+                        ) {
+                            match build_client(true) {
+                                Ok(fresh) => {
+                                    *client_slot
+                                        .write()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh;
+                                    tls12_probe = true;
+                                    attempt -= 1;
+                                    continue 'retry;
+                                }
+                                Err(build_error) => {
+                                    let _ = tx.send(Ok(StreamEvent::Error(format!(
+                                        "TLS 1.2 fallback client build failed: {build_error:#}"
+                                    ))));
+                                    return;
+                                }
+                            }
+                        }
+                        let _ =
+                            tx.send(Ok(StreamEvent::Error(format!("Connection failed: {}", e))));
+                        return;
+                    }
+                };
 
                 if !response.status().is_success() {
                     let status = response.status();

@@ -116,6 +116,7 @@ pub trait LlmProvider: Send + Sync {
 pub(super) fn build_http_client(
     ua_override: Option<&str>,
     skip_tls_verify: bool,
+    force_tls12: bool,
 ) -> anyhow::Result<reqwest::Client> {
     let ua = ua_override.unwrap_or(crate::ATOMCODE_USER_AGENT);
     let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
@@ -137,6 +138,9 @@ pub(super) fn build_http_client(
         // retry classifier in `retry::is_retryable_error` as a backstop.
         .pool_idle_timeout(std::time::Duration::from_secs(30))
         .user_agent(ua);
+    if force_tls12 {
+        builder = builder.max_tls_version(reqwest::tls::Version::TLS_1_2);
+    }
 
     // TLS trust (issue #514): the webpki base roots (from the `rustls-tls`
     // feature) are ALWAYS present, so `.build()` never hard-fails on certs.
@@ -499,7 +503,7 @@ mod build_http_client_tls_tests {
     fn build_http_client_succeeds_with_native_roots_issue_514() {
         // Plain build (no SSL_CERT_FILE) must succeed under native-roots.
         std::env::remove_var("SSL_CERT_FILE");
-        assert!(build_http_client(None, false).is_ok());
+        assert!(build_http_client(None, false, false).is_ok());
     }
 
     #[test]
@@ -517,7 +521,7 @@ mod build_http_client_tls_tests {
         )
         .unwrap();
         std::env::set_var("SSL_CERT_FILE", &cert_path);
-        let built = build_http_client(None, false);
+        let built = build_http_client(None, false, false);
         std::env::remove_var("SSL_CERT_FILE");
         assert!(
             built.is_err(),
@@ -530,7 +534,7 @@ mod build_http_client_tls_tests {
     fn build_http_client_skip_tls_verify_still_builds_issue_514() {
         // skip_tls_verify=true must continue to build.
         std::env::remove_var("SSL_CERT_FILE");
-        assert!(build_http_client(None, true).is_ok());
+        assert!(build_http_client(None, true, false).is_ok());
     }
 }
 
