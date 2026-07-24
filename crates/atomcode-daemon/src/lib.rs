@@ -1724,14 +1724,43 @@ struct ProjectStateResponse {
 }
 
 /// GET /project - Get current project state
+/// Choose the project (working dir + name) the webui should display. A TUI sharing its
+/// runtime via `/webui` / `/sync` is AUTHORITATIVE: its `working_dir` reflects the user's
+/// ACTUAL directory (including any `/cd`), whereas the daemon's project state seeds its
+/// `working_dir` from the process cwd at startup (`std::env::current_dir()`), which can
+/// differ — leaving the webui footer "未设置" and the session list filtered by the wrong
+/// project hash (empty). Falls back to the daemon project state for a standalone
+/// (non-shared) webui, where there is no embedded binding.
+fn resolve_project_view(
+    embedded_working_dir: Option<PathBuf>,
+    project_working_dir: &std::path::Path,
+    project_name: &str,
+) -> (PathBuf, String) {
+    match embedded_working_dir {
+        Some(dir) => {
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| project_name.to_string());
+            (dir, name)
+        }
+        None => (project_working_dir.to_path_buf(), project_name.to_string()),
+    }
+}
+
 async fn get_project_state(State(state): State<AppState>) -> impl IntoResponse {
-    let state = state.project.read().await;
+    let project = state.project.read().await;
+    let (working_dir, name) = resolve_project_view(
+        crate::native_live::embedded_binding().map(|binding| binding.working_dir),
+        &project.working_dir,
+        &project.name,
+    );
     Json(ProjectStateResponse {
-        working_dir: state.working_dir.clone(),
-        previous_dir: state.previous_dir.clone(),
-        recent_dirs: state.recent_dirs.clone(),
-        name: state.name.clone(),
-        project_hash: hash_path(&state.working_dir),
+        working_dir: working_dir.clone(),
+        previous_dir: project.previous_dir.clone(),
+        recent_dirs: project.recent_dirs.clone(),
+        name,
+        project_hash: hash_path(&working_dir),
     })
 }
 
@@ -6388,6 +6417,29 @@ mod tests {
             PathBuf::from("/x"),
         );
         assert_eq!(resolved, here);
+    }
+
+    #[test]
+    fn project_view_prefers_embedded_tui_working_dir() {
+        // A shared TUI runtime (`/webui`/`/sync`) wins over the daemon's own project
+        // working dir, so the webui footer + session list match the user's actual TUI
+        // directory instead of the daemon's process cwd. (Fixes: "未设置工作目录" + empty list.)
+        let (dir, name) = resolve_project_view(
+            Some(PathBuf::from("/home/me/proj")),
+            std::path::Path::new("/daemon/cwd"),
+            "cwd",
+        );
+        assert_eq!(dir, PathBuf::from("/home/me/proj"));
+        assert_eq!(name, "proj", "name derived from the embedded dir's basename");
+    }
+
+    #[test]
+    fn project_view_falls_back_to_daemon_state_when_not_shared() {
+        // Standalone webui (no embedded TUI runtime) keeps the daemon's project state.
+        let (dir, name) =
+            resolve_project_view(None, std::path::Path::new("/daemon/cwd"), "my-project");
+        assert_eq!(dir, PathBuf::from("/daemon/cwd"));
+        assert_eq!(name, "my-project");
     }
 
     #[test]
