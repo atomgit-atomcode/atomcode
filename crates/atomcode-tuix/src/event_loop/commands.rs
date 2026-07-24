@@ -3463,12 +3463,15 @@ fn execute_slash_command_impl(
                 // 贪婪多 skill 解析：前缀是一串已知 skill 名，其余是任务描述，
                 // 任务描述会传给每个 skill（保留 $ARGUMENTS 占位符语义）。单个
                 // skill（无第二个 skill 词）解析结果与旧 splitn(2) 一致，零回归。
+                // Returns the skill's canonical identity (`s.name`, the unique
+                // normalized registry key) so `split_skill_names` dedups by
+                // identity — two spellings of the same skill inject it once.
                 let resolve = |name: &str| {
-                    ctx.skill_registry
-                        .read()
-                        .ok()
-                        .and_then(|r| r.get(name).map(|s| s.user_invocable))
-                        .unwrap_or(false)
+                    ctx.skill_registry.read().ok().and_then(|r| {
+                        r.get(name)
+                            .filter(|s| s.user_invocable)
+                            .map(|s| s.name.clone())
+                    })
                 };
                 let (skills, skill_args) = split_skill_names(arg_trim, resolve);
                 if skills.is_empty() {
@@ -3668,20 +3671,30 @@ fn execute_slash_command_impl(
     Ok(())
 }
 
-/// 贪婪切分 `/skills` 参数：从左到右扫 whitespace 分词，只要当前 token 被
-/// `resolve` 判定为已知 user-invocable skill 就收入列表（去重、保持首见顺序）；
-/// 遇到第一个非 skill 的 token，它及其之后的内容（按原串偏移，保留原空白）作为
-/// 任务描述返回。单个 skill（后面无第二个 skill 词）等价于旧的 `splitn(2)` 行为。
-fn split_skill_names(arg: &str, resolve: impl Fn(&str) -> bool) -> (Vec<String>, String) {
+/// 贪婪切分 `/skills` 参数：从左到右扫 whitespace 分词，`resolve(token)` 返回该
+/// token 对应 skill 的**规范身份**（`Some(canonical)`）时收入列表，否则停止。去重
+/// 按规范身份而非原始拼写——两个拼写不同但解析到同一 skill 的 token（大小写、后缀
+/// 简写等）只注入一次。列表里存用户原始拼写（回显更友好），展开时 `expand_skill`
+/// 会再归一化。遇到第一个非 skill 的 token，它及其之后的内容（按原串偏移，保留原
+/// 空白）作为任务描述返回。单个 skill（后面无第二个 skill 词）等价于旧 `splitn(2)`。
+fn split_skill_names(
+    arg: &str,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> (Vec<String>, String) {
     let mut skills: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     let mut rest = arg.trim_start();
     loop {
         let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let token = &rest[..token_end];
-        if token.is_empty() || !resolve(token) {
+        if token.is_empty() {
             break;
         }
-        if !skills.iter().any(|s| s == token) {
+        let Some(canonical) = resolve(token) else {
+            break;
+        };
+        if !seen.iter().any(|c| c == &canonical) {
+            seen.push(canonical);
             skills.push(token.to_string());
         }
         rest = rest[token_end..].trim_start();
@@ -7699,60 +7712,75 @@ mod mcp_subcommand_tests {
 mod split_skill_names_tests {
     use super::split_skill_names;
 
-    /// 测试用假解析器：这几个名字算已知 skill。
-    fn known(name: &str) -> bool {
+    /// 测试用假解析器：返回 skill 的规范身份（小写）。镜像真实 `SkillRegistry::get`
+    /// 的大小写不敏感解析——`resolve("BrainStorming")` 与 `resolve("brainstorming")`
+    /// 返回同一规范名，所以去重按规范身份而非原始拼写。
+    fn resolve(name: &str) -> Option<String> {
+        let canonical = name.to_ascii_lowercase();
         matches!(
-            name,
+            canonical.as_str(),
             "adapt-agent" | "skill-creator" | "brainstorming" | "a"
         )
+        .then_some(canonical)
     }
 
     #[test]
     fn multiple_skills_then_task() {
-        let (skills, task) = split_skill_names("adapt-agent skill-creator 路径在哪", known);
+        let (skills, task) = split_skill_names("adapt-agent skill-creator 路径在哪", resolve);
         assert_eq!(skills, vec!["adapt-agent", "skill-creator"]);
         assert_eq!(task, "路径在哪");
     }
 
     #[test]
     fn single_skill_with_task_unchanged() {
-        let (skills, task) = split_skill_names("brainstorming 做个登录页", known);
+        let (skills, task) = split_skill_names("brainstorming 做个登录页", resolve);
         assert_eq!(skills, vec!["brainstorming"]);
         assert_eq!(task, "做个登录页");
     }
 
     #[test]
     fn single_skill_no_task_unchanged() {
-        let (skills, task) = split_skill_names("brainstorming", known);
+        let (skills, task) = split_skill_names("brainstorming", resolve);
         assert_eq!(skills, vec!["brainstorming"]);
         assert_eq!(task, "");
     }
 
     #[test]
     fn first_token_not_a_skill_yields_empty() {
-        let (skills, task) = split_skill_names("路径在哪", known);
+        let (skills, task) = split_skill_names("路径在哪", resolve);
         assert!(skills.is_empty());
         assert_eq!(task, "路径在哪");
     }
 
     #[test]
     fn typo_second_skill_falls_into_task() {
-        let (skills, task) = split_skill_names("adapt-agent skil-creator 路径在哪", known);
+        let (skills, task) = split_skill_names("adapt-agent skil-creator 路径在哪", resolve);
         assert_eq!(skills, vec!["adapt-agent"]);
         assert_eq!(task, "skil-creator 路径在哪");
     }
 
     #[test]
     fn duplicate_skill_deduped() {
-        let (skills, task) = split_skill_names("a a 任务", known);
+        let (skills, task) = split_skill_names("a a 任务", resolve);
         assert_eq!(skills, vec!["a"]);
         assert_eq!(task, "任务");
     }
 
     #[test]
     fn task_whitespace_preserved_verbatim() {
-        let (skills, task) = split_skill_names("brainstorming line1\n  line2", known);
+        let (skills, task) = split_skill_names("brainstorming line1\n  line2", resolve);
         assert_eq!(skills, vec!["brainstorming"]);
         assert_eq!(task, "line1\n  line2");
+    }
+
+    #[test]
+    fn variant_spellings_of_same_skill_dedup_to_one() {
+        // Different case both resolve to canonical "brainstorming" → one skill,
+        // NOT two (which would inject the same skill body twice). The first
+        // spelling the user typed is kept for display.
+        let (skills, task) =
+            split_skill_names("BrainStorming brainstorming 任务", resolve);
+        assert_eq!(skills, vec!["BrainStorming"]);
+        assert_eq!(task, "任务");
     }
 }
