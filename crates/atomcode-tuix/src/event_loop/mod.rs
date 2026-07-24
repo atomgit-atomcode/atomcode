@@ -12487,10 +12487,12 @@ pub(crate) fn user_input_should_auto_skip(mode: crate::state::AgentMode) -> bool
 
 /// Pure mapping used by approval compatibility tests.
 #[cfg(test)]
-fn approval_choice_to_decision(choice: ApprovalChoice) -> atomcode_core::tool::PermissionDecision {
-    use atomcode_core::tool::PermissionDecision;
+fn approval_choice_to_decision(
+    choice: ApprovalChoice,
+) -> atomcode_capabilities::tools::approval::PermissionDecision {
+    use atomcode_capabilities::tools::approval::PermissionDecision;
     match choice {
-        ApprovalChoice::Allow => PermissionDecision::Allow,
+        ApprovalChoice::Allow => PermissionDecision::AllowOnce,
         ApprovalChoice::AllowAlways => PermissionDecision::AllowAlways,
         ApprovalChoice::Deny => PermissionDecision::Deny,
     }
@@ -12570,7 +12572,7 @@ fn bypass_approval_choice() -> ApprovalChoice {
 #[cfg(test)]
 mod bypass_approval_tests {
     use super::{approval_choice_to_decision, bypass_approval_choice, ApprovalChoice};
-    use atomcode_core::tool::PermissionDecision;
+    use atomcode_capabilities::tools::approval::PermissionDecision;
 
     // The auto-approve invariant now lives on `approval_should_auto_bypass(mode)`
     // (see `auto_mode_bypasses_approval`); the old `dangerously_skip_permissions`
@@ -12584,8 +12586,8 @@ mod bypass_approval_tests {
     fn bypass_command_resolves_to_allow() {
         let decision = approval_choice_to_decision(bypass_approval_choice());
         assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "BYPASS must auto-approve with Allow, got {decision:?}"
+            matches!(decision, PermissionDecision::AllowOnce),
+            "BYPASS must auto-approve with AllowOnce, got {decision:?}"
         );
     }
 
@@ -12594,7 +12596,7 @@ mod bypass_approval_tests {
     fn approval_command_decision_mapping() {
         assert!(matches!(
             approval_choice_to_decision(ApprovalChoice::Allow),
-            PermissionDecision::Allow
+            PermissionDecision::AllowOnce
         ));
         assert!(matches!(
             approval_choice_to_decision(ApprovalChoice::AllowAlways),
