@@ -232,6 +232,8 @@ zeroize = "1"
 # JOBOBJECT_EXTENDED_LIMIT_INFORMATION embeds): the Bash tool assigns each shell
 # child to a kill-on-close Job Object so timeout/cancel reaps the WHOLE process tree.
 windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
+# Windows SChannel backend for reqwest (dodges rustls-fingerprint RST on *.atomgit.com).
+reqwest = { version = "0.12", features = ["native-tls"], default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "test-util"] }

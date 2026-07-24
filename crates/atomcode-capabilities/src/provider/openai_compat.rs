@@ -259,7 +259,11 @@ fn build_http_client_inner(
     // and SSL_CERT_FILE on top, additively and best-effort. This is the DEFAULT
     // v2 provider path. Mirrors `core::provider::add_trusted_roots` — kept
     // crate-local because capabilities does not depend on core.
-    if trust_os_roots {
+    // Skip the rustls root-layering on Windows: the native-tls (SChannel) default backend
+    // trusts the Windows system store natively, and re-feeding certs through native-tls's
+    // parser risks rejecting one rustls accepted. Runtime `cfg!` keeps the fn referenced
+    // (no dead_code) while compiling the call out on Windows.
+    if trust_os_roots && !cfg!(target_os = "windows") {
         builder = add_trusted_roots(builder);
     }
     if skip_tls_verify {

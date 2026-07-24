@@ -149,7 +149,15 @@ pub(super) fn build_http_client(
     // on TOP, additively and best-effort. Bad/partial certs are warned and
     // skipped, never fatal — this is the codex-style graceful load that avoids
     // the panics reqwest's strict `rustls-tls-native-roots` would cascade.
-    builder = add_trusted_roots(builder);
+    // On Windows the default TLS backend is native-tls (SChannel), which trusts the
+    // Windows system cert store natively. The rustls-specific root layering is both
+    // redundant AND risky there — it re-feeds certs through native-tls's parser, which
+    // can reject a cert rustls accepted (a #514-style build failure in reverse). Use a
+    // runtime `cfg!` (not `#[cfg]`) so `add_trusted_roots` stays referenced on Windows
+    // (no dead_code warning) while the call is compiled out.
+    if !cfg!(target_os = "windows") {
+        builder = add_trusted_roots(builder);
+    }
 
     if skip_tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
