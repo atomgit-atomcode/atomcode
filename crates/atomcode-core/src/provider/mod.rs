@@ -142,13 +142,13 @@ pub(super) fn build_http_client(
         builder = builder.max_tls_version(reqwest::tls::Version::TLS_1_2);
     }
 
-    // TLS trust (issue #514): the webpki base roots (from the `rustls-tls`
-    // feature) are ALWAYS present, so `.build()` never hard-fails on certs.
-    // Layer the OS native store (Windows cert manager / macOS keychain / Linux
-    // /etc/ssl/certs — where a corporate MITM-proxy CA lives) and SSL_CERT_FILE
-    // on TOP, additively and best-effort. Bad/partial certs are warned and
-    // skipped, never fatal — this is the codex-style graceful load that avoids
-    // the panics reqwest's strict `rustls-tls-native-roots` would cascade.
+    // TLS trust (issue #514) — NON-WINDOWS (rustls) path only, see the cfg! guard
+    // below: the webpki base roots (from the `rustls-tls` feature) are ALWAYS
+    // present, so `.build()` never hard-fails on certs. Layer the OS native store
+    // (macOS keychain / Linux /etc/ssl/certs — where a corporate MITM-proxy CA
+    // lives) and SSL_CERT_FILE on TOP, additively and best-effort. Bad/partial
+    // certs are warned and skipped, never fatal — the codex-style graceful load
+    // that avoids the panics reqwest's strict `rustls-tls-native-roots` would cascade.
     // On Windows the default TLS backend is native-tls (SChannel), which trusts the
     // Windows system cert store natively. The rustls-specific root layering is both
     // redundant AND risky there — it re-feeds certs through native-tls's parser, which
