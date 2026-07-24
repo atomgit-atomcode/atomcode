@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use atomcode_kernel::message::ImageContent;
-use atomcode_core::stream::TokenUsage;
-use atomcode_core::tool::ToolCall;
+use atomcode_kernel::stream::TokenUsage;
+use atomcode_kernel::tool::ToolCall;
 use atomcode_kernel::event::ToolBatchCall;
 use atomcode_kernel::message::SessionSnapshot;
 

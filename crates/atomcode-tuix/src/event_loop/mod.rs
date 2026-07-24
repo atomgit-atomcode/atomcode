@@ -14448,10 +14448,10 @@ fn project_kernel_event(
                 duration: started.elapsed(),
             })
         }
-        Kernel::Usage(meta) => Some(AgentEvent::TokenUsage(atomcode_core::stream::TokenUsage {
-            prompt_tokens: meta.tokens.prompt as usize,
-            completion_tokens: meta.tokens.completion as usize,
-            cached_tokens: meta.tokens.cached as usize,
+        Kernel::Usage(meta) => Some(AgentEvent::TokenUsage(atomcode_kernel::stream::TokenUsage {
+            prompt: meta.tokens.prompt,
+            completion: meta.tokens.completion,
+            cached: meta.tokens.cached,
         })),
         Kernel::Error { message, .. } => Some(AgentEvent::Error {
             error: message,
@@ -14907,7 +14907,7 @@ fn handle_runtime_event(
                         AgentEvent::ApprovalNeeded {
                             tool_name: approval.tool.clone(),
                             reason: "Requires approval".into(),
-                            call: atomcode_core::tool::ToolCall {
+                            call: atomcode_kernel::tool::ToolCall {
                                 id: approval.call_id,
                                 name: approval.tool,
                                 arguments: approval.args,
@@ -17468,15 +17468,15 @@ fn handle_agent_event(
         }
         AgentEvent::TokenUsage(u) => {
             state.on_token_usage();
-            state.prompt_tokens += u.prompt_tokens;
-            state.completion_tokens += u.completion_tokens;
-            state.cached_tokens += u.cached_tokens;
-            state.total_tokens += u.completion_tokens;
+            state.prompt_tokens += u.prompt as usize;
+            state.completion_tokens += u.completion as usize;
+            state.cached_tokens += u.cached as usize;
+            state.total_tokens += u.completion as usize;
             // Per-turn tallies for the footer's billable count + cache annotation
             // (reset in on_turn_complete / on_turn_cancelled).
-            state.turn_prompt_tokens += u.prompt_tokens;
-            state.turn_completion_tokens += u.completion_tokens;
-            state.turn_cached_tokens += u.cached_tokens;
+            state.turn_prompt_tokens += u.prompt as usize;
+            state.turn_completion_tokens += u.completion as usize;
+            state.turn_cached_tokens += u.cached as usize;
         }
         AgentEvent::WorkingDirChanged(new_dir) => {
             // Fires when a tool (change_dir / bash cd) or
@@ -19823,9 +19823,7 @@ pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
     // Model-name check delegates to the provider so the UI "applicable" hint
     // and the actual request-body gate (OpenAiProvider) can never diverge.
     (ptype == "deepseek" || ptype == "openai")
-        && atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(
-            &ctx.model_name,
-        )
+        && atomcode_capabilities::provider::reason_effort_applicable(&ctx.model_name)
 }
 
 /// Install a [`crate::modals::password::PasswordModal`] as the active modal on

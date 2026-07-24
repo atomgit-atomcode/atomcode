@@ -894,7 +894,9 @@ fn build_request_body(
     Value::Object(body)
 }
 
-fn reason_effort_applicable(model: &str) -> bool {
+/// Whether a model accepts a top-level `reasoning_effort` control. Exposed so a UI
+/// (the TUI effort hint) and the request-body gate can never diverge.
+pub fn reason_effort_applicable(model: &str) -> bool {
     // Only DeepSeek-V4 takes a top-level `reasoning_effort`; others reject/ignore it.
     model.to_ascii_lowercase().contains("deepseek-v4")
 }

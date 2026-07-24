@@ -26,7 +26,9 @@ mod sign;
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use atomgit_sign::{atomgit_request_signer, is_atomgit_gateway, signer_available};
 pub use ollama::{OllamaConfig, OllamaProvider};
-pub use openai_compat::{model_suggests_vision, OpenAiCompatConfig, OpenAiCompatProvider};
+pub use openai_compat::{
+    model_suggests_vision, reason_effort_applicable, OpenAiCompatConfig, OpenAiCompatProvider,
+};
 pub use reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
 pub use retry::RetryPolicy;
 pub use sign::{RequestSigner, RequestSigningError, SignedAuth};
