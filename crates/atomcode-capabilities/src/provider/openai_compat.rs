@@ -196,6 +196,36 @@ fn build_http_client(
     skip_tls_verify: bool,
     user_agent: Option<String>,
 ) -> Result<reqwest::Client, ProviderError> {
+    // First attempt: webpki base + OS native store + SSL_CERT_FILE (add_trusted_roots).
+    match build_http_client_inner(connect_timeout, skip_tls_verify, user_agent.clone(), true) {
+        Ok(client) => Ok(client),
+        Err(first) => {
+            // BACKSTOP (issue #514): even with the per-cert probe in `add_trusted_roots`,
+            // a poisoned SSL_CERT_FILE (or any other trust-root surprise) rejected by
+            // rustls at `.build()` aborts the ENTIRE client — leaving every provider dead
+            // on startup with an opaque "builder error". Rather than a total outage, retry
+            // ONCE with the INFALLIBLE webpki base only. Public-CA endpoints (the gateway,
+            // model APIs) still work; only a corporate MITM root would be lost, and a
+            // request-time TLS error is far better than a client that never builds.
+            tracing::warn!(
+                "http client build failed with the OS/SSL_CERT_FILE trust roots ({}); \
+                 retrying with the webpki base only — a custom/corporate root may be ignored (issue #514)",
+                first.message
+            );
+            build_http_client_inner(connect_timeout, skip_tls_verify, user_agent, false)
+        }
+    }
+}
+
+/// Build a client with a single trust-root policy. `trust_os_roots=false` uses only
+/// the infallible webpki base (the backstop path); `true` layers the OS native store
+/// and `SSL_CERT_FILE` on top via [`add_trusted_roots`].
+fn build_http_client_inner(
+    connect_timeout: std::time::Duration,
+    skip_tls_verify: bool,
+    user_agent: Option<String>,
+    trust_os_roots: bool,
+) -> Result<reqwest::Client, ProviderError> {
     let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
         .connect_timeout(connect_timeout)
         // Drop idle keep-alive connections before the gateway LB does, so
@@ -211,13 +241,18 @@ fn build_http_client(
     // and SSL_CERT_FILE on top, additively and best-effort. This is the DEFAULT
     // v2 provider path. Mirrors `core::provider::add_trusted_roots` — kept
     // crate-local because capabilities does not depend on core.
-    builder = add_trusted_roots(builder);
+    if trust_os_roots {
+        builder = add_trusted_roots(builder);
+    }
     if skip_tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
     }
     builder.build().map_err(|e| ProviderError {
         retryable: false,
-        message: format!("http client build failed: {e}"),
+        // reqwest's builder-error `Display` is a bare "builder error" — the real
+        // reason (bad cert, invalid header, …) lives in its `source()` chain, so
+        // walk it (shared `retry::err_chain`) or the message is useless (issue #514).
+        message: format!("http client build failed: {}", retry::err_chain(&e)),
         ..Default::default()
     })
 }
@@ -238,17 +273,35 @@ fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuil
             native.certs.len()
         );
     }
+    // `reqwest::Certificate::from_der` does NOT validate under rustls — it just stores
+    // the bytes and defers validation to `rustls::RootCertStore::add` INSIDE `.build()`,
+    // which aborts the WHOLE client on the first cert rustls rejects (a legacy OS root
+    // without X509v3 extensions is enough). Pre-filter each cert through the same rustls
+    // parser so one bad OS root can't take every provider down. reqwest's own native
+    // loader is likewise tolerant; ours must be too. See issue #514.
+    let mut rejected = 0usize;
     for der in native.certs {
+        if rustls::RootCertStore::empty().add(der.clone()).is_err() {
+            rejected += 1;
+            continue;
+        }
         if let Ok(cert) = reqwest::Certificate::from_der(der.as_ref()) {
             builder = builder.add_root_certificate(cert);
         }
     }
+    if rejected > 0 {
+        tracing::warn!(
+            "skipped {rejected} OS root cert(s) rustls rejected; they would have aborted the whole client build (issue #514)"
+        );
+    }
 
     // 2) SSL_CERT_FILE override/extra (empty string = unset). Loaded explicitly
     //    for cross-platform certainty. reqwest's `Certificate` is validated only
-    //    at `.build()`, so a MALFORMED SSL_CERT_FILE surfaces there as a clear
-    //    `ProviderError` (never a panic, and only for this opt-in builder — every
-    //    other client build uses the webpki base and is unaffected). See #514.
+    //    at `.build()`; unlike the native loop above we do NOT pre-probe these
+    //    (no DER in hand from `from_pem_bundle`), so a MALFORMED SSL_CERT_FILE
+    //    still poisons `.build()` — but the `build_http_client` BACKSTOP catches
+    //    that and rebuilds on the webpki base (never a panic; the file is then
+    //    ignored with a warning rather than killing the client). See #514.
     let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|p| !p.is_empty()) else {
         return builder;
     };
@@ -3009,10 +3062,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(ssl_cert_file_env)]
-    fn build_http_client_reports_malformed_ssl_cert_file_as_error_not_panic() {
-        // A malformed SSL_CERT_FILE surfaces as a clear `ProviderError` at
-        // `.build()` — NEVER a panic, and only for this opt-in builder. The
-        // webpki base leaves every other client build unaffected. See #514.
+    fn build_http_client_recovers_from_malformed_ssl_cert_file_via_backstop() {
+        // A malformed SSL_CERT_FILE poisons the first `.build()` (rustls rejects the
+        // cert). BEFORE the #514 backstop this killed the whole client and left every
+        // provider dead on startup with an opaque "builder error". Now it must fall
+        // back to the infallible webpki base and STILL build — resilience over outage.
         let tmp = tempfile::tempdir().unwrap();
         let cert_path = tmp.path().join("roots.pem");
         std::fs::write(
@@ -3024,9 +3078,52 @@ mod tests {
         let built = build_http_client(std::time::Duration::from_secs(5), false, None);
         std::env::remove_var("SSL_CERT_FILE");
         assert!(
-            built.is_err(),
-            "a malformed SSL_CERT_FILE must surface as Err, not panic"
+            built.is_ok(),
+            "a malformed SSL_CERT_FILE must fall back to the webpki base, not abort the client"
         );
+    }
+
+    #[test]
+    fn reqwest_aborts_whole_build_on_one_bad_root() {
+        // ROOT-CAUSE PROOF (issue #514): `reqwest::Certificate::from_der` stores bytes
+        // WITHOUT validating under rustls; validation is deferred to
+        // `rustls::RootCertStore::add` inside `.build()`, which propagates an error and
+        // aborts the ENTIRE client on the first cert it rejects. A single legacy OS root
+        // is therefore enough to take every provider down — which is exactly why
+        // `add_trusted_roots` must pre-filter each cert.
+        let junk = reqwest::Certificate::from_der(&[0x30, 0x03, 0x02, 0x01, 0x00])
+            .expect("from_der stores bytes without validating under rustls");
+        let built = reqwest::Client::builder()
+            .add_root_certificate(junk)
+            .build();
+        assert!(
+            built.is_err(),
+            "reqwest aborts the whole build on one bad user root — the failure we defend against"
+        );
+    }
+
+    #[test]
+    fn rustls_probe_rejects_garbage_der_and_accepts_a_real_root() {
+        use rustls::pki_types::CertificateDer;
+        // The same probe `add_trusted_roots` uses to skip poison certs.
+        let probe = |der: Vec<u8>| {
+            rustls::RootCertStore::empty()
+                .add(CertificateDer::from(der))
+                .is_ok()
+        };
+        assert!(
+            !probe(vec![0x30, 0x03, 0x02, 0x01, 0x00]),
+            "garbage DER must be rejected by the probe (kept out of reqwest's builder)"
+        );
+        // A genuine OS root — if the machine has any — must be accepted, so the probe
+        // does not throw away the real trust anchors we need.
+        let native = rustls_native_certs::load_native_certs();
+        if let Some(good) = native.certs.into_iter().next() {
+            assert!(
+                probe(good.as_ref().to_vec()),
+                "a real OS root must survive the probe"
+            );
+        }
     }
 
     #[test]
