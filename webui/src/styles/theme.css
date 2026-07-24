@@ -15,6 +15,12 @@
   --app-input-active-border:#d97757; --app-input-placeholder-foreground:#8f8c83; --app-input-secondary-background:#2a2927;
   --app-button-foreground:#ffffff; --app-button-background:#c2613f; --app-button-hover-background:#d97757; --app-ghost-button-hover-background:#ffffff14;
   --app-tool-background:#1f1e1d; --app-header-background:#262624; --app-primary-border-color:#393633; --app-accent-color:#d97757;
+  /* Table cell border — brighter than the primary border so GFM tables read on the dark canvas. */
+  --app-table-border:#57534d;
+  /* Shared max-width for the centered message + input columns (kept equal so they align).
+     Responsive: uses the full padded column below 1100px (the container already supplies
+     side padding, so no extra %-margin to compound), caps at 1100px on ultrawide. */
+  --app-content-max-width:min(1100px, 100%);
   --app-list-hover-background:#302f2c; --app-list-active-background:#3b3935; --app-list-active-foreground:#ffffff;
   --app-menu-background:#30302e; --app-menu-border:#454340; --app-menu-foreground:#e8e6df; --app-menu-selection-background:#3a2f28;
   --app-command-menu-hover-background:color-mix(in srgb,var(--app-brand) 10%,var(--app-menu-background)); --app-command-menu-active-background:color-mix(in srgb,var(--app-brand) 22%,var(--app-menu-background)); --app-command-menu-active-accent:var(--app-brand);
@@ -39,6 +45,7 @@
   --app-input-placeholder-foreground:#9b988e; --app-input-secondary-background:#f0eee6;
   --app-ghost-button-hover-background:#0000000d; --app-tool-background:#f0eee6; --app-header-background:#faf9f5;
   --app-primary-border-color:#eae6db; --app-list-hover-background:#efece3; --app-list-active-background:#e6e1d4;
+  --app-table-border:#d8d3c6;
   --app-menu-background:#ffffff; --app-menu-border:#e6e2d6; --app-menu-foreground:#1f1e1d; --app-menu-selection-background:#f3e7df;
   --app-command-menu-hover-background:color-mix(in srgb,var(--app-brand) 10%,var(--app-menu-background)); --app-command-menu-active-background:color-mix(in srgb,var(--app-brand) 22%,var(--app-menu-background)); --app-command-menu-active-accent:var(--app-brand);
   --app-link-color:#0969da; --app-transparent-inner-border:#00000012;
@@ -54,6 +61,7 @@
     --app-input-placeholder-foreground:#9b988e; --app-input-secondary-background:#f0eee6;
     --app-ghost-button-hover-background:#0000000d; --app-tool-background:#f0eee6; --app-header-background:#faf9f5;
     --app-primary-border-color:#eae6db; --app-list-hover-background:#efece3; --app-list-active-background:#e6e1d4;
+    --app-table-border:#d8d3c6;
     --app-menu-background:#ffffff; --app-menu-border:#e6e2d6; --app-menu-foreground:#1f1e1d; --app-menu-selection-background:#f3e7df;
     --app-command-menu-hover-background:color-mix(in srgb,var(--app-brand) 10%,var(--app-menu-background)); --app-command-menu-active-background:color-mix(in srgb,var(--app-brand) 22%,var(--app-menu-background)); --app-command-menu-active-accent:var(--app-brand);
     --app-link-color:#0969da; --app-transparent-inner-border:#00000012;

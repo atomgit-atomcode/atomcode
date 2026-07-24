@@ -257,10 +257,10 @@ body {
   position: relative;
 }
 
-/* Centered fixed-width message column (matches the input width). */
+/* Centered responsive message column (matches the input width; see --app-content-max-width). */
 .timeline-inner {
   width: 100%;
-  max-width: 760px;
+  max-width: var(--app-content-max-width);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -893,7 +893,7 @@ body {
 }
 .markdown-root th,
 .markdown-root td {
-  border: 1px solid var(--app-primary-border-color);
+  border: 1px solid var(--app-table-border);
   padding: 5px 10px;
   text-align: left;
   vertical-align: top;
@@ -915,10 +915,10 @@ body {
   background: var(--app-primary-background);
 }
 
-/* Centered fixed-width input column (input box + cwd breadcrumb below it). */
+/* Centered responsive input column (input box + cwd breadcrumb below it; see --app-content-max-width). */
 .input-wrap {
   width: 100%;
-  max-width: 760px;
+  max-width: var(--app-content-max-width);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -2810,7 +2810,7 @@ body {
 
 .landing-inner {
   width: 100%;
-  max-width: 760px;
+  max-width: var(--app-content-max-width);
   display: flex;
   flex-direction: column;
   align-items: center;
