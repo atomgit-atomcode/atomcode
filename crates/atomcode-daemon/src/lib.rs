@@ -733,7 +733,7 @@ pub struct MessageInfo {
 }
 
 /// Serializable image payload returned in session history.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageData {
     pub media_type: String,
     pub data: String,
@@ -2015,6 +2015,89 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
     }
 }
 
+/// Display-only image sidecar: the ORIGINAL images of VL-preprocessed user messages.
+///
+/// When the active model lacks vision, the runtime's VL seam strips the image from the
+/// conversation (only the text caption reaches the model + the persisted snapshot). The
+/// image must NOT go back into the conversation — the kernel counts every stored image as
+/// ~1600 tokens (`Message::estimate_tokens`) and the adapter would re-send it — so we
+/// stash the originals HERE, out of band, and re-attach them for DISPLAY only on load.
+/// Ordered: one entry per VL-preprocessed submission, matched to the VL-marker user
+/// messages in order (each such submission produces exactly one).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ImageSidecar {
+    #[serde(default)]
+    pub sets: Vec<Vec<ImageData>>,
+}
+
+fn image_sidecar_path(working_dir: &std::path::Path, session_id: &str) -> PathBuf {
+    atomcode_capabilities::session::SessionManager::for_project(working_dir)
+        .root()
+        .join(format!("{session_id}.images.json"))
+}
+
+/// Append a VL-preprocessed message's ORIGINAL images to the session's display-only
+/// sidecar. Best-effort: a failure just means the image later shows as the "missing"
+/// placeholder — it never blocks the turn and never touches the model context.
+pub(crate) fn append_display_images(
+    working_dir: &std::path::Path,
+    session_id: &str,
+    images: Vec<ImageData>,
+) {
+    if images.is_empty() {
+        return;
+    }
+    let path = image_sidecar_path(working_dir, session_id);
+    let mut sidecar: ImageSidecar = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    sidecar.sets.push(images);
+    if let Ok(bytes) = serde_json::to_vec(&sidecar) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+/// Re-attach display-only sidecar images to the VL-preprocessed user messages that
+/// currently render the "missing image" placeholder, IN ORDER. Real (vision-model)
+/// images and non-user messages are left untouched.
+pub(crate) fn attach_display_images(
+    messages: &mut [MessageInfo],
+    working_dir: &std::path::Path,
+    session_id: &str,
+) {
+    let sets = std::fs::read(image_sidecar_path(working_dir, session_id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ImageSidecar>(&bytes).ok())
+        .map(|sidecar| sidecar.sets)
+        .unwrap_or_default();
+    attach_image_sets(messages, sets);
+}
+
+/// Pure matcher (see [`attach_display_images`]): replace each VL-marker user message's
+/// "missing image" placeholder with the next sidecar image set, IN ORDER. Real images and
+/// non-user messages are left untouched.
+fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
+    if sets.is_empty() {
+        return;
+    }
+    let mut next = sets.into_iter();
+    for message in messages.iter_mut() {
+        let is_missing_placeholder = message.role == "user"
+            && message
+                .images
+                .as_ref()
+                .is_some_and(|imgs| imgs.iter().any(|img| img.missing));
+        if is_missing_placeholder {
+            if let Some(images) = next.next() {
+                if !images.is_empty() {
+                    message.images = Some(images);
+                }
+            }
+        }
+    }
+}
+
 fn merge_catalog_session_messages_for_display(
     session: &crate::legacy_convert::CatalogSessionView,
 ) -> anyhow::Result<Vec<MessageInfo>> {
@@ -2093,6 +2176,13 @@ fn merge_catalog_session_messages_for_display(
             });
         }
     }
+    // Re-attach display-only images (VL-preprocessed originals) stashed out of band, so a
+    // reloaded session shows the thumbnail instead of the "missing image" placeholder.
+    attach_display_images(
+        &mut messages,
+        std::path::Path::new(&session.meta.working_dir),
+        &session.meta.id,
+    );
     Ok(messages)
 }
 
@@ -6412,6 +6502,45 @@ mod tests {
             PathBuf::from("/x"),
         );
         assert_eq!(resolved, embedded);
+    }
+
+    #[test]
+    fn attach_image_sets_replaces_placeholders_in_order_only() {
+        fn msg(role: &str, images: Option<Vec<ImageData>>) -> MessageInfo {
+            MessageInfo {
+                role: role.into(),
+                content: String::new(),
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images,
+                created_at: None,
+            }
+        }
+        let real = |tag: &str| ImageData {
+            media_type: "image/png".into(),
+            data: tag.into(),
+            missing: false,
+        };
+        // Two VL-preprocessed user messages (placeholders), an assistant, and a real
+        // (vision-model) image message that must NOT be touched.
+        let mut messages = vec![
+            msg("user", Some(vec![ImageData::missing_placeholder()])),
+            msg("assistant", None),
+            msg("user", Some(vec![ImageData::missing_placeholder()])),
+            msg("user", Some(vec![real("keep-me")])),
+        ];
+        attach_image_sets(&mut messages, vec![vec![real("A")], vec![real("B")]]);
+
+        assert_eq!(messages[0].images.as_ref().unwrap()[0].data, "A", "1st placeholder → 1st set");
+        assert!(messages[1].images.is_none(), "assistant untouched");
+        assert_eq!(messages[2].images.as_ref().unwrap()[0].data, "B", "2nd placeholder → 2nd set");
+        assert_eq!(
+            messages[3].images.as_ref().unwrap()[0].data, "keep-me",
+            "a real image is never overwritten"
+        );
     }
 
     #[test]

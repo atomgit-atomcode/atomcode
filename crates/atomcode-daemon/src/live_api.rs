@@ -1019,13 +1019,22 @@ pub(crate) async fn live_stream(
     };
     let project_hash = crate::hash_path(&snapshot_wd);
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
+    let mut snapshot_messages: Vec<crate::MessageInfo> = join
+        .snapshot
+        .messages
+        .iter()
+        .map(crate::MessageInfo::from_kernel)
+        .collect();
+    // Re-attach display-only images (VL-preprocessed originals) so a refresh — which
+    // rebuilds from the kernel snapshot (image stripped) — shows the thumbnail, not the
+    // "missing image" placeholder. Same sidecar the HTTP session-load path reads.
+    crate::attach_display_images(
+        &mut snapshot_messages,
+        &snapshot_wd,
+        &join.binding.session_id,
+    );
     let _ = tx.send(LiveWireEvent::Snapshot {
-        messages: join
-            .snapshot
-            .messages
-            .iter()
-            .map(crate::MessageInfo::from_kernel)
-            .collect(),
+        messages: snapshot_messages,
         session_id: join.binding.session_id.clone(),
         session_name,
         project_hash,
@@ -1267,6 +1276,20 @@ pub(crate) async fn live_message(
         Some(&join.binding.session_id),
     )
     .await;
+    // VL preprocessing produced a caption ⇒ the runtime strips the image from the
+    // conversation (it must never re-enter model context — see estimate_tokens). Stash the
+    // originals in the display-only sidecar so a page refresh re-attaches the thumbnail.
+    if text_carries_vl_caption(&runtime_text) && !original_images.is_empty() {
+        let display: Vec<crate::ImageData> = original_images
+            .iter()
+            .map(|image| crate::ImageData {
+                media_type: image.media_type.clone(),
+                data: image.data.clone(),
+                missing: false,
+            })
+            .collect();
+        crate::append_display_images(&join.binding.working_dir, &join.binding.session_id, display);
+    }
     let echo_images: Vec<atomcode_kernel::message::ImageContent> = original_images
         .into_iter()
         .map(|image| atomcode_kernel::message::ImageContent {
