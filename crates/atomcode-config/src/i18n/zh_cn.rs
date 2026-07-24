@@ -450,6 +450,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  未找到历史会话。请先开始一段对话。\n".into(),
         Msg::CmdUnknownCommand { name } =>
             format!("未知命令：/{name}").into(),
+        Msg::CmdCustomArgRequired { name } =>
+            format!("/{name} 需要提供参数。用法：/{name} <你的输入>").into(),
         Msg::CmdLoginFailed { error } =>
             format!("登录失败：{error}").into(),
         Msg::CmdLogoutDone =>

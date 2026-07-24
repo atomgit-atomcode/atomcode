@@ -451,6 +451,69 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 > /plugin install weixin@atomcode-channel
 > ```
 
+### Custom Commands
+
+Beyond built-ins and plugin commands, you can define your own slash commands as Markdown template files — perfect for prompt patterns you use frequently.
+
+**Locations** (lowest to highest priority):
+
+| Location | Scope |
+|---------|-------|
+| `$ATOMCODE_HOME/commands/` (default `~/.atomcode/commands/`) | Global — applies to every project |
+| `<project>/.atomcode/commands/` | Project-level — overrides same-named global commands |
+| `plugins/<name>/commands/` | Plugin-contributed — installed via `/plugin install` |
+
+**File format:**
+
+```markdown
+---
+name: explain
+description: Explain how a specific function or module works
+args: required
+---
+
+Explain the following code in detail:
+
+$ARGUMENTS
+
+Cover: function signature & parameters, core business logic, data flow & side effects.
+```
+
+- **`name`** — Required. The command name; `/explain` triggers it.
+- **`description`** — Optional. Shown in Tab completion.
+- **`args`** — Optional. Controls argument expectation and UX:
+
+  | Value | Menu Enter | Empty-arg submit |
+  |-------|-----------|------------------|
+  | `none` (default) | Execute immediately | Accepted (substitutes `""`) |
+  | `optional` | Complete to `/name `, wait for input | Accepted |
+  | `required` | Complete to `/name `, wait for input | Rejected with error message |
+
+  The template variable `$ARGUMENTS` / `${ARGUMENTS}` is always replaced with whatever the user types after the command name (empty string if nothing is typed).
+
+- **Template body** — The prompt sent to the AI when the command is invoked. `$ARGUMENTS` or `${ARGUMENTS}` is replaced with whatever the user types after the command name.
+
+**Example: create a code-review command**
+
+```bash
+mkdir -p .atomcode/commands
+
+cat > .atomcode/commands/codereview.md << 'EOF'
+---
+name: codereview
+description: Review the current git diff
+args: optional
+---
+
+Review all changes in the current git diff.
+If specific files are given, review only: $ARGUMENTS
+EOF
+```
+
+Run `/help commands` to list all loaded custom commands.
+
+> **Priority rule.** A custom command cannot shadow a built-in command with the same name. If a built-in `/review` already exists, a project-level `review.md` won't appear in completion or dispatch.
+
 ## Architecture
 
 AtomCode is a layered Rust workspace:
