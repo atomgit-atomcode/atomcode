@@ -9,8 +9,8 @@ use atomcode_kernel::message::{
 /// `legacy_convert.rs::snapshot_to_core` (the cold-summary split at
 /// legacy_convert.rs:1780-1786): a synthetic message tagged with
 /// `LEGACY_COLD_SUMMARY_ORIGIN` carries one summary, stored as its `text` behind
-/// the `LEGACY_COLD_SUMMARY_PREFIX`. (`LEGACY_COLD_SUMMARY_*` still live in core
-/// until Task 5 relocates them.)
+/// the `LEGACY_COLD_SUMMARY_PREFIX`. Both constants now live in
+/// `atomcode_kernel::message` (relocated from core by Task 5).
 pub fn cold_summaries_from_messages(messages: &[Message]) -> Vec<String> {
     messages
         .iter()
@@ -156,7 +156,14 @@ impl TuiSession {
             .snapshot
             .messages
             .iter()
-            .filter(|m| m.internal_origin.as_deref() != Some(LEGACY_COLD_SUMMARY_ORIGIN))
+            .filter(|m| {
+                // Mirror the authority (legacy_convert.rs::snapshot_to_core): a
+                // message is only consumed as a cold-summary if it is BOTH
+                // origin-tagged AND its text successfully strips the prefix.
+                // If origin matches but prefix does not, keep it as a real message.
+                !(m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
+                    && m.text.starts_with(LEGACY_COLD_SUMMARY_PREFIX))
+            })
             .cloned()
             .collect();
         let mut display_messages = Vec::with_capacity(view.presentation.entries.len());
@@ -227,7 +234,13 @@ impl TuiSession {
         self.messages = snapshot
             .messages
             .into_iter()
-            .filter(|m| m.internal_origin.as_deref() != Some(LEGACY_COLD_SUMMARY_ORIGIN))
+            .filter(|m| {
+                // Mirror the authority (legacy_convert.rs::snapshot_to_core): only
+                // drop a message as a cold-summary if it is BOTH origin-tagged AND
+                // the text successfully strips the prefix.
+                !(m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
+                    && m.text.starts_with(LEGACY_COLD_SUMMARY_PREFIX))
+            })
             .collect();
     }
 
