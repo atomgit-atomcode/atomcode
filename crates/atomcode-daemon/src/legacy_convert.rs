@@ -70,6 +70,85 @@ impl From<atomcode_capabilities::session::LoadedSession> for CatalogSessionView 
 pub const IMPORTER_VERSION: u32 = 4;
 pub const LEGACY_SCHEMA: &str = "core-session-json";
 
+// ---------------------------------------------------------------------------
+// Frozen DTOs — self-contained read model for the retired core session JSON.
+// Every serde attribute mirrors core::conversation::message exactly so that
+// existing <id>.json files round-trip without deserialization loss.
+// ---------------------------------------------------------------------------
+
+/// Verbatim copy of core `ToolCall` serde shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Verbatim copy of core `ThinkingBlock` serde shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyThinkingBlock {
+    text: String,
+    signature: String,
+}
+
+/// Verbatim copy of core `MessageContent` serde shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyContent {
+    Text(String),
+    AssistantWithToolCalls {
+        text: Option<String>,
+        tool_calls: Vec<LegacyToolCall>,
+        #[serde(default)]
+        reasoning_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        thinking_blocks: Vec<LegacyThinkingBlock>,
+    },
+    ToolResult(LegacyToolResult),
+    ToolResultRef(LegacyToolResultRef),
+    MultiPart {
+        text: Option<String>,
+        images: Vec<LegacyImagePart>,
+    },
+}
+
+/// Verbatim copy of core `ToolResult` serde shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyToolResult {
+    call_id: String,
+    output: String,
+    success: bool,
+}
+
+/// Verbatim copy of core `ToolResultRef` serde shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyToolResultRef {
+    call_id: String,
+    hash: String,
+    summary: String,
+    byte_size: usize,
+    success: bool,
+}
+
+/// Verbatim copy of core `ImagePart` serde shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyImagePart {
+    media_type: String,
+    data: String,
+}
+
+/// Frozen message DTO: mirrors core `Message` serde shape verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyMessage {
+    role: String,
+    content: LegacyContent,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    synthetic: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    internal_origin: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+
 /// Frozen reader for the retired core session JSON schema. Keeping this DTO
 /// private prevents legacy persistence fields from leaking back into drivers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,7 +158,7 @@ struct LegacySession {
     working_dir: std::path::PathBuf,
     created_at: u64,
     updated_at: u64,
-    messages: Vec<CoreMessage>,
+    messages: Vec<LegacyMessage>,
     #[serde(default)]
     display_messages: Vec<LegacyDisplayMessage>,
     #[serde(default)]
@@ -92,19 +171,10 @@ struct LegacySession {
     turn_stats: Vec<LegacyTurnStat>,
 }
 
-impl LegacySession {
-    fn to_conversation_snapshot(&self) -> ConversationSnapshot {
-        ConversationSnapshot {
-            messages: self.messages.clone(),
-            cold_summaries: self.cold_summaries.clone(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LegacyDisplayMessage {
     after_message: usize,
-    message: CoreMessage,
+    message: LegacyMessage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,6 +333,82 @@ pub fn message_to_kernel(message: &CoreMessage) -> KernelMessage {
         MessageContent::MultiPart { text, images } => KernelMessage::user_with_images(
             text.clone().unwrap_or_default(),
             images.iter().map(image_to_kernel).collect(),
+        ),
+    };
+    converted.synthetic = message.synthetic;
+    converted.internal_origin = message.internal_origin.clone();
+    converted
+}
+
+fn legacy_image_to_kernel(image: &LegacyImagePart) -> ImageContent {
+    ImageContent {
+        media_type: image.media_type.clone(),
+        data: image.data.clone(),
+    }
+}
+
+fn legacy_role_to_kernel(role: &str) -> KernelRole {
+    match role {
+        "System" => KernelRole::System,
+        "User" => KernelRole::User,
+        "Assistant" => KernelRole::Assistant,
+        "Tool" => KernelRole::Tool,
+        // Unrecognised roles fall back to User; validate_tool_pairing will
+        // catch structural issues in the message sequence.
+        _ => KernelRole::User,
+    }
+}
+
+/// Convert a frozen legacy DTO message to a kernel message without going
+/// through core::conversation types.
+fn legacy_message_to_kernel(message: &LegacyMessage) -> KernelMessage {
+    let mut converted = match &message.content {
+        LegacyContent::Text(text) => {
+            let mut converted = KernelMessage::user(text.clone());
+            converted.role = legacy_role_to_kernel(&message.role);
+            converted
+        }
+        LegacyContent::AssistantWithToolCalls {
+            text,
+            tool_calls,
+            reasoning_content,
+            thinking_blocks,
+        } => {
+            let mut converted = KernelMessage::assistant(
+                text.clone().unwrap_or_default(),
+                tool_calls
+                    .iter()
+                    .map(|call| atomcode_kernel::tool::ToolCall {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    })
+                    .collect(),
+            );
+            converted.reasoning = reasoning_content.clone();
+            converted.reasoning_blocks = thinking_blocks
+                .iter()
+                .map(|block| atomcode_kernel::message::ReasoningBlock {
+                    text: block.text.clone(),
+                    opaque: Some(block.signature.clone()),
+                    // Legacy files did not persist provider identity. The signature
+                    // is lossless, but attributing it to Anthropic would be a guess.
+                    provider: None,
+                })
+                .collect();
+            converted
+        }
+        LegacyContent::ToolResult(result) => {
+            KernelMessage::tool_result(result.call_id.clone(), result.output.clone(), !result.success)
+        }
+        LegacyContent::ToolResultRef(result) => KernelMessage::tool_result(
+            result.call_id.clone(),
+            result.summary.clone(),
+            !result.success,
+        ),
+        LegacyContent::MultiPart { text, images } => KernelMessage::user_with_images(
+            text.clone().unwrap_or_default(),
+            images.iter().map(legacy_image_to_kernel).collect(),
         ),
     };
     converted.synthetic = message.synthetic;
@@ -442,16 +588,16 @@ fn convert_legacy_session_with_diagnostic(
                 if display.after_message > session.messages.len() {
                     anyhow::bail!("legacy presentation position is outside the message history")
                 }
-                let role = match display.message.role {
-                    CoreRole::User => PresentationRole::User,
-                    CoreRole::Assistant => PresentationRole::Assistant,
-                    ref role => {
+                let role = match display.message.role.as_str() {
+                    "User" => PresentationRole::User,
+                    "Assistant" => PresentationRole::Assistant,
+                    role => {
                         anyhow::bail!(
                             "legacy presentation role {role:?} is not supported by schema v1"
                         )
                     }
                 };
-                let MessageContent::Text(text) = &display.message.content else {
+                let LegacyContent::Text(text) = &display.message.content else {
                     anyhow::bail!("legacy presentation content is not plain text")
                 };
                 Ok(PresentationEntry {
@@ -467,7 +613,19 @@ fn convert_legacy_session_with_diagnostic(
             .collect::<anyhow::Result<Vec<_>>>()?,
     };
 
-    let mut snapshot = snapshot_to_kernel(&session.to_conversation_snapshot());
+    // Build the kernel snapshot from frozen DTOs directly, without going through
+    // core::conversation types. Cold summaries are prepended as synthetic messages
+    // (mirrors snapshot_to_kernel's historical behaviour exactly).
+    let mut snapshot_messages =
+        Vec::with_capacity(session.cold_summaries.len() + session.messages.len());
+    for summary in &session.cold_summaries {
+        let mut msg = KernelMessage::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}{summary}"));
+        msg.synthetic = true;
+        msg.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
+        snapshot_messages.push(msg);
+    }
+    snapshot_messages.extend(session.messages.iter().map(legacy_message_to_kernel));
+    let mut snapshot = atomcode_kernel::message::SessionSnapshot::new(snapshot_messages);
     validate_tool_pairing(&snapshot.messages)?;
     // Imported presentation anchors consume stable historical turn ids. Seed the
     // kernel above them so the first resumed turn cannot reuse an imported id.
@@ -1648,11 +1806,38 @@ pub fn usage_to_core(
 mod tests {
     use super::*;
 
+    /// Inline fixture used by the DTO-decoupling characterization test.
+    /// Covers: AssistantWithToolCalls (tool_calls + reasoning_content + thinking_blocks),
+    /// ToolResult, ToolResultRef, MultiPart (with image), cold_summaries, display_messages,
+    /// turn_stats, user_renamed:true, seconds-level created_at/updated_at.
+    const LEGACY_JSON: &str = include_str!(
+        "../../atomcode-core/tests/fixtures/session/legacy_full.json"
+    );
+
     fn full_legacy_session() -> LegacySession {
-        serde_json::from_str(include_str!(
-            "../../atomcode-core/tests/fixtures/session/legacy_full.json"
-        ))
-        .expect("full legacy session fixture must parse")
+        serde_json::from_str(LEGACY_JSON)
+            .expect("full legacy session fixture must parse")
+    }
+
+    /// Characterization (baseline) test: locks the current importer output so that
+    /// the DTO decoupling in Steps 4-5 is proven to be a pure type substitution.
+    #[test]
+    fn legacy_import_is_stable_across_dto_decoupling() {
+        let session: LegacySession = serde_json::from_str(LEGACY_JSON).unwrap();
+        let out = convert_legacy_session(&session).expect("fixture must convert");
+
+        // kernel snapshot: 2 cold-summary synthetics + 7 real messages = 9
+        assert_eq!(out.snapshot.messages.len(), 9);
+        // cold-summary synthetic messages carry the legacy origin marker
+        assert!(out.snapshot.messages.iter().any(|m| {
+            m.internal_origin.as_deref()
+                == Some(atomcode_core::conversation::LEGACY_COLD_SUMMARY_ORIGIN)
+        }));
+        // meta: naming flags and seconds → milliseconds timestamp conversion
+        assert_eq!(out.meta.user_renamed, true);
+        assert_eq!(out.meta.created_at, session.created_at as i64 * 1000);
+        // presentation: the fixture has 2 display_messages
+        assert_eq!(out.presentation.entries.len(), 2);
     }
 
     #[test]
@@ -1750,7 +1935,17 @@ mod tests {
     #[test]
     fn full_legacy_fixture_converts_to_expected_kernel_snapshot() {
         let session = full_legacy_session();
-        let snapshot = snapshot_to_kernel(&session.to_conversation_snapshot());
+        // Build the kernel snapshot via the frozen-DTO path (mirrors what
+        // convert_legacy_session does internally after the DTO decoupling).
+        let mut msgs = Vec::new();
+        for s in &session.cold_summaries {
+            let mut m = KernelMessage::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}{s}"));
+            m.synthetic = true;
+            m.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
+            msgs.push(m);
+        }
+        msgs.extend(session.messages.iter().map(legacy_message_to_kernel));
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(msgs);
 
         assert_eq!(snapshot.version, atomcode_kernel::message::SNAPSHOT_VERSION);
         assert_eq!(snapshot.messages.len(), 9);
@@ -1874,7 +2069,12 @@ mod tests {
     #[test]
     fn importer_rejects_dangling_legacy_tool_call() {
         let mut session = full_legacy_session();
-        session.messages[3] = CoreMessage::new(CoreRole::User, "interrupt");
+        session.messages[3] = LegacyMessage {
+            role: "User".to_string(),
+            content: LegacyContent::Text("interrupt".to_string()),
+            synthetic: false,
+            internal_origin: None,
+        };
 
         let error = convert_legacy_session(&session).unwrap_err();
         assert!(error.to_string().contains("tool pairing"), "{error:#}");
@@ -3536,7 +3736,18 @@ mod tests {
     #[test]
     fn kernel_round_trip_characterizes_legacy_ref_summary_loss() {
         let session = full_legacy_session();
-        let kernel = snapshot_to_kernel(&session.to_conversation_snapshot());
+        // Build kernel snapshot via frozen-DTO path, then round-trip through
+        // snapshot_to_core to characterise ToolResultRef → ToolResult lossy
+        // collapse (the ref's full output is not preserved in the core snapshot).
+        let mut msgs = Vec::new();
+        for s in &session.cold_summaries {
+            let mut m = KernelMessage::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}{s}"));
+            m.synthetic = true;
+            m.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
+            msgs.push(m);
+        }
+        msgs.extend(session.messages.iter().map(legacy_message_to_kernel));
+        let kernel = atomcode_kernel::message::SessionSnapshot::new(msgs);
         let round_trip = snapshot_to_core(&kernel);
 
         assert_eq!(round_trip.cold_summaries, session.cold_summaries);
