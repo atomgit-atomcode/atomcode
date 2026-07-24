@@ -52,7 +52,6 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
   const [dirLoading, setDirLoading] = useState(false);
   const [dirError, setDirError] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
-  const [setAsDefault, setSetAsDefault] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [newFolder, setNewFolder] = useState('');
   const [mkdirError, setMkdirError] = useState<string | null>(null);
@@ -131,8 +130,7 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
     if (!finalPath) return;
     setConfirming(true);
     try {
-      // 始终同步到 daemon 的当前项目（刷新后保持）；勾选框只决定是否写回 config 默认。
-      await changeDir(finalPath, setAsDefault);
+      await changeDir(finalPath);
       onPick(finalPath);
       onClose();
     } catch {
@@ -270,16 +268,6 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
         </div>
 
         <div class="modal-footer">
-          <label class="checkbox-label">
-            <input
-              type="checkbox"
-              checked={setAsDefault}
-              onChange={(e) =>
-                setSetAsDefault((e.target as HTMLInputElement).checked)
-              }
-            />
-            {t('cwd.setDefault')}
-          </label>
           <button class="btn" onClick={onClose}>
             {t('cwd.cancel')}
           </button>
