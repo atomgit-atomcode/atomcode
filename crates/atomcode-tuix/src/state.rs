@@ -664,7 +664,7 @@ pub struct ContextSnapshot {
 #[derive(Debug, Clone)]
 pub struct QueuedMessage {
     pub text: String,
-    pub images: Vec<atomcode_core::conversation::message::ImagePart>,
+    pub images: Vec<atomcode_kernel::message::ImageContent>,
     pub image_markers: Vec<usize>,
 }
 
@@ -830,7 +830,7 @@ pub struct UiState {
     /// Re-attached on `VisionPreprocessFailed` so the user can retry without
     /// re-pasting. Overwritten each image-carrying submit; only read on
     /// failure. Parallel vecs (aligned by index).
-    pub last_submitted_pasted_images: Vec<atomcode_core::conversation::message::ImagePart>,
+    pub last_submitted_pasted_images: Vec<atomcode_kernel::message::ImageContent>,
     pub last_submitted_pasted_markers: Vec<usize>,
     /// `/context` dispatched a `RefreshContextStats` command and is
     /// waiting for the resulting rich ContextStats event to render the
@@ -842,7 +842,7 @@ pub struct UiState {
     pub pending_context_render: Option<bool>,
     /// Images pasted from clipboard (Ctrl+V) waiting to be sent with
     /// the next user message. Drained on submit.
-    pub pending_images: Vec<atomcode_core::conversation::message::ImagePart>,
+    pub pending_images: Vec<atomcode_kernel::message::ImageContent>,
     /// Parallel to `pending_images` — content fingerprint of each pasted
     /// image's raw RGBA bytes. Used by the right-aligned status hint to
     /// suppress `Image in clipboard · ctrl+v to paste` once the clipboard
@@ -2110,7 +2110,7 @@ mod tests {
         s.session_image_count += 1;
         let n1 = s.session_image_count;
         s.pending_images
-            .push(atomcode_core::conversation::message::ImagePart {
+            .push(atomcode_kernel::message::ImageContent {
                 media_type: "image/png".into(),
                 data: "AAAA".into(),
             });
@@ -2495,7 +2495,7 @@ mod tests {
     fn queued_message_carries_images() {
         let q = QueuedMessage {
             text: "hi".into(),
-            images: vec![atomcode_core::conversation::message::ImagePart {
+            images: vec![atomcode_kernel::message::ImageContent {
                 media_type: "image/png".into(),
                 data: "AAAA".into(),
             }],

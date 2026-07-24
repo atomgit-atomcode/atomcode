@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use atomcode_capabilities::session::{DisplayAnchor, PresentationRole};
-use atomcode_core::conversation::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
-use atomcode_kernel::message::{Message, Role, SessionSnapshot};
+use atomcode_kernel::message::{
+    LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX, Message, Role, SessionSnapshot,
+};
 
 /// Extract legacy cold-summary strings from a kernel message set. Mirrors
 /// `legacy_convert.rs::snapshot_to_core` (the cold-summary split at
@@ -253,9 +254,9 @@ mod tests {
     fn cold_summaries_extracted_from_synthetic_messages() {
         let mut m = Message::user(format!(
             "{}old summary",
-            atomcode_core::conversation::LEGACY_COLD_SUMMARY_PREFIX
+            LEGACY_COLD_SUMMARY_PREFIX
         ));
-        m.internal_origin = Some(atomcode_core::conversation::LEGACY_COLD_SUMMARY_ORIGIN.to_string());
+        m.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
         let msgs = vec![Message::user("hi"), m];
         assert_eq!(
             cold_summaries_from_messages(&msgs),
@@ -269,7 +270,7 @@ mod tests {
         // summary lands in `cold_summaries`, the real messages in `messages`
         // (mirrors the old core split). Re-emitting must re-prepend the synthetic
         // so the runtime sees the same set (mirrors snapshot_to_kernel).
-        use atomcode_core::conversation::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
+        use atomcode_kernel::message::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
         let mut cold = Message::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}older context"));
         cold.synthetic = true;
         cold.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());

@@ -42,7 +42,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::{mpsc, watch};
 use ui_event::{UiAgentPhase as AgentPhase, UiEvent as AgentEvent};
 
-use atomcode_core::conversation::message::ImagePart;
+use atomcode_kernel::message::ImageContent;
 use base64::Engine;
 
 use crate::commands::{parse_bash_command, parse_slash_line, CommandRegistry};
@@ -63,14 +63,8 @@ fn runtime_mode(mode: crate::state::AgentMode) -> atomcode_coding::RuntimeMode {
     }
 }
 
-fn runtime_user_input(text: String, images: Vec<ImagePart>) -> atomcode_coding::UserInput {
-    atomcode_coding::UserInput {
-        text,
-        images: images
-            .iter()
-            .map(atomcode_daemon::legacy_convert::image_to_kernel)
-            .collect(),
-    }
+fn runtime_user_input(text: String, images: Vec<ImageContent>) -> atomcode_coding::UserInput {
+    atomcode_coding::UserInput { text, images }
 }
 
 fn submit_foreground_runtime(ctx: &LoopCtx, input: atomcode_coding::UserInput) -> bool {
@@ -171,7 +165,7 @@ fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Try to grab an image from the system clipboard via `arboard`.
-/// Returns `Some((ImagePart, fingerprint))` if the clipboard holds an
+/// Returns `Some((ImageContent, fingerprint))` if the clipboard holds an
 /// image, `None` otherwise. The fingerprint is hashed off the raw RGBA
 /// Try to get an image from the clipboard. First attempts to read image
 /// bytes directly (screenshots, Preview Copy). If that fails, falls back
@@ -204,7 +198,7 @@ fn is_paste_image_chord(
 /// bytes (not the PNG-encoded base64) — same hash function the status
 /// poll uses, so paste-side and poll-side fingerprints line up for the
 /// "is this the same image we already attached?" check.
-fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
+fn try_paste_clipboard_image() -> Option<(ImageContent, u64)> {
     // Three-tier fallback chain for Ctrl+V → image attach. Each tier
     // covers a real-world clipboard shape Cmd+V already handled via
     // bracketed paste; Ctrl+V is intercepted at the key layer before
@@ -221,7 +215,7 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
         let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
         return Some((
-            ImagePart {
+            ImageContent {
                 media_type: "image/png".into(),
                 data: b64,
             },
@@ -297,7 +291,7 @@ fn read_macos_clipboard_file_url() -> Option<String> {
     Some(decoded.into_owned())
 }
 
-/// Map an `ImagePart::media_type` to a cache filename extension.
+/// Map an `ImageContent::media_type` to a cache filename extension.
 /// Unknown MIMEs degrade to `bin` — they still round-trip via the
 /// stored `media_type` field on `HistoryImageRef`, so the extension is
 /// purely informational for humans poking at `~/.atomcode/image-cache/`.
@@ -318,7 +312,7 @@ fn ext_for_mt(mt: &str) -> &'static str {
 /// the source of truth for the current submit.
 fn cache_write_image(
     cache_dir: &std::path::Path,
-    img: &atomcode_core::conversation::message::ImagePart,
+    img: &atomcode_kernel::message::ImageContent,
     hash: u64,
 ) {
     let path = cache_dir.join(format!("{:016x}.{}", hash, ext_for_mt(&img.media_type)));
@@ -476,7 +470,7 @@ pub(crate) fn hydrate_recalled_attachments(
                 let hash_u64 = u64::from_str_radix(&refed.hash, 16).unwrap_or(0);
                 state
                     .pending_images
-                    .push(atomcode_core::conversation::message::ImagePart {
+                    .push(atomcode_kernel::message::ImageContent {
                         media_type: refed.mt.clone(),
                         data: base64::engine::general_purpose::STANDARD.encode(&raw),
                     });
@@ -500,7 +494,7 @@ pub(crate) fn hydrate_recalled_attachments(
 const MAX_PATH_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Try to interpret a paste payload as a filesystem path to an image
-/// file and load it as an [`ImagePart`]. Returns `Some` only when the
+/// file and load it as an [`ImageContent`]. Returns `Some` only when the
 /// payload looks unambiguously like an image-attachment intent, never
 /// for plain prose that happens to mention a file name.
 ///
@@ -537,7 +531,7 @@ const MAX_PATH_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 /// works; collisions with a clipboard-paste of the same image (which
 /// hashes RGBA, not file bytes) are out of scope — the hash is a
 /// per-source dedup signal, not a global content identity.
-fn try_attach_image_from_path(text: &str) -> Option<(ImagePart, u64)> {
+fn try_attach_image_from_path(text: &str) -> Option<(ImageContent, u64)> {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.contains('\n') {
         return None;
@@ -582,7 +576,7 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImagePart, u64)> {
     let hash = rgba_fingerprint(0, 0, &bytes);
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Some((
-        ImagePart {
+        ImageContent {
             media_type: media_type.into(),
             data: b64,
         },
@@ -630,7 +624,7 @@ mod image_path_tests {
         p
     }
 
-    /// PNG path → ImagePart with `image/png` media type. The single
+    /// PNG path → ImageContent with `image/png` media type. The single
     /// happy-path covering iTerm2's Cmd+V-of-image temp-file shape.
     #[test]
     fn png_path_attaches_as_image_png() {
@@ -5268,7 +5262,7 @@ mod menu_tests {
     fn cache_write_image_writes_and_is_idempotent() {
         use base64::Engine;
         let dir = tempfile::tempdir().unwrap();
-        let img = atomcode_core::conversation::message::ImagePart {
+        let img = atomcode_kernel::message::ImageContent {
             media_type: "image/png".into(),
             data: base64::engine::general_purpose::STANDARD.encode(b"hello"),
         };
@@ -5345,7 +5339,7 @@ mod menu_tests {
 
         // ── Turn 1: paste image, submit ────────────────────────────────
         let raw_bytes = b"\x89PNG\r\n\x1a\nfake".to_vec();
-        let img = atomcode_core::conversation::message::ImagePart {
+        let img = atomcode_kernel::message::ImageContent {
             media_type: "image/png".into(),
             data: base64::engine::general_purpose::STANDARD.encode(&raw_bytes),
         };
@@ -8837,7 +8831,7 @@ fn attach_image_to_input(
     app: &mut App,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
-    img_hash: Option<(ImagePart, u64)>,
+    img_hash: Option<(ImageContent, u64)>,
 ) -> Result<bool> {
     let Some((img, hash)) = img_hash else {
         return Ok(false);
@@ -8902,7 +8896,7 @@ fn attach_typed_image_paths(
     app: &mut App,
     ctx: &mut LoopCtx,
     text: &mut String,
-    images: &mut Vec<ImagePart>,
+    images: &mut Vec<ImageContent>,
     kept_markers: &mut Vec<usize>,
 ) {
     if !ctx.config.can_handle_attached_images() {
@@ -9154,7 +9148,7 @@ fn handle_input(
                 //     string land in their input buffer — Cmd+V on iTerm2
                 //     felt broken vs. Claude Code / Aider, which all do
                 //     this same path-recognition.
-                let image_paste: Option<(ImagePart, u64)> = if text.trim().is_empty() {
+                let image_paste: Option<(ImageContent, u64)> = if text.trim().is_empty() {
                     try_paste_clipboard_image()
                 } else {
                     try_attach_image_from_path(&text)
@@ -10616,7 +10610,7 @@ fn handle_idle_key(
                 let pending = std::mem::take(&mut app.state.pending_images);
                 let pending_markers = std::mem::take(&mut app.state.pending_image_markers);
                 let pending_hashes = std::mem::take(&mut app.state.pending_image_hashes);
-                let mut images: Vec<ImagePart> = Vec::with_capacity(pending.len());
+                let mut images: Vec<ImageContent> = Vec::with_capacity(pending.len());
                 let mut kept_markers: Vec<usize> = Vec::with_capacity(pending.len());
                 let mut kept_refs: Vec<crate::input::history::HistoryImageRef> =
                     Vec::with_capacity(pending.len());
@@ -12249,7 +12243,7 @@ fn handle_streaming_key(
             let pending = std::mem::take(&mut app.state.pending_images);
             let pending_markers = std::mem::take(&mut app.state.pending_image_markers);
             let pending_hashes = std::mem::take(&mut app.state.pending_image_hashes);
-            let mut q_images: Vec<ImagePart> = Vec::with_capacity(pending.len());
+            let mut q_images: Vec<ImageContent> = Vec::with_capacity(pending.len());
             let mut q_markers: Vec<usize> = Vec::with_capacity(pending.len());
             let mut q_refs: Vec<crate::input::history::HistoryImageRef> =
                 Vec::with_capacity(pending.len());
@@ -16301,6 +16295,8 @@ mod coding_runtime_event_tests {
 
     #[test]
     fn kernel_projection_preserves_reasoning_blocks() {
+        // Build a kernel assistant message that carries both tool calls and
+        // reasoning blocks (the Anthropic extended-thinking case).
         let mut message = atomcode_kernel::message::Message::assistant(
             "answer",
             vec![atomcode_kernel::tool::ToolCall {
@@ -16315,28 +16311,21 @@ mod coding_runtime_event_tests {
             provider: Some("anthropic".into()),
         }];
 
-        let projected = snapshot_to_core(&atomcode_kernel::message::SessionSnapshot::new(vec![
-            message,
-        ]))
-        .messages
-        .into_iter()
-        .next()
-        .expect("projected message");
-        let atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
-            thinking_blocks,
-            ..
-        } = projected.content
-        else {
-            panic!("expected assistant tool-call content");
-        };
-        assert_eq!(thinking_blocks.len(), 1);
-        assert_eq!(thinking_blocks[0].text, "thought");
-        assert_eq!(thinking_blocks[0].signature, "sig");
+        // Verify the kernel message itself carries the reasoning blocks on its
+        // flat fields — no core::conversation projection needed.
+        assert!(!message.tool_calls.is_empty(), "tool_calls must be set");
+        assert_eq!(message.reasoning_blocks.len(), 1);
+        assert_eq!(message.reasoning_blocks[0].text, "thought");
+        assert_eq!(
+            message.reasoning_blocks[0].opaque.as_deref(),
+            Some("sig"),
+            "opaque (signature) must round-trip"
+        );
     }
 
     #[test]
     fn kernel_projection_restores_legacy_cold_summaries() {
-        use atomcode_core::conversation::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
+        use atomcode_kernel::message::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
         let mut summary = atomcode_kernel::message::Message::user(format!(
             "{LEGACY_COLD_SUMMARY_PREFIX}older context"
         ));
@@ -18226,7 +18215,7 @@ mod session_naming_tests {
     /// Build a kernel snapshot whose messages carry cold-summary synthetics
     /// INLINE (mirrors `snapshot_to_kernel`), matching what the runtime emits.
     fn snapshot(cold_summaries: &[&str], messages: Vec<Message>) -> SessionSnapshot {
-        use atomcode_core::conversation::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
+        use atomcode_kernel::message::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
         let mut all = Vec::new();
         for summary in cold_summaries {
             let mut m = Message::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}{summary}"));

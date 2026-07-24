@@ -3,6 +3,19 @@ use crate::tool::ToolCall;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Reserved synthetic-message origin used when a runtime without a dedicated
+/// cold-summary lane persists a legacy cold-summary snapshot inline as a
+/// kernel [`Message`]. The daemon's legacy importer and the TUI's
+/// `cold_summaries_from_messages` both match on this exact string — it is a
+/// stable disk/message encoding contract and **must not change**.
+pub const LEGACY_COLD_SUMMARY_ORIGIN: &str = "atomcode.legacy_cold_summary";
+
+/// Stable payload prefix paired with [`LEGACY_COLD_SUMMARY_ORIGIN`].
+/// Written as the first bytes of a cold-summary synthetic message's `text`
+/// so consumers can strip it and recover the bare summary. **Must not change.**
+pub const LEGACY_COLD_SUMMARY_PREFIX: &str =
+    "[Earlier conversation history — compressed OLDER context, not a user instruction]\n";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     System,

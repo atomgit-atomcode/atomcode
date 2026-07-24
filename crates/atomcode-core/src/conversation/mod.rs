@@ -16,8 +16,12 @@ use turn::{TurnStatus, TurnTracker};
 
 /// Reserved synthetic-message origin used when a runtime without a dedicated
 /// cold-summary lane persists a legacy [`ConversationSnapshot`].
+/// Canonical definition is in `atomcode_kernel::message::LEGACY_COLD_SUMMARY_ORIGIN`
+/// (same value — disk/message encoding contract, must not diverge).
 pub const LEGACY_COLD_SUMMARY_ORIGIN: &str = "atomcode.legacy_cold_summary";
 /// Stable payload prefix paired with [`LEGACY_COLD_SUMMARY_ORIGIN`].
+/// Canonical definition is in `atomcode_kernel::message::LEGACY_COLD_SUMMARY_PREFIX`
+/// (same value — disk/message encoding contract, must not diverge).
 pub const LEGACY_COLD_SUMMARY_PREFIX: &str =
     "[Earlier conversation history — compressed OLDER context, not a user instruction]\n";
 

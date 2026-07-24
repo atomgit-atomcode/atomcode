@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use atomcode_core::conversation::message::ImagePart;
+use atomcode_kernel::message::ImageContent;
 use atomcode_core::stream::TokenUsage;
 use atomcode_core::tool::ToolCall;
 use atomcode_kernel::event::ToolBatchCall;
@@ -102,7 +102,7 @@ pub enum UiEvent {
     },
     HookWarningHint(String),
     RestorePendingImages {
-        images: Vec<ImagePart>,
+        images: Vec<ImageContent>,
         markers: Vec<usize>,
     },
     VisionPreprocessSuccess {
