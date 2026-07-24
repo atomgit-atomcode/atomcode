@@ -1823,8 +1823,7 @@ fn spawn_deferred_tui_runtime(
     session: &atomcode_tuix::session::Session,
 ) -> atomcode_tuix::SpawnedRuntime {
     let session_id = session.id.as_str().to_string();
-    let snapshot =
-        atomcode_daemon::legacy_convert::snapshot_to_kernel(&session.to_conversation_snapshot());
+    let snapshot = session.to_conversation_snapshot();
     let (native_control, mut events, runtime_state) =
         atomcode_daemon::spawn_native_runtime_for_session_deferred_with_preprocessor(
             cfg,

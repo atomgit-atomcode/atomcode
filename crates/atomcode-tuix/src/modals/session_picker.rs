@@ -606,10 +606,8 @@ fn turn_divider_label(stat: Option<&TurnStat>) -> String {
 /// live. Mirrors the live [`UiState::last_assistant_response`]: the accumulated
 /// assistant text of the newest turn that produced any (a `User` message is a
 /// turn boundary). Returns `""` when the session has no assistant text.
-fn last_assistant_reply_markdown(
-    messages: &[atomcode_core::conversation::message::Message],
-) -> String {
-    use atomcode_core::conversation::message::{MessageContent, Role};
+fn last_assistant_reply_markdown(messages: &[atomcode_kernel::message::Message]) -> String {
+    use atomcode_kernel::message::Role;
     // Append `text` to the in-progress turn's reply, paragraph-separated so a
     // turn that emitted prose, then a tool call, then more prose reads cleanly.
     fn push_reply(acc: &mut String, text: &str) {
@@ -625,19 +623,19 @@ fn last_assistant_reply_markdown(
     let mut acc = String::new(); // assistant text of the in-progress turn
     let mut last = String::new(); // newest turn that produced assistant text
     for m in messages {
-        match (&m.role, &m.content) {
+        match m.role {
             // Turn boundary: seal the turn that just ended (keep the previous
             // `last` if this turn produced no assistant text — a trailing bare
             // user message must not blank out the reply above it).
-            (Role::User, _) if is_real_user_message(m) => {
+            Role::User if is_real_user_message(m) => {
                 if !acc.is_empty() {
                     last = std::mem::take(&mut acc);
                 }
             }
-            (Role::Assistant, MessageContent::Text(s)) => push_reply(&mut acc, s),
-            (Role::Assistant, MessageContent::AssistantWithToolCalls { text: Some(t), .. }) => {
-                push_reply(&mut acc, t)
-            }
+            // Assistant text is the flat `text` field for both a plain reply and
+            // a tool-call turn (kernel merges them; `text` is empty for a bare
+            // tool call, so `push_reply` no-ops on it).
+            Role::Assistant => push_reply(&mut acc, &m.text),
             _ => {}
         }
     }
@@ -647,8 +645,8 @@ fn last_assistant_reply_markdown(
     last
 }
 
-fn is_real_user_message(message: &atomcode_core::conversation::message::Message) -> bool {
-    use atomcode_core::conversation::message::Role;
+fn is_real_user_message(message: &atomcode_kernel::message::Message) -> bool {
+    use atomcode_kernel::message::Role;
     matches!(message.role, Role::User) && !message.synthetic
 }
 
@@ -658,7 +656,7 @@ pub(crate) fn replay_session(
     session: &Session,
     reset: bool,
 ) {
-    use atomcode_core::conversation::message::{MessageContent, Role};
+    use atomcode_kernel::message::Role;
     // Bracket the whole replay — the `reset()` screen wipe plus the
     // line-by-line re-emit of the entire transcript — in ONE DECSET 2026
     // synchronized-output envelope. Capable hosts then paint it as a single
@@ -705,29 +703,20 @@ pub(crate) fn replay_session(
             }
             seen_user = true;
         }
-        match (&m.role, &m.content) {
-            (Role::User, MessageContent::Text(s)) if is_real_user_message(m) => {
-                renderer.render(UiLine::User(s.clone()));
+        match m.role {
+            Role::User if is_real_user_message(m) => {
+                renderer.render(UiLine::User(m.text.clone()));
             }
-            (Role::Assistant, MessageContent::Text(s)) => {
-                if !s.is_empty() {
-                    renderer.render(UiLine::AssistantText(s.clone()));
+            // A kernel assistant message carries flat `text` + `tool_calls`
+            // (empty for a pure text reply). Render the prose first, then each
+            // requested tool call — identical to the old `Text` /
+            // `AssistantWithToolCalls` split.
+            Role::Assistant => {
+                if !m.text.is_empty() {
+                    renderer.render(UiLine::AssistantText(m.text.clone()));
                     renderer.render(UiLine::AssistantLineBreak);
                 }
-            }
-            (
-                Role::Assistant,
-                MessageContent::AssistantWithToolCalls {
-                    text, tool_calls, ..
-                },
-            ) => {
-                if let Some(t) = text {
-                    if !t.is_empty() {
-                        renderer.render(UiLine::AssistantText(t.clone()));
-                        renderer.render(UiLine::AssistantLineBreak);
-                    }
-                }
-                for tc in tool_calls {
+                for tc in &m.tool_calls {
                     // todowrite → no inline block; the persistent panel is the sole
                     // view. Suppress the (successful) tool RESULT below by remembering
                     // the call id. Mirror the live path: only a PARSEABLE call is
@@ -747,23 +736,18 @@ pub(crate) fn replay_session(
                     });
                 }
             }
-            (Role::Tool, MessageContent::ToolResult(r)) => {
-                // Suppress ONLY a SUCCESSFUL todowrite result (its block already rendered).
-                // An errored todowrite must still show its error — matches the live path
-                // (`suppress_body_echo = … && success`).
-                if !(r.success && todowrite_call_ids.contains(&r.call_id)) {
+            // Tool RESULT: kernel carries `tool_call_id` + `is_error` + flat
+            // `text` (both the old `ToolResult.output` and `ToolResultRef.summary`
+            // land in `text` via `message_to_kernel`). Suppress ONLY a SUCCESSFUL
+            // todowrite result (its block already rendered); an errored one still
+            // shows — matches the live path (`suppress_body_echo = … && success`).
+            Role::Tool => {
+                let success = !m.is_error;
+                let call_id = m.tool_call_id.as_deref().unwrap_or("");
+                if !(success && todowrite_call_ids.contains(call_id)) {
                     renderer.render(UiLine::ToolResult {
-                        success: r.success,
-                        summary: summarise(&r.output),
-                        diff_stats: None,
-                    });
-                }
-            }
-            (Role::Tool, MessageContent::ToolResultRef(r)) => {
-                if !(r.success && todowrite_call_ids.contains(&r.call_id)) {
-                    renderer.render(UiLine::ToolResult {
-                        success: true,
-                        summary: summarise(&r.summary),
+                        success,
+                        summary: summarise(&m.text),
                         diff_stats: None,
                     });
                 }
@@ -882,35 +866,27 @@ mod tests {
 
     #[test]
     fn last_reply_picks_newest_assistant_turn() {
-        use atomcode_core::conversation::message::{Message, Role};
+        use atomcode_kernel::message::Message;
         let msgs = vec![
-            Message::new(Role::User, "q1"),
-            Message::new(Role::Assistant, "A1"),
-            Message::new(Role::User, "q2"),
-            Message::new(Role::Assistant, "A2"),
+            Message::user("q1"),
+            Message::assistant("A1", vec![]),
+            Message::user("q2"),
+            Message::assistant("A2", vec![]),
         ];
         assert_eq!(last_assistant_reply_markdown(&msgs), "A2");
     }
 
     #[test]
     fn last_reply_accumulates_text_across_a_tool_call_turn() {
-        use atomcode_core::conversation::message::{Message, MessageContent, Role};
+        use atomcode_kernel::message::Message;
         // One turn: prose → tool call (with text) → prose. Live accumulates all
         // visible text of the turn, so replay must too.
         let msgs = vec![
-            Message::new(Role::User, "q"),
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::AssistantWithToolCalls {
-                    text: Some("Let me check.".into()),
-                    tool_calls: vec![],
-                    reasoning_content: None,
-                    thinking_blocks: vec![],
-                },
-                synthetic: false,
-                internal_origin: None,
-            },
-            Message::new(Role::Assistant, "The answer is X."),
+            Message::user("q"),
+            // A tool-call turn that also emitted prose: kernel keeps the prose in
+            // the flat `text` field alongside `tool_calls`.
+            Message::assistant("Let me check.", vec![]),
+            Message::assistant("The answer is X.", vec![]),
         ];
         assert_eq!(
             last_assistant_reply_markdown(&msgs),
@@ -920,23 +896,23 @@ mod tests {
 
     #[test]
     fn last_reply_keeps_prior_reply_when_session_ends_on_bare_user() {
-        use atomcode_core::conversation::message::{Message, Role};
+        use atomcode_kernel::message::Message;
         // Session ends on a user message the assistant hasn't answered yet —
         // the reply still on screen is the prior one, so keep it (mirrors live,
         // where the buffer isn't cleared until the next turn's first delta).
         let msgs = vec![
-            Message::new(Role::User, "q1"),
-            Message::new(Role::Assistant, "A1"),
-            Message::new(Role::User, "q2 pending"),
+            Message::user("q1"),
+            Message::assistant("A1", vec![]),
+            Message::user("q2 pending"),
         ];
         assert_eq!(last_assistant_reply_markdown(&msgs), "A1");
     }
 
     #[test]
     fn last_reply_empty_when_no_assistant_text() {
-        use atomcode_core::conversation::message::{Message, Role};
+        use atomcode_kernel::message::Message;
         assert_eq!(last_assistant_reply_markdown(&[]), "");
-        let only_user = vec![Message::new(Role::User, "hi")];
+        let only_user = vec![Message::user("hi")];
         assert_eq!(last_assistant_reply_markdown(&only_user), "");
     }
 
@@ -1105,7 +1081,7 @@ mod tests {
 
     #[test]
     fn selecting_current_session_replays_the_ui_without_a_runtime_transition() {
-        use atomcode_core::conversation::message::{Message, Role};
+        use atomcode_kernel::message::Message;
 
         #[derive(Default)]
         struct Rec {
@@ -1131,8 +1107,8 @@ mod tests {
         current.id = "current-id".into();
         current.name = "current session".into();
         current.messages = vec![
-            Message::new(Role::User, "question"),
-            Message::new(Role::Assistant, "answer"),
+            Message::user("question"),
+            Message::assistant("answer", vec![]),
         ];
         let mut selected = meta("current session", current.messages.len());
         selected.id = current.id.clone();
@@ -1318,8 +1294,8 @@ mod tests {
     // error results are unaffected.
     #[test]
     fn replay_seeds_todo_panel_and_suppresses_todowrite_result() {
-        use atomcode_core::conversation::message::{Message, MessageContent, Role};
-        use atomcode_core::tool::{ToolCall, ToolResult as MToolResult};
+        use atomcode_kernel::message::Message;
+        use atomcode_kernel::tool::ToolCall;
 
         #[derive(Default)]
         struct Rec {
@@ -1340,82 +1316,37 @@ mod tests {
 
         let mut session = Session::new(PathBuf::from("/tmp/x"));
         session.messages = vec![
-            Message {
-                role: Role::User,
-                content: MessageContent::Text("go".into()),
-                synthetic: false,
-                internal_origin: None,
-            },
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::AssistantWithToolCalls {
-                    text: None,
-                    tool_calls: vec![
-                        ToolCall {
-                            id: "t1".into(),
-                            name: "todowrite".into(),
-                            arguments: r#"{"todos":[{"content":"task A","status":"in_progress"},{"content":"task B","status":"pending"}]}"#.into(),
-                        },
-                        ToolCall {
-                            id: "r1".into(),
-                            name: "read".into(),
-                            arguments: r#"{"path":"x"}"#.into(),
-                        },
-                    ],
-                    reasoning_content: None,
-                    thinking_blocks: vec![],
-                },
-                synthetic: false,
-                internal_origin: None,
-            },
-            Message {
-                role: Role::Tool,
-                content: MessageContent::ToolResult(MToolResult {
-                    call_id: "t1".into(),
-                    output: "[~] task A\n[ ] task B".into(),
-                    success: true,
-                }),
-                synthetic: false,
-                internal_origin: None,
-            },
-            Message {
-                role: Role::Tool,
-                content: MessageContent::ToolResult(MToolResult {
-                    call_id: "r1".into(),
-                    output: "file contents".into(),
-                    success: true,
-                }),
-                synthetic: false,
-                internal_origin: None,
-            },
-            // A FAILED todowrite (success=false): its error result must NOT be
+            Message::user("go"),
+            Message::assistant(
+                "",
+                vec![
+                    ToolCall {
+                        id: "t1".into(),
+                        name: "todowrite".into(),
+                        arguments: r#"{"todos":[{"content":"task A","status":"in_progress"},{"content":"task B","status":"pending"}]}"#.into(),
+                    },
+                    ToolCall {
+                        id: "r1".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"x"}"#.into(),
+                    },
+                ],
+            ),
+            // `is_error = !success`: a successful tool result is `false`.
+            Message::tool_result("t1", "[~] task A\n[ ] task B", false),
+            Message::tool_result("r1", "file contents", false),
+            // A FAILED todowrite (is_error=true): its error result must NOT be
             // suppressed (parity with live's `… && success` suppression). It IS
             // the last valid call, so the panel is seeded from it (task C).
-            Message {
-                role: Role::Assistant,
-                content: MessageContent::AssistantWithToolCalls {
-                    text: None,
-                    tool_calls: vec![ToolCall {
-                        id: "t2".into(),
-                        name: "todowrite".into(),
-                        arguments: r#"{"todos":[{"content":"task C","status":"pending"}]}"#.into(),
-                    }],
-                    reasoning_content: None,
-                    thinking_blocks: vec![],
-                },
-                synthetic: false,
-                internal_origin: None,
-            },
-            Message {
-                role: Role::Tool,
-                content: MessageContent::ToolResult(MToolResult {
-                    call_id: "t2".into(),
-                    output: "error: bad todo item".into(),
-                    success: false,
-                }),
-                synthetic: false,
-                internal_origin: None,
-            },
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "t2".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"task C","status":"pending"}]}"#.into(),
+                }],
+            ),
+            Message::tool_result("t2", "error: bad todo item", true),
         ];
 
         let mut state = UiState::with_unicode(true);
@@ -1492,7 +1423,7 @@ mod tests {
 
     #[test]
     fn replay_skips_synthetic_user_messages() {
-        use atomcode_core::conversation::message::{Message, Role};
+        use atomcode_kernel::message::Message;
 
         #[derive(Default)]
         struct Rec {
@@ -1513,10 +1444,10 @@ mod tests {
 
         let mut session = Session::new(PathBuf::from("/tmp/x"));
         session.messages = vec![
-            Message::new(Role::User, "real prompt"),
-            Message::new(Role::Assistant, "first reply"),
+            Message::user("real prompt"),
+            Message::assistant("first reply", vec![]),
             Message::synthetic_user("[SYNTAX CHECK: fix parser before continuing.]"),
-            Message::new(Role::Assistant, "second reply"),
+            Message::assistant("second reply", vec![]),
         ];
 
         let mut state = UiState::with_unicode(true);
@@ -1547,7 +1478,7 @@ mod tests {
 
     #[test]
     fn replay_ignores_accounting_only_turn_positions() {
-        use atomcode_core::conversation::message::{Message, Role};
+        use atomcode_kernel::message::Message;
 
         #[derive(Default)]
         struct Rec {
@@ -1568,10 +1499,10 @@ mod tests {
 
         let mut session = Session::new(PathBuf::from("/tmp/x"));
         session.messages = vec![
-            Message::new(Role::User, "q1"),
-            Message::new(Role::Assistant, "a1"),
-            Message::new(Role::User, "q2"),
-            Message::new(Role::Assistant, "a2"),
+            Message::user("q1"),
+            Message::assistant("a1", vec![]),
+            Message::user("q2"),
+            Message::assistant("a2", vec![]),
         ];
         session.turn_stats.push(TurnStat {
             after_message: 4,

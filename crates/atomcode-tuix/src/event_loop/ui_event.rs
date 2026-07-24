@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use atomcode_core::conversation::message::ImagePart;
-use atomcode_core::conversation::ConversationSnapshot;
 use atomcode_core::stream::TokenUsage;
 use atomcode_core::tool::ToolCall;
 use atomcode_kernel::event::ToolBatchCall;
+use atomcode_kernel::message::SessionSnapshot;
 
 /// TUI-only presentation events. Runtime and live-session inputs are projected
 /// into this type at the driver boundary; it is not an engine protocol.
@@ -52,7 +52,7 @@ pub enum UiEvent {
         tool_name: String,
         reason: String,
         call: ToolCall,
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
     },
     TokenUsage(TokenUsage),
     PhaseChange(UiAgentPhase),
@@ -62,13 +62,13 @@ pub enum UiEvent {
         turn_count: usize,
         tool_call_count: usize,
         stop_reason: UiTurnStopReason,
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
     },
     TurnCancelled {
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
     },
     ConversationTruncated {
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
         restored_prompt: String,
         target_n: usize,
         prompts_before: usize,
@@ -78,11 +78,11 @@ pub enum UiEvent {
         available: usize,
     },
     MessagesSync {
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
     },
     ConversationRestored {
         restore_id: u64,
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
     },
     ConversationRestoreFailed {
         restore_id: u64,
@@ -90,7 +90,7 @@ pub enum UiEvent {
     },
     Error {
         error: String,
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
     },
     Warning(String),
     RateLimited {

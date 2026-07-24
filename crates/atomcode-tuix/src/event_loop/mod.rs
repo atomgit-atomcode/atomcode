@@ -36,6 +36,7 @@ use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCom
 use atomcode_coding::CodingRuntimeHandle;
 use atomcode_config::config::Config;
 use atomcode_config::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};
+#[cfg(test)]
 use atomcode_daemon::legacy_convert::snapshot_to_core;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::{mpsc, watch};
@@ -1295,7 +1296,7 @@ mod submit_hold_tests {
             turn_count: 0,
             tool_call_count: 0,
             stop_reason: ui_event::UiTurnStopReason::Natural,
-            snapshot: Default::default(),
+            snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         });
         assert_eq!(
             type_ahead_queue_action(&presentation_only),
@@ -1426,7 +1427,7 @@ mod submit_hold_tests {
                 turn_count: 0,
                 tool_call_count: 0,
                 stop_reason,
-                snapshot: Default::default(),
+                snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
             })
         };
 
@@ -14460,7 +14461,7 @@ fn project_kernel_event(
         })),
         Kernel::Error { message, .. } => Some(AgentEvent::Error {
             error: message,
-            snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+            snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         }),
         Kernel::Warning(message) => Some(AgentEvent::Warning(message)),
         Kernel::RateLimited {
@@ -14904,8 +14905,10 @@ fn handle_runtime_event(
                     let snapshot = request
                         .snapshot
                         .as_deref()
-                        .map(snapshot_to_core)
-                        .unwrap_or_default();
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            atomcode_kernel::message::SessionSnapshot::new(Vec::new())
+                        });
                     handle_agent_event(
                         AgentEvent::ApprovalNeeded {
                             tool_name: approval.tool.clone(),
@@ -14942,7 +14945,7 @@ fn handle_runtime_event(
                             ..
                         } if matches!(reason, atomcode_kernel::event::StopReason::Cancelled) => {
                             AgentEvent::TurnCancelled {
-                                snapshot: snapshot_to_core(snapshot.as_ref()),
+                                snapshot: snapshot.as_ref().clone(),
                             }
                         }
                         atomcode_coding::TurnCompletion::Completed {
@@ -14962,13 +14965,13 @@ fn handle_runtime_event(
                                 turn_count: stats.turn_count,
                                 tool_call_count: stats.tool_call_count,
                                 stop_reason: kernel_stop_reason(reason),
-                                snapshot: snapshot_to_core(snapshot.as_ref()),
+                                snapshot: snapshot.as_ref().clone(),
                             }
                         }
                         atomcode_coding::TurnCompletion::SnapshotUnavailable { error, .. } => {
                             AgentEvent::Error {
                                 error: error.message,
-                                snapshot: Default::default(),
+                                snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
                             }
                         }
                     };
@@ -15003,7 +15006,7 @@ fn handle_runtime_event(
                         handle_agent_event(
                             AgentEvent::Error {
                                 error: "coding runtime stopped before turn terminal".into(),
-                                snapshot: Default::default(),
+                                snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
                             },
                             state,
                             think,
@@ -15207,7 +15210,7 @@ fn handle_runtime_event(
                 CodingRuntimeEvent::UndoFinished(result) => {
                     match result {
                         Ok(result) => handle_undo_success(
-                            snapshot_to_core(result.snapshot.as_ref()),
+                            result.snapshot.as_ref().clone(),
                             result.restored_prompt,
                             result.target_n,
                             result.prompts_before,
@@ -15863,9 +15866,7 @@ fn commit_live_capability_projection(
     let Some(binding) = ctx.live_binding.clone() else {
         return Ok(());
     };
-    let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
-        &ctx.current_session.to_conversation_snapshot(),
-    );
+    let snapshot = ctx.current_session.to_conversation_snapshot();
     ctx.live_binding = Some(
         atomcode_daemon::native_live::commit_runtime_snapshot(
             &binding,
@@ -15918,9 +15919,7 @@ fn commit_native_session_changed(
     let session_id = session.id.clone();
     let working_dir = atomcode_capabilities::pathnorm::strip_verbatim_path(&working_dir);
     let next_live_binding = if let Some(binding) = ctx.live_binding.clone() {
-        let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
-            &session.to_conversation_snapshot(),
-        );
+        let snapshot = session.to_conversation_snapshot();
         Some(
             atomcode_daemon::native_live::replace_snapshot(
                 &binding,
@@ -16089,7 +16088,7 @@ fn run_local_shell_command(command: String, ctx: &LoopCtx) {
 }
 
 fn handle_undo_success(
-    snapshot: atomcode_core::conversation::ConversationSnapshot,
+    snapshot: atomcode_kernel::message::SessionSnapshot,
     restored_prompt: String,
     target_n: usize,
     prompts_before: usize,
@@ -16160,8 +16159,7 @@ fn persist_native_compaction_snapshot(
         return false;
     };
 
-    let core_snapshot = snapshot_to_core(snapshot);
-    persist_current_session(ctx, core_snapshot, renderer)
+    persist_current_session(ctx, snapshot.clone(), renderer)
 }
 
 fn handle_coding_runtime_event(
@@ -17983,7 +17981,9 @@ fn handle_agent_event(
             // recover the conversation state. A correlated native restore has its
             // own completion event; ignore a stale generic sync while that handoff
             // owns the session boundary.
-            if !snapshot.messages.is_empty() || !snapshot.cold_summaries.is_empty() {
+            // A kernel snapshot carries cold-summary synthetics inline in
+            // `messages`, so a non-empty `messages` is the only presence check.
+            if !snapshot.messages.is_empty() {
                 apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
                     .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
@@ -18136,10 +18136,12 @@ fn apply_ai_session_name(ctx: &mut LoopCtx, name: String, renderer: &mut dyn Ren
 /// the native runtime hooks; this function must never write core JSON.
 fn persist_current_session(
     ctx: &mut LoopCtx,
-    snapshot: atomcode_core::conversation::ConversationSnapshot,
+    snapshot: atomcode_kernel::message::SessionSnapshot,
     renderer: &mut dyn Renderer,
 ) -> bool {
-    if snapshot.messages.is_empty() && snapshot.cold_summaries.is_empty() {
+    // Cold summaries live inline as synthetics in a kernel snapshot, so an empty
+    // `messages` is the empty-working-set signal.
+    if snapshot.messages.is_empty() {
         return true;
     }
     apply_session_snapshot(&mut ctx.current_session, snapshot);
@@ -18151,9 +18153,12 @@ fn persist_current_session(
 
 pub(crate) fn apply_session_snapshot(
     session: &mut crate::session::Session,
-    snapshot: atomcode_core::conversation::ConversationSnapshot,
+    snapshot: atomcode_kernel::message::SessionSnapshot,
 ) {
-    if snapshot.messages.is_empty() && snapshot.cold_summaries.is_empty() {
+    // A kernel snapshot carries cold-summary synthetics INLINE in `messages`, so
+    // an empty `messages` is the empty-working-set signal (the old core snapshot
+    // split cold_summaries out into a separate field, hence the two-part check).
+    if snapshot.messages.is_empty() {
         return;
     }
     session.update_from_conversation_snapshot(snapshot);
@@ -18173,7 +18178,7 @@ pub(crate) fn apply_session_snapshot(
             || session.name.starts_with("session-")
             || session.name.trim_start().starts_with('['));
     if should_rename {
-        use atomcode_core::conversation::message::Role;
+        use atomcode_kernel::message::Role;
         // Primary signal: `Message.synthetic` field (accurate for sessions
         // saved after the field landed). Secondary signal: bracket-prefix
         // legacy heuristic for sessions saved before the field existed
@@ -18182,7 +18187,8 @@ pub(crate) fn apply_session_snapshot(
             .messages
             .iter()
             .filter(|m| matches!(m.role, Role::User) && !m.synthetic)
-            .find_map(|m| m.text().filter(|t| !is_synthetic_user_text(t)));
+            .map(|m| m.text.as_str())
+            .find(|t| !is_synthetic_user_text(t));
         if let Some(text) = first_real_user {
             let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();
             if !name.is_empty() {
@@ -18209,23 +18215,38 @@ fn is_synthetic_user_text(text: &str) -> bool {
 mod session_naming_tests {
     use super::{apply_session_snapshot, is_synthetic_user_text};
     use crate::session::Session;
+    use atomcode_kernel::message::{Message, Role, SessionSnapshot};
+
+    fn user_msg(role: Role, text: &str) -> Message {
+        let mut m = Message::user(text);
+        m.role = role;
+        m
+    }
+
+    /// Build a kernel snapshot whose messages carry cold-summary synthetics
+    /// INLINE (mirrors `snapshot_to_kernel`), matching what the runtime emits.
+    fn snapshot(cold_summaries: &[&str], messages: Vec<Message>) -> SessionSnapshot {
+        use atomcode_core::conversation::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
+        let mut all = Vec::new();
+        for summary in cold_summaries {
+            let mut m = Message::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}{summary}"));
+            m.synthetic = true;
+            m.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
+            all.push(m);
+        }
+        all.extend(messages);
+        SessionSnapshot::new(all)
+    }
 
     #[test]
     fn apply_session_snapshot_renames_from_first_real_user() {
-        use atomcode_core::conversation::message::{Message, Role};
         let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
         let messages = vec![
-            Message::new(Role::User, "[System meta · not a user message]\nread this"),
-            Message::new(Role::User, "implement background sessions\nwith tests"),
+            user_msg(Role::User, "[System meta · not a user message]\nread this"),
+            user_msg(Role::User, "implement background sessions\nwith tests"),
         ];
 
-        apply_session_snapshot(
-            &mut session,
-            atomcode_core::conversation::ConversationSnapshot {
-                messages,
-                cold_summaries: Vec::new(),
-            },
-        );
+        apply_session_snapshot(&mut session, snapshot(&[], messages));
 
         assert_eq!(session.name, "implement background sessions");
         assert_eq!(session.messages.len(), 2);
@@ -18233,16 +18254,12 @@ mod session_naming_tests {
 
     #[test]
     fn apply_session_snapshot_preserves_custom_name() {
-        use atomcode_core::conversation::message::{Message, Role};
         let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
         session.name = "manual name".to_string();
 
         apply_session_snapshot(
             &mut session,
-            atomcode_core::conversation::ConversationSnapshot {
-                messages: vec![Message::new(Role::User, "new task")],
-                cold_summaries: Vec::new(),
-            },
+            snapshot(&[], vec![user_msg(Role::User, "new task")]),
         );
 
         assert_eq!(session.name, "manual name");
@@ -18250,18 +18267,11 @@ mod session_naming_tests {
 
     #[test]
     fn apply_session_snapshot_preserves_cold_summaries() {
-        use atomcode_core::conversation::{
-            message::{Message, Role},
-            ConversationSnapshot,
-        };
         let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
 
         apply_session_snapshot(
             &mut session,
-            ConversationSnapshot {
-                messages: vec![Message::new(Role::User, "new task")],
-                cold_summaries: vec!["compressed context".to_string()],
-            },
+            snapshot(&["compressed context"], vec![user_msg(Role::User, "new task")]),
         );
 
         assert_eq!(session.cold_summaries, vec!["compressed context"]);
@@ -18269,20 +18279,10 @@ mod session_naming_tests {
 
     #[test]
     fn apply_session_snapshot_accepts_a_cold_only_working_set() {
-        use atomcode_core::conversation::{
-            message::{Message, Role},
-            ConversationSnapshot,
-        };
         let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
-        session.messages = vec![Message::new(Role::User, "stale recent turn")];
+        session.messages = vec![user_msg(Role::User, "stale recent turn")];
 
-        apply_session_snapshot(
-            &mut session,
-            ConversationSnapshot {
-                messages: Vec::new(),
-                cold_summaries: vec!["all retained context".to_string()],
-            },
-        );
+        apply_session_snapshot(&mut session, snapshot(&["all retained context"], Vec::new()));
 
         assert!(session.messages.is_empty());
         assert_eq!(session.cold_summaries, vec!["all retained context"]);
@@ -19939,19 +19939,16 @@ pub(crate) fn todo_progress_from_args(args: &str) -> Option<crate::render::TodoP
 /// when the last valid call cleared the list. Used to seed the panel on
 /// `/resume` / session switch with zero extra storage.
 pub(crate) fn todo_progress_from_messages(
-    messages: &[atomcode_core::conversation::message::Message],
+    messages: &[atomcode_kernel::message::Message],
 ) -> Option<crate::render::TodoProgress> {
-    use atomcode_core::conversation::message::MessageContent;
     // Fold `todowrite` (replace) + `todo` (add/update) in transcript order through the SAME
     // reducer capabilities uses, so a resumed session's panel reflects incremental updates —
     // not just the last full-list todowrite. Collect (name, args) in order first.
+    // kernel `Message.tool_calls` is a flat field (non-empty only on assistant
+    // messages that requested tools), so no content-variant match is needed.
     let calls: Vec<(&str, &str)> = messages
         .iter()
-        .filter_map(|m| match &m.content {
-            MessageContent::AssistantWithToolCalls { tool_calls, .. } => Some(tool_calls),
-            _ => None,
-        })
-        .flat_map(|tcs| tcs.iter())
+        .flat_map(|m| m.tool_calls.iter())
         .map(|c| (c.name.as_str(), c.arguments.as_str()))
         .collect();
     let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
@@ -20007,22 +20004,17 @@ mod todo_block_tests {
 
     #[test]
     fn todo_progress_from_messages_last_valid_wins() {
-        use atomcode_core::conversation::message::{Message, MessageContent, Role};
-        use atomcode_core::tool::ToolCall;
-        let mk = |id: &str, args: &str| Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
+        use atomcode_kernel::message::Message;
+        use atomcode_kernel::tool::ToolCall;
+        let mk = |id: &str, args: &str| {
+            Message::assistant(
+                "",
+                vec![ToolCall {
                     id: id.into(),
                     name: "todowrite".into(),
                     arguments: args.into(),
                 }],
-                reasoning_content: None,
-                thinking_blocks: vec![],
-            },
-            synthetic: false,
-            internal_origin: None,
+            )
         };
         let msgs = vec![
             mk("1", r#"{"todos":[{"content":"old","status":"pending"}]}"#),
@@ -20042,22 +20034,17 @@ mod todo_block_tests {
     fn todo_progress_from_messages_folds_incremental_todo_events() {
         // Replay parity: a resumed session must reflect `todo` add/update events, not just the
         // last full-list todowrite (this was the gap the incremental tool introduced).
-        use atomcode_core::conversation::message::{Message, MessageContent, Role};
-        use atomcode_core::tool::ToolCall;
-        let call = |id: &str, name: &str, args: &str| Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
+        use atomcode_kernel::message::Message;
+        use atomcode_kernel::tool::ToolCall;
+        let call = |id: &str, name: &str, args: &str| {
+            Message::assistant(
+                "",
+                vec![ToolCall {
                     id: id.into(),
                     name: name.into(),
                     arguments: args.into(),
                 }],
-                reasoning_content: None,
-                thinking_blocks: vec![],
-            },
-            synthetic: false,
-            internal_origin: None,
+            )
         };
         let msgs = vec![
             call(

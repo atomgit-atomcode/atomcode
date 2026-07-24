@@ -352,7 +352,7 @@ mod bg_live_guard_tests {
                 turn_count: 0,
                 tool_call_count: 0,
                 stop_reason: crate::event_loop::ui_event::UiTurnStopReason::Natural,
-                snapshot: Default::default(),
+                snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
             },
         )]);
         let mut replay_queue = std::collections::VecDeque::new();
@@ -474,9 +474,7 @@ pub(crate) fn attach_live_runtime(
     mode: AgentMode,
     renderer: &mut dyn Renderer,
 ) -> Result<(), String> {
-    let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
-        &ctx.current_session.to_conversation_snapshot(),
-    );
+    let snapshot = ctx.current_session.to_conversation_snapshot();
     let provider_fingerprint = atomcode_daemon::native_live::provider_fingerprint(
         &ctx.config,
         &ctx.config.default_provider,
@@ -5518,13 +5516,13 @@ fn default_save_filename() -> String {
 /// Render the session's exportable turns as a markdown transcript. Pure /
 /// side-effect-free so it can be unit-tested independently of file I/O.
 fn render_save_markdown(
-    messages: &[atomcode_core::conversation::message::Message],
+    messages: &[atomcode_kernel::message::Message],
 ) -> Option<String> {
-    use atomcode_core::conversation::message::Role;
+    use atomcode_kernel::message::Role;
     let turns: Vec<(&Role, &str)> = messages
         .iter()
         .filter(|m| !m.synthetic && matches!(m.role, Role::User | Role::Assistant))
-        .filter_map(|m| m.text().map(|t| (&m.role, t)))
+        .map(|m| (&m.role, m.text.as_str()))
         .filter(|(_, t)| !t.trim().is_empty())
         .collect();
     if turns.is_empty() {
@@ -5551,7 +5549,7 @@ fn render_save_markdown(
 /// a bare name or relative path resolves against `working_dir`;
 /// an absolute path is used as-is. Existing files are overwritten.
 fn resolve_save_in(
-    messages: &[atomcode_core::conversation::message::Message],
+    messages: &[atomcode_kernel::message::Message],
     arg: &str,
     working_dir: &std::path::Path,
 ) -> SaveOutcome {
@@ -6509,37 +6507,22 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
 /// The synthetic `todowrite`-empty call + its tool result. Appended to the
 /// conversation, they make `reduce_todos`/`derive_current_todos` fold the list to
 /// `[]` (the empty list is the last plan), while keeping the transcript's
-/// call/result pairing valid for the next request. Core (session) message model.
-fn todo_clear_messages(id: String) -> Vec<atomcode_core::conversation::message::Message> {
-    use atomcode_core::conversation::message::{Message, MessageContent, Role};
-    use atomcode_core::tool::{ToolCall, ToolResult};
-    vec![
-        Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: id.clone(),
-                    name: "todowrite".to_string(),
-                    arguments: r#"{"todos":[]}"#.to_string(),
-                }],
-                reasoning_content: None,
-                thinking_blocks: Vec::new(),
-            },
-            synthetic: false,
-            internal_origin: Some("todo_clear".to_string()),
-        },
-        Message {
-            role: Role::Tool,
-            content: MessageContent::ToolResult(ToolResult {
-                call_id: id,
-                output: "0 tasks".to_string(),
-                success: true,
-            }),
-            synthetic: false,
-            internal_origin: Some("todo_clear".to_string()),
-        },
-    ]
+/// call/result pairing valid for the next request. Kernel (session) message model.
+fn todo_clear_messages(id: String) -> Vec<atomcode_kernel::message::Message> {
+    use atomcode_kernel::message::Message;
+    use atomcode_kernel::tool::ToolCall;
+    let mut call = Message::assistant(
+        "",
+        vec![ToolCall {
+            id: id.clone(),
+            name: "todowrite".to_string(),
+            arguments: r#"{"todos":[]}"#.to_string(),
+        }],
+    );
+    call.internal_origin = Some("todo_clear".to_string());
+    let mut result = Message::tool_result(id, "0 tasks", false);
+    result.internal_origin = Some("todo_clear".to_string());
+    vec![call, result]
 }
 
 /// Synthetic tool-call pair for `/todo add <content>`: an incremental
@@ -6547,40 +6530,22 @@ fn todo_clear_messages(id: String) -> Vec<atomcode_core::conversation::message::
 /// [`todo_clear_messages`]; the `content` is JSON-encoded via `serde_json` so
 /// quotes/newlines in the user's text can't break the args. Folds through the
 /// canonical `reduce_todos` as a new pending task appended at the end.
-fn todo_add_messages(
-    id: String,
-    content: &str,
-) -> Vec<atomcode_core::conversation::message::Message> {
-    use atomcode_core::conversation::message::{Message, MessageContent, Role};
-    use atomcode_core::tool::{ToolCall, ToolResult};
+fn todo_add_messages(id: String, content: &str) -> Vec<atomcode_kernel::message::Message> {
+    use atomcode_kernel::message::Message;
+    use atomcode_kernel::tool::ToolCall;
     let args = serde_json::json!({ "action": "add", "content": content }).to_string();
-    vec![
-        Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: id.clone(),
-                    name: "todowrite".to_string(),
-                    arguments: args,
-                }],
-                reasoning_content: None,
-                thinking_blocks: Vec::new(),
-            },
-            synthetic: false,
-            internal_origin: Some("todo_add".to_string()),
-        },
-        Message {
-            role: Role::Tool,
-            content: MessageContent::ToolResult(ToolResult {
-                call_id: id,
-                output: format!("Added task: {content}"),
-                success: true,
-            }),
-            synthetic: false,
-            internal_origin: Some("todo_add".to_string()),
-        },
-    ]
+    let mut call = Message::assistant(
+        "",
+        vec![ToolCall {
+            id: id.clone(),
+            name: "todowrite".to_string(),
+            arguments: args,
+        }],
+    );
+    call.internal_origin = Some("todo_add".to_string());
+    let mut result = Message::tool_result(id, format!("Added task: {content}"), false);
+    result.internal_origin = Some("todo_add".to_string());
+    vec![call, result]
 }
 
 /// Append a synthetic todo-mutation message `pair` to the conversation and reseed
@@ -6595,13 +6560,13 @@ fn todo_add_messages(
 fn reseed_todo_conversation(
     ctx: &mut LoopCtx,
     state: &mut UiState,
-    pair: Vec<atomcode_core::conversation::message::Message>,
+    pair: Vec<atomcode_kernel::message::Message>,
 ) {
     let mut snapshot = ctx.current_session.to_conversation_snapshot();
     snapshot.messages.extend(pair);
     ctx.runtime
         .dispatch(atomcode_coding::DriverCommand::RestoreSnapshot(
-            atomcode_daemon::legacy_convert::snapshot_to_kernel(&snapshot),
+            snapshot.clone(),
         ))
         .ok();
     ctx.current_session
@@ -6635,20 +6600,16 @@ fn clear_todos(ctx: &mut LoopCtx, state: &mut UiState) {
 ///
 /// Pure function — no I/O, no side effects.  Easy to unit-test in isolation.
 pub(crate) fn format_todo_command(
-    messages: &[atomcode_core::conversation::message::Message],
+    messages: &[atomcode_kernel::message::Message],
     unicode: bool,
 ) -> String {
-    use atomcode_core::conversation::message::MessageContent;
     // Fold the FULL transcript via the canonical `reduce_todos` (baseline = last full-list plan;
     // then apply every `{action}` update after it), so `/todo` shows the CURRENT statuses — not
     // just the initial plan. Shape-based, matching the merged `todowrite` tool + the live panel.
+    // kernel `Message.tool_calls` is a flat field, so no content-variant match.
     let calls: Vec<(&str, &str)> = messages
         .iter()
-        .filter_map(|m| match &m.content {
-            MessageContent::AssistantWithToolCalls { tool_calls, .. } => Some(tool_calls),
-            _ => None,
-        })
-        .flat_map(|tcs| tcs.iter().map(|c| (c.name.as_str(), c.arguments.as_str())))
+        .flat_map(|m| m.tool_calls.iter().map(|c| (c.name.as_str(), c.arguments.as_str())))
         .collect();
     let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
     if todos.is_empty() {
@@ -6773,8 +6734,16 @@ mod save_tests {
         default_save_filename, expand_tilde_path, render_save_markdown, resolve_save_in,
         SaveOutcome,
     };
-    use atomcode_core::conversation::message::{Message, Role};
+    use atomcode_kernel::message::{Message, Role};
     use std::path::{Path, PathBuf};
+
+    /// Build a kernel text message with an explicit role (kernel has no generic
+    /// `new(role, text)`).
+    fn msg(role: Role, text: &str) -> Message {
+        let mut m = Message::user(text);
+        m.role = role;
+        m
+    }
 
     #[test]
     fn expand_tilde_path_maps_home_prefix() {
@@ -6807,7 +6776,7 @@ mod save_tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("config.py");
         std::fs::write(&target, "SECRET = 1\n").unwrap();
-        let msgs = vec![Message::new(Role::User, "hi")];
+        let msgs = vec![msg(Role::User, "hi")];
         match resolve_save_in(&msgs, target.to_str().unwrap(), dir.path()) {
             SaveOutcome::RefuseOverwrite(p) => assert!(p.contains("config.py"), "{p}"),
             other => panic!("expected RefuseOverwrite, got {other:?}"),
@@ -6819,7 +6788,7 @@ mod save_tests {
     #[test]
     fn save_overwrites_existing_markdown_and_allows_new_nonmd() {
         let dir = tempfile::tempdir().unwrap();
-        let msgs = vec![Message::new(Role::User, "hi")];
+        let msgs = vec![msg(Role::User, "hi")];
         // Existing .md → overwrite is fine (re-export).
         let md = dir.path().join("report.md");
         std::fs::write(&md, "old").unwrap();
@@ -6841,13 +6810,13 @@ mod save_tests {
     fn conv(msgs: &[(&str, &str)]) -> Vec<Message> {
         msgs.iter()
             .map(|(role, text)| {
-                Message::new(
+                msg(
                     match *role {
                         "user" => Role::User,
                         "assistant" => Role::Assistant,
                         _ => Role::System,
                     },
-                    *text,
+                    text,
                 )
             })
             .collect()
@@ -6864,7 +6833,7 @@ mod save_tests {
 
     #[test]
     fn save_empty_history_when_only_tool_messages() {
-        let msgs = vec![Message::new(Role::Tool, "tool output")];
+        let msgs = vec![msg(Role::Tool, "tool output")];
         assert!(matches!(
             resolve_save_in(&msgs, "", Path::new(".")),
             SaveOutcome::EmptyHistory
@@ -6902,10 +6871,10 @@ mod save_tests {
     #[test]
     fn save_render_skips_synthetic_and_tool_messages() {
         let msgs = vec![
-            Message::new(Role::User, "real prompt"),
+            msg(Role::User, "real prompt"),
             Message::synthetic_user("synthetic injection"),
-            Message::new(Role::Tool, "tool noise"),
-            Message::new(Role::Assistant, "reply"),
+            msg(Role::Tool, "tool noise"),
+            msg(Role::Assistant, "reply"),
         ];
         let md = render_save_markdown(&msgs).expect("renders");
         assert!(md.contains("## User\nreal prompt"));
@@ -6917,7 +6886,7 @@ mod save_tests {
     #[test]
     fn save_render_returns_none_for_empty() {
         assert!(render_save_markdown(&[]).is_none());
-        assert!(render_save_markdown(&[Message::new(Role::Tool, "x")]).is_none());
+        assert!(render_save_markdown(&[msg(Role::Tool, "x")]).is_none());
     }
 
     #[test]
@@ -7582,14 +7551,26 @@ mod todo_command_tests {
     use crate::custom_commands::ArgsRequirement;
     use crate::render::{Renderer, UiLine};
     use atomcode_config::i18n::{t, Msg};
-    use atomcode_core::conversation::message::{Message, MessageContent, Role};
-    use atomcode_core::tool::ToolCall;
+    use atomcode_kernel::message::{Message, Role};
+    use atomcode_kernel::tool::ToolCall;
     use std::path::PathBuf;
+
+    /// Kernel text message with an explicit role.
+    fn msg(role: Role, text: &str) -> Message {
+        let mut m = Message::user(text);
+        m.role = role;
+        m
+    }
+
+    /// Assistant message carrying `tool_calls` (kernel flat field).
+    fn tool_call_msg(calls: Vec<ToolCall>) -> Message {
+        Message::assistant("", calls)
+    }
 
     #[test]
     fn todo_command_text_with_and_without_list() {
         // No todowrite calls → "no list" message (i18n'd).
-        let empty = vec![Message::new(Role::User, "hi")];
+        let empty = vec![msg(Role::User, "hi")];
         let no_list = t(Msg::TodoNoList).into_owned();
         assert!(
             format_todo_command(&empty, false).contains(&no_list),
@@ -7597,21 +7578,11 @@ mod todo_command_tests {
         );
 
         // A todowrite call with one pending item → list output.
-        let with = vec![Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: "1".into(),
-                    name: "todowrite".into(),
-                    arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
-                }],
-                reasoning_content: None,
-                thinking_blocks: vec![],
-            },
-            synthetic: false,
-            internal_origin: None,
-        }];
+        let with = vec![tool_call_msg(vec![ToolCall {
+            id: "1".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+        }])];
         let out = format_todo_command(&with, false);
         assert!(
             out.contains("[ ] do x"),
@@ -7711,21 +7682,11 @@ mod todo_command_tests {
         // A live plan, then the `/todo clear` synthetic pair appended, must
         // derive to an empty list → `/todo` shows the "no list" message. This
         // is what makes cancelled/stale tasks stop reappearing.
-        let mut msgs = vec![Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: "1".into(),
-                    name: "todowrite".into(),
-                    arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
-                }],
-                reasoning_content: None,
-                thinking_blocks: vec![],
-            },
-            synthetic: false,
-            internal_origin: None,
-        }];
+        let mut msgs = vec![tool_call_msg(vec![ToolCall {
+            id: "1".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+        }])];
         assert!(format_todo_command(&msgs, false).contains("[ ] do x"));
         msgs.extend(super::todo_clear_messages("todo-clear-1".to_string()));
         let no_list = t(Msg::TodoNoList).into_owned();
@@ -7763,21 +7724,11 @@ mod todo_command_tests {
     fn todo_add_pair_appends_a_task_keeping_existing() {
         // A live plan, then the `/todo add` synthetic pair appended, must fold to
         // the ORIGINAL task plus the new one at the end — existing tasks untouched.
-        let mut msgs = vec![Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: "1".into(),
-                    name: "todowrite".into(),
-                    arguments: r#"{"todos":[{"content":"do x","status":"in_progress"}]}"#.into(),
-                }],
-                reasoning_content: None,
-                thinking_blocks: vec![],
-            },
-            synthetic: false,
-            internal_origin: None,
-        }];
+        let mut msgs = vec![tool_call_msg(vec![ToolCall {
+            id: "1".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"do x","status":"in_progress"}]}"#.into(),
+        }])];
         msgs.extend(super::todo_add_messages(
             "todo-add-1".to_string(),
             "ship it",
@@ -7816,28 +7767,18 @@ mod todo_command_tests {
     fn todo_command_applies_incremental_updates_after_the_plan() {
         // Merge regression: `/todo` folds via `reduce_todos`, so a `{action:update}` after the
         // plan is reflected — not just the initial (pending) plan.
-        let msgs = vec![Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![
-                    ToolCall {
-                        id: "1".into(),
-                        name: "todowrite".into(),
-                        arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
-                    },
-                    ToolCall {
-                        id: "2".into(),
-                        name: "todowrite".into(),
-                        arguments: r#"{"action":"update","id":1,"status":"completed"}"#.into(),
-                    },
-                ],
-                reasoning_content: None,
-                thinking_blocks: vec![],
+        let msgs = vec![tool_call_msg(vec![
+            ToolCall {
+                id: "1".into(),
+                name: "todowrite".into(),
+                arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
             },
-            synthetic: false,
-            internal_origin: None,
-        }];
+            ToolCall {
+                id: "2".into(),
+                name: "todowrite".into(),
+                arguments: r#"{"action":"update","id":1,"status":"completed"}"#.into(),
+            },
+        ])];
         let out = format_todo_command(&msgs, false);
         assert!(out.contains("do x"), "task shown: {out}");
         assert!(
