@@ -75,10 +75,10 @@ pub fn project_trust_key(project_dir: &std::path::Path) -> String {
 
 /// Check whether `project_dir` is recorded as trusted in the shared MCP trust store.
 ///
-/// This is a LOCAL reimplementation of `atomcode_core::mcp::trust::is_project_trusted`
-/// for use within `atomcode-capabilities` (which cannot depend on `atomcode-core` due to
-/// layering constraints). Both implementations read the SAME `mcp_trust.json` file, using
-/// the same hash scheme (normalize path → hash as `PathBuf` via `DefaultHasher` → `{:016x}`),
+/// This mirrors `trust::is_project_trusted` in this crate (kept as a local helper so the
+/// sync `Tool::risk` path can consult trust without an `.await`). It reads the SAME
+/// `mcp_trust.json` file, using the same hash scheme (normalize path → hash as `PathBuf`
+/// via `DefaultHasher` → `{:016x}`),
 /// so core and capabilities agree on trust state at runtime.
 ///
 /// Honors `ATOMCODE_MCP_TRUST_STORE` (the same env-var test seam as core).
@@ -207,10 +207,24 @@ impl McpRegistry {
     }
 
     /// Mark a specific full tool name auto-approved at runtime (idempotent).
-    pub(crate) fn mark_tool_auto_approved(&self, full_name: &str) {
+    pub fn mark_tool_auto_approved(&self, full_name: &str) {
         if let Ok(mut s) = self.auto_approved_tools.write() {
             s.insert(full_name.to_string());
         }
+    }
+
+    /// Split a full MCP tool name (`mcp__{server}__{tool}`) into `(server, tool)`,
+    /// matching against known server names so a server name containing `__` still
+    /// resolves. Returns `None` if the prefix is missing or no server matches.
+    pub async fn split_tool_name(&self, full: &str) -> Option<(String, String)> {
+        let rest = full.strip_prefix("mcp__")?;
+        let servers = self.servers.read().await;
+        for name in servers.keys() {
+            if let Some(tool) = rest.strip_prefix(&format!("{name}__")) {
+                return Some((name.clone(), tool.to_string()));
+            }
+        }
+        None
     }
 
     /// Split configs by project trust. Uses the shared trust store (via the local
@@ -794,6 +808,27 @@ impl Default for McpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn split_tool_name_matches_known_server_and_rejects_others() {
+        let reg = McpRegistry::new();
+        reg.servers.write().await.insert(
+            "srv".to_string(),
+            Arc::new(BarrierListClient {
+                name: "srv".to_string(),
+                barrier: Arc::new(tokio::sync::Barrier::new(1)),
+            }) as Arc<dyn McpClient>,
+        );
+        // Known server → split.
+        assert_eq!(
+            reg.split_tool_name("mcp__srv__query").await,
+            Some(("srv".to_string(), "query".to_string()))
+        );
+        // Unknown server → None.
+        assert_eq!(reg.split_tool_name("mcp__other__x").await, None);
+        // Missing `mcp__` prefix → None.
+        assert_eq!(reg.split_tool_name("plain_tool").await, None);
+    }
 
     struct BarrierListClient {
         name: String,

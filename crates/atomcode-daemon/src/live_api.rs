@@ -8,29 +8,24 @@
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
 
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_config::config::Config;
 use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
-use atomcode_core::lsp::manager::build_lsp_manager;
-use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
+use atomcode_capabilities::mcp::McpRegistry;
 use atomcode_core::provider;
-use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::PermissionDecision;
-use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_telemetry::Telemetry;
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use std::sync::OnceLock;
 
 pub(crate) use crate::approval_mode::ApprovalMode;
-use crate::CachedMcpRegistry;
 
 pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
     match mode {
@@ -180,187 +175,13 @@ fn live_current_provider() -> String {
         .unwrap_or_default()
 }
 
-/// All components needed to run one agent turn.
-pub(crate) struct TurnParts {
-    pub provider: Arc<dyn atomcode_core::provider::LlmProvider>,
-    pub tools: Arc<ToolRegistry>,
-    pub ctx: Arc<dyn atomcode_core::ctx::CtxBuilder>,
-    pub system_prompt: String,
-}
-
-pub(crate) fn commit_mcp_cache_miss(
-    cache: &mut HashMap<PathBuf, CachedMcpRegistry>,
-    working_dir: PathBuf,
-    candidate: Arc<McpRegistry>,
-) -> Arc<McpRegistry> {
-    if let Some(current) = cache.get_mut(&working_dir) {
-        current.last_used = std::time::Instant::now();
-        return current.registry.clone();
-    }
-    if cache.len() >= crate::MCP_CACHE_MAX {
-        if let Some(oldest_key) = cache
-            .iter()
-            .min_by_key(|(_, value)| value.last_used)
-            .map(|(key, _)| key.clone())
-        {
-            cache.remove(&oldest_key);
-        }
-    }
-    cache.insert(
-        working_dir,
-        CachedMcpRegistry {
-            registry: candidate.clone(),
-            last_used: std::time::Instant::now(),
-        },
-    );
-    candidate
-}
-
-/// 独立构造 turn 组件（与 process_chat_request 等价，但不复用其代码）。
-/// `provider_name` 为 None 时用 config.default_provider。
-pub(crate) async fn build_turn_parts(
-    working_dir: &Path,
-    provider_name: Option<&str>,
-    mcp_cache: &Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
-    telemetry: Arc<Telemetry>,
-) -> anyhow::Result<TurnParts> {
-    use atomcode_core::tool::{
-        bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
-        read::ReadFileTool, search_replace::SearchReplaceTool, todo::TodoTool,
-        web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteFileTool,
-    };
-
-    // Load config
-    let config_path = Config::default_path();
-    let config = Config::load(&config_path)?;
-
-    // Determine provider
-    let resolved_provider_name = provider_name
+/// Resolve the effective provider key: an explicit `provider_name` override wins,
+/// otherwise the config's `default_provider`. Shared by the `/compact` and
+/// `/context` commands so both select the same model for the same input.
+pub(crate) fn resolve_provider_name(config: &Config, provider_name: Option<&str>) -> String {
+    provider_name
         .map(|s| s.to_string())
-        .unwrap_or_else(|| config.default_provider.clone());
-    let provider_config = config
-        .providers
-        .get(&resolved_provider_name)
-        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved_provider_name))?;
-
-    // Create provider instance. `create_provider` may do blocking auth I/O
-    // (OAuth token refresh) — run it off the async runtime so a slow/unreachable
-    // auth host can't block a worker thread.
-    let provider = {
-        let cfg = provider_config.clone();
-        tokio::task::spawn_blocking(move || provider::create_provider(&cfg))
-            .await
-            .map_err(|e| anyhow::anyhow!("provider construction task panicked: {e}"))??
-    };
-
-    // Build tool context — use "live" as session-id label
-    let mut tool_context =
-        ToolContext::with_telemetry(working_dir.to_path_buf(), "live", telemetry);
-
-    let mut tool_registry = ToolRegistry::new();
-
-    tool_registry.register_sync(Box::new(ReadFileTool));
-    tool_registry.register_sync(Box::new(WriteFileTool));
-    tool_registry.register_sync(Box::new(EditFileTool));
-    tool_registry.register_sync(Box::new(BashTool));
-    tool_registry.register_sync(Box::new(GrepTool));
-    tool_registry.register_sync(Box::new(GlobTool));
-    tool_registry.register_sync(Box::new(ListDirTool));
-    if !atomcode_config::config::offline::is_offline_active() {
-        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
-        tool_registry.register_sync(Box::new(WebFetchTool));
-    }
-    tool_registry.register_sync(Box::new(SearchReplaceTool));
-    tool_registry.register_sync(Box::new(TodoTool::new()));
-
-    // Load skills and register use_skill tool
-    let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
-    skill_registry.reload(working_dir);
-    let has_skills = !skill_registry.is_empty();
-    let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
-    if has_skills {
-        tool_registry.register_sync(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
-            registry: skill_registry.clone(),
-        }));
-    }
-
-    // Register MCP tools using per-project cache (same pattern as process_chat_request)
-    let working_dir_buf = working_dir.to_path_buf();
-    let mcp_registry: Arc<McpRegistry> = {
-        let cache = mcp_cache.read().await;
-        if let Some(cached) = cache.get(&working_dir_buf) {
-            cached.registry.clone()
-        } else {
-            drop(cache);
-            // Cache miss — create new registry for this project
-            let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir_buf));
-            new_registry
-                .wait_for_initial_connections(Duration::from_secs(5))
-                .await;
-            // Store only if another reload/cache-miss did not win while the
-            // connection attempt was in flight.
-            let mut cache = mcp_cache.write().await;
-            commit_mcp_cache_miss(&mut cache, working_dir_buf.clone(), new_registry)
-        }
-    };
-    // Update last_used timestamp
-    {
-        let mut cache = mcp_cache.write().await;
-        if let Some(entry) = cache.get_mut(&working_dir_buf) {
-            entry.last_used = std::time::Instant::now();
-        }
-    }
-    let mcp_tools = mcp_registry.list_all_tools().await;
-    if !mcp_tools.is_empty() {
-        register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
-    }
-
-    // Build LSP manager from config and inject into ToolContext.
-    let lsp_manager = build_lsp_manager(&config.lsp, working_dir);
-    if lsp_manager.is_some() {
-        tool_registry.register_sync(Box::new(DiagnosticsTool));
-    }
-    tool_context.lsp = lsp_manager;
-
-    // Build ctx for the RESOLVED provider (not default) so context-window /
-    // truncation matches the model actually being called when a non-default
-    // provider is selected. (process_chat_request uses default here; build_turn_parts
-    // exposes provider_name explicitly, so we calibrate ctx to it.)
-    let ctx = match config.providers.get(&resolved_provider_name) {
-        Some(pc) => atomcode_core::ctx::for_provider(pc),
-        None => {
-            atomcode_core::ctx::for_provider(&atomcode_config::config::provider::ProviderConfig {
-                provider_type: String::new(),
-                api_key: None,
-                model: String::new(),
-                base_url: None,
-                system_prompt: None,
-                user_agent: None,
-                context_window: 128_000,
-                max_tokens: None,
-                thinking_type: None,
-                thinking_keep: None,
-                reasoning_history: None,
-                reasoning_effort: None,
-                thinking_enabled: None,
-                thinking_budget: None,
-                skip_tls_verify: false,
-                ephemeral: true,
-                capable_model: None,
-            })
-        }
-    };
-
-    // Build system prompt
-    let system_prompt =
-        crate::build_api_system_prompt(&working_dir_buf, &config, provider_config, &skill_registry);
-
-    Ok(TurnParts {
-        provider: provider.into(),
-        tools: Arc::new(tool_registry),
-        ctx,
-        system_prompt,
-    })
+        .unwrap_or_else(|| config.default_provider.clone())
 }
 
 // ============================================================================
@@ -1825,7 +1646,7 @@ pub(crate) async fn live_permission(
             if let Some((server, tool)) = reg.split_tool_name(full).await {
                 let project_dir = state.project.read().await.working_dir.clone();
                 if let Err(e) =
-                    atomcode_core::mcp::config::add_auto_approved_tool(&project_dir, &server, &tool)
+                    atomcode_capabilities::mcp::config::add_auto_approved_tool(&project_dir, &server, &tool)
                 {
                     tracing::warn!("[permission] persist autoApprove failed: {e}");
                 }
@@ -1929,7 +1750,7 @@ pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResp
 pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoResponse {
     let fallback = { state.project.read().await.working_dir.clone() };
     let working_dir = live_current_working_dir(&fallback);
-    match atomcode_core::mcp::trust::trust_project(&working_dir) {
+    match atomcode_capabilities::mcp::trust::trust_project(&working_dir) {
         Ok(()) => {
             let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir));
             crate::replace_project_mcp_registry(&state, &working_dir, new_registry).await;
@@ -2014,14 +1835,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_provider_name_prefers_override_then_default() {
+        let mut config = Config::default();
+        config.default_provider = "default-prov".to_string();
+
+        // Explicit override wins.
+        assert_eq!(resolve_provider_name(&config, Some("chosen")), "chosen");
+        // No override → falls back to the config default.
+        assert_eq!(resolve_provider_name(&config, None), "default-prov");
+    }
+
     /// Trust round-trip at the daemon layer: trust_project → is_project_trusted → partition_by_trust
     /// clears blocked list.  Uses ATOMCODE_MCP_TRUST_STORE as the test seam so we never touch the
     /// developer's real trust store.
     #[test]
     #[serial_test::serial]
     fn mcp_trust_round_trip_clears_blocked() {
-        use atomcode_core::mcp::config::{McpConfigSource, McpServerConfig, McpTransportConfig};
-        use atomcode_core::mcp::trust::{is_project_trusted, partition_by_trust, trust_project};
+        use atomcode_capabilities::mcp::config::{McpConfigSource, McpServerConfig, McpTransportConfig};
+        use atomcode_capabilities::mcp::trust::{is_project_trusted, partition_by_trust, trust_project};
 
         let store_dir = tempfile::tempdir().unwrap();
         // SAFETY: test seam; serial attribute prevents concurrent mutation.

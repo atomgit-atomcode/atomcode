@@ -10,7 +10,6 @@ use atomcode_capabilities::session::{
     SessionMeta as NativeSessionMeta, SessionStoreError,
 };
 use atomcode_config::config::memory::MemoryStore;
-use atomcode_core::conversation::Conversation;
 
 struct KernelSummaryProvider {
     inner: Arc<dyn atomcode_core::provider::LlmProvider>,
@@ -106,12 +105,10 @@ pub(crate) enum CommandResult {
         project: Vec<String>,
     },
     Context {
-        system_tokens: usize,
-        sent_tokens: usize,
+        used_tokens: usize,
         total_messages: usize,
-        tool_defs_tokens: usize,
-        cold_zone_tokens: usize,
         ctx_window: usize,
+        utilization: f32,
         ctx_name: String,
     },
     Compact {
@@ -337,29 +334,30 @@ fn commit_native_compaction(
 }
 
 async fn exec_native_compact(
-    state: &AppState,
-    working_dir: &std::path::Path,
     provider_name: Option<&str>,
     arg: &str,
     session: NativeCommandSession,
 ) -> anyhow::Result<CommandResult> {
     let config =
         atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())?;
-    let selected_provider = provider_name.unwrap_or(&config.default_provider);
-    let context_window = config
+    let resolved = crate::live_api::resolve_provider_name(&config, provider_name);
+    let provider_config = config
         .providers
-        .get(selected_provider)
-        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", selected_provider))?
-        .context_window as u32;
-    let parts = crate::live_api::build_turn_parts(
-        working_dir,
-        provider_name,
-        &state.mcp_cache,
-        state.telemetry.clone(),
-    )
-    .await?;
+        .get(&resolved)
+        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved))?;
+    let context_window = provider_config.context_window as u32;
+    // Compaction only needs the summarizing provider — not the live tool
+    // registry. Build it directly (mirrors `build_turn_parts`' provider step):
+    // `create_provider` may do blocking auth I/O (OAuth refresh), so run it off
+    // the async runtime so a slow/unreachable auth host can't block a worker thread.
+    let cfg = provider_config.clone();
+    let inner: Arc<dyn atomcode_core::provider::LlmProvider> = Arc::from(
+        tokio::task::spawn_blocking(move || atomcode_core::provider::create_provider(&cfg))
+            .await
+            .map_err(|e| anyhow::anyhow!("provider construction task panicked: {e}"))??,
+    );
     let provider = Arc::new(KernelSummaryProvider {
-        inner: parts.provider,
+        inner,
         context_window,
     });
     let compacted = atomcode_coding::runtime::compact_snapshot(
@@ -391,8 +389,23 @@ fn exec_undo(
     exec_native_undo(native, arg)
 }
 
+/// The session's current context size for `/context`: the prompt tokens the
+/// provider reported on the most recent assistant turn (`meta.used_tokens`), or
+/// 0 before any assistant turn. Mirrors kernel `Conversation::last_pressure`'s
+/// used-tokens read, but works directly off a persisted snapshot so `/context`
+/// reflects what the live (native) turn actually sent — no parallel tool assembly.
+pub(crate) fn snapshot_used_tokens(messages: &[atomcode_kernel::message::Message]) -> u32 {
+    use atomcode_kernel::message::Role;
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant)
+        .and_then(|m| m.meta.as_ref())
+        .map(|meta| meta.used_tokens)
+        .unwrap_or(0)
+}
+
 async fn exec_context(
-    state: &AppState,
     working_dir: &std::path::Path,
     project_hash: Option<&str>,
     session_id: Option<&str>,
@@ -400,26 +413,30 @@ async fn exec_context(
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for context"))?;
     let session = load_command_session_view(working_dir, project_hash, sid)?;
-    let parts = crate::live_api::build_turn_parts(
-        working_dir,
-        provider,
-        &state.mcp_cache,
-        state.telemetry.clone(),
-    )
-    .await?;
-    let conv =
-        Conversation::from_snapshot(crate::legacy_convert::snapshot_to_core(&session.snapshot));
-    let (msgs, _) = parts.ctx.build_messages(&conv, &parts.system_prompt, "");
-    let s = atomcode_core::ctx::compute_rich_context_stats(&conv, &msgs, &parts.tools, &*parts.ctx)
-        .await;
+    // Report the SAME context the live (native) turn tracks: the prompt tokens the
+    // provider reported on the last assistant turn, projected onto the CURRENT
+    // provider window. No parallel core tool-assembly (which diverged from the
+    // native turn's actual tools/prompt and produced misleading per-zone numbers).
+    let config =
+        atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())?;
+    let resolved = crate::live_api::resolve_provider_name(&config, provider);
+    let provider_config = config
+        .providers
+        .get(&resolved)
+        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved))?;
+    let ctx_window = provider_config.context_window as u32;
+    let used_tokens = snapshot_used_tokens(&session.snapshot.messages);
+    let utilization = if ctx_window > 0 {
+        used_tokens as f32 / ctx_window as f32
+    } else {
+        0.0
+    };
     Ok(CommandResult::Context {
-        system_tokens: s.system_tokens,
-        sent_tokens: s.sent_tokens,
-        total_messages: s.total_messages,
-        tool_defs_tokens: s.tool_defs_tokens,
-        cold_zone_tokens: s.cold_zone_tokens,
-        ctx_window: s.ctx_window,
-        ctx_name: s.ctx_name,
+        used_tokens: used_tokens as usize,
+        total_messages: session.snapshot.messages.len(),
+        ctx_window: ctx_window as usize,
+        utilization,
+        ctx_name: provider_config.model.clone(),
     })
 }
 
@@ -468,7 +485,6 @@ fn exec_memory(working_dir: &Path) -> anyhow::Result<CommandResult> {
 }
 
 async fn exec_compact(
-    state: &AppState,
     working_dir: &std::path::Path,
     project_hash: Option<&str>,
     session_id: Option<&str>,
@@ -478,7 +494,7 @@ async fn exec_compact(
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for compact"))?;
     let native = load_native_command_session(working_dir, project_hash, sid)?
         .ok_or_else(|| anyhow::anyhow!("session {sid:?} not found"))?;
-    exec_native_compact(state, working_dir, provider, arg, native).await
+    exec_native_compact(provider, arg, native).await
 }
 
 fn exec_whoami() -> anyhow::Result<CommandResult> {
@@ -779,7 +795,7 @@ fn todo_items_from_messages(messages: &[atomcode_kernel::message::Message]) -> V
 }
 
 pub(crate) async fn run_command(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Json(req): Json<CommandReq>,
 ) -> impl IntoResponse {
     let working_dir = match req.working_dir.as_deref() {
@@ -802,7 +818,6 @@ pub(crate) async fn run_command(
         "memory" => exec_memory(&working_dir),
         "context" => {
             exec_context(
-                &state,
                 &working_dir,
                 req.project_hash.as_deref(),
                 req.session_id.as_deref(),
@@ -812,7 +827,6 @@ pub(crate) async fn run_command(
         }
         "compact" => {
             exec_compact(
-                &state,
                 &working_dir,
                 req.project_hash.as_deref(),
                 req.session_id.as_deref(),
@@ -851,6 +865,25 @@ mod tests {
     use atomcode_capabilities::session::PresentationFile;
     use atomcode_capabilities::session::{StorageOwner, TurnStat};
     use atomcode_config::config::memory::MemoryStore;
+
+    #[test]
+    fn snapshot_used_tokens_reads_latest_assistant_meta() {
+        use atomcode_kernel::message::{Message, MessageMeta};
+
+        // No assistant turn yet → zero.
+        assert_eq!(snapshot_used_tokens(&[Message::user("hi")]), 0);
+
+        // The most recent assistant meta's recorded prompt tokens win.
+        let mut a = Message::assistant("ans", Vec::new());
+        a.meta = Some(MessageMeta {
+            ctx_window: 128_000,
+            used_tokens: 40_000,
+            utilization: 0.3125,
+            ..Default::default()
+        });
+        let msgs = vec![Message::user("hi"), a];
+        assert_eq!(snapshot_used_tokens(&msgs), 40_000);
+    }
 
     #[test]
     fn native_undo_preserves_updates_after_session_load() {

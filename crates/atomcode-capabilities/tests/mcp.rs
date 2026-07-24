@@ -119,7 +119,7 @@ async fn adapter_passes_kernel_tool_conformance() {
 }
 
 /// Write a trust store file that marks `project_dir` as trusted.
-/// Mirrors the format written by `atomcode_core::mcp::trust::trust_project`.
+/// Mirrors the format written by `mcp::trust::trust_project`.
 fn write_trusted_store(store_path: &std::path::Path, project_dir: &std::path::Path) {
     let key = atomcode_capabilities::mcp::registry::project_trust_key(project_dir);
     let store = serde_json::json!({

@@ -19,7 +19,7 @@ atomcode-codingplan = { path = "../atomcode-codingplan" }
 # transitional atomcode_core::config re-export shim.
 atomcode-config = { path = "../atomcode-config" }
 atomcode-auth = { path = "../atomcode-auth" }
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["plugin"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["plugin", "mcp"] }
 # Unified native runtime used by daemon live/chat/session paths.
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-coding = { path = "../atomcode-coding" }

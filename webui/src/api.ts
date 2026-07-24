@@ -780,7 +780,7 @@ export type CommandResult =
   | { kind: 'remember'; scope: 'global' | 'project' }
   | { kind: 'forget'; removed: string[] }
   | { kind: 'memory'; global: string[]; project: string[] }
-  | { kind: 'context'; system_tokens: number; sent_tokens: number; total_messages: number; tool_defs_tokens: number; cold_zone_tokens: number; ctx_window: number; ctx_name: string }
+  | { kind: 'context'; used_tokens: number; total_messages: number; ctx_window: number; utilization: number; ctx_name: string }
   | { kind: 'compact'; applied: boolean; removed_messages: number; before_tokens: number; after_tokens: number }
   | { kind: 'whoami'; logged_in: boolean; username?: string; name?: string; email?: string }
   | { kind: 'status'; logged_in: boolean; username?: string; provider: string; model: string; working_dir: string; config_path: string; text: string }

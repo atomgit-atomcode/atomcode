@@ -26,7 +26,6 @@ pub use atomcode_config::i18n;
 // `locale` fully lives in `atomcode-config` now (re-export shim removed).
 mod fs_atomic;
 pub mod lsp;
-pub mod mcp;
 pub mod plugin;
 pub mod provider;
 pub mod proxy;

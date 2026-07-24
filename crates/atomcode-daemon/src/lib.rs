@@ -82,7 +82,7 @@ use atomcode_capabilities::session::SessionManager as NativeSessionManager;
 use atomcode_coding::CodingRuntimeEvent;
 use atomcode_config::config::Config;
 use atomcode_core::conversation::Conversation;
-use atomcode_core::mcp::McpRegistry;
+use atomcode_capabilities::mcp::McpRegistry;
 use atomcode_core::provider;
 use atomcode_telemetry::detect_repo_origin;
 use atomcode_telemetry::{
@@ -3772,122 +3772,6 @@ async fn process_chat_request(
 /// full rules). The only omission is plan mode (not applicable in API mode).
 ///
 /// This function is self-contained — it does NOT touch any TUI code path.
-pub(crate) fn build_api_system_prompt(
-    working_dir: &PathBuf,
-    config: &Config,
-    provider_config: &atomcode_config::config::provider::ProviderConfig,
-    skill_registry: &Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
-) -> String {
-    // Respect user's custom system_prompt override (same as TUI).
-    let rules = if let Some(custom) = provider_config.system_prompt.as_deref() {
-        custom.to_string()
-    } else {
-        atomcode_config::config::prompt_sections::build_rules().to_string()
-    };
-
-    // Environment metadata
-    let shell = if cfg!(target_os = "windows") {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
-    } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
-    };
-    let env_info = format!("Platform: {} | Shell: {}", std::env::consts::OS, shell);
-
-    // Identity: inject model name so the model correctly identifies itself.
-    let model_display = &provider_config.model;
-
-    // Assemble prompt: identity + env → rules LAST (recency effect).
-    let mut prompt = format!(
-        "You are AtomCode. When asked who you are, say you are AtomCode \
-         (an AI coding agent by AtomGit) running the {} model. \
-         Never claim to be another product.\n\
-         Working directory: {wd}\n\
-         All file paths in tool calls must be absolute, resolved under {wd}. \
-         Verify file existence before editing.\n{env_info}\n",
-        model_display,
-        wd = working_dir.display(),
-        env_info = env_info,
-    );
-
-    // Git commit attribution (Co-Authored-By trailer).
-    prompt.push_str(&format!(
-        "\n=== GIT COMMITS ===\n\
-         {}\n\
-         When you create a git commit on the user's behalf, end the commit \
-         message with this trailer (preceded by a blank line):\n\
-         \n\
-         Co-Authored-By: AtomCode ({}) <noreply@atomgit.com>\n\
-         \n\
-         Use a HEREDOC for `git commit -m` so the trailer's blank line is \
-         preserved verbatim. Skip this trailer for `git commit --amend` \
-         and `git revert` (those operate on existing commits whose \
-         attribution shouldn't change).\n",
-        atomcode_coding::commit_language_guidance(Some(
-            atomcode_config::i18n::resolve_initial_locale(None, config.language),
-        )),
-        model_display
-    ));
-
-    // Layered instructions (global → project → user).
-    // Pure file reads, no side effects, < 1ms.
-    let instructions =
-        atomcode_config::config::instructions::LayeredInstructions::load(working_dir);
-    let merged_instructions = instructions.merged();
-    if !merged_instructions.is_empty() {
-        prompt.push_str(&format!("\n{}\n", merged_instructions));
-    }
-
-    // Persistent memory (global + project).
-    // Pure file reads, no side effects.
-    {
-        use atomcode_config::config::memory::MemoryStore;
-        let project_name = working_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "project".to_string());
-        let global = MemoryStore::global();
-        let project = MemoryStore::project(working_dir);
-        let memory_block = MemoryStore::merged_for_prompt(&global, &project, &project_name);
-        if !memory_block.is_empty() {
-            prompt.push_str(&format!("\n{}\n", memory_block));
-        }
-    }
-
-    // Available skills — budget-gated, source-ranked catalog (verbatim-aligned with
-    // the coding path's SkillCatalogHook). Replaces the old inline full-dump injection
-    // that emitted every skill's full description and drowned high-value process skills.
-    if let Ok(registry) = skill_registry.read() {
-        if let Some(catalog) = registry.render_catalog() {
-            prompt.push('\n');
-            prompt.push_str(&catalog);
-            prompt.push('\n');
-        }
-    }
-
-    // Git snapshot (branch / HEAD / status).
-    // Blocking I/O (~30ms) — acceptable per chat request since this runs once
-    // at prompt construction time, not on a hot path.
-    let env_snapshot = atomcode_core::ctx::EnvSnapshot::capture(working_dir);
-    prompt.push_str(&env_snapshot.as_prompt_section());
-
-    // RULES GO LAST — recency effect ensures the model remembers these.
-    prompt.push_str(&format!(
-        "\n=== RULES (follow these strictly) ===\n{rules}\n"
-    ));
-
-    // Platform-specific rules (Windows path conventions, etc.)
-    let platform = atomcode_config::config::platform_rules();
-    if !platform.is_empty() {
-        prompt.push_str(platform);
-        prompt.push('\n');
-    }
-
-    if atomcode_config::config::offline::is_offline_active() {
-        prompt.push_str(&atomcode_coding::persona::offline_environment_block());
-    }
-
-    prompt
-}
 
 /// Request to stop a chat session
 #[derive(Debug, Deserialize)]
@@ -3977,7 +3861,7 @@ async fn chat_permission(
             if let Some((server, tool)) = reg.split_tool_name(full).await {
                 let project_dir = state.project.read().await.working_dir.clone();
                 if let Err(e) =
-                    atomcode_core::mcp::config::add_auto_approved_tool(&project_dir, &server, &tool)
+                    atomcode_capabilities::mcp::config::add_auto_approved_tool(&project_dir, &server, &tool)
                 {
                     tracing::warn!("[permission] persist autoApprove failed: {e}");
                 }
@@ -4028,15 +3912,15 @@ struct McpStatusResponse {
 /// empty list. A status the registry already knows (Connected / Failed /
 /// Disconnected) always wins over the synthetic `Connecting`.
 fn merge_configured_mcp_statuses(
-    statuses: Vec<(String, atomcode_core::mcp::ServerStatus)>,
+    statuses: Vec<(String, atomcode_capabilities::mcp::ServerStatus)>,
     configured_names: &[String],
-) -> Vec<(String, atomcode_core::mcp::ServerStatus)> {
-    let mut by_name: std::collections::BTreeMap<String, atomcode_core::mcp::ServerStatus> =
+) -> Vec<(String, atomcode_capabilities::mcp::ServerStatus)> {
+    let mut by_name: std::collections::BTreeMap<String, atomcode_capabilities::mcp::ServerStatus> =
         statuses.into_iter().collect();
     for name in configured_names {
         by_name
             .entry(name.clone())
-            .or_insert(atomcode_core::mcp::ServerStatus::Connecting);
+            .or_insert(atomcode_capabilities::mcp::ServerStatus::Connecting);
     }
     by_name.into_iter().collect()
 }
@@ -4060,15 +3944,15 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
 
     let statuses = registry.server_statuses().await;
 
-    let all_cfgs = atomcode_core::mcp::load_mcp_config(&working_dir).unwrap_or_default();
+    let all_cfgs = atomcode_capabilities::mcp::load_mcp_config(&working_dir).unwrap_or_default();
 
     // Trust / blocked enrichment: compute blocked FIRST so we can exclude them from the
     // "connecting" synthetic entries below. Blocked (untrusted-project) servers are withheld
     // — they never connect — so they must NOT appear as "connecting" in the status list while
     // simultaneously appearing in `blocked[]` (a contradiction the webui rendered).
-    let trusted = atomcode_core::mcp::trust::is_project_trusted(&working_dir);
+    let trusted = atomcode_capabilities::mcp::trust::is_project_trusted(&working_dir);
     let blocked: Vec<String> =
-        atomcode_core::mcp::trust::partition_by_trust(all_cfgs.clone(), &working_dir)
+        atomcode_capabilities::mcp::trust::partition_by_trust(all_cfgs.clone(), &working_dir)
             .blocked
             .into_iter()
             .map(|c| c.name)
@@ -4088,15 +3972,37 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
 
     // Fetch the tool list once (was previously re-fetched per connected server).
     let tools = registry.list_all_tools().await;
+    let servers = build_mcp_server_rows(statuses, &tools);
+    Json(McpStatusResponse {
+        servers,
+        trusted,
+        blocked,
+    })
+}
+
+/// Build the `/mcp` status server rows from raw registry statuses.
+///
+/// Blocked (untrusted-project) servers are surfaced ONLY via the response's
+/// `blocked[]` list — never as a server row. The capabilities `McpRegistry`
+/// reports withheld servers as `ServerStatus::BlockedUntrusted` (core's enum had
+/// no such variant), so without this skip they would render twice: once as a
+/// "blocked" status row here and once in the blocked banner.
+fn build_mcp_server_rows(
+    statuses: Vec<(String, atomcode_capabilities::mcp::ServerStatus)>,
+    tools: &[atomcode_capabilities::mcp::McpToolInfo],
+) -> Vec<McpServerStatus> {
+    use atomcode_capabilities::mcp::ServerStatus;
     let mut servers = Vec::new();
     for (name, status) in statuses {
         let (status_str, error) = match &status {
-            atomcode_core::mcp::ServerStatus::Connecting => ("connecting".to_string(), None),
-            atomcode_core::mcp::ServerStatus::Connected => ("connected".to_string(), None),
-            atomcode_core::mcp::ServerStatus::Failed(e) => ("error".to_string(), Some(e.clone())),
-            atomcode_core::mcp::ServerStatus::Disconnected => ("disconnected".to_string(), None),
+            ServerStatus::Connecting => ("connecting".to_string(), None),
+            ServerStatus::Connected => ("connected".to_string(), None),
+            ServerStatus::Failed(e) => ("error".to_string(), Some(e.clone())),
+            ServerStatus::Disconnected => ("disconnected".to_string(), None),
+            // Withheld: represented in `blocked[]` only, never as a server row.
+            ServerStatus::BlockedUntrusted => continue,
         };
-        let tool_count = if matches!(status, atomcode_core::mcp::ServerStatus::Connected) {
+        let tool_count = if matches!(status, ServerStatus::Connected) {
             Some(tools.iter().filter(|t| t.server_name == name).count())
         } else {
             None
@@ -4108,11 +4014,7 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
             error,
         });
     }
-    Json(McpStatusResponse {
-        servers,
-        trusted,
-        blocked,
-    })
+    servers
 }
 
 /// Replace the daemon fallback registry and invalidate the per-project cache
@@ -5503,32 +5405,6 @@ mod tests {
         assert!(Arc::ptr_eq(&*current, &replacement));
     }
 
-    #[test]
-    fn concurrent_mcp_cache_miss_cannot_overwrite_a_reload_replacement() {
-        let working_dir = PathBuf::from("/project");
-        let replacement = Arc::new(McpRegistry::new());
-        let stale_candidate = Arc::new(McpRegistry::new());
-        let mut cache = HashMap::from([(
-            working_dir.clone(),
-            CachedMcpRegistry {
-                registry: replacement.clone(),
-                last_used: std::time::Instant::now(),
-            },
-        )]);
-
-        let selected = crate::live_api::commit_mcp_cache_miss(
-            &mut cache,
-            working_dir.clone(),
-            stale_candidate,
-        );
-
-        assert!(Arc::ptr_eq(&selected, &replacement));
-        assert!(Arc::ptr_eq(
-            &cache.get(&working_dir).unwrap().registry,
-            &replacement
-        ));
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn chat_admission_rejects_the_same_session_across_request_aliases() {
         let home = ScopedChatHome::new();
@@ -5824,7 +5700,7 @@ mod tests {
     // 补成 connecting，让面板在连接窗口里就有东西显示，而不是空列表。
     #[test]
     fn merge_surfaces_configured_servers_as_connecting() {
-        use atomcode_core::mcp::ServerStatus;
+        use atomcode_capabilities::mcp::ServerStatus;
         let statuses = vec![
             ("connected-srv".to_string(), ServerStatus::Connected),
             (
@@ -5859,7 +5735,7 @@ mod tests {
 
     #[test]
     fn merge_keeps_registry_status_over_synthetic_connecting() {
-        use atomcode_core::mcp::ServerStatus;
+        use atomcode_capabilities::mcp::ServerStatus;
         // A server already known as Failed/Connected must NOT be downgraded to the
         // synthetic Connecting just because it's also in the config file.
         let merged = merge_configured_mcp_statuses(
@@ -5872,11 +5748,28 @@ mod tests {
 
     #[test]
     fn merge_no_config_is_identity() {
-        use atomcode_core::mcp::ServerStatus;
+        use atomcode_capabilities::mcp::ServerStatus;
         let merged =
             merge_configured_mcp_statuses(vec![("s".to_string(), ServerStatus::Connected)], &[]);
         assert_eq!(merged.len(), 1);
         assert!(matches!(merged[0].1, ServerStatus::Connected));
+    }
+
+    #[test]
+    fn blocked_untrusted_servers_are_excluded_from_server_rows() {
+        use atomcode_capabilities::mcp::ServerStatus;
+        // A withheld (untrusted-project) server is reported via the response's
+        // `blocked[]` list, NOT as a server row — otherwise the webui renders it
+        // twice (once as a "blocked" status row, once in the blocked banner).
+        let rows = build_mcp_server_rows(
+            vec![
+                ("ok".to_string(), ServerStatus::Connected),
+                ("evil".to_string(), ServerStatus::BlockedUntrusted),
+            ],
+            &[],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "ok");
     }
 
     // 回归：daemon 解析工作目录→物理会话桶名的 hash 必须与 native 会话存储命名目录
@@ -6703,83 +6596,4 @@ mod channel_mode_tests {
         assert!(!approval_mode_requires_responder(ApprovalMode::Plan));
     }
 
-    // ---- Offline parity: build_api_system_prompt must emit OFFLINE ENVIRONMENT ----
-
-    fn minimal_build_api_system_prompt_fixture() -> (
-        PathBuf,
-        atomcode_config::config::Config,
-        atomcode_config::config::provider::ProviderConfig,
-        Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
-    ) {
-        let working_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let config = atomcode_config::config::Config::default();
-        let provider_config = atomcode_config::config::provider::ProviderConfig {
-            provider_type: "openai".to_string(),
-            api_key: None,
-            model: "test-model".to_string(),
-            base_url: None,
-            system_prompt: None,
-            user_agent: None,
-            context_window: 128000,
-            max_tokens: None,
-            thinking_type: None,
-            thinking_keep: None,
-            reasoning_history: None,
-            reasoning_effort: None,
-            thinking_enabled: None,
-            thinking_budget: None,
-            skip_tls_verify: false,
-            ephemeral: false,
-            capable_model: None,
-        };
-        let mut registry = atomcode_core::skill::SkillRegistry::new();
-        registry.reload(&working_dir);
-        let skill_registry = Arc::new(std::sync::RwLock::new(registry));
-        (working_dir, config, provider_config, skill_registry)
-    }
-
-    #[test]
-    #[serial_test::serial(offline_verdict)]
-    fn build_api_system_prompt_emits_offline_block_when_offline() {
-        use atomcode_config::config::offline::{
-            reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
-        };
-        reset_offline_verdict_for_test();
-        seed_offline_verdict(OfflineMode::On, None);
-        let (wd, cfg, pcfg, sr) = minimal_build_api_system_prompt_fixture();
-        let prompt = build_api_system_prompt(&wd, &cfg, &pcfg, &sr);
-        assert!(
-            prompt.contains("## OFFLINE ENVIRONMENT:"),
-            "daemon prompt must carry the offline block when offline: {prompt}"
-        );
-        reset_offline_verdict_for_test();
-    }
-
-    #[test]
-    #[serial_test::serial(offline_verdict)]
-    fn build_api_system_prompt_omits_offline_block_when_online() {
-        use atomcode_config::config::offline::{
-            reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
-        };
-        reset_offline_verdict_for_test();
-        seed_offline_verdict(OfflineMode::Off, None);
-        let (wd, cfg, pcfg, sr) = minimal_build_api_system_prompt_fixture();
-        let prompt = build_api_system_prompt(&wd, &cfg, &pcfg, &sr);
-        assert!(
-            !prompt.contains("## OFFLINE ENVIRONMENT:"),
-            "daemon prompt must NOT carry the offline block when online: {prompt}"
-        );
-        reset_offline_verdict_for_test();
-    }
-
-    #[test]
-    fn build_api_system_prompt_uses_configured_commit_language() {
-        let (wd, mut cfg, pcfg, sr) = minimal_build_api_system_prompt_fixture();
-        cfg.language = Some(atomcode_config::locale::Locale::ZhCn);
-
-        let prompt = build_api_system_prompt(&wd, &cfg, &pcfg, &sr);
-
-        assert!(prompt.contains("subject and body in Simplified Chinese"));
-        assert!(prompt.contains("Conventional Commit types/scopes"));
-    }
 }

@@ -1456,8 +1456,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           if (res.kind === 'context') {
             pushCommandNotice(
               t('cmd.context.body', {
-                sent: res.sent_tokens, sys: res.system_tokens, tools: res.tool_defs_tokens,
-                cold: res.cold_zone_tokens, total: res.sent_tokens + res.system_tokens + res.tool_defs_tokens + res.cold_zone_tokens,
+                used: res.used_tokens, msgs: res.total_messages,
+                pct: Math.round(res.utilization * 100),
                 window: res.ctx_window, name: res.ctx_name,
               })
             );
