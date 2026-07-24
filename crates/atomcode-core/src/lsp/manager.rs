@@ -478,7 +478,10 @@ mod tests {
         let (mgr, mut rx) =
             LspManager::with_event_channel(PathBuf::from("/tmp"), registry, true, 150);
         assert!(mgr.active_servers().await.is_empty());
-        assert!(rx.try_recv().is_err(), "no events expected before any ensure_server call");
+        assert!(
+            rx.try_recv().is_err(),
+            "no events expected before any ensure_server call"
+        );
     }
 
     /// A failed `ensure_server` (server command not on PATH won't even
@@ -511,7 +514,10 @@ mod tests {
         // continues silently. This matches MCP's "command not found"
         // behavior and avoids spamming scrollback for projects that
         // don't have the language tooling installed.
-        assert!(rx.try_recv().is_err(), "no event expected for missing command");
+        assert!(
+            rx.try_recv().is_err(),
+            "no event expected for missing command"
+        );
     }
 
     /// Sender drops cleanly: dropping the receiver before any send
@@ -520,8 +526,7 @@ mod tests {
     #[tokio::test]
     async fn emit_no_op_when_receiver_dropped() {
         let registry = LspServerRegistry::with_defaults();
-        let (mgr, rx) =
-            LspManager::with_event_channel(PathBuf::from("/tmp"), registry, true, 150);
+        let (mgr, rx) = LspManager::with_event_channel(PathBuf::from("/tmp"), registry, true, 150);
         drop(rx);
         // Trigger the path that calls `emit` — non-existent file ext
         // takes the early-return; we explicitly call the emit helper

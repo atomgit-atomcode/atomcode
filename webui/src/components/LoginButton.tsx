@@ -46,12 +46,15 @@ export function useAuth() {
   const [expired, setExpired] = useState(false);
   const [user, setUser] = useState<UserInfo | null>(null);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const pollTimer = useRef<number | null>(null);
+  const loginGeneration = useRef(0);
 
-  async function refresh() {
+  async function refresh(shouldApply: () => boolean = () => true) {
     try {
       const r = await fetch('/auth/status', { headers: authHeaders() });
       const s = await r.json();
+      if (!shouldApply()) return;
       setLoggedIn(!!s.logged_in);
       setExpired(!!s.expired);
       setUser(s.user ?? null);
@@ -61,14 +64,29 @@ export function useAuth() {
   }
 
   useEffect(() => {
-    refresh();
+    let active = true;
+    const refreshWhileMounted = () => {
+      if (active) void refresh(() => active);
+    };
+    refreshWhileMounted();
+    const interval = window.setInterval(refreshWhileMounted, 2_000);
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') refreshWhileMounted();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
     return () => {
-      if (pollTimer.current) clearInterval(pollTimer.current);
+      active = false;
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisibility);
+      loginGeneration.current += 1;
+      if (pollTimer.current !== null) clearTimeout(pollTimer.current);
     };
   }, []);
 
   async function startLogin() {
-    if (busy) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
+    const generation = ++loginGeneration.current;
     setBusy(true);
     try {
       const r = await fetch('/auth/login/start', {
@@ -76,53 +94,78 @@ export function useAuth() {
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ open_browser: false }),
       });
+      if (!r.ok) throw new Error(`Login start failed: ${r.status}`);
       const start = await r.json();
       if (start?.url) window.open(start.url, '_blank', 'noopener');
       const id = start?.login_id;
       if (!id) {
+        busyRef.current = false;
         setBusy(false);
         return;
       }
-      // Poll until the login completes (or ~5 min timeout).
-      let ticks = 0;
-      pollTimer.current = window.setInterval(async () => {
-        ticks += 1;
+      const deadline = Date.now() + Math.max(1, start.expires_in_seconds ?? 600) * 1000;
+      const schedule = (delayMs: number) => {
+        if (loginGeneration.current !== generation) return;
+        pollTimer.current = window.setTimeout(() => void poll(), Math.max(100, delayMs));
+      };
+      const poll = async () => {
+        if (loginGeneration.current !== generation) return;
+        if (Date.now() >= deadline) {
+          await fetch(`/auth/login/${encodeURIComponent(id)}`, {
+            method: 'DELETE',
+            headers: authHeaders(),
+          }).catch(() => undefined);
+          stopPolling();
+          return;
+        }
         try {
-          await fetch(`/auth/login/${encodeURIComponent(id)}/poll`, {
+          const response = await fetch(`/auth/login/${encodeURIComponent(id)}/poll`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...authHeaders() },
           });
-          const sr = await fetch('/auth/status', { headers: authHeaders() });
-          const s = await sr.json();
-          if (s.logged_in) {
-            // Login completed — stop polling regardless of `expired`. A fresh
-            // token is normally usable, but even if the probe reports expired
-            // (odd edge: instant rejection / clock skew) we surface that state
-            // honestly instead of spinning "Signing in…" until the timeout.
-            setLoggedIn(true);
-            setExpired(!!s.expired);
-            setUser(s.user ?? null);
-            stopPolling();
+          const result = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            if (result.retryable === true && Date.now() < deadline) {
+              schedule(2000);
+            } else {
+              stopPolling();
+            }
+            return;
           }
+          if (result.status === 'pending') {
+            schedule(result.retry_after_ms ?? 2000);
+            return;
+          }
+          if (result.status === 'authorized') {
+            await refresh();
+            stopPolling();
+            return;
+          }
+          // expired / cancelled / failed are terminal login states.
+          stopPolling();
         } catch {
-          /* keep polling */
+          if (Date.now() < deadline) schedule(2000); else stopPolling();
         }
-        if (ticks > 150) stopPolling(); // ~5 min at 2s
-      }, 2000);
+      };
+      await poll();
     } catch {
+      busyRef.current = false;
       setBusy(false);
     }
   }
 
   function stopPolling() {
-    if (pollTimer.current) {
-      clearInterval(pollTimer.current);
+    busyRef.current = false;
+    loginGeneration.current += 1;
+    if (pollTimer.current !== null) {
+      clearTimeout(pollTimer.current);
       pollTimer.current = null;
     }
     setBusy(false);
   }
 
   async function doLogout() {
+    stopPolling();
     try {
       await fetch('/auth/logout', { method: 'POST', headers: authHeaders() });
     } catch {

@@ -60,7 +60,7 @@ cargo run -p atomcode-daemon -- --host 0.0.0.0 --port 8080
 ```json
 {
   "status": "ok",
-  "version": "5.0.0",
+  "version": "5.0.1",
   "service": "atomcode-daemon"
 }
 ```
@@ -503,7 +503,8 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 ```json
 {
   "logged_in": true,
-  "auth_path": "/home/user/.atomcode/auth.json",
+  "expired": false,
+  "auth_path": "/home/user/.atomcode/auth.toml",
   "user": {
     "username": "example_user",
     "email": "user@example.com"
@@ -537,7 +538,8 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 {
   "login_id": "uuid-of-login-session",
   "url": "https://auth.example.com/login?code=xxx",
-  "expires_in_seconds": 600
+  "expires_in_seconds": 600,
+  "daemon_instance_id": "uuid-of-daemon-process"
 }
 ```
 
@@ -550,9 +552,15 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 ```json
 {
   "status": "pending",
-  "user": null
+  "user": null,
+  "retry_after_ms": 2000
 }
 ```
+
+`pending`、`authorized` 使用 HTTP 200。`expired`、`cancelled` 使用 HTTP 410，
+`failed` 使用 HTTP 500；这些终态附带稳定的 `code`/`error` 和 `retryable: false`。
+可重试的临时错误使用 HTTP 503 和 `retryable: true`。登录会话只属于创建它的 daemon
+实例，实例重启后客户端必须重新发起登录，不能重放旧 `login_id`。
 
 **响应示例（已授权）：**
 
@@ -567,7 +575,7 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 
 #### `DELETE /auth/login/:login_id`
 
-取消并移除进行中的登录会话。
+幂等取消登录会话。终态会短暂保留，保证并发请求和响应重试能读取一致结果。
 
 #### `POST /auth/logout`
 
@@ -703,5 +711,5 @@ daemon 使用以下配置文件（位于 `~/.atomcode/` 目录）：
 |------|------|
 | `config.toml` | 主配置（Provider、默认工作目录等） |
 | `mcp.json` | MCP 服务器配置 |
-| `auth.json` | 认证信息（OAuth token） |
+| `auth.toml` | 认证信息（OAuth token） |
 | `sessions/` | 会话数据存储目录 |

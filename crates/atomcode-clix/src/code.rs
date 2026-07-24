@@ -17,9 +17,12 @@ use anyhow::{bail, Context, Result};
 use atomcode_capabilities::memory::MemoryStore;
 use atomcode_capabilities::session::SessionManager;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
-use atomcode_coding::{assemble, prepare, CodingAgentConfig, PrepareOptions, SessionMode};
-use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
-use atomcode_kernel::provider::LlmProvider;
+use atomcode_coding::{
+    CodingAgentConfig, CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
+    CodingRuntimeStart, DefaultCodingProviderFactory, PrepareOptions, SessionMode,
+    StaticPluginHookSource, TurnCompletion, UserInput,
+};
+use atomcode_kernel::event::{AgentEvent, StopReason};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,7 +91,11 @@ pub fn sessions(args: SessionsArgs) -> Result<()> {
     let mgr = SessionManager::for_project(&dir);
     let list = mgr.list();
     if list.is_empty() {
-        println!("No sessions for {} (bucket: {})", dir.display(), mgr.root().display());
+        println!(
+            "No sessions for {} (bucket: {})",
+            dir.display(),
+            mgr.root().display()
+        );
         return Ok(());
     }
     for m in list {
@@ -107,18 +114,24 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     let dir = args.dir.canonicalize().context("working dir not found")?;
 
     // Provider creds: flag > env > config.toml (same resolution as `review`).
-    let entry = crate::load_provider_entry(args.config.as_deref(), args.provider.as_deref())?;
-    let entry = entry.as_ref();
+    let selected = crate::load_config_selection(args.config.as_deref(), args.provider.as_deref())?;
+    let entry = selected.provider.as_ref();
     let base_url = crate::first_nonempty([
         args.base_url.clone(),
         crate::env("ATOMCODE_BASE_URL"),
-        entry.and_then(|e| e.base_url.clone()).map(|v| crate::expand_env(&v)),
+        entry
+            .and_then(|e| e.base_url.clone())
+            .map(|v| crate::expand_env(&v)),
     ])
-    .context("missing base URL: pass --base-url, set $ATOMCODE_BASE_URL, or configure a provider")?;
+    .context(
+        "missing base URL: pass --base-url, set $ATOMCODE_BASE_URL, or configure a provider",
+    )?;
     let model = crate::first_nonempty([
         args.model.clone(),
         crate::env("ATOMCODE_MODEL"),
-        entry.and_then(|e| e.model.clone()).map(|v| crate::expand_env(&v)),
+        entry
+            .and_then(|e| e.model.clone())
+            .map(|v| crate::expand_env(&v)),
     ])
     .context("missing model: pass --model, set $ATOMCODE_MODEL, or configure a provider")?;
     if crate::is_signing_gateway(&base_url) {
@@ -130,11 +143,14 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     let api_key = crate::first_nonempty([
         args.api_key.clone(),
         crate::env("ATOMCODE_API_KEY"),
-        entry.and_then(|e| e.api_key.clone()).map(|k| crate::expand_env(&k)),
+        entry
+            .and_then(|e| e.api_key.clone())
+            .map(|k| crate::expand_env(&k)),
     ])
     .unwrap_or_default();
 
     let mut cfg = CodingAgentConfig::new(api_key, base_url, &model, &dir);
+    cfg.preferred_language = selected.language;
     cfg.context_window = entry.and_then(|e| e.context_window).unwrap_or(128_000);
     cfg.stream_timeout = std::time::Duration::from_secs(args.stream_timeout);
     // Telemetry: the full host-loop instrumentation (turn-level TelemetryHook + tool
@@ -159,32 +175,48 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     let opts = PrepareOptions {
         session,
         skill_dirs: None,
+        plugin_skill_dirs: Vec::new(),
         mcp: !args.no_mcp,
         memory: !args.no_memory,
         web: !args.no_web,
         // The `code` agent can also review the current changes in-session (the dedicated
         // `atomcodex review` subcommand still exists for headless/CI one-shots).
         review: true,
+        // clix is intentionally core/bridge-free; external endpoints keep generic 429 handling.
+        rate_limit_source: None,
     };
 
     eprintln!("preparing ({model}) …");
-    let mut parts = prepare(&cfg, opts).await.context("prepare failed")?;
-    for ev in &parts.mcp_events {
-        use atomcode_capabilities::mcp::McpConnectEvent as E;
-        match ev {
-            E::Connected { name } => eprintln!("  mcp ✓ {name}"),
-            E::Failed { name, error } => eprintln!("  mcp ✗ {name}: {error}"),
-            E::Warning { name, message } => eprintln!("  mcp ! {name}: {message}"),
-        }
-    }
-    let session_id = parts.session.as_ref().map(|b| b.id.clone());
-    let resumed = parts.session.as_ref().is_some_and(|b| b.resume.is_some());
-
-    let provider = build_provider(&cfg)?;
-    let mut handle = assemble(&mut parts, &cfg, provider).context("assemble failed")?.spawn();
+    let runtime = CodingRuntime::start(CodingRuntimeStart {
+        agent: cfg,
+        prepare: opts,
+        provider_factory: Arc::new(DefaultCodingProviderFactory::new(concat!(
+            "atomcode/",
+            env!("CARGO_PKG_VERSION")
+        ))),
+        plugin_hooks: Arc::new(StaticPluginHookSource::default()),
+        image_preprocessor: None,
+    })
+    .await
+    .context("runtime start failed")?;
+    let session_id = runtime.session.as_ref().map(|session| session.id.clone());
+    let resumed = runtime
+        .session
+        .as_ref()
+        .is_some_and(|session| session.resumed);
+    let CodingRuntime {
+        handle,
+        mut events,
+        task,
+        ..
+    } = runtime;
 
     if let Some(id) = &session_id {
-        eprintln!("session {} {}", id, if resumed { "(resumed)" } else { "(new)" });
+        eprintln!(
+            "session {} {}",
+            id,
+            if resumed { "(resumed)" } else { "(new)" }
+        );
     }
 
     let mut input = BufReader::new(tokio::io::stdin()).lines();
@@ -198,13 +230,21 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     // One-shot: a single turn, then exit (still persisted). A failed turn must
     // exit NON-ZERO — `--yolo -p` is the CI mode, and CI needs the signal.
     if let Some(p) = args.prompt {
-        let _ = handle.commands.send(AgentCommand::SendMessage { text: p, images: vec![] });
-        let reason = drive_turn(&mut handle, &mut input, args.yolo, &mut sigint).await;
-        finish(handle, session_id).await?;
+        handle
+            .wait_mcp_ready(atomcode_capabilities::mcp::CONNECT_TIMEOUT)
+            .await?;
+        handle.submit(UserInput::from(p)).await?;
+        let outcome = drive_turn(&handle, &mut events, &mut input, args.yolo, &mut sigint).await;
+        finish(handle, task, session_id).await?;
         telemetry.shutdown(crate::tel::FLUSH_TIMEOUT).await;
-        return match reason {
-            Some(StopReason::Stopped) => Ok(()),
-            Some(other) => bail!("turn did not complete normally: {other:?}"),
+        return match outcome {
+            Some(TurnOutcome::Completed(StopReason::Stopped)) => Ok(()),
+            Some(TurnOutcome::Completed(other)) => {
+                bail!("turn did not complete normally: {other:?}")
+            }
+            Some(TurnOutcome::SnapshotUnavailable { reason, error }) => {
+                bail!("turn snapshot unavailable after {reason:?}: {error}")
+            }
             None => bail!("agent terminated unexpectedly"),
         };
     }
@@ -239,16 +279,19 @@ pub async fn code(args: CodeArgs) -> Result<()> {
                 SlashOutcome::Quit => break,
             }
         }
-        if handle.commands.send(AgentCommand::SendMessage { text: line, images: vec![] }).is_err() {
+        if handle.submit(UserInput::from(line)).await.is_err() {
             eprintln!("[agent terminated — exiting]");
             break;
         }
-        if drive_turn(&mut handle, &mut input, args.yolo, &mut sigint).await.is_none() {
+        if drive_turn(&handle, &mut events, &mut input, args.yolo, &mut sigint)
+            .await
+            .is_none()
+        {
             eprintln!("[agent terminated — exiting]");
             break;
         }
     }
-    let r = finish(handle, session_id).await;
+    let r = finish(handle, task, session_id).await;
     telemetry.shutdown(crate::tel::FLUSH_TIMEOUT).await;
     r
 }
@@ -271,26 +314,13 @@ fn spawn_sigint_listener() -> tokio::sync::mpsc::UnboundedReceiver<()> {
     rx
 }
 
-/// Construct the OpenAI-compatible provider from the config (same provider the
-/// minimal `build_coding_agent` uses; clix keeps construction here so a model swap
-/// respawn can build a NEW provider against the same parts later).
-fn build_provider(cfg: &CodingAgentConfig) -> Result<Arc<dyn LlmProvider>> {
-    use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
-    let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
-    pc.context_window = cfg.context_window;
-    // Byte-idle liveness: follow the config's stream_timeout instead of the adapter's
-    // hardcoded 120s default, else a thinking model's >120s mid-reasoning silence is
-    // misclassified as `[Error: stream idle timeout]` (mirrors build_coding_agent).
-    pc.idle_timeout = cfg.stream_timeout;
-    Ok(Arc::new(OpenAiCompatProvider::new(pc).map_err(|e| anyhow::anyhow!(e.message))?))
-}
-
 async fn finish(
-    handle: atomcode_kernel::agent::AgentHandle,
+    handle: CodingRuntimeHandle,
+    task: tokio::task::JoinHandle<atomcode_coding::RuntimeExit>,
     session_id: Option<String>,
 ) -> Result<()> {
-    let _ = handle.commands.send(AgentCommand::Shutdown);
-    let _ = handle.task.await;
+    let _ = handle.shutdown().await;
+    let _ = task.await;
     if let Some(id) = session_id {
         eprintln!("session saved — resume with: atomcodex code --resume {id}");
     }
@@ -300,13 +330,32 @@ async fn finish(
 /// Drive ONE turn: render events until `TurnComplete`; answer approval requests
 /// (interactive, or auto-allow under --yolo); Ctrl-C (via the shared SIGINT channel)
 /// cancels the turn — the kernel also unparks a pending approval, fail-closed.
-/// Returns the turn's final `StopReason`, or `None` when the agent task died.
+/// Returns the runtime-owned completion variant, or `None` when the agent task died.
+#[derive(Debug, PartialEq, Eq)]
+enum TurnOutcome {
+    Completed(StopReason),
+    SnapshotUnavailable { reason: StopReason, error: String },
+}
+
+fn turn_outcome(completion: TurnCompletion) -> TurnOutcome {
+    match completion {
+        TurnCompletion::Completed { reason, .. } => TurnOutcome::Completed(reason),
+        TurnCompletion::SnapshotUnavailable { reason, error, .. } => {
+            TurnOutcome::SnapshotUnavailable {
+                reason,
+                error: error.message,
+            }
+        }
+    }
+}
+
 async fn drive_turn(
-    handle: &mut atomcode_kernel::agent::AgentHandle,
+    handle: &CodingRuntimeHandle,
+    events: &mut CodingRuntimeEvents,
     input: &mut Lines<BufReader<Stdin>>,
     yolo: bool,
     sigint: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
-) -> Option<StopReason> {
+) -> Option<TurnOutcome> {
     use std::io::Write;
     let mut streamed = false;
     // Once a cancel is in flight, any approval Request still buffered in the event
@@ -315,51 +364,55 @@ async fn drive_turn(
     let mut cancelled = false;
     loop {
         let ev = tokio::select! {
-            ev = handle.events.recv() => match ev { Some(ev) => ev, None => return None },
+            ev = events.recv() => match ev { Some(ev) => ev.event, None => return None },
             _ = sigint.recv() => {
                 eprintln!("\n[cancelling …]");
                 cancelled = true;
-                let _ = handle.commands.send(AgentCommand::Cancel);
+                let _ = handle.cancel().await;
                 continue;
             }
         };
         match ev {
-            AgentEvent::TextDelta(t) => {
+            CodingRuntimeEvent::Agent(AgentEvent::TextDelta(t)) => {
                 streamed = true;
                 print!("{t}");
                 let _ = std::io::stdout().flush();
             }
-            AgentEvent::ToolStarted { call } => {
-                eprintln!("  → {} {}", call.name, crate::tool_hint(&call.name, &call.arguments));
+            CodingRuntimeEvent::Agent(AgentEvent::ToolStarted { call }) => {
+                eprintln!(
+                    "  → {} {}",
+                    call.name,
+                    crate::tool_hint(&call.name, &call.arguments)
+                );
             }
-            AgentEvent::ToolResult { result } => {
+            CodingRuntimeEvent::Agent(AgentEvent::ToolResult { result }) => {
                 let mark = if result.is_error { "✗" } else { "✓" };
                 eprintln!("    {mark} ({} chars)", result.content.chars().count());
             }
-            AgentEvent::Request { id, kind, payload } if kind == APPROVAL_KIND && !cancelled => {
-                match approval_decision(&payload, input, yolo, sigint).await {
+            CodingRuntimeEvent::Request(request) if request.kind == APPROVAL_KIND && !cancelled => {
+                match approval_decision(&request.payload, input, yolo, sigint).await {
                     ApprovalAnswer::Respond(value) => {
-                        let _ = handle.commands.send(AgentCommand::Respond { id, value });
+                        let _ = handle.respond(request.id, value).await;
                     }
                     ApprovalAnswer::Cancelled => {
                         // Ctrl-C at the approval prompt: cancel the TURN — the kernel
                         // flushes this very round-trip to Null (deny) and unparks.
                         eprintln!("\n[cancelling …]");
                         cancelled = true;
-                        let _ = handle.commands.send(AgentCommand::Cancel);
+                        let _ = handle.cancel().await;
                     }
                 }
             }
-            AgentEvent::Request { id, .. } => {
+            CodingRuntimeEvent::Request(request) => {
                 // Unknown kind, or a stale approval after cancel: fail closed
                 // (Null → deny semantics; a flushed id no-ops harmlessly).
-                let _ = handle
-                    .commands
-                    .send(AgentCommand::Respond { id, value: serde_json::Value::Null });
+                let _ = handle.respond(request.id, serde_json::Value::Null).await;
             }
-            AgentEvent::Error { message, .. } => eprintln!("\n[error] {message}"),
-            AgentEvent::Warning(w) => eprintln!("[warn] {w}"),
-            AgentEvent::CompactionStarted { trigger } => {
+            CodingRuntimeEvent::Agent(AgentEvent::Error { message, .. }) => {
+                eprintln!("\n[error] {message}")
+            }
+            CodingRuntimeEvent::Agent(AgentEvent::Warning(w)) => eprintln!("[warn] {w}"),
+            CodingRuntimeEvent::CompactionStarted { trigger } => {
                 // The kernel fires this ONLY when a real drain/summary (a multi-second
                 // LLM call) will run — manual `/compact`, overflow tier 2, OR an auto
                 // compaction that escalated past the high-water mark. Show a progress
@@ -367,21 +420,36 @@ async fn drive_turn(
                 let _ = &trigger;
                 eprintln!("[compacting …]");
             }
-            AgentEvent::Compacted { committed, .. } => {
-                eprintln!("[compacted{}]", if committed { "" } else { " — refused (no gain)" });
+            CodingRuntimeEvent::CompactionFinished {
+                completion: atomcode_coding::runtime::CompactionCompletion::Completed(outcome),
+            } => {
+                eprintln!(
+                    "[compacted{}]",
+                    if outcome.committed {
+                        ""
+                    } else {
+                        " — refused (no gain)"
+                    }
+                );
             }
-            AgentEvent::CompactionFailed { error, .. } => {
+            CodingRuntimeEvent::CompactionFinished {
+                completion: atomcode_coding::runtime::CompactionCompletion::Failed { error, .. },
+            } => {
                 eprintln!("[compact failed] {error}");
             }
-            AgentEvent::TurnComplete { reason } => {
+            CodingRuntimeEvent::TurnFinished(completion) => {
                 if streamed {
                     println!();
                 }
-                match reason {
-                    StopReason::Stopped => {}
-                    ref other => eprintln!("[turn ended: {other:?}]"),
+                let outcome = turn_outcome(completion);
+                match &outcome {
+                    TurnOutcome::Completed(StopReason::Stopped) => {}
+                    TurnOutcome::Completed(other) => eprintln!("[turn ended: {other:?}]"),
+                    TurnOutcome::SnapshotUnavailable { reason, error } => {
+                        eprintln!("[turn snapshot unavailable after {reason:?}: {error}]")
+                    }
                 }
-                return Some(reason);
+                return Some(outcome);
             }
             _ => {}
         }
@@ -433,7 +501,11 @@ async fn approval_decision(
     if discarded > 0 {
         eprintln!("  (discarded {discarded} typed-ahead line(s) — an approval prompt needs a fresh answer)");
     }
-    eprintln!("  approval needed: {} {}", req.tool, crate::truncate(&req.args, 200));
+    eprintln!(
+        "  approval needed: {} {}",
+        req.tool,
+        crate::truncate(&req.args, 200)
+    );
     eprint!("  allow? [y = once / always = remember / N = deny] ");
     let answer = tokio::select! {
         l = input.next_line() => l.ok().flatten().unwrap_or_default(),
@@ -462,11 +534,7 @@ enum SlashOutcome {
 /// Handle a `/command`. Memory commands write through `MemoryStore` (the engine
 /// injects/reconciles at the NEXT session start — production semantics); `/compact`
 /// goes to the agent (queued to the turn boundary if one is running).
-fn handle_slash(
-    cmd: &str,
-    dir: &std::path::Path,
-    handle: &atomcode_kernel::agent::AgentHandle,
-) -> SlashOutcome {
+fn handle_slash(cmd: &str, dir: &std::path::Path, handle: &CodingRuntimeHandle) -> SlashOutcome {
     let (name, rest) = match cmd.split_once(char::is_whitespace) {
         Some((n, r)) => (n, r.trim()),
         None => (cmd, ""),
@@ -490,7 +558,11 @@ fn handle_slash(
                 eprintln!("  usage: /remember [-g] <fact>");
                 return SlashOutcome::Handled;
             }
-            let store = if global { MemoryStore::global() } else { MemoryStore::project(dir) };
+            let store = if global {
+                MemoryStore::global()
+            } else {
+                MemoryStore::project(dir)
+            };
             match store.append(text) {
                 Ok(()) => eprintln!(
                     "  remembered ({}) — injected from the next session start",
@@ -506,7 +578,11 @@ fn handle_slash(
                 eprintln!("  usage: /forget [-g] <keyword>");
                 return SlashOutcome::Handled;
             }
-            let store = if global { MemoryStore::global() } else { MemoryStore::project(dir) };
+            let store = if global {
+                MemoryStore::global()
+            } else {
+                MemoryStore::project(dir)
+            };
             match store.remove_matching(kw) {
                 Ok(removed) if removed.is_empty() => eprintln!("  nothing matched '{kw}'"),
                 Ok(removed) => {
@@ -522,7 +598,9 @@ fn handle_slash(
             let merged = MemoryStore::merged_for_prompt(
                 &MemoryStore::global(),
                 &MemoryStore::project(dir),
-                &dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into()),
+                &dir.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "project".into()),
             );
             if merged.is_empty() {
                 eprintln!("  (memory is empty — /remember <fact>)");
@@ -533,14 +611,20 @@ fn handle_slash(
         }
         "compact" => {
             let focus = (!rest.is_empty()).then(|| rest.to_string());
-            let _ = handle.commands.send(AgentCommand::Compact { focus });
+            let _ = handle.compact(focus);
             eprintln!("  compaction requested");
             SlashOutcome::Handled
         }
         "sessions" => {
             let mgr = SessionManager::for_project(dir);
             for m in mgr.list() {
-                eprintln!("  {}  {:<28} turns {:<4} {}", m.id, m.name, m.turn_count, fmt_ts(m.updated_at));
+                eprintln!(
+                    "  {}  {:<28} turns {:<4} {}",
+                    m.id,
+                    m.name,
+                    m.turn_count,
+                    fmt_ts(m.updated_at)
+                );
             }
             SlashOutcome::Handled
         }
@@ -580,7 +664,11 @@ fn fmt_ts(ms: i64) -> String {
             let days = (secs / 86_400) as i64;
             let (y, m, dd) = civil_from_days(days);
             let rem = secs % 86_400;
-            format!("{y:04}-{m:02}-{dd:02} {:02}:{:02} UTC", rem / 3600, (rem % 3600) / 60)
+            format!(
+                "{y:04}-{m:02}-{dd:02} {:02}:{:02} UTC",
+                rem / 3600,
+                (rem % 3600) / 60
+            )
         }
         Err(_) => ms.to_string(),
     }
@@ -610,7 +698,11 @@ mod tests {
         assert_eq!(split_global_flag("--global x"), (true, "x"));
         assert_eq!(split_global_flag("plain fact"), (false, "plain fact"));
         assert_eq!(split_global_flag("-g"), (true, ""));
-        assert_eq!(split_global_flag("-grand fact"), (false, "-grand fact"), "no false prefix match");
+        assert_eq!(
+            split_global_flag("-grand fact"),
+            (false, "-grand fact"),
+            "no false prefix match"
+        );
     }
 
     #[test]
@@ -631,5 +723,25 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
         assert!(fmt_ts(0).starts_with("1970-01-01 00:00"));
+    }
+
+    #[test]
+    fn snapshot_unavailable_is_not_a_successful_stopped_turn() {
+        let completion = TurnCompletion::SnapshotUnavailable {
+            turn_id: 1,
+            reason: StopReason::Stopped,
+            error: atomcode_coding::RuntimeSnapshotError {
+                message: "snapshot failed".into(),
+            },
+            stats: Default::default(),
+        };
+
+        assert!(matches!(
+            turn_outcome(completion),
+            TurnOutcome::SnapshotUnavailable {
+                reason: StopReason::Stopped,
+                ..
+            }
+        ));
     }
 }

@@ -12,7 +12,7 @@ use atomcode_config::config::Config;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{build_status, save_and_reload, Buffer, LoopCtx};
+use crate::event_loop::{build_status, set_default_provider_and_reload, Buffer, LoopCtx};
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
@@ -142,70 +142,12 @@ impl Modal for ModelPicker {
                     Some(p) => p.to_string(),
                     None => return Ok(ModalAction::Close),
                 };
-                let display = ctx
-                    .config
-                    .providers
-                    .get(&chosen)
-                    .map(|p| p.model.clone())
-                    .unwrap_or_else(|| chosen.clone());
-                ctx.config.default_provider = chosen.clone();
-                ctx.model_name = display.clone();
-                // Refresh the footer's context window NOW. The `used/window`
-                // pair comes from the cached ContextStats snapshot, which is
-                // only updated during a turn — switching models fires none, so
-                // without this the denominator stays pinned to the previous
-                // model's window (e.g. 10.1k/200k after switching to a 128k
-                // model). `default_provider` was just set above, so the lookup
-                // returns the new model's window.
-                state.on_model_window_changed(ctx.config.default_context_window());
-                // Persist to config.toml + notify agent. Without this,
-                // the switch lives only in memory and the next startup
-                // reverts to whatever was last saved.
-                save_and_reload(ctx, renderer);
-                // Live-sync: broadcast this switch so an attached webui's model
-                // dropdown follows. No-op when no live session exists (it just
-                // updates the process-level selection, which is harmless).
-                atomcode_daemon::live_set_provider(chosen.clone());
-                // Clear any stale drift warning tied to the PREVIOUS
-                // active provider — if the new provider is also CodingPlan,
-                // the re-fire below will repopulate the slot with a
-                // correct warning (or leave it clean).
-                if let Ok(mut g) = ctx.monitor_warning.lock() {
-                    *g = None;
+                if set_default_provider_and_reload(ctx, &chosen, renderer) {
+                    Ok(ModalAction::Close)
+                } else {
+                    self.draw(buf, state, ctx, renderer);
+                    Ok(ModalAction::Continue)
                 }
-                // Same treatment for the usage slot: switching providers
-                // invalidates the previous CodingPlan's quota snapshot.
-                // Clearing here makes `build_usage_hint` short-circuit to
-                // None until a fresh fetch lands; otherwise the user would
-                // briefly see the OLD plan's percent on the new provider.
-                if let Ok(mut g) = ctx.usage_slot.lock() {
-                    *g = None;
-                }
-                // Re-fire the drift check if the new provider is also
-                // CodingPlan-managed. Bypasses the 15-min cooldown on
-                // purpose — explicit user action deserves a fresh read.
-                if crate::event_loop::monitor::is_codingplan_provider(&chosen) {
-                    ctx.monitor_last_check_at = Some(std::time::Instant::now());
-                    crate::event_loop::monitor::spawn_check(
-                        ctx.config.clone(),
-                        ctx.model_name.clone(),
-                        ctx.monitor_warning.clone(),
-                        ctx.wake_tx.clone(),
-                    );
-                    // Mirror: re-fire usage check too. 30s cooldown is
-                    // bypassed because the user just made an explicit
-                    // switch — they want fresh data, not stale 30s data.
-                    ctx.usage_last_check_at = Some(std::time::Instant::now());
-                    crate::event_loop::usage_monitor::spawn_check(
-                        ctx.usage_slot.clone(),
-                        ctx.wake_tx.clone(),
-                    );
-                }
-                renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::ModelSwitched { provider: &chosen, model: &display }).into_owned(),
-                ));
-                renderer.flush();
-                Ok(ModalAction::Close)
             }
             KeyCode::Esc => Ok(ModalAction::Close),
             _ => Ok(ModalAction::Continue),
@@ -260,15 +202,15 @@ fn build_menu_payload(p: &ModelPicker, ctx: &LoopCtx) -> MenuPayload {
         } else if p.query.is_empty() {
             "(no providers match)".to_string()
         } else {
-            format!(
-                "(no providers match \"{}\" — Backspace to clear)",
-                p.query
-            )
+            format!("(no providers match \"{}\" — Backspace to clear)", p.query)
         };
         return MenuPayload {
             items: vec![(label, String::new())],
             selected: 0,
-            kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
+            kind: crate::render::MenuKind::TwoColumn {
+                row_prefix: "",
+                selected_marker: "▸",
+            },
         };
     }
     let items: Vec<(String, String)> = p
@@ -288,7 +230,10 @@ fn build_menu_payload(p: &ModelPicker, ctx: &LoopCtx) -> MenuPayload {
     MenuPayload {
         items,
         selected: p.selected,
-        kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
+        kind: crate::render::MenuKind::TwoColumn {
+            row_prefix: "",
+            selected_marker: "▸",
+        },
     }
 }
 
@@ -333,7 +278,10 @@ mod tests {
     #[test]
     fn open_shows_all_providers_initially() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let p = ModelPicker::open(&config);
@@ -346,7 +294,10 @@ mod tests {
     #[test]
     fn update_filter_matches_by_name_case_insensitive() {
         let config = make_config(
-            vec![("Alpha", "openai", "gpt-4"), ("Beta", "anthropic", "claude-3")],
+            vec![
+                ("Alpha", "openai", "gpt-4"),
+                ("Beta", "anthropic", "claude-3"),
+            ],
             "Alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -359,7 +310,10 @@ mod tests {
     #[test]
     fn update_filter_matches_by_provider_type() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -372,7 +326,10 @@ mod tests {
     #[test]
     fn update_filter_matches_by_model() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -385,7 +342,10 @@ mod tests {
     #[test]
     fn update_filter_empty_query_shows_all() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -400,7 +360,10 @@ mod tests {
     #[test]
     fn update_filter_resets_selection_to_zero() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -413,7 +376,11 @@ mod tests {
     #[test]
     fn down_and_up_stay_within_filtered_bounds() {
         let config = make_config(
-            vec![("a", "openai", "gpt-4"), ("b", "anthropic", "claude-3"), ("c", "openai", "gpt-3.5")],
+            vec![
+                ("a", "openai", "gpt-4"),
+                ("b", "anthropic", "claude-3"),
+                ("c", "openai", "gpt-3.5"),
+            ],
             "a",
         );
         let mut p = ModelPicker::open(&config);
@@ -434,7 +401,10 @@ mod tests {
     #[test]
     fn chosen_returns_provider_at_selected() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let p = ModelPicker::open(&config);
@@ -443,10 +413,7 @@ mod tests {
 
     #[test]
     fn chosen_returns_none_when_filter_empty() {
-        let config = make_config(
-            vec![("alpha", "openai", "gpt-4")],
-            "alpha",
-        );
+        let config = make_config(vec![("alpha", "openai", "gpt-4")], "alpha");
         let mut p = ModelPicker::open(&config);
         p.query = "zzz".to_string();
         p.update_filter(&config);

@@ -355,8 +355,24 @@
 }
 
 /* === Search Dimmed === */
-.messages-container.dimmed > .timeline-message:not(.highlighted) { opacity: 0.4; }
-.timeline-message.highlighted { opacity: 1; z-index: 10; }
+.messages-container.dimmed > .timeline-message:not(.highlighted),
+.messages-container.dimmed > .user-message-wrapper:not(.highlighted) { opacity: 0.4; }
+
+.timeline-message.highlighted,
+.user-message-wrapper.highlighted {
+  opacity: 1;
+  z-index: 10;
+  position: relative;
+}
+
+.timeline-message.highlighted {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--app-brand), transparent 70%);
+}
+
+.user-message-wrapper.highlighted .user-message-bubble {
+  border-color: color-mix(in srgb, var(--app-brand), var(--app-input-border) 40%);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--app-brand), transparent 75%);
+}
 
 /* === Markdown Root === */
 .markdown-root {
@@ -898,12 +914,20 @@
 }
 
 /* === Search Highlight === */
-.search-highlight {
-  background: color-mix(in srgb, var(--app-brand), transparent 80%);
+mark.search-highlight {
+  background: color-mix(in srgb, var(--app-brand), transparent 75%);
+  color: inherit;
   border-radius: 2px;
   padding: 0 1px;
 }
 
-.search-highlight.active {
-  background: color-mix(in srgb, var(--app-brand), transparent 60%);
+/* The CURRENT match message (nav is per-message: `{current}/{total}` counts
+   messages, Enter/Shift+Enter cycle them). Brighten its keyword marks so the
+   focused hit is visually distinct from other matched-but-not-current messages
+   — otherwise the only cue is scroll position. `.active` on an individual mark
+   was dead code (never applied); the `.search-current` ancestor is the live seam. */
+.search-current mark.search-highlight,
+mark.search-highlight.active {
+  background: color-mix(in srgb, var(--app-brand), transparent 45%);
+  outline: 1px solid color-mix(in srgb, var(--app-brand), transparent 30%);
 }

@@ -4,6 +4,7 @@ import { formatTokenCount } from '../utils/format';
 import { SlashPicker } from './SlashPicker';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
+import { TodoPanel } from './TodoPanel';
 import { postMessage } from '../vscode';
 import { ImageData, SkillInfo } from '../state/types';
 import { useT } from '../i18n';
@@ -474,6 +475,7 @@ export function InputArea() {
 
   return (
     <div className="input-container" ref={containerRef}>
+      {state.activeTodos.length > 0 && <TodoPanel items={state.activeTodos} />}
       <div className="input-box" ref={inputBoxRef}>
         {showSlash && (
           <SlashPicker
@@ -648,9 +650,9 @@ export function InputArea() {
           {state.tokenCount && <span className="footer-tokens">{formatTokenCount(state.tokenCount.total, t)}</span>}
           <ModeSelector placement="up" onOpen={() => setShowSlash(false)} />
           <ModelSelector placement="up" onOpen={() => setShowSlash(false)} />
-          {state.isGenerating ? (
+          {state.isGenerating || state.recoveryLocked ? (
             <>
-              {hasText && (
+              {state.isGenerating && !state.recoveryLocked && hasText && (
                 <button className="btn-send" onClick={handleSend} disabled={state.approvalModePending} title={t('input.queueMessage')}>
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
                     <line x1="12" y1="19" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" />

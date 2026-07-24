@@ -47,7 +47,9 @@ const ATOMCODE_USER_AGENT: &str = concat!("atomcode/", env!("CARGO_PKG_VERSION")
 /// proxy env items so this crate needs no `atomcode-core` dependency.
 fn apply_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     atomcode_config::proxy::ensure_runtime_initialized();
-    if std::env::var(atomcode_config::proxy::MODE_ENV).ok().as_deref()
+    if std::env::var(atomcode_config::proxy::MODE_ENV)
+        .ok()
+        .as_deref()
         == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
     {
         builder.no_proxy()
@@ -1038,15 +1040,16 @@ pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
 /// constraints); caller should surface the error and keep running with
 /// the old binary rather than exiting silently.
 pub fn re_exec_self(override_exe: Option<&Path>) -> Result<std::convert::Infallible> {
-    let exe = override_exe
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| current_exe_path().unwrap_or_else(|_| {
+    let exe = override_exe.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+        current_exe_path().unwrap_or_else(|_| {
             // Fallback: if we can't resolve current_exe AND no override,
             // try argv[0] as a last resort.
-            std::env::args_os().next()
+            std::env::args_os()
+                .next()
                 .map(PathBuf::from)
                 .unwrap_or_default()
-        }));
+        })
+    });
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
 
     #[cfg(unix)]
@@ -1279,11 +1282,11 @@ mod tests {
 
     #[test]
     fn is_newer_semver() {
-        assert!(is_newer("v4.19.0", "v4.18.2"));  // latest, current
+        assert!(is_newer("v4.19.0", "v4.18.2")); // latest, current
         assert!(is_newer("v4.19.0", "v4.18.9"));
-        assert!(is_newer("v5.0.0", "v4.99.99"));
+        assert!(is_newer("v5.0.1", "v4.99.99"));
         assert!(!is_newer("v4.19.0", "v4.19.0"));
-        assert!(!is_newer("v4.18.0", "v4.19.0"));  // latest is older than current
+        assert!(!is_newer("v4.18.0", "v4.19.0")); // latest is older than current
     }
 
     #[test]
@@ -1434,9 +1437,13 @@ mod tests {
         let exdev = 17;
         #[cfg(not(windows))]
         let exdev = 18;
-        assert!(is_cross_device_error(&std::io::Error::from_raw_os_error(exdev)));
+        assert!(is_cross_device_error(&std::io::Error::from_raw_os_error(
+            exdev
+        )));
         // A permission-style error must NOT be mistaken for cross-device.
-        assert!(!is_cross_device_error(&std::io::Error::from_raw_os_error(13)));
+        assert!(!is_cross_device_error(&std::io::Error::from_raw_os_error(
+            13
+        )));
     }
 
     #[test]

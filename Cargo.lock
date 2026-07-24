@@ -311,14 +311,16 @@ dependencies = [
 
 [[package]]
 name = "atomcode"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
  "assert_cmd",
- "atomcode-bridge",
+ "async-trait",
+ "atomcode-auth",
  "atomcode-capabilities",
  "atomcode-coding",
+ "atomcode-codingplan",
  "atomcode-config",
  "atomcode-core",
  "atomcode-daemon",
@@ -343,6 +345,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "toml_edit",
+ "tracing-subscriber",
  "url",
  "uuid",
  "which",
@@ -353,9 +356,10 @@ dependencies = [
 
 [[package]]
 name = "atomcode-auth"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "anyhow",
+ "atomcode-codingplan-crypto",
  "atomcode-config",
  "atomcode-telemetry",
  "libc",
@@ -363,40 +367,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "toml 0.8.23",
  "tracing",
+ "url",
  "uuid",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
-name = "atomcode-bridge"
-version = "5.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "atomcode-capabilities",
- "atomcode-coding",
- "atomcode-config",
- "atomcode-core",
- "atomcode-kernel",
- "atomcode-telemetry",
- "getrandom 0.2.17",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "url",
-]
-
-[[package]]
 name = "atomcode-capabilities"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "atomcode-auth",
  "atomcode-config",
  "atomcode-kernel",
  "base64",
@@ -405,7 +391,9 @@ dependencies = [
  "ctor",
  "dirs",
  "encoding_rs",
+ "fs2",
  "futures",
+ "getrandom 0.2.17",
  "globset",
  "grep",
  "httpdate",
@@ -413,15 +401,20 @@ dependencies = [
  "libc",
  "regex",
  "reqwest",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "serial_test",
  "sha2",
  "similar",
+ "sysinfo",
+ "tar",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-util",
  "toml 0.8.23",
+ "tracing",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -438,18 +431,21 @@ dependencies = [
  "url",
  "uuid",
  "which",
+ "windows-sys 0.61.2",
  "wiremock",
  "zeroize",
+ "zstd",
 ]
 
 [[package]]
 name = "atomcode-clix"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "atomcode-capabilities",
  "atomcode-coding",
+ "atomcode-config",
  "atomcode-kernel",
  "atomcode-review",
  "atomcode-telemetry",
@@ -464,12 +460,11 @@ dependencies = [
 
 [[package]]
 name = "atomcode-coding"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "async-trait",
  "atomcode-capabilities",
  "atomcode-config",
- "atomcode-core",
  "atomcode-kernel",
  "atomcode-review",
  "atomcode-telemetry",
@@ -477,11 +472,27 @@ dependencies = [
  "ctor",
  "dirs",
  "futures",
+ "serde",
  "serde_json",
  "serial_test",
  "tempfile",
  "tokio",
+ "tokio-util",
  "uuid",
+]
+
+[[package]]
+name = "atomcode-codingplan"
+version = "5.0.1"
+dependencies = [
+ "anyhow",
+ "atomcode-auth",
+ "atomcode-config",
+ "atomcode-telemetry",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -490,26 +501,28 @@ version = "0.1.0"
 
 [[package]]
 name = "atomcode-config"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "anyhow",
  "atomcode-telemetry",
  "dirs",
+ "fs2",
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml 0.8.23",
+ "winreg",
 ]
 
 [[package]]
 name = "atomcode-core"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "atomcode-auth",
- "atomcode-codingplan-crypto",
  "atomcode-config",
  "atomcode-kernel",
  "atomcode-telemetry",
@@ -519,7 +532,6 @@ dependencies = [
  "ctor",
  "dirs",
  "encoding_rs",
- "fs2",
  "futures",
  "getrandom 0.2.17",
  "globset",
@@ -529,12 +541,11 @@ dependencies = [
  "libc",
  "regex",
  "reqwest",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "serial_test",
  "sha2",
- "sysinfo",
- "tar",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -560,18 +571,18 @@ dependencies = [
  "windows-sys 0.61.2",
  "winreg",
  "wiremock",
- "zstd",
 ]
 
 [[package]]
 name = "atomcode-daemon"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "atomcode-bridge",
+ "atomcode-auth",
  "atomcode-capabilities",
  "atomcode-coding",
+ "atomcode-codingplan",
  "atomcode-config",
  "atomcode-core",
  "atomcode-kernel",
@@ -599,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-kernel"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -611,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-review"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "async-trait",
  "atomcode-capabilities",
@@ -626,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-telemetry"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -648,12 +659,14 @@ dependencies = [
 
 [[package]]
 name = "atomcode-tuix"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "anyhow",
  "arboard",
+ "atomcode-auth",
  "atomcode-capabilities",
  "atomcode-coding",
+ "atomcode-codingplan",
  "atomcode-config",
  "atomcode-core",
  "atomcode-daemon",
@@ -680,6 +693,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml 0.8.23",
  "unicode-segmentation",
  "unicode-width",
@@ -691,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-updater"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "anyhow",
  "atomcode-config",
@@ -1004,6 +1018,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
 dependencies = [
  "unicode-segmentation",
+]
+
+[[package]]
+name = "core-foundation"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
 ]
 
 [[package]]
@@ -2245,6 +2269,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
+]
+
+[[package]]
 name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2341,6 +2374,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3b335231dfd352ffb0f8017f3b6027a4917f7df785ea2143d8af2adc66980ae"
 dependencies = [
  "winapi",
+]
+
+[[package]]
+name = "nu-ansi-term"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2452,6 +2494,12 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "openssl-probe"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "option-ext"
@@ -3071,6 +3119,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-native-certs"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
+dependencies = [
+ "openssl-probe",
+ "rustls-pki-types",
+ "schannel",
+ "security-framework",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3122,6 +3182,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "schannel"
+version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "schemars"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3169,6 +3238,29 @@ name = "sdd"
 version = "3.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
+
+[[package]]
+name = "security-framework"
+version = "3.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
+dependencies = [
+ "bitflags 2.11.0",
+ "core-foundation",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
+]
+
+[[package]]
+name = "security-framework-sys"
+version = "2.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
 
 [[package]]
 name = "semver"
@@ -3339,6 +3431,15 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "sharded-slab"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]
@@ -3625,6 +3726,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "thread_local"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]
@@ -3935,6 +4045,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+ "valuable",
+]
+
+[[package]]
+name = "tracing-log"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
+dependencies = [
+ "log",
+ "once_cell",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-subscriber"
+version = "0.3.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
+dependencies = [
+ "matchers",
+ "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
+ "sharded-slab",
+ "smallvec",
+ "thread_local",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
 ]
 
 [[package]]
@@ -4172,6 +4312,12 @@ dependencies = [
  "serde_core",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "valuable"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "version_check"

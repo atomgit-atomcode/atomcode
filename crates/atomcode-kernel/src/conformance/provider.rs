@@ -22,23 +22,45 @@ use std::sync::Arc;
 
 /// Run the scenario-independent provider conformance suite.
 pub async fn check(provider: Arc<dyn LlmProvider>) -> ConformanceReport {
-    let subject =
-        catch_sync(|| provider.model_name().to_string()).unwrap_or_else(|_| "<model_name() panicked>".into());
+    let subject = catch_sync(|| provider.model_name().to_string())
+        .unwrap_or_else(|_| "<model_name() panicked>".into());
     let mut r = ConformanceReport::new("LlmProvider", subject);
 
     // model_name(): non-empty + stable (it labels stored meta / telemetry).
-    match (catch_sync(|| provider.model_name().to_string()), catch_sync(|| provider.model_name().to_string())) {
+    match (
+        catch_sync(|| provider.model_name().to_string()),
+        catch_sync(|| provider.model_name().to_string()),
+    ) {
         (Ok(a), Ok(b)) => {
-            r.record("model_name_non_empty", !a.is_empty(), "model_name() must be non-empty");
-            r.record("model_name_stable", a == b, format!("model_name() must be stable across calls; got {a:?} then {b:?}"));
+            r.record(
+                "model_name_non_empty",
+                !a.is_empty(),
+                "model_name() must be non-empty",
+            );
+            r.record(
+                "model_name_stable",
+                a == b,
+                format!("model_name() must be stable across calls; got {a:?} then {b:?}"),
+            );
         }
         _ => r.record("model_name_no_panic", false, "model_name() panicked"),
     }
 
     // context_window(): stable (0 = unknown is allowed).
-    match (catch_sync(|| provider.context_window()), catch_sync(|| provider.context_window())) {
-        (Ok(a), Ok(b)) => r.record("context_window_stable", a == b, format!("context_window() must be stable across calls; got {a} then {b}")),
-        _ => r.record("context_window_no_panic", false, "context_window() panicked"),
+    match (
+        catch_sync(|| provider.context_window()),
+        catch_sync(|| provider.context_window()),
+    ) {
+        (Ok(a), Ok(b)) => r.record(
+            "context_window_stable",
+            a == b,
+            format!("context_window() must be stable across calls; got {a} then {b}"),
+        ),
+        _ => r.record(
+            "context_window_no_panic",
+            false,
+            "context_window() panicked",
+        ),
     }
 
     // chat_stream(): a minimal request opens (Ok) or fails cleanly (Err), no panic; an
@@ -118,15 +140,31 @@ pub fn check_stream_wellformed(events: &[StreamEvent]) -> ConformanceReport {
         Some(i) => r.record(
             "no_events_after_terminal",
             i + 1 == events.len(),
-            format!("a Done/Error terminal must be the LAST event; {} event(s) follow it", events.len().saturating_sub(i + 1)),
+            format!(
+                "a Done/Error terminal must be the LAST event; {} event(s) follow it",
+                events.len().saturating_sub(i + 1)
+            ),
         ),
-        None => r.record("no_events_after_terminal", true, "no Done/Error terminal present (stream ends via end-of-stream)"),
+        None => r.record(
+            "no_events_after_terminal",
+            true,
+            "no Done/Error terminal present (stream ends via end-of-stream)",
+        ),
     }
 
-    let dones = events.iter().filter(|e| matches!(e, StreamEvent::Done { .. })).count();
-    r.record("at_most_one_done", dones <= 1, format!("a stream must emit Done at most once; found {dones}"));
+    let dones = events
+        .iter()
+        .filter(|e| matches!(e, StreamEvent::Done { .. }))
+        .count();
+    r.record(
+        "at_most_one_done",
+        dones <= 1,
+        format!("a stream must emit Done at most once; found {dones}"),
+    );
 
-    let bad_status = events.iter().any(|e| matches!(e, StreamEvent::Error(err) if err.http_status.is_some()));
+    let bad_status = events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::Error(err) if err.http_status.is_some()));
     r.record(
         "midstream_error_has_no_http_status",
         !bad_status,
@@ -155,7 +193,12 @@ pub fn check_stream_reconstruction(events: &[StreamEvent]) -> ConformanceReport 
     let mut complete: Vec<ToolCall> = Vec::new();
     for ev in events {
         match ev {
-            StreamEvent::ToolCallDelta { index, id, name, arguments } => {
+            StreamEvent::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments,
+            } => {
                 let g = groups.entry(*index).or_default();
                 if g.0.is_none() {
                     if let Some(i) = id {

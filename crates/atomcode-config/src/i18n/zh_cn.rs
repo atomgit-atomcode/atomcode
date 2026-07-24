@@ -1,5 +1,5 @@
-use std::borrow::Cow;
 use super::messages::Msg;
+use std::borrow::Cow;
 
 pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
@@ -21,6 +21,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  ⚠ 登录凭证已失效 — 正在重新登录...\n".into(),
         Msg::ChatAuthExpired =>
             "认证已过期，请执行 /login 重新登录".into(),
+        Msg::NetworkConnectHint =>
+            "网络连接失败。若浏览器能打开，可能是代理/防火墙差异：用 /proxy 配置代理或设置 HTTPS_PROXY，或在浏览器打开上面的登录链接完成扫码。可按 Esc 跳过，稍后 /login 重试。".into(),
         Msg::CpSetupHeader =>
             "  AtomCode CodingPlan 配置：\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
@@ -111,6 +113,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 状态栏 ──
         Msg::StatusNoProvider =>
             "未配置 Provider · 使用 /provider 配置".into(),
+        Msg::StatusRuntimeUnavailable =>
+            "Runtime 不可用 · 请重启或查看上方错误".into(),
         Msg::StatusOfficialBuildRequired =>
             "CodingPlan 需要官方构建".into(),
         Msg::StatusUpgradeHint { version } =>
@@ -120,7 +124,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusModelNotConfigured =>
             "（未配置）".into(),
         Msg::StatusClipboardImageHint =>
-            "剪贴板有图片 · ctrl+v 粘贴".into(),
+            "剪贴板有图片 · ctrl+v / ctrl+alt+v 粘贴".into(),
         Msg::StatusClipboardImageHintSlash =>
             "剪贴板有图片 · /paste 粘贴".into(),
         Msg::StatusWebuiHint =>
@@ -169,8 +173,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── 输入 ──
     Enter                            发送消息
-    Ctrl+J                           插入换行（所有终端通用）
-    \ 后接 Enter                     插入换行（atomcode 兜底，所有终端通用）
+    \ 后接 Enter                     插入换行（所有终端通用）
     Alt+Enter                        插入换行 *
     Shift+Enter                      插入换行 **
     /                                打开斜杠命令菜单
@@ -213,24 +216,24 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
      Kitty / WezTerm / iTerm2（启用 Report Modifiers）/
      Windows Terminal / Ghostty / Warp。其他终端（包括 macOS
      Apple Terminal、默认 xterm、GNOME Terminal、VS Code 集成
-     终端）不区分 Shift+Enter 与 Enter，请用 Ctrl+J 或 \ + Enter。
+     终端）不区分 Shift+Enter 与 Enter，请用 \ + Enter。
 
   提示：输入 /help 查看完整斜杠命令列表。
 "#.into(),
 
         // ── Provider 向导 ──
         Msg::ProviderWizardHeader =>
-            "  Provider 管理 — 添加 / 编辑 / 删除 / 设为默认。按 Esc 取消。\n".into(),
+            "  管理 Provider：添加、编辑、删除或设置全局默认。按 Esc 取消。\n".into(),
         Msg::ProviderWizardCancelled =>
             "（已取消）".into(),
         Msg::ProviderMenuAdd => "添加".into(),
-        Msg::ProviderMenuAddDesc => "添加新 Provider".into(),
+        Msg::ProviderMenuAddDesc => "新建 Provider 配置".into(),
         Msg::ProviderMenuEdit => "编辑".into(),
-        Msg::ProviderMenuEditDesc => "编辑已有 Provider".into(),
+        Msg::ProviderMenuEditDesc => "修改已有 Provider 配置".into(),
         Msg::ProviderMenuDelete => "删除".into(),
-        Msg::ProviderMenuDeleteDesc => "移除 Provider".into(),
-        Msg::ProviderMenuSetDefault => "设为默认".into(),
-        Msg::ProviderMenuSetDefaultDesc => "切换默认 Provider".into(),
+        Msg::ProviderMenuDeleteDesc => "删除已有 Provider 配置".into(),
+        Msg::ProviderMenuSetDefault => "设为全局默认".into(),
+        Msg::ProviderMenuSetDefaultDesc => "设置默认 Provider，并切换当前会话".into(),
         Msg::ProviderImportPrompt =>
             "粘贴模板自动识别（curl / JSON / TOML），或直接回车手动填写：".into(),
         Msg::ProviderImportParsed { base_url, type_name, model } =>
@@ -242,7 +245,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDeleteConfirm { name } =>
             format!("删除 \"{name}\"？[y/N]").into(),
         Msg::ProviderDeleted { name } =>
-            format!("已移除 \"{name}\"。").into(),
+            format!("已删除 \"{name}\"。").into(),
         Msg::ProviderDeleteKept => "（已保留）".into(),
         Msg::ProviderDefaultSet { name } =>
             format!("默认已设为 {name}。").into(),
@@ -291,13 +294,19 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
-            format!("  已切换到 {provider} · {model}\n").into(),
+            format!("  当前会话已切换到 {provider} · {model}\n").into(),
+        Msg::ModelSwitchedAndDefault { provider, model } =>
+            format!("  已切换到 {provider} · {model}；已设为新会话默认\n").into(),
 
         // ── 会话选择器 ──
         Msg::SessionLoadFailed { error } =>
             format!("加载会话失败：{error}").into(),
         Msg::SessionResumedLabel { name } =>
             format!("已恢复：{name}").into(),
+        Msg::SessionBusyForked { source_id, fork_id } =>
+            format!(
+                "最近会话（{source_id}）正在另一个窗口运行，已从其最后提交状态创建独立分支（{fork_id}）。"
+            ).into(),
 
         // ── 待办面板 ──
         Msg::TodoPanelTitle => "待办".into(),
@@ -308,6 +317,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAllowOnce => "允许一次".into(),
         Msg::ApprovalAlwaysAllow { tool } => format!("本会话总是允许 {tool}").into(),
         Msg::ApprovalAlwaysAllowFolder => "本会话总是允许写入此目录".into(),
+        Msg::ApprovalAlwaysAllowCommand => "本会话总是允许此命令".into(),
         Msg::ApprovalDeny => "拒绝".into(),
         Msg::ApprovalHint => "↑↓ 选择 · Enter 确认 · Esc 取消".into(),
         Msg::ApprovalHeader { tool, detail } => {
@@ -342,6 +352,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("保存会话失败：{error}。未持久化新名称。").into(),
         Msg::SessionNoneSelected =>
             "未选中会话".into(),
+        Msg::SessionPickerHint =>
+            "↑↓ 移动 · Enter 打开 · Ctrl+D×2 删除 · 输入内容搜索 · Esc 取消".into(),
+        Msg::SessionPickerTitle { n, total, project } =>
+            format!("恢复会话（{n}/{total} · {project}）").into(),
+        Msg::SessionPickerTitleBare =>
+            "恢复会话".into(),
+        Msg::SessionPickerEmptyProject =>
+            "（此项目暂无会话）".into(),
+        Msg::SessionPickerEmptyFilter =>
+            "（无匹配会话）".into(),
+        Msg::SessionPickerEmptyFilterQuery { query } =>
+            format!("（无匹配 \"{query}\" — Backspace 清除）").into(),
         Msg::SessionDeleted { name } =>
             format!("「{name}」已删除").into(),
         Msg::SessionDeleteConfirm { name } =>
@@ -392,7 +414,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeTipsHeading => "上手提示".into(),
         Msg::WelcomeTipLogin => "领取免费额度".into(),
         Msg::WelcomeTipProvider => "添加自定义模型".into(),
-        Msg::WelcomeTipModel => "切换模型".into(),
+        Msg::WelcomeTipModel => "设置默认模型".into(),
         Msg::WelcomeTipResume => "恢复上次会话".into(),
         Msg::WelcomeTipSetup => "一键推荐配置".into(),
         Msg::WelcomeTipSkills => "浏览可用技能".into(),
@@ -414,8 +436,16 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  已切换到 Build 模式（完整执行）。\n".into(),
         Msg::CmdNewSession =>
             "  新会话已开始。\n".into(),
+        Msg::CmdSessionTransitionPending =>
+            "  Runtime 正在重配置；就绪前会保留当前输入。\n".into(),
+        Msg::CmdSessionTransitionFailed { error } =>
+            format!("会话切换失败，原会话仍可用：{error}").into(),
+        Msg::CmdCapabilityReloadFailed { error } =>
+            format!("Runtime 能力重载失败，原 Runtime 仍可用：{error}").into(),
         Msg::CmdNoProviders =>
             "  未配置任何 Provider。\n".into(),
+        Msg::CmdSessionListLoading =>
+            "  正在加载会话列表…\n".into(),
         Msg::CmdNoSessions =>
             "  未找到历史会话。请先开始一段对话。\n".into(),
         Msg::CmdUnknownCommand { name } =>
@@ -450,10 +480,20 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  用法：/undo 或 /undo N（N 为轮次号）。\n".into(),
         Msg::CmdNoChanges =>
             "  （无变更）\n".into(),
+        Msg::CmdDiffTruncated =>
+            "  … diff 输出已截断\n".into(),
         Msg::CmdCheckingUpdate =>
             "  正在检查更新...\n".into(),
         Msg::CmdNoActiveProvider =>
             "未配置活跃的 Provider。使用 /provider 添加一个。".into(),
+        Msg::CmdProviderUnavailable =>
+            "Provider 当前不可用。请使用 /login 登录，或用 /provider 配置。".into(),
+        Msg::CmdProviderReloading =>
+            "正在切换 Provider/模型，请等待切换完成后再发送。".into(),
+        Msg::SubmitHeldUntilProviderReady =>
+            "  ↳ provider 尚未就绪，消息已排队，就绪后将自动发送\n".into(),
+        Msg::SubmitHeldUntilLogin =>
+            "  ↳ 尚未登录，消息已排队，执行 /login 登录后将自动发送\n".into(),
 
         // ── 审批提示 ──
         Msg::ApprovalPromptAlt { tool, detail } =>
@@ -491,11 +531,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::UpgradeRolledBack { exe, backup } =>
             format!("\n✓ 已回滚。当前二进制: {}；另一版本保存在 {}\n  正在重启回滚版本...\n", exe, backup).into(),
 
-        // ── 终端键盘提示 ──
-        Msg::KbdHintMacos =>
-            "  ⚠ 终端不支持增强键盘协议。\n    请使用 Ctrl+Enter 插入换行（Shift+Enter 不可用）。\n\n".into(),
-        Msg::KbdHintOther =>
-            "  ⚠ 终端不支持增强键盘协议。\n    请使用 Alt+Enter 或 Ctrl+Enter 插入换行（Shift+Enter 不可用）。\n\n".into(),
 
         // ── /config ──
         Msg::ConfigProviderLabel { provider, path } =>
@@ -572,16 +607,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("    - {}  连接中...\n", name).into(),
         Msg::McpNoServersConfigured =>
             "  未配置 MCP 服务器。\n".into(),
-        Msg::McpClearedReconnecting { removed } =>
-            format!("  ✓ 已清除 {} 个 MCP 工具。正在后台重新连接...\n", removed).into(),
-        Msg::McpClearedNoServers { removed } =>
-            format!("  ✓ 已清除 {} 个 MCP 工具。无需连接。\n", removed).into(),
+        Msg::McpClearedReconnecting =>
+            "  已请求重载 MCP；旧 MCP 工具会先撤下，再在后台重新连接。\n".into(),
+        Msg::McpClearedNoServers =>
+            "  已请求重载 MCP；旧 MCP 工具会先撤下，当前没有已配置的服务器。\n".into(),
         Msg::McpToolsUsage =>
             "  用法：/mcp tools <服务器名>\n  示例：/mcp tools filesystem\n".into(),
-        Msg::McpToolsListing { server } =>
-            format!("  正在列出 '{}' 的 MCP 工具...\n", server).into(),
-        Msg::McpNoRegistry =>
-            "  MCP 注册表未加载。请先运行 /mcp reload。\n".into(),
         Msg::McpServersHeader =>
             "  MCP 服务器：\n".into(),
         Msg::McpReloadFailed { error } =>
@@ -598,7 +629,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpOAuthStarting { server } =>
             format!("  正在浏览器中启动 '{server}' 的 MCP OAuth 流程...\n").into(),
         Msg::McpOAuthSaved { provider, server } =>
-            format!("  已保存 MCP 服务 '{server}' 的 {provider} OAuth Token。运行 /mcp reload 完成连接。\n").into(),
+            format!("  已保存 MCP 服务 '{server}' 的 {provider} OAuth Token。正在重载 MCP 能力。\n").into(),
         Msg::McpOAuthFailed { error } =>
             format!("  MCP OAuth 失败：{error}\n").into(),
         Msg::McpOAuthTokenRemoved { server } =>
@@ -607,11 +638,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  未找到 MCP 服务 '{server}' 保存的 OAuth Token。\n").into(),
         Msg::McpOAuthLogoutFailed { error } =>
             format!("  MCP OAuth 登出失败：{error}\n").into(),
-        // MCP / LSP 服务连接反馈
-        Msg::McpServerConnected { name } =>
-            format!("✓ MCP 服务 '{name}' 已连接").into(),
-        Msg::McpServerFailed { name, error } =>
-            format!("× MCP 服务 '{name}' 失败：{error}").into(),
+        Msg::McpProjectTrusted =>
+            "  已信任本项目 — 正在重连 MCP。\n".into(),
+        Msg::McpProjectUntrusted =>
+            "  已撤销本项目信任。\n".into(),
+        Msg::McpProjectNotTrusted =>
+            "  本项目未被信任。\n".into(),
         Msg::LspServerStarted { name, ext } =>
             format!("✓ LSP 服务 '{name}' 已为 .{ext} 启动").into(),
         Msg::LspServerFailed { name, ext, error } =>
@@ -729,9 +761,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMarketplaceListFailed { error } =>
             format!("列出 marketplace 失败：{error}").into(),
         Msg::PluginAutoUpdateSkipped { detail } =>
-            format!("插件市场自动更新已跳过（不影响对话）：{detail}").into(),
+            format!("插件市场同步已跳过（不影响对话）：{detail}").into(),
         Msg::OfflineModeActive =>
             "离线模式：已停用联网工具、遥测与自动更新。".into(),
+        Msg::PluginHooksUntrusted { count, names } => format!(
+            "{count} 个插件带未信任的 hook（{names}）—— 不会运行。运行 atomcode plugin trust <name> 授权。"
+        ).into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("正在安装 `{plugin}@{marketplace}`…").into(),
         Msg::PluginInstallingByName { plugin } =>
@@ -820,12 +855,12 @@ Msg::CmdDescSetup =>
         Msg::CmdDescLogin => "使用 AtomGit OAuth 登录并领取 CodingPlan 模型".into(),
         Msg::CmdDescLogout => "退出 AtomGit 登录".into(),
         Msg::CmdDescWhoami => "显示当前登录用户".into(),
-        Msg::CmdDescModel => "切换 Provider / 模型".into(),
-        Msg::CmdDescProvider => "管理 Provider（添加 / 编辑 / 删除）".into(),
+        Msg::CmdDescModel => "设置默认 Provider / 模型，并切换当前会话".into(),
+        Msg::CmdDescProvider => "管理 Provider（添加、编辑、删除、设为全局默认）".into(),
         Msg::CmdDescStatus => "显示会话状态".into(),
         Msg::CmdDescConfig => "显示配置文件路径".into(),
         Msg::CmdDescReload => "从磁盘重新加载 $ATOMCODE_HOME/config.toml".into(),
-        Msg::CmdDescCd => "切换工作目录".into(),
+        Msg::CmdDescCd => "切换工作目录并开启新建对话".into(),
 Msg::CmdDescInit => "分析项目并生成 AGENTS.md".into(),
 Msg::CmdDescBg => "后台会话：/bg、/bg list、/bg <N>、/bg drop <N>".into(),
 Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务（只读工具子集）".into(),
@@ -876,7 +911,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescReview => "审查当前代码改动（/review · /review staged · /review <基准>）".into(),
         Msg::CmdDescGoal => "设定完成目标（自主循环直到达成）".into(),
         Msg::CmdDescProxy => "切换出站代理模式".into(),
-        Msg::CmdDescTodo => "重新打印当前任务清单（从会话记录中推导）".into(),
+        Msg::CmdDescTodo => "显示当前任务清单；`/todo add <任务>` 追加一条，`/todo clear` 清空".into(),
         Msg::CmdDescDesktop =>
             "打开 AtomCode 桌面端（已安装则启动，否则显示下载地址）".into(),
         Msg::DesktopOpening { name, path } =>
@@ -887,11 +922,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("找到了应用但启动失败：{}\n  {}\n", err, path).into(),
         Msg::TodoNoList => "当前无任务清单（模型尚未创建 todo）。".into(),
         Msg::TodoListHeader => "当前任务清单:".into(),
-        Msg::ViewUsage => "用法：/view <文件路径>".into(),
+        Msg::TodoAddUsage => "用法：/todo add <任务描述>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode 使用指南 — 输入 /guide <问题> 提问".into(),
         Msg::GuideMenuTopics => "常用话题：".into(),
         Msg::GuideMenuGettingStarted => "怎么开始使用          首次安装、登录、配置".into(),
-        Msg::GuideMenuSwitchModel => "怎么切换模型          /model /provider 操作".into(),
+        Msg::GuideMenuSwitchModel => "怎么设置默认模型       /model /provider 操作".into(),
         Msg::GuideMenuMcp => "怎么用 MCP            MCP 服务器配置与管理".into(),
         Msg::GuideMenuSkills => "怎么用技能和插件       /skills /plugin 使用".into(),
         Msg::GuideMenuMemory => "怎么用记忆功能         /remember /forget /memory".into(),
@@ -901,7 +936,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::GuideMenuConfig => "怎么配置               config.toml 配置说明".into(),
         Msg::GuideMenuTip => "
   提示：输入 /guide <你的问题> 获取具体回答。
-  例如：/guide 怎么切换模型
+  例如：/guide 怎么设置默认模型
 ".into(),
         Msg::GuideMenuDocUrl => "  完整文档：https://atomcode.atomgit.com/docs/zh/".into(),
         Msg::CmdGuideInstalling => "正在安装 ask skill，请稍候...".into(),
@@ -957,14 +992,18 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdWelcomeDescription => "重新运行 onboarding 向导".into(),
         Msg::VisionPreprocessSuccess { char_count } =>
             format!("✓ VL 识别图片成功，返回 {char_count} chars").into(),
+        Msg::VisionPreprocessFailed { reason } =>
+            format!("VL 预处理失败：{reason} · 本轮以纯文字继续，图片已恢复可重试").into(),
         Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens, cached_pct } =>
             format!(
                 "✓ {done} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens{}",
                 super::fmt_tokens(total_tokens),
                 cached_pct.map(|p| format!(" · {p}% cached")).unwrap_or_default(),
             ).into(),
-        Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✗ 已中断 · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
+        Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens, reason } => {
+            let cause = reason.map(|r| format!("：{r}")).unwrap_or_default();
+            format!("✗ 已中断{cause} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
+        }
         Msg::LoginQrHeader =>
             "  登录 AtomGit — 使用微信扫描下方二维码：\n\n".into(),
         Msg::LoginUrlAfterQr =>
@@ -1210,7 +1249,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::UsageCodingPlanOnly =>
             "使用情况仅 CodingPlan 可用 — 请先 /login。".into(),
 
-        // ── engine v2 provider init (atomcode-bridge) ──
+        // ── CodingRuntime provider init ──
         Msg::ProviderInitFailed { detail } =>
             format!("模型初始化失败：{detail}").into(),
         Msg::ProviderInitNeedsLogin =>

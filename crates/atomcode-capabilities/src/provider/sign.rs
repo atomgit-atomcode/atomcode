@@ -14,8 +14,35 @@ pub struct SignedAuth {
     pub headers: Vec<(String, String)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestSigningError {
+    CredentialsUnavailable(String),
+    SigningFailed(String),
+}
+
+impl RequestSigningError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::CredentialsUnavailable(_) => "authentication_unavailable",
+            Self::SigningFailed(_) => "request_signing_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for RequestSigningError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CredentialsUnavailable(message) | Self::SigningFailed(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for RequestSigningError {}
+
 /// Supplies per-attempt auth for a request. See the module docs.
 pub trait RequestSigner: Send + Sync {
     /// Produce auth for one attempt over the given request body.
-    fn sign(&self, body: &[u8]) -> SignedAuth;
+    fn sign(&self, body: &[u8]) -> Result<SignedAuth, RequestSigningError>;
 }

@@ -13,7 +13,7 @@
 
 use super::{err, ok};
 use async_trait::async_trait;
-use atomcode_kernel::agent::{Agent, AutoRespond};
+use atomcode_kernel::agent::{Agent, AutoRespond, ToolLoopPolicy};
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, Tool, ToolContext, ToolResult};
@@ -39,6 +39,8 @@ pub struct ParallelEditTool {
     make_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     persona: String,
     max_files: usize,
+    max_rounds: Option<u32>,
+    tool_loop_policy: Option<ToolLoopPolicy>,
 }
 
 impl ParallelEditTool {
@@ -51,6 +53,8 @@ impl ParallelEditTool {
             make_tools: Box::new(make_tools),
             persona: DEFAULT_PERSONA.to_string(),
             max_files: DEFAULT_MAX_FILES,
+            max_rounds: Some(super::DEFAULT_CHILD_MAX_ROUNDS),
+            tool_loop_policy: Some(ToolLoopPolicy::default()),
         }
     }
     /// Override the per-child system prompt.
@@ -61,6 +65,19 @@ impl ParallelEditTool {
     /// Override the max number of files per call (default 12).
     pub fn with_max_files(mut self, max: usize) -> Self {
         self.max_files = max.max(2);
+        self
+    }
+    /// Override the per-child model-round high-water mark. `0` disables this cap;
+    /// the exact no-progress policy is configured independently.
+    pub fn with_max_rounds(mut self, n: u32) -> Self {
+        self.max_rounds = (n != 0).then_some(n);
+        self
+    }
+
+    /// Use the embedding product's exact no-progress policy. `None` disables it
+    /// for intentional repeated operations; the independent round cap still applies.
+    pub fn with_tool_loop_policy(mut self, policy: Option<ToolLoopPolicy>) -> Self {
+        self.tool_loop_policy = policy;
         self
     }
 }
@@ -174,7 +191,10 @@ impl Tool for ParallelEditTool {
         let contract_block = if a.contract.trim().is_empty() {
             String::new()
         } else {
-            format!("\n\nCross-file contract (honor exactly):\n{}", a.contract.trim())
+            format!(
+                "\n\nCross-file contract (honor exactly):\n{}",
+                a.contract.trim()
+            )
         };
 
         // Spawn one detached child agent per file, concurrently. Detaching via
@@ -183,20 +203,27 @@ impl Tool for ParallelEditTool {
         // child is stopped only by `ctx.cancel.child_token()` cascading in.
         // Dispatch header so the user sees the fan-out begin (v1 SubAgentDispatchStart
         // parity). Per-file ↻/✓/✗ lines follow via `ctx.progress` → ToolProgress.
-        ctx.progress.emit(format!("并行编辑 {} 个文件(子代理)", a.files.len()));
+        ctx.progress
+            .emit(format!("并行编辑 {} 个文件(子代理)", a.files.len()));
         let mut handles = Vec::with_capacity(a.files.len());
         for f in &a.files {
             let task = format!(
                 "File to edit: {}\n\nInstruction:\n{}{}\n\nEdit ONLY this file using your tools, then stop.",
                 f.path, f.instruction, contract_block
             );
-            let child = Agent::builder()
+            let mut builder = Agent::builder()
                 .provider((self.make_provider)())
                 .tools((self.make_tools)())
                 .persona(self.persona.clone())
                 .working_dir(ctx.working_dir.clone())
-                .cancel_token(ctx.cancel.child_token())
-                .build();
+                .cancel_token(ctx.cancel.child_token());
+            if let Some(policy) = self.tool_loop_policy {
+                builder = builder.tool_loop_policy(policy);
+            }
+            if let Some(max_rounds) = self.max_rounds {
+                builder = builder.max_rounds(max_rounds);
+            }
+            let child = builder.build();
             let path = f.path.clone();
             // Cheap clone (Arc inside); moved into the child task so it can report the
             // moment THIS child settles — concurrent, so lines interleave by real
@@ -205,7 +232,11 @@ impl Tool for ParallelEditTool {
             handles.push(tokio::spawn(async move {
                 progress.emit(format!("↻ {path}"));
                 let outcome = child.run_to_completion(task, AutoRespond::AllowAll).await;
-                let icon = if outcome.stop == StopReason::Stopped { "✓" } else { "✗" };
+                let icon = if outcome.stop == StopReason::Stopped {
+                    "✓"
+                } else {
+                    "✗"
+                };
                 progress.emit(format!("{icon} {path}"));
                 (path, outcome)
             }));
@@ -236,7 +267,11 @@ impl Tool for ParallelEditTool {
             };
             if outcome.stop == StopReason::Stopped {
                 let summary = outcome.text.lines().next().unwrap_or("").trim();
-                let summary = if summary.is_empty() { "(edited)" } else { summary };
+                let summary = if summary.is_empty() {
+                    "(edited)"
+                } else {
+                    summary
+                };
                 results.push(FileResult {
                     path,
                     success: true,
@@ -245,7 +280,9 @@ impl Tool for ParallelEditTool {
                     failures: vec![],
                 });
             } else {
-                let reason = outcome.error.unwrap_or_else(|| format!("{:?}", outcome.stop));
+                let reason = outcome
+                    .error
+                    .unwrap_or_else(|| format!("{:?}", outcome.stop));
                 results.push(FileResult {
                     path: path.clone(),
                     success: false,
@@ -421,10 +458,17 @@ mod tests {
         ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
             match &self.reply {
                 Some(text) => {
-                    let evs = vec![StreamEvent::TextDelta(text.clone()), StreamEvent::Done { truncated: false }];
+                    let evs = vec![
+                        StreamEvent::TextDelta(text.clone()),
+                        StreamEvent::Done { truncated: false },
+                    ];
                     Ok(stream::iter(evs).boxed())
                 }
-                None => Err(ProviderError { retryable: false, message: "mock open failure".into(), ..Default::default() }),
+                None => Err(ProviderError {
+                    retryable: false,
+                    message: "mock open failure".into(),
+                    ..Default::default()
+                }),
             }
         }
     }
@@ -440,15 +484,36 @@ mod tests {
             working_dir: dir,
             cancel: CancellationToken::new(),
             progress: ProgressSink::noop(),
+            requester: None,
         }
     }
 
     fn tool(reply: Option<&'static str>) -> ParallelEditTool {
         let reply = reply.map(|s| s.to_string());
         ParallelEditTool::new(
-            move || Arc::new(MockProvider { reply: reply.clone() }) as Arc<dyn LlmProvider>,
+            move || {
+                Arc::new(MockProvider {
+                    reply: reply.clone(),
+                }) as Arc<dyn LlmProvider>
+            },
             || ToolRegistry::new().mount(&[]), // children need no tools for these tests
         )
+    }
+
+    #[test]
+    fn child_round_limit_is_configurable_and_zero_means_unbounded() {
+        assert_eq!(tool(None).max_rounds, Some(200));
+        assert_eq!(tool(None).with_max_rounds(500).max_rounds, Some(500));
+        assert_eq!(tool(None).with_max_rounds(0).max_rounds, None);
+    }
+
+    #[test]
+    fn child_exact_loop_policy_can_be_inherited_or_disabled() {
+        assert_eq!(tool(None).tool_loop_policy, Some(ToolLoopPolicy::default()));
+        assert_eq!(
+            tool(None).with_tool_loop_policy(None).tool_loop_policy,
+            None
+        );
     }
 
     #[tokio::test]
@@ -466,6 +531,7 @@ mod tests {
             working_dir: tempfile::tempdir().expect("tempdir").keep(),
             cancel: CancellationToken::new(),
             progress: sink,
+            requester: None,
         };
         let _ = tool(Some("done"))
             .execute(
@@ -475,11 +541,23 @@ mod tests {
             .await;
         let msgs = captured.lock().unwrap();
         // Start line per file.
-        assert!(msgs.iter().any(|m| m.contains("↻") && m.contains("a.rs")), "start a.rs: {msgs:?}");
-        assert!(msgs.iter().any(|m| m.contains("↻") && m.contains("b.rs")), "start b.rs: {msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("↻") && m.contains("a.rs")),
+            "start a.rs: {msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("↻") && m.contains("b.rs")),
+            "start b.rs: {msgs:?}"
+        );
         // Settle line per file (mock provider stops cleanly → ✓).
-        assert!(msgs.iter().any(|m| m.contains("✓") && m.contains("a.rs")), "done a.rs: {msgs:?}");
-        assert!(msgs.iter().any(|m| m.contains("✓") && m.contains("b.rs")), "done b.rs: {msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("✓") && m.contains("a.rs")),
+            "done a.rs: {msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("✓") && m.contains("b.rs")),
+            "done b.rs: {msgs:?}"
+        );
     }
 
     #[tokio::test]
@@ -499,14 +577,18 @@ mod tests {
 
     #[tokio::test]
     async fn fewer_than_two_files_errors() {
-        let r = tool(Some("x")).execute(r#"{"files":[{"path":"a.rs","instruction":"y"}]}"#, &ctx()).await;
+        let r = tool(Some("x"))
+            .execute(r#"{"files":[{"path":"a.rs","instruction":"y"}]}"#, &ctx())
+            .await;
         assert!(r.is_error);
         assert!(r.content.contains("at least 2 files"), "{}", r.content);
     }
 
     #[tokio::test]
     async fn too_many_files_errors() {
-        let files: Vec<String> = (0..13).map(|i| format!("{{\"path\":\"f{i}.rs\",\"instruction\":\"x\"}}")).collect();
+        let files: Vec<String> = (0..13)
+            .map(|i| format!("{{\"path\":\"f{i}.rs\",\"instruction\":\"x\"}}"))
+            .collect();
         let args = format!("{{\"files\":[{}]}}", files.join(","));
         let r = tool(Some("x")).execute(&args, &ctx()).await;
         assert!(r.is_error);
@@ -516,10 +598,17 @@ mod tests {
     #[tokio::test]
     async fn empty_path_or_instruction_errors() {
         let r = tool(Some("x"))
-            .execute(r#"{"files":[{"path":"a.rs","instruction":""},{"path":"b.rs","instruction":"y"}]}"#, &ctx())
+            .execute(
+                r#"{"files":[{"path":"a.rs","instruction":""},{"path":"b.rs","instruction":"y"}]}"#,
+                &ctx(),
+            )
             .await;
         assert!(r.is_error);
-        assert!(r.content.contains("files[0].instruction is empty"), "{}", r.content);
+        assert!(
+            r.content.contains("files[0].instruction is empty"),
+            "{}",
+            r.content
+        );
     }
 
     #[tokio::test]
@@ -536,6 +625,9 @@ mod tests {
 
     #[test]
     fn risk_is_risky() {
-        assert_eq!(tool(Some("x")).risk("{}"), atomcode_kernel::tool::RiskLevel::Risky);
+        assert_eq!(
+            tool(Some("x")).risk("{}"),
+            atomcode_kernel::tool::RiskLevel::Risky
+        );
     }
 }

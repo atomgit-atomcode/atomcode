@@ -25,8 +25,8 @@ async fn main() {
         eprintln!("Set ATOMCODE_API_KEY (+ optional ATOMCODE_BASE_URL / ATOMCODE_MODEL) to run a live task.");
         std::process::exit(2);
     };
-    let base_url =
-        std::env::var("ATOMCODE_BASE_URL").unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string());
+    let base_url = std::env::var("ATOMCODE_BASE_URL")
+        .unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string());
     let model = std::env::var("ATOMCODE_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string());
     let cwd = std::env::current_dir().expect("cwd");
 

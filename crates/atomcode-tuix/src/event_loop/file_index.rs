@@ -5,10 +5,21 @@
 // See spec: docs/superpowers/specs/2026-05-06-at-mention-design.md
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
+
+/// Well-known agent/CLI config directories that must appear in the `@`
+/// index even when `.gitignore` excludes them. These are exactly the dirs
+/// atomcode already treats as skill/command sources (see
+/// `atomcode_core::skill` and `standard_skill_dirs`), and users routinely
+/// gitignore them while still wanting to `@`-reference the skills/config
+/// inside. The general gitignore filter — which keeps `node_modules/`,
+/// `target/`, build output, etc. out of the popup — stays intact for
+/// everything else; only these names are force-indexed.
+const ALWAYS_INDEX_DIRS: &[&str] = &[".claude", ".atomcode", ".agents"];
 
 /// How long a completed full-tree index stays "fresh" before the next
 /// `filter()` call kicks a background re-walk. This is what lets files
@@ -30,6 +41,16 @@ const STALE_TTL: Duration = Duration::from_secs(3);
 /// keeps the worst case sub-second.
 const MAX_INDEX_ENTRIES: usize = 50_000;
 
+/// Per-directory cap for the allowlist pass (`ALWAYS_INDEX_DIRS`). The
+/// allowlist walks these dirs with gitignore OFF and runs before the main
+/// walk, so without a bound a large `.claude` (accumulated session history,
+/// plugin caches, a vendored skill repo) could monopolize `MAX_INDEX_ENTRIES`
+/// and starve the user's actual source files out of the `@` popup — a
+/// regression vs. the old behaviour where a gitignored `.claude` contributed
+/// nothing. The popup only shows 30 rows and substring-searches, so a few
+/// thousand skill/command entries per dir is already far more than useful.
+const ALLOWLIST_DIR_MAX_ENTRIES: usize = 2_000;
+
 // ---------------------------------------------------------------------------
 // Token detection
 // ---------------------------------------------------------------------------
@@ -47,12 +68,15 @@ const MAX_INDEX_ENTRIES: usize = 50_000;
 /// 4. Token = characters from `@`'s next byte to the next whitespace
 ///    (or EOF), including bytes after cursor.
 pub fn detect_at_mention(buf: &str, cursor: usize) -> Option<String> {
-    detect_at_mention_range(buf, cursor)
-        .map(|(at_pos, end)| buf[at_pos + 1..end].to_string())
+    detect_at_mention_range(buf, cursor).map(|(at_pos, end)| buf[at_pos + 1..end].to_string())
 }
 
 pub fn format_at_mention_replacement(selected_path: &str) -> String {
-    format!("@{}", selected_path)
+    if selected_path.ends_with('/') {
+        format!("@{}", selected_path)
+    } else {
+        format!("@{} ", selected_path)
+    }
 }
 
 /// Companion to `detect_at_mention`. Returns the byte range
@@ -102,6 +126,51 @@ fn rel_path_to_forward_slash(rel: &std::path::Path) -> String {
     } else {
         s.replace(std::path::MAIN_SEPARATOR, "/")
     }
+}
+
+/// Convert one walked dir-entry — its path already made relative to the
+/// index root — into an `Entry` and push it, applying the filters shared by
+/// the allowlist pass and the main gitignore walk: skip the walk root
+/// itself, skip whitespace-containing paths (they'd break
+/// `detect_at_mention`'s whitespace-as-terminator rule), skip `.git/`
+/// internals at any depth (nobody `@`-references git metadata), and dedup via
+/// `seen` so a dir surfaced by BOTH passes is indexed once. Returns `true`
+/// once `out` reaches `max_entries`, signalling the caller to stop walking.
+fn push_indexed(
+    out: &mut Vec<Entry>,
+    seen: &mut HashSet<String>,
+    rel: &Path,
+    is_dir: bool,
+    max_entries: usize,
+) -> bool {
+    if rel.as_os_str().is_empty() {
+        return false; // the walk root itself
+    }
+    // Skip `.git` at ANY depth — a gitignore-respecting walk doesn't
+    // auto-skip `.git` (the dir isn't tracked), and the allowlist pass
+    // (git_ignore(false)) can descend into a nested `.claude/.git/` of a
+    // vendored skill repo. Component-wise so both the root `.git/` and
+    // nested ones are dropped; nobody `@`-references git metadata.
+    if rel.components().any(|c| c.as_os_str() == ".git") {
+        return false;
+    }
+    let mut s = rel_path_to_forward_slash(rel);
+    if s.contains(char::is_whitespace) {
+        return false;
+    }
+    if is_dir {
+        s.push('/');
+    }
+    if !seen.insert(s.clone()) {
+        return false; // already indexed by the other pass
+    }
+    let depth = rel.components().count();
+    out.push(Entry {
+        rel_path: s,
+        is_dir,
+        depth,
+    });
+    out.len() >= max_entries
 }
 
 /// Splits a mention token (without leading `@`) into `(scope_dir, filter)`
@@ -355,6 +424,63 @@ impl FileIndex {
     /// later hides.
     fn walk_with_depth(root: PathBuf, max_depth: Option<usize>, max_entries: usize) -> Vec<Entry> {
         let mut out = Vec::new();
+        // Dedup key shared across the allowlist pass and the main walk, so an
+        // allowlisted dir that is NOT gitignored isn't indexed twice.
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // Allowlist pass: force-index the well-known agent/CLI config dirs
+        // (`.claude`, …) even when `.gitignore` excludes them. Runs FIRST, but
+        // each dir is bounded by `ALLOWLIST_DIR_MAX_ENTRIES` so a large
+        // `.claude` can't monopolize the budget and starve the main walk's
+        // source files. The main gitignore-aware walk below fills the rest, so
+        // `node_modules/` / `target/` stay filtered out as before.
+        for name in ALWAYS_INDEX_DIRS {
+            let dir = root.join(name);
+            if !dir.is_dir() {
+                continue;
+            }
+            // Per-dir budget, still clamped by the global cap: hitting the
+            // per-dir cap just stops THIS dir and moves on; hitting the global
+            // cap stops everything (checked after the loop).
+            let dir_cap = out
+                .len()
+                .saturating_add(ALLOWLIST_DIR_MAX_ENTRIES)
+                .min(max_entries);
+            // Depth is measured from `root`; the dir sits at depth 1, so its
+            // subtree budget is one less. `Some(0)` makes the sub-walk yield
+            // only the dir itself (its `<name>/` entry), matching the main
+            // walk's depth-1 "top-level dirs only" shallow view.
+            let sub_depth = max_depth.map(|d| d.saturating_sub(1));
+            let mut b = WalkBuilder::new(&dir);
+            b.hidden(false)
+                .git_ignore(false)
+                .git_global(false)
+                .git_exclude(false)
+                .ignore(false)
+                .parents(false)
+                .require_git(false)
+                .max_filesize(None);
+            b.max_depth(sub_depth);
+            for result in b.build() {
+                let Ok(dent) = result else { continue };
+                // Paths are under `dir`, itself under `root`, so strip_prefix
+                // yields `<name>/…` — the same shape the main walk produces.
+                let Ok(rel) = dent.path().strip_prefix(&root) else {
+                    continue;
+                };
+                let is_dir = dent.file_type().is_some_and(|t| t.is_dir());
+                // Stop at the per-dir cap; break (not return) so remaining
+                // agent dirs and the main walk still run.
+                if push_indexed(&mut out, &mut seen, rel, is_dir, dir_cap) {
+                    break;
+                }
+            }
+            // Global cap genuinely exhausted → nothing more can be added.
+            if out.len() >= max_entries {
+                return out;
+            }
+        }
+
         let mut builder = WalkBuilder::new(&root);
         builder
             .hidden(false)
@@ -374,40 +500,11 @@ impl FileIndex {
             let Ok(rel) = dent.path().strip_prefix(&root) else {
                 continue;
             };
-            if rel.as_os_str().is_empty() {
-                continue; // skip the root itself
-            }
             let is_dir = dent.file_type().is_some_and(|t| t.is_dir());
-            let mut s = rel_path_to_forward_slash(rel);
-
-            // v1 limitation: skip paths containing whitespace (would break
-            // detect_at_mention's whitespace-as-terminator rule).
-            if s.contains(char::is_whitespace) {
-                continue;
-            }
-
-            // Hide `.git/` and its contents — gitignore-respecting walk
-            // doesn't auto-skip it (the directory itself isn't tracked).
-            // The user almost never wants to `@`-reference internal git
-            // metadata; surfacing it just clutters the popup.
-            if s == ".git" || s == ".git/" || s.starts_with(".git/") {
-                continue;
-            }
-
-            if is_dir {
-                s.push('/');
-            }
-            let depth = rel.components().count();
-            out.push(Entry {
-                rel_path: s,
-                is_dir,
-                depth,
-            });
-
             // CPU/memory backstop: stop the (otherwise unbounded) walk once
             // we've collected enough. Dropping the `walker` iterator here stops
             // further filesystem traversal, so a giant tree can't peg a core.
-            if out.len() >= max_entries {
+            if push_indexed(&mut out, &mut seen, rel, is_dir, max_entries) {
                 break;
             }
         }
@@ -561,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn at_mention_replacement_keeps_token_active() {
+    fn directory_at_mention_replacement_keeps_token_active() {
         let replacement = format_at_mention_replacement("crates/atomcode-bridge/");
 
         assert_eq!(replacement, "@crates/atomcode-bridge/");
@@ -569,6 +666,14 @@ mod tests {
             detect_at_mention(&replacement, replacement.len()),
             Some("crates/atomcode-bridge/".to_string())
         );
+    }
+
+    #[test]
+    fn file_at_mention_replacement_finalizes_token() {
+        let replacement = format_at_mention_replacement("latest.json");
+
+        assert_eq!(replacement, "@latest.json ");
+        assert_eq!(detect_at_mention(&replacement, replacement.len()), None);
     }
 
     // ---- split_token ----
@@ -605,14 +710,46 @@ mod tests {
         FileIndex::from_entries(
             PathBuf::from("/tmp"),
             vec![
-                Entry { rel_path: "Cargo.toml".into(), is_dir: false, depth: 1 },
-                Entry { rel_path: "crates/".into(), is_dir: true, depth: 1 },
-                Entry { rel_path: "docker/".into(), is_dir: true, depth: 1 },
-                Entry { rel_path: ".atomcode/".into(), is_dir: true, depth: 1 },
-                Entry { rel_path: "crates/atomcode-cli/".into(), is_dir: true, depth: 2 },
-                Entry { rel_path: "crates/atomcode-tuix/".into(), is_dir: true, depth: 2 },
-                Entry { rel_path: "crates/atomcode-tuix/Cargo.toml".into(), is_dir: false, depth: 3 },
-                Entry { rel_path: "docker/Dockerfile".into(), is_dir: false, depth: 2 },
+                Entry {
+                    rel_path: "Cargo.toml".into(),
+                    is_dir: false,
+                    depth: 1,
+                },
+                Entry {
+                    rel_path: "crates/".into(),
+                    is_dir: true,
+                    depth: 1,
+                },
+                Entry {
+                    rel_path: "docker/".into(),
+                    is_dir: true,
+                    depth: 1,
+                },
+                Entry {
+                    rel_path: ".atomcode/".into(),
+                    is_dir: true,
+                    depth: 1,
+                },
+                Entry {
+                    rel_path: "crates/atomcode-cli/".into(),
+                    is_dir: true,
+                    depth: 2,
+                },
+                Entry {
+                    rel_path: "crates/atomcode-tuix/".into(),
+                    is_dir: true,
+                    depth: 2,
+                },
+                Entry {
+                    rel_path: "crates/atomcode-tuix/Cargo.toml".into(),
+                    is_dir: false,
+                    depth: 3,
+                },
+                Entry {
+                    rel_path: "docker/Dockerfile".into(),
+                    is_dir: false,
+                    depth: 2,
+                },
             ],
         )
     }
@@ -647,11 +784,7 @@ mod tests {
         let result = idx.filter("", "tuix");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         // Should include the depth-2 dir even though we filtered from root.
-        assert!(
-            names.contains(&"crates/atomcode-tuix/"),
-            "got: {:?}",
-            names
-        );
+        assert!(names.contains(&"crates/atomcode-tuix/"), "got: {:?}", names);
     }
 
     #[test]
@@ -744,6 +877,162 @@ mod tests {
             !names.contains(&"ignored.txt"),
             "gitignored file should be skipped: {:?}",
             names
+        );
+    }
+
+    // Feature: the well-known agent-config dirs (`.claude`, `.atomcode`,
+    // `.agents`) must be `@`-indexable even when `.gitignore` excludes them,
+    // so a project that gitignores `.claude` can still `@`-reference the
+    // skills/commands inside. Other gitignored paths stay filtered out.
+    #[test]
+    fn allowlisted_agent_dirs_bypass_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join(".gitignore"), ".claude/\nnode_modules/\n");
+        write_file(&tmp.path().join(".claude/skills/wiki/SKILL.md"), "x");
+        write_file(&tmp.path().join("node_modules/dep/index.js"), "y");
+        write_file(&tmp.path().join("kept.txt"), "z");
+
+        let idx = FileIndex::new(tmp.path().to_path_buf());
+
+        // Top-level view (empty filter = direct children only): the
+        // gitignored `.claude/` dir is now indexed; `node_modules/` is not.
+        let top: Vec<String> = filter_walk(&idx, "", "")
+            .iter()
+            .map(|e| e.rel_path.clone())
+            .collect();
+        assert!(
+            top.contains(&".claude/".to_string()),
+            "top-level: {:?}",
+            top
+        );
+        assert!(
+            top.contains(&"kept.txt".to_string()),
+            "top-level: {:?}",
+            top
+        );
+        assert!(
+            !top.iter().any(|n| n.starts_with("node_modules")),
+            "gitignored node_modules must not surface: {:?}",
+            top
+        );
+
+        // Cross-level filter proves the whole gitignored `.claude` subtree is
+        // in the index (reachable by `@`-drilling or filtering).
+        let deep: Vec<String> = filter_walk(&idx, "", "SKILL")
+            .iter()
+            .map(|e| e.rel_path.clone())
+            .collect();
+        assert!(
+            deep.iter().any(|n| n == ".claude/skills/wiki/SKILL.md"),
+            "gitignored .claude contents must be indexed: {:?}",
+            deep
+        );
+
+        // Other gitignored trees stay out of the index entirely.
+        let nm: Vec<String> = filter_walk(&idx, "", "index.js")
+            .iter()
+            .map(|e| e.rel_path.clone())
+            .collect();
+        assert!(
+            nm.is_empty(),
+            "node_modules must stay filtered out: {:?}",
+            nm
+        );
+    }
+
+    // A `.claude` dir that is NOT gitignored must still be indexed exactly
+    // once (the allowlist pass and the main walk both see it → dedup).
+    #[test]
+    fn allowlisted_dir_not_double_indexed_when_tracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join(".claude/skills/wiki/SKILL.md"), "x");
+
+        let idx = FileIndex::new(tmp.path().to_path_buf());
+        let result = filter_walk(&idx, "", "");
+        let claude_hits = result.iter().filter(|e| e.rel_path == ".claude/").count();
+        assert_eq!(
+            claude_hits, 1,
+            "`.claude/` must be indexed once, not duplicated"
+        );
+    }
+
+    // Regression (review): a `.git` nested inside an allowlisted dir (e.g. a
+    // vendored skill repo at `.claude/skills/repo/.git/`) must NOT leak into
+    // the index — the allowlist pass walks with git_ignore(false), so the
+    // per-entry `.git` filter has to match at any depth, not just the root.
+    #[test]
+    fn nested_git_inside_allowlisted_dir_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join(".gitignore"), ".claude/\n");
+        write_file(&tmp.path().join(".claude/skills/repo/.git/HEAD"), "ref: x");
+        write_file(&tmp.path().join(".claude/skills/repo/SKILL.md"), "y");
+
+        let idx = FileIndex::new(tmp.path().to_path_buf());
+        let all: Vec<String> = filter_walk(&idx, "", "git")
+            .iter()
+            .map(|e| e.rel_path.clone())
+            .collect();
+        assert!(
+            !all.iter()
+                .any(|n| n.contains("/.git/") || n.ends_with("/.git")),
+            "nested .git must be filtered out: {:?}",
+            all
+        );
+        // The real skill file next to it must still be indexed.
+        let skills: Vec<String> = filter_walk(&idx, "", "SKILL")
+            .iter()
+            .map(|e| e.rel_path.clone())
+            .collect();
+        assert!(
+            skills.iter().any(|n| n == ".claude/skills/repo/SKILL.md"),
+            "skill file must still be indexed: {:?}",
+            skills
+        );
+    }
+
+    // Regression (review): a large `.claude` must not starve the user's
+    // source files out of the `@` index. The allowlist pass is bounded per
+    // dir by `ALLOWLIST_DIR_MAX_ENTRIES`, so the main walk always runs and
+    // the tracked source file still shows up.
+    #[test]
+    fn large_allowlisted_dir_does_not_starve_source_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join(".gitignore"), ".claude/\n");
+        // Overflow the per-dir cap with junk under `.claude`.
+        for i in 0..(ALLOWLIST_DIR_MAX_ENTRIES + 50) {
+            write_file(&tmp.path().join(format!(".claude/junk/f{i}.txt")), "x");
+        }
+        write_file(&tmp.path().join("main.rs"), "fn main() {}");
+
+        let idx = FileIndex::new(tmp.path().to_path_buf());
+
+        // The source file survived (main walk still ran after the cap).
+        let top: Vec<String> = filter_walk(&idx, "", "")
+            .iter()
+            .map(|e| e.rel_path.clone())
+            .collect();
+        assert!(
+            top.contains(&"main.rs".to_string()),
+            "source file must not be starved by a large .claude: {:?}",
+            top
+        );
+        // Inspect the RAW cache (not `filter`, which truncates to 30): the
+        // allowlist contribution for `.claude/junk/` must be bounded by the
+        // per-dir cap even though 2050 files exist on disk. Without the cap
+        // this count would exceed ALLOWLIST_DIR_MAX_ENTRIES.
+        let junk = idx
+            .entries
+            .borrow()
+            .as_ref()
+            .map(|v| {
+                v.iter()
+                    .filter(|e| e.rel_path.starts_with(".claude/junk/"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert!(
+            junk > 0 && junk <= ALLOWLIST_DIR_MAX_ENTRIES,
+            "allowlist pass must be capped per dir, indexed {junk} junk entries"
         );
     }
 
@@ -859,7 +1148,11 @@ mod tests {
         idx.mark_stale();
         let r3 = filter_walk(&idx, "", "");
         let n3: Vec<&str> = r3.iter().map(|e| e.rel_path.as_str()).collect();
-        assert!(n3.contains(&"second.txt"), "TTL refresh should surface new file: {:?}", n3);
+        assert!(
+            n3.contains(&"second.txt"),
+            "TTL refresh should surface new file: {:?}",
+            n3
+        );
         assert!(n3.contains(&"first.txt"), "got: {:?}", n3);
     }
 

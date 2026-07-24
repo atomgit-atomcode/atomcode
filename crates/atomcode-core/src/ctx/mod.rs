@@ -33,6 +33,7 @@ pub mod file_store;
 pub mod ollama;
 pub mod render;
 pub mod resolver;
+pub mod stats;
 pub mod truncate;
 
 use crate::conversation::message::Message;
@@ -43,6 +44,7 @@ pub use default::DefaultCtx;
 pub use env::EnvSnapshot;
 pub use ollama::OllamaCtx;
 pub use resolver::for_provider;
+pub use stats::{compute_rich_context_stats, RichContextStats};
 
 /// Per-session context construction strategy. Selected once at
 /// `AgentLoop::new` via [`for_provider`] and rebuilt on `ReloadConfig`.
@@ -94,8 +96,7 @@ pub trait CtxBuilder: Send + Sync {
     ///
     /// Reflects any defensive clamps the impl applies (e.g. `OllamaCtx`
     /// floors at 4K even if `provider.context_window == 0`). Callers
-    /// that need the actual budget — `ctx_budget_hint` reset, datalog,
-    /// per-tool truncation — should use this instead of
+    /// that need the actual budget should use this instead of
     /// `Config::default_context_window()`, which returns the raw,
     /// unclamped value and may diverge for degenerate configs.
     fn ctx_window(&self) -> usize;

@@ -409,7 +409,8 @@ async fn multi_edit_string_line_numbers() {
             "end_line": "3",
             "new_string": "replaced"
         }]
-    }).to_string();
+    })
+    .to_string();
 
     let result = tool.execute(&args, &ctx).await.unwrap();
     assert!(
@@ -890,7 +891,9 @@ fn main() {
     let after = std::fs::read_to_string(&path).unwrap();
     // The critical assertion: `.run(...)` must still be at 8 spaces,
     // not 17 (8 + 9 drift) nor any other amount.
-    let run_line = after.lines().find(|l| l.contains(".run(tauri::"))
+    let run_line = after
+        .lines()
+        .find(|l| l.contains(".run(tauri::"))
         .expect("`.run(` line must still exist after edit");
     let run_indent = run_line.len() - run_line.trim_start().len();
     assert_eq!(
@@ -899,10 +902,16 @@ fn main() {
         run_indent, after
     );
     // Expect `.expect(...)` on its own 8-space-indented line too.
-    assert!(after.contains("        .expect(\"error while running"),
-        "`.expect(...)` should keep 8-space indent; got:\n{}", after);
+    assert!(
+        after.contains("        .expect(\"error while running"),
+        "`.expect(...)` should keep 8-space indent; got:\n{}",
+        after
+    );
     // Marker was added (new_string included it).
-    assert!(after.contains("undefined_marker"), "marker should be present");
+    assert!(
+        after.contains("undefined_marker"),
+        "marker should be present"
+    );
     cleanup(&path);
 }
 
@@ -941,7 +950,9 @@ fn main() {
     assert!(r2.success);
 
     let after = std::fs::read_to_string(&path).unwrap();
-    let run_line = after.lines().find(|l| l.contains(".run(tauri::"))
+    let run_line = after
+        .lines()
+        .find(|l| l.contains(".run(tauri::"))
         .expect("`.run(` line");
     let run_indent = run_line.len() - run_line.trim_start().len();
     // Without the fix this would be 17 or 26. With the fix it's 8.
@@ -951,7 +962,11 @@ fn main() {
         run_indent, after
     );
     // Marker should be gone.
-    assert!(!after.contains("marker"), "marker should be deleted, got:\n{}", after);
+    assert!(
+        !after.contains("marker"),
+        "marker should be deleted, got:\n{}",
+        after
+    );
     cleanup(&path);
 }
 
@@ -983,15 +998,21 @@ async fn fuzzy_match_handles_outdented_lines_correctly() {
 
     let after = std::fs::read_to_string(&path).unwrap();
     // `updated_foo` should keep its 8-space indent (anchor match).
-    let foo_line = after.lines().find(|l| l.contains("updated_foo"))
+    let foo_line = after
+        .lines()
+        .find(|l| l.contains("updated_foo"))
         .expect("updated_foo line");
     assert_eq!(foo_line.len() - foo_line.trim_start().len(), 8);
     // `outdented()` was 6 less than anchor → 8 - 6 = 2 spaces.
-    let out_line = after.lines().find(|l| l.contains("outdented"))
+    let out_line = after
+        .lines()
+        .find(|l| l.contains("outdented"))
         .expect("outdented line");
     assert_eq!(out_line.len() - out_line.trim_start().len(), 2);
     // `bareline()` was 8 less than anchor → clamp to 0.
-    let bare_line = after.lines().find(|l| l.contains("bareline"))
+    let bare_line = after
+        .lines()
+        .find(|l| l.contains("bareline"))
         .expect("bareline");
     assert_eq!(bare_line.len() - bare_line.trim_start().len(), 0);
     cleanup(&path);

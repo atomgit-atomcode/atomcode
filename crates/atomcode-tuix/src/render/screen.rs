@@ -474,7 +474,11 @@ mod tests {
         push_str_cells(&mut rule, "──────", &CellStyle::default());
         s.draw_row(0, 0, &rule);
         let out = String::from_utf8(s.render_diff()).unwrap();
-        assert!(out.contains("──────"), "rule must be one contiguous run: {:?}", out);
+        assert!(
+            out.contains("──────"),
+            "rule must be one contiguous run: {:?}",
+            out
+        );
         assert_eq!(
             out.matches("\x1b[1;1H").count(),
             1,
@@ -609,7 +613,7 @@ mod tests {
         let mut s = Screen::new(10, 3);
         s.invalidate();
         let _ = s.render_diff(); // consumes the cold-start cue
-        // Second frame: no invalidate, no cold start.
+                                 // Second frame: no invalidate, no cold start.
         let bytes = s.render_diff();
         let out = String::from_utf8_lossy(&bytes);
         assert!(
@@ -756,7 +760,11 @@ mod tests {
         );
         // Cell content lands inside the wrap.
         let x_pos = out.find('x').expect("x rendered");
-        assert!(bsu < x_pos && x_pos < esu, "cell write must sit inside wrap: {:?}", out);
+        assert!(
+            bsu < x_pos && x_pos < esu,
+            "cell write must sit inside wrap: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -764,9 +772,21 @@ mod tests {
         let mut s = Screen::new(10, 3);
         let bytes = s.render_diff();
         let out = String::from_utf8_lossy(&bytes);
-        assert!(!out.contains("\x1b[?2026h"), "no BSU on empty frame: {:?}", out);
-        assert!(!out.contains("\x1b[?2026l"), "no ESU on empty frame: {:?}", out);
-        assert!(!out.contains("\x1b[?25l"), "no hide on empty frame: {:?}", out);
+        assert!(
+            !out.contains("\x1b[?2026h"),
+            "no BSU on empty frame: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("\x1b[?2026l"),
+            "no ESU on empty frame: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("\x1b[?25l"),
+            "no hide on empty frame: {:?}",
+            out
+        );
     }
 
     /// Invalidate triggers a cold-start CUP+EL walk across every row —
@@ -778,8 +798,16 @@ mod tests {
         s.invalidate();
         let bytes = s.render_diff();
         let out = String::from_utf8_lossy(&bytes);
-        assert!(out.starts_with("\x1b[?2026h\x1b[?25l"), "cold-start frame must open with BSU+hide: {:?}", out);
-        assert!(out.ends_with("\x1b[?25h\x1b[?2026l"), "cold-start frame must close with show+ESU: {:?}", out);
+        assert!(
+            out.starts_with("\x1b[?2026h\x1b[?25l"),
+            "cold-start frame must open with BSU+hide: {:?}",
+            out
+        );
+        assert!(
+            out.ends_with("\x1b[?25h\x1b[?2026l"),
+            "cold-start frame must close with show+ESU: {:?}",
+            out
+        );
     }
 
     /// During a multi-operation synchronized batch (e.g. the `/resume`
@@ -800,11 +828,27 @@ mod tests {
         s.draw_row(0, 0, &cells);
         let bytes = s.render_diff();
         let out = String::from_utf8_lossy(&bytes);
-        assert!(!out.contains("\x1b[?2026h"), "suppressed frame must NOT open its own BSU: {:?}", out);
-        assert!(!out.contains("\x1b[?2026l"), "suppressed frame must NOT close its own ESU: {:?}", out);
+        assert!(
+            !out.contains("\x1b[?2026h"),
+            "suppressed frame must NOT open its own BSU: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("\x1b[?2026l"),
+            "suppressed frame must NOT close its own ESU: {:?}",
+            out
+        );
         // Cursor still hidden for the patch walk and restored after.
-        assert!(out.contains("\x1b[?25l"), "cursor still hidden during patch walk: {:?}", out);
-        assert!(out.contains("\x1b[?25h"), "cursor visibility restored: {:?}", out);
+        assert!(
+            out.contains("\x1b[?25l"),
+            "cursor still hidden during patch walk: {:?}",
+            out
+        );
+        assert!(
+            out.contains("\x1b[?25h"),
+            "cursor visibility restored: {:?}",
+            out
+        );
         // Cell content still emitted inside the (outer-owned) envelope.
         assert!(out.contains('x'), "cell write still happens: {:?}", out);
     }

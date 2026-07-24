@@ -97,17 +97,19 @@ impl OllamaProvider {
             // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
             .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
             // Product UA for gateway attribution (parity with core's build_http_client).
-            .user_agent(cfg.user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+            .user_agent(
+                cfg.user_agent
+                    .as_deref()
+                    .unwrap_or(super::DEFAULT_USER_AGENT),
+            );
         if cfg.skip_tls_verify {
             builder = builder.danger_accept_invalid_certs(true);
         }
-        let client = builder
-            .build()
-            .map_err(|e| ProviderError {
-                retryable: false,
-                message: format!("http client build failed: {e}"),
-                ..Default::default()
-            })?;
+        let client = builder.build().map_err(|e| ProviderError {
+            retryable: false,
+            message: format!("http client build failed: {e}"),
+            ..Default::default()
+        })?;
         let url = format!("{}/api/chat", cfg.base_url.trim_end_matches('/'));
         Ok(Self {
             cfg,
@@ -252,7 +254,8 @@ async fn open_stream(
                     }
                     // Capture the real `Retry-After` BEFORE `text()` consumes `resp` — the
                     // authoritative rate-limit countdown for the self-heal (vs scraping text).
-                    let retry_after_secs = retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
+                    let retry_after_secs =
+                        retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
                     let text = resp.text().await.unwrap_or_default();
                     // Ollama errors are `{"error":"..."}` (a STRING).
                     let detail = serde_json::from_str::<Value>(&text)
@@ -261,7 +264,7 @@ async fn open_stream(
                         .unwrap_or_else(|| truncate_msg(&text));
                     return Err(ProviderError {
                         retryable: retry::is_retryable_status(code),
-                        message: format!("HTTP {code}: {detail}"),
+                        message: super::friendly_http_error(code, &detail),
                         http_status: Some(code),
                         code: None,
                         retry_after_secs,
@@ -439,7 +442,12 @@ struct OllamaNdjsonDecoder {
 
 impl OllamaNdjsonDecoder {
     fn new() -> Self {
-        Self { buf: Vec::new(), tool_index: 0, truncated: false, done: false }
+        Self {
+            buf: Vec::new(),
+            tool_index: 0,
+            truncated: false,
+            done: false,
+        }
     }
 
     fn feed(&mut self, chunk: &[u8]) -> Vec<StreamEvent> {
@@ -463,7 +471,9 @@ impl OllamaNdjsonDecoder {
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         if !self.done {
-            out.push(StreamEvent::Done { truncated: self.truncated });
+            out.push(StreamEvent::Done {
+                truncated: self.truncated,
+            });
             self.done = true;
         }
         out
@@ -501,7 +511,11 @@ impl OllamaNdjsonDecoder {
             if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
                 for tc in tcs {
                     let f = tc.get("function");
-                    let name = f.and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string();
+                    let name = f
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // arguments is an OBJECT → serialize to the kernel's raw-string form.
                     let args = f
                         .and_then(|f| f.get("arguments"))
@@ -511,7 +525,11 @@ impl OllamaNdjsonDecoder {
                     // can pair the call with its result (id stays internal).
                     let id = format!("ollama_call_{}", self.tool_index);
                     self.tool_index += 1;
-                    out.push(StreamEvent::ToolCall(ToolCall { id, name, arguments: args }));
+                    out.push(StreamEvent::ToolCall(ToolCall {
+                        id,
+                        name,
+                        arguments: args,
+                    }));
                 }
             }
         }
@@ -519,12 +537,21 @@ impl OllamaNdjsonDecoder {
             if v.get("done_reason").and_then(|r| r.as_str()) == Some("length") {
                 self.truncated = true;
             }
-            let prompt = v.get("prompt_eval_count").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+            let prompt = v
+                .get("prompt_eval_count")
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0) as u32;
             let completion = v.get("eval_count").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
             if prompt > 0 || completion > 0 {
-                out.push(StreamEvent::Usage(TokenUsage { prompt, completion, cached: 0 }));
+                out.push(StreamEvent::Usage(TokenUsage {
+                    prompt,
+                    completion,
+                    cached: 0,
+                }));
             }
-            out.push(StreamEvent::Done { truncated: self.truncated });
+            out.push(StreamEvent::Done {
+                truncated: self.truncated,
+            });
             self.done = true;
         }
     }
@@ -550,14 +577,24 @@ mod tests {
         let msgs = vec![
             Message::system("sys"),
             Message::user("hi"),
-            Message::assistant("", vec![ToolCall { id: "x".into(), name: "read".into(), arguments: "{\"p\":\"a\"}".into() }]),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "x".into(),
+                    name: "read".into(),
+                    arguments: "{\"p\":\"a\"}".into(),
+                }],
+            ),
             Message::tool_result("x", "body", false),
         ];
         let out = format_messages(&msgs);
         assert_eq!(out[0], json!({"role":"system","content":"sys"}));
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
         // assistant tool_calls: arguments is an OBJECT, no id on the wire.
-        assert_eq!(out[2], json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"read","arguments":{"p":"a"}}}]}));
+        assert_eq!(
+            out[2],
+            json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"read","arguments":{"p":"a"}}}]})
+        );
         // tool result → role tool (no tool_call_id on the wire; matched by order).
         assert_eq!(out[3], json!({"role":"tool","content":"body"}));
     }
@@ -572,24 +609,48 @@ mod tests {
             Message::user("hi"),
         ];
         let out = format_messages(&msgs);
-        assert_eq!(out.iter().filter(|v| v["role"] == "system").count(), 1, "{out:?}");
-        assert_eq!(out[0], json!({"role":"system","content":"persona\n\nMEMORY\n- fact"}));
+        assert_eq!(
+            out.iter().filter(|v| v["role"] == "system").count(),
+            1,
+            "{out:?}"
+        );
+        assert_eq!(
+            out[0],
+            json!({"role":"system","content":"persona\n\nMEMORY\n- fact"})
+        );
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
     }
 
     #[test]
     fn user_images_are_bare_base64_array() {
-        let m = Message::user_with_images("look", vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }]);
+        let m = Message::user_with_images(
+            "look",
+            vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            }],
+        );
         let out = format_messages(&[m]);
-        assert_eq!(out[0], json!({"role":"user","content":"look","images":["QUJD"]}));
+        assert_eq!(
+            out[0],
+            json!({"role":"user","content":"look","images":["QUJD"]})
+        );
     }
 
     #[test]
     fn body_basics_options_tools_and_think() {
         let mut c = cfg();
         c.think = true;
-        let opts = ChatOptions { temperature: Some(0.5), max_tokens: Some(128), ..Default::default() };
-        let tools = vec![ToolDef { name: "read".into(), description: "d".into(), parameters: json!({"type":"object"}) }];
+        let opts = ChatOptions {
+            temperature: Some(0.5),
+            max_tokens: Some(128),
+            ..Default::default()
+        };
+        let tools = vec![ToolDef {
+            name: "read".into(),
+            description: "d".into(),
+            parameters: json!({"type":"object"}),
+        }];
         let body = build_request_body("qwen3", &[Message::user("hi")], &tools, &opts, &c);
         assert_eq!(body["model"], "qwen3");
         assert_eq!(body["stream"], true);
@@ -597,36 +658,73 @@ mod tests {
         assert_eq!(body["options"]["num_predict"].as_u64(), Some(128));
         assert_eq!(body["think"], true, "cfg.think → think:true");
         // OpenAI-style tool definition.
-        assert_eq!(body["tools"][0], json!({"type":"function","function":{"name":"read","description":"d","parameters":{"type":"object"}}}));
+        assert_eq!(
+            body["tools"][0],
+            json!({"type":"function","function":{"name":"read","description":"d","parameters":{"type":"object"}}})
+        );
     }
 
     #[test]
     fn body_omits_empty_options_and_tools_and_think() {
-        let body = build_request_body("qwen3", &[Message::user("hi")], &[], &ChatOptions::default(), &cfg());
-        assert!(body.get("options").is_none(), "no options knobs → omit options");
+        let body = build_request_body(
+            "qwen3",
+            &[Message::user("hi")],
+            &[],
+            &ChatOptions::default(),
+            &cfg(),
+        );
+        assert!(
+            body.get("options").is_none(),
+            "no options knobs → omit options"
+        );
         assert!(body.get("tools").is_none(), "empty tools omitted");
         assert!(body.get("think").is_none(), "think off by default");
     }
 
     #[test]
     fn reasoning_effort_maps_to_think_level() {
-        let opts = ChatOptions { reasoning_effort: Some(ReasoningEffort::High), ..Default::default() };
+        let opts = ChatOptions {
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
         let body = build_request_body("qwen3", &[Message::user("hi")], &[], &opts, &cfg());
-        assert_eq!(body["think"], "high", "per-call effort → think level string");
+        assert_eq!(
+            body["think"], "high",
+            "per-call effort → think level string"
+        );
     }
 
     #[test]
     fn body_serialization_is_deterministic() {
-        let opts = ChatOptions { temperature: Some(0.7), max_tokens: Some(64), ..Default::default() };
+        let opts = ChatOptions {
+            temperature: Some(0.7),
+            max_tokens: Some(64),
+            ..Default::default()
+        };
         let tools = vec![
-            ToolDef { name: "b".into(), description: "db".into(), parameters: json!({"type":"object","properties":{"z":{"type":"string"},"a":{"type":"number"}}}) },
-            ToolDef { name: "a".into(), description: "da".into(), parameters: json!({"type":"object"}) },
+            ToolDef {
+                name: "b".into(),
+                description: "db".into(),
+                parameters: json!({"type":"object","properties":{"z":{"type":"string"},"a":{"type":"number"}}}),
+            },
+            ToolDef {
+                name: "a".into(),
+                description: "da".into(),
+                parameters: json!({"type":"object"}),
+            },
         ];
         let msgs = vec![Message::system("s"), Message::user("u")];
-        let first = serde_json::to_string(&build_request_body("qwen3", &msgs, &tools, &opts, &cfg())).unwrap();
+        let first =
+            serde_json::to_string(&build_request_body("qwen3", &msgs, &tools, &opts, &cfg()))
+                .unwrap();
         for _ in 0..100 {
-            let again = serde_json::to_string(&build_request_body("qwen3", &msgs, &tools, &opts, &cfg())).unwrap();
-            assert_eq!(first, again, "request body serialization must be deterministic");
+            let again =
+                serde_json::to_string(&build_request_body("qwen3", &msgs, &tools, &opts, &cfg()))
+                    .unwrap();
+            assert_eq!(
+                first, again,
+                "request body serialization must be deterministic"
+            );
         }
     }
 
@@ -642,6 +740,7 @@ mod tests {
                 StreamEvent::ToolCallDelta { .. } => "tooldelta",
                 StreamEvent::Usage(_) => "usage",
                 StreamEvent::ResponseId(_) => "response_id",
+                StreamEvent::ResponseModel(_) => "response_model",
                 StreamEvent::Done { .. } => "done",
                 StreamEvent::Error(_) => "error",
                 StreamEvent::Malformed => "malformed",
@@ -657,15 +756,33 @@ mod tests {
     fn ndjson_content_then_thinking_then_usage_done() {
         let mut d = OllamaNdjsonDecoder::new();
         let mut ev = Vec::new();
-        ev.extend(d.feed(nd(json!({"message":{"role":"assistant","thinking":"hmm"},"done":false})).as_bytes()));
-        ev.extend(d.feed(nd(json!({"message":{"role":"assistant","content":"Hel"},"done":false})).as_bytes()));
-        ev.extend(d.feed(nd(json!({"message":{"role":"assistant","content":"lo"},"done":false})).as_bytes()));
+        ev.extend(d.feed(
+            nd(json!({"message":{"role":"assistant","thinking":"hmm"},"done":false})).as_bytes(),
+        ));
+        ev.extend(d.feed(
+            nd(json!({"message":{"role":"assistant","content":"Hel"},"done":false})).as_bytes(),
+        ));
+        ev.extend(d.feed(
+            nd(json!({"message":{"role":"assistant","content":"lo"},"done":false})).as_bytes(),
+        ));
         ev.extend(d.feed(nd(json!({"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":7,"eval_count":2})).as_bytes()));
         assert_eq!(kinds(&ev), vec!["reason", "text", "text", "usage", "done"]);
-        let u = ev.iter().find_map(|e| if let StreamEvent::Usage(u) = e { Some(*u) } else { None }).unwrap();
+        let u = ev
+            .iter()
+            .find_map(|e| {
+                if let StreamEvent::Usage(u) = e {
+                    Some(*u)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
         assert_eq!(u.prompt, 7);
         assert_eq!(u.completion, 2);
-        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
+        assert!(matches!(
+            ev.last().unwrap(),
+            StreamEvent::Done { truncated: false }
+        ));
     }
 
     #[test]
@@ -674,7 +791,16 @@ mod tests {
         let mut ev = Vec::new();
         ev.extend(d.feed(nd(json!({"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_weather","arguments":{"city":"Paris"}}}]},"done":false})).as_bytes()));
         ev.extend(d.feed(nd(json!({"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":3,"eval_count":1})).as_bytes()));
-        let tc = ev.iter().find_map(|e| if let StreamEvent::ToolCall(c) = e { Some(c.clone()) } else { None }).unwrap();
+        let tc = ev
+            .iter()
+            .find_map(|e| {
+                if let StreamEvent::ToolCall(c) = e {
+                    Some(c.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
         assert_eq!(tc.name, "get_weather");
         assert_eq!(tc.id, "ollama_call_0", "synthesized stable id");
         // arguments serialized back to a string for the kernel; valid JSON.
@@ -686,14 +812,26 @@ mod tests {
     fn ndjson_done_reason_length_sets_truncated() {
         let mut d = OllamaNdjsonDecoder::new();
         let ev = d.feed(nd(json!({"message":{"role":"assistant","content":"x"},"done":true,"done_reason":"length","eval_count":1})).as_bytes());
-        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: true }));
+        assert!(matches!(
+            ev.last().unwrap(),
+            StreamEvent::Done { truncated: true }
+        ));
     }
 
     #[test]
     fn ndjson_error_line_surfaces_and_terminates() {
         let mut d = OllamaNdjsonDecoder::new();
         let ev = d.feed(nd(json!({"error":"model 'nope' not found"})).as_bytes());
-        let e = ev.iter().find_map(|e| if let StreamEvent::Error(e) = e { Some(e.clone()) } else { None }).expect("error surfaced");
+        let e = ev
+            .iter()
+            .find_map(|e| {
+                if let StreamEvent::Error(e) = e {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("error surfaced");
         assert!(e.message.contains("not found"));
         assert!(!e.retryable);
     }
@@ -719,7 +857,9 @@ mod tests {
     #[test]
     fn ndjson_finish_without_done_flushes() {
         let mut d = OllamaNdjsonDecoder::new();
-        let mut ev = d.feed(nd(json!({"message":{"role":"assistant","content":"x"},"done":false})).as_bytes());
+        let mut ev = d.feed(
+            nd(json!({"message":{"role":"assistant","content":"x"},"done":false})).as_bytes(),
+        );
         ev.extend(d.finish());
         assert!(matches!(ev.last().unwrap(), StreamEvent::Done { .. }));
     }
@@ -800,7 +940,10 @@ mod tests {
         let events: Vec<StreamEvent> = stream.collect().await;
 
         let has_error = events.iter().any(|e| matches!(e, StreamEvent::Error(_)));
-        assert!(!has_error, "must not surface a mid-stream error after a clean re-open: {events:?}");
+        assert!(
+            !has_error,
+            "must not surface a mid-stream error after a clean re-open: {events:?}"
+        );
         let text: String = events
             .iter()
             .filter_map(|e| match e {
@@ -808,7 +951,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "ok", "should deliver the re-opened response: {events:?}");
+        assert_eq!(
+            text, "ok",
+            "should deliver the re-opened response: {events:?}"
+        );
 
         let _ = handle.join();
     }
@@ -869,18 +1015,28 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "ok", "should deliver the third (successful) response: {events:?}");
+        assert_eq!(
+            text, "ok",
+            "should deliver the third (successful) response: {events:?}"
+        );
 
         let _ = handle.join();
     }
 
     /// Capture the first request's head, then answer 200 + close so `chat_stream`
     /// resolves and the stream ends on EOF.
-    fn capture_then_ok(port_back: std::sync::mpsc::Sender<u16>) -> (std::sync::Arc<std::sync::Mutex<String>>, std::thread::JoinHandle<()>) {
+    fn capture_then_ok(
+        port_back: std::sync::mpsc::Sender<u16>,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<String>>,
+        std::thread::JoinHandle<()>,
+    ) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        port_back.send(listener.local_addr().unwrap().port()).unwrap();
+        port_back
+            .send(listener.local_addr().unwrap().port())
+            .unwrap();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let cap = captured.clone();
         let handle = std::thread::spawn(move || {
@@ -888,12 +1044,20 @@ mod tests {
             let mut buf = Vec::new();
             let mut tmp = [0u8; 1024];
             loop {
-                let n = match s.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => n };
+                let n = match s.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
                 buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
             }
-            *cap.lock().unwrap() =
-                String::from_utf8_lossy(&buf).split("\r\n\r\n").next().unwrap_or("").to_string();
+            *cap.lock().unwrap() = String::from_utf8_lossy(&buf)
+                .split("\r\n\r\n")
+                .next()
+                .unwrap_or("")
+                .to_string();
             let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n");
             let _ = s.flush();
             drop(s);
@@ -919,7 +1083,13 @@ mod tests {
         let _ = handle.join();
 
         let head = captured.lock().unwrap().to_lowercase();
-        assert!(head.contains("x-atomcode-session-id: sess-ollama"), "session header must be forwarded: {head}");
-        assert!(head.contains("user-agent: atomcode/9.9.9"), "product UA must be sent: {head}");
+        assert!(
+            head.contains("x-atomcode-session-id: sess-ollama"),
+            "session header must be forwarded: {head}"
+        );
+        assert!(
+            head.contains("user-agent: atomcode/9.9.9"),
+            "product UA must be sent: {head}"
+        );
     }
 }

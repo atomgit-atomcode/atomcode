@@ -9,10 +9,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::Stream;
 
-use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::Message;
 use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
+use atomcode_config::config::provider::ProviderConfig;
 
 /// Per-provider strategy for echoing back `reasoning_content` from historical
 /// assistant tool_call messages on subsequent requests.
@@ -62,11 +62,11 @@ pub enum ReasoningPolicy {
 /// already preserves *real* reasoning, so this sentinel only fires when the
 /// model genuinely emitted none — this keeps that residual filler invisible.
 ///
-/// `TurnRunner::Done` strips this exact value (`is_only_placeholder_filler`)
-/// and refuses to promote a buffer that is only copies of it into the
+/// The kernel agent strips this exact value and refuses to promote a buffer
+/// that is only copies of it into the
 /// assistant text channel — without that gate a gateway echoing it back caused
 /// the silent mid-task stops above. Both send sites (`format_messages`) and
-/// that guard route through this one constant, so the value can change here
+/// kernel guard route through this one constant, so the value can change here
 /// without desyncing them.
 pub const REASONING_PLACEHOLDER: &str = "·";
 
@@ -113,7 +113,10 @@ pub trait LlmProvider: Send + Sync {
 /// workspace-wide `ATOMCODE_USER_AGENT` (`atomcode/<version>`) — see the
 /// constant's doc-comment for why lowercasing matters on the LLM gateway.
 /// `skip_tls_verify` disables TLS certificate verification when true.
-pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool) -> reqwest::Client {
+pub(super) fn build_http_client(
+    ua_override: Option<&str>,
+    skip_tls_verify: bool,
+) -> anyhow::Result<reqwest::Client> {
     let ua = ua_override.unwrap_or(crate::ATOMCODE_USER_AGENT);
     let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
         .connect_timeout(std::time::Duration::from_secs(30))
@@ -135,11 +138,77 @@ pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool
         .pool_idle_timeout(std::time::Duration::from_secs(30))
         .user_agent(ua);
 
+    // TLS trust (issue #514): the webpki base roots (from the `rustls-tls`
+    // feature) are ALWAYS present, so `.build()` never hard-fails on certs.
+    // Layer the OS native store (Windows cert manager / macOS keychain / Linux
+    // /etc/ssl/certs — where a corporate MITM-proxy CA lives) and SSL_CERT_FILE
+    // on TOP, additively and best-effort. Bad/partial certs are warned and
+    // skipped, never fatal — this is the codex-style graceful load that avoids
+    // the panics reqwest's strict `rustls-tls-native-roots` would cascade.
+    builder = add_trusted_roots(builder);
+
     if skip_tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
     }
 
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    // With the infallible webpki base + graceful root loading above, `.build()`
+    // no longer fails on cert config; it can still fail on other builder state
+    // (e.g. a bad proxy), so surface that as a clear error rather than panicking.
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
+}
+
+/// Add the OS native root store and `SSL_CERT_FILE` (if set) to the builder's
+/// trusted roots, ON TOP of the built-in webpki roots. Best-effort: a cert that
+/// fails to parse, an unreadable/malformed `SSL_CERT_FILE`, or native-store load
+/// errors are warned and skipped — NEVER fatal (the webpki base guarantees a
+/// working client). Mirrors codex's graceful `load_native_certs` +
+/// `add_parsable_certificates`. See issue #514.
+fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    // 1) OS native roots (corporate MITM CAs live here).
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        tracing::warn!(
+            "loaded OS native roots with {} error(s); using the {} that parsed (issue #514)",
+            native.errors.len(),
+            native.certs.len()
+        );
+    }
+    for der in native.certs {
+        if let Ok(cert) = reqwest::Certificate::from_der(der.as_ref()) {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    // 2) SSL_CERT_FILE override/extra (empty string = unset). Loaded explicitly
+    //    for cross-platform certainty (rustls-native-certs' env handling varies
+    //    by platform). reqwest's `Certificate` is validated only at `.build()`,
+    //    so a MALFORMED SSL_CERT_FILE surfaces there as a clear `Err` (never a
+    //    panic, and only for this opt-in builder — every other client build uses
+    //    the webpki base and is unaffected). A VALID bundle is trusted. See #514.
+    let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|p| !p.is_empty()) else {
+        return builder;
+    };
+    let Ok(pem) = std::fs::read(&path) else {
+        tracing::warn!("SSL_CERT_FILE={path:?} could not be read; ignoring (issue #514)");
+        return builder;
+    };
+    match reqwest::Certificate::from_pem_bundle(&pem) {
+        Ok(certs) => {
+            let count = certs.len();
+            for c in certs {
+                builder = builder.add_root_certificate(c);
+            }
+            tracing::info!("Loaded {count} TLS root(s) from SSL_CERT_FILE={path:?} (issue #514)");
+        }
+        Err(e) => {
+            tracing::warn!(
+                "SSL_CERT_FILE={path:?} is not a valid PEM bundle: {e}; ignoring (issue #514)"
+            );
+        }
+    }
+    builder
 }
 
 /// Distill an upstream HTTP error body down to a human-readable message.
@@ -169,11 +238,7 @@ pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool
 /// compact form keeps "429" inline AND the inner `<msg>` typically
 /// carries "rate" / "rate limit" — so the auto-retry backoff path
 /// fires identically against the new format.
-pub(super) fn format_http_error(
-    status: reqwest::StatusCode,
-    url: &str,
-    msg: &str,
-) -> String {
+pub(super) fn format_http_error(status: reqwest::StatusCode, url: &str, msg: &str) -> String {
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         format!("[429] {}", msg)
     } else {
@@ -240,7 +305,9 @@ mod non_retryable_rate_limit_tests {
             r#"{"error":{"message":"当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。","type":"auth_error","code":"429"}}"#
         ));
         // And on the agent-side formatted string.
-        assert!(is_non_retryable_rate_limit("[429] 当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。"));
+        assert!(is_non_retryable_rate_limit(
+            "[429] 当前月度额度已用完，请于 2026-06-20 21:26 后继续使用。"
+        ));
     }
 
     #[test]
@@ -254,7 +321,9 @@ mod non_retryable_rate_limit_tests {
         // Rolling-window / load limits recover on their own — keep retrying.
         assert!(!is_non_retryable_rate_limit("滚动窗口限流，请稍后再试"));
         assert!(!is_non_retryable_rate_limit("请求过于频繁，请稍后再试"));
-        assert!(!is_non_retryable_rate_limit("模型「GLM-5.1」的请求负载过高，请稍后再试。"));
+        assert!(!is_non_retryable_rate_limit(
+            "模型「GLM-5.1」的请求负载过高，请稍后再试。"
+        ));
         assert!(!is_non_retryable_rate_limit("服务繁忙"));
         assert!(!is_non_retryable_rate_limit("当前已被限流"));
     }
@@ -409,9 +478,67 @@ mod format_http_error_tests {
     }
 }
 
+// ── issue #514: TLS root trust (OS native roots + SSL_CERT_FILE) ──
+//
+// build_http_client must (a) build successfully under the
+// rustls-tls-native-roots feature, and (b) honour SSL_CERT_FILE by loading
+// its PEM bundle. We cannot easily verify the certs are actually used by a
+// real handshake in a unit test, but we CAN verify the builder does NOT
+// panic / error when SSL_CERT_FILE points at a real PEM bundle, and that
+// the env var is consulted at all.
+#[cfg(test)]
+mod build_http_client_tls_tests {
+    use super::build_http_client;
+
+    // `#[serial(ssl_cert_file_env)]`: these mutate the process-global
+    // SSL_CERT_FILE env var; without serialisation a parallel test's bogus
+    // value leaks in and makes native-roots `.build()` fail ("zero valid
+    // certificates found in native root store").
+    #[test]
+    #[serial_test::serial(ssl_cert_file_env)]
+    fn build_http_client_succeeds_with_native_roots_issue_514() {
+        // Plain build (no SSL_CERT_FILE) must succeed under native-roots.
+        std::env::remove_var("SSL_CERT_FILE");
+        assert!(build_http_client(None, false).is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial(ssl_cert_file_env)]
+    fn build_http_client_reports_malformed_ssl_cert_file_as_error_not_panic() {
+        // A malformed SSL_CERT_FILE cert surfaces as a clear `Err` at `.build()`
+        // (reqwest validates certs only there). The guarantees: (1) NEVER a panic
+        // (Result); (2) it affects ONLY this opt-in builder — the webpki base
+        // leaves every other client build in the workspace unaffected. See #514.
+        let tmp = tempfile::tempdir().unwrap();
+        let cert_path = tmp.path().join("roots.pem");
+        std::fs::write(
+            &cert_path,
+            "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::env::set_var("SSL_CERT_FILE", &cert_path);
+        let built = build_http_client(None, false);
+        std::env::remove_var("SSL_CERT_FILE");
+        assert!(
+            built.is_err(),
+            "a malformed SSL_CERT_FILE must surface as Err, not panic"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(ssl_cert_file_env)]
+    fn build_http_client_skip_tls_verify_still_builds_issue_514() {
+        // skip_tls_verify=true must continue to build.
+        std::env::remove_var("SSL_CERT_FILE");
+        assert!(build_http_client(None, true).is_ok());
+    }
+}
+
 /// Factory: create the right provider from config.
-/// If `api_key` is `None`, automatically loads from `$ATOMCODE_HOME/auth.toml`
-/// (with token refresh if expired).
+///
+/// This may perform blocking auth I/O when the config relies on AtomGit OAuth
+/// credentials instead of a static API key. Async callers must run provider
+/// construction through `tokio::task::spawn_blocking` or a dedicated thread.
 pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> {
     let mut config = if config.api_key.is_none() && config.provider_type != "ollama" {
         // Security: only fall back to the OAuth access_token when the
@@ -419,7 +546,7 @@ pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> 
         // platform credential to an attacker-controlled base_url would
         // leak the user's AtomGit identity.
         let base_url = config.base_url.as_deref().unwrap_or("");
-        if !crate::coding_plan::crypto::is_atomgit_gateway(base_url) {
+        if !atomcode_auth::gateway_crypto::is_atomgit_gateway(base_url) {
             anyhow::bail!(
                 "Provider '{}' has no api_key and base_url '{base_url}' is not \
                  a trusted AtomGit gateway.\n\
@@ -743,8 +870,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-
-}
+        }
     }
 
     #[test]
@@ -915,7 +1041,8 @@ mod tests {
     /// access_token when the provider points to an untrusted base_url.
     #[test]
     fn create_provider_rejects_no_api_key_on_untrusted_gateway() {
-        let result = super::create_provider(&cfg_no_key("openai", Some("https://evil.attacker.tld")));
+        let result =
+            super::create_provider(&cfg_no_key("openai", Some("https://evil.attacker.tld")));
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("expected Err for api_key=None + untrusted base_url"),
@@ -962,8 +1089,10 @@ mod tests {
     /// must NOT be a gateway-guard error.
     #[test]
     fn create_provider_delegates_auth_on_trusted_gateway() {
-        let result =
-            super::create_provider(&cfg_no_key("openai", Some("https://pre-llm-api-cce.atomgit.com/v1")));
+        let result = super::create_provider(&cfg_no_key(
+            "openai",
+            Some("https://pre-llm-api-cce.atomgit.com/v1"),
+        ));
         let msg = match &result {
             Err(e) => e.to_string(),
             Ok(_) => "provider constructed (auth.toml exists)".to_string(),
@@ -994,7 +1123,10 @@ mod tests {
     /// Malicious subdomain of the trusted host must NOT pass the guard.
     #[test]
     fn create_provider_rejects_no_api_key_on_lookalike_gateway() {
-        let result = super::create_provider(&cfg_no_key("openai", Some("https://pre-llm-api-cce.atomgit.com.evil.com")));
+        let result = super::create_provider(&cfg_no_key(
+            "openai",
+            Some("https://pre-llm-api-cce.atomgit.com.evil.com"),
+        ));
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("expected Err for lookalike domain"),

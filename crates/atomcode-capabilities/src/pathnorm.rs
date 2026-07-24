@@ -37,6 +37,36 @@ pub fn strip_verbatim_path(path: &Path) -> PathBuf {
     PathBuf::from(strip_verbatim(&path.to_string_lossy()).as_ref())
 }
 
+/// A platform-aware key for de-duplicating paths that refer to the same
+/// directory but differ only in case. Case-insensitive filesystems (Windows,
+/// macOS default) fold case; case-sensitive ones (Linux) keep the path verbatim,
+/// so `C:\Users` and `C:\users` collapse to one entry on Windows/macOS but
+/// distinct paths stay distinct on Linux.
+///
+/// This is a COMPARISON key only, never persisted — folding on macOS here does
+/// NOT touch the session-bucket hash (`session::hash_path`, which stays as-is to
+/// avoid orphaning existing sessions).
+///
+/// Mirrors `session::hash_path`'s string normalization (strip `\\?\`, unify
+/// separators, drop a trailing slash) so different spellings of one directory —
+/// `C:\Users`, `C:/Users`, `\\?\C:\Users\` — share a key, then case-folds on
+/// case-insensitive filesystems. `to_lowercase` (not ASCII) matches `hash_path`.
+pub fn path_case_key(path: &Path) -> String {
+    let s = strip_verbatim(&path.to_string_lossy()).into_owned();
+    let mut s = s.replace('\\', "/");
+    if s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        s.to_lowercase()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        s
+    }
+}
+
 /// `std::fs::canonicalize` with the Windows `\\?\` verbatim prefix stripped, so the
 /// result is a stable NATIVE path safe to store, hash, compare, or hand to another
 /// tool. The single source of path identity — prefer this over raw `canonicalize`
@@ -68,7 +98,10 @@ mod tests {
     #[test]
     fn strip_verbatim_disk_and_unc_and_noop() {
         assert_eq!(strip_verbatim(r"\\?\C:\Users\x"), r"C:\Users\x");
-        assert_eq!(strip_verbatim(r"\\?\UNC\server\share\x"), r"\\server\share\x");
+        assert_eq!(
+            strip_verbatim(r"\\?\UNC\server\share\x"),
+            r"\\server\share\x"
+        );
         assert_eq!(strip_verbatim("/home/u/x"), "/home/u/x"); // POSIX untouched
         assert_eq!(strip_verbatim(r"C:\already\plain"), r"C:\already\plain");
     }
@@ -92,6 +125,9 @@ mod tests {
     fn to_display_strips_verbatim_prefix() {
         // On any platform, the `\\?\` string form must be gone from the output.
         let out = to_display(Path::new(r"\\?\C:\repo\src\main.rs"));
-        assert!(!out.starts_with(r"\\?\"), "verbatim prefix must be stripped: {out}");
+        assert!(
+            !out.starts_with(r"\\?\"),
+            "verbatim prefix must be stripped: {out}"
+        );
     }
 }

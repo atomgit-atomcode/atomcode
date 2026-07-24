@@ -10,9 +10,8 @@ const s = (over: Partial<SessionLike> = {}): SessionLike => ({
 });
 
 test('optimistic row is suppressed once the real session is in the list even when ids differ (same dir + shared name prefix)', () => {
-  // The bug: the /live snapshot realigns the optimistic id to the LIVE session id
-  // (capabilities store), but /sessions lists the CORE .json under a DIFFERENT id.
-  // id-only dedup then fails, leaving a duplicate sidebar row until a full refresh.
+  // The bug: the /live snapshot can realign the optimistic id before /sessions
+  // catches up. Id-only dedup then leaves a duplicate row until a full refresh.
   // Optimistic name = first 10 chars of the message; the persisted auto-name is the
   // fuller first message, so one is a prefix of the other.
   const optimistic = s({ id: 'optimistic-123', name: '你谁呢？跟cc有啥差' });
@@ -81,7 +80,7 @@ test('empty optimistic name never matches by prefix (avoids hiding unrelated ses
 });
 
 // Regression: a 2-char name like "你好" is under MIN_PREFIX_MATCH_LEN, so the
-// prefix path never fired and the optimistic (live id) + persisted (core id)
+// prefix path never fired and the optimistic id + persisted id
 // rows both showed. An EXACT name match in the same project closes this.
 test('short EXACT name in the same project (by hash) suppresses the duplicate', () => {
   const optimistic = s({ id: 'opt', name: '你好', working_dir: '/w', project_hash: 'h1' });

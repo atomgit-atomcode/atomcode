@@ -17,7 +17,9 @@ pub struct LspServerRegistry {
 
 impl LspServerRegistry {
     pub fn empty() -> Self {
-        Self { servers: HashMap::new() }
+        Self {
+            servers: HashMap::new(),
+        }
     }
 
     /// Common defaults (server binaries must be on PATH; absence degrades gracefully).
@@ -34,9 +36,24 @@ impl LspServerRegistry {
             );
         };
         add("rs", "rust-analyzer", &[], &["Cargo.toml"]);
-        add("ts", "typescript-language-server", &["--stdio"], &["tsconfig.json", "package.json"]);
-        add("tsx", "typescript-language-server", &["--stdio"], &["tsconfig.json"]);
-        add("js", "typescript-language-server", &["--stdio"], &["package.json"]);
+        add(
+            "ts",
+            "typescript-language-server",
+            &["--stdio"],
+            &["tsconfig.json", "package.json"],
+        );
+        add(
+            "tsx",
+            "typescript-language-server",
+            &["--stdio"],
+            &["tsconfig.json"],
+        );
+        add(
+            "js",
+            "typescript-language-server",
+            &["--stdio"],
+            &["package.json"],
+        );
         add("py", "pylsp", &[], &["pyproject.toml", "setup.py"]);
         add("go", "gopls", &["serve"], &["go.mod"]);
         add("java", "jdtls", &[], &["pom.xml", "build.gradle"]);
@@ -111,7 +128,14 @@ mod tests {
     #[test]
     fn insert_overrides() {
         let mut r = LspServerRegistry::with_defaults();
-        r.insert("rs", LspServerConfig { command: "custom-ra".into(), args: vec![], root_markers: vec![] });
+        r.insert(
+            "rs",
+            LspServerConfig {
+                command: "custom-ra".into(),
+                args: vec![],
+                root_markers: vec![],
+            },
+        );
         assert_eq!(r.get("rs").unwrap().command, "custom-ra");
     }
 }

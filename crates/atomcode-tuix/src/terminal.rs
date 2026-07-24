@@ -129,11 +129,31 @@ pub struct TerminalCaps {
     /// per-`─`-CUP rule fragmentation that JediTerm's no-fallback paint layer
     /// produces. See `EnvView::terminal_emulator` for the full mechanism.
     pub jediterm: bool,
+    /// A modern terminal emulator was detected: Windows Terminal (`WT_SESSION`)
+    /// or iTerm2 / VS Code / WezTerm / Hyper (`TERM_PROGRAM`). Same signal as
+    /// the legacy-console heuristic. Consumed by the welcome-mascot gate: the
+    /// half-block + per-cell-background pixel art renders reliably only on
+    /// modern emulators; bare / SSH terminals (FinalShell, PuTTY, …) that set
+    /// neither var may not paint cell backgrounds, fragmenting the art — so we
+    /// omit it there (the tips stack cleanly instead). Note this is `false` over
+    /// SSH regardless of the client, since SSH doesn't forward these client-side
+    /// vars to the remote where atomcode runs.
+    pub modern_emulator: bool,
 }
 
 impl TerminalCaps {
     pub fn from_env(env: EnvView) -> Self {
-        let is_dumb = env.term.as_deref() == Some("dumb");
+        // `TERM=dumb` means "no escape sequences, no raw mode" on Unix
+        // (Emacs `M-x shell`, some CI wrappers). But TERM is a Unix
+        // terminfo concept: on Windows crossterm drives the console via the
+        // Win32 console API and ignores TERM entirely, so a stray
+        // `TERM=dumb` — commonly leaked into the environment by Git / MSYS /
+        // SSH tooling — does NOT mean the console lacks raw mode, colours,
+        // or VT processing. Honouring it there wrongly zeroed `raw_mode`,
+        // dropping atomcode into the cooked LINE-input fallback where arrow
+        // keys never reach menus (you could only Enter-select the first
+        // item). Scope the dumb check to non-Windows.
+        let is_dumb = !env.is_windows && env.term.as_deref() == Some("dumb");
         let tty = env.is_stdout_tty;
 
         // LC_ALL wins over LANG per POSIX; either being one of the
@@ -156,6 +176,11 @@ impl TerminalCaps {
         // Users on conhost who installed a Unicode-capable font
         // (Cascadia Code / JetBrains Mono / etc.) can opt back in
         // with `ATOMCODE_UNICODE=1`.
+        // UTF-8 output only proves that the console accepts the code points; it
+        // says nothing about the active font's block-glyph geometry. In
+        // particular, pwsh7 on Win10 conhost commonly runs code page 65001 but
+        // renders `▀/▄/█` with seams that destroy terminal QR codes. Only an
+        // actual emulator marker is strong enough to enable Unicode artwork.
         let on_modern_emulator = env.wt_session.is_some() || env.term_program.is_some();
         let windows_legacy_console = env.is_windows && !on_modern_emulator;
 
@@ -169,9 +194,9 @@ impl TerminalCaps {
         // `TERMINAL_EMULATOR` string IntelliJ-platform terminals export.
         // INTENTIONALLY computed AFTER (and independent of) unicode_symbols /
         // legacy_conhost above — it must not perturb any existing decision.
-        let jediterm = env.force_jediterm.unwrap_or_else(|| {
-            env.terminal_emulator.as_deref() == Some("JetBrains-JediTerm")
-        });
+        let jediterm = env
+            .force_jediterm
+            .unwrap_or_else(|| env.terminal_emulator.as_deref() == Some("JetBrains-JediTerm"));
 
         Self {
             tty,
@@ -183,6 +208,7 @@ impl TerminalCaps {
             unicode_symbols,
             legacy_conhost: windows_legacy_console,
             jediterm,
+            modern_emulator: on_modern_emulator,
         }
     }
 
@@ -275,7 +301,13 @@ mod tests {
         assert!(!wt.legacy_conhost);
 
         // Non-Windows is never legacy conhost.
-        assert!(!TerminalCaps::from_env(EnvView { is_windows: false, ..env() }).legacy_conhost);
+        assert!(
+            !TerminalCaps::from_env(EnvView {
+                is_windows: false,
+                ..env()
+            })
+            .legacy_conhost
+        );
     }
 
     #[test]
@@ -295,7 +327,9 @@ mod tests {
 
     #[test]
     fn dumb_term_disables_spinner_and_colors() {
+        // Non-Windows: TERM=dumb is authoritative (Emacs `M-x shell`, etc.).
         let caps = TerminalCaps::from_env(EnvView {
+            is_windows: false,
             term: Some("dumb".to_string()),
             colorterm: None,
             ..env()
@@ -303,7 +337,37 @@ mod tests {
         assert!(caps.tty);
         assert!(!caps.colors);
         assert!(!caps.spinner);
+        assert!(!caps.raw_mode, "dumb TERM on Unix has no raw mode");
         assert!(!caps.unicode_symbols, "dumb TERM forces ASCII fallback");
+    }
+
+    // Regression: a Windows user reported that arrow keys couldn't navigate
+    // any menu (/model list, approval options) — only Enter worked, always
+    // picking the first item — in BOTH cmd.exe and Windows Terminal. A
+    // tuix.log showed input arriving as `paste(<line>)` + `key(Press,Enter)`
+    // with zero `[ RD]` reader traces: the cooked LINE reader was running,
+    // not the raw-mode reader, so arrow keys were swallowed by the console's
+    // own line editor and never reached the app. Cause: a stray `TERM=dumb`
+    // in the environment (Git/MSYS/SSH tooling leaks it) forced
+    // `raw_mode=false`. But TERM is a Unix terminfo concept; crossterm drives
+    // the Windows console via the Win32 API and ignores TERM entirely, so on
+    // Windows a dumb TERM must NOT disable raw mode / interactivity.
+    #[test]
+    fn dumb_term_is_ignored_on_windows() {
+        let caps = TerminalCaps::from_env(EnvView {
+            is_windows: true,
+            term: Some("dumb".to_string()),
+            colorterm: None,
+            ..env()
+        });
+        assert!(caps.tty);
+        assert!(
+            caps.raw_mode,
+            "Windows console raw mode is independent of TERM — a stray \
+             TERM=dumb must not drop us into the cooked line reader"
+        );
+        assert!(caps.bracketed_paste);
+        assert!(caps.scroll_region);
     }
 
     #[test]
@@ -392,7 +456,10 @@ mod tests {
             term_program: Some("vscode".to_string()),
             ..env()
         });
-        assert!(caps.unicode_symbols, "VS Code's integrated terminal is fine");
+        assert!(
+            caps.unicode_symbols,
+            "VS Code's integrated terminal is fine"
+        );
     }
 
     #[test]
@@ -404,6 +471,10 @@ mod tests {
             ..env()
         });
         assert!(caps.unicode_symbols);
+        assert!(
+            caps.legacy_conhost,
+            "the Unicode preference must not reclassify legacy conhost"
+        );
     }
 
     // ── JediTerm detection (DevEco Studio / IntelliJ-platform terminals) ──
@@ -461,7 +532,10 @@ mod tests {
         assert_eq!(base.prompt_chevron(), jt.prompt_chevron());
         // And on bare Windows the JediTerm marker still leaves the
         // legacy-console ASCII fallback exactly as it was.
-        let win = TerminalCaps::from_env(EnvView { is_windows: true, ..env() });
+        let win = TerminalCaps::from_env(EnvView {
+            is_windows: true,
+            ..env()
+        });
         let win_jt = TerminalCaps::from_env(EnvView {
             is_windows: true,
             terminal_emulator: Some("JetBrains-JediTerm".to_string()),
@@ -502,7 +576,10 @@ mod tests {
             "non-JediTerm TTY: push iff non-Windows"
         );
         // Never pushed when stdout isn't a TTY, JediTerm or not.
-        let not_tty = TerminalCaps::from_env(EnvView { is_stdout_tty: false, ..env() });
+        let not_tty = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: false,
+            ..env()
+        });
         assert!(!crate::should_enable_kitty_keyboard(&not_tty));
     }
 

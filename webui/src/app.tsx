@@ -199,6 +199,31 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 当 sessionId 改变，且 activeSession 的 id 与之不匹配时，自动解析/加载该会话的元数据。
+  // 解决了在 TUI 或其他端中执行 /resume 切换会话、或新建会话后，webui 无法同步更新
+  // activeSession、CWD 以及 projectHash 的问题。
+  useEffect(() => {
+    if (!sessionId) return;
+    if (activeSession && activeSession.id === sessionId) return;
+
+    let cancelled = false;
+    resolveSession(sessionId)
+      .then((found) => {
+        if (cancelled || !found) return;
+        setActiveSession(found);
+        if (found.working_dir) setCwd(found.working_dir);
+        if (found.project_hash) setProjectHash(found.project_hash);
+        setSessionListVersion((v) => v + 1);
+      })
+      .catch((err) => {
+        console.warn('[syncSession] resolve session failed:', err);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
   // 在指定目录下创建一个新会话并切过去（落地、侧栏可见）。
   // 先重置画布回落地页给即时反馈，再异步建会话；失败则停在落地页。
   function openNewSession(targetCwd: string | undefined) {
@@ -260,6 +285,22 @@ export function App() {
     // meantime, then openNewSession's response re-pins projectHash.
     setProjectHash('');
     openNewSession(path || undefined);
+  }
+
+  // 当从外部（TUI `/cd` 等）收到工作目录变更通知时：
+  // 更新 cwd 并拉取最新的项目信息以更新 projectHash。
+  function handleCwdChanged(newCwd: string) {
+    setCwd(newCwd);
+    getProject()
+      .then((p) => {
+        if (p.project_hash) {
+          setProjectHash(p.project_hash);
+        }
+        setSessionListVersion((v) => v + 1);
+      })
+      .catch((err) => {
+        console.warn('[cwdChanged] failed to get project state:', err);
+      });
   }
 
   // 删除会话：若删的是当前打开的会话，回到空白新对话。
@@ -427,7 +468,7 @@ export function App() {
             onLiveTurnDone={() => setSessionListVersion((v) => v + 1)}
             onOptimisticSession={handleOptimisticSession}
             onOpenCwd={() => setShowCwd(true)}
-            onCwdChanged={setCwd}
+            onCwdChanged={handleCwdChanged}
             onLanding={setIsLanding}
             skillInsert={skillInsert}
             onSessionRenamed={(name) => setActiveSession((prev) => prev ? { ...prev, name } : prev)}

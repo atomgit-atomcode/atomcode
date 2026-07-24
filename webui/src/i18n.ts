@@ -30,6 +30,8 @@ const zh = {
   'sidebar.mcpDisconnected': '已断开',
   'sidebar.mcpError': '错误',
   'sidebar.mcpTools': '{n} 个工具',
+  'mcp.blockedUntrusted': '已拦截 {n} 个来自不受信任项目的 MCP server。',
+  'mcp.trustProject': '信任本项目',
   'sidebar.search': '搜索会话',
   'sidebar.searchPlaceholder': '搜索会话…',
   'sidebar.searchHint': '输入关键词搜索会话记录',
@@ -81,14 +83,16 @@ const zh = {
   // Model selector
   'model.label': '模型',
 
-  // Approval mode selector (Build / Plan / Bypass)
+  // Approval mode selector (Build / Accept Edits / Auto / Plan)
   'mode.label': '模式',
   'mode.build': 'Build',
   'mode.build.desc': '改动前逐个审批（默认）',
+  'mode.accept_edits': 'Accept Edits',
+  'mode.accept_edits.desc': '自动批准文件改动，命令需审批',
+  'mode.auto': 'Auto',
+  'mode.auto.desc': '⚠ 自动批准所有操作，含改文件/跑命令',
   'mode.plan': 'Plan',
   'mode.plan.desc': '只读探索，先出方案',
-  'mode.bypass': '免审批',
-  'mode.bypass.desc': '⚠ 自动批准所有操作，含改文件/跑命令',
 
   // Reasoning effort selector (DeepSeek V4 only)
   'effort.label': '强度',
@@ -106,6 +110,10 @@ const zh = {
   'chat.skillExpand': '展开查看',
   'chat.skillCollapse': '收起',
   'chat.continueSession': '继续会话 {id}（历史在 TUI/磁盘中）',
+  'chat.detachedActive': '⚠ 此会话仍在后台执行，但当前页面无法重新接收该回合输出。请停止回合后再继续。',
+  'chat.detachedStopped': '已请求停止后台回合，可以继续发送。',
+  'chat.activeCheckFailed': '无法确认会话运行状态：{error}',
+  'chat.recoveryBlocked': '无法确认当前回合已结束，已锁定发送和自动队列。请重试「停止」或切换会话。',
   'chat.inputPlaceholder': '输入消息…  （/ 唤起技能，@ 引用文件）',
   'chat.kbdHint': 'Enter 发送 · Shift+Enter 换行',
   'chat.stop': '停止',
@@ -116,18 +124,22 @@ const zh = {
   'chat.jumpToBottom': '回到底部',
   'chat.error': '[错误: {msg}]',
   'chat.warning': '⚠ {msg}',
+  'chat.incomplete': '⚠ 回合未完成（{msg}）。已保留当前结果，请确认后再继续。',
   'chat.connError': '[连接错误: {msg}]',
+  'chat.cancelFailed': '⚠ 无法确认旧回合已停止（{error}）。已丢弃排队消息，请确认运行状态后再继续。',
   'chat.rateLimited.paused': '5 小时窗口已用尽，约 {time} 恢复',
   'chat.rateLimited.pausedNoTime': '5 小时窗口已用尽，稍后恢复',
+  'chat.rateLimited.generic': '限流（HTTP 429）',
+  'chat.rateLimited.remaining': '（还有 {dur}）',
   'chat.rateLimited.hint': '已保留已完成内容 · 可换模型或稍后重试',
   'chat.rateLimited.waiting': '限流，{secs}s 后自动继续…',
 
-  // 会话内搜索反查定位
+  // 会话内浮动搜索框 (Cmd/Ctrl+F 呼出,Esc 关闭,反查定位)
   'chat.searchPlaceholder': '搜索本会话消息…',
   'chat.searchNoMatch': '无匹配消息',
   'chat.searchPrev': '上一条',
   'chat.searchNext': '下一条',
-  'chat.searchClear': '清除搜索',
+  'chat.searchClose': '关闭搜索 (Esc)',
 
   // Input attach (+) menu
   'attach.menu': '添加',
@@ -247,10 +259,21 @@ const zh = {
   'perm.alwaysAllow': '本会话总是允许',
   'perm.allowPersist': '永久允许此工具',
 
+  // User input card
+  'userInput.submit': '提交',
+  'userInput.skip': '跳过',
+  'userInput.other': 'Other',
+  'userInput.error': '提交失败，请重试',
+
   // Sync toggle
   'sync.toggle': '同步当前会话',
   'sync.on': '已同步（多端实时）',
   'sync.off': '独立会话',
+  'sync.switchFailed': '实时同步切换失败：{error}',
+  'sync.reconnectFailed': '实时连接无法恢复。已停止自动发送并丢弃排队消息，请重新开启同步。',
+  'sync.reconnectTerminalUnknown': '实时连接恢复时已无法取得上一回合终态；为避免误执行，已丢弃排队消息。',
+  'sync.stopBeforeDetach': '当前实时回合仍在执行，请先停止回合再关闭同步。',
+  'sync.stopBeforeAttach': '当前独立回合仍在执行或终态未确认，请先停止回合再开启同步。',
 
   // Copy button
   'copy.copy': '复制',
@@ -335,6 +358,8 @@ const en: Record<MsgKey, string> = {
   'sidebar.mcpDisconnected': 'Disconnected',
   'sidebar.mcpError': 'Error',
   'sidebar.mcpTools': '{n} tools',
+  'mcp.blockedUntrusted': 'Blocked {n} MCP server(s) from an untrusted project.',
+  'mcp.trustProject': 'Trust this project',
   'sidebar.search': 'Search sessions',
   'sidebar.searchPlaceholder': 'Search sessions…',
   'sidebar.searchHint': 'Type to search session records',
@@ -381,14 +406,16 @@ const en: Record<MsgKey, string> = {
 
   'model.label': 'Model',
 
-  // Approval mode selector (Build / Plan / Bypass)
+  // Approval mode selector (Build / Accept Edits / Auto / Plan)
   'mode.label': 'Mode',
   'mode.build': 'Build',
   'mode.build.desc': 'Approve each change (default)',
+  'mode.accept_edits': 'Accept Edits',
+  'mode.accept_edits.desc': 'Auto-approve file edits, ask for commands',
+  'mode.auto': 'Auto',
+  'mode.auto.desc': '⚠ Auto-approve everything, incl. edits/commands',
   'mode.plan': 'Plan',
   'mode.plan.desc': 'Read-only — explore and plan first',
-  'mode.bypass': 'Bypass',
-  'mode.bypass.desc': '⚠ Auto-approve everything, incl. edits/commands',
 
   // Reasoning effort selector (DeepSeek V4 only)
   'effort.label': 'Effort',
@@ -405,6 +432,10 @@ const en: Record<MsgKey, string> = {
   'chat.skillExpand': 'Expand',
   'chat.skillCollapse': 'Collapse',
   'chat.continueSession': 'Continue session {id} (history on TUI/disk)',
+  'chat.detachedActive': '⚠ This session is still running in the background, but this page cannot reattach to its output. Stop the turn before continuing.',
+  'chat.detachedStopped': 'The background turn was asked to stop; you can send again.',
+  'chat.activeCheckFailed': 'Could not verify the session runtime state: {error}',
+  'chat.recoveryBlocked': 'The current turn terminal could not be verified, so sending and automatic queue drain are locked. Retry Stop or switch sessions.',
   'chat.inputPlaceholder': 'Message…  (/ for skills, @ for files)',
   'chat.kbdHint': 'Enter to send · Shift+Enter for newline',
   'chat.stop': 'Stop',
@@ -415,18 +446,22 @@ const en: Record<MsgKey, string> = {
   'chat.jumpToBottom': 'Jump to bottom',
   'chat.error': '[Error: {msg}]',
   'chat.warning': '⚠ {msg}',
+  'chat.incomplete': '⚠ Turn incomplete ({msg}). Partial results were preserved; review them before continuing.',
   'chat.connError': '[Connection error: {msg}]',
+  'chat.cancelFailed': '⚠ Could not confirm the previous turn stopped ({error}). Queued messages were discarded; verify runtime state before continuing.',
   'chat.rateLimited.paused': '5-hour window exhausted — resets around {time}',
   'chat.rateLimited.pausedNoTime': '5-hour window exhausted — resets later',
+  'chat.rateLimited.generic': 'Rate limited (HTTP 429)',
+  'chat.rateLimited.remaining': '(in {dur})',
   'chat.rateLimited.hint': 'Completed work is preserved · switch model or retry later',
   'chat.rateLimited.waiting': 'Rate limited — auto-continuing in {secs}s…',
 
-  // 会话内搜索反查定位
+  // 会话内浮动搜索框 (Cmd/Ctrl+F 呼出,Esc 关闭,反查定位)
   'chat.searchPlaceholder': 'Search this conversation…',
   'chat.searchNoMatch': 'No matching messages',
   'chat.searchPrev': 'Previous match',
   'chat.searchNext': 'Next match',
-  'chat.searchClear': 'Clear search',
+  'chat.searchClose': 'Close search (Esc)',
 
   'attach.menu': 'Add',
   'attach.image': 'Upload image',
@@ -539,10 +574,21 @@ const en: Record<MsgKey, string> = {
   'perm.alwaysAllow': 'Always allow this session',
   'perm.allowPersist': 'Always allow this tool',
 
+  // User input card
+  'userInput.submit': 'Submit',
+  'userInput.skip': 'Skip',
+  'userInput.other': 'Other',
+  'userInput.error': 'Submit failed, please retry',
+
   // Sync toggle
   'sync.toggle': 'Sync current session',
   'sync.on': 'Synced (live)',
   'sync.off': 'Independent',
+  'sync.switchFailed': 'Live sync switch failed: {error}',
+  'sync.reconnectFailed': 'Live connection could not be restored. Automatic sending stopped and queued messages were discarded; enable sync again to retry.',
+  'sync.reconnectTerminalUnknown': 'The previous turn terminal was unavailable after reconnect; queued messages were discarded to prevent unintended execution.',
+  'sync.stopBeforeDetach': 'The live turn is still running. Stop it before disabling sync.',
+  'sync.stopBeforeAttach': 'The independent turn is still running or unresolved. Stop it before enabling sync.',
 
   // Copy button
   'copy.copy': 'Copy',

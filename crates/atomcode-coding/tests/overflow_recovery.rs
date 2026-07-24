@@ -51,11 +51,24 @@ impl LlmProvider for OverflowOnce {
 #[tokio::test]
 async fn coding_agent_recovers_from_overflow() {
     let calls = Arc::new(Mutex::new(0usize));
-    let provider = Arc::new(OverflowOnce { failed: Mutex::new(false), calls: calls.clone() });
+    let provider = Arc::new(OverflowOnce {
+        failed: Mutex::new(false),
+        calls: calls.clone(),
+    });
     let cfg = CodingAgentConfig::new("k", "http://localhost", "test-model", std::env::temp_dir());
     let agent = build_coding_agent_with(&cfg, provider);
-    let outcome = agent.run_to_completion("do a thing", AutoRespond::AllowAll).await;
-    assert!(*calls.lock().unwrap() >= 2, "overflow → compact → retry (calls: {})", *calls.lock().unwrap());
+    let outcome = agent
+        .run_to_completion("do a thing", AutoRespond::AllowAll)
+        .await;
+    assert!(
+        *calls.lock().unwrap() >= 2,
+        "overflow → compact → retry (calls: {})",
+        *calls.lock().unwrap()
+    );
     assert_eq!(outcome.error, None, "recovered: {:?}", outcome.error);
-    assert!(outcome.text.contains("done after recovery"), "got: {}", outcome.text);
+    assert!(
+        outcome.text.contains("done after recovery"),
+        "got: {}",
+        outcome.text
+    );
 }

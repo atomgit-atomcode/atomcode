@@ -48,7 +48,10 @@ fi
 # ---- detect binary ----
 BIN=$(command -v atomcode 2>/dev/null || true)
 if [ -z "$BIN" ]; then
-    for c in /usr/local/bin/atomcode "$HOME/.local/bin/atomcode"; do
+    # `.exe` variants cover a Windows-shell (MSYS/MinGW/Cygwin) install — install.sh drops
+    # atomcode.exe into ~/.local/bin there.
+    for c in /usr/local/bin/atomcode "$HOME/.local/bin/atomcode" \
+             /usr/local/bin/atomcode.exe "$HOME/.local/bin/atomcode.exe"; do
         [ -e "$c" ] && BIN=$c && break
     done
 fi

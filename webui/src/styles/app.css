@@ -371,25 +371,24 @@ body {
   color: var(--app-brand);
 }
 
-/* === 会话内搜索栏 (反查定位) === */
-/* sticky 在滚动区顶部,仅在有历史时显示。低对比,不与时间线争抢注意力。 */
-.msg-search-bar {
-  position: sticky;
-  top: 0;
-  z-index: 5;
+/* === 会话内浮动搜索框 (Cmd/Ctrl+F 呼出,反查定位) === */
+/* 仿浏览器 Find-in-page: 右侧依次 ↑ ↓ ×,无图标,× 带独立圆角边框。
+   absolute 钉在消息区右上角,不占布局空间。 */
+.msg-search-float {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  z-index: 21; /* 高于 .jump-to-bottom (20),避免被遮挡 */
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  margin-bottom: 6px;
-  background: var(--app-secondary-background);
-  border: 1px solid var(--app-input-border);
-  border-radius: var(--corner-radius-small);
-}
-.msg-search-icon {
-  flex: 0 0 auto;
-  color: var(--app-secondary-foreground);
-  opacity: 0.7;
+  padding: 6px 6px 6px 16px;
+  height: 48px;
+  width: min(320px, calc(100% - 28px));
+  background: var(--app-primary-background);
+  border: 1px solid var(--app-input-border, rgba(128, 128, 128, 0.2));
+  border-radius: 12px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08);
+  color: var(--app-primary-foreground);
 }
 .msg-search-input {
   flex: 1 1 auto;
@@ -397,48 +396,92 @@ body {
   border: none;
   background: transparent;
   color: var(--app-primary-foreground);
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: 14px;
+  line-height: 1.4;
   outline: none;
+  padding: 0;
 }
-/* bot review P3: type="text" 无浏览器默认清除按钮,::-webkit-search-cancel-button 伪元素已无目标,删除。 */
-/* 焦点可见性 (WCAG 2.4.7): outline:none 移除默认环后必须给替代视觉,
-   否则键盘 Tab 进入看不到焦点。用 :focus-visible 避免鼠标点击也触发。 */
-.msg-search-input:focus-visible {
-  outline: 2px solid var(--app-brand);
-  outline-offset: -2px;
+/* 焦点可见性:用整框高亮替代输入环,避免内部光环打断胶囊观感。 */
+.msg-search-float:focus-within {
+  border-color: var(--app-brand);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08), 0 0 0 2px color-mix(in srgb, var(--app-brand) 25%, transparent);
 }
 .msg-search-count {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--app-secondary-foreground);
-  opacity: 0.85;
   white-space: nowrap;
+  padding: 0 8px;
+  user-select: none;
 }
-.msg-search-nav,
-.msg-search-clear {
+/* ↑ ↓ 按钮:无边框,纯灰图标,hover 圆角矩形灰底。 */
+.msg-search-nav {
   flex: 0 0 auto;
-  width: 22px;
-  height: 22px;
+  width: 32px;
+  height: 32px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--app-input-border);
-  border-radius: var(--corner-radius-small);
-  background: var(--app-secondary-background);
+  border: none;
+  border-radius: 6px;
+  background: transparent;
   color: var(--app-secondary-foreground);
   cursor: pointer;
-  font-size: 12px;
-  line-height: 1;
   padding: 0;
-  transition: opacity 0.15s, background 0.15s, color 0.15s;
-  opacity: 0.7;
+  transition: background 0.12s, color 0.12s;
+  margin: 0 2px;
 }
-.msg-search-nav:hover,
-.msg-search-clear:hover {
-  opacity: 1;
-  background: var(--app-ghost-button-hover-background);
+.msg-search-nav:hover:not(:disabled) {
+  background: var(--app-ghost-button-hover-background, rgba(128, 128, 128, 0.08));
   color: var(--app-primary-foreground);
+}
+.msg-search-nav:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+/* 移除了 ↑ ↓ 与 × 之间的细竖线分隔，将其设为隐藏。 */
+.msg-search-divider {
+  display: none;
+}
+/* × 关闭:独立圆角方框,与图片一致。 */
+.msg-search-close {
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--app-input-border, rgba(0, 0, 0, 0.08));
+  border-radius: 8px;
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  margin-left: 6px;
+}
+.msg-search-close:hover {
+  background: var(--app-ghost-button-hover-background, rgba(128, 128, 128, 0.08));
+  border-color: var(--app-input-border, rgba(0, 0, 0, 0.15));
+  color: var(--app-primary-foreground);
+}
+
+/* === 字符背景高亮 (搜索定位效果) === */
+.msg-search-highlight {
+  background: color-mix(in srgb, var(--app-brand) 32%, rgba(230, 180, 0, 0.35));
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+/* 当前聚焦定位到的匹配项消息高亮 */
+.is-active-search-match .msg-search-highlight {
+  background: var(--app-brand, #d97757);
+  color: var(--app-brand-ivory, #fff) !important;
+}
+.timeline-message.is-active-search-match,
+.user-message-wrapper.is-active-search-match .user-message-bubble {
+  outline: 2px solid color-mix(in srgb, var(--app-brand) 40%, transparent);
+  outline-offset: 2px;
 }
 
 /* === PR #562: send-time label under each message === */
@@ -576,6 +619,19 @@ body {
   margin: 6px 0;
   font-size: 13.5px;
   line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.msg-notice.command-output {
+  color: var(--app-primary-foreground);
+  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
+  border: 1px solid var(--app-input-border);
+  font-family: var(--app-monospace-font-family);
+  font-size: 13px;
+  line-height: 1.5;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 8px 0;
   white-space: pre-wrap;
 }
 
@@ -1816,6 +1872,23 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Blocked-untrusted-project notice inside the MCP popover. */
+.mcp-blocked-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: var(--corner-radius-small);
+  background: color-mix(in srgb, var(--app-warning-accent), transparent 88%);
+  color: var(--app-warning-accent);
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 4px 0;
+}
+.mcp-blocked-error {
+  font-size: 11px;
+  color: #ef4444;
+}
 
 /* Settings button at the bottom of the collapsed icon rail (inside rail-bottom). */
 .rail-btn-settings {
@@ -1962,6 +2035,89 @@ body {
 .permission-footer .btn {
   border-radius: 999px;
   padding: 0 18px;
+}
+
+/* === UserInputCard (request_user_input tool) === */
+/* Option row: wraps a radio/checkbox + label body inline; the whole label is
+   clickable (native label-for semantics via wrapping). */
+.user-input-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: var(--corner-radius-small);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.user-input-option:hover { background: var(--app-list-hover-background); }
+.user-input-option input[type="radio"],
+.user-input-option input[type="checkbox"] {
+  flex-shrink: 0;
+  margin-top: 2px; /* optical alignment with the first line of label text */
+  cursor: pointer;
+  accent-color: var(--app-brand);
+}
+/* Body block: label text + optional description stacked vertically. */
+.user-input-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.user-input-option-label {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--app-primary-foreground);
+  line-height: 1.4;
+}
+.user-input-option-desc {
+  font-size: 12px;
+  color: var(--app-secondary-foreground);
+  line-height: 1.4;
+}
+
+/* Single-line text input (Other option in single/multiple mode). */
+.user-input-text {
+  width: 100%;
+  box-sizing: border-box;
+  height: 34px;
+  padding: 0 10px;
+  background: var(--app-input-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  color: var(--app-input-foreground);
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+}
+.user-input-text::placeholder { color: var(--app-input-placeholder-foreground); }
+.user-input-text:focus { border-color: var(--app-input-active-border, var(--app-brand)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--app-brand) 15%, transparent); }
+.user-input-text:disabled { opacity: 0.5; cursor: default; }
+
+/* Multi-line textarea (text mode). */
+.user-input-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  background: var(--app-input-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  color: var(--app-input-foreground);
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+}
+.user-input-textarea::placeholder { color: var(--app-input-placeholder-foreground); }
+.user-input-textarea:focus { border-color: var(--app-input-active-border, var(--app-brand)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--app-brand) 15%, transparent); }
+.user-input-textarea:disabled { opacity: 0.5; cursor: default; }
+
+/* Inline error message below the options/input. */
+.user-input-error {
+  font-size: 12px;
+  color: var(--app-error-foreground);
+  margin: 0;
 }
 
 /* === Tool detail (expanded args + output) === */
@@ -2545,9 +2701,9 @@ body {
 
 .model-item:hover { background: var(--app-list-hover-background); }
 
-/* ── Approval mode selector (Build / Plan / Bypass) ──────────────────────
+/* ── Approval mode selector (Build / Accept Edits / Auto / Plan) ────────
    Reuses .model-selector / .model-dropdown / .model-item chrome. Each option
-   stacks a bold label over a muted one-line description. Bypass (免审批) is a
+   stacks a bold label over a muted one-line description. Auto is a
    safety-consequential toggle → warning accent on both the option and, while
    active, the trigger pill (mirrors the TUI red BYPASS badge). */
 .mode-item {

@@ -15,7 +15,7 @@ pub mod locale;
 pub mod i18n;
 
 /// Vendored leaf helpers (home-dir resolution, vision heuristic) config needs.
-mod util;
+pub mod util;
 
 /// `[network.proxy]` config types + process-env proxy policy. The reqwest-applying
 /// runtime stays in `atomcode-core::proxy` (needs the HTTP stack) and re-exports these.
@@ -29,4 +29,12 @@ pub mod lsp_registry;
 /// load/save/paths. `atomcode_core::config` re-exports this during the transition.
 pub mod config;
 
+/// Transactional, cross-process-safe access to `config.toml`.
+pub mod store;
+
+/// Pure parsers for OS system-proxy descriptions: Windows ProxyServer/ProxyOverride
+/// and macOS `scutil --proxy` output → normalized HTTP(S)_PROXY / NO_PROXY values.
+pub mod system_proxy;
+
 pub use config::{provider::ProviderConfig, Config};
+pub use store::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};

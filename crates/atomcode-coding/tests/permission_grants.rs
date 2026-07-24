@@ -18,7 +18,10 @@ fn _isolate_atomcode_home() {
 async fn always_allow_grants_survive_reassembly() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    let outside_dir = tempfile::tempdir().unwrap();
+    let workspace_target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("target");
+    let outside_dir = tempfile::tempdir_in(workspace_target).unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
 
     let mut cfg = CodingAgentConfig::new("k", "http://unused", "test-model", project.path());
@@ -27,10 +30,12 @@ async fn always_allow_grants_survive_reassembly() {
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
         skill_dirs: Some(vec![project.path().join("skills")]),
+        plugin_skill_dirs: Vec::new(),
         mcp: false,
         memory: false,
         web: false,
         review: false,
+        rate_limit_source: None,
     };
     let mut parts = prepare(&cfg, opts).await.unwrap();
 
@@ -49,13 +54,19 @@ async fn always_allow_grants_survive_reassembly() {
             }),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done writing".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("done writing".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let mut h1 = assemble(&mut parts, &cfg, provider1).unwrap().spawn();
 
     h1.commands
-        .send(AgentCommand::SendMessage { text: "write outside file".into(), images: vec![] })
+        .send(AgentCommand::SendMessage {
+            text: "write outside file".into(),
+            images: vec![],
+        })
         .unwrap();
 
     // Handle approval request and reply with AllowAlways
@@ -64,13 +75,15 @@ async fn always_allow_grants_survive_reassembly() {
         match ev {
             AgentEvent::Request { id, kind, .. } if kind == "approval" => {
                 seen_approval = true;
-                h1.commands.send(AgentCommand::Respond {
-                    id,
-                    value: serde_json::json!({
-                        "decision": "allow_always",
-                        "remember": false
-                    }),
-                }).unwrap();
+                h1.commands
+                    .send(AgentCommand::Respond {
+                        id,
+                        value: serde_json::json!({
+                            "decision": "allow_always",
+                            "remember": false
+                        }),
+                    })
+                    .unwrap();
             }
             AgentEvent::TurnComplete { .. } => break,
             _ => {}
@@ -79,7 +92,10 @@ async fn always_allow_grants_survive_reassembly() {
     h1.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = h1.task.await;
 
-    assert!(seen_approval, "Must have prompted for approval in the first run");
+    assert!(
+        seen_approval,
+        "Must have prompted for approval in the first run"
+    );
     assert!(out_file.exists(), "The file should have been written");
     std::fs::remove_file(&out_file).unwrap();
 
@@ -92,16 +108,25 @@ async fn always_allow_grants_survive_reassembly() {
             StreamEvent::ToolCall(ToolCall {
                 id: "c2".into(),
                 name: "write_file".into(),
-                arguments: format!(r#"{{"file_path":{:?},"content":"hello again"}}"#, out_file_str),
+                arguments: format!(
+                    r#"{{"file_path":{:?},"content":"hello again"}}"#,
+                    out_file_str
+                ),
             }),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done writing again".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("done writing again".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let mut h2 = assemble(&mut parts, &cfg, provider2).unwrap().spawn();
     h2.commands
-        .send(AgentCommand::SendMessage { text: "write outside file again".into(), images: vec![] })
+        .send(AgentCommand::SendMessage {
+            text: "write outside file again".into(),
+            images: vec![],
+        })
         .unwrap();
 
     let mut seen_approval_run2 = false;
@@ -117,6 +142,12 @@ async fn always_allow_grants_survive_reassembly() {
     h2.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = h2.task.await;
 
-    assert!(!seen_approval_run2, "Must NOT prompt for approval in the second run (grant should be remembered)");
-    assert!(out_file.exists(), "The file should have been written in the second run");
+    assert!(
+        !seen_approval_run2,
+        "Must NOT prompt for approval in the second run (grant should be remembered)"
+    );
+    assert!(
+        out_file.exists(),
+        "The file should have been written in the second run"
+    );
 }

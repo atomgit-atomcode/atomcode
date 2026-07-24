@@ -49,11 +49,28 @@ fn format_version(v: (u64, u64, u64)) -> String {
     format!("v{}.{}.{}", v.0, v.1, v.2)
 }
 
+/// Apply the process proxy policy to an async reqwest builder. Self-contained
+/// over the config leaf's proxy env machinery — mirrors the identical per-layer
+/// helpers in `atomcode-capabilities`/`atomcode-telemetry`, so the TUI needs no
+/// `atomcode-core` proxy dependency.
+fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    atomcode_config::proxy::ensure_runtime_initialized();
+    if std::env::var(atomcode_config::proxy::MODE_ENV)
+        .ok()
+        .as_deref()
+        == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
+    {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
+
 /// Fetch `latest.json` and, if newer than `current`, return the advertised
 /// version. Short timeout keeps startup snappy; any error (network, HTTP,
 /// parse) returns `None` silently.
 pub async fn check_latest(current: &str) -> Option<String> {
-    let client = atomcode_core::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+    let client = apply_async_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(5))
         .user_agent(atomcode_core::ATOMCODE_USER_AGENT)
         .build()
@@ -96,8 +113,8 @@ mod tests {
     #[test]
     fn newer_major_version_returns_some() {
         assert_eq!(
-            parse_and_compare("v4.15.3", &manifest_body("v5.0.0")),
-            Some("v5.0.0".to_string())
+            parse_and_compare("v4.15.3", &manifest_body("v5.0.1")),
+            Some("v5.0.1".to_string())
         );
     }
 

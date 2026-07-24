@@ -1,9 +1,10 @@
+use std::path::PathBuf;
+
+use super::ui_event::UiEvent as AgentEvent;
+use crate::session::Session;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_config::i18n::{t, Msg};
-#[cfg(test)]
-use atomcode_core::agent::AgentClient;
-use atomcode_core::agent::AgentEvent;
-use atomcode_core::session::{Session, SessionManager};
+use atomcode_daemon::legacy_convert::snapshot_to_core;
 
 use super::RuntimeEndpoint;
 
@@ -25,8 +26,40 @@ pub struct RuntimeEvent {
 
 #[derive(Clone, Debug)]
 pub enum RuntimeEventPayload {
-    Legacy(AgentEvent),
+    Ui(AgentEvent),
     Native(CodingRuntimeEvent),
+    SequencedNative(atomcode_coding::SequencedRuntimeEvent),
+    Driver(DriverEvent),
+}
+
+#[derive(Clone, Debug)]
+pub enum DriverEvent {
+    LocalShellFinished {
+        output: String,
+        failed: bool,
+    },
+    SessionTransitionFinished {
+        operation: atomcode_coding::ReconfigureKind,
+        result: Result<atomcode_coding::SessionChanged, atomcode_coding::RuntimeError>,
+    },
+    SessionResumePrepared {
+        project_bucket: String,
+        session_id: String,
+        working_dir: PathBuf,
+        result: Result<atomcode_daemon::legacy_convert::PreparedCatalogSessionResume, String>,
+    },
+    CapabilitiesReloadFinished {
+        result: Result<atomcode_coding::SessionChanged, atomcode_coding::RuntimeError>,
+    },
+    /// The `/resume` session catalog finished loading off the UI thread (the scan
+    /// reads/parses every session file, which froze the event loop when done
+    /// inline). Carries the current-project session list ready to install into the
+    /// picker; `working_dir` lets the handler drop a result the user has navigated
+    /// away from.
+    SessionCatalogLoaded {
+        working_dir: PathBuf,
+        result: Result<Vec<crate::session::SessionMeta>, String>,
+    },
 }
 
 pub fn spawn_event_forwarder(
@@ -69,22 +102,40 @@ impl RuntimeState {
 pub enum BgError {
     SlotLimit { max: usize },
     InvalidSlot { slot: usize, len: usize },
+    NoRuntimeClient { slot: usize },
+    SessionProjectionUnavailable { slot: usize, error: String },
 }
 
 pub struct ForegroundRuntime {
     pub runtime_id: RuntimeId,
     pub endpoint: Option<RuntimeEndpoint>,
     pub session: Session,
+    /// Runtime-owned project directory. `Session::working_dir` is persisted
+    /// display metadata and can be stale after legacy migrations.
+    pub working_dir: PathBuf,
 }
 
 pub struct BackgroundSlot {
     pub runtime_id: RuntimeId,
     pub endpoint: Option<RuntimeEndpoint>,
     pub session: Session,
+    /// Physical project bucket owned by this runtime.
+    pub working_dir: PathBuf,
     pub state: RuntimeState,
     pub created_at: u64,
     pub summary: String,
-    pub buffered_events: Vec<AgentEvent>,
+    /// Presentation events observed after this runtime left the foreground.
+    /// They are replayed synchronously before the shared runtime queue is
+    /// consumed again, so a pending request cannot be overtaken by its terminal.
+    pub buffered_events: Vec<RuntimeEventPayload>,
+    /// Runtime-committed identity that could not yet be projected from the
+    /// exact native catalog location. Resume must retry and fail closed rather
+    /// than pairing this runtime with the previous session mirror.
+    pending_session_change: Option<atomcode_coding::SessionChanged>,
+    /// Runtime-owned interactive request that arrived while this slot was in
+    /// the background. The request id and payload, not transcript heuristics,
+    /// are the authority restored when the slot returns to the foreground.
+    pending_request: Option<atomcode_coding::RuntimeRequest>,
 }
 
 impl BackgroundSlot {
@@ -93,6 +144,7 @@ impl BackgroundSlot {
             runtime_id: self.runtime_id,
             endpoint: self.endpoint,
             session: self.session,
+            working_dir: self.working_dir,
         }
     }
 }
@@ -171,13 +223,25 @@ impl BackgroundSlots {
         }
         let bg = &mut self.slots[slot - 1];
         match event {
-            AgentEvent::TurnComplete { snapshot, .. } => {
-                bg.state = RuntimeState::Done;
+            AgentEvent::TurnComplete {
+                snapshot,
+                stop_reason,
+                ..
+            } => {
+                bg.pending_request = None;
+                retain_session_replay_events(&mut bg.buffered_events);
+                bg.state = match stop_reason {
+                    super::ui_event::UiTurnStopReason::Natural => RuntimeState::Done,
+                    super::ui_event::UiTurnStopReason::Cancelled => RuntimeState::Cancelled,
+                    _ => RuntimeState::Error,
+                };
                 super::apply_session_snapshot(&mut bg.session, snapshot.clone());
                 bg.summary = session_summary(&bg.session);
                 true
             }
             AgentEvent::TurnCancelled { snapshot } => {
+                bg.pending_request = None;
+                retain_session_replay_events(&mut bg.buffered_events);
                 bg.state = RuntimeState::Cancelled;
                 super::apply_session_snapshot(&mut bg.session, snapshot.clone());
                 bg.summary = session_summary(&bg.session);
@@ -189,22 +253,26 @@ impl BackgroundSlots {
                 if !snapshot.messages.is_empty() {
                     super::apply_session_snapshot(&mut bg.session, snapshot.clone());
                     bg.summary = session_summary(&bg.session);
+                    retain_session_replay_events(&mut bg.buffered_events);
                 }
                 false
             }
+            AgentEvent::WorkingDirChanged(working_dir) => {
+                bg.working_dir = atomcode_capabilities::pathnorm::strip_verbatim_path(working_dir);
+                false
+            }
             AgentEvent::Error { snapshot, .. } => {
-                // Persist whatever conversation state we have at error
-                // time so a background session that died mid-turn can
-                // still be `/resume`d to inspect the partial transcript.
-                // Empty snapshots from the streaming-error forwarder
-                // skips the snapshot (no fresh state to commit). Return
-                // `true` so `apply_background_event` flushes to disk.
+                // Diagnostic only: the runtime-owned TurnFinished or
+                // RuntimeStopped event decides the terminal state. Preserve a
+                // non-empty snapshot for replay without making the slot idle.
                 let did_snapshot = !snapshot.messages.is_empty();
                 if did_snapshot {
                     super::apply_session_snapshot(&mut bg.session, snapshot.clone());
                     bg.summary = session_summary(&bg.session);
+                    retain_session_replay_events(&mut bg.buffered_events);
                 }
-                bg.state = RuntimeState::Error;
+                bg.buffered_events
+                    .push(RuntimeEventPayload::Ui(event.clone()));
                 did_snapshot
             }
             AgentEvent::TextDelta(_)
@@ -213,7 +281,13 @@ impl BackgroundSlots {
             | AgentEvent::ToolCallStarted { .. }
             | AgentEvent::ToolOutputChunk { .. }
             | AgentEvent::ToolCallResult { .. } => {
-                bg.buffered_events.push(event.clone());
+                bg.buffered_events
+                    .push(RuntimeEventPayload::Ui(event.clone()));
+                false
+            }
+            AgentEvent::UserEcho(_) => {
+                bg.buffered_events
+                    .push(RuntimeEventPayload::Ui(event.clone()));
                 false
             }
             _ => false,
@@ -243,18 +317,24 @@ impl BackgroundSlots {
             runtime_id: RuntimeId::new(self.slots.len() as u64 + 1),
             endpoint: None,
             summary: session.name.clone(),
+            working_dir: session.working_dir.clone(),
             session,
             state,
             created_at: 0,
             buffered_events: Vec::new(),
+            pending_session_change: None,
+            pending_request: None,
         })
     }
 }
 
 pub struct ResumeOutcome {
     pub resumed_session: Session,
+    pub resumed_working_dir: PathBuf,
     pub resumed_runtime_id: RuntimeId,
-    pub resumed_endpoint: Option<RuntimeEndpoint>,
+    pub resumed_endpoint: RuntimeEndpoint,
+    pub resumed_state: RuntimeState,
+    pub replay_events: Vec<RuntimeEventPayload>,
     pub previous_foreground_slot: Option<usize>,
 }
 
@@ -264,13 +344,76 @@ pub struct BgRuntimeManager {
     next_runtime_id: u64,
 }
 
+fn load_background_session_projection(
+    changed: &atomcode_coding::SessionChanged,
+) -> Result<Session, String> {
+    load_background_session_projection_in_root(
+        &atomcode_capabilities::session::SessionManager::sessions_root(),
+        changed,
+    )
+}
+
+fn load_background_session_projection_in_root(
+    sessions_root: &std::path::Path,
+    changed: &atomcode_coding::SessionChanged,
+) -> Result<Session, String> {
+    let session_id = changed
+        .session_id
+        .as_deref()
+        .ok_or_else(|| "background runtime changed to a sessionless state".to_string())?;
+    let working_dir = atomcode_capabilities::pathnorm::strip_verbatim_path(&changed.working_dir);
+    let project_bucket = atomcode_capabilities::session::SessionManager::project_hash(&working_dir);
+    let manager = atomcode_capabilities::session::SessionManager::with_root(
+        sessions_root.join(&project_bucket),
+    );
+    let loaded = manager.load_native_session(session_id).map_err(|error| {
+        format!("failed to load background session {project_bucket}/{session_id}: {error}")
+    })?;
+    let session = Session::from_catalog_view(loaded.into())
+        .map_err(|error| format!("failed to decode background session {session_id}: {error}"))?;
+    if session.id != session_id {
+        return Err(format!(
+            "background session identity mismatch: runtime={session_id:?}, catalog={:?}",
+            session.id
+        ));
+    }
+    Ok(session)
+}
+
+fn resolve_background_session_projection(
+    changed: &atomcode_coding::SessionChanged,
+    load: impl FnOnce(&atomcode_coding::SessionChanged) -> Result<Session, String>,
+) -> Result<(Session, PathBuf), String> {
+    let expected_id = changed
+        .session_id
+        .as_deref()
+        .ok_or_else(|| "background runtime changed to a sessionless state".to_string())?;
+    let session = load(changed)?;
+    if session.id != expected_id {
+        return Err(format!(
+            "background session identity mismatch: runtime={expected_id:?}, loaded={:?}",
+            session.id
+        ));
+    }
+    Ok((
+        session,
+        atomcode_capabilities::pathnorm::strip_verbatim_path(&changed.working_dir),
+    ))
+}
+
 impl BgRuntimeManager {
-    pub fn new(session: Session, runtime_id: RuntimeId, endpoint: RuntimeEndpoint) -> Self {
+    pub fn new(
+        session: Session,
+        working_dir: PathBuf,
+        runtime_id: RuntimeId,
+        endpoint: RuntimeEndpoint,
+    ) -> Self {
         Self {
             foreground: ForegroundRuntime {
                 runtime_id,
                 endpoint: Some(endpoint),
                 session,
+                working_dir,
             },
             backgrounds: BackgroundSlots::new(MAX_BACKGROUND_SLOTS),
             next_runtime_id: runtime_id.0,
@@ -290,8 +433,9 @@ impl BgRuntimeManager {
         self.backgrounds.has_capacity()
     }
 
-    pub fn set_foreground_session(&mut self, session: Session) {
+    pub fn set_foreground_session(&mut self, session: Session, working_dir: PathBuf) {
         self.foreground.session = session;
+        self.foreground.working_dir = working_dir;
     }
 
     pub fn set_foreground_runtime(
@@ -299,11 +443,13 @@ impl BgRuntimeManager {
         runtime_id: RuntimeId,
         endpoint: RuntimeEndpoint,
         session: Session,
+        working_dir: PathBuf,
     ) {
         self.foreground = ForegroundRuntime {
             runtime_id,
             endpoint: Some(endpoint),
             session,
+            working_dir,
         };
     }
 
@@ -311,8 +457,28 @@ impl BgRuntimeManager {
         &mut self,
         new_endpoint: RuntimeEndpoint,
         new_session: Session,
+        new_working_dir: PathBuf,
         new_runtime_id: RuntimeId,
         current_state: RuntimeState,
+    ) -> Result<usize, BgError> {
+        self.background_current_with_replay(
+            new_endpoint,
+            new_session,
+            new_working_dir,
+            new_runtime_id,
+            current_state,
+            Vec::new(),
+        )
+    }
+
+    pub fn background_current_with_replay(
+        &mut self,
+        new_endpoint: RuntimeEndpoint,
+        new_session: Session,
+        new_working_dir: PathBuf,
+        new_runtime_id: RuntimeId,
+        current_state: RuntimeState,
+        replay_events: Vec<RuntimeEventPayload>,
     ) -> Result<usize, BgError> {
         if !self.backgrounds.has_capacity() {
             return Err(BgError::SlotLimit {
@@ -325,6 +491,7 @@ impl BgRuntimeManager {
                 runtime_id: new_runtime_id,
                 endpoint: Some(new_endpoint),
                 session: new_session,
+                working_dir: new_working_dir,
             },
         );
         let summary = session_summary(&old.session);
@@ -332,10 +499,13 @@ impl BgRuntimeManager {
             runtime_id: old.runtime_id,
             endpoint: old.endpoint,
             session: old.session,
+            working_dir: old.working_dir,
             state: current_state,
             created_at: current_timestamp(),
             summary,
-            buffered_events: Vec::new(),
+            buffered_events: replay_events,
+            pending_session_change: None,
+            pending_request: None,
         })
     }
 
@@ -344,6 +514,7 @@ impl BgRuntimeManager {
         runtime_id: RuntimeId,
         endpoint: RuntimeEndpoint,
         session: Session,
+        working_dir: PathBuf,
         state: RuntimeState,
     ) -> Result<usize, BgError> {
         let summary = session_summary(&session);
@@ -351,10 +522,13 @@ impl BgRuntimeManager {
             runtime_id,
             endpoint: Some(endpoint),
             session,
+            working_dir,
             state,
             created_at: current_timestamp(),
             summary,
             buffered_events: Vec::new(),
+            pending_session_change: None,
+            pending_request: None,
         })
     }
 
@@ -363,49 +537,300 @@ impl BgRuntimeManager {
         slot: usize,
         current_state: RuntimeState,
     ) -> Result<ResumeOutcome, BgError> {
-        let resumed = self.backgrounds.drop_slot(slot)?;
+        self.resume_slot_with_loader(slot, current_state, load_background_session_projection)
+    }
+
+    fn resume_slot_with_loader(
+        &mut self,
+        slot: usize,
+        current_state: RuntimeState,
+        load: impl FnOnce(&atomcode_coding::SessionChanged) -> Result<Session, String>,
+    ) -> Result<ResumeOutcome, BgError> {
+        if slot == 0 || slot > self.backgrounds.slots.len() {
+            return Err(BgError::InvalidSlot {
+                slot,
+                len: self.backgrounds.slots.len(),
+            });
+        }
+        let index = slot - 1;
+        let resumed_endpoint = self.backgrounds.slots[index]
+            .endpoint
+            .clone()
+            .ok_or(BgError::NoRuntimeClient { slot })?;
+        if let Some(changed) = self.backgrounds.slots[index].pending_session_change.clone() {
+            let (session, working_dir) = resolve_background_session_projection(&changed, load)
+                .map_err(|error| BgError::SessionProjectionUnavailable { slot, error })?;
+            let background = &mut self.backgrounds.slots[index];
+            background.summary = session_summary(&session);
+            background.session = session;
+            background.working_dir = working_dir;
+            background.pending_session_change = None;
+        }
+
+        let mut resumed = self.backgrounds.slots.remove(index);
+        let resumed_state = resumed.state;
+        let pending_request = resumed.pending_request.take();
+        let mut replay_events = std::mem::take(&mut resumed.buffered_events);
+        if let Some(request) = pending_request {
+            replay_events.push(RuntimeEventPayload::Native(CodingRuntimeEvent::Request(
+                request,
+            )));
+        }
         let old_foreground = std::mem::replace(&mut self.foreground, resumed.into_foreground());
         let old_had_state = !old_foreground.session.messages.is_empty()
             || matches!(current_state, RuntimeState::Running);
         let previous_foreground_slot = if old_had_state {
             let summary = session_summary(&old_foreground.session);
-            Some(self.backgrounds.push_slot(BackgroundSlot {
+            self.backgrounds.slots.push(BackgroundSlot {
                 runtime_id: old_foreground.runtime_id,
                 endpoint: old_foreground.endpoint,
                 session: old_foreground.session,
+                working_dir: old_foreground.working_dir,
                 state: current_state,
                 created_at: current_timestamp(),
                 summary,
                 buffered_events: Vec::new(),
-            })?)
+                pending_session_change: None,
+                pending_request: None,
+            });
+            Some(self.backgrounds.slots.len())
         } else {
             None
         };
 
         Ok(ResumeOutcome {
             resumed_session: self.foreground.session.clone(),
+            resumed_working_dir: self.foreground.working_dir.clone(),
             resumed_runtime_id: self.foreground.runtime_id,
-            resumed_endpoint: self.foreground.endpoint.clone(),
+            resumed_endpoint,
+            resumed_state,
+            replay_events,
             previous_foreground_slot,
         })
+    }
+
+    fn apply_background_session_changed_with(
+        &mut self,
+        runtime_id: RuntimeId,
+        changed: atomcode_coding::SessionChanged,
+        load: impl FnOnce(&atomcode_coding::SessionChanged) -> Result<Session, String>,
+    ) {
+        if self
+            .backgrounds
+            .slot_mut_for_runtime_id(runtime_id)
+            .is_none()
+        {
+            return;
+        }
+        match resolve_background_session_projection(&changed, load) {
+            Ok((session, working_dir)) => {
+                let background = self
+                    .backgrounds
+                    .slot_mut_for_runtime_id(runtime_id)
+                    .expect("background slot existence was checked above");
+                background.summary = session_summary(&session);
+                background.session = session;
+                background.working_dir = working_dir;
+                background.pending_session_change = None;
+                background.pending_request = None;
+                background.buffered_events.clear();
+            }
+            Err(error) => {
+                crate::tuix_trace!(
+                    "BG",
+                    "background session projection deferred runtime={} session={:?} dir={} error={}",
+                    runtime_id.0,
+                    changed.session_id,
+                    changed.working_dir.display(),
+                    error,
+                );
+                let background = self
+                    .backgrounds
+                    .slot_mut_for_runtime_id(runtime_id)
+                    .expect("background slot existence was checked above");
+                background.pending_session_change = Some(changed);
+                background.pending_request = None;
+                background.buffered_events.clear();
+            }
+        }
+    }
+
+    fn apply_background_session_name_with(
+        &mut self,
+        runtime_id: RuntimeId,
+        name: String,
+        persist: impl FnOnce(&std::path::Path, &str, &str) -> Result<bool, String>,
+    ) {
+        let Some(background) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) else {
+            return;
+        };
+        if background.pending_session_change.is_some() {
+            background.buffered_events.push(RuntimeEventPayload::Native(
+                CodingRuntimeEvent::SessionNameSuggested { name },
+            ));
+            return;
+        }
+        if !atomcode_coding::session_title::should_accept_ai_name(
+            background.session.user_renamed,
+            background.session.ai_named,
+        ) {
+            return;
+        }
+        let working_dir = background.working_dir.clone();
+        let session_id = background.session.id.clone();
+
+        match persist(&working_dir, session_id.as_str(), &name) {
+            Ok(true) => {
+                let background = self
+                    .backgrounds
+                    .slot_mut_for_runtime_id(runtime_id)
+                    .expect("background slot existed before synchronous name persistence");
+                background.session.name = name;
+                background.session.ai_named = true;
+                background.session.touch();
+                background.summary = session_summary(&background.session);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                crate::tuix_trace!(
+                    "BG",
+                    "background session name persistence deferred runtime={} session={} error={}",
+                    runtime_id.0,
+                    session_id,
+                    error,
+                );
+                let background = self
+                    .backgrounds
+                    .slot_mut_for_runtime_id(runtime_id)
+                    .expect("background slot existed before synchronous name persistence");
+                background.buffered_events.push(RuntimeEventPayload::Native(
+                    CodingRuntimeEvent::SessionNameSuggested { name },
+                ));
+            }
+        }
+    }
+
+    fn apply_background_session_name(&mut self, runtime_id: RuntimeId, name: String) {
+        self.apply_background_session_name_with(
+            runtime_id,
+            name,
+            |working_dir, session_id, name| {
+                let project_bucket =
+                    atomcode_capabilities::session::SessionManager::project_hash(working_dir);
+                atomcode_daemon::legacy_convert::apply_ai_catalog_name_in_project(
+                    &project_bucket,
+                    session_id,
+                    name,
+                )
+                .map_err(|error| error.to_string())
+            },
+        );
     }
 
     pub fn drop_slot(&mut self, slot: usize) -> Result<BackgroundSlot, BgError> {
         self.backgrounds.drop_slot(slot)
     }
 
-    pub fn apply_background_event(
-        &mut self,
-        runtime_id: RuntimeId,
-        event: RuntimeEventPayload,
-        session_manager: &SessionManager,
-    ) {
+    pub fn apply_background_event(&mut self, runtime_id: RuntimeId, event: RuntimeEventPayload) {
         let Some(slot) = self.backgrounds.slot_for_runtime_id(runtime_id) else {
             return;
         };
+        let event = match event {
+            RuntimeEventPayload::SequencedNative(envelope) => {
+                RuntimeEventPayload::Native(envelope.event)
+            }
+            event => event,
+        };
         let terminal = match event {
-            RuntimeEventPayload::Legacy(event) => {
-                self.backgrounds.apply_event_to_slot(slot, &event)
+            RuntimeEventPayload::Ui(event) => self.backgrounds.apply_event_to_slot(slot, &event),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::WorkingDirectoryChanged(
+                working_dir,
+            )) => {
+                if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
+                    bg.working_dir =
+                        atomcode_capabilities::pathnorm::strip_verbatim_path(&working_dir);
+                }
+                false
+            }
+            RuntimeEventPayload::Native(CodingRuntimeEvent::SessionChanged(changed)) => {
+                self.apply_background_session_changed_with(
+                    runtime_id,
+                    changed,
+                    load_background_session_projection,
+                );
+                false
+            }
+            RuntimeEventPayload::Native(CodingRuntimeEvent::SessionNameSuggested { name }) => {
+                self.apply_background_session_name(runtime_id, name);
+                false
+            }
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(event)) => {
+                if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
+                    if !matches!(
+                        &event,
+                        atomcode_kernel::event::AgentEvent::Cancelled
+                            | atomcode_kernel::event::AgentEvent::Request { .. }
+                            | atomcode_kernel::event::AgentEvent::Snapshot { .. }
+                            | atomcode_kernel::event::AgentEvent::TurnComplete { .. }
+                    ) {
+                        bg.buffered_events.push(RuntimeEventPayload::Native(
+                            CodingRuntimeEvent::Agent(event),
+                        ));
+                    }
+                }
+                false
+            }
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Request(request)) => {
+                if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
+                    if let Some(snapshot) = request.snapshot.as_deref() {
+                        super::apply_session_snapshot(&mut bg.session, snapshot_to_core(snapshot));
+                        bg.summary = session_summary(&bg.session);
+                        retain_session_replay_events(&mut bg.buffered_events);
+                    }
+                    bg.pending_request = Some(request);
+                    bg.state = RuntimeState::Running;
+                }
+                false
+            }
+            RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(completion)) => {
+                if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
+                    bg.pending_request = None;
+                    match completion {
+                        atomcode_coding::TurnCompletion::Completed {
+                            reason, snapshot, ..
+                        } => {
+                            retain_session_replay_events(&mut bg.buffered_events);
+                            super::apply_session_snapshot(
+                                &mut bg.session,
+                                snapshot_to_core(snapshot.as_ref()),
+                            );
+                            bg.summary = session_summary(&bg.session);
+                            bg.state = background_state_for_stop_reason(reason);
+                        }
+                        atomcode_coding::TurnCompletion::SnapshotUnavailable { error, .. } => {
+                            bg.state = RuntimeState::Error;
+                            bg.buffered_events.push(RuntimeEventPayload::Native(
+                                CodingRuntimeEvent::Agent(
+                                    atomcode_kernel::event::AgentEvent::Error {
+                                        message: error.message,
+                                        http_status: None,
+                                        code: None,
+                                    },
+                                ),
+                            ));
+                        }
+                    }
+                }
+                false
+            }
+            RuntimeEventPayload::Native(CodingRuntimeEvent::RuntimeStopped(_)) => {
+                if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
+                    bg.pending_request = None;
+                    if matches!(bg.state, RuntimeState::Running) {
+                        bg.state = RuntimeState::Error;
+                    }
+                }
+                false
             }
             RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished { completion })
                 if completion.is_manual() =>
@@ -415,9 +840,9 @@ impl BgRuntimeManager {
                     if let CompactionCompletion::Completed(outcome) = &completion {
                         if outcome.committed {
                             if let Some(snapshot) = outcome.committed_snapshot.as_deref() {
-                                let core_snapshot = super::kernel_snapshot_to_core(snapshot);
+                                let core_snapshot = snapshot_to_core(snapshot);
                                 super::apply_session_snapshot(&mut bg.session, core_snapshot);
-                                failed = session_manager.save(&bg.session).is_err();
+                                // The background CodingRuntime owns native persistence.
                             } else {
                                 failed = true;
                             }
@@ -434,21 +859,26 @@ impl BgRuntimeManager {
                 false
             }
             RuntimeEventPayload::Native(_) => false,
+            RuntimeEventPayload::SequencedNative(_) => unreachable!("normalized above"),
+            RuntimeEventPayload::Driver(_) => false,
         };
-        if terminal {
-            if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
-                let _ = session_manager.save(&bg.session);
-            }
-        }
+        let _ = terminal;
     }
 
     #[cfg(test)]
     pub fn new_for_test(session: Session) -> Self {
+        let working_dir = session.working_dir.clone();
+        Self::new_for_test_at(session, working_dir)
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test_at(session: Session, working_dir: PathBuf) -> Self {
         Self {
             foreground: ForegroundRuntime {
                 runtime_id: RuntimeId::new(1),
-                endpoint: None,
+                endpoint: Some(test_endpoint()),
                 session,
+                working_dir,
             },
             backgrounds: BackgroundSlots::new(MAX_BACKGROUND_SLOTS),
             next_runtime_id: 1,
@@ -466,6 +896,11 @@ impl BgRuntimeManager {
     }
 
     #[cfg(test)]
+    pub fn foreground_working_dir(&self) -> &PathBuf {
+        &self.foreground.working_dir
+    }
+
+    #[cfg(test)]
     pub fn push_test_background(
         &mut self,
         session: Session,
@@ -473,14 +908,18 @@ impl BgRuntimeManager {
     ) -> Result<usize, BgError> {
         let runtime_id = self.allocate_runtime_id();
         let summary = session_summary(&session);
+        let working_dir = session.working_dir.clone();
         self.backgrounds.push_slot(BackgroundSlot {
             runtime_id,
-            endpoint: None,
+            endpoint: Some(test_endpoint()),
             session,
+            working_dir,
             state,
             created_at: 0,
             summary,
             buffered_events: Vec::new(),
+            pending_session_change: None,
+            pending_request: None,
         })
     }
 
@@ -489,7 +928,8 @@ impl BgRuntimeManager {
         let runtime_id = self.allocate_runtime_id();
         self.background_current(
             test_endpoint(),
-            Session::default_session(self.foreground.session.working_dir.clone()),
+            Session::default_session(self.foreground.working_dir.clone()),
+            self.foreground.working_dir.clone(),
             runtime_id,
             RuntimeState::Idle,
         )
@@ -544,13 +984,16 @@ pub fn render_bg_list(slots: &BackgroundSlots) -> String {
     }
     let mut out = t(Msg::BgListHeader).into_owned();
     for row in slots.list_rows() {
-        out.push_str(&t(Msg::BgListRow {
-            slot: row.slot,
-            short_id: &row.short_id,
-            state: &row.state.localised(),
-            age: &humanize_age(row.created_at),
-            summary: &row.summary,
-        }).into_owned());
+        out.push_str(
+            &t(Msg::BgListRow {
+                slot: row.slot,
+                short_id: &row.short_id,
+                state: &row.state.localised(),
+                age: &humanize_age(row.created_at),
+                summary: &row.summary,
+            })
+            .into_owned(),
+        );
     }
     out
 }
@@ -560,6 +1003,23 @@ fn session_summary(session: &Session) -> String {
         session.short_id().to_string()
     } else {
         session.name.clone()
+    }
+}
+
+fn retain_session_replay_events(events: &mut Vec<RuntimeEventPayload>) {
+    events.retain(|event| {
+        matches!(
+            event,
+            RuntimeEventPayload::Native(CodingRuntimeEvent::SessionNameSuggested { .. })
+        )
+    });
+}
+
+fn background_state_for_stop_reason(reason: atomcode_kernel::event::StopReason) -> RuntimeState {
+    match reason {
+        atomcode_kernel::event::StopReason::Stopped => RuntimeState::Done,
+        atomcode_kernel::event::StopReason::Cancelled => RuntimeState::Cancelled,
+        _ => RuntimeState::Error,
     }
 }
 
@@ -585,30 +1045,17 @@ fn humanize_age(ts: u64) -> String {
 }
 
 #[cfg(test)]
-fn test_client() -> AgentClient {
-    let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-    AgentClient {
-        cmd_tx,
-        tool_registry: std::sync::Arc::new(atomcode_core::tool::ToolRegistry::new()),
-        skill_registry: std::sync::Arc::new(std::sync::RwLock::new(
-            atomcode_core::skill::SkillRegistry::new(),
-        )),
-    }
-}
-
-#[cfg(test)]
 fn test_endpoint() -> RuntimeEndpoint {
     let (native, _controls) = atomcode_coding::runtime::coding_runtime_control_channel();
     RuntimeEndpoint {
-        legacy: test_client(),
-        native,
+        native: native.into(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::session::Session;
+    use crate::session::Session;
     use std::path::PathBuf;
 
     fn session(name: &str) -> Session {
@@ -703,7 +1150,7 @@ mod tests {
 
     #[test]
     fn background_turn_complete_updates_slot_to_done_and_messages() {
-        use atomcode_core::agent::TurnStopReason;
+        use crate::event_loop::ui_event::UiTurnStopReason as TurnStopReason;
         use atomcode_core::conversation::{
             message::{Message, Role},
             ConversationSnapshot,
@@ -735,6 +1182,422 @@ mod tests {
     }
 
     #[test]
+    fn legacy_background_turn_complete_respects_abnormal_stop_reason() {
+        use crate::event_loop::ui_event::UiTurnStopReason as TurnStopReason;
+
+        let mut slots = BackgroundSlots::new(16);
+        slots
+            .push_test_slot(
+                Session::default_session(PathBuf::from("/tmp/project")),
+                RuntimeState::Running,
+            )
+            .unwrap();
+
+        slots.apply_event_to_slot(
+            1,
+            &AgentEvent::TurnComplete {
+                duration: std::time::Duration::from_secs(1),
+                total_tokens: 10,
+                turn_count: 1,
+                tool_call_count: 0,
+                stop_reason: TurnStopReason::TurnLimit,
+                snapshot: Default::default(),
+            },
+        );
+
+        assert_eq!(slots.list_rows()[0].state, RuntimeState::Error);
+    }
+
+    #[test]
+    fn legacy_background_error_is_diagnostic_until_terminal() {
+        let mut slots = BackgroundSlots::new(16);
+        slots
+            .push_test_slot(
+                Session::default_session(PathBuf::from("/tmp/project")),
+                RuntimeState::Running,
+            )
+            .unwrap();
+
+        slots.apply_event_to_slot(
+            1,
+            &AgentEvent::Error {
+                error: "provider diagnostic".into(),
+                snapshot: Default::default(),
+            },
+        );
+
+        assert_eq!(slots.list_rows()[0].state, RuntimeState::Running);
+    }
+
+    #[test]
+    fn sequenced_native_turn_terminal_updates_background_snapshot_and_state() {
+        use std::sync::Arc;
+
+        use atomcode_coding::{RuntimeTurnStats, SequencedRuntimeEvent, TurnCompletion};
+        use atomcode_kernel::{
+            event::StopReason,
+            message::{Message, SessionSnapshot},
+        };
+
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
+        manager
+            .push_test_background(session("native task"), RuntimeState::Running)
+            .unwrap();
+        let snapshot = Arc::new(SessionSnapshot::new(vec![Message::user("native result")]));
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::SequencedNative(SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: StopReason::Stopped,
+                    snapshot,
+                    stats: RuntimeTurnStats::default(),
+                }),
+            }),
+        );
+
+        let slot = &manager.backgrounds.slots[0];
+        assert_eq!(slot.state, RuntimeState::Done);
+        assert_eq!(slot.session.messages.len(), 1);
+        assert_eq!(slot.session.messages[0].text(), Some("native result"));
+    }
+
+    #[test]
+    fn sequenced_native_request_is_retained_for_foreground_resume() {
+        use std::sync::Arc;
+
+        use atomcode_coding::{RuntimeRequest, SequencedRuntimeEvent};
+        use atomcode_kernel::message::{Message, SessionSnapshot};
+
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
+        manager
+            .push_test_background(session("approval task"), RuntimeState::Running)
+            .unwrap();
+        let request = RuntimeRequest {
+            id: 42,
+            kind: atomcode_capabilities::tools::APPROVAL_KIND.into(),
+            payload: serde_json::json!({
+                "call_id": "call-42",
+                "tool": "bash",
+                "args": "{\"command\":\"pwd\"}"
+            }),
+            snapshot: Some(Arc::new(SessionSnapshot::new(vec![Message::user(
+                "approve this",
+            )]))),
+        };
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::SequencedNative(SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::Request(request.clone()),
+            }),
+        );
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+
+        assert_eq!(resumed.resumed_state, RuntimeState::Running);
+        assert!(resumed.replay_events.iter().any(|event| {
+            matches!(
+                event,
+                RuntimeEventPayload::Native(CodingRuntimeEvent::Request(request))
+                    if request.id == 42
+            )
+        }));
+        assert_eq!(resumed.resumed_session.messages.len(), 1);
+        assert_eq!(
+            resumed.resumed_session.messages[0].text(),
+            Some("approve this")
+        );
+    }
+
+    #[test]
+    fn sequenced_native_agent_output_is_retained_for_foreground_resume() {
+        use atomcode_coding::SequencedRuntimeEvent;
+
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
+        manager
+            .push_test_background(session("streaming task"), RuntimeState::Running)
+            .unwrap();
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::SequencedNative(SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::TextDelta(
+                    "partial answer".into(),
+                )),
+            }),
+        );
+
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+        assert!(matches!(
+            resumed.replay_events.as_slice(),
+            [RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+                atomcode_kernel::event::AgentEvent::TextDelta(text)
+            ))] if text == "partial answer"
+        ));
+    }
+
+    #[test]
+    fn background_request_replays_after_prior_agent_output() {
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
+        manager
+            .push_test_background(session("approval task"), RuntimeState::Running)
+            .unwrap();
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+                atomcode_kernel::event::AgentEvent::TextDelta("before approval".into()),
+            )),
+        );
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Request(
+                atomcode_coding::RuntimeRequest {
+                    id: 7,
+                    kind: atomcode_capabilities::tools::APPROVAL_KIND.into(),
+                    payload: serde_json::json!({}),
+                    snapshot: None,
+                },
+            )),
+        );
+
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+
+        assert!(matches!(
+            resumed.replay_events.as_slice(),
+            [
+                RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+                    atomcode_kernel::event::AgentEvent::TextDelta(text)
+                )),
+                RuntimeEventPayload::Native(CodingRuntimeEvent::Request(request)),
+            ] if text == "before approval" && request.id == 7
+        ));
+    }
+
+    #[test]
+    fn request_snapshot_supersedes_already_buffered_turn_output() {
+        use std::sync::Arc;
+
+        use atomcode_kernel::message::{Message, SessionSnapshot};
+
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
+        manager
+            .push_test_background(session("approval task"), RuntimeState::Running)
+            .unwrap();
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Ui(AgentEvent::UserEcho("question".into())),
+        );
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+                atomcode_kernel::event::AgentEvent::TextDelta("streamed answer".into()),
+            )),
+        );
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Request(
+                atomcode_coding::RuntimeRequest {
+                    id: 7,
+                    kind: atomcode_capabilities::tools::APPROVAL_KIND.into(),
+                    payload: serde_json::json!({}),
+                    snapshot: Some(Arc::new(SessionSnapshot::new(vec![Message::user(
+                        "question",
+                    )]))),
+                },
+            )),
+        );
+
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+
+        assert!(matches!(
+            resumed.replay_events.as_slice(),
+            [RuntimeEventPayload::Native(CodingRuntimeEvent::Request(request))]
+                if request.id == 7
+        ));
+        assert_eq!(resumed.resumed_session.messages.len(), 1);
+    }
+
+    #[test]
+    fn background_session_name_is_persisted_before_updating_the_mirror() {
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
+        manager
+            .push_test_background(session("temporary"), RuntimeState::Running)
+            .unwrap();
+        let expected_id = manager.backgrounds.slots[0].session.id.clone();
+
+        manager.apply_background_session_name_with(
+            RuntimeId::new(2),
+            "generated title".into(),
+            |working_dir, session_id, name| {
+                assert_eq!(working_dir, std::path::Path::new("/tmp/project"));
+                assert_eq!(session_id, expected_id);
+                assert_eq!(name, "generated title");
+                Ok(true)
+            },
+        );
+
+        let background = &manager.backgrounds.slots[0];
+        assert_eq!(background.session.name, "generated title");
+        assert!(background.session.ai_named);
+        assert_eq!(background.summary, "generated title");
+    }
+
+    #[test]
+    fn failed_background_name_persistence_is_retried_on_resume() {
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
+        manager
+            .push_test_background(session("temporary"), RuntimeState::Done)
+            .unwrap();
+
+        manager.apply_background_session_name_with(
+            RuntimeId::new(2),
+            "generated title".into(),
+            |_, _, _| Err("catalog unavailable".into()),
+        );
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+
+        assert!(matches!(
+            resumed.replay_events.as_slice(),
+            [RuntimeEventPayload::Native(
+                CodingRuntimeEvent::SessionNameSuggested { name }
+            )] if name == "generated title"
+        ));
+    }
+
+    #[test]
+    fn background_agent_error_waits_for_authoritative_runtime_terminal() {
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
+        manager
+            .push_test_background(session("startup failure"), RuntimeState::Running)
+            .unwrap();
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+                atomcode_kernel::event::AgentEvent::Error {
+                    message: "provider could not start".into(),
+                    http_status: None,
+                    code: None,
+                },
+            )),
+        );
+
+        assert_eq!(manager.backgrounds.slots[0].state, RuntimeState::Running);
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::RuntimeStopped(
+                atomcode_coding::RuntimeExit {
+                    reason: atomcode_coding::RuntimeExitReason::OwnerStopped,
+                    forced: false,
+                },
+            )),
+        );
+        assert_eq!(manager.backgrounds.slots[0].state, RuntimeState::Error);
+    }
+
+    #[test]
+    fn abnormal_native_turn_terminals_do_not_look_successful() {
+        use std::sync::Arc;
+
+        use atomcode_coding::{RuntimeTurnStats, TurnCompletion};
+        use atomcode_kernel::{event::StopReason, message::SessionSnapshot};
+
+        for reason in [
+            StopReason::MaxRounds,
+            StopReason::MaxContinuations,
+            StopReason::RepeatLoop,
+            StopReason::ToolLoopDetected,
+            StopReason::ProviderError,
+            StopReason::Timeout,
+            StopReason::PromptRejected,
+            StopReason::RateLimited,
+        ] {
+            let mut manager = BgRuntimeManager::new_for_test(Session::default_session(
+                PathBuf::from("/tmp/project"),
+            ));
+            manager
+                .push_test_background(session("failed task"), RuntimeState::Running)
+                .unwrap();
+            manager.apply_background_event(
+                RuntimeId::new(2),
+                RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+                    TurnCompletion::Completed {
+                        turn_id: 1,
+                        reason,
+                        snapshot: Arc::new(SessionSnapshot::new(Vec::new())),
+                        stats: RuntimeTurnStats::default(),
+                    },
+                )),
+            );
+
+            assert_eq!(manager.backgrounds.slots[0].state, RuntimeState::Error);
+        }
+    }
+
+    #[test]
+    fn snapshot_failure_keeps_partial_output_available_for_resume() {
+        use atomcode_coding::{RuntimeSnapshotError, RuntimeTurnStats, TurnCompletion};
+        use atomcode_kernel::event::StopReason;
+
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
+        manager
+            .push_test_background(session("failed snapshot"), RuntimeState::Running)
+            .unwrap();
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+                atomcode_kernel::event::AgentEvent::TextDelta("partial answer".into()),
+            )),
+        );
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+                TurnCompletion::SnapshotUnavailable {
+                    turn_id: 1,
+                    reason: StopReason::ProviderError,
+                    error: RuntimeSnapshotError {
+                        message: "snapshot failed".into(),
+                    },
+                    stats: RuntimeTurnStats::default(),
+                },
+            )),
+        );
+
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+
+        assert_eq!(resumed.resumed_state, RuntimeState::Error);
+        assert!(matches!(
+            resumed.replay_events.first(),
+            Some(RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+                atomcode_kernel::event::AgentEvent::TextDelta(text)
+            ))) if text == "partial answer"
+        ));
+        assert!(matches!(
+            resumed.replay_events.last(),
+            Some(RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+                atomcode_kernel::event::AgentEvent::Error { message, .. }
+            ))) if message == "snapshot failed"
+        ));
+    }
+
+    #[test]
     fn resume_slot_discards_empty_foreground() {
         let mut manager =
             BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
@@ -752,17 +1615,16 @@ mod tests {
 
     #[tokio::test]
     async fn resume_restores_the_native_handle_for_that_runtime() {
-        use atomcode_coding::runtime::{
-            coding_runtime_control_channel, CodingRuntimeControl,
-        };
+        use atomcode_coding::runtime::{coding_runtime_control_channel, CodingRuntimeControl};
 
         let (first_native, mut first_controls) = coding_runtime_control_channel();
         let first_endpoint = RuntimeEndpoint {
-            legacy: test_client(),
-            native: first_native,
+            native: first_native.into(),
         };
+        let first = session("first");
         let mut manager = BgRuntimeManager::new(
-            session("first"),
+            first.clone(),
+            first.working_dir.clone(),
             RuntimeId::new(1),
             first_endpoint,
         );
@@ -771,10 +1633,10 @@ mod tests {
         manager
             .background_current(
                 RuntimeEndpoint {
-                    legacy: test_client(),
-                    native: second_native,
+                    native: second_native.into(),
                 },
                 session("second"),
+                PathBuf::from("/tmp/project"),
                 RuntimeId::new(2),
                 RuntimeState::Idle,
             )
@@ -783,7 +1645,6 @@ mod tests {
         let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
         resumed
             .resumed_endpoint
-            .unwrap()
             .native
             .compact(Some("first runtime".into()))
             .unwrap();
@@ -793,6 +1654,202 @@ mod tests {
             Some(CodingRuntimeControl::Compact { focus: Some(focus), .. })
                 if focus == "first runtime"
         ));
+    }
+
+    #[test]
+    fn resume_restores_the_runtime_working_dir_instead_of_stale_session_metadata() {
+        let first_runtime_dir = PathBuf::from("/projects/first");
+        let second_runtime_dir = PathBuf::from("/projects/second");
+        let mut first = Session::default_session(PathBuf::from("/stale/first"));
+        first.name = "first".into();
+        let mut second = Session::default_session(PathBuf::from("/stale/second"));
+        second.name = "second".into();
+        let mut manager = BgRuntimeManager::new_for_test_at(first, first_runtime_dir.clone());
+
+        manager
+            .background_current(
+                test_endpoint(),
+                second,
+                second_runtime_dir.clone(),
+                RuntimeId::new(2),
+                RuntimeState::Idle,
+            )
+            .unwrap();
+
+        let resumed = manager.resume_slot(1, RuntimeState::Running).unwrap();
+
+        assert_eq!(resumed.resumed_working_dir, first_runtime_dir);
+        assert_eq!(
+            manager.foreground_working_dir(),
+            &resumed.resumed_working_dir
+        );
+        assert_eq!(manager.backgrounds.slots[0].working_dir, second_runtime_dir);
+    }
+
+    #[test]
+    fn resume_uses_working_dir_changed_while_runtime_was_backgrounded() {
+        let first_runtime_dir = PathBuf::from("/projects/first");
+        let changed_runtime_dir = PathBuf::from("/projects/first/nested");
+        let mut manager = BgRuntimeManager::new_for_test_at(
+            Session::default_session(first_runtime_dir.clone()),
+            first_runtime_dir,
+        );
+
+        manager.background_current_for_test().unwrap();
+        manager.apply_background_event(
+            RuntimeId::new(1),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::WorkingDirectoryChanged(
+                changed_runtime_dir.clone(),
+            )),
+        );
+
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+
+        assert_eq!(resumed.resumed_working_dir, changed_runtime_dir);
+    }
+
+    #[test]
+    fn resume_without_runtime_endpoint_leaves_manager_unchanged() {
+        let first_dir = PathBuf::from("/projects/first");
+        let mut manager = BgRuntimeManager::new_for_test_at(
+            Session::default_session(first_dir.clone()),
+            first_dir,
+        );
+        manager.background_current_for_test().unwrap();
+        manager.backgrounds.slots[0].endpoint = None;
+        let foreground_runtime_id = manager.foreground.runtime_id;
+        let foreground_session_id = manager.foreground.session.id.clone();
+        let foreground_working_dir = manager.foreground.working_dir.clone();
+        let background_runtime_id = manager.backgrounds.slots[0].runtime_id;
+        let background_session_id = manager.backgrounds.slots[0].session.id.clone();
+
+        let error = match manager.resume_slot(1, RuntimeState::Idle) {
+            Err(error) => error,
+            Ok(_) => panic!("resume without an endpoint must fail"),
+        };
+
+        assert_eq!(error, BgError::NoRuntimeClient { slot: 1 });
+        assert_eq!(manager.foreground.runtime_id, foreground_runtime_id);
+        assert_eq!(manager.foreground.session.id, foreground_session_id);
+        assert_eq!(manager.foreground.working_dir, foreground_working_dir);
+        assert_eq!(manager.backgrounds.len(), 1);
+        assert_eq!(
+            manager.backgrounds.slots[0].runtime_id,
+            background_runtime_id
+        );
+        assert_eq!(
+            manager.backgrounds.slots[0].session.id,
+            background_session_id
+        );
+    }
+
+    #[test]
+    fn background_session_changed_replaces_the_complete_session_projection() {
+        let original_dir = PathBuf::from("/projects/original");
+        let changed_dir = PathBuf::from("/projects/changed");
+        let mut manager = BgRuntimeManager::new_for_test_at(
+            Session::default_session(original_dir.clone()),
+            original_dir,
+        );
+        manager.background_current_for_test().unwrap();
+        let runtime_id = manager.backgrounds.slots[0].runtime_id;
+        let changed = atomcode_coding::SessionChanged {
+            generation: atomcode_coding::RuntimeGeneration(2),
+            session_id: Some("changed-session".into()),
+            working_dir: changed_dir.clone(),
+        };
+        let mut loaded = Session::default_session(PathBuf::from("/stale/catalog/path"));
+        loaded.id = "changed-session".into();
+        loaded.name = "loaded from exact bucket".into();
+
+        manager.apply_background_session_changed_with(runtime_id, changed, |_| Ok(loaded.clone()));
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+
+        assert_eq!(resumed.resumed_session.id, "changed-session");
+        assert_eq!(resumed.resumed_session.name, "loaded from exact bucket");
+        assert_eq!(resumed.resumed_working_dir, changed_dir);
+    }
+
+    #[test]
+    fn background_session_loader_uses_the_exact_project_bucket() {
+        use atomcode_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+        use atomcode_kernel::message::{Message, SessionSnapshot};
+
+        let root = tempfile::tempdir().unwrap();
+        let id = "same-session-id";
+        let first_dir = PathBuf::from("/projects/first");
+        let second_dir = PathBuf::from("/projects/second");
+        for (working_dir, name) in [(&first_dir, "first"), (&second_dir, "second")] {
+            let bucket = SessionManager::project_hash(working_dir);
+            let manager = SessionManager::with_root(root.path().join(bucket));
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot = SessionSnapshot::new(vec![Message::user(name)]);
+            let mut meta = SessionMeta::new(id, working_dir.to_string_lossy(), 1);
+            meta.owner = StorageOwner::Native;
+            meta.name = name.into();
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+        }
+        let changed = atomcode_coding::SessionChanged {
+            generation: atomcode_coding::RuntimeGeneration(2),
+            session_id: Some(id.into()),
+            working_dir: second_dir,
+        };
+
+        let loaded = load_background_session_projection_in_root(root.path(), &changed).unwrap();
+
+        assert_eq!(loaded.id, id);
+        assert_eq!(loaded.name, "second");
+        assert_eq!(loaded.messages[0].text(), Some("second"));
+    }
+
+    #[test]
+    fn unresolved_background_session_change_blocks_resume_without_mutation() {
+        let original_dir = PathBuf::from("/projects/original");
+        let changed_dir = PathBuf::from("/projects/changed");
+        let mut manager = BgRuntimeManager::new_for_test_at(
+            Session::default_session(original_dir.clone()),
+            original_dir,
+        );
+        manager.background_current_for_test().unwrap();
+        let runtime_id = manager.backgrounds.slots[0].runtime_id;
+        let changed = atomcode_coding::SessionChanged {
+            generation: atomcode_coding::RuntimeGeneration(2),
+            session_id: Some("missing-session".into()),
+            working_dir: changed_dir,
+        };
+        manager.apply_background_session_changed_with(runtime_id, changed, |_| {
+            Err("catalog read failed".into())
+        });
+        let foreground_runtime_id = manager.foreground.runtime_id;
+        let background_session_id = manager.backgrounds.slots[0].session.id.clone();
+
+        let error = match manager.resume_slot_with_loader(1, RuntimeState::Idle, |_| {
+            Err("catalog still unavailable".into())
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("resume with an unresolved session projection must fail"),
+        };
+
+        assert!(matches!(
+            error,
+            BgError::SessionProjectionUnavailable { slot: 1, .. }
+        ));
+        assert_eq!(manager.foreground.runtime_id, foreground_runtime_id);
+        assert_eq!(manager.backgrounds.len(), 1);
+        assert_eq!(
+            manager.backgrounds.slots[0].session.id,
+            background_session_id
+        );
     }
 
     #[test]
@@ -815,7 +1872,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_event_forwarder_tags_events() {
-        use atomcode_core::agent::AgentEvent;
+        use crate::event_loop::ui_event::UiEvent as AgentEvent;
 
         let (agent_tx, agent_rx) = tokio::sync::mpsc::unbounded_channel();
         let (fan_tx, mut fan_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -823,7 +1880,7 @@ mod tests {
 
         spawn_event_forwarder(runtime_id, agent_rx, fan_tx);
         agent_tx
-            .send(RuntimeEventPayload::Legacy(AgentEvent::TextDelta(
+            .send(RuntimeEventPayload::Ui(AgentEvent::TextDelta(
                 "hello".to_string(),
             )))
             .unwrap();
@@ -832,7 +1889,7 @@ mod tests {
         assert_eq!(event.runtime_id, runtime_id);
         assert!(matches!(
             event.event,
-            RuntimeEventPayload::Legacy(AgentEvent::TextDelta(text)) if text == "hello"
+            RuntimeEventPayload::Ui(AgentEvent::TextDelta(text)) if text == "hello"
         ));
     }
 
@@ -862,7 +1919,6 @@ mod tests {
                     committed_snapshot: None,
                 }),
             }),
-            &SessionManager::new(&project),
         );
 
         assert_eq!(
@@ -872,6 +1928,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn committed_manual_compaction_updates_background_session_mirror() {
         use atomcode_coding::runtime::CompactionOutcome;
         use atomcode_kernel::message::{CompactTrigger, Message, SessionSnapshot};
@@ -899,7 +1956,6 @@ mod tests {
                     committed_snapshot: Some(std::sync::Arc::new(snapshot)),
                 }),
             }),
-            &SessionManager::new(&project),
         );
 
         let messages = &manager.backgrounds.slots[0].session.messages;
@@ -929,10 +1985,12 @@ mod tests {
                     reason: atomcode_coding::runtime::CompactionInterruption::RuntimeReconfigured,
                 },
             }),
-            &SessionManager::new(&project),
         );
 
-        assert_eq!(manager.backgrounds().list_rows()[0].state, RuntimeState::Idle);
+        assert_eq!(
+            manager.backgrounds().list_rows()[0].state,
+            RuntimeState::Idle
+        );
     }
 
     #[test]
@@ -953,7 +2011,6 @@ mod tests {
                     error: atomcode_kernel::checkpoint::CompactionCheckpointError::new("disk full"),
                 },
             }),
-            &SessionManager::new(&project),
         );
 
         assert_eq!(
@@ -988,9 +2045,11 @@ mod tests {
                     committed_snapshot: None,
                 }),
             }),
-            &SessionManager::new(&project),
         );
 
-        assert_eq!(manager.backgrounds().list_rows()[0].state, RuntimeState::Done);
+        assert_eq!(
+            manager.backgrounds().list_rows()[0].state,
+            RuntimeState::Done
+        );
     }
 }

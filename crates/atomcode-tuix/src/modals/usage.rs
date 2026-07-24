@@ -3,8 +3,8 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use atomcode_core::coding_plan::types::{PlanInfo, RateLimitWindow};
-use atomcode_core::coding_plan::usage::{compute_overview, humanize_tokens, OverviewStats, UsageResponse};
+use atomcode_codingplan::types::{PlanInfo, RateLimitWindow};
+use atomcode_codingplan::usage::{compute_overview, humanize_tokens, OverviewStats, UsageResponse};
 
 use super::{Modal, ModalAction};
 use crate::event_loop::{build_status, Buffer, LoopCtx};
@@ -43,7 +43,11 @@ pub struct UsageModal {
 
 impl UsageModal {
     pub fn new(data: UsageData) -> Self {
-        Self { data, tab: Tab::Current, copy_notice: None }
+        Self {
+            data,
+            tab: Tab::Current,
+            copy_notice: None,
+        }
     }
 
     pub(crate) fn next_tab(&mut self) {
@@ -69,6 +73,22 @@ impl UsageModal {
             '3' => Tab::Models,
             _ => self.tab,
         };
+    }
+
+    /// Map a tab-navigation key to a tab switch. The single authority for the
+    /// nav key set, shared by the interactive modal ([`handle_key`]) and the
+    /// streaming footer report so the two surfaces can never drift. Returns
+    /// `true` when the key was a nav key (and thus consumed).
+    ///
+    /// [`handle_key`]: Modal::handle_key
+    pub(crate) fn handle_tab_nav(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Tab | KeyCode::Right => self.next_tab(),
+            KeyCode::BackTab | KeyCode::Left => self.prev_tab(),
+            KeyCode::Char(c @ '1'..='3') => self.select_tab(c),
+            _ => return false,
+        }
+        true
     }
 
     /// Build the tab bar string (active = bold, inactive = dim/muted).
@@ -121,7 +141,12 @@ impl UsageModal {
             // Window duration hint
             if w.window_hours > 0 {
                 rows.push((
-                    format!("  {m}({})\x1b[39m", t(Msg::UsageWindowHours { hours: w.window_hours })),
+                    format!(
+                        "  {m}({})\x1b[39m",
+                        t(Msg::UsageWindowHours {
+                            hours: w.window_hours
+                        })
+                    ),
                     String::new(),
                 ));
             }
@@ -187,6 +212,45 @@ impl UsageModal {
         rows
     }
 
+    /// Theme-aware, colour-preserving snapshot of the tab bar + the ACTIVE tab.
+    ///
+    /// Streaming `/usage` can't install the interactive modal (live token
+    /// redraws own the footer), so tab switching mid-stream re-renders this
+    /// snapshot into the footer instead. It reuses the modal's exact rows so
+    /// headings, progress bars, plan status, heatmap, and palette match. Unlike
+    /// [`active_tab_text`] (clipboard, ANSI-stripped) it keeps colour so the
+    /// footer's bars/heatmap render, and it follows `self.tab` across all three
+    /// tabs. `models_rows` needs the terminal caps, hence the parameters.
+    ///
+    /// [`active_tab_text`]: Self::active_tab_text
+    pub(crate) fn active_snapshot_text(&self, caps_colors: bool, caps_unicode: bool) -> String {
+        let mut lines = vec![self.tab_bar(), String::new()];
+        lines.extend(
+            self.active_tab_lines(caps_colors, caps_unicode)
+                .into_iter()
+                .skip_while(String::is_empty),
+        );
+        lines.join("\n")
+    }
+
+    /// The active tab's body lines with colour intact — the single tab-body
+    /// dispatch shared by the colour-keeping [`active_snapshot_text`] and the
+    /// ANSI-stripped [`active_tab_text`].
+    ///
+    /// [`active_snapshot_text`]: Self::active_snapshot_text
+    /// [`active_tab_text`]: Self::active_tab_text
+    fn active_tab_lines(&self, caps_colors: bool, caps_unicode: bool) -> Vec<String> {
+        match self.tab {
+            Tab::Current => self.current_rows().into_iter().map(|(l, _)| l).collect(),
+            Tab::Overview => self.overview_lines(),
+            Tab::Models => self
+                .models_rows(caps_colors, caps_unicode)
+                .into_iter()
+                .map(|(l, _)| l)
+                .collect(),
+        }
+    }
+
     /// Build Overview tab rows — calendar heatmap + stats block.
     pub fn overview_lines(&self) -> Vec<String> {
         let m = muted_open();
@@ -197,8 +261,11 @@ impl UsageModal {
         let mut lines: Vec<String> = Vec::new();
 
         // ── Calendar heatmap ──
-        let cal_rows: Vec<(String, u64)> =
-            u.rows.iter().map(|r| (r.date.clone(), r.total_tokens)).collect();
+        let cal_rows: Vec<(String, u64)> = u
+            .rows
+            .iter()
+            .map(|r| (r.date.clone(), r.total_tokens))
+            .collect();
 
         if !cal_rows.is_empty() {
             let cells = calendar_layout(&cal_rows);
@@ -212,8 +279,7 @@ impl UsageModal {
             // can't fit before the next month, so a sliver month at the edge
             // doesn't show a cramped/clipped name.
             let month_names = [
-                "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
             ];
             const CELL_W: usize = 4; // display width per week-column cell (bigger grid)
             const WD_LABEL_W: usize = 4; // "Sun " weekday-label column width
@@ -323,38 +389,46 @@ impl UsageModal {
 
         // ── Stats block ──
         lines.push(String::new());
-        let overview = self.data.overview.as_ref().cloned().unwrap_or_else(|| compute_overview(u));
+        let overview = self
+            .data
+            .overview
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| compute_overview(u));
 
-        let stat = |label: &str, value: &str| -> String {
-            format!("  {m}{label:<20}\x1b[39m \x1b[1m{value}\x1b[22m")
-        };
-
+        // Collect the label/value pairs, then align the value column by DISPLAY
+        // width. The old `{label:<20}` padded by CHAR COUNT, but CJK labels have
+        // different char-count-vs-cell-width ratios (`请求次数` = 4 chars / 8 cells
+        // vs `总 Token 数` = 9 chars / 11 cells), so every value started at a
+        // different terminal column — the misalignment reported on `/usage`.
+        let mut pairs: Vec<(String, String)> = Vec::new();
         if let Some(fav) = &overview.favorite_model {
-            lines.push(stat(&t(Msg::UsageStatFavorite), fav));
+            pairs.push((t(Msg::UsageStatFavorite).into_owned(), fav.clone()));
         }
-        lines.push(stat(
-            &t(Msg::UsageStatTotal),
-            &humanize_tokens(overview.total_tokens),
+        pairs.push((
+            t(Msg::UsageStatTotal).into_owned(),
+            humanize_tokens(overview.total_tokens),
         ));
-        lines.push(stat(
-            &t(Msg::UsageStatRequests),
-            &overview.total_requests.to_string(),
+        pairs.push((
+            t(Msg::UsageStatRequests).into_owned(),
+            overview.total_requests.to_string(),
         ));
-        lines.push(stat(
-            &t(Msg::UsageStatActiveDays),
-            &format!("{} / {}", overview.active_days, overview.total_days),
+        pairs.push((
+            t(Msg::UsageStatActiveDays).into_owned(),
+            format!("{} / {}", overview.active_days, overview.total_days),
         ));
         if let Some(day) = &overview.most_active_day {
-            lines.push(stat(&t(Msg::UsageStatMostActive), day));
+            pairs.push((t(Msg::UsageStatMostActive).into_owned(), day.clone()));
         }
-        lines.push(stat(
-            &t(Msg::UsageStatLongestStreak),
-            &format!("{} days", overview.longest_streak),
+        pairs.push((
+            t(Msg::UsageStatLongestStreak).into_owned(),
+            format!("{} days", overview.longest_streak),
         ));
-        lines.push(stat(
-            &t(Msg::UsageStatCurrentStreak),
-            &format!("{} days", overview.current_streak),
+        pairs.push((
+            t(Msg::UsageStatCurrentStreak).into_owned(),
+            format!("{} days", overview.current_streak),
         ));
+        lines.extend(align_stat_lines(&pairs, m));
 
         lines
     }
@@ -443,7 +517,7 @@ impl UsageModal {
         if caps_colors && caps_unicode {
             // ── Unified braille line chart ──
             let chart_w = 52usize; // cells (wider for clearer display)
-            let chart_h = 6usize;  // cells
+            let chart_h = 6usize; // cells
 
             // Global max across all series
             let global_max: u64 = model_stats
@@ -476,10 +550,7 @@ impl UsageModal {
                 .collect();
 
             // Chart title
-            rows.push((
-                format!("  \x1b[1mTokens per Day\x1b[22m"),
-                String::new(),
-            ));
+            rows.push((format!("  \x1b[1mTokens per Day\x1b[22m"), String::new()));
 
             // Render rows: merge grids, colour by first model with a dot
             for ri in 0..chart_h {
@@ -614,9 +685,7 @@ impl UsageModal {
                     String::new(),
                 ));
                 rows.push((
-                    format!(
-                        "    \x1b[38;5;{color}m{spark}\x1b[39m"
-                    ),
+                    format!("    \x1b[38;5;{color}m{spark}\x1b[39m"),
                     String::new(),
                 ));
                 rows.push((
@@ -654,24 +723,11 @@ impl UsageModal {
 
     /// Build a plain-text snapshot of the active tab suitable for clipboard copy.
     fn active_tab_text(&self, caps_colors: bool, caps_unicode: bool) -> String {
-        let rows: Vec<String> = match self.tab {
-            Tab::Current => self
-                .current_rows()
-                .into_iter()
-                .map(|(l, _)| Self::strip_ansi(&l))
-                .collect(),
-            Tab::Overview => self
-                .overview_lines()
-                .into_iter()
-                .map(|l| Self::strip_ansi(&l))
-                .collect(),
-            Tab::Models => self
-                .models_rows(caps_colors, caps_unicode)
-                .into_iter()
-                .map(|(l, _)| Self::strip_ansi(&l))
-                .collect(),
-        };
-        rows.join("\n")
+        self.active_tab_lines(caps_colors, caps_unicode)
+            .iter()
+            .map(|l| Self::strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -693,13 +749,11 @@ impl Modal for UsageModal {
             self.draw(buf, state, ctx, renderer);
             return Ok(ModalAction::Continue);
         }
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(ModalAction::Close),
-            KeyCode::Tab | KeyCode::Right => self.next_tab(),
-            KeyCode::BackTab | KeyCode::Left => self.prev_tab(),
-            KeyCode::Char(c @ '1'..='3') => self.select_tab(c),
-            _ => {}
+        if let KeyCode::Esc | KeyCode::Char('q') = code {
+            return Ok(ModalAction::Close);
         }
+        // Tab / ←→ / 1-3 switch tabs; other keys are no-ops here.
+        self.handle_tab_nav(code);
         let _ = mods;
         // Clear any copy notice on any other keypress
         self.copy_notice = None;
@@ -799,10 +853,33 @@ fn muted_open() -> &'static str {
     }
 }
 
+/// Render a `label → value` stats block with the value column aligned by DISPLAY
+/// width. Padding is computed from `crate::width::display_width` (CJK-aware), NOT
+/// char count, so mixed-width labels (`请求次数` vs `总 Token 数`) still put every
+/// value at the same terminal column. `muted` is the label's SGR-open colour;
+/// labels are muted, values bold, with a fixed gap between the widest label and
+/// the value column.
+fn align_stat_lines(pairs: &[(String, String)], muted: &str) -> Vec<String> {
+    const GAP: usize = 3;
+    let label_w = pairs
+        .iter()
+        .map(|(l, _)| crate::width::display_width(l))
+        .max()
+        .unwrap_or(0);
+    pairs
+        .iter()
+        .map(|(label, value)| {
+            let pad = label_w.saturating_sub(crate::width::display_width(label)) + GAP;
+            let spaces = " ".repeat(pad);
+            format!("  {muted}{label}\x1b[39m{spaces}\x1b[1m{value}\x1b[22m")
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::coding_plan::usage::{compute_overview, parse_usage};
+    use atomcode_codingplan::usage::{compute_overview, parse_usage};
 
     // Small inline sample — matches the shape from usage.rs core tests
     const SAMPLE: &str = r#"{
@@ -869,6 +946,23 @@ mod tests {
     }
 
     #[test]
+    fn handle_tab_nav_switches_on_nav_keys_and_ignores_others() {
+        let mut m = empty_modal();
+        assert!(m.handle_tab_nav(KeyCode::Tab));
+        assert_eq!(m.tab, Tab::Overview);
+        assert!(m.handle_tab_nav(KeyCode::Right));
+        assert_eq!(m.tab, Tab::Models);
+        assert!(m.handle_tab_nav(KeyCode::Left));
+        assert_eq!(m.tab, Tab::Overview);
+        assert!(m.handle_tab_nav(KeyCode::Char('3')));
+        assert_eq!(m.tab, Tab::Models);
+        // Non-nav keys are not consumed — the caller keeps them for other uses.
+        assert!(!m.handle_tab_nav(KeyCode::Char('x')));
+        assert!(!m.handle_tab_nav(KeyCode::Esc));
+        assert_eq!(m.tab, Tab::Models);
+    }
+
+    #[test]
     fn hms_formats_correctly() {
         assert_eq!(UsageModal::hms(0), "00:00:00");
         assert_eq!(UsageModal::hms(3661), "01:01:01");
@@ -878,7 +972,55 @@ mod tests {
     }
 
     #[test]
+    fn align_stat_lines_aligns_value_column_by_display_width() {
+        // CJK labels of different char-count-vs-cell-width ratios must still put
+        // every value at the same terminal column (the /usage misalignment bug).
+        let pairs = vec![
+            ("最常用模型".to_string(), "deepseek-v4-flash".to_string()),
+            ("总 Token 数".to_string(), "166.0m".to_string()),
+            ("请求次数".to_string(), "4332".to_string()),
+            ("最长连续天数".to_string(), "18 days".to_string()),
+        ];
+        let lines = align_stat_lines(&pairs, "\x1b[37m");
+
+        // Strip SGR, measure the display column where each value (bold) starts.
+        let strip = |s: &str| -> String {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for c2 in chars.by_ref() {
+                        if c2 == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let cols: Vec<usize> = lines
+            .iter()
+            .map(|l| {
+                let prefix = l.split("\x1b[1m").next().unwrap();
+                crate::width::display_width(&strip(prefix))
+            })
+            .collect();
+        assert_eq!(cols.len(), 4);
+        assert!(
+            cols.iter().all(|&c| c == cols[0]),
+            "value column must align across CJK labels, got {cols:?}"
+        );
+        // Values survive intact.
+        assert!(lines[0].contains("deepseek-v4-flash"));
+        assert!(lines[3].contains("18 days"));
+    }
+
+    #[test]
     fn overview_lines_contains_humanized_total_and_requests() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let m = sample_modal();
         let lines = m.overview_lines();
         let all = lines.join("\n");
@@ -939,27 +1081,106 @@ mod tests {
 
     #[test]
     fn tab_bar_marks_active_tab_bold() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let mut m = sample_modal();
         m.tab = Tab::Overview;
         let bar = m.tab_bar();
         // Active tab "Overview" on the default (dark) test theme: bold + fixed
         // near-white 256-colour (231), the brightest/most prominent.
-        assert!(bar.contains("\x1b[1;38;5;231mOverview\x1b[22;39m"),
-            "active tab should be bold + fixed near-white 231 on dark; got: {bar}");
+        assert!(
+            bar.contains("\x1b[1;38;5;231mOverview\x1b[22;39m"),
+            "active tab should be bold + fixed near-white 231 on dark; got: {bar}"
+        );
         // Inactive tabs: fixed mid-grey (245), dimmer than active and
         // palette-independent. Must NOT use SGR 90/37/39 — all broke on
         // Solarized Dark (90≈bg, 37 brighter than default, 39=grey default fg).
-        assert!(bar.contains("\x1b[38;5;245m"),
-            "inactive tabs should use fixed 256-colour grey 245; got: {bar}");
-        assert!(!bar.contains("\x1b[90m") && !bar.contains("\x1b[37m") && !bar.contains("\x1b[1;39m"),
-            "tabs must not rely on palette-dependent SGR 90/37/39; got: {bar}");
+        assert!(
+            bar.contains("\x1b[38;5;245m"),
+            "inactive tabs should use fixed 256-colour grey 245; got: {bar}"
+        );
+        assert!(
+            !bar.contains("\x1b[90m") && !bar.contains("\x1b[37m") && !bar.contains("\x1b[1;39m"),
+            "tabs must not rely on palette-dependent SGR 90/37/39; got: {bar}"
+        );
+    }
+
+    #[test]
+    fn streaming_snapshot_keeps_all_three_tab_labels() {
+        // Default tab is Current; sample_modal has no window → "unavailable".
+        let text = sample_modal().active_snapshot_text(true, true);
+
+        assert!(text.contains(t(Msg::UsageTabCurrent).as_ref()));
+        assert!(text.contains(t(Msg::UsageTabOverview).as_ref()));
+        assert!(text.contains(t(Msg::UsageTabModels).as_ref()));
+        assert!(
+            text.contains(t(Msg::UsageWindowUnavailable).as_ref()),
+            "snapshot should still render the Current body"
+        );
+    }
+
+    #[test]
+    fn active_snapshot_text_always_keeps_all_three_tab_labels() {
+        // The tab bar must render on every tab so the footer snapshot preserves
+        // the modal's information hierarchy while streaming.
+        for tab in [Tab::Current, Tab::Overview, Tab::Models] {
+            let mut m = sample_modal();
+            m.tab = tab;
+            let text = m.active_snapshot_text(true, true);
+            assert!(text.contains(t(Msg::UsageTabCurrent).as_ref()));
+            assert!(text.contains(t(Msg::UsageTabOverview).as_ref()));
+            assert!(text.contains(t(Msg::UsageTabModels).as_ref()));
+        }
+    }
+
+    #[test]
+    fn active_snapshot_text_renders_models_tab_body() {
+        // Switching to the Models tab mid-stream must surface the models body
+        // (model names), not the Current body.
+        let mut m = sample_modal();
+        m.tab = Tab::Models;
+        let text = m.active_snapshot_text(true, true);
+        assert!(
+            text.contains("deepseek-v4-flash"),
+            "Models tab snapshot must contain model names; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn active_snapshot_text_renders_overview_tab_body() {
+        // Switching to the Overview tab mid-stream must surface the overview
+        // body (favorite model), not the Current body.
+        let mut m = sample_modal();
+        m.tab = Tab::Overview;
+        let text = m.active_snapshot_text(true, true);
+        assert!(
+            text.contains("GLM-5.2"),
+            "Overview tab snapshot must contain overview stats; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn active_snapshot_text_keeps_ansi_color() {
+        // Unlike the clipboard variant, the footer snapshot must keep ANSI so
+        // the progress bars / heatmap render in colour below the input box.
+        let mut m = sample_modal();
+        m.tab = Tab::Overview;
+        let text = m.active_snapshot_text(true, true);
+        assert!(
+            text.contains('\x1b'),
+            "footer snapshot must retain ANSI colour codes; got:\n{text}"
+        );
     }
 
     #[test]
     fn current_tab_window_unavailable_when_no_window() {
         let m = sample_modal();
         let rows = m.current_rows();
-        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let all: String = rows
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             all.contains("unavailable") || all.contains("Unavailable") || all.contains("不可用"),
             "expected unavailable message on Current tab with no window; got:\n{all}"
@@ -970,8 +1191,15 @@ mod tests {
     fn models_rows_contains_model_names() {
         let m = sample_modal();
         let rows = m.models_rows(true, true);
-        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(all.contains("deepseek-v4-flash"), "missing deepseek model; got:\n{all}");
+        let all: String = rows
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("deepseek-v4-flash"),
+            "missing deepseek model; got:\n{all}"
+        );
         assert!(all.contains("GLM-5.2"), "missing GLM model; got:\n{all}");
     }
 
@@ -979,28 +1207,51 @@ mod tests {
     fn models_rows_unified_chart_contains_breakdown_percent() {
         let m = sample_modal();
         let rows = m.models_rows(true, true);
-        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let all: String = rows
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // GLM-5.2 has 717016/717116 ≈ 100% of tokens
         assert!(all.contains('%'), "expected percent breakdown; got:\n{all}");
         // The per-model TABLE has a "Requests" column header.
-        assert!(all.contains("Requests"), "expected 'Requests' table column; got:\n{all}");
+        assert!(
+            all.contains("Requests"),
+            "expected 'Requests' table column; got:\n{all}"
+        );
         // Title should appear
-        assert!(all.contains("Tokens per Day"), "expected chart title; got:\n{all}");
+        assert!(
+            all.contains("Tokens per Day"),
+            "expected chart title; got:\n{all}"
+        );
     }
 
     #[test]
     fn models_rows_fallback_contains_breakdown() {
         let m = sample_modal();
         let rows = m.models_rows(false, false);
-        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(all.contains("GLM-5.2"), "missing GLM model in fallback; got:\n{all}");
-        assert!(all.contains('%'), "expected percent in fallback breakdown; got:\n{all}");
-        assert!(all.contains("reqs"), "expected 'reqs' in fallback breakdown; got:\n{all}");
+        let all: String = rows
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("GLM-5.2"),
+            "missing GLM model in fallback; got:\n{all}"
+        );
+        assert!(
+            all.contains('%'),
+            "expected percent in fallback breakdown; got:\n{all}"
+        );
+        assert!(
+            all.contains("reqs"),
+            "expected 'reqs' in fallback breakdown; got:\n{all}"
+        );
     }
 
     #[test]
     fn current_rows_shows_plan_info_when_present() {
-        use atomcode_core::coding_plan::types::PlanInfo;
+        use atomcode_codingplan::types::PlanInfo;
         let plan = PlanInfo {
             plan_name: "CodingPlan Pro".into(),
             status: 1,
@@ -1020,7 +1271,11 @@ mod tests {
             error: None,
         });
         let rows = m.current_rows();
-        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let all: String = rows
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // plan_name should appear
         assert!(
             all.contains("CodingPlan Pro"),
@@ -1033,10 +1288,16 @@ mod tests {
         );
         // The standalone "Plan" title heading should NOT be its own line
         // (we omit the UsagePlanTitle push intentionally)
-        let stripped: String = rows.iter().map(|(l, _)| UsageModal::strip_ansi(l)).collect::<Vec<_>>().join("\n");
+        let stripped: String = rows
+            .iter()
+            .map(|(l, _)| UsageModal::strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         // The plan section starts directly at "CodingPlan Pro · Active", no bare "Plan" heading line
         assert!(
-            !stripped.lines().any(|line| line.trim() == t(Msg::UsagePlanTitle).as_ref()),
+            !stripped
+                .lines()
+                .any(|line| line.trim() == t(Msg::UsagePlanTitle).as_ref()),
             "standalone Plan title heading should be absent; got:\n{stripped}"
         );
     }
@@ -1048,9 +1309,15 @@ mod tests {
         // GLM-5.2 has 717016 tokens in rows, which should appear in breakdown.
         let m = sample_modal();
         let rows = m.models_rows(true, true);
-        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(all.contains("717.1k") || all.contains("717016") || all.contains("717"),
-            "expected GLM token count in breakdown; got:\n{all}");
+        let all: String = rows
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("717.1k") || all.contains("717016") || all.contains("717"),
+            "expected GLM token count in breakdown; got:\n{all}"
+        );
     }
 
     #[test]
@@ -1063,6 +1330,9 @@ mod tests {
     fn active_tab_text_is_plain() {
         let m = sample_modal();
         let text = m.active_tab_text(false, false);
-        assert!(!text.contains('\x1b'), "active_tab_text should not contain ANSI escapes");
+        assert!(
+            !text.contains('\x1b'),
+            "active_tab_text should not contain ANSI escapes"
+        );
     }
 }

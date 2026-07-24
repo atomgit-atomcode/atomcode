@@ -22,7 +22,10 @@ const PERSONA: &str = "you are a neutral test agent";
 fn agent_handle(provider: Arc<RecordingProvider>, options: Option<ChatOptions>) -> AgentHandle {
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(EchoTool));
-    let mut builder = Agent::builder().provider(provider).tools(reg.mount(&["echo"])).persona(PERSONA);
+    let mut builder = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["echo"]))
+        .persona(PERSONA);
     if let Some(o) = options {
         builder = builder.chat_options(o);
     }
@@ -30,7 +33,13 @@ fn agent_handle(provider: Arc<RecordingProvider>, options: Option<ChatOptions>) 
 }
 
 async fn drive_one_turn(handle: &mut AgentHandle, text: &str) {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: text.into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -61,7 +70,10 @@ async fn configured_chat_options_reach_the_provider() {
     let _ = handle.task.await;
 
     let calls = calls.lock().unwrap();
-    assert!(!calls.is_empty(), "the turn must have made at least one chat_stream call");
+    assert!(
+        !calls.is_empty(),
+        "the turn must have made at least one chat_stream call"
+    );
     // The provider received EXACTLY the configured options on its FIRST call.
     assert_eq!(
         calls[0].2, configured,
@@ -91,7 +103,10 @@ async fn default_agent_sends_neutral_options() {
     let _ = handle.task.await;
 
     let calls = calls.lock().unwrap();
-    assert!(!calls.is_empty(), "the turn must have made at least one chat_stream call");
+    assert!(
+        !calls.is_empty(),
+        "the turn must have made at least one chat_stream call"
+    );
     assert_eq!(
         calls[0].2,
         ChatOptions::default(),

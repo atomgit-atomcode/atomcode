@@ -109,7 +109,11 @@ impl CodeGraph {
         let line = edge.line;
         self.edges_out.entry(from).or_default().push(edge);
         // reverse map stores the SOURCE in `to` (production convention).
-        self.edges_in.entry(to).or_default().push(Edge { to: from, kind, line });
+        self.edges_in.entry(to).or_default().push(Edge {
+            to: from,
+            kind,
+            line,
+        });
     }
 
     pub fn node(&self, id: SymbolId) -> Option<&SymbolNode> {
@@ -163,7 +167,11 @@ impl CodeGraph {
             if depth >= max_depth {
                 continue;
             }
-            let edges = if callers { self.callers(cur) } else { self.callees(cur) };
+            let edges = if callers {
+                self.callers(cur)
+            } else {
+                self.callees(cur)
+            };
             if let Some(edges) = edges {
                 for e in edges {
                     if visited.insert(e.to) {
@@ -258,8 +266,22 @@ mod tests {
         g.add_symbol(node(1, "a", "a.rs"));
         g.add_symbol(node(2, "b", "b.rs"));
         g.add_symbol(node(3, "c", "c.rs"));
-        g.add_edge(1, Edge { to: 2, kind: EdgeKind::Calls, line: 1 });
-        g.add_edge(2, Edge { to: 3, kind: EdgeKind::Calls, line: 1 });
+        g.add_edge(
+            1,
+            Edge {
+                to: 2,
+                kind: EdgeKind::Calls,
+                line: 1,
+            },
+        );
+        g.add_edge(
+            2,
+            Edge {
+                to: 3,
+                kind: EdgeKind::Calls,
+                line: 1,
+            },
+        );
         g
     }
 
@@ -324,7 +346,10 @@ mod tests {
         g.add_symbol(node(2, "dup", "b.rs"));
         // Simulate a graph produced by a path that bypasses add_symbol (serde skips by_name).
         g.by_name.clear();
-        assert!(g.find_by_name("dup").is_empty(), "empty index → lookup misses");
+        assert!(
+            g.find_by_name("dup").is_empty(),
+            "empty index → lookup misses"
+        );
         g.rebuild_name_index();
         assert_eq!(g.find_by_name("dup").len(), 2, "rebuild restores the index");
     }

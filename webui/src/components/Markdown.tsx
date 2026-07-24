@@ -16,7 +16,7 @@ renderer.code = function (code: string, infostring?: string) {
   const text = code ?? '';
   if (!text.trim()) return '';
   const lang = (infostring ?? '').split(/\s+/)[0] ?? '';
-  // escape HTML in code (no hljs for v1)
+  // Escape HTML in code; syntax highlighting is intentionally omitted here.
   const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return (
     `<div class="code-block-wrapper">` +
@@ -26,12 +26,59 @@ renderer.code = function (code: string, infostring?: string) {
   );
 };
 
-export function Markdown({ content }: { content: string }) {
+function highlightHtml(html: string, search: string): string {
+  if (!search.trim()) return html;
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+  const walk = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null);
+  const nodes: Text[] = [];
+  let node: Node | null;
+  while ((node = walk.nextNode())) {
+    nodes.push(node as Text);
+  }
+  const searchLower = search.toLowerCase();
+  for (const textNode of nodes) {
+    const text = textNode.nodeValue ?? '';
+    if (!text.toLowerCase().includes(searchLower)) continue;
+    
+    const parent = textNode.parentNode;
+    if (!parent) continue;
+    
+    const parentTag = (parent as HTMLElement).tagName?.toLowerCase();
+    if (parentTag === 'script' || parentTag === 'style') continue;
+
+    const newFragment = doc.createDocumentFragment();
+    let lastIndex = 0;
+    let index = text.toLowerCase().indexOf(searchLower);
+    while (index !== -1) {
+      if (index > lastIndex) {
+        newFragment.appendChild(doc.createTextNode(text.substring(lastIndex, index)));
+      }
+      const mark = doc.createElement('mark');
+      mark.className = 'msg-search-highlight';
+      mark.textContent = text.substring(index, index + search.length);
+      newFragment.appendChild(mark);
+      lastIndex = index + search.length;
+      index = text.toLowerCase().indexOf(searchLower, lastIndex);
+    }
+    if (lastIndex < text.length) {
+      newFragment.appendChild(doc.createTextNode(text.substring(lastIndex)));
+    }
+    parent.replaceChild(newFragment, textNode);
+  }
+  return doc.body.innerHTML;
+}
+
+export function Markdown({ content, search }: { content: string; search?: string }) {
   const html = useMemo(() => {
     const raw = marked.parse(content ?? '', { renderer }) as string;
     // SECURITY: model output is untrusted — sanitize before injecting as HTML.
-    return DOMPurify.sanitize(raw, { ADD_ATTR: ['data-copy'] });
-  }, [content]);
+    const sanitized = DOMPurify.sanitize(raw, { ADD_ATTR: ['data-copy'] });
+    if (search && search.trim()) {
+      return highlightHtml(sanitized, search);
+    }
+    return sanitized;
+  }, [content, search]);
 
   function onClick(e: MouseEvent) {
     const t = (e.target as HTMLElement)?.closest('.copy-button') as HTMLElement | null;

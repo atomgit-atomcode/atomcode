@@ -18,7 +18,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use atomcode_kernel::agent::AutoRespond;
+use atomcode_kernel::agent::{AutoRespond, ToolLoopPolicy};
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
@@ -149,12 +149,59 @@ impl Default for ReviewToolConfig {
 pub struct ReviewTool {
     provider: SharedReviewProvider,
     cfg: ReviewToolConfig,
+    max_rounds: Option<u32>,
+    max_turn_duration: Option<Duration>,
+    tool_loop_policy: Option<ToolLoopPolicy>,
 }
 
 impl ReviewTool {
     pub fn new(provider: SharedReviewProvider, cfg: ReviewToolConfig) -> Self {
-        Self { provider, cfg }
+        let (max_rounds, max_turn_duration) = resolve_embedded_review_limits(
+            std::env::var("ATOMCODE_REVIEW_MAX_ROUNDS").ok().as_deref(),
+            std::env::var("ATOMCODE_REVIEW_MAX_DURATION_SECS")
+                .ok()
+                .as_deref(),
+        );
+        Self {
+            provider,
+            cfg,
+            max_rounds,
+            max_turn_duration,
+            tool_loop_policy: crate::config::resolve_tool_loop_policy(
+                std::env::var("ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD")
+                    .ok()
+                    .as_deref(),
+                std::env::var("ATOMCODE_TOOL_LOOP_STOP_THRESHOLD")
+                    .ok()
+                    .as_deref(),
+            ),
+        }
     }
+
+    /// Inherit the embedding product's exact-loop policy so disabling or raising
+    /// its thresholds applies to nested review work as well.
+    pub fn with_tool_loop_policy(mut self, policy: Option<ToolLoopPolicy>) -> Self {
+        self.tool_loop_policy = policy;
+        self
+    }
+}
+
+/// The parent coding round is blocked while `code_review` runs, so its round fuse
+/// cannot bound the child. Give the embedded reviewer independent, configurable
+/// round and wall-clock high-water marks. Zero explicitly disables either cap.
+fn resolve_embedded_review_limits(
+    rounds_env: Option<&str>,
+    duration_env: Option<&str>,
+) -> (Option<u32>, Option<Duration>) {
+    let max_rounds = rounds_env
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .map(|value| (value != 0).then_some(value))
+        .unwrap_or(Some(200));
+    let max_turn_duration = duration_env
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| (value != 0).then_some(Duration::from_secs(value)))
+        .unwrap_or(Some(Duration::from_secs(900)));
+    (max_rounds, max_turn_duration)
 }
 
 #[derive(Deserialize, Default)]
@@ -403,6 +450,9 @@ impl Tool for ReviewTool {
         cfg.context_window = self.cfg.context_window;
         cfg.stream_timeout = self.cfg.stream_timeout;
         cfg.request_timeout = self.cfg.request_timeout;
+        cfg.max_rounds = self.max_rounds;
+        cfg.max_turn_duration = self.max_turn_duration;
+        cfg.tool_loop_policy = self.tool_loop_policy;
         cfg.progress = Some(ctx.progress.clone());
         let (agent, report) = build_review_agent_with(&cfg, provider);
 
@@ -666,6 +716,26 @@ mod tests {
     use futures::StreamExt;
     use std::sync::Mutex;
 
+    #[test]
+    fn embedded_review_limits_are_bounded_configurable_and_zero_disables() {
+        assert_eq!(
+            resolve_embedded_review_limits(None, None),
+            (Some(200), Some(Duration::from_secs(900)))
+        );
+        assert_eq!(
+            resolve_embedded_review_limits(Some("450"), Some("1800")),
+            (Some(450), Some(Duration::from_secs(1800)))
+        );
+        assert_eq!(
+            resolve_embedded_review_limits(Some("0"), Some("0")),
+            (None, None)
+        );
+        assert_eq!(
+            resolve_embedded_review_limits(Some("invalid"), Some("invalid")),
+            (Some(200), Some(Duration::from_secs(900)))
+        );
+    }
+
     fn finding(priority: &str, conf: f32, file: &str, title: &str) -> Finding {
         Finding {
             title: title.into(),
@@ -884,6 +954,9 @@ mod tests {
         }
     }
 
+    /// A genuinely progressing long review: every round reads the next line instead of
+    /// repeating the same call/result. This distinguishes "more than twelve rounds" from
+    /// an exact no-progress loop, which the kernel is expected to stop.
     struct FinishesAfterThirteenRounds {
         calls: AtomicU32,
     }
@@ -906,7 +979,7 @@ mod tests {
                     StreamEvent::ToolCall(ToolCall {
                         id: format!("read-{call}"),
                         name: "read_file".into(),
-                        arguments: r#"{"file_path":"a.rs"}"#.into(),
+                        arguments: format!(r#"{{"file_path":"a.rs","offset":{call},"limit":1}}"#),
                     }),
                     StreamEvent::Done { truncated: false },
                 ]
@@ -984,6 +1057,7 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             cancel: Default::default(),
             progress: ProgressSink::noop(),
+            requester: None,
         };
 
         let result = tool.execute("{}", &ctx).await;
@@ -1034,6 +1108,10 @@ mod tests {
             return;
         }
         let dir = repo_with_working_tree_change();
+        let long_file = (1..=14)
+            .map(|line| format!("fn changed_{line}() {{}}\n"))
+            .collect::<String>();
+        std::fs::write(dir.path().join("a.rs"), long_file).unwrap();
         let provider: SharedReviewProvider =
             Arc::new(RwLock::new(Some(Arc::new(FinishesAfterThirteenRounds {
                 calls: AtomicU32::new(0),
@@ -1049,6 +1127,7 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             cancel: Default::default(),
             progress: ProgressSink::noop(),
+            requester: None,
         };
 
         let result = tool.execute("{}", &ctx).await;
@@ -1081,6 +1160,7 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             cancel: Default::default(),
             progress: ProgressSink::noop(),
+            requester: None,
         };
 
         let result = tool.execute("{}", &ctx).await;
@@ -1130,6 +1210,7 @@ mod tests {
             progress: ProgressSink::new(Arc::new(move |message| {
                 progress_capture.lock().unwrap().push(message);
             })),
+            requester: None,
         };
         let res = tool.execute("{}", &ctx).await;
         assert!(!res.is_error, "review should succeed: {}", res.content);
@@ -1177,6 +1258,7 @@ mod tests {
             working_dir: root.to_path_buf(),
             cancel: Default::default(),
             progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
         };
         let res = tool.execute("{}", &ctx).await;
         assert!(!res.is_error, "clean tree is not an error: {}", res.content);

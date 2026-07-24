@@ -116,7 +116,9 @@ async fn handle_connection(
 
     // Cache hit: respond immediately without queuing a prompt.
     if let Some(pw) = cache.get(&key, now) {
-        let resp = super::protocol::Response { password: Some(pw.as_str().to_string()) };
+        let resp = super::protocol::Response {
+            password: Some(pw.as_str().to_string()),
+        };
         if let Ok(s) = serde_json::to_string(&resp) {
             let _ = w.write_all(s.as_bytes()).await;
             let _ = w.write_all(b"\n").await;
@@ -126,7 +128,11 @@ async fn handle_connection(
 
     // Cache miss: forward the prompt to the event loop via mpsc.
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let prompt_msg = AskpassPrompt { prompt: req.prompt, key: key.clone(), reply: reply_tx };
+    let prompt_msg = AskpassPrompt {
+        prompt: req.prompt,
+        key: key.clone(),
+        reply: reply_tx,
+    };
 
     if tx.send(prompt_msg).await.is_err() {
         // No consumer; respond with None.
@@ -161,7 +167,11 @@ async fn handle_connection(
 /// Must be called from within a Tokio runtime context.
 pub fn start(
     cache: Arc<PasswordCache>,
-) -> io::Result<(AskpassEnv, tokio::sync::mpsc::Receiver<AskpassPrompt>, AskpassServerGuard)> {
+) -> io::Result<(
+    AskpassEnv,
+    tokio::sync::mpsc::Receiver<AskpassPrompt>,
+    AskpassServerGuard,
+)> {
     let sock_path = socket_path()?;
 
     // Remove any stale socket from a previous run.
@@ -181,8 +191,14 @@ pub fn start(
     let token = gen_token()?;
     let (tx, rx) = tokio::sync::mpsc::channel::<AskpassPrompt>(32);
 
-    let guard = AskpassServerGuard { sock_path: sock_path.clone() };
-    let env = AskpassEnv { sock_path, token: token.clone(), askpass_script: std::path::PathBuf::new() };
+    let guard = AskpassServerGuard {
+        sock_path: sock_path.clone(),
+    };
+    let env = AskpassEnv {
+        sock_path,
+        token: token.clone(),
+        askpass_script: std::path::PathBuf::new(),
+    };
 
     tokio::spawn(async move {
         loop {
@@ -211,7 +227,10 @@ mod tests {
     #[test]
     fn key_for_prompt_classifies_sudo_and_ssh() {
         assert_eq!(key_for_prompt("[sudo] password for alice:"), "sudo");
-        assert_eq!(key_for_prompt("alice@host.example.com's password:"), "ssh:host.example.com");
+        assert_eq!(
+            key_for_prompt("alice@host.example.com's password:"),
+            "ssh:host.example.com"
+        );
         assert_eq!(key_for_prompt("Enter passphrase for key '/x':"), "generic");
         // multi-@ (e.g. user@proxy@host): host must be the segment after the LAST '@'
         assert_eq!(key_for_prompt("user@proxy@host's password:"), "ssh:host");
@@ -219,7 +238,9 @@ mod tests {
 
     #[tokio::test]
     async fn server_prompts_then_caches() {
-        let cache = std::sync::Arc::new(crate::askpass::cache::PasswordCache::new(Duration::from_secs(300)));
+        let cache = std::sync::Arc::new(crate::askpass::cache::PasswordCache::new(
+            Duration::from_secs(300),
+        ));
         let (env, mut rx, _guard) = start(cache).unwrap();
 
         // Consumer (stands in for the event loop): answer the first prompt, then expect cache hit (no 2nd prompt).
@@ -244,7 +265,9 @@ mod tests {
     // Minimal in-test client mirroring the `__askpass` helper.
     async fn client_ask(env: &AskpassEnv, prompt: &str) -> Option<String> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let stream = tokio::net::UnixStream::connect(&env.sock_path).await.unwrap();
+        let stream = tokio::net::UnixStream::connect(&env.sock_path)
+            .await
+            .unwrap();
         let (r, mut w) = stream.into_split();
         let req = serde_json::to_string(&crate::askpass::protocol::Request {
             token: env.token.clone(),
@@ -256,7 +279,8 @@ mod tests {
         w.flush().await.unwrap();
         let mut line = String::new();
         BufReader::new(r).read_line(&mut line).await.unwrap();
-        let resp: crate::askpass::protocol::Response = serde_json::from_str(line.trim_end()).unwrap();
+        let resp: crate::askpass::protocol::Response =
+            serde_json::from_str(line.trim_end()).unwrap();
         resp.password
     }
 }

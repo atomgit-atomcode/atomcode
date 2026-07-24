@@ -625,8 +625,7 @@ fn register_oauth_client(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED
-        {
+        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED {
             bail!(
                 "MCP OAuth dynamic client registration failed: HTTP {status} — \
                  the authorization server rejected the request. \
@@ -635,9 +634,7 @@ fn register_oauth_client(
                  Response: {body}"
             );
         }
-        bail!(
-            "MCP OAuth dynamic client registration failed: HTTP {status}\nResponse: {body}"
-        );
+        bail!("MCP OAuth dynamic client registration failed: HTTP {status}\nResponse: {body}");
     }
     resp.json()
         .context("Failed to parse MCP OAuth dynamic client registration response")
@@ -752,7 +749,10 @@ fn base64_url_no_pad(bytes: &[u8]) -> String {
 
 #[cfg(target_os = "macos")]
 fn open_browser(url: &str) -> Result<()> {
-    std::process::Command::new("open").arg(url).spawn()?;
+    std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .context("Failed to open browser")?;
     Ok(())
 }
 
@@ -762,7 +762,8 @@ fn open_browser(url: &str) -> Result<()> {
         .arg(url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .spawn()
+        .context("Failed to open browser")?;
     Ok(())
 }
 
@@ -774,7 +775,8 @@ fn open_browser(url: &str) -> Result<()> {
         .raw_arg(format!("/C start \"\" \"{}\"", url))
         // Suppress cmd.exe's own window flash; the browser it launches is unaffected.
         .creation_flags(CREATE_NO_WINDOW)
-        .spawn()?;
+        .spawn()
+        .context("Failed to open browser")?;
     Ok(())
 }
 

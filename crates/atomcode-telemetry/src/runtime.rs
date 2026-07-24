@@ -76,6 +76,22 @@ impl CurrentContext {
         CTX.scope(ctx, fut()).await
     }
 
+    /// Synchronous analogue of [`CurrentContext::scope`] for blocking code paths.
+    ///
+    /// The OAuth / CodingPlan flow is fully synchronous (`reqwest::blocking`,
+    /// which stands up its own tokio runtime internally). It must run on a
+    /// dedicated blocking thread — via `tokio::task::spawn_blocking` — because
+    /// dropping that inner runtime on an async worker thread panics with
+    /// "Cannot drop a runtime in a context where blocking is not allowed".
+    /// `spawn_blocking` threads do not inherit the task-local `CTX`, so callers
+    /// use this to re-establish the telemetry scope around the blocking work.
+    pub fn scope_blocking<F, R>(ctx: CurrentContext, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        CTX.sync_scope(ctx, f)
+    }
+
     /// Access the current context, or default if unset.
     pub fn current() -> CurrentContext {
         CTX.try_with(|c| c.clone()).unwrap_or_default()

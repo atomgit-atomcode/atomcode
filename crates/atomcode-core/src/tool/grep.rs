@@ -13,9 +13,15 @@ pub struct GrepTool;
 struct GrepArgs {
     pattern: String,
     path: Option<String>,
-    #[serde(default = "default_max_results", deserialize_with = "deserialize_lenient_usize")]
+    #[serde(
+        default = "default_max_results",
+        deserialize_with = "deserialize_lenient_usize"
+    )]
     max_results: usize,
-    #[serde(default = "default_context", deserialize_with = "deserialize_lenient_usize")]
+    #[serde(
+        default = "default_context",
+        deserialize_with = "deserialize_lenient_usize"
+    )]
     context: usize,
 }
 
@@ -57,15 +63,15 @@ where
 
         fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
             if v < 0.0 || v.is_nan() {
-                return Err(serde::de::Error::custom("negative or NaN value not allowed"));
+                return Err(serde::de::Error::custom(
+                    "negative or NaN value not allowed",
+                ));
             }
             Ok(v as usize)
         }
 
         fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
-            v.trim()
-                .parse::<usize>()
-                .map_err(serde::de::Error::custom)
+            v.trim().parse::<usize>().map_err(serde::de::Error::custom)
         }
     }
 
@@ -117,8 +123,7 @@ impl Tool for GrepTool {
             Err(_) => return self.approval(args),
         };
         let raw_path = parsed.path.as_deref().unwrap_or(".");
-        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Read)
-        {
+        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Read) {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }

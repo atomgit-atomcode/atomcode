@@ -36,11 +36,18 @@ const LIVENESS: Duration = Duration::from_millis(50);
 const OUTER_GUARD: Duration = Duration::from_secs(5);
 
 fn send(text: &str) -> AgentCommand {
-    AgentCommand::SendMessage { text: text.into(), images: vec![] }
+    AgentCommand::SendMessage {
+        text: text.into(),
+        images: vec![],
+    }
 }
 
 fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
-    ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args.into(),
+    }
 }
 
 // ── (1a) STREAM TIMEOUT → RECONNECT → RECOVER ────────────────────────────────
@@ -94,9 +101,18 @@ async fn stream_timeout_reconnects_then_recovers() {
     .await
     .expect("reconnect-and-recover must finish within the outer guard, not hang");
 
-    assert!(completed, "the turn must complete after a successful reconnect");
-    assert!(saw_reconnect, "a `reconnecting` Warning must be emitted on the idle timeout");
-    assert!(error_msg.is_none(), "a recovered turn must NOT surface an Error; got {error_msg:?}");
+    assert!(
+        completed,
+        "the turn must complete after a successful reconnect"
+    );
+    assert!(
+        saw_reconnect,
+        "a `reconnecting` Warning must be emitted on the idle timeout"
+    );
+    assert!(
+        error_msg.is_none(),
+        "a recovered turn must NOT surface an Error; got {error_msg:?}"
+    );
     let log = log.lock().unwrap();
     assert!(
         log.contains(&"on_model_response".to_string()),
@@ -148,14 +164,23 @@ async fn stream_timeout_exhausts_retries_then_fails() {
     .await
     .expect("exhausted retries must clean-fail within the guard, not loop forever");
 
-    assert!(completed, "after exhausting retries the turn must clean-fail with TurnComplete");
-    assert_eq!(reconnects, 5, "must reconnect exactly MAX_STREAM_RETRIES=5 times before failing");
+    assert!(
+        completed,
+        "after exhausting retries the turn must clean-fail with TurnComplete"
+    );
+    assert_eq!(
+        reconnects, 5,
+        "must reconnect exactly MAX_STREAM_RETRIES=5 times before failing"
+    );
     assert!(
         error_msg.as_deref().is_some_and(|m| m.contains("timeout")),
         "the exhausted timeout must surface as an Error mentioning 'timeout'; got {error_msg:?}"
     );
     let log = log.lock().unwrap();
-    assert!(log.contains(&"on_error".to_string()), "on_error must fire on the clean-fail");
+    assert!(
+        log.contains(&"on_error".to_string()),
+        "on_error must fire on the clean-fail"
+    );
     assert!(
         !log.contains(&"on_model_response".to_string()),
         "an exhausted-timeout turn must NOT run the success path"
@@ -223,8 +248,14 @@ async fn request_timeout_degrades_to_null_and_unblocks_turn() {
     .await
     .expect("request-timeout turn must NOT hang — the round-trip must degrade to Null and unblock");
 
-    assert!(saw_request, "the middleware must have round-tripped an approval Request");
-    assert!(completed, "the turn must complete after the request degrades to Null");
+    assert!(
+        saw_request,
+        "the middleware must have round-tripped an approval Request"
+    );
+    assert!(
+        completed,
+        "the turn must complete after the request degrades to Null"
+    );
     // Null → ApprovalMiddleware treats it as deny → the tool is BLOCKED.
     assert!(
         blocked_result.as_deref().is_some_and(|c| c.contains("blocked")),
@@ -275,6 +306,12 @@ async fn no_timeout_by_default_unchanged() {
     .await
     .expect("a normal default turn must complete promptly");
 
-    assert!(completed, "a normal turn completes with the default-None timeouts");
-    assert_eq!(text, "answer", "the default path is unchanged — full text delivered");
+    assert!(
+        completed,
+        "a normal turn completes with the default-None timeouts"
+    );
+    assert_eq!(
+        text, "answer",
+        "the default path is unchanged — full text delivered"
+    );
 }

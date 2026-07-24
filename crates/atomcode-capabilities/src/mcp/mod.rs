@@ -9,15 +9,12 @@
 //!   [`McpConnectEvent`] (cross-cutting telemetry lives on a seam, not hard-coded
 //!   in the registry).
 //!
-//! # Cache discipline
-//! MCP tool defs are part of the provider request's cached prefix. Connect EAGERLY
-//! (via [`connect_and_adapt`]) before the first turn so the tools are present from
-//! turn 1 and the prefix stays stable. Changing the mounted tool set mid-session is
-//! a non-goal (it invalidates the prefix); a `/mcp reload` is modeled as re-spawning
-//! the agent with a freshly-built registry (a new prefix generation), never an
-//! in-place mutation.
+//! # Runtime boundary
+//! This module owns transport, discovery, trust, and tool adaptation. It does not
+//! own a coding session transition or decide when discovered tools become visible.
+//! The embedding runtime may connect in the background and atomically publish a new
+//! per-turn tool catalog; non-interactive surfaces may instead await readiness.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,23 +27,25 @@ pub mod registry;
 pub mod tool;
 pub mod transport_http;
 pub mod transport_stdio;
+pub mod trust;
 pub mod types;
 mod util;
 
 pub use client::{McpClient, McpToolInfo};
 pub use config::{
-    load_mcp_config, McpHttpAuthConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
+    load_mcp_config, merge_http_oauth_mcp_server_into_json_file,
+    merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthConfig, McpServerConfig,
+    McpTransportConfig,
 };
 pub use oauth::{
     login_github_oauth, login_mcp_oauth, refresh_mcp_oauth_token, McpOAuthLoginOptions,
     McpOAuthToken, McpTokenStore,
 };
-pub use registry::{McpConnectEvent, McpRegistry};
+pub use registry::{project_trust_key, McpConnectEvent, McpRegistry};
 pub use tool::McpToolAdapter;
 pub use types::*;
 
-/// Default bound on how long [`connect_and_adapt`] waits for initial server
-/// connections before proceeding with whatever connected so far.
+/// Default bound used by callers that explicitly require initial MCP readiness.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Register MCP tool adapters into `reg`; returns their `mcp__…` names so the
@@ -60,35 +59,4 @@ pub fn register_mcp_tools(reg: &mut ToolRegistry, adapters: Vec<Arc<dyn Tool>>) 
         reg.register(adapter);
     }
     names
-}
-
-/// High-level integration entry: load `.mcp.json` + `$ATOMCODE_HOME/mcp.json`,
-/// connect all configured servers in parallel (each with its own timeout, the whole
-/// wait bounded by [`CONNECT_TIMEOUT`]), discover their tools, and return
-/// ready-to-mount kernel `Tool` adapters.
-///
-/// Returns the live [`McpRegistry`] (held — the adapters route calls through it),
-/// the discovered adapters, and the connect events emitted so far (for a driver/UI
-/// to surface connection status / failures). Servers that fail to connect are
-/// skipped; their failure is in the returned events and in
-/// [`McpRegistry::server_statuses`].
-pub async fn connect_and_adapt(
-    project_dir: &Path,
-) -> (Arc<McpRegistry>, Vec<Arc<dyn Tool>>, Vec<McpConnectEvent>) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let registry = McpRegistry::from_config_background_with_events(project_dir, Some(tx)).share();
-    registry.wait_for_initial_connections(CONNECT_TIMEOUT).await;
-
-    let infos = registry.list_all_tools().await;
-    let adapters: Vec<Arc<dyn Tool>> = infos
-        .into_iter()
-        .map(|info| Arc::new(McpToolAdapter::new(registry.clone(), info)) as Arc<dyn Tool>)
-        .collect();
-
-    let mut events = Vec::new();
-    while let Ok(ev) = rx.try_recv() {
-        events.push(ev);
-    }
-
-    (registry, adapters, events)
 }

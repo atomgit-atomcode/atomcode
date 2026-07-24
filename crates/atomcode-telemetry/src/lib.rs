@@ -14,11 +14,11 @@ pub mod scrub;
 pub mod sender;
 
 pub use config::{CliOverride, ResolvedConfig, TelemetryConfig, TelemetryState};
-pub use repo_origin::detect_repo_origin;
 pub use event::{
     CodingplanErrorKind, CodingplanResult, Envelope, Event, LlmErrorKind, McpErrorKind,
     McpTransport, Record, RepoHost, RepoOrigin, SessionMode, ToolErrorKind, UseCommandErrorKind,
 };
+pub use repo_origin::detect_repo_origin;
 pub use runtime::{
     resolve_provider_host, Counters, CountersSnapshot, CurrentContext, Telemetry, TelemetryError,
 };

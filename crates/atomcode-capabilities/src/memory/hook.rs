@@ -57,7 +57,11 @@ impl MemoryHook {
         project: MemoryStore,
         project_name: impl Into<String>,
     ) -> Self {
-        Self { global, project, project_name: project_name.into() }
+        Self {
+            global,
+            project,
+            project_name: project_name.into(),
+        }
     }
 }
 
@@ -93,7 +97,11 @@ impl LifecycleHooks for MemoryHook {
                 // The session started with empty stores; /remember happened since.
                 // Land it where a fresh session would have: after the leading run
                 // of system messages (persona first).
-                let at = convo.messages.iter().take_while(|m| m.role == Role::System).count();
+                let at = convo
+                    .messages
+                    .iter()
+                    .take_while(|m| m.role == Role::System)
+                    .count();
                 convo.messages.insert(at, Message::system(merged));
             }
             None => {}
@@ -169,14 +177,20 @@ mod tests {
         // The snapshot carries the OLD injected message between persona and history.
         let mut convo = Conversation::new();
         convo.push(Message::system("persona"));
-        convo.push(Message::system(format!("{MEMORY_HEADER}\nstale copy from snapshot")));
+        convo.push(Message::system(format!(
+            "{MEMORY_HEADER}\nstale copy from snapshot"
+        )));
         convo.push(Message::user("earlier turn"));
 
         // memory.md changed since the snapshot (/remember while the session slept).
         h.global.append("new fact").unwrap();
         h.session_start(&mut convo, true).await;
 
-        assert_eq!(convo.messages.len(), 3, "refresh replaces in place, no growth");
+        assert_eq!(
+            convo.messages.len(),
+            3,
+            "refresh replaces in place, no growth"
+        );
         let mem = &convo.messages[1];
         assert!(mem.text.contains("- old fact") && mem.text.contains("- new fact"));
         assert!(!mem.text.contains("stale copy"));
@@ -188,15 +202,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h = hook(dir.path(), "same fact", "");
 
-        let frozen =
-            MemoryStore::merged_for_prompt(&h.global, &h.project, &h.project_name);
+        let frozen = MemoryStore::merged_for_prompt(&h.global, &h.project, &h.project_name);
         let mut convo = Conversation::new();
         convo.push(Message::system("persona"));
         convo.push(Message::system(frozen.clone()));
         convo.push(Message::user("earlier turn"));
 
         h.session_start(&mut convo, true).await;
-        assert_eq!(convo.messages[1].text, frozen, "unchanged memory → identical bytes");
+        assert_eq!(
+            convo.messages[1].text, frozen,
+            "unchanged memory → identical bytes"
+        );
     }
 
     #[tokio::test]
@@ -213,7 +229,11 @@ mod tests {
         h.session_start(&mut convo, true).await;
 
         assert_eq!(convo.messages.len(), 3);
-        assert_eq!(convo.messages[1].role, Role::System, "lands after the persona run");
+        assert_eq!(
+            convo.messages[1].role,
+            Role::System,
+            "lands after the persona run"
+        );
         assert!(convo.messages[1].text.contains("- learned later"));
         assert_eq!(convo.messages[2].text, "earlier turn");
     }
@@ -225,13 +245,22 @@ mod tests {
 
         let mut convo = Conversation::new();
         convo.push(Message::system("persona"));
-        convo.push(Message::system(format!("{MEMORY_HEADER}\n- forgotten fact")));
+        convo.push(Message::system(format!(
+            "{MEMORY_HEADER}\n- forgotten fact"
+        )));
         convo.push(Message::user("earlier turn"));
 
         h.session_start(&mut convo, true).await;
 
-        assert_eq!(convo.messages.len(), 2, "/forget-emptied memory drops the block");
-        assert!(!convo.messages.iter().any(|m| m.text.starts_with(MEMORY_HEADER)));
+        assert_eq!(
+            convo.messages.len(),
+            2,
+            "/forget-emptied memory drops the block"
+        );
+        assert!(!convo
+            .messages
+            .iter()
+            .any(|m| m.text.starts_with(MEMORY_HEADER)));
     }
 
     #[test]

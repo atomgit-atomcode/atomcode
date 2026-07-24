@@ -59,7 +59,11 @@ const THINKING_TOOL_SSE: &str = concat!(
 fn provider_for(server_uri: &str, thinking: bool) -> AnthropicProvider {
     let mut cfg = AnthropicConfig::new("test-key", server_uri, "claude-opus-4-8");
     cfg.thinking = thinking;
-    cfg.retry = RetryPolicy { max_attempts: 3, base_delay: Duration::from_millis(1), max_delay: Duration::from_millis(5) };
+    cfg.retry = RetryPolicy {
+        max_attempts: 3,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    };
     AnthropicProvider::new(cfg).expect("build provider")
 }
 
@@ -77,7 +81,12 @@ impl Tool for GetTimeTool {
         serde_json::json!({ "type": "object", "properties": {} })
     }
     async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "12:00".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "12:00".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -110,12 +119,18 @@ async fn retry_on_transient_500_then_succeeds() {
     while let Some(ev) = stream.next().await {
         match ev {
             atomcode_kernel::stream::StreamEvent::TextDelta(t) => text.push_str(&t),
-            atomcode_kernel::stream::StreamEvent::Error(e) => panic!("unexpected error: {}", e.message),
+            atomcode_kernel::stream::StreamEvent::Error(e) => {
+                panic!("unexpected error: {}", e.message)
+            }
             _ => {}
         }
     }
     assert_eq!(text, "It is noon.");
-    assert_eq!(server.received_requests().await.unwrap().len(), 2, "one 500 + one success");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        2,
+        "one 500 + one success"
+    );
 }
 
 #[tokio::test]
@@ -139,8 +154,16 @@ async fn open_failure_parses_anthropic_error_type() {
         .expect("a 400 surfaces an Err");
     assert!(!err.retryable, "400 is fatal");
     assert_eq!(err.http_status, Some(400));
-    assert_eq!(err.code.as_deref(), Some("invalid_request_error"), "structured error type");
-    assert!(err.message.contains("max_tokens: required"), "reason carried: {}", err.message);
+    assert_eq!(
+        err.code.as_deref(),
+        Some("invalid_request_error"),
+        "structured error type"
+    );
+    assert!(
+        err.message.contains("max_tokens: required"),
+        "reason carried: {}",
+        err.message
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -186,11 +209,23 @@ async fn multi_round_tool_call_then_final_answer() {
 
     let round2 = String::from_utf8_lossy(&reqs[1].body);
     // The assistant's tool_use is echoed back as a content block...
-    assert!(round2.contains("\"type\":\"tool_use\""), "round 2 echoes the assistant tool_use: {round2}");
-    assert!(round2.contains("\"tu1\""), "with the original tool_use id: {round2}");
+    assert!(
+        round2.contains("\"type\":\"tool_use\""),
+        "round 2 echoes the assistant tool_use: {round2}"
+    );
+    assert!(
+        round2.contains("\"tu1\""),
+        "with the original tool_use id: {round2}"
+    );
     // ...and the kernel-supplied tool_result is fed in as a user tool_result block.
-    assert!(round2.contains("\"type\":\"tool_result\""), "round 2 carries the tool_result: {round2}");
-    assert!(round2.contains("12:00"), "the tool's output is fed back: {round2}");
+    assert!(
+        round2.contains("\"type\":\"tool_result\""),
+        "round 2 carries the tool_result: {round2}"
+    );
+    assert!(
+        round2.contains("12:00"),
+        "the tool's output is fed back: {round2}"
+    );
 }
 
 #[tokio::test]
@@ -201,11 +236,23 @@ async fn multi_round_signed_thinking_is_echoed_back_verbatim() {
     let round2 = String::from_utf8_lossy(&reqs[1].body);
     // The round-1 signed thinking block is replayed VERBATIM in round 2 (Anthropic
     // requires the signature echoed alongside the tool call).
-    assert!(round2.contains("\"type\":\"thinking\""), "round 2 echoes a thinking block: {round2}");
-    assert!(round2.contains("\"signature\":\"SIG123\""), "with the EXACT signature: {round2}");
-    assert!(round2.contains("I should check the time."), "and the thinking text: {round2}");
+    assert!(
+        round2.contains("\"type\":\"thinking\""),
+        "round 2 echoes a thinking block: {round2}"
+    );
+    assert!(
+        round2.contains("\"signature\":\"SIG123\""),
+        "with the EXACT signature: {round2}"
+    );
+    assert!(
+        round2.contains("I should check the time."),
+        "and the thinking text: {round2}"
+    );
     // The request also enables thinking at the top level.
-    assert!(round2.contains("\"thinking\":{\"type\":\"adaptive\"}"), "thinking enabled: {round2}");
+    assert!(
+        round2.contains("\"thinking\":{\"type\":\"adaptive\"}"),
+        "thinking enabled: {round2}"
+    );
 }
 
 #[tokio::test]
@@ -215,8 +262,17 @@ async fn signed_thinking_not_echoed_when_thinking_disabled() {
     // would 400).
     let reqs = run_two_round(THINKING_TOOL_SSE, false).await;
     let round2 = String::from_utf8_lossy(&reqs[1].body);
-    assert!(!round2.contains("\"type\":\"thinking\""), "no thinking block echoed when disabled: {round2}");
-    assert!(!round2.contains("SIG123"), "signature not echoed when thinking disabled: {round2}");
+    assert!(
+        !round2.contains("\"type\":\"thinking\""),
+        "no thinking block echoed when disabled: {round2}"
+    );
+    assert!(
+        !round2.contains("SIG123"),
+        "signature not echoed when thinking disabled: {round2}"
+    );
     // The tool round-trip still works.
-    assert!(round2.contains("12:00"), "tool result still fed back: {round2}");
+    assert!(
+        round2.contains("12:00"),
+        "tool result still fed back: {round2}"
+    );
 }

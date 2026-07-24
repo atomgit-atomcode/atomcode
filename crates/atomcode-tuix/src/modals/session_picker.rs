@@ -4,21 +4,33 @@
 //
 // Lists all sessions for the current project (pre-filtered to >0 msgs)
 // with type-to-filter search. Up/Down navigates, Enter loads + replays
-// into scrollback + syncs the agent via `AgentCommand::SetConversation`,
+// into scrollback + restores the runtime conversation through the native API,
 // Esc cancels, printable chars + Backspace edit the filter query.
-// F2 renames the selected session.
+//
+// The chrome mirrors the `/plugin` manager (MenuKind::SessionList): a title
+// row with count + project name, a bordered search box (the InputPrompt buffer
+// carries the filter query, NOT the main composer), two-line session rows
+// (bright title + gray metadata), and a muted bottom hint. Rename is no longer
+// supported.
 
+use crate::session::{Session, SessionMeta, TurnStat};
 use anyhow::Result;
-use atomcode_core::agent::AgentCommand;
-use atomcode_core::session::{Session, SessionMeta};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
 use crate::event_loop::{
-    build_status, format_tool_detail, perform_session_rename, summarise, Buffer, LoopCtx,
+    build_status, format_tool_detail, provider_transition_pending, summarise, Buffer, LoopCtx,
 };
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
+
+fn flatten_session_preparation<T>(
+    result: Result<Result<T, String>, tokio::task::JoinError>,
+) -> Result<T, String> {
+    result
+        .map_err(|error| format!("session preparation task failed: {error}"))
+        .and_then(|result| result)
+}
 
 pub struct SessionPicker {
     /// All sessions for the project, pre-filtered to message_count > 0.
@@ -29,10 +41,10 @@ pub struct SessionPicker {
     pub filtered: Vec<usize>,
     /// Index into `filtered`.
     pub selected: usize,
-    /// Whether we are in rename editing mode.
-    pub rename_editing: bool,
-    /// The new name being edited for rename.
-    pub rename_buffer: String,
+    /// Whether keyboard focus is on the search box (vs. a session row). When
+    /// true, the bordered search box is highlighted with a live cursor and no
+    /// session row is marked. Reached by pressing Up from the first session.
+    pub search_focused: bool,
     /// Index into `sessions` awaiting delete confirmation, or None.
     pub confirm_delete: Option<usize>,
     /// Status message shown in the footer (overwrites previous status).
@@ -47,8 +59,7 @@ impl SessionPicker {
             query: String::new(),
             filtered,
             selected: 0,
-            rename_editing: false,
-            rename_buffer: String::new(),
+            search_focused: false,
             confirm_delete: None,
             delete_status: None,
         }
@@ -67,16 +78,34 @@ impl SessionPicker {
     }
 
     pub fn up(&mut self) {
+        self.confirm_delete = None;
         if self.filtered.is_empty() {
             self.selected = 0;
+            self.search_focused = true;
             return;
         }
-        self.selected = self.selected.saturating_sub(1);
-        self.confirm_delete = None;
+        if self.search_focused {
+            // Already at the top — stay in the search box.
+            return;
+        }
+        if self.selected == 0 {
+            // Move focus off the first session and into the search box.
+            self.search_focused = true;
+            return;
+        }
+        self.selected -= 1;
     }
 
     pub fn down(&mut self) {
+        self.confirm_delete = None;
         if self.filtered.is_empty() {
+            self.selected = 0;
+            self.search_focused = false;
+            return;
+        }
+        if self.search_focused {
+            // Leave the search box and land on the first session.
+            self.search_focused = false;
             self.selected = 0;
             return;
         }
@@ -84,12 +113,54 @@ impl SessionPicker {
         if self.selected < max {
             self.selected += 1;
         }
-        self.confirm_delete = None;
     }
 
-    pub fn chosen_id(&self) -> Option<atomcode_core::session::SessionId> {
-        let i = *self.filtered.get(self.selected)?;
-        self.sessions.get(i).map(|s| s.id.clone())
+    pub fn chosen_id(&self) -> Option<String> {
+        self.chosen_session().map(|session| session.id.clone())
+    }
+
+    fn chosen_session(&self) -> Option<&SessionMeta> {
+        let index = *self.filtered.get(self.selected)?;
+        self.sessions.get(index)
+    }
+
+    fn replay_selected_current_session(
+        &self,
+        current_session: &Session,
+        current_project_bucket: &str,
+        state: &mut UiState,
+        renderer: &mut dyn Renderer,
+    ) -> bool {
+        let is_current = self.chosen_session().is_some_and(|session| {
+            session.id == current_session.id && session.project_bucket == current_project_bucket
+        });
+        if !is_current {
+            return false;
+        }
+
+        // The runtime already owns this exact session and its lease. Replaying
+        // it is therefore a display-only operation: repaint the in-memory
+        // transcript and restore copy/context/todo projections without asking
+        // the runtime to reacquire the lease or publishing a session switch.
+        replay_session(renderer, state, current_session, true);
+        true
+    }
+
+    /// The static key-legend hint advertising the picker's actions
+    /// (`↑↓ move · Enter open · Ctrl+D×2 delete · Type to search · Esc cancel`),
+    /// or `None` for an empty list (nothing to act on). Existence of this legend
+    /// is the reported gap: users couldn't tell how to delete a session because
+    /// the picker showed no keys.
+    ///
+    /// NOTE: with the `SessionList` chrome this hint is ALSO rendered as the
+    /// bottom `— … —` row inside the menu, so it's visible even when a
+    /// `build_status` warning occupies the status slot; the status-slot copy
+    /// (below) is a bonus, gated LOWER priority than any warning.
+    fn browse_hint(&self) -> Option<String> {
+        if self.filtered.is_empty() {
+            return None;
+        }
+        Some(crate::i18n::t(crate::i18n::Msg::SessionPickerHint).into_owned())
     }
 }
 
@@ -103,78 +174,6 @@ impl Modal for SessionPicker {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
-        // Handle rename editing mode
-        if self.rename_editing {
-            match code {
-                KeyCode::Esc => {
-                    // Cancel rename editing
-                    self.rename_editing = false;
-                    self.rename_buffer.clear();
-                    self.draw(buf, state, ctx, renderer);
-                    return Ok(ModalAction::Continue);
-                }
-                KeyCode::Enter => {
-                    if let Some(idx) = self.filtered.get(self.selected).copied() {
-                        if let Some(session_meta) = self.sessions.get(idx) {
-                            let id = session_meta.id.clone();
-                            match perform_session_rename(
-                                &ctx.session_manager,
-                                &id,
-                                &self.rename_buffer,
-                            ) {
-                                Ok((old_name, new_name)) => {
-                                    // Update the session name in our local list
-                                    if let Some(s) = self.sessions.get_mut(idx) {
-                                        s.name = new_name.clone();
-                                    }
-                                    // Recompute filtered list since new name may no longer match query
-                                    let prev_id = id.clone();
-                                    self.update_filter();
-                                    // Try to keep the same session selected
-                                    self.selected = self
-                                        .filtered
-                                        .iter()
-                                        .position(|&fi| self.sessions[fi].id == prev_id)
-                                        .unwrap_or(0);
-                                    // Show success feedback
-                                    renderer.render(UiLine::CommandOutput(
-                                        crate::i18n::t(crate::i18n::Msg::SessionRenamed {
-                                            old: &old_name,
-                                            new: &new_name,
-                                        }).into_owned(),
-                                    ));
-                                    renderer.flush();
-                                }
-                                Err(err) => {
-                                    renderer.render(UiLine::Error(err));
-                                    renderer.flush();
-                                }
-                            }
-                        }
-                    }
-                    self.rename_editing = false;
-                    self.rename_buffer.clear();
-                    self.draw(buf, state, ctx, renderer);
-                    return Ok(ModalAction::Continue);
-                }
-                KeyCode::Backspace => {
-                    self.rename_buffer.pop();
-                    self.draw(buf, state, ctx, renderer);
-                    return Ok(ModalAction::Continue);
-                }
-                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                    self.rename_buffer.push(c);
-                    self.draw(buf, state, ctx, renderer);
-                    return Ok(ModalAction::Continue);
-                }
-                _ => {
-                    self.draw(buf, state, ctx, renderer);
-                    return Ok(ModalAction::Continue);
-                }
-            }
-        }
-
-        // Normal mode handling
         match code {
             KeyCode::Up => {
                 self.up();
@@ -191,6 +190,9 @@ impl Modal for SessionPicker {
             KeyCode::Backspace => {
                 self.query.pop();
                 self.update_filter();
+                // Editing the query is editing the search box — pull focus there
+                // so the caret appears and no session row looks active.
+                self.search_focused = true;
                 self.confirm_delete = None;
                 self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
@@ -199,31 +201,19 @@ impl Modal for SessionPicker {
             KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
                 self.query.push(c);
                 self.update_filter();
+                self.search_focused = true;
                 self.confirm_delete = None;
                 self.delete_status = None;
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
-            KeyCode::F(2) => {
-                // F2 to start rename editing for selected session
-                if let Some(idx) = self.filtered.get(self.selected).copied() {
-                    if let Some(session) = self.sessions.get(idx) {
-                        self.rename_buffer = session.name.clone();
-                        self.rename_editing = true;
-                        self.confirm_delete = None;
-                        self.delete_status = None;
-                        self.draw(buf, state, ctx, renderer);
-                    }
-                } else {
-                    renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::SessionNoneSelected).into_owned(),
-                    ));
-                    renderer.flush();
-                }
-                Ok(ModalAction::Continue)
-            }
             KeyCode::Char(c) if mods.contains(KeyModifiers::CONTROL) && c == 'd' => {
-                // Ctrl+D: delete selected session (with confirmation)
+                // Ctrl+D: delete selected session (with confirmation). Ignored
+                // while the search box holds focus — no session row is marked, so
+                // there is nothing unambiguous to delete.
+                if self.search_focused {
+                    return Ok(ModalAction::Continue);
+                }
                 let Some(idx) = self.filtered.get(self.selected).copied() else {
                     renderer.render(UiLine::Error(
                         crate::i18n::t(crate::i18n::Msg::SessionNoneSelected).into_owned(),
@@ -235,7 +225,10 @@ impl Modal for SessionPicker {
                     // Second Ctrl+D: confirm delete
                     if let Some(session) = self.sessions.get(idx) {
                         let id = session.id.clone();
-                        match ctx.session_manager.delete(&id) {
+                        match atomcode_daemon::legacy_convert::delete_catalog_session_in_project(
+                            &session.project_bucket,
+                            id.as_str(),
+                        ) {
                             Ok(()) => {
                                 let name = session.name.clone();
                                 self.sessions.remove(idx);
@@ -251,7 +244,8 @@ impl Modal for SessionPicker {
                                 self.delete_status = Some(
                                     crate::i18n::t(crate::i18n::Msg::SessionDeleted {
                                         name: &name,
-                                    }).into_owned(),
+                                    })
+                                    .into_owned(),
                                 );
                             }
                             Err(e) => {
@@ -259,7 +253,8 @@ impl Modal for SessionPicker {
                                 self.delete_status = Some(
                                     crate::i18n::t(crate::i18n::Msg::SessionDeleteFailed {
                                         error: &e.to_string(),
-                                    }).into_owned(),
+                                    })
+                                    .into_owned(),
                                 );
                             }
                         }
@@ -271,7 +266,8 @@ impl Modal for SessionPicker {
                         self.delete_status = Some(
                             crate::i18n::t(crate::i18n::Msg::SessionDeleteConfirm {
                                 name: &session.name,
-                            }).into_owned(),
+                            })
+                            .into_owned(),
                         );
                     }
                 }
@@ -279,53 +275,95 @@ impl Modal for SessionPicker {
                 Ok(ModalAction::Continue)
             }
             KeyCode::Enter => {
-                let Some(id) = self.chosen_id() else {
+                let Some(selected) = self.chosen_session().cloned() else {
                     // Filter matched nothing — ignore Enter, stay open.
                     return Ok(ModalAction::Continue);
                 };
-                match ctx.session_manager.load(&id) {
-                    Ok(session) => {
-                        ctx.current_session_id = Some(id);
-                        replay_session(renderer, state, &session, true);
-                        ctx.agent
-                            .cmd_tx
-                            .send(AgentCommand::SetConversation {
-                                snapshot: session.to_conversation_snapshot(),
-                                restore_id: None,
-                            })
-                            .ok();
-                        // Continue accumulating into the same session file —
-                        // future TurnComplete saves overwrite it. Bind
-                        // telemetry + agent (header/datalog) to the resumed
-                        // session's persistent id so /resume reuses its
-                        // original id (gateway routes back to the warm upstream).
-                        crate::event_loop::commands::bind_telemetry_to_session(ctx, &session);
-                        ctx.current_session = session;
-                        ctx.bg_manager
-                            .set_foreground_session(ctx.current_session.clone());
-                        state.on_turn_complete();
-                        // 同步模式：把这次「本地切换到历史会话」双向同步到 webui，并把
-                        // 共享 LiveSession 重绑到该会话（含其历史）。非同步模式下为 no-op。
-                        crate::event_loop::commands::sync_local_session_switch(ctx, renderer);
-                        Ok(ModalAction::Close)
-                    }
-                    Err(e) => {
-                        ctx.current_session_id = None;
-                        state.total_tokens = 0;
-                        state.thinking_idx = 0;
-                        state.on_turn_complete();
-                        let msg = format!("{}", e);
-                        renderer.render(UiLine::Error(
-                            crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &msg }).into_owned(),
-                        ));
-                        renderer.flush();
-                        Ok(ModalAction::Close)
-                    }
+                let expected_bucket =
+                    ctx.current_session_project_bucket
+                        .clone()
+                        .unwrap_or_else(|| {
+                            atomcode_capabilities::session::SessionManager::project_hash(
+                                &ctx.working_dir,
+                            )
+                        });
+                if self.replay_selected_current_session(
+                    &ctx.current_session,
+                    &expected_bucket,
+                    state,
+                    renderer,
+                ) {
+                    return Ok(ModalAction::Close);
                 }
+                if provider_transition_pending(ctx) {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+                    ));
+                    renderer.flush();
+                    return Ok(ModalAction::Continue);
+                }
+                if ctx.pending_session_resume.is_some()
+                    || ctx.pending_session_resume_preparation.is_some()
+                {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::SessionLoadFailed {
+                            error: "another session resume is still in progress",
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+                    return Ok(ModalAction::Close);
+                }
+
+                let pending = crate::event_loop::PendingSessionResumePreparation {
+                    project_bucket: selected.project_bucket.clone(),
+                    session_id: selected.id.clone(),
+                    working_dir: ctx.working_dir.clone(),
+                };
+                ctx.pending_session_resume_preparation = Some(pending.clone());
+                let event_tx = ctx.runtime_event_tx.clone();
+                let runtime_id = ctx.foreground_runtime_id;
+                let preparation = pending.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        atomcode_daemon::legacy_convert::prepare_catalog_session_resume_in_project(
+                            &preparation.project_bucket,
+                            &preparation.session_id,
+                        )
+                        .map_err(|error| error.to_string())
+                        .and_then(|prepared| {
+                            prepared.ok_or_else(|| {
+                                format!("session {} not found", preparation.session_id)
+                            })
+                        })
+                    })
+                    .await;
+                    let result = flatten_session_preparation(result);
+                    let _ = event_tx.send(crate::event_loop::bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: crate::event_loop::bg_runtime::RuntimeEventPayload::Driver(
+                            crate::event_loop::bg_runtime::DriverEvent::SessionResumePrepared {
+                                project_bucket: pending.project_bucket,
+                                session_id: pending.session_id,
+                                working_dir: pending.working_dir,
+                                result,
+                            },
+                        ),
+                    });
+                });
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
+                ));
+                renderer.flush();
+                Ok(ModalAction::Close)
             }
             KeyCode::Esc => {
                 if self.confirm_delete.is_some() {
+                    // Cancel the pending delete. Clear the confirm prompt too,
+                    // otherwise the "Press Ctrl+D again…" footer lingers (and
+                    // suppresses the key legend) until the next Up/Down/edit.
                     self.confirm_delete = None;
+                    self.delete_status = None;
                     self.draw(buf, state, ctx, renderer);
                     Ok(ModalAction::Continue)
                 } else {
@@ -352,6 +390,7 @@ impl Modal for SessionPicker {
             self.query.push(c);
         }
         self.update_filter();
+        self.search_focused = true;
         self.confirm_delete = None;
         self.delete_status = None;
         self.selected = 0;
@@ -359,15 +398,52 @@ impl Modal for SessionPicker {
         Ok(ModalAction::Continue)
     }
 
-    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
-        let payload = build_menu_payload(self);
+    fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+        // Project name = basename of the working dir (falls back to the full
+        // path string, then to a placeholder, so the title never renders blank).
+        let project = ctx
+            .working_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                let p = ctx.working_dir.to_string_lossy();
+                if p.is_empty() {
+                    "project".to_string()
+                } else {
+                    p.into_owned()
+                }
+            });
+        let current_project_bucket =
+            atomcode_capabilities::session::SessionManager::project_hash(&ctx.working_dir);
+        let payload = build_menu_payload(
+            self,
+            &project,
+            Some((
+                ctx.current_session.id.as_str(),
+                current_project_bucket.as_str(),
+            )),
+        );
         let mut status = build_status(state, ctx);
+        // Delete confirmation/result is the user's own active interaction — it
+        // must always show, overriding any build_status warning. The static key
+        // legend is lowest priority: only fill an otherwise-empty hint slot so a
+        // no-provider / official-build / usage warning stays visible in the
+        // picker (the legend also renders as the menu's bottom `— … —` row, so
+        // it's never fully hidden even when a warning owns the status slot).
         if let Some(msg) = &self.delete_status {
             status.hint = Some((msg.clone(), crate::render::HintSeverity::Info));
+        } else if status.hint.is_none() {
+            if let Some(msg) = self.browse_hint() {
+                status.hint = Some((msg, crate::render::HintSeverity::Info));
+            }
         }
+        // The `SessionList` chrome puts the filter query in the (bordered) search
+        // box, so the InputPrompt buffer carries the QUERY — not the main
+        // composer — exactly like `/plugin`.
         renderer.render(UiLine::InputPrompt {
-            buf: buf.text.clone(),
-            cursor_byte: buf.cursor,
+            buf: self.query.clone(),
+            cursor_byte: self.query.len(),
             menu: Some(payload),
             status,
             attachments: Vec::new(),
@@ -376,60 +452,106 @@ impl Modal for SessionPicker {
     }
 }
 
-fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
+/// The four fixed header rows (title, blank, search query, blank) that the
+/// `SessionList` chrome expects before the session rows begin. Session row
+/// `selected` indices are offset by this in the payload so the `▸` marker
+/// lands on the right row (mirrors `plugin_manager`'s `selected_offset`).
+pub(crate) const HEADER_ROWS: usize = 4;
+
+fn build_menu_payload(
+    p: &SessionPicker,
+    project: &str,
+    current_session: Option<(&str, &str)>,
+) -> MenuPayload {
+    // Title row: when the search box is focused, show just the bare heading
+    // ("恢复会话" / "Resume session") without position/total/project, so the
+    // user isn't distracted by the count while typing.
+    let title = if p.search_focused {
+        crate::i18n::t(crate::i18n::Msg::SessionPickerTitleBare).into_owned()
+    } else {
+        let total = p.sessions.len();
+        let pos = if p.filtered.is_empty() {
+            0
+        } else {
+            p.selected + 1
+        };
+        crate::i18n::t(crate::i18n::Msg::SessionPickerTitle {
+            n: pos,
+            total,
+            project,
+        })
+        .into_owned()
+    };
+    let hint = crate::i18n::t(crate::i18n::Msg::SessionPickerHint).into_owned();
+
+    // Header chrome: title, blank, search query, blank.
+    let mut items: Vec<(String, String)> =
+        vec![(title, String::new()), (String::new(), String::new())];
+    items.push((p.query.clone(), String::new()));
+    items.push((String::new(), String::new()));
     // Empty state: surface a hint row so the user can tell the filter is
     // active and which query is excluding everything (otherwise the menu
-    // renders as blank space and looks like the modal hung).
+    // renders as blank chrome and looks like the modal hung). This row is NOT
+    // selectable, so `selected` points past the list (never highlights it).
     if p.filtered.is_empty() {
         let label = if p.sessions.is_empty() {
-            "(no sessions in this project yet)".to_string()
+            crate::i18n::t(crate::i18n::Msg::SessionPickerEmptyProject).into_owned()
         } else if p.query.is_empty() {
-            "(no sessions match)".to_string()
+            crate::i18n::t(crate::i18n::Msg::SessionPickerEmptyFilter).into_owned()
         } else {
-            format!("(no sessions match \"{}\" — Backspace to clear)", p.query)
+            crate::i18n::t(crate::i18n::Msg::SessionPickerEmptyFilterQuery { query: &p.query })
+                .into_owned()
         };
+        items.push((label, String::new()));
+        items.push((format!("— {} —", hint), String::new()));
         return MenuPayload {
-            items: vec![(label, String::new())],
-            selected: 0,
-            kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
+            items,
+            // No session is selectable. If the search box holds focus (the user
+            // typed a query that excludes everything, or pressed Up), keep it
+            // highlighted with a cursor at row 2; otherwise point past the end so
+            // no row is marked.
+            selected: if p.search_focused { 2 } else { usize::MAX },
+            kind: crate::render::MenuKind::SessionList,
         };
     }
-    let items: Vec<(String, String)> = p
-        .filtered
-        .iter()
-        .enumerate()
-        .map(|(filter_idx, &session_idx)| {
-            let s = &p.sessions[session_idx];
-            let msgs = crate::i18n::t(crate::i18n::Msg::SessionMsgCount { count: s.message_count });
-            let desc = format!("{} · {}", msgs, humanize_age(s.updated_at));
-            // If in rename editing mode and this is the selected item, show the editing buffer
-            if p.rename_editing && filter_idx == p.selected {
-                (
-                    crate::i18n::t(crate::i18n::Msg::SessionRenameEditing {
-                        buffer: &p.rename_buffer,
-                    }).into_owned(),
-                    desc,
-                )
-            } else {
-                (s.name.clone(), desc)
-            }
-        })
-        .collect();
+    for &session_idx in &p.filtered {
+        let s = &p.sessions[session_idx];
+        let msgs = crate::i18n::t(crate::i18n::Msg::SessionMsgCount {
+            count: s.message_count,
+        });
+        let mut metadata = format!("{} · {}", msgs, humanize_age(s.updated_at));
+        if current_session
+            .is_some_and(|(id, project_bucket)| s.id == id && s.project_bucket == project_bucket)
+        {
+            metadata.push_str(" · ");
+            metadata.push_str(&crate::i18n::t(crate::i18n::Msg::DirCurrent));
+        }
+        items.push((s.name.clone(), metadata));
+    }
+    items.push((format!("— {} —", hint), String::new()));
+
+    // When the search box holds focus, mark row 2 (the bordered query field) as
+    // selected so it highlights and shows a cursor; no session row is marked.
+    // Otherwise offset the selection past the header chrome so the ▸ marker
+    // lands on the selected session row (rows begin at index HEADER_ROWS).
+    let selected = if p.search_focused {
+        2
+    } else {
+        HEADER_ROWS + p.selected
+    };
     MenuPayload {
+        selected,
         items,
-        selected: p.selected,
-        kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
+        kind: crate::render::MenuKind::SessionList,
     }
 }
 
-fn humanize_age(ts: u64) -> String {
+fn humanize_age(ts_ms: i64) -> String {
     use crate::i18n::{t, Msg};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(ts);
-    let d = now.saturating_sub(ts);
+    let d = atomcode_capabilities::session::now_ms()
+        .saturating_sub(ts_ms)
+        .max(0) as u64
+        / 1000;
     if d < 60 {
         t(Msg::SessionTimeJustNow).into_owned()
     } else if d < 3600 {
@@ -454,13 +576,15 @@ fn humanize_age(ts: u64) -> String {
 /// (old session, or a cancelled turn that recorded no stat) → empty label,
 /// which renders as a plain horizontal rule so the visual interval is still
 /// restored. `done` is fixed on replay (the live rotation is cosmetic).
-fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String {
+fn turn_divider_label(stat: Option<&TurnStat>) -> String {
     match stat {
         Some(s) if s.errored => crate::i18n::t(crate::i18n::Msg::TurnSummaryError {
             turn_count: s.turn_count,
             tool_call_count: s.tool_call_count,
             duration: &crate::render::fmt_dur(std::time::Duration::from_millis(s.duration_ms)),
             total_tokens: s.total_tokens,
+            // Resume replay: the reason is live-only (not persisted in TurnStat).
+            reason: None,
         })
         .into_owned(),
         Some(s) => crate::i18n::t(crate::i18n::Msg::TurnSummary {
@@ -482,7 +606,9 @@ fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String
 /// live. Mirrors the live [`UiState::last_assistant_response`]: the accumulated
 /// assistant text of the newest turn that produced any (a `User` message is a
 /// turn boundary). Returns `""` when the session has no assistant text.
-fn last_assistant_reply_markdown(messages: &[atomcode_core::conversation::message::Message]) -> String {
+fn last_assistant_reply_markdown(
+    messages: &[atomcode_core::conversation::message::Message],
+) -> String {
     use atomcode_core::conversation::message::{MessageContent, Role};
     // Append `text` to the in-progress turn's reply, paragraph-separated so a
     // turn that emitted prose, then a tool call, then more prose reads cleanly.
@@ -547,7 +673,10 @@ pub(crate) fn replay_session(
     if reset {
         renderer.reset();
     }
-    let resumed = crate::i18n::t(crate::i18n::Msg::SessionResumedLabel { name: &session.name }).into_owned();
+    let resumed = crate::i18n::t(crate::i18n::Msg::SessionResumedLabel {
+        name: &session.name,
+    })
+    .into_owned();
     renderer.render(UiLine::TurnSeparator {
         label: resumed.clone(),
     });
@@ -561,11 +690,15 @@ pub(crate) fn replay_session(
     let mut seen_user = false;
     // Suppress successful todowrite tool RESULTs (the persistent panel is the sole
     // view for todowrite output; errors still show). Track parseable call ids.
-    let mut todowrite_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut todowrite_call_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for (i, m) in session.messages.iter().enumerate() {
         if is_real_user_message(m) {
             if seen_user {
-                let stat = session.turn_stats.iter().find(|s| s.after_message == i);
+                let stat = session
+                    .turn_stats
+                    .iter()
+                    .find(|s| s.position_valid && s.after_message == i);
                 renderer.render(UiLine::TurnSeparator {
                     label: turn_divider_label(stat),
                 });
@@ -622,6 +755,7 @@ pub(crate) fn replay_session(
                     renderer.render(UiLine::ToolResult {
                         success: r.success,
                         summary: summarise(&r.output),
+                        diff_stats: None,
                     });
                 }
             }
@@ -630,6 +764,7 @@ pub(crate) fn replay_session(
                     renderer.render(UiLine::ToolResult {
                         success: true,
                         summary: summarise(&r.summary),
+                        diff_stats: None,
                     });
                 }
             }
@@ -641,16 +776,14 @@ pub(crate) fn replay_session(
     if let Some(stat) = session
         .turn_stats
         .iter()
-        .find(|s| s.after_message == session.messages.len())
+        .find(|s| s.position_valid && s.after_message == session.messages.len())
     {
         renderer.render(UiLine::TurnSeparator {
             label: turn_divider_label(Some(stat)),
         });
     }
     renderer.render(UiLine::TurnComplete);
-    renderer.render(UiLine::TurnSeparator {
-        label: resumed,
-    });
+    renderer.render(UiLine::TurnSeparator { label: resumed });
     renderer.flush();
     renderer.set_suppress_auto_copy(false);
     renderer.end_sync();
@@ -673,7 +806,9 @@ pub(crate) fn replay_session(
     // screen; `restore_context` no-ops only when there's nothing to show or clear.
     let (used, window) = session
         .turn_stats
-        .last()
+        .iter()
+        .rev()
+        .find(|stat| stat.position_valid)
         .map(|s| (s.used_tokens, s.ctx_window))
         .unwrap_or((0, 0));
     state.restore_context(used, window);
@@ -690,13 +825,13 @@ pub(crate) fn replay_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::session::{SessionId, SessionMeta};
     use std::path::PathBuf;
 
     fn meta(name: &str, msgs: usize) -> SessionMeta {
         SessionMeta {
-            id: SessionId::from_string(format!("id-{name}")),
+            id: format!("id-{name}"),
             name: name.to_string(),
+            project_bucket: "0123456789abcdef".to_string(),
             working_dir: PathBuf::from("/tmp/x"),
             created_at: 0,
             updated_at: 0,
@@ -707,9 +842,9 @@ mod tests {
 
     #[test]
     fn turn_divider_label_renders_stats_or_plain_rule() {
-        use atomcode_core::session::TurnStat;
         let s = TurnStat {
             after_message: 4,
+            position_valid: true,
             turn_count: 3,
             tool_call_count: 5,
             duration_ms: 6800,
@@ -730,7 +865,10 @@ mod tests {
             "got {normal:?}"
         );
         // Errored turn → ✗ variant.
-        let err = TurnStat { errored: true, ..s.clone() };
+        let err = TurnStat {
+            errored: true,
+            ..s.clone()
+        };
         assert!(super::turn_divider_label(Some(&err)).contains('✗'));
         // No stat (old session / cancelled turn) → empty label → plain rule.
         assert_eq!(super::turn_divider_label(None), "");
@@ -803,6 +941,48 @@ mod tests {
     }
 
     #[test]
+    fn browse_hint_advertises_key_actions() {
+        // Discoverability: the picker must surface the delete/open/search
+        // shortcuts, else users can't tell how to act on a session (the reported
+        // gap). Rename is intentionally no longer supported, so it is absent.
+        let p = SessionPicker::open(vec![meta("a", 1)]);
+        let h = p.browse_hint().expect("browse mode advertises key actions");
+        // Locale-independent: the literal shortcuts appear in both en and zh.
+        assert!(h.contains("Ctrl+D"), "delete shortcut must be shown: {h:?}");
+        assert!(h.contains("Enter"), "open shortcut must be shown: {h:?}");
+        assert!(h.contains("Esc"), "cancel shortcut must be shown: {h:?}");
+        assert!(
+            !h.contains("F2"),
+            "rename is removed — F2 must not be advertised: {h:?}"
+        );
+    }
+
+    #[test]
+    fn browse_hint_suppressed_when_empty() {
+        // Empty list: nothing to act on, so no footer legend.
+        let empty = SessionPicker::open(vec![]);
+        assert_eq!(empty.browse_hint(), None);
+    }
+
+    #[test]
+    fn no_rename_fields_or_refs_remain() {
+        // Rename removed: the struct must construct without any rename state and
+        // the payload never renders a rename-editing label. (Compile-time proof
+        // that `rename_editing` / `rename_buffer` are gone; if they were
+        // re-added, `..Default`-style construction below would need them.)
+        let p = SessionPicker::open(vec![meta("a", 1)]);
+        let payload = build_menu_payload(&p, "proj", None);
+        assert!(
+            payload
+                .items
+                .iter()
+                .all(|(name, _)| !name.contains("[Enter: confirm")),
+            "no rename-editing label may appear: {:?}",
+            payload.items
+        );
+    }
+
+    #[test]
     fn open_shows_all_sessions_initially() {
         let p = SessionPicker::open(vec![meta("alpha", 3), meta("beta", 5)]);
         assert_eq!(p.filtered.len(), 2);
@@ -863,6 +1043,50 @@ mod tests {
     }
 
     #[test]
+    fn up_from_first_session_focuses_search_box() {
+        let mut p = SessionPicker::open(vec![meta("a", 1), meta("b", 1)]);
+        p.down();
+        assert_eq!(p.selected, 1);
+        assert!(!p.search_focused);
+        p.up();
+        assert_eq!(p.selected, 0, "up from second lands on first session");
+        assert!(!p.search_focused, "still on a session row, not the box");
+        p.up();
+        assert!(
+            p.search_focused,
+            "up from first session focuses the search box"
+        );
+        assert_eq!(p.selected, 0);
+        p.up();
+        assert!(p.search_focused, "up again stays in the search box");
+    }
+
+    #[test]
+    fn down_from_search_box_returns_to_first_session() {
+        let mut p = SessionPicker::open(vec![meta("a", 1), meta("b", 1)]);
+        p.up();
+        assert!(p.search_focused);
+        p.down();
+        assert!(!p.search_focused, "down leaves the search box");
+        assert_eq!(p.selected, 0, "and lands on the first session");
+    }
+
+    #[test]
+    fn empty_filter_focuses_search_box_on_up() {
+        let mut p = SessionPicker::open(vec![meta("x", 1)]);
+        p.query = "zzz".to_string();
+        p.update_filter();
+        assert!(p.filtered.is_empty());
+        p.up();
+        assert!(
+            p.search_focused,
+            "up with no matches parks focus on the box"
+        );
+        p.down();
+        assert!(!p.search_focused);
+    }
+
+    #[test]
     fn chosen_returns_session_at_selected() {
         let sessions = vec![meta("first", 1), meta("second", 1)];
         let mut p = SessionPicker::open(sessions);
@@ -880,36 +1104,212 @@ mod tests {
     }
 
     #[test]
+    fn selecting_current_session_replays_the_ui_without_a_runtime_transition() {
+        use atomcode_core::conversation::message::{Message, Role};
+
+        #[derive(Default)]
+        struct Rec {
+            lines: Vec<UiLine>,
+            reset_count: usize,
+        }
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.lines.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {
+                self.reset_count += 1;
+            }
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        let mut current = Session::new(PathBuf::from("/tmp/x"));
+        current.id = "current-id".into();
+        current.name = "current session".into();
+        current.messages = vec![
+            Message::new(Role::User, "question"),
+            Message::new(Role::Assistant, "answer"),
+        ];
+        let mut selected = meta("current session", current.messages.len());
+        selected.id = current.id.clone();
+        let current_bucket =
+            atomcode_capabilities::session::SessionManager::project_hash(&current.working_dir);
+        selected.project_bucket = current_bucket.clone();
+        let picker = SessionPicker::open(vec![selected]);
+        let mut state = UiState::with_unicode(true);
+        let mut renderer = Rec::default();
+
+        assert!(picker.replay_selected_current_session(
+            &current,
+            &current_bucket,
+            &mut state,
+            &mut renderer,
+        ));
+
+        assert_eq!(
+            renderer.reset_count, 1,
+            "current replay must repaint scrollback"
+        );
+        assert!(
+            renderer.lines.iter().any(|line| matches!(
+                line,
+                UiLine::TurnSeparator { label } if label.contains("current session")
+            )),
+            "current replay must show the same resumed separator as another session"
+        );
+        assert_eq!(state.last_assistant_response, "answer");
+
+        let mut same_id_other_bucket = meta("duplicate", current.messages.len());
+        same_id_other_bucket.id = current.id.clone();
+        let other_picker = SessionPicker::open(vec![same_id_other_bucket]);
+        let mut other_renderer = Rec::default();
+        assert!(
+            !other_picker.replay_selected_current_session(
+                &current,
+                &current_bucket,
+                &mut state,
+                &mut other_renderer,
+            ),
+            "session identity is project bucket plus id, not id alone"
+        );
+        assert_eq!(other_renderer.reset_count, 0);
+    }
+
+    #[test]
     fn build_menu_payload_shows_hint_when_filter_matches_nothing() {
         // Regression: typing a query that excludes every session used to
-        // render a blank menu (items.len() == 0), so the user couldn't
-        // tell whether /resume hung, the filter was active, or what.
-        // Now we surface a single non-interactive hint row so the empty
-        // state is visible.
+        // render a blank menu, so the user couldn't tell whether /resume hung,
+        // the filter was active, or what. Now we surface a non-interactive hint
+        // row (after the header chrome) so the empty state is visible.
         let mut p = SessionPicker::open(vec![meta("alpha", 1), meta("beta", 1)]);
         p.query = "zz".to_string();
         p.update_filter();
         assert_eq!(p.filtered.len(), 0);
-        let payload = build_menu_payload(&p);
+        let payload = build_menu_payload(&p, "proj", None);
+        // 4 header chrome rows + 1 empty-state label + 1 bottom hint = 6.
         assert_eq!(
             payload.items.len(),
-            1,
-            "empty filter should produce a single hint row, got: {:?}",
+            HEADER_ROWS + 2,
+            "empty filter: header chrome + one label + hint, got: {:?}",
             payload.items
         );
-        let (label, _) = &payload.items[0];
+        let (label, _) = &payload.items[HEADER_ROWS];
         assert!(
             label.contains("zz"),
             "hint should echo the user's query so they know which filter is active: {}",
             label
+        );
+        // Nothing selectable → selection points past every row (no highlight).
+        assert!(
+            payload.selected >= payload.items.len(),
+            "empty state must not highlight a row: {}",
+            payload.selected
         );
     }
 
     #[test]
     fn build_menu_payload_shows_hint_when_no_sessions_at_all() {
         let p = SessionPicker::open(vec![]);
-        let payload = build_menu_payload(&p);
-        assert_eq!(payload.items.len(), 1, "must show some empty-state hint");
+        let payload = build_menu_payload(&p, "proj", None);
+        assert_eq!(
+            payload.items.len(),
+            HEADER_ROWS + 2,
+            "must show header chrome + empty-state label + hint"
+        );
+    }
+
+    #[test]
+    fn build_menu_payload_row_order_and_kind() {
+        // The SessionList chrome must emit: title → blank → query → blank →
+        // one row per session → bottom `— … —` hint, and use MenuKind::SessionList.
+        let mut p = SessionPicker::open(vec![meta("First task", 12), meta("Second task", 8)]);
+        p.query = "task".to_string();
+        p.update_filter();
+        assert_eq!(p.filtered.len(), 2);
+        let payload = build_menu_payload(&p, "atomcode", None);
+
+        assert_eq!(payload.kind, crate::render::MenuKind::SessionList);
+        // Row 0: title.
+        assert!(
+            payload.items[0].0.contains("atomcode"),
+            "row 0 must be the title with project name: {:?}",
+            payload.items[0]
+        );
+        // Row 1: blank separator.
+        assert_eq!(payload.items[1], (String::new(), String::new()));
+        // Row 2: the search query (goes into the bordered search box).
+        assert_eq!(payload.items[2].0, "task");
+        // Row 3: blank separator.
+        assert_eq!(payload.items[3], (String::new(), String::new()));
+        // Rows 4..: session rows (name, metadata).
+        assert_eq!(payload.items[HEADER_ROWS].0, "First task");
+        assert!(payload.items[HEADER_ROWS].1.contains('·'));
+        assert_eq!(payload.items[HEADER_ROWS + 1].0, "Second task");
+        // Last row: bottom hint wrapped in em-dashes.
+        let last = &payload.items[payload.items.len() - 1].0;
+        assert!(
+            last.starts_with('—') && last.ends_with('—'),
+            "last row must be the em-dash-wrapped hint: {last:?}"
+        );
+        // Selection is offset past the header so ▸ lands on the selected session.
+        assert_eq!(payload.selected, HEADER_ROWS);
+        p.down();
+        let payload2 = build_menu_payload(&p, "atomcode", None);
+        assert_eq!(payload2.selected, HEADER_ROWS + 1);
+    }
+
+    #[test]
+    fn title_string_format() {
+        // Title = "Resume session (n/total · project)" with n = 1-based position
+        // in the CURRENT filtered list, total = total sessions in the project.
+        let mut p = SessionPicker::open(vec![meta("a", 1), meta("b", 1), meta("c", 1)]);
+        p.down(); // selected = 1 → position 2
+        let payload = build_menu_payload(&p, "atomcode", None);
+        let title = &payload.items[0].0;
+        assert!(
+            title.contains("2/3") && title.contains("atomcode"),
+            "title must show 1-based position / total · project: {title:?}"
+        );
+
+        // Filtering shrinks the position range but total stays the project count.
+        p.query = "b".to_string();
+        p.update_filter(); // filtered = [b], selected reset to 0 → position 1
+        let payload = build_menu_payload(&p, "atomcode", None);
+        let title = &payload.items[0].0;
+        assert!(
+            title.contains("1/3"),
+            "position is over the filtered list; total is the whole project: {title:?}"
+        );
+    }
+
+    #[test]
+    fn build_menu_payload_marks_the_current_session() {
+        let mut duplicate = meta("other", 3);
+        duplicate.id = "id-current".into();
+        duplicate.project_bucket = "fedcba9876543210".into();
+        let sessions = vec![meta("current", 2), duplicate];
+        let current_id = sessions[0].id.clone();
+        let current_bucket = sessions[0].project_bucket.clone();
+        let p = SessionPicker::open(sessions);
+
+        let payload = build_menu_payload(&p, "atomcode", Some((&current_id, &current_bucket)));
+
+        assert!(
+            payload.items[HEADER_ROWS].1.contains("current")
+                || payload.items[HEADER_ROWS].1.contains("当前"),
+            "current session must be visible before Enter changes the screen: {:?}",
+            payload.items
+        );
+        assert!(
+            !payload.items[HEADER_ROWS + 1].1.contains("current")
+                && !payload.items[HEADER_ROWS + 1].1.contains("当前"),
+            "only the active session may carry the current marker: {:?}",
+            payload.items
+        );
     }
 
     // On /resume, todowrite calls no longer render an inline block. Instead the
@@ -919,7 +1319,6 @@ mod tests {
     #[test]
     fn replay_seeds_todo_panel_and_suppresses_todowrite_result() {
         use atomcode_core::conversation::message::{Message, MessageContent, Role};
-        use atomcode_core::session::Session;
         use atomcode_core::tool::{ToolCall, ToolResult as MToolResult};
 
         #[derive(Default)]
@@ -1032,12 +1431,20 @@ mod tests {
             })
             .collect();
         assert!(
-            !cmd_out.iter().any(|s| s.contains("task A") || s.contains("task B") || s.contains("task C")),
+            !cmd_out
+                .iter()
+                .any(|s| s.contains("task A") || s.contains("task B") || s.contains("task C")),
             "todowrite no longer renders an inline block on replay: {cmd_out:?}"
         );
         // Panel seeded from the transcript's LAST valid todowrite (task C, 1 pending).
-        let panel = state.active_todos.clone().expect("panel seeded from transcript");
-        assert_eq!(panel.total, 1, "last todowrite (task C) seeds the panel: {panel:?}");
+        let panel = state
+            .active_todos
+            .clone()
+            .expect("panel seeded from transcript");
+        assert_eq!(
+            panel.total, 1,
+            "last todowrite (task C) seeds the panel: {panel:?}"
+        );
 
         let tool_call_names: Vec<&str> = rec
             .lines
@@ -1048,10 +1455,16 @@ mod tests {
             })
             .collect();
         assert!(
-            !tool_call_names.iter().any(|n| n.to_lowercase().contains("todo")),
+            !tool_call_names
+                .iter()
+                .any(|n| n.to_lowercase().contains("todo")),
             "todowrite must NOT render as a generic tool row: {tool_call_names:?}"
         );
-        assert_eq!(tool_call_names.len(), 1, "only the non-todowrite call is a tool row: {tool_call_names:?}");
+        assert_eq!(
+            tool_call_names.len(),
+            1,
+            "only the non-todowrite call is a tool row: {tool_call_names:?}"
+        );
 
         let results: Vec<&str> = rec
             .lines
@@ -1062,7 +1475,9 @@ mod tests {
             })
             .collect();
         assert!(
-            !results.iter().any(|s| s.contains("task A") || s.contains("[~]")),
+            !results
+                .iter()
+                .any(|s| s.contains("task A") || s.contains("[~]")),
             "todowrite result must be suppressed: {results:?}"
         );
         assert!(
@@ -1078,7 +1493,6 @@ mod tests {
     #[test]
     fn replay_skips_synthetic_user_messages() {
         use atomcode_core::conversation::message::{Message, Role};
-        use atomcode_core::session::Session;
 
         #[derive(Default)]
         struct Rec {
@@ -1130,4 +1544,88 @@ mod tests {
         );
         assert_eq!(state.last_assistant_response, "first reply\n\nsecond reply");
     }
+
+    #[test]
+    fn replay_ignores_accounting_only_turn_positions() {
+        use atomcode_core::conversation::message::{Message, Role};
+
+        #[derive(Default)]
+        struct Rec {
+            lines: Vec<UiLine>,
+        }
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.lines.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {}
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        let mut session = Session::new(PathBuf::from("/tmp/x"));
+        session.messages = vec![
+            Message::new(Role::User, "q1"),
+            Message::new(Role::Assistant, "a1"),
+            Message::new(Role::User, "q2"),
+            Message::new(Role::Assistant, "a2"),
+        ];
+        session.turn_stats.push(TurnStat {
+            after_message: 4,
+            position_valid: true,
+            turn_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 77,
+            errored: false,
+            used_tokens: 77,
+            ctx_window: 100,
+        });
+        session.turn_stats.push(TurnStat {
+            after_message: 2,
+            position_valid: false,
+            turn_count: 9,
+            tool_call_count: 9,
+            duration_ms: 9,
+            total_tokens: 987_654,
+            errored: false,
+            used_tokens: 9,
+            ctx_window: 9,
+        });
+
+        let mut state = UiState::with_unicode(true);
+        let mut rec = Rec::default();
+        replay_session(&mut rec, &mut state, &session, false);
+
+        let labels: Vec<&str> = rec
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                UiLine::TurnSeparator { label } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.iter().all(|label| !label.contains("987")),
+            "accounting-only stat leaked into replay divider: {labels:?}"
+        );
+        let context = state.last_context.as_ref().expect("valid context restored");
+        assert_eq!(context.sent_tokens, 77);
+        assert_eq!(context.ctx_window, 100);
+    }
+}
+#[tokio::test]
+async fn preparation_join_failure_becomes_an_error_terminal() {
+    let joined = tokio::task::spawn_blocking(|| -> Result<(), String> {
+        panic!("preparation panic");
+    })
+    .await;
+
+    let error = flatten_session_preparation(joined).unwrap_err();
+
+    assert!(error.contains("session preparation task failed"));
+    assert!(error.contains("panicked"));
 }

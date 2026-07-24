@@ -87,13 +87,44 @@ fn apply_blocking_proxy_policy(
     builder: reqwest::blocking::ClientBuilder,
 ) -> reqwest::blocking::ClientBuilder {
     atomcode_config::proxy::ensure_runtime_initialized();
-    if std::env::var(atomcode_config::proxy::MODE_ENV).ok().as_deref()
+    if std::env::var(atomcode_config::proxy::MODE_ENV)
+        .ok()
+        .as_deref()
         == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
     {
         builder.no_proxy()
     } else {
         builder
     }
+}
+
+/// The localized network hint for a login HTTP failure, or `None` when the
+/// error is not connection-level. Connect resets (e.g. Windows os error 10054)
+/// and timeouts mean the endpoint was unreachable on THIS client's path while a
+/// browser may still work — usually a proxy/firewall difference.
+fn network_connect_hint(err: &reqwest::Error) -> Option<std::borrow::Cow<'static, str>> {
+    if err.is_connect() || err.is_timeout() {
+        Some(atomcode_config::i18n::t(
+            atomcode_config::i18n::Msg::NetworkConnectHint,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Wrap a login HTTP `send()` result with a failure context, appending the
+/// network hint as INNER context (below `ctx`) when the error is
+/// connect/timeout — so the display leads with `ctx` and supplements with
+/// proxy guidance. Shared by the login GET/exchange calls.
+fn with_login_context<T>(result: reqwest::Result<T>, ctx: &'static str) -> Result<T> {
+    result.map_err(|e| {
+        let hint = network_connect_hint(&e);
+        let mut err = anyhow::Error::new(e);
+        if let Some(h) = hint {
+            err = err.context(h.into_owned());
+        }
+        err.context(ctx)
+    })
 }
 
 fn blocking_client() -> Result<reqwest::blocking::Client> {
@@ -143,6 +174,14 @@ pub struct UserInfo {
     pub name: Option<String>,
     pub email: Option<String>,
     pub avatar_url: Option<String>,
+}
+
+/// Minimal, internally coherent credentials needed to authenticate one gateway request.
+/// The refresh token and profile fields never leave the auth owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidAuthSession {
+    pub access_token: String,
+    pub user_id: String,
 }
 
 // ============================================================================
@@ -356,7 +395,15 @@ pub enum PollOutcome {
 pub struct LoginSession {
     state: String,
     login_url: String,
-    client: reqwest::blocking::Client,
+    client: Option<reqwest::blocking::Client>,
+}
+
+impl Drop for LoginSession {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            let _ = std::thread::spawn(move || drop(client));
+        }
+    }
 }
 
 impl LoginSession {
@@ -377,83 +424,106 @@ impl LoginSession {
     /// `Authorized`. Errors only on transport/parse failures; a
     /// "not yet" answer is `Ok(Pending)`, never `Err`.
     pub fn poll_once(&self) -> Result<PollOutcome> {
-        let resp = self
-            .client
-            .get(platform_check_url())
-            .query(&[("state", &self.state)])
-            .send()
-            .context("Failed to call /auth/check")?;
-        if resp.status().is_success() {
-            if let Ok(check) = resp.json::<PlatformCheckResponse>() {
-                if check.valid {
-                    return Ok(PollOutcome::Authorized);
+        let client = match &self.client {
+            Some(c) => c.clone(),
+            None => return Ok(PollOutcome::Pending),
+        };
+        let state = self.state.clone();
+        std::thread::spawn(move || {
+            let resp = with_login_context(
+                client
+                    .get(platform_check_url())
+                    .query(&[("state", &state)])
+                    .send(),
+                "Failed to call /auth/check",
+            )?;
+            if resp.status().is_success() {
+                if let Ok(check) = resp.json::<PlatformCheckResponse>() {
+                    if check.valid {
+                        return Ok(PollOutcome::Authorized);
+                    }
                 }
             }
-        }
-        Ok(PollOutcome::Pending)
+            Ok(PollOutcome::Pending)
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("poll_once thread panicked"))?
     }
 
     /// Final step: `/auth/token` exchange + `LoginSuccess` telemetry.
     /// Consumes the session — only call after `poll_once` returned
     /// `Authorized`.
-    pub fn finish(self, tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
-        let token_resp: PlatformTokenResponse = self
-            .client
-            .get(platform_token_url())
-            .query(&[("state", &self.state)])
-            .send()
-            .context("Failed to call /auth/token")?
-            .json()
-            .context("Failed to parse /auth/token response")?;
-
-        // `duration_since(UNIX_EPOCH)` only fails when the wall clock
-        // is before 1970 — a misconfigured VM clock at boot is the
-        // realistic trigger. Treat that as `created_at = 0`: the
-        // expiry check downstream will see the token as immediately
-        // stale and force a refresh / re-login rather than panicking
-        // out of the OAuth callback (#45).
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        let auth_info = AuthInfo {
-            access_token: token_resp.access_token,
-            refresh_token: token_resp.refresh_token,
-            token_type: token_resp.token_type,
-            expires_in: token_resp.expires_in,
-            created_at,
-            user: UserInfo {
-                id: token_resp.user.id,
-                username: token_resp.user.username,
-                name: token_resp.user.name,
-                email: token_resp.user.email,
-                avatar_url: token_resp.user.avatar_url,
-            },
-        };
-
-        if let Some(t) = tel {
-            // Push account_id onto the telemetry handle BEFORE emitting
-            // login_success so the event itself — and every subsequent event in
-            // this process — carries the id. The handle-level setter outlives
-            // any task-local scope, so events emitted outside the main scope
-            // (e.g. before scope is entered, or from spawned tasks) inherit it.
-            t.set_account_id(Some(auth_info.user.id.to_string()));
-            let (invite_code, install_uuid) = pending_invite_for_login();
-            let event = Event::LoginSuccess {
-                invite_code,
-                install_uuid,
+    pub fn finish(mut self, tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
+        let client = self.client.take();
+        let state = self.state.clone();
+        let tel = tel.cloned();
+        std::thread::spawn(move || {
+            let client = match client {
+                Some(c) => c,
+                None => blocking_client()?,
             };
-            if let Err(e) = t.track_durable_sync(event.clone()) {
-                tracing::warn!(
-                    ?e,
-                    "login_success durable enqueue failed; falling back to async telemetry"
-                );
-                t.track(event);
-            }
-        }
+            let resp = with_login_context(
+                client
+                    .get(platform_token_url())
+                    .query(&[("state", &state)])
+                    .send(),
+                "Failed to call /auth/token",
+            )?;
+            let token_resp: PlatformTokenResponse = resp
+                .json()
+                .context("Failed to parse /auth/token response")?;
 
-        Ok(auth_info)
+            // `duration_since(UNIX_EPOCH)` only fails when the wall clock
+            // is before 1970 — a misconfigured VM clock at boot is the
+            // realistic trigger. Treat that as `created_at = 0`: the
+            // expiry check downstream will see the token as immediately
+            // stale and force a refresh / re-login rather than panicking
+            // out of the OAuth callback (#45).
+            let created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            let auth_info = AuthInfo {
+                access_token: token_resp.access_token,
+                refresh_token: token_resp.refresh_token,
+                token_type: token_resp.token_type,
+                expires_in: token_resp.expires_in,
+                created_at,
+                user: UserInfo {
+                    id: token_resp.user.id,
+                    username: token_resp.user.username,
+                    name: token_resp.user.name,
+                    email: token_resp.user.email,
+                    avatar_url: token_resp.user.avatar_url,
+                },
+            };
+
+            if let Some(t) = tel.as_ref() {
+                // Push account_id onto the telemetry handle BEFORE emitting
+                // login_success so the event itself — and every subsequent event in
+                // this process — carries the id. The handle-level setter outlives
+                // any task-local scope, so events emitted outside the main scope
+                // (e.g. before scope is entered, or from spawned tasks) inherit it.
+                t.set_account_id(Some(auth_info.user.id.to_string()));
+                let (invite_code, install_uuid) = pending_invite_for_login();
+                let event = Event::LoginSuccess {
+                    invite_code,
+                    install_uuid,
+                };
+                if let Err(e) = t.track_durable_sync(event.clone()) {
+                    tracing::warn!(
+                        ?e,
+                        "login_success durable enqueue failed; falling back to async telemetry"
+                    );
+                    t.track(event);
+                }
+            }
+
+            Ok(auth_info)
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("finish thread panicked"))?
     }
 }
 
@@ -462,22 +532,27 @@ impl LoginSession {
 /// user action — separated from polling so callers can render the URL
 /// before yielding control to the wait loop.
 pub fn start_login() -> Result<LoginSession> {
-    // `Client::new()` panics on TLS/resolver init failure; with `panic =
-    // "abort"` that aborts the process before the QR can even render.
-    // Build fallibly and surface a recoverable error instead.
-    let client = blocking_client()?;
-    let resp: PlatformLoginResponse = client
-        .get(platform_login_url())
-        .query(&[("provider", "atomgit")])
-        .send()
-        .context("Failed to call /auth/login")?
-        .json()
-        .context("Failed to parse /auth/login response")?;
-    Ok(LoginSession {
-        state: resp.state,
-        login_url: strip_force_login(&resp.login_url),
-        client,
+    std::thread::spawn(move || {
+        // `Client::new()` panics on TLS/resolver init failure; with `panic =
+        // "abort"` that aborts the process before the QR can even render.
+        // Build fallibly and surface a recoverable error instead.
+        let client = blocking_client()?;
+        let sent = client
+            .get(platform_login_url())
+            .query(&[("provider", "atomgit")])
+            .send();
+        let resp = with_login_context(sent, "Failed to call /auth/login")?;
+        let resp: PlatformLoginResponse = resp
+            .json()
+            .context("Failed to parse /auth/login response")?;
+        Ok(LoginSession {
+            state: resp.state,
+            login_url: strip_force_login(&resp.login_url),
+            client: Some(client),
+        })
     })
+    .join()
+    .map_err(|_| anyhow::anyhow!("start_login thread panicked"))?
 }
 
 /// Drop `force_login=true` from the broker-supplied OAuth URL. The
@@ -638,7 +713,11 @@ pub fn open_browser(url: &str) -> Result<()> {
     }
 
     // ShellExecute failed (rare). Fall back to the legacy launchers.
-    if std::process::Command::new("explorer").arg(url).spawn().is_ok() {
+    if std::process::Command::new("explorer")
+        .arg(url)
+        .spawn()
+        .is_ok()
+    {
         return Ok(());
     }
     std::process::Command::new("cmd")
@@ -957,78 +1036,82 @@ fn urlencoding_decode(s: &str) -> String {
 /// Refresh the access token using the stored refresh_token via Platform Broker.
 /// Returns updated AuthInfo with new tokens, and saves it to disk.
 pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
-    let refresh_token = auth
-        .refresh_token
-        .as_deref()
-        .context("No refresh_token available — please /login again")?;
-
-    let client = blocking_client()?;
-
-    // Call Platform Broker API for refresh
-    let response = client
-        .post(platform_refresh_url())
-        .json(&serde_json::json!({ "refresh_token": refresh_token }))
-        .send()
-        .context("Failed to send refresh token request to broker")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        anyhow::bail!(
-            "Token refresh failed ({}): {} — please /login again",
-            status,
-            body
-        );
-    }
-
-    #[derive(Deserialize)]
-    struct BrokerResponse {
-        access_token: String,
-        token_type: Option<String>,
-        expires_in: Option<i64>,
-        refresh_token: Option<String>,
-        user: Option<PlatformUserInfo>,
-    }
-
-    let broker_resp: BrokerResponse = response.json().context("Failed to parse broker response")?;
-
-    // Pre-1970 wall clock would otherwise panic on `unwrap` and lose
-    // the refresh result. Falling back to 0 forces the next token
-    // check to refresh again — safer than crashing the broker path.
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    let new_auth = AuthInfo {
-        access_token: broker_resp.access_token,
-        refresh_token: broker_resp
+    let auth = auth.clone();
+    std::thread::spawn(move || {
+        let refresh_token = auth
             .refresh_token
-            .or_else(|| auth.refresh_token.clone()),
-        token_type: broker_resp
-            .token_type
-            .unwrap_or_else(|| auth.token_type.clone()),
-        expires_in: broker_resp.expires_in.or(auth.expires_in),
-        created_at,
-        user: broker_resp
-            .user
-            .map(|u| UserInfo {
-                id: u.id,
-                username: u.username,
-                name: u.name,
-                email: u.email,
-                avatar_url: u.avatar_url,
-            })
-            .unwrap_or_else(|| auth.user.clone()),
-    };
+            .as_deref()
+            .context("No refresh_token available — please /login again")?;
 
-    save_auth(&new_auth)?;
-    Ok(new_auth)
+        let client = blocking_client()?;
+
+        // Call Platform Broker API for refresh
+        let response = client
+            .post(platform_refresh_url())
+            .json(&serde_json::json!({ "refresh_token": refresh_token }))
+            .send()
+            .context("Failed to send refresh token request to broker")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            anyhow::bail!(
+                "Token refresh failed ({}): {} — please /login again",
+                status,
+                body
+            );
+        }
+
+        #[derive(Deserialize)]
+        struct BrokerResponse {
+            access_token: String,
+            token_type: Option<String>,
+            expires_in: Option<i64>,
+            refresh_token: Option<String>,
+            user: Option<PlatformUserInfo>,
+        }
+
+        let broker_resp: BrokerResponse =
+            response.json().context("Failed to parse broker response")?;
+
+        // Pre-1970 wall clock would otherwise panic on `unwrap` and lose
+        // the refresh result. Falling back to 0 forces the next token
+        // check to refresh again — safer than crashing the broker path.
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let new_auth = AuthInfo {
+            access_token: broker_resp.access_token,
+            refresh_token: broker_resp
+                .refresh_token
+                .or_else(|| auth.refresh_token.clone()),
+            token_type: broker_resp
+                .token_type
+                .unwrap_or_else(|| auth.token_type.clone()),
+            expires_in: broker_resp.expires_in.or(auth.expires_in),
+            created_at,
+            user: broker_resp
+                .user
+                .map(|u| UserInfo {
+                    id: u.id,
+                    username: u.username,
+                    name: u.name,
+                    email: u.email,
+                    avatar_url: u.avatar_url,
+                })
+                .unwrap_or_else(|| auth.user.clone()),
+        };
+
+        save_auth(&new_auth)?;
+        Ok(new_auth)
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("refresh_access_token thread panicked"))?
 }
 
-/// Get a valid access token, refreshing automatically if expired.
-/// Returns the access token string ready to use.
-pub fn get_valid_token() -> Result<String> {
+fn get_valid_auth_info() -> Result<AuthInfo> {
     let auth = get_stored_auth().context("Not logged in — please use /login first")?;
 
     // Check if token is expired (with 5-minute safety margin)
@@ -1046,7 +1129,7 @@ pub fn get_valid_token() -> Result<String> {
         if now >= expires_at - 300 {
             // Token expired or about to expire — try refresh
             match refresh_access_token(&auth) {
-                Ok(new_auth) => return Ok(new_auth.access_token),
+                Ok(new_auth) => return Ok(new_auth),
                 Err(e) => anyhow::bail!("Token expired and refresh failed: {}", e),
             }
         }
@@ -1055,11 +1138,35 @@ pub fn get_valid_token() -> Result<String> {
         // try refresh if refresh_token is available, otherwise use as-is
         if auth.refresh_token.is_some() {
             if let Ok(new_auth) = refresh_access_token(&auth) {
-                return Ok(new_auth.access_token);
+                return Ok(new_auth);
             }
         }
     }
 
+    Ok(auth)
+}
+
+/// Get a valid token and its matching user identity from one auth snapshot.
+/// Refresh, when needed, happens before either value is projected so callers cannot
+/// accidentally combine a new token with a stale user id.
+pub fn get_valid_auth_session() -> Result<ValidAuthSession> {
+    let auth = get_valid_auth_info()?;
+    if auth.access_token.trim().is_empty() || auth.user.id.trim().is_empty() {
+        anyhow::bail!("Invalid auth.toml — please use /login first");
+    }
+    Ok(ValidAuthSession {
+        access_token: auth.access_token,
+        user_id: auth.user.id,
+    })
+}
+
+/// Get a valid access token, refreshing automatically if expired.
+/// Returns the access token string ready to use.
+pub fn get_valid_token() -> Result<String> {
+    let auth = get_valid_auth_info()?;
+    if auth.access_token.trim().is_empty() {
+        anyhow::bail!("Invalid auth.toml — please use /login first");
+    }
     Ok(auth.access_token)
 }
 
@@ -1406,6 +1513,58 @@ mod tests {
         assert_eq!(
             sanitize_base_url("127.0.0.1:8765/"),
             "http://127.0.0.1:8765"
+        );
+    }
+
+    #[test]
+    fn connect_error_yields_hint_timeout_does_too() {
+        // A builder timeout produces a timeout-class reqwest error.
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(1))
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap();
+        // 203.0.113.0/24 is TEST-NET-3 (RFC 5737) — guaranteed unroutable, so this
+        // fails at connect/timeout without depending on any real host.
+        let err = client
+            .get("http://203.0.113.1:81/")
+            .send()
+            .expect_err("must fail");
+        assert!(
+            super::network_connect_hint(&err).is_some(),
+            "connect/timeout error must yield a hint, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn non_network_error_yields_no_hint() {
+        // A decode error is neither connect nor timeout → no hint.
+        // Build any reqwest::Error that is not connect/timeout by parsing a bad URL.
+        let err = reqwest::blocking::Client::new()
+            .get("http://")
+            .build()
+            .expect_err("bad url builds an error");
+        assert!(super::network_connect_hint(&err).is_none(), "got: {err:?}");
+    }
+
+    #[test]
+    fn with_login_context_leads_with_ctx_and_adds_hint_on_connect_error() {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(1))
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap();
+        // TEST-NET-3 (RFC 5737) — unroutable, fails at connect/timeout.
+        let res = client.get("http://203.0.113.1:81/").send();
+        let err = super::with_login_context(res, "Failed to call /auth/test").unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.starts_with("Failed to call /auth/test"),
+            "ctx must lead: {chain}"
+        );
+        assert!(
+            chain.contains("/proxy") || chain.contains("HTTPS_PROXY"),
+            "hint present: {chain}"
         );
     }
 }

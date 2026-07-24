@@ -17,7 +17,9 @@ mod tel;
 use anyhow::{bail, Context, Result};
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
-use atomcode_review::{build_review_agent_with_cancel, shared_review_deadline, Finding, ReviewAgentConfig};
+use atomcode_review::{
+    build_review_agent_with_cancel, shared_review_deadline, Finding, ReviewAgentConfig,
+};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -169,14 +171,26 @@ async fn review(args: ReviewArgs) -> Result<()> {
         ("--diff-file", args.diff_file.as_deref()),
         ("--task-file", args.task_file.as_deref()),
         ("--system-prompt-file", args.system_prompt_file.as_deref()),
-        ("--append-system-prompt-file", args.append_system_prompt_file.as_deref()),
+        (
+            "--append-system-prompt-file",
+            args.append_system_prompt_file.as_deref(),
+        ),
     ];
-    let on_stdin: Vec<&str> =
-        stdin_users.iter().filter(|(_, v)| *v == Some("-")).map(|(n, _)| *n).collect();
+    let on_stdin: Vec<&str> = stdin_users
+        .iter()
+        .filter(|(_, v)| *v == Some("-"))
+        .map(|(n, _)| *n)
+        .collect();
     if on_stdin.len() > 1 {
-        bail!("{} all read stdin; give all but one of them a file path", on_stdin.join(" and "));
+        bail!(
+            "{} all read stdin; give all but one of them a file path",
+            on_stdin.join(" and ")
+        );
     }
-    let repo = args.repo.canonicalize().with_context(|| format!("repo not found: {}", args.repo.display()))?;
+    let repo = args
+        .repo
+        .canonicalize()
+        .with_context(|| format!("repo not found: {}", args.repo.display()))?;
 
     // Two modes: a CUSTOM task (chat/explain/summary — no diff) or the built-in diff review.
     let custom_task = resolve_task(args.task.clone(), args.task_file.clone())?;
@@ -212,11 +226,18 @@ async fn review(args: ReviewArgs) -> Result<()> {
             changed_files = atomcode_review::changed_files_from_diff(&diff);
             // Language rules matched against the changed files.
             if !args.no_rules {
-                let section = atomcode_review::render_rules_section(&changed_files, args.rules_dir.as_deref());
+                let section = atomcode_review::render_rules_section(
+                    &changed_files,
+                    args.rules_dir.as_deref(),
+                );
                 if !section.is_empty() {
                     // Observability: confirm on stderr that rules actually got injected
                     // (the composed system prompt is not otherwise visible to callers).
-                    eprintln!("[rules] injected for {} changed file(s) ({} chars)", changed_files.len(), section.len());
+                    eprintln!(
+                        "[rules] injected for {} changed file(s) ({} chars)",
+                        changed_files.len(),
+                        section.len()
+                    );
                     rules_section = Some(section);
                 } else {
                     eprintln!("[rules] no language rules matched the changed files");
@@ -229,8 +250,11 @@ async fn review(args: ReviewArgs) -> Result<()> {
             let file_checklist = if changed_files.is_empty() {
                 String::new()
             } else {
-                let list =
-                    changed_files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
+                let list = changed_files
+                    .iter()
+                    .map(|f| format!("- {f}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 format!(
                     "\n\nYou MUST review EVERY one of the {} changed file(s) listed below, one \
                      at a time — investigate each file's changes and surrounding code before \
@@ -272,7 +296,9 @@ async fn review(args: ReviewArgs) -> Result<()> {
         env("ATOMCODE_MODEL"),
         entry.and_then(|e| e.model.clone()).map(|v| expand_env(&v)),
     ])
-    .context("missing model: pass --model, set $ATOMCODE_MODEL, or add model to the config provider")?;
+    .context(
+        "missing model: pass --model, set $ATOMCODE_MODEL, or add model to the config provider",
+    )?;
     // The AtomGit/gitcode gateways require AtomCode's proprietary request signing (a
     // closed-source overlay in the official binary). atomcodex uses the neutral provider
     // and cannot sign — fail fast with an actionable message instead of a confusing 401.
@@ -289,10 +315,13 @@ async fn review(args: ReviewArgs) -> Result<()> {
     let api_key = first_nonempty([
         args.api_key,
         env("ATOMCODE_API_KEY"),
-        entry.and_then(|e| e.api_key.clone()).map(|k| expand_env(&k)),
+        entry
+            .and_then(|e| e.api_key.clone())
+            .map(|k| expand_env(&k)),
     ])
     .unwrap_or_default();
-    let context_window = resolve_context_window(args.context_window, entry.and_then(|e| e.context_window));
+    let context_window =
+        resolve_context_window(args.context_window, entry.and_then(|e| e.context_window));
 
     let mut cfg = ReviewAgentConfig::new(api_key, base_url, model, &repo);
     cfg.context_window = context_window;
@@ -305,11 +334,14 @@ async fn review(args: ReviewArgs) -> Result<()> {
         cfg.graph_max_indexed_files = n as usize;
     }
     // Full system-prompt override (flag text > file/stdin). None ⇒ built-in reviewer persona.
-    cfg.persona = resolve_system_prompt(args.system_prompt.clone(), args.system_prompt_file.clone())?;
+    cfg.persona =
+        resolve_system_prompt(args.system_prompt.clone(), args.system_prompt_file.clone())?;
     // Appended sections compose after the persona: engine-injected language rules first,
     // then the caller's append (later text wins when guidance overlaps).
-    let user_append =
-        resolve_system_prompt(args.append_system_prompt.clone(), args.append_system_prompt_file.clone())?;
+    let user_append = resolve_system_prompt(
+        args.append_system_prompt.clone(),
+        args.append_system_prompt_file.clone(),
+    )?;
     cfg.persona_append = match (rules_section, user_append) {
         (Some(r), Some(u)) => Some(format!("{r}\n\n{u}")),
         (Some(r), None) => Some(r),
@@ -333,7 +365,8 @@ async fn review(args: ReviewArgs) -> Result<()> {
     // first pass already spent (observed: 200s first pass + 240s re-review = 440s on
     // a `--max-duration 240` run, blowing the caller's budget and CI timeouts).
     let review_deadline = shared_review_deadline(cfg.max_turn_duration);
-    let (agent, report) = build_review_agent_with_cancel(&cfg, provider.clone(), review_deadline.clone());
+    let (agent, report) =
+        build_review_agent_with_cancel(&cfg, provider.clone(), review_deadline.clone());
 
     // Live trace on stderr (stdout stays clean for findings / --json). The run is one LLM
     // turn loop — without this the terminal looks frozen while the model thinks + calls tools.
@@ -342,13 +375,27 @@ async fn review(args: ReviewArgs) -> Result<()> {
 
     // Trace summary: tool-usage profile + token spend — exactly what you need to optimize.
     if run.tool_calls > 0 {
-        let profile: Vec<String> = run.tool_counts.iter().map(|(n, c)| format!("{n}×{c}")).collect();
-        eprintln!("— trace — {} tool call(s): {}", run.tool_calls, profile.join(", "));
+        let profile: Vec<String> = run
+            .tool_counts
+            .iter()
+            .map(|(n, c)| format!("{n}×{c}"))
+            .collect();
+        eprintln!(
+            "— trace — {} tool call(s): {}",
+            run.tool_calls,
+            profile.join(", ")
+        );
     }
     if let Some(u) = run.usage {
-        eprintln!("— tokens — prompt {} / completion {} / cached {}", u.prompt, u.completion, u.cached);
+        eprintln!(
+            "— tokens — prompt {} / completion {} / cached {}",
+            u.prompt, u.completion, u.cached
+        );
     }
 
+    let mut incomplete_reasons: Vec<String> = review_incomplete_reason("initial pass", &run)
+        .into_iter()
+        .collect();
     let mut findings = report.findings();
     // Drop findings anchored to files OUTSIDE the diff's changed set — the reviewer is
     // scoped to diff-introduced problems, but the model occasionally reads an un-changed
@@ -357,7 +404,10 @@ async fn review(args: ReviewArgs) -> Result<()> {
     // (empty ⇒ we can't trust it, so we don't filter).
     let dropped = drop_out_of_scope(&mut findings, &changed_files);
     if dropped > 0 {
-        eprintln!("[scope] dropped {dropped} finding(s) anchored outside the {} changed file(s)", changed_files.len());
+        eprintln!(
+            "[scope] dropped {dropped} finding(s) anchored outside the {} changed file(s)",
+            changed_files.len()
+        );
     }
 
     // Coverage backstop: on a wide diff the model sometimes declares "done" having reported on
@@ -369,18 +419,34 @@ async fn review(args: ReviewArgs) -> Result<()> {
         let uncovered = uncovered_files(&changed_files, &findings);
         let sub = sub_diff_for_files(&annotated_diff, &uncovered);
         if !sub.trim().is_empty() {
-            eprintln!("[coverage] {} changed file(s) had no findings; re-reviewing: {}", uncovered.len(), uncovered.join(", "));
+            eprintln!(
+                "[coverage] {} changed file(s) had no findings; re-reviewing: {}",
+                uncovered.len(),
+                uncovered.join(", ")
+            );
             let scoped_task = format!(
                 "A prior review pass did NOT report on the changed file(s) below. Review EACH \
                  one thoroughly and report every real issue via `report_finding`; if a file is \
                  genuinely clean, that is fine. Each hunk line is prefixed with its real file \
                  line number (`N: `) — use these for `line_start`/`line_end`.\n\n```diff\n{sub}\n```"
             );
-            let (agent2, report2) = build_review_agent_with_cancel(&cfg, provider.clone(), review_deadline.clone());
+            let (agent2, report2) =
+                build_review_agent_with_cancel(&cfg, provider.clone(), review_deadline.clone());
             let run2 = run_review_streaming(agent2, scoped_task).await;
             if run2.tool_calls > 0 {
-                let profile: Vec<String> = run2.tool_counts.iter().map(|(n, c)| format!("{n}×{c}")).collect();
-                eprintln!("— coverage trace — {} tool call(s): {}", run2.tool_calls, profile.join(", "));
+                let profile: Vec<String> = run2
+                    .tool_counts
+                    .iter()
+                    .map(|(n, c)| format!("{n}×{c}"))
+                    .collect();
+                eprintln!(
+                    "— coverage trace — {} tool call(s): {}",
+                    run2.tool_calls,
+                    profile.join(", ")
+                );
+            }
+            if let Some(reason) = review_incomplete_reason("coverage pass", &run2) {
+                incomplete_reasons.push(reason);
             }
             let mut extra = report2.findings();
             drop_out_of_scope(&mut extra, &changed_files);
@@ -398,8 +464,9 @@ async fn review(args: ReviewArgs) -> Result<()> {
         println!("{}", render_json(&findings, &run.text, run.usage)?);
     } else if !findings.is_empty() {
         print!("{}", render_findings(&findings));
-    } else if run.error.is_some() {
-        // Don't claim "clean" — the run didn't finish, so we can't conclude there are no issues.
+    } else if !incomplete_reasons.is_empty() {
+        // Don't claim "clean" — at least one pass did not finish, so zero collected
+        // findings is not evidence that the whole diff is clean.
         println!("Review did not complete — no findings were collected.");
     } else {
         println!("No findings — the diff looks clean.");
@@ -412,18 +479,17 @@ async fn review(args: ReviewArgs) -> Result<()> {
     // delivered — a stall AFTER findings were collected still produced the review, so warn
     // but succeed; a failure with no findings (auth/connect/immediate stall) is a real
     // failure CI must detect.
-    // Cut-short detection: an error OR a non-`Stopped` terminal (Cancelled via max-duration,
-    // Timeout, MaxRounds) means the run didn't finish on the model's own terms. If nothing was
-    // delivered, that's a real failure CI/callers must see — NEVER a clean "no issues" run
-    // (the max-duration cancel path emits Cancelled WITHOUT an error, so checking error alone
-    // would silently pass a cut-short review as clean). With findings already collected the
-    // review still produced value: warn but succeed.
-    if review_incomplete(run.stop, run.error.is_some()) {
-        let why = run.error.clone().unwrap_or_else(|| format!("{:?}", run.stop));
+    // Cut-short detection covers BOTH the initial and coverage passes. Otherwise a
+    // clean first pass followed by a failed re-review could be reported as clean.
+    if !incomplete_reasons.is_empty() {
+        let why = incomplete_reasons.join("; ");
         if findings.is_empty() {
             bail!("review did not complete ({why}): no findings collected");
         }
-        eprintln!("warning: review ended early ({why}); {} finding(s) collected before it stopped", findings.len());
+        eprintln!(
+            "warning: review ended early ({why}); {} finding(s) collected before it stopped",
+            findings.len()
+        );
     }
     Ok(())
 }
@@ -455,11 +521,25 @@ struct ReviewRun {
     tool_calls: usize,
 }
 
+fn review_incomplete_reason(label: &str, run: &ReviewRun) -> Option<String> {
+    review_incomplete(run.stop, run.error.is_some()).then(|| {
+        let reason = run
+            .error
+            .clone()
+            .unwrap_or_else(|| format!("{:?}", run.stop));
+        format!("{label}: {reason}")
+    })
+}
+
 impl ReviewRun {
     /// Fold ONE agent event into the run, mutating accumulators in place.
     /// Returns `false` once the turn is terminal (the caller then stops reading).
     /// `call_names` maps tool-call id → name for the live stderr trace.
-    fn apply(&mut self, ev: AgentEvent, call_names: &mut std::collections::HashMap<String, String>) -> bool {
+    fn apply(
+        &mut self,
+        ev: AgentEvent,
+        call_names: &mut std::collections::HashMap<String, String>,
+    ) -> bool {
         match ev {
             AgentEvent::ToolStarted { call } => {
                 self.tool_calls += 1;
@@ -471,12 +551,22 @@ impl ReviewRun {
                 // closing summary (persona §XI). Without this, every turn's narration
                 // leaked into `text` and onto the PR comment.
                 self.text.clear();
-                eprintln!("  → {} {}", call.name, tool_hint(&call.name, &call.arguments));
+                eprintln!(
+                    "  → {} {}",
+                    call.name,
+                    tool_hint(&call.name, &call.arguments)
+                );
             }
             AgentEvent::ToolResult { result } => {
-                let name = call_names.get(&result.call_id).map(String::as_str).unwrap_or("tool");
+                let name = call_names
+                    .get(&result.call_id)
+                    .map(String::as_str)
+                    .unwrap_or("tool");
                 let mark = if result.is_error { "✗" } else { "✓" };
-                eprintln!("    {mark} {name} ({} chars)", result.content.chars().count());
+                eprintln!(
+                    "    {mark} {name} ({} chars)",
+                    result.content.chars().count()
+                );
             }
             AgentEvent::TextDelta(t) => self.text.push_str(&t),
             // Each turn emits ONE per-turn usage figure; SUM across turns for the run total.
@@ -493,10 +583,10 @@ impl ReviewRun {
                 self.error = Some(message);
             }
             AgentEvent::Warning(w) => eprintln!("    [warn] {w}"),
-AgentEvent::TurnComplete { reason } => {
-    self.stop = reason;
-    return false;
-}
+            AgentEvent::TurnComplete { reason } => {
+                self.stop = reason;
+                return false;
+            }
             _ => {}
         }
         true
@@ -508,10 +598,14 @@ AgentEvent::TurnComplete { reason } => {
 /// tool-usage + token profile. Returns the accumulated summary text + stats.
 async fn run_review_streaming(agent: Agent, task: String) -> ReviewRun {
     let mut handle = agent.spawn();
-    let _ = handle.commands.send(AgentCommand::SendMessage { text: task, images: vec![] });
+    let _ = handle.commands.send(AgentCommand::SendMessage {
+        text: task,
+        images: vec![],
+    });
 
     let mut run = ReviewRun::default();
-    let mut call_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut call_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     while let Some(ev) = handle.events.recv().await {
         if !run.apply(ev, &mut call_names) {
@@ -567,12 +661,7 @@ pub(crate) fn env(name: &str) -> Option<String> {
 /// True if `base_url`'s host is an AtomGit/gitcode signing-enforced LLM gateway — those
 /// require AtomCode's proprietary request signing, which this neutral CLI cannot produce.
 pub(crate) fn is_signing_gateway(base_url: &str) -> bool {
-    const HOSTS: &[&str] =
-        &["llm-api.atomgit.com", "api-ai.gitcode.com", "pre-llm-api-cce.atomgit.com"];
-    // Match on host, not a bare substring, so a lookalike path can't trip it.
-    let after_scheme = base_url.split("://").nth(1).unwrap_or(base_url);
-    let host = after_scheme.split(['/', ':']).next().unwrap_or("");
-    HOSTS.contains(&host)
+    atomcode_capabilities::provider::is_atomgit_gateway(base_url)
 }
 
 /// Expand a WHOLE-VALUE env reference, consistent with the rest of the ecosystem:
@@ -612,9 +701,17 @@ pub(crate) struct ProviderEntry {
 #[derive(Deserialize, Default)]
 struct FileConfig {
     #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
     default_provider: Option<String>,
     #[serde(default)]
     providers: HashMap<String, ProviderEntry>,
+}
+
+#[derive(Default)]
+pub(crate) struct ConfigSelection {
+    pub(crate) provider: Option<ProviderEntry>,
+    pub(crate) language: Option<atomcode_config::locale::Locale>,
 }
 
 /// Parse a config.toml string into the subset we need (ignoring unrelated keys).
@@ -626,6 +723,16 @@ fn parse_file_config(toml_str: &str) -> Result<FileConfig> {
 fn pick_provider(fc: &FileConfig, override_name: Option<&str>) -> Option<ProviderEntry> {
     let name = override_name.or(fc.default_provider.as_deref())?;
     fc.providers.get(name).cloned()
+}
+
+fn select_config(fc: &FileConfig, provider: Option<&str>) -> ConfigSelection {
+    ConfigSelection {
+        provider: pick_provider(fc, provider),
+        language: fc
+            .language
+            .as_deref()
+            .and_then(|language| language.parse().ok()),
+    }
 }
 
 /// `~/.atomcode/config.toml` (honors $ATOMCODE_HOME, else $HOME / %USERPROFILE%).
@@ -643,30 +750,41 @@ fn resolve_context_window(flag: Option<u32>, entry: Option<u32>) -> u32 {
     flag.or(entry).unwrap_or(128_000)
 }
 
-/// Load the selected provider entry from the config file.
-/// - default path absent → `Ok(None)` (flags/env can still supply everything);
+/// Load the top-level language and selected provider from the config file.
+/// - default path absent → an empty selection (flags/env can still supply everything);
 /// - explicit `--config` path unreadable → `Err` (the user pointed at it);
 /// - file present but MALFORMED → `Err` (don't silently fall through to a confusing
 ///   "missing base URL" later);
-/// - file parses but has no matching provider → `Ok(None)`.
-pub(crate) fn load_provider_entry(
+/// - file parses but has no matching provider → preserve the language with no provider.
+pub(crate) fn load_config_selection(
     config_override: Option<&Path>,
     provider: Option<&str>,
-) -> Result<Option<ProviderEntry>> {
+) -> Result<ConfigSelection> {
     let (path, explicit) = match config_override {
         Some(p) => (p.to_path_buf(), true),
         None => match default_config_path() {
             Some(p) => (p, false),
-            None => return Ok(None),
+            None => return Ok(ConfigSelection::default()),
         },
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) if explicit => return Err(anyhow::Error::new(e)).with_context(|| format!("cannot read config file: {}", path.display())),
-        Err(_) => return Ok(None), // default path simply absent — fine
+        Err(e) if explicit => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("cannot read config file: {}", path.display()))
+        }
+        Err(_) => return Ok(ConfigSelection::default()), // default path simply absent — fine
     };
-    let fc = parse_file_config(&text).with_context(|| format!("malformed config file: {}", path.display()))?;
-    Ok(pick_provider(&fc, provider))
+    let fc = parse_file_config(&text)
+        .with_context(|| format!("malformed config file: {}", path.display()))?;
+    Ok(select_config(&fc, provider))
+}
+
+pub(crate) fn load_provider_entry(
+    config_override: Option<&Path>,
+    provider: Option<&str>,
+) -> Result<Option<ProviderEntry>> {
+    Ok(load_config_selection(config_override, provider)?.provider)
 }
 
 /// Resolve the diff to review from the chosen source. Precedence: `--diff-file` (any
@@ -691,7 +809,9 @@ fn resolve_task(text: Option<String>, file: Option<String>) -> Result<Option<Str
         let content = if f == "-" {
             use std::io::Read;
             let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf).context("failed to read task from stdin")?;
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("failed to read task from stdin")?;
             buf
         } else {
             std::fs::read_to_string(&f).with_context(|| format!("failed to read task file: {f}"))?
@@ -714,10 +834,13 @@ fn resolve_system_prompt(text: Option<String>, file: Option<String>) -> Result<O
         let content = if f == "-" {
             use std::io::Read;
             let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf).context("failed to read system prompt from stdin")?;
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("failed to read system prompt from stdin")?;
             buf
         } else {
-            std::fs::read_to_string(&f).with_context(|| format!("failed to read system prompt file: {f}"))?
+            std::fs::read_to_string(&f)
+                .with_context(|| format!("failed to read system prompt file: {f}"))?
         };
         return Ok(Some(content));
     }
@@ -729,7 +852,9 @@ fn read_diff_file(path: &str) -> Result<String> {
     if path == "-" {
         use std::io::Read;
         let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf).context("failed to read diff from stdin")?;
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("failed to read diff from stdin")?;
         Ok(buf)
     } else {
         std::fs::read_to_string(path).with_context(|| format!("failed to read diff file: {path}"))
@@ -783,7 +908,11 @@ fn sort_findings(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         priority_ord(&a.priority)
             .cmp(&priority_ord(&b.priority))
-            .then(b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
+            .then(
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
 }
 
@@ -823,7 +952,10 @@ fn render_findings(findings: &[Finding]) -> String {
         } else {
             format!("{}:{}-{}", f.file_path, f.line_start, f.line_end)
         };
-        out.push_str(&format!("[{} {:.2}] {}  {}\n", f.priority, f.confidence, loc, f.title));
+        out.push_str(&format!(
+            "[{} {:.2}] {}  {}\n",
+            f.priority, f.confidence, loc, f.title
+        ));
         for line in f.body.lines() {
             out.push_str(&format!("    {line}\n"));
         }
@@ -882,10 +1014,8 @@ fn merge_findings(findings: &mut Vec<Finding>, extra: Vec<Finding>) -> usize {
 /// [`changed_files_from_diff`](atomcode_review::changed_files_from_diff), i.e. `b/`-stripped).
 /// Preserves each kept section verbatim so the scoped re-review sees real hunks + line context.
 fn sub_diff_for_files(full_diff: &str, files: &[String]) -> String {
-    let wanted = |path: &Option<String>| {
-        path.as_ref()
-            .is_some_and(|p| files.iter().any(|f| f == p))
-    };
+    let wanted =
+        |path: &Option<String>| path.as_ref().is_some_and(|p| files.iter().any(|f| f == p));
     let mut out = String::new();
     let mut section = String::new();
     let mut section_path: Option<String> = None;
@@ -926,7 +1056,11 @@ fn render_json(
     text: &str,
     usage: Option<atomcode_kernel::stream::TokenUsage>,
 ) -> serde_json::Result<String> {
-    serde_json::to_string_pretty(&ReviewJson { findings, text: text.trim(), usage })
+    serde_json::to_string_pretty(&ReviewJson {
+        findings,
+        text: text.trim(),
+        usage,
+    })
 }
 
 #[cfg(test)]
@@ -948,10 +1082,36 @@ mod tests {
     }
 
     #[test]
+    fn coverage_pass_terminal_is_reported_with_its_own_reason() {
+        let run = ReviewRun {
+            stop: StopReason::ToolLoopDetected,
+            ..ReviewRun::default()
+        };
+        assert_eq!(
+            review_incomplete_reason("coverage pass", &run).as_deref(),
+            Some("coverage pass: ToolLoopDetected")
+        );
+
+        let run = ReviewRun {
+            stop: StopReason::Stopped,
+            error: Some("stream closed without terminal".into()),
+            ..ReviewRun::default()
+        };
+        assert_eq!(
+            review_incomplete_reason("coverage pass", &run).as_deref(),
+            Some("coverage pass: stream closed without terminal")
+        );
+    }
+
+    #[test]
     fn closing_summary_survives_pre_call_narration_dropped() {
         use atomcode_kernel::tool::ToolCall;
         let tool = |id: &str, name: &str| AgentEvent::ToolStarted {
-            call: ToolCall { id: id.into(), name: name.into(), arguments: "{}".into() },
+            call: ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: "{}".into(),
+            },
         };
         // 模型每轮调工具前都会叙述（"let me read X…"），那是过程噪声，不该进 text；
         // 只有最后一次工具调用之后输出的 Closing Summary（persona §XI）才该保留。
@@ -961,7 +1121,9 @@ mod tests {
             AgentEvent::TextDelta("Now let me check validation.go…".into()),
             tool("c2", "report_finding"),
             AgentEvent::TextDelta("## 审查总结\nP0: 1, P1: 2\n整体风险：HIGH".into()),
-            AgentEvent::TurnComplete { reason: StopReason::Stopped },
+            AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            },
         ];
         let mut run = ReviewRun::default();
         let mut names = std::collections::HashMap::new();
@@ -998,7 +1160,11 @@ mod tests {
     #[test]
     fn scope_drops_findings_outside_changed_set() {
         let changed = vec!["a.go".to_string(), "pkg/b.go".to_string()];
-        let mut fs = vec![finding_in("a.go"), finding_in("pkg/b.go"), finding_in("untouched.go")];
+        let mut fs = vec![
+            finding_in("a.go"),
+            finding_in("pkg/b.go"),
+            finding_in("untouched.go"),
+        ];
         let dropped = drop_out_of_scope(&mut fs, &changed);
         assert_eq!(dropped, 1, "the out-of-diff finding is dropped");
         assert!(fs.iter().all(|f| f.file_path != "untouched.go"));
@@ -1010,7 +1176,11 @@ mod tests {
         // Unknown changed set (e.g. task mode) must NOT drop everything.
         let mut fs = vec![finding_in("x.go"), finding_in("y.go")];
         assert_eq!(drop_out_of_scope(&mut fs, &[]), 0);
-        assert_eq!(fs.len(), 2, "nothing dropped when the changed set is unknown");
+        assert_eq!(
+            fs.len(),
+            2,
+            "nothing dropped when the changed set is unknown"
+        );
     }
 
     #[test]
@@ -1057,9 +1227,15 @@ diff --git a/pkg/b.go b/pkg/b.go\n\
     #[test]
     fn sub_diff_extracts_only_requested_file() {
         let got = sub_diff_for_files(TWO_FILE_DIFF, &["pkg/b.go".to_string()]);
-        assert!(got.contains("diff --git a/pkg/b.go b/pkg/b.go"), "keeps b.go section: {got}");
+        assert!(
+            got.contains("diff --git a/pkg/b.go b/pkg/b.go"),
+            "keeps b.go section: {got}"
+        );
         assert!(got.contains("+newB"), "keeps b.go hunk: {got}");
-        assert!(!got.contains("a.go"), "drops the a.go section entirely: {got}");
+        assert!(
+            !got.contains("a.go"),
+            "drops the a.go section entirely: {got}"
+        );
     }
 
     #[test]
@@ -1071,20 +1247,26 @@ diff --git a/pkg/b.go b/pkg/b.go\n\
     #[test]
     fn sub_diff_keeps_all_when_all_requested() {
         let got = sub_diff_for_files(TWO_FILE_DIFF, &["a.go".to_string(), "pkg/b.go".to_string()]);
-        assert!(got.contains("+newA") && got.contains("+newB"), "both hunks kept: {got}");
+        assert!(
+            got.contains("+newA") && got.contains("+newB"),
+            "both hunks kept: {got}"
+        );
     }
 
     #[test]
     fn merge_adds_new_and_skips_duplicates() {
         let mut base = vec![finding_in("a.go")]; // a.go:1 "t"
-        // one genuine new finding, one exact duplicate of the existing one.
+                                                 // one genuine new finding, one exact duplicate of the existing one.
         let mut dup = finding_in("a.go"); // same file+line+title as base[0]
         dup.body = "different body but same identity".into();
         let extra = vec![finding_in("qrcode.go"), dup];
         let added = merge_findings(&mut base, extra);
         assert_eq!(added, 1, "only the qrcode.go finding is new");
         assert_eq!(base.len(), 2);
-        assert!(base.iter().any(|f| f.file_path == "qrcode.go"), "new file folded in");
+        assert!(
+            base.iter().any(|f| f.file_path == "qrcode.go"),
+            "new file folded in"
+        );
     }
 
     #[test]
@@ -1120,7 +1302,11 @@ diff --git a/pkg/b.go b/pkg/b.go\n\
     #[test]
     fn json_envelope_carries_findings_text_usage() {
         let fs = vec![finding("P0", 0.9, "x")];
-        let usage = atomcode_kernel::stream::TokenUsage { prompt: 10, completion: 5, cached: 2 };
+        let usage = atomcode_kernel::stream::TokenUsage {
+            prompt: 10,
+            completion: 5,
+            cached: 2,
+        };
         let out = render_json(&fs, "  summary prose  ", Some(usage)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["findings"][0]["title"], "x");
@@ -1163,7 +1349,10 @@ diff --git a/pkg/b.go b/pkg/b.go\n\
         let mut fs = vec![finding("P0", 0.95, "fix: x"), finding("P2", 0.5, "tidy: y")];
         sort_findings(&mut fs);
         let out = render_findings(&fs);
-        assert!(out.contains("2 finding(s): 1 P0, 0 P1, 1 P2, 0 P3"), "{out}");
+        assert!(
+            out.contains("2 finding(s): 1 P0, 0 P1, 1 P2, 0 P3"),
+            "{out}"
+        );
         assert!(out.contains("[P0 0.95] src/a.rs:1  fix: x"), "{out}");
         assert!(out.contains("    b\n"), "body indented: {out}");
     }
@@ -1197,7 +1386,10 @@ base_url = "https://openrouter.ai/api/v1"
         let fc = parse_file_config(SAMPLE).unwrap();
         let e = pick_provider(&fc, None).expect("default provider resolves");
         assert_eq!(e.model.as_deref(), Some("deepseek-v4-flash"));
-        assert_eq!(e.base_url.as_deref(), Some("https://llm-api.atomgit.com/v1"));
+        assert_eq!(
+            e.base_url.as_deref(),
+            Some("https://llm-api.atomgit.com/v1")
+        );
         assert_eq!(e.context_window, Some(1_000_000));
         assert_eq!(e.api_key, None, "atomgit entry has no api_key");
     }
@@ -1208,27 +1400,66 @@ base_url = "https://openrouter.ai/api/v1"
         let e = pick_provider(&fc, Some("openrouter")).expect("named provider resolves");
         assert_eq!(e.model.as_deref(), Some("stepfun/step-3.7-flash"));
         assert_eq!(e.api_key.as_deref(), Some("$OPENROUTER_API_KEY"));
-        assert!(pick_provider(&fc, Some("nope")).is_none(), "unknown provider → None");
+        assert!(
+            pick_provider(&fc, Some("nope")).is_none(),
+            "unknown provider → None"
+        );
     }
 
     #[test]
     fn ignores_unrelated_keys_and_missing_default() {
         // No default_provider, extra top-level keys → still parses; default pick → None.
-        let fc = parse_file_config("language = \"zh\"\n[providers.x]\nmodel=\"m\"\nbase_url=\"u\"\n").unwrap();
+        let fc =
+            parse_file_config("language = \"zh\"\n[providers.x]\nmodel=\"m\"\nbase_url=\"u\"\n")
+                .unwrap();
         assert!(pick_provider(&fc, None).is_none());
         assert!(pick_provider(&fc, Some("x")).is_some());
     }
 
     #[test]
+    fn selected_config_carries_top_level_language() {
+        let fc = parse_file_config(
+            "language = \"zh\"\ndefault_provider = \"x\"\n[providers.x]\nmodel=\"m\"\nbase_url=\"u\"\n",
+        )
+        .unwrap();
+        let selected = select_config(&fc, None);
+
+        assert_eq!(
+            selected.language,
+            Some(atomcode_config::locale::Locale::ZhCn)
+        );
+        assert!(selected.provider.is_some());
+    }
+
+    #[test]
+    fn coding_config_keeps_top_level_language_without_a_provider() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("config.toml");
+        std::fs::write(&path, "language = \"zh\"\n").unwrap();
+
+        let selected = load_config_selection(Some(&path), None).unwrap();
+
+        assert!(selected.provider.is_none());
+        assert_eq!(
+            selected.language,
+            Some(atomcode_config::locale::Locale::ZhCn)
+        );
+    }
+
+    #[test]
     fn detects_signing_gateways_by_host() {
         assert!(is_signing_gateway("https://llm-api.atomgit.com/v1"));
-        assert!(is_signing_gateway("https://api-ai.gitcode.com/v1/chat/completions"));
+        assert!(is_signing_gateway(
+            "https://api-ai.gitcode.com/v1/chat/completions"
+        ));
         assert!(is_signing_gateway("https://pre-llm-api-cce.atomgit.com/v1"));
         // plain providers are fine.
         assert!(!is_signing_gateway("https://openrouter.ai/api/v1"));
         assert!(!is_signing_gateway("https://api.deepseek.com/v1"));
         // a lookalike path must NOT trip the host check.
-        assert!(!is_signing_gateway("https://evil.com/llm-api.atomgit.com/v1"));
+        assert!(!is_signing_gateway(
+            "https://evil.com/llm-api.atomgit.com/v1"
+        ));
     }
 
     #[test]
@@ -1237,15 +1468,26 @@ base_url = "https://openrouter.ai/api/v1"
         // Malformed TOML at an explicit --config path → Err (not silently None).
         let bad = d.path().join("bad.toml");
         std::fs::write(&bad, "this is = = not valid toml [[[").unwrap();
-        assert!(load_provider_entry(Some(&bad), None).is_err(), "malformed config must error");
+        assert!(
+            load_provider_entry(Some(&bad), None).is_err(),
+            "malformed config must error"
+        );
         // Explicit but missing path → Err.
         let missing = d.path().join("nope.toml");
-        assert!(load_provider_entry(Some(&missing), None).is_err(), "explicit missing config errors");
+        assert!(
+            load_provider_entry(Some(&missing), None).is_err(),
+            "explicit missing config errors"
+        );
         // Valid config, unknown provider → Ok(None).
         let good = d.path().join("good.toml");
         std::fs::write(&good, SAMPLE).unwrap();
-        assert!(load_provider_entry(Some(&good), Some("nope")).unwrap().is_none());
-        assert!(load_provider_entry(Some(&good), None).unwrap().is_some(), "default_provider resolves");
+        assert!(load_provider_entry(Some(&good), Some("nope"))
+            .unwrap()
+            .is_none());
+        assert!(
+            load_provider_entry(Some(&good), None).unwrap().is_some(),
+            "default_provider resolves"
+        );
     }
 
     #[test]
@@ -1256,17 +1498,31 @@ base_url = "https://openrouter.ai/api/v1"
         assert_eq!(expand_env("${ATOMCODE_CLIX_TEST_KEY}"), "secret-123");
         // ${VAR:-default} falls back when unset, uses the value when set.
         assert_eq!(expand_env("${NOPE_UNSET_VAR_XYZ:-fallback}"), "fallback");
-        assert_eq!(expand_env("${ATOMCODE_CLIX_TEST_KEY:-fallback}"), "secret-123");
+        assert_eq!(
+            expand_env("${ATOMCODE_CLIX_TEST_KEY:-fallback}"),
+            "secret-123"
+        );
         // literals + unset + malformed pass through / empty as appropriate.
-        assert_eq!(expand_env("sk-literal"), "sk-literal", "non-$ passes through");
+        assert_eq!(
+            expand_env("sk-literal"),
+            "sk-literal",
+            "non-$ passes through"
+        );
         assert_eq!(expand_env("$NOPE_UNSET_VAR_XYZ"), "", "unset $VAR → empty");
-        assert_eq!(expand_env("${unclosed"), "${unclosed", "malformed brace ref passes through");
+        assert_eq!(
+            expand_env("${unclosed"),
+            "${unclosed",
+            "malformed brace ref passes through"
+        );
     }
 
     #[test]
     fn resolve_context_window_flag_wins_then_entry_then_default() {
         // --context-window flag overrides everything.
-        assert_eq!(resolve_context_window(Some(1_000_000), Some(128_000)), 1_000_000);
+        assert_eq!(
+            resolve_context_window(Some(1_000_000), Some(128_000)),
+            1_000_000
+        );
         // No flag → config provider's context_window.
         assert_eq!(resolve_context_window(None, Some(200_000)), 200_000);
         // Neither → 128k built-in default.
@@ -1276,7 +1532,13 @@ base_url = "https://openrouter.ai/api/v1"
     #[test]
     fn first_nonempty_respects_precedence() {
         assert_eq!(
-            first_nonempty([Some("  ".into()), None, Some("flag".into()), Some("env".into())]).as_deref(),
+            first_nonempty([
+                Some("  ".into()),
+                None,
+                Some("flag".into()),
+                Some("env".into())
+            ])
+            .as_deref(),
             Some("flag"),
             "first non-empty wins (blank skipped)"
         );
@@ -1287,11 +1549,16 @@ base_url = "https://openrouter.ai/api/v1"
     fn system_prompt_text_wins_over_file_and_none_default() {
         // inline text wins.
         assert_eq!(
-            resolve_system_prompt(Some("CUSTOM PROMPT".into()), Some("ignored".into())).unwrap().as_deref(),
+            resolve_system_prompt(Some("CUSTOM PROMPT".into()), Some("ignored".into()))
+                .unwrap()
+                .as_deref(),
             Some("CUSTOM PROMPT")
         );
         // blank text falls through to None when no file.
-        assert_eq!(resolve_system_prompt(Some("  ".into()), None).unwrap(), None);
+        assert_eq!(
+            resolve_system_prompt(Some("  ".into()), None).unwrap(),
+            None
+        );
         // nothing → None (built-in persona).
         assert_eq!(resolve_system_prompt(None, None).unwrap(), None);
         // file path is read.
@@ -1299,7 +1566,9 @@ base_url = "https://openrouter.ai/api/v1"
         let p = d.path().join("p.txt");
         std::fs::write(&p, "FROM FILE").unwrap();
         assert_eq!(
-            resolve_system_prompt(None, Some(p.to_string_lossy().to_string())).unwrap().as_deref(),
+            resolve_system_prompt(None, Some(p.to_string_lossy().to_string()))
+                .unwrap()
+                .as_deref(),
             Some("FROM FILE")
         );
     }
@@ -1320,7 +1589,12 @@ base_url = "https://openrouter.ai/api/v1"
         let d = tempfile::tempdir().unwrap();
         let repo = d.path();
         let git = |args: &[&str]| {
-            Command::new("git").arg("-C").arg(repo).args(args).output().unwrap()
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
         };
         if !git(&["init", "-q"]).status.success() {
             return; // git unavailable in this environment → skip
@@ -1348,6 +1622,9 @@ base_url = "https://openrouter.ai/api/v1"
         std::fs::write(repo.join("f.txt"), "two\n").unwrap();
 
         let diff = git_diff(repo, None, false).unwrap();
-        assert!(diff.contains("-one") && diff.contains("+two"), "diff shows the edit: {diff}");
+        assert!(
+            diff.contains("-one") && diff.contains("+two"),
+            "diff shows the edit: {diff}"
+        );
     }
 }

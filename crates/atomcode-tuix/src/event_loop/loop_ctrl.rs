@@ -24,6 +24,10 @@ pub struct LoopController {
     pub max_rounds: u32,
     pub due: bool,
     pub consecutive_failures: u32,
+    /// A prompt payload was accepted and has not yet reached the runtime-owned
+    /// `TurnFinished` terminal. UI presentation events must not release this
+    /// gate because they can precede the authoritative terminal.
+    pub awaiting_turn_terminal: bool,
     pub started_at: Instant,
     pub next_fire_at: Option<Instant>,
 }
@@ -37,6 +41,7 @@ impl LoopController {
             max_rounds: 100,
             due: false,
             consecutive_failures: 0,
+            awaiting_turn_terminal: false,
             started_at: Instant::now(),
             next_fire_at: None,
         }
@@ -44,16 +49,28 @@ impl LoopController {
 
     /// Decide what to do given current agent idleness. Pure — no side effects.
     pub fn decide(&self, idle: bool) -> LoopAction {
-        if self.round >= self.max_rounds || self.consecutive_failures >= 3 {
+        if (self.max_rounds != 0 && self.round >= self.max_rounds) || self.consecutive_failures >= 3
+        {
             return LoopAction::Stop;
         }
         if !self.due {
+            return LoopAction::Skip;
+        }
+        if self.awaiting_turn_terminal {
             return LoopAction::Skip;
         }
         if !idle {
             return LoopAction::Skip;
         }
         LoopAction::Fire
+    }
+
+    pub fn mark_turn_submitted(&mut self) {
+        self.awaiting_turn_terminal = true;
+    }
+
+    pub fn mark_turn_stopped_normally(&mut self) {
+        self.awaiting_turn_terminal = false;
     }
 }
 
@@ -85,10 +102,36 @@ mod tests {
         assert_eq!(c.decide(true), LoopAction::Stop);
     }
     #[test]
+    fn zero_round_limit_is_unbounded() {
+        let mut c = LoopController::new_interval(300, LoopPayload::Prompt("x".into()));
+        c.max_rounds = 0;
+        c.round = u32::MAX;
+        c.due = true;
+        assert_eq!(c.decide(true), LoopAction::Fire);
+    }
+    #[test]
     fn failing_payload_stops_after_3() {
-        let mut c = LoopController::new_interval(300, LoopPayload::Slash { cmd: "/x".into(), arg: "".into() });
+        let mut c = LoopController::new_interval(
+            300,
+            LoopPayload::Slash {
+                cmd: "/x".into(),
+                arg: "".into(),
+            },
+        );
         c.due = true;
         c.consecutive_failures = 3;
         assert_eq!(c.decide(true), LoopAction::Stop);
+    }
+
+    #[test]
+    fn prompt_loop_waits_for_authoritative_turn_terminal() {
+        let mut c = LoopController::new_interval(300, LoopPayload::Prompt("x".into()));
+        c.due = true;
+        c.mark_turn_submitted();
+
+        assert_eq!(c.decide(true), LoopAction::Skip);
+
+        c.mark_turn_stopped_normally();
+        assert_eq!(c.decide(true), LoopAction::Fire);
     }
 }

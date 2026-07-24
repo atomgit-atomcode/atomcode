@@ -8,12 +8,34 @@ import type {
   MessageBlock,
   PermissionRequestData,
   StatusData,
+  SearchState,
+  AuthStatus,
+  ProviderInfo,
+  SessionTerminalState,
 } from './types';
 import { blocksFromLegacyMessage } from './blocks';
+import { applyTodoCall, reduceTodosFromMessages } from './todo';
+import { buildSearchMatches } from '../utils/search';
 
 let _msgCounter = 0;
 function nextId(): string {
   return `msg-${Date.now()}-${++_msgCounter}`;
+}
+
+function providerSetupRequired(
+  providers: ProviderInfo[],
+  currentProvider: string,
+  auth?: AuthStatus,
+): boolean {
+  if (providers.length === 0) return true;
+  const current = providers.find((provider) => provider.name === currentProvider)
+    ?? providers.find((provider) => provider.is_default);
+  const authUnavailable = !auth?.logged_in || auth.expired === true;
+  // Older daemons did not expose requires_login. Preserve their previous
+  // conservative behaviour until the daemon is upgraded.
+  return current?.requires_login === undefined
+    ? authUnavailable
+    : current.requires_login && authUnavailable;
 }
 
 function lastAssistantIndex(messages: ChatMessage[]): number {
@@ -274,6 +296,57 @@ function settleOpenTools(
   );
 }
 
+function mergeTerminalIntoHistory(
+  messages: ChatMessage[],
+  terminal?: SessionTerminalState,
+): ChatMessage[] {
+  if (!terminal) return messages;
+  const next = [...messages];
+  const assistantIndex = lastAssistantIndex(next);
+  const assistant = assistantIndex >= 0 ? next[assistantIndex] : undefined;
+
+  if (terminal.type === 'done') {
+    if (assistant) {
+      let settled = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
+      if (terminal.stopReason && terminal.stopReason !== 'stopped') {
+        settled = upsertStatusBlock(settled, {
+          kind: 'warning',
+          message: terminal.message || `The turn ended before completion (${terminal.stopReason}).`,
+        });
+      }
+      next[assistantIndex] = settled;
+    } else if (terminal.stopReason && terminal.stopReason !== 'stopped') {
+      next.push({
+        id: nextId(),
+        role: 'error',
+        text: terminal.message || `The turn ended before completion (${terminal.stopReason}).`,
+        timestamp: Date.now(),
+      });
+    }
+    return next;
+  }
+
+  if (terminal.type === 'stopped') {
+    if (assistant) {
+      next[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
+    }
+    return next;
+  }
+
+  if (assistant) {
+    next[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'error', terminal.message);
+  }
+  if (next.at(-1)?.role !== 'error' || next.at(-1)?.text !== terminal.message) {
+    next.push({
+      id: nextId(),
+      role: 'error',
+      text: terminal.message,
+      timestamp: Date.now(),
+    });
+  }
+  return next;
+}
+
 function updatePermissionBlock(
   message: ChatMessage,
   id: string,
@@ -344,10 +417,30 @@ function stripVisionPreprocessText(rawText: string): { displayText: string; hadV
   };
 }
 
+const EMPTY_SEARCH: SearchState = { matches: [], currentMatchIndex: -1 };
+
+/** Recompute search matches for the given query. Keeps the current index
+ *  clamped to the new range so navigation stays valid after edits. */
+function recomputeSearch(
+  messages: ChatMessage[],
+  query: string,
+  prev?: SearchState,
+): SearchState {
+  const trimmed = query.trim();
+  if (!trimmed) return EMPTY_SEARCH;
+  const matches = buildSearchMatches(messages, query);
+  if (matches.length === 0) return { matches, currentMatchIndex: -1 };
+  let nextIndex = prev && prev.currentMatchIndex >= 0 ? prev.currentMatchIndex : 0;
+  if (nextIndex >= matches.length) nextIndex = 0;
+  return { matches, currentMatchIndex: nextIndex };
+}
+
 export const initialState: ChatState = {
   messages: [],
   queuedMessages: [],
+  activeTodos: [],
   isGenerating: false,
+  recoveryLocked: false,
   isSessionList: document.body.dataset.viewMode === 'sidebar',
   viewMode: document.body.dataset.viewMode === 'sidebar' ? 'sidebar' : 'tab',
   currentModel: 'default',
@@ -368,12 +461,31 @@ export const initialState: ChatState = {
   settingsOpen: false,
   searchQuery: '',
   searchOpen: false,
+  search: EMPTY_SEARCH,
   locale: document.body.dataset.locale,
   approvalMode: 'build',
   approvalModePending: false,
 };
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
+  const next = chatReducerInner(state, action);
+  // Keep search matches in sync when messages change and a query is active.
+  if (next.messages !== state.messages && next.searchQuery.trim()) {
+    const recomputed = recomputeSearch(next.messages, next.searchQuery, next.search);
+    // Skip if matches haven't meaningfully changed (avoids unnecessary re-renders).
+    const sameMatches =
+      recomputed.matches.length === next.search.matches.length &&
+      recomputed.matches.every((m, idx) =>
+        m.messageId === next.search.matches[idx]?.messageId &&
+        m.ranges.length === next.search.matches[idx]?.ranges.length);
+    if (!sameMatches || recomputed.currentMatchIndex !== next.search.currentMatchIndex) {
+      return { ...next, search: recomputed };
+    }
+  }
+  return next;
+}
+
+function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
   switch (action.type) {
     // ─── User sends a message ────────────────────────
     case 'ADD_USER_MESSAGE': {
@@ -445,6 +557,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         isGenerating: true,
+        recoveryLocked: false,
         messages: [...state.messages, assistant],
       };
     }
@@ -453,6 +566,11 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     // START_GENERATION: create a fresh streaming assistant message that
     // subsequent text/toolStart events will append to.
     case 'RESUME_STREAMING': {
+      if (state.messages.some((message) => message.role === 'assistant' && message.streaming)) {
+        return state.isGenerating && !state.recoveryLocked
+          ? state
+          : { ...state, isGenerating: true, recoveryLocked: false };
+      }
       const assistant: ChatMessage = {
         id: nextId(),
         role: 'assistant',
@@ -465,6 +583,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         isGenerating: true,
+        recoveryLocked: false,
         messages: [...state.messages, assistant],
       };
     }
@@ -484,12 +603,15 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        const tools: ToolCallData[] = action.calls.map((c) => ({
-          id: c.id,
-          name: c.name,
-          args: c.args,
-          status: 'queued' as const,
-        }));
+        const existingIds = new Set((assistant.toolCalls ?? []).map((tool) => tool.id));
+        const tools: ToolCallData[] = action.calls
+          .filter((call) => !existingIds.has(call.id))
+          .map((c) => ({
+            id: c.id,
+            name: c.name,
+            args: c.args,
+            status: 'queued' as const,
+          }));
         msgs[assistantIndex] = {
           ...assistant,
           toolCalls: [...(assistant.toolCalls ?? []), ...tools],
@@ -503,16 +625,23 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const msgs = [...state.messages];
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      let shouldApplyTodo = false;
       if (assistant) {
         const existingIndex = assistant.toolCalls?.findIndex((t) => t.id === action.id);
         if (existingIndex !== undefined && existingIndex >= 0) {
-          // Tool was already announced via TOOL_BATCH_START — transition to running
-          const updated = assistant.toolCalls!.map((t, i) =>
-            i === existingIndex ? { ...t, args: action.args, status: 'running' as const } : t,
-          );
-          const updatedTool = updated[existingIndex];
-          msgs[assistantIndex] = upsertToolBlock({ ...assistant, toolCalls: updated }, updatedTool);
+          const existingStatus = assistant.toolCalls![existingIndex].status;
+          shouldApplyTodo = existingStatus === 'queued' || existingStatus === 'waiting_approval';
+          if (shouldApplyTodo) {
+            // Tool was already announced via TOOL_BATCH_START — transition to running.
+            // Replayed starts must not reopen terminal calls.
+            const updated = assistant.toolCalls!.map((t, i) =>
+              i === existingIndex ? { ...t, args: action.args, status: 'running' as const } : t,
+            );
+            const updatedTool = updated[existingIndex];
+            msgs[assistantIndex] = upsertToolBlock({ ...assistant, toolCalls: updated }, updatedTool);
+          }
         } else {
+          shouldApplyTodo = true;
           // Legacy path: tool wasn't in a batch, add it directly as running
           const tool: ToolCallData = {
             id: action.id,
@@ -527,7 +656,13 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           msgs[assistantIndex] = upsertToolBlock(msgs[assistantIndex], tool);
         }
       }
-      return { ...state, messages: msgs };
+      return {
+        ...state,
+        messages: msgs,
+        activeTodos: shouldApplyTodo
+          ? applyTodoCall(state.activeTodos, action.name, action.args)
+          : state.activeTodos,
+      };
     }
 
     case 'TOOL_PROGRESS': {
@@ -702,6 +837,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         isGenerating: false,
+        recoveryLocked: false,
         messages: msgs,
         tokenCount,
       };
@@ -714,7 +850,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (assistant) {
         msgs[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
       }
-      return { ...state, isGenerating: false, messages: msgs, queuedMessages: [] };
+      return { ...state, isGenerating: false, recoveryLocked: false, messages: msgs, queuedMessages: [] };
     }
 
     case 'GENERATION_ERROR': {
@@ -730,12 +866,18 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         text: action.message,
         timestamp: Date.now(),
       };
-      return { ...state, isGenerating: false, messages: [...msgs, errMsg], queuedMessages: [] };
+      return { ...state, isGenerating: false, recoveryLocked: false, messages: [...msgs, errMsg], queuedMessages: [] };
     }
+
+    case 'RECOVERY_REQUIRED':
+      return { ...state, recoveryLocked: true, queuedMessages: [] };
+
+    case 'RECOVERY_CLEARED':
+      return { ...state, recoveryLocked: false };
 
     // ─── Session management ─────────────────────────
     case 'CLEAR_CHAT':
-      return { ...state, messages: [], queuedMessages: [], tokenCount: undefined, contextFiles: [], isGenerating: false };
+      return { ...state, messages: [], queuedMessages: [], activeTodos: [], tokenCount: undefined, contextFiles: [], isGenerating: false, recoveryLocked: false };
 
     case 'SET_MODELS': {
       const hasCurrent = action.models.some((m) => m.provider === state.currentProvider);
@@ -758,7 +900,11 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         providers: action.providers,
         currentProvider: current?.name ?? state.currentProvider,
         currentModel: current?.model ?? state.currentModel,
-        setupRequired: state.auth?.logged_in === false || action.providers.length === 0,
+        setupRequired: providerSetupRequired(
+          action.providers,
+          current?.name ?? state.currentProvider,
+          state.auth,
+        ),
       };
     }
 
@@ -766,7 +912,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         auth: action.auth,
-        setupRequired: !action.auth.logged_in || state.providers.length === 0,
+        setupRequired: providerSetupRequired(state.providers, state.currentProvider, action.auth),
       };
 
     case 'SET_SETUP_STATE': {
@@ -801,6 +947,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         ...state,
         currentProvider: action.provider,
         currentModel: action.model ?? provider?.model ?? state.currentModel,
+        setupRequired: providerSetupRequired(state.providers, action.provider, state.auth),
       };
     }
 
@@ -822,7 +969,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         activeSessionId: action.sessionId,
-        activeProjectHash: action.projectHash,
+        activeTodos: action.sessionId === state.activeSessionId ? state.activeTodos : [],
+        activeProjectHash: action.projectHash
+          ?? (action.sessionId === state.activeSessionId ? state.activeProjectHash : undefined),
       };
 
     // ─── Context files ──────────────────────────────
@@ -948,14 +1097,43 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         };
         messages.push({ ...message, blocks: role === 'assistant' ? blocksFromLegacyMessage(message) : undefined });
       }
-      return { ...state, messages, isGenerating: false };
+      const mergedMessages = mergeTerminalIntoHistory(messages, action.terminal);
+      return {
+        ...state,
+        messages: mergedMessages,
+        activeTodos: reduceTodosFromMessages(mergedMessages),
+        isGenerating: false,
+      };
     }
 
-    case 'SET_SEARCH_QUERY':
-      return { ...state, searchQuery: action.query };
+    case 'SET_SEARCH_QUERY': {
+      const search = recomputeSearch(state.messages, action.query, state.search);
+      return { ...state, searchQuery: action.query, search };
+    }
 
-    case 'TOGGLE_SEARCH':
-      return { ...state, searchOpen: !state.searchOpen, searchQuery: state.searchOpen ? '' : state.searchQuery };
+    case 'TOGGLE_SEARCH': {
+      const closing = state.searchOpen;
+      return {
+        ...state,
+        searchOpen: !state.searchOpen,
+        searchQuery: closing ? '' : state.searchQuery,
+        search: closing ? EMPTY_SEARCH : recomputeSearch(state.messages, state.searchQuery),
+      };
+    }
+
+    case 'SEARCH_NEXT': {
+      const { matches, currentMatchIndex } = state.search;
+      if (matches.length === 0) return state;
+      const next = (currentMatchIndex + 1) % matches.length;
+      return { ...state, search: { matches, currentMatchIndex: next } };
+    }
+
+    case 'SEARCH_PREV': {
+      const { matches, currentMatchIndex } = state.search;
+      if (matches.length === 0) return state;
+      const prev = currentMatchIndex <= 0 ? matches.length - 1 : currentMatchIndex - 1;
+      return { ...state, search: { matches, currentMatchIndex: prev } };
+    }
 
     case 'PERMISSION_REQUEST': {
       const msgs = [...state.messages];
@@ -1021,19 +1199,23 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     }
 
     // ─── Init ───────────────────────────────────────
-    case 'INIT':
+    case 'INIT': {
+      const activeSessionId = action.activeSessionId ?? state.activeSessionId;
       return {
         ...state,
         isGenerating: action.generating,
+        recoveryLocked: action.recoveryLocked ?? false,
         currentModel: action.currentModel ?? state.currentModel,
         viewMode: action.viewMode ?? state.viewMode,
-        activeSessionId: action.activeSessionId ?? state.activeSessionId,
+        activeSessionId,
+        activeTodos: activeSessionId === state.activeSessionId ? state.activeTodos : [],
         activeProjectHash: action.projectHash ?? state.activeProjectHash,
         isSessionList: action.isSessionList ?? state.isSessionList,
         locale: action.locale ?? state.locale,
         approvalMode: action.approvalMode ?? state.approvalMode,
         approvalModePending: action.approvalModePending ?? state.approvalModePending,
       };
+    }
 
     default:
       return state;

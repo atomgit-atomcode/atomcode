@@ -19,19 +19,21 @@ use crate::event_loop::{Buffer, LoopCtx};
 use crate::render::Renderer;
 use crate::state::UiState;
 
+pub mod diff_viewer;
 pub mod dir_picker;
 pub mod file_viewer;
 pub mod language_picker;
 pub mod model_picker;
 pub mod onboarding_wizard;
-pub mod plugin_manager;
 pub mod password;
+pub mod plugin_manager;
 pub mod provider_wizard;
 pub mod proxy_picker;
 mod qr;
 pub mod session_picker;
 pub mod usage;
 pub mod usage_render;
+pub use diff_viewer::DiffViewer;
 pub use dir_picker::DirPicker;
 pub use file_viewer::FileViewer;
 pub use language_picker::LanguagePicker;
@@ -67,6 +69,29 @@ pub(crate) fn tab_chip(label: &str, active: bool) -> String {
     } else {
         format!("  \x1b[38;5;245m{label}\x1b[39m  ")
     }
+}
+
+/// The "N more files" indicator row shared by the `/diff` and `/view` panels:
+/// shown below a scrolled file window when the list is longer than the visible
+/// cap. `above`/`below` are the hidden-file counts on each side; the arrow hints
+/// which way ↑/↓ scrolls to reach them.
+pub(crate) fn more_files_row(above: usize, below: usize) -> crate::render::DiffPanelRow {
+    use crate::render::{DiffPanelRow, DiffPanelSpan, DiffPanelTone};
+    let hidden = above + below;
+    let arrow = match (above > 0, below > 0) {
+        (true, true) => "↕",
+        (true, false) => "↑",
+        (false, true) => "↓",
+        (false, false) => "",
+    };
+    let text = match crate::i18n::current_locale() {
+        crate::i18n::Locale::ZhCn => format!("{arrow} 还有 {hidden} 个文件 (↑/↓ 滚动)"),
+        _ => format!("{arrow} {hidden} more files (↑/↓ to scroll)"),
+    };
+    DiffPanelRow::new(vec![DiffPanelSpan::new(
+        text.trim().to_string(),
+        DiffPanelTone::Muted,
+    )])
 }
 
 /// Result of a modal consuming one key event.
@@ -137,7 +162,13 @@ pub trait Modal: Send {
     /// any cached lists it is displaying. Default: ignore. Only the
     /// interactive `/plugin` manager overrides this. The event loop calls it
     /// before rendering the job result and before redrawing the modal.
-    fn on_plugin_event(&mut self, _ev: &atomcode_core::plugin::PluginJobEvent) {}
+    fn on_plugin_event(&mut self, _ev: &atomcode_capabilities::plugin::PluginJobEvent) {}
+
+    /// Poll modal-owned background work after the shared wake channel fires.
+    /// Returns true when visible state changed and the modal should be redrawn.
+    fn poll_background(&mut self) -> bool {
+        false
+    }
 
     /// Whether this modal has requested to close. The event loop checks this
     /// to clean up the modal asynchronously.

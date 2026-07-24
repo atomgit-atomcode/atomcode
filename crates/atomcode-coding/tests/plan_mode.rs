@@ -27,14 +27,16 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
         skill_dirs: Some(vec![project.path().join("skills")]),
+        plugin_skill_dirs: Vec::new(),
         mcp: false,
         memory: false,
         web: false,
         review: false,
+        rate_limit_source: None,
     };
 
     let mut parts = prepare(&cfg, opts).await.unwrap();
-    // Activate plan mode BEFORE the turn (the bridge maps SetPlanMode onto this flag).
+    // Activate plan mode before the turn, matching CodingRuntime::set_mode.
     parts.plan_mode.store(true, Ordering::Relaxed);
 
     // Round 1: the model calls write_file (Risky). Round 2: it gives up and answers.
@@ -47,12 +49,18 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
             }),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("here is my plan".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("here is my plan".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let mut h = assemble(&mut parts, &cfg, provider).unwrap().spawn();
     h.commands
-        .send(AgentCommand::SendMessage { text: "add a file".into(), images: vec![] })
+        .send(AgentCommand::SendMessage {
+            text: "add a file".into(),
+            images: vec![],
+        })
         .unwrap();
 
     let mut blocked_content = None;
@@ -68,13 +76,20 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
     h.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = h.task.await;
 
-    let (is_error, content) = blocked_content.expect("write_file should have produced a tool result");
-    assert!(is_error, "a plan-mode-blocked write must be an error result");
+    let (is_error, content) =
+        blocked_content.expect("write_file should have produced a tool result");
+    assert!(
+        is_error,
+        "a plan-mode-blocked write must be an error result"
+    );
     assert!(
         content.contains("plan mode"),
         "the blocked result must explain plan mode; got: {content:?}"
     );
 
     // The file must NOT have been written.
-    assert!(!project.path().join("x.txt").exists(), "plan mode must not let a write through");
+    assert!(
+        !project.path().join("x.txt").exists(),
+        "plan mode must not let a write through"
+    );
 }

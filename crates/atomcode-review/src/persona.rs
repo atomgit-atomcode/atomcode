@@ -170,21 +170,41 @@ mod tests {
     #[test]
     fn persona_carries_model_and_anchors() {
         let p = review_persona("deepseek-v4");
-        assert!(p.contains("model: deepseek-v4"), "identity must carry the model");
-        assert!(p.starts_with("You are AtomCode Reviewer"), "identity line first");
+        assert!(
+            p.contains("model: deepseek-v4"),
+            "identity must carry the model"
+        );
+        assert!(
+            p.starts_with("You are AtomCode Reviewer"),
+            "identity line first"
+        );
         assert!(p.contains("read-only"), "must state read-only");
-        assert!(p.contains("report_finding"), "must instruct the report tool");
+        assert!(
+            p.contains("report_finding"),
+            "must instruct the report tool"
+        );
         // Required reporting fields, including the fix-suggestion protocol.
         for field in ["suggestion", "suggested_code", "confidence", "line_start"] {
-            assert!(p.contains(field), "persona must describe the `{field}` field");
+            assert!(
+                p.contains(field),
+                "persona must describe the `{field}` field"
+            );
         }
         // Named read-only tools (code-intelligence tools are described by category).
         for tool in ["read_file", "grep", "ast_grep", "web_search"] {
             assert!(p.contains(tool), "persona must advertise the tool `{tool}`");
         }
         // Core review-discipline anchors.
-        for anchor in ["Review Scope", "Priority Criteria", "Noise-Reduction", "Line Anchoring"] {
-            assert!(p.contains(anchor), "persona must keep the `{anchor}` section");
+        for anchor in [
+            "Review Scope",
+            "Priority Criteria",
+            "Noise-Reduction",
+            "Line Anchoring",
+        ] {
+            assert!(
+                p.contains(anchor),
+                "persona must keep the `{anchor}` section"
+            );
         }
     }
 
@@ -193,7 +213,10 @@ mod tests {
         let p = review_persona("m");
         // The reviewer must not advertise write/edit/bash — it is read-only.
         for forbidden in ["write_file", "edit_file", "`bash`"] {
-            assert!(!p.contains(forbidden), "reviewer persona must not advertise `{forbidden}`");
+            assert!(
+                !p.contains(forbidden),
+                "reviewer persona must not advertise `{forbidden}`"
+            );
         }
     }
 }

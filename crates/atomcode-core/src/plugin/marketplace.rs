@@ -42,17 +42,27 @@ pub fn find_git() -> Result<PathBuf> {
 
     // 2. Fallback: probe common installation directories that are
     //    frequently missing from the PATH of GUI-launched processes.
+    //
+    //    MUST verify the candidate actually RUNS, not merely that the file
+    //    exists: on macOS WITHOUT the Xcode Command Line Tools installed,
+    //    `/usr/bin/git` is present as a `xcode-select` STUB that fails on
+    //    every invocation ("No developer tools were found, requesting
+    //    install"). An `exists()`-only check treated that stub as a working
+    //    git, so the early GitNotFound guard was skipped and the later
+    //    `git clone` dumped a red, crash-looking error on fresh installs.
+    //    Probing `--version` rejects the stub → callers fall through to the
+    //    friendly "install git (`xcode-select --install`)" hint.
     let candidates: &[&str] = &[
-        "/usr/bin/git",               // macOS system (Xcode CLI tools)
-        "/usr/local/bin/git",          // macOS Intel Homebrew
-        "/opt/homebrew/bin/git",       // macOS Apple Silicon Homebrew
-        "/opt/local/bin/git",          // MacPorts
-        "/snap/bin/git",               // Ubuntu snap
-        "/app/bin/git",                // NixOS / some containers
+        "/usr/bin/git",          // macOS system (Xcode CLI tools)
+        "/usr/local/bin/git",    // macOS Intel Homebrew
+        "/opt/homebrew/bin/git", // macOS Apple Silicon Homebrew
+        "/opt/local/bin/git",    // MacPorts
+        "/snap/bin/git",         // Ubuntu snap
+        "/app/bin/git",          // NixOS / some containers
     ];
     for candidate in candidates {
         let p = PathBuf::from(candidate);
-        if p.exists() {
+        if p.exists() && git_runs(&p) {
             return Ok(p);
         }
     }
@@ -79,10 +89,7 @@ fn which_git(name: &str) -> Result<PathBuf> {
     // bare name (which still works for Command::new).
     #[cfg(unix)]
     {
-        let which_out = Command::new("which")
-            .arg(name)
-            .output()
-            .ok();
+        let which_out = Command::new("which").arg(name).output().ok();
         if let Some(w) = which_out {
             if w.status.success() {
                 let path = String::from_utf8_lossy(&w.stdout).trim().to_string();
@@ -95,10 +102,31 @@ fn which_git(name: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(name))
 }
 
+/// Does the git binary at `path` actually run? Runs `<path> --version` and
+/// checks it exits successfully. Distinguishes a working git from a present-
+/// but-nonfunctional stub (notably macOS's `/usr/bin/git` xcode-select shim
+/// before the Command Line Tools are installed, which exists on disk but exits
+/// non-zero on every invocation). Any spawn/exec error counts as "does not run".
+fn git_runs(path: &Path) -> bool {
+    Command::new(path)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Sanitize a name into a path-safe segment (CC convention).
 pub fn sanitize_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -125,7 +153,10 @@ pub fn add_marketplace(url: &str) -> Result<MarketplaceInfo> {
     // when manifest.name differs from the URL tail.
     let tmp_suffix: u128 = {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     };
     let tmp_dir = mp_root.join(format!(".tmp-{}-{}", std::process::id(), tmp_suffix));
     if tmp_dir.exists() {
@@ -165,7 +196,10 @@ pub fn add_marketplace(url: &str) -> Result<MarketplaceInfo> {
     let mp_name = sanitize_name(&raw_mp_name);
     if mp_name.is_empty() {
         cleanup(&tmp_dir);
-        bail!("marketplace name `{}` sanitized to empty string", raw_mp_name);
+        bail!(
+            "marketplace name `{}` sanitized to empty string",
+            raw_mp_name
+        );
     }
 
     let target = mp_root.join(&mp_name);
@@ -186,10 +220,18 @@ pub fn add_marketplace(url: &str) -> Result<MarketplaceInfo> {
 
     if let Err(e) = std::fs::rename(&tmp_dir, &target) {
         cleanup(&tmp_dir);
-        return Err(anyhow!("rename {} -> {}: {}", tmp_dir.display(), target.display(), e));
+        return Err(anyhow!(
+            "rename {} -> {}: {}",
+            tmp_dir.display(),
+            target.display(),
+            e
+        ));
     }
 
-    let plugins_list = plugins.iter().map(|p| sanitize_name(&p.name)).collect::<Vec<_>>();
+    let plugins_list = plugins
+        .iter()
+        .map(|p| sanitize_name(&p.name))
+        .collect::<Vec<_>>();
 
     state.marketplaces.insert(
         mp_name.clone(),
@@ -256,8 +298,7 @@ pub(super) fn git_command(git: &Path) -> Command {
 /// (creds passed in) so it's unit-testable without touching auth.toml.
 fn basic_auth_header(username: &str, token: &str) -> String {
     use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD
-        .encode(format!("{}:{}", username, token));
+    let b64 = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", username, token));
     format!("Authorization: Basic {}", b64)
 }
 
@@ -431,7 +472,10 @@ fn git_rev_parse(repo: &Path) -> Result<String> {
         .output()
         .context("spawn git rev-parse")?;
     if !out.status.success() {
-        bail!("git rev-parse failed: {}", String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -447,14 +491,9 @@ pub fn remove_marketplace(name: &str) -> Result<()> {
         bail!("marketplace `{}` not found", name);
     }
     // Refuse if any installed plugin still references this marketplace.
-    let installed = super::state::load_installed_plugins_file(
-        &paths::installed_plugins_file().unwrap(),
-    )?;
-    if installed
-        .plugins
-        .values()
-        .any(|p| p.marketplace == name)
-    {
+    let installed =
+        super::state::load_installed_plugins_file(&paths::installed_plugins_file().unwrap())?;
+    if installed.plugins.values().any(|p| p.marketplace == name) {
         bail!(
             "marketplace `{}` has installed plugins; uninstall them first",
             name
@@ -531,20 +570,80 @@ mod tests {
     use crate::plugin::test_support::isolated_home;
     use std::path::PathBuf;
 
+    #[cfg(unix)]
+    #[test]
+    fn git_runs_rejects_present_but_failing_stub() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Present-but-nonfunctional stub (mirrors macOS `/usr/bin/git` with no
+        // Xcode CLT: the file exists but every invocation exits non-zero). It
+        // must NOT be treated as a working git — otherwise the GitNotFound hint
+        // is skipped and a later `git clone` dumps a red xcode-select error.
+        let stub = dir.path().join("git-stub");
+        write!(
+            std::fs::File::create(&stub).unwrap(),
+            "#!/bin/sh\necho 'No developer tools were found' >&2\nexit 1\n"
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !git_runs(&stub),
+            "a stub that exits non-zero must not count as working git"
+        );
+
+        // A binary that runs `--version` successfully IS accepted.
+        let ok = dir.path().join("git-ok");
+        write!(
+            std::fs::File::create(&ok).unwrap(),
+            "#!/bin/sh\necho 'git version 2.40.0'\nexit 0\n"
+        )
+        .unwrap();
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            git_runs(&ok),
+            "a binary whose --version succeeds must count as git"
+        );
+
+        // A path that does not exist does not run.
+        assert!(!git_runs(&dir.path().join("does-not-exist")));
+    }
+
     fn make_bare_repo_with_manifest(name: &str, manifest: Option<&str>) -> PathBuf {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join(name);
         std::fs::create_dir_all(&repo).unwrap();
-        Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["config", "user.name", "t"]).current_dir(&repo).status().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
         if let Some(m) = manifest {
             std::fs::create_dir_all(repo.join(".atomcode-plugin")).unwrap();
             std::fs::write(repo.join(".atomcode-plugin/marketplace.json"), m).unwrap();
         }
         std::fs::write(repo.join("README"), "x").unwrap();
-        Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
-        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo).status().unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
         repo
     }
 
@@ -578,7 +677,9 @@ mod tests {
         ));
         // Plain not-found / network errors are NOT auth failures — they must
         // keep their original message, not the credentials hint.
-        assert!(!is_git_auth_failure("fatal: repository 'https://x/y' not found"));
+        assert!(!is_git_auth_failure(
+            "fatal: repository 'https://x/y' not found"
+        ));
         assert!(!is_git_auth_failure(
             "fatal: unable to access 'https://x/y': Could not resolve host"
         ));
@@ -626,7 +727,10 @@ mod tests {
         // wouldn't help — guide to SSH/creds instead.
         let m = auth_required_message("克隆", "https://github.com/o/r", "fatal: auth");
         assert!(m.contains("SSH"), "got: {m}");
-        assert!(!m.contains("/login"), "must not suggest /login for untrusted host: {m}");
+        assert!(
+            !m.contains("/login"),
+            "must not suggest /login for untrusted host: {m}"
+        );
     }
 
     #[test]
@@ -634,7 +738,10 @@ mod tests {
     fn auth_required_message_trusted_not_logged_in_suggests_login() {
         let _home = isolated_home(); // no auth.toml under the temp ATOMCODE_HOME
         let m = auth_required_message("克隆", "https://gitcode.com/o/r", "fatal: auth");
-        assert!(m.contains("/login"), "trusted host + not logged in should guide to /login: {m}");
+        assert!(
+            m.contains("/login"),
+            "trusted host + not logged in should guide to /login: {m}"
+        );
     }
 
     #[test]
@@ -699,7 +806,9 @@ mod tests {
         let _home = isolated_home();
         let repo = make_bare_repo_with_manifest(
             "ascend-model-agent-plugin",
-            Some(r#"{"name":"ascend-model-agent-plugin","plugins":[{"name":"ascend-model-agent-plugin","source":"./"}]}"#),
+            Some(
+                r#"{"name":"ascend-model-agent-plugin","plugins":[{"name":"ascend-model-agent-plugin","source":"./"}]}"#,
+            ),
         );
         let url = format!("file://{}", repo.display());
         let info = add_marketplace(&url).unwrap();
@@ -764,7 +873,9 @@ mod tests {
         // "canonical-name".
         let repo = make_bare_repo_with_manifest(
             "url-tail-name",
-            Some(r#"{"name":"canonical-name","plugins":[{"name":"canonical-name","source":"./"}]}"#),
+            Some(
+                r#"{"name":"canonical-name","plugins":[{"name":"canonical-name","source":"./"}]}"#,
+            ),
         );
         let url = format!("file://{}", repo.display());
         let info = add_marketplace(&url).unwrap();

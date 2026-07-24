@@ -140,6 +140,29 @@ fn path_in_workspace_lexical(raw: &str, workspace: &Path) -> bool {
     lexical_normalize(&joined).starts_with(&root)
 }
 
+/// Doc / prose / tabular-data file types for which a compile or type-check is meaningless.
+/// Writing a README, a generated markdown report, a CSV, or a log is NOT "code that must be
+/// verified", so such a write must not arm the "run cargo check" cadence — otherwise a
+/// non-coding turn (e.g. "write my weekly report" → a `.md` file) triggers a bogus nudge and
+/// the model runs an unrelated project's tests. Deliberately conservative: only clearly
+/// non-source extensions are listed. Anything NOT here still arms — source code AND
+/// build-affecting config (`Cargo.toml`, `package.json`, `tsconfig.json`, …), whose edits a
+/// real check legitimately catches.
+const NONCODE_DOC_EXTS: &[&str] = &[
+    "md", "markdown", "mdx", "txt", "text", "rst", "adoc", "asciidoc", "org", "csv", "tsv", "log",
+];
+
+/// Whether an edit target is a doc/data file whose edit should not arm the verify cadence
+/// (see [`NONCODE_DOC_EXTS`]). Keys purely on the file extension; a path with no extension,
+/// or any extension not in the denylist, is treated as verifiable code (conservative).
+fn path_is_noncode_doc(raw: &str) -> bool {
+    Path::new(raw.trim())
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| NONCODE_DOC_EXTS.contains(&e.as_str()))
+}
+
 /// Whether a post-edit `bash` command plausibly VERIFIES the edit (runs a build / type-check
 /// / test / lint), as opposed to read-only or review commands a model might run instead. A
 /// command verifies iff at least one of its chained segments runs a NON-read-only command —
@@ -234,10 +257,14 @@ fn unverified_edit(convo: &Conversation, workspace: &Path) -> Option<NudgedEdit>
                     // Only edits WITHIN the workspace arm the cadence — a throwaway write
                     // outside the project (e.g. /tmp) is not code to compile-check. A missing
                     // /unparseable path is treated as in-workspace (conservative — keep the nudge).
+                    // A doc/data write (a `.md` report, `.csv`, `.log`) is also skipped: it is
+                    // not compilable code, so it must not arm "run cargo check" on a non-coding
+                    // turn (see [`path_is_noncode_doc`]).
                     Some("edit_file") | Some("write_file")
                         if edit_paths
                             .get(id)
-                            .is_none_or(|p| path_in_workspace_lexical(p, workspace)) =>
+                            .is_none_or(|p| path_in_workspace_lexical(p, workspace))
+                            && !edit_paths.get(id).is_some_and(|p| path_is_noncode_doc(p)) =>
                     {
                         last_edit_id = Some(id.to_string());
                         bash_after_edit = false;
@@ -577,12 +604,12 @@ mod tests {
         assert!(path_in_workspace_lexical("src/main.rs", ws)); // relative → joined to ws
         assert!(path_in_workspace_lexical("./a/b.rs", ws));
         assert!(path_in_workspace_lexical("/home/proj/./sub/../x.rs", ws)); // normalizes inside
-        // Outside.
+                                                                            // Outside.
         assert!(!path_in_workspace_lexical("/tmp/test.txt", ws));
         assert!(!path_in_workspace_lexical("/home/other/x.rs", ws));
         assert!(!path_in_workspace_lexical("../sibling/x.rs", ws)); // escapes via ..
         assert!(!path_in_workspace_lexical("/home/proj/../evil.rs", ws)); // climbs out
-        // Sibling-prefix must not false-match (/home/proj2 is NOT under /home/proj).
+                                                                          // Sibling-prefix must not false-match (/home/proj2 is NOT under /home/proj).
         assert!(!path_in_workspace_lexical("/home/proj2/x.rs", ws));
         // Empty / unparseable → conservative in-workspace.
         assert!(path_in_workspace_lexical("", ws));
@@ -610,6 +637,93 @@ mod tests {
     async fn no_edits_does_not_nudge() {
         let msgs = vec![assistant_call("r1", "read_file"), tool_result("r1", false)];
         assert!(nudge_of(msgs).await.1.is_none());
+    }
+
+    #[tokio::test]
+    async fn writing_a_markdown_report_does_not_nudge() {
+        // Reported misfire: a non-coding turn that writes a markdown report (a weekly report)
+        // must NOT arm "run cargo check" — a `.md` is prose, not compilable code.
+        let hook = VerifyCadenceHook::new("/home/proj");
+        let mut convo = Conversation::new();
+        convo.messages = vec![
+            assistant_call_path("w1", "write_file", "/home/proj/report_2026W26.md"),
+            tool_result("w1", false),
+        ];
+        assert!(
+            hook.offer_continuation(&convo).await.is_none(),
+            "writing a markdown report must not trigger the verify cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn weekly_report_turn_with_verified_scripts_then_md_does_not_nudge() {
+        // The exact reported sequence: throwaway analysis scripts (RUN via node → verified),
+        // then the final markdown report (doc → does not arm). The turn must not nudge, so the
+        // model never reaches for a previous coding task's test suite.
+        let hook = VerifyCadenceHook::new("/home/proj");
+        let mut convo = Conversation::new();
+        convo.messages = vec![
+            user("analyze my week then write my weekly report"),
+            assistant_call_path("w1", "write_file", "/home/proj/_activity.js"),
+            tool_result("w1", false),
+            bash_call("b1", "node _activity.js"),
+            tool_result("b1", false),
+            assistant_call_path("w2", "write_file", "/home/proj/_week.js"),
+            tool_result("w2", false),
+            bash_call("b2", "node _week.js"),
+            tool_result("b2", false),
+            assistant_call_path("w3", "write_file", "/home/proj/report_2026W26.md"),
+            tool_result("w3", false),
+        ];
+        assert!(
+            hook.offer_continuation(&convo).await.is_none(),
+            "a report turn whose only unverified write is a .md doc must not nudge"
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_markdown_before_a_real_source_edit_still_nudges() {
+        // The doc skip must not mask a genuine unverified SOURCE edit later in the turn.
+        let hook = VerifyCadenceHook::new("/home/proj");
+        let mut convo = Conversation::new();
+        convo.messages = vec![
+            assistant_call_path("w1", "write_file", "/home/proj/notes.md"),
+            tool_result("w1", false),
+            assistant_call_path("e1", "edit_file", "/home/proj/src/main.rs"),
+            tool_result("e1", false),
+        ];
+        assert!(
+            hook.offer_continuation(&convo).await.is_some(),
+            "an unverified source edit after a doc write must still nudge"
+        );
+    }
+
+    #[test]
+    fn path_is_noncode_doc_classifies_extensions() {
+        for doc in [
+            "report.md",
+            "a.markdown",
+            "notes.txt",
+            "data.csv",
+            "run.log",
+            "/x/y.MD",
+        ] {
+            assert!(path_is_noncode_doc(doc), "{doc} should be a non-code doc");
+        }
+        for code in [
+            "main.rs",
+            "app.ts",
+            "x.py",
+            "index.html",
+            "Cargo.toml",
+            "package.json",
+            "noext",
+        ] {
+            assert!(
+                !path_is_noncode_doc(code),
+                "{code} must stay verifiable (arms cadence)"
+            );
+        }
     }
 
     #[tokio::test]

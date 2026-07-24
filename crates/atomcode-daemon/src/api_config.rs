@@ -1,5 +1,6 @@
 use atomcode_config::config::provider::ProviderConfig;
 use atomcode_config::config::Config;
+use atomcode_config::ConfigStore;
 use axum::{response::IntoResponse, Json};
 
 use crate::{json_error, ConfigResponse, ProviderInfo};
@@ -54,7 +55,11 @@ pub(crate) fn provider_info(
         provider_type: p.provider_type.clone(),
         model: p.model.clone(),
         base_url: p.base_url.clone(),
-        has_api_key: p.api_key.is_some(),
+        has_api_key: p.resolved_api_key().is_some(),
+        requires_login: p
+            .base_url
+            .as_deref()
+            .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway),
         is_default: name == default_provider,
         context_window: p.context_window,
         max_tokens: p.max_tokens,
@@ -92,19 +97,16 @@ pub(crate) fn validate_provider_name(name: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// Save config to disk.
-pub(crate) fn save_config(config: &Config) -> Result<(), String> {
-    let path = Config::default_path();
-    config
-        .save(&path)
-        .map_err(|e| format!("Failed to save config: {:#}", e))
-}
-
-/// Clean up expired login sessions (TTL: 10 minutes).
-pub(crate) async fn cleanup_expired_sessions(login_sessions: &crate::LoginSessionsStore) {
-    let mut sessions = login_sessions.write().await;
-    let now = std::time::Instant::now();
-    sessions.retain(|_, entry| now.duration_since(entry.created_at).as_secs() < 600);
+/// Apply one config delta to the latest on-disk snapshot. Provider/config API
+/// handlers should use this instead of load-mutate-save to avoid lost updates
+/// when an IDE and TUI write concurrently.
+pub(crate) fn update_config(
+    mutate: impl FnOnce(&mut Config) -> anyhow::Result<()>,
+) -> Result<Config, String> {
+    ConfigStore::default_store()
+        .update(mutate)
+        .map(|commit| commit.snapshot.config)
+        .map_err(|e| format!("Failed to update config: {e:#}"))
 }
 
 // ============================================================================
@@ -131,4 +133,51 @@ pub(crate) async fn reload_config() -> impl IntoResponse {
         }
     };
     Json(config_response(&config)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(base_url: &str) -> ProviderConfig {
+        ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: None,
+            model: "model".into(),
+            base_url: Some(base_url.into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+            capable_model: None,
+        }
+    }
+
+    #[test]
+    fn provider_info_reports_login_dependency_from_gateway() {
+        assert!(
+            provider_info(
+                "renamed",
+                &provider("https://llm-api.atomgit.com/v1"),
+                "renamed"
+            )
+            .requires_login
+        );
+        assert!(
+            !provider_info(
+                "AtomGit-looking-custom",
+                &provider("https://example.test/v1"),
+                "AtomGit-looking-custom"
+            )
+            .requires_login
+        );
+    }
 }

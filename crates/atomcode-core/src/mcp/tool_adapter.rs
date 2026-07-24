@@ -44,10 +44,7 @@ impl Tool for McpToolAdapter {
                     self.info.server_name
                 )
             } else {
-                format!(
-                    "[MCP:{}] {}",
-                    self.info.server_name, self.info.description
-                )
+                format!("[MCP:{}] {}", self.info.server_name, self.info.description)
             },
             parameters: self.info.input_schema.clone(),
         }
@@ -137,29 +134,51 @@ mod approval_tests {
         let reg = Arc::new(McpRegistry::new());
         reg.mark_trusted("trusted-srv");
         let adapter = McpToolAdapter::new(reg, info("trusted-srv"));
-        assert!(matches!(adapter.approval("{}"), ApprovalRequirement::AutoApprove));
+        assert!(matches!(
+            adapter.approval("{}"),
+            ApprovalRequirement::AutoApprove
+        ));
     }
 
     #[test]
     fn untrusted_server_requires_approval() {
         let reg = Arc::new(McpRegistry::new());
         let adapter = McpToolAdapter::new(reg, info("other-srv"));
-        assert!(matches!(adapter.approval("{}"), ApprovalRequirement::RequireApproval(_)));
+        assert!(matches!(
+            adapter.approval("{}"),
+            ApprovalRequirement::RequireApproval(_)
+        ));
     }
 
     #[test]
     fn per_tool_auto_approve_bypasses_only_that_tool() {
         let reg = Arc::new(McpRegistry::new());
         reg.mark_tool_auto_approved("mcp__srv__query");
-        let approved = McpToolAdapter::new(reg.clone(), McpToolInfo {
-            server_name: "srv".into(), tool_name: "query".into(),
-            description: String::new(), input_schema: serde_json::json!({}),
-        });
-        assert!(matches!(approved.approval("{}"), ApprovalRequirement::AutoApprove));
-        let other = McpToolAdapter::new(reg, McpToolInfo {
-            server_name: "srv".into(), tool_name: "delete".into(),
-            description: String::new(), input_schema: serde_json::json!({}),
-        });
-        assert!(matches!(other.approval("{}"), ApprovalRequirement::RequireApproval(_)));
+        let approved = McpToolAdapter::new(
+            reg.clone(),
+            McpToolInfo {
+                server_name: "srv".into(),
+                tool_name: "query".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({}),
+            },
+        );
+        assert!(matches!(
+            approved.approval("{}"),
+            ApprovalRequirement::AutoApprove
+        ));
+        let other = McpToolAdapter::new(
+            reg,
+            McpToolInfo {
+                server_name: "srv".into(),
+                tool_name: "delete".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({}),
+            },
+        );
+        assert!(matches!(
+            other.approval("{}"),
+            ApprovalRequirement::RequireApproval(_)
+        ));
     }
 }

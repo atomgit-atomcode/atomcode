@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.0</span>
+    <span class="dhdr-ver">v5.0.1</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -161,7 +163,8 @@ atomcode --dangerously-skip-permissions</code></pre>
       <p>In the TUI:</p>
       <ul>
         <li><code>Enter</code> sends the message.</li>
-        <li><code>Shift+Enter</code> / <code>Ctrl+Enter</code> / <code>Ctrl+J</code> insert a newline (requires Kitty keyboard protocol: kitty / WezTerm / Alacritty / iTerm2 ≥3.5 / Windows Terminal ≥1.21).</li>
+        <li><code>\</code> then <code>Enter</code> inserts a newline — works in every terminal (a trailing backslash makes the line a continuation).</li>
+        <li><code>Shift+Enter</code> / <code>Ctrl+Enter</code> insert a newline (requires Kitty keyboard protocol: kitty / WezTerm / Alacritty / iTerm2 ≥3.5 / Windows Terminal ≥1.21; not available on Windows).</li>
         <li><code>Alt+Enter</code> inserts a newline (works in most terminals, but Windows Terminal binds it to "toggle fullscreen" by default — unbind in settings).</li>
         <li>The input area grows with content.</li>
       </ul>
@@ -238,7 +241,7 @@ atomcode --dangerously-skip-permissions</code></pre>
       <ul>
         <li><code>/resume</code> — switch between or restore previous sessions</li>
         <li><code>/session</code> — start a clean session</li>
-        <li><code>/cd</code> or just type <code>cd /path</code> — switch working directory (status bar updates live)</li>
+        <li><code>/cd</code> or just type <code>cd /path</code> — switch working directory and start a new session (status bar updates live)</li>
         <li><code>/clear</code> — clear messages in the current session</li>
         <li><code>/compact</code> — compact history to free up context budget</li>
       </ul>

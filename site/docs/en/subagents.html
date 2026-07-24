@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Subagents · AtomCode Docs</title>
+<meta name="description" content="Delegate parallel, mechanical, or read-only subtasks to short-lived subagents via the task tool, with enforced write scopes.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="subagents">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v5.0.1</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
+    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
+    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Subagents</h1>
+      <p class="lede">When a task splits cleanly — parallel edits, mechanical repetition, or read-only investigation — the main agent can hand subtasks to short-lived <strong>subagents</strong> through the <code>task</code> tool. Each subagent runs in its own isolated context; the main agent keeps the cross-file reasoning and owns the final result. The <code>task</code> tool is <strong>on by default</strong>.</p>
+
+      <h2>Two kinds of subagent</h2>
+      <table>
+        <thead>
+          <tr><th>Type</th><th>What it can do</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>explore</strong></td><td>Read-only investigation — reads and searches the codebase to answer a “where / how” question, then returns findings. <strong>Cannot edit files.</strong></td></tr>
+          <tr><td><strong>worker</strong></td><td>Executes a tightly-specified change. Reads freely, but its <em>writes</em> are confined to a declared <code>scope</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <h2>How they run</h2>
+      <ul>
+        <li>Subagents run in parallel, up to <code>max_concurrent</code> at a time, each in an isolated context.</li>
+        <li>Each subtask carries a difficulty: <code>simple</code> routes to your <strong>fast</strong> model, <code>hard</code> routes to your <strong>capable</strong> model — chosen by the <code>capable_model</code> rank across your configured providers. With a single provider, the subagent uses the current model.</li>
+        <li>The main agent reviews each result before continuing — a subagent proposes, the main agent decides.</li>
+      </ul>
+
+      <h2>Worker scope &amp; safety</h2>
+      <p>A <code>worker</code> subtask <strong>must</strong> declare a <code>scope</code>: a list of working-directory-relative globs it is allowed to write, e.g. <code>["src/auth/**", "Cargo.toml"]</code>. This is enforced, not advisory:</p>
+      <ul>
+        <li>Writes outside the scope (<code>edit_file</code>, <code>write_file</code>, <code>search_replace</code>) are <strong>hard-denied</strong> — not prompted — by the WorkerScopeGate.</li>
+        <li>Reads and <code>bash</code> are not restricted by scope.</li>
+        <li>A dispatch that contains any <code>worker</code> is treated as a <strong>Risky</strong> action, so it goes through <a href="./approvals.html">approval</a> first, with the scopes shown.</li>
+        <li>When several workers run at once, give them non-overlapping scopes so they cannot clobber each other.</li>
+      </ul>
+
+      <h2>Configuration</h2>
+      <p>Tune the subagent pool in <code>~/.atomcode/config.toml</code>:</p>
+      <pre><code>[subagent]
+max_concurrent = 3     # parallel subagents at once (min 1)
+timeout_secs   = 900   # per-subtask wall-clock limit, seconds (min 30)
+max_rounds     = 200   # per-subtask model-round cap (0 = unbounded)</code></pre>
+      <table>
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Meaning</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>max_concurrent</code></td><td>3</td><td>How many subagents run in parallel</td></tr>
+          <tr><td><code>timeout_secs</code></td><td>900</td><td>Wall-clock timeout per subtask (floored to 30s)</td></tr>
+          <tr><td><code>max_rounds</code></td><td>200</td><td>Model-round high-water mark per subtask; <code>0</code> = unbounded</td></tr>
+        </tbody>
+      </table>
+      <p>Environment overrides: <code>ATOMCODE_SUBAGENT_TIMEOUT</code> and <code>ATOMCODE_SUBAGENT_MAX_ROUNDS</code> take precedence over the config values.</p>
+
+      <h2>Turning it off</h2>
+      <p>The <code>task</code> tool is enabled by default. To remove it entirely, set:</p>
+      <pre><code>ATOMCODE_SUBAGENT=0 atomcode</code></pre>
+      <p>Any of <code>0</code>, <code>false</code>, or <code>off</code> disables it; unset (or any other value) leaves it on.</p>
+
+      <h2>Related</h2>
+      <ul>
+        <li><a href="./tools.html">Built-in Tools</a> — the tools a subagent has access to</li>
+        <li><a href="./approvals.html">Permissions &amp; Approvals</a> — why a worker dispatch asks for approval</li>
+        <li><a href="./configuration.html">Configuration</a> — the full <code>config.toml</code> reference</li>
+      </ul>
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

@@ -48,7 +48,11 @@ impl Tool for TraceCalleesTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => return err(format!("trace_callees: invalid arguments: {e}. Expected {{\"symbol\":\"<name>\"}}.")),
+            Err(e) => {
+                return err(format!(
+                    "trace_callees: invalid arguments: {e}. Expected {{\"symbol\":\"<name>\"}}."
+                ))
+            }
         };
         let depth = a.depth.unwrap_or(3).min(5);
         let index = self.index.clone();
@@ -66,11 +70,19 @@ fn render(index: &CodeIndex, root: &Path, symbol: &str, depth: usize) -> ToolRes
     let root: &Path = &croot;
     let matches = g.find_by_name(symbol);
     if matches.is_empty() {
-        return err(format!("Symbol '{symbol}' not found in code graph ({} symbols indexed).", g.node_count()));
+        return err(format!(
+            "Symbol '{symbol}' not found in code graph ({} symbols indexed).",
+            g.node_count()
+        ));
     }
     let mut out = String::new();
     for sym in &matches {
-        out.push_str(&format!("Callees of {} ({:?}) in {}:\n", sym.name, sym.kind, display_path(&sym.file, root)));
+        out.push_str(&format!(
+            "Callees of {} ({:?}) in {}:\n",
+            sym.name,
+            sym.kind,
+            display_path(&sym.file, root)
+        ));
         let callees = g.trace_callees(sym.id, depth);
         if callees.is_empty() {
             out.push_str("  (no callees found)\n");
@@ -80,7 +92,11 @@ fn render(index: &CodeIndex, root: &Path, symbol: &str, depth: usize) -> ToolRes
                     let indent = "  ".repeat(*d);
                     out.push_str(&format!(
                         "{}[depth {}] {} ({:?}) — {}\n",
-                        indent, d, node.name, node.kind, display_path(&node.file, root)
+                        indent,
+                        d,
+                        node.name,
+                        node.kind,
+                        display_path(&node.file, root)
                     ));
                 }
             }
@@ -98,9 +114,18 @@ mod tests {
     #[tokio::test]
     async fn traces_callees() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("a.rs"), "fn leaf() {}\nfn root() { leaf(); }\n").unwrap();
+        std::fs::write(
+            d.path().join("a.rs"),
+            "fn leaf() {}\nfn root() { leaf(); }\n",
+        )
+        .unwrap();
         let tool = TraceCalleesTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
         let r = tool.execute(r#"{"symbol":"root"}"#, &ctx).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("Callees of root"), "{}", r.content);

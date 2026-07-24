@@ -16,16 +16,23 @@ use agent_client_protocol::schema::v1::{
     SessionId, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Client, ConnectionTo};
-use atomcode_kernel::event::AgentCommand;
-use tokio::sync::mpsc::UnboundedSender;
+use atomcode_coding::CodingRuntimeHandle;
 
 /// The four standard permission options, each with a stable `option_id` string
 /// that `outcome_to_decision` maps back to the kernel's decision JSON.
 pub fn permission_options() -> Vec<PermissionOption> {
     vec![
         PermissionOption::new("allow_once", "Allow once", PermissionOptionKind::AllowOnce),
-        PermissionOption::new("allow_always", "Always allow", PermissionOptionKind::AllowAlways),
-        PermissionOption::new("reject_once", "Reject once", PermissionOptionKind::RejectOnce),
+        PermissionOption::new(
+            "allow_always",
+            "Always allow",
+            PermissionOptionKind::AllowAlways,
+        ),
+        PermissionOption::new(
+            "reject_once",
+            "Reject once",
+            PermissionOptionKind::RejectOnce,
+        ),
         PermissionOption::new(
             "reject_always",
             "Always reject",
@@ -61,7 +68,7 @@ pub fn outcome_to_decision(option_id: &str) -> serde_json::Value {
 pub async fn handle_approval(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
-    cmd_tx: &UnboundedSender<AgentCommand>,
+    runtime: &CodingRuntimeHandle,
     req_id: u64,
     payload: serde_json::Value,
 ) -> Result<(), agent_client_protocol::Error> {
@@ -99,7 +106,9 @@ pub async fn handle_approval(
         .await
     {
         Ok(resp) => match resp.outcome {
-            RequestPermissionOutcome::Selected(sel) => outcome_to_decision(sel.option_id.0.as_ref()),
+            RequestPermissionOutcome::Selected(sel) => {
+                outcome_to_decision(sel.option_id.0.as_ref())
+            }
             // Cancelled or any future non-exhaustive variant → fail closed.
             _ => serde_json::json!({"decision": "deny"}),
         },
@@ -109,7 +118,7 @@ pub async fn handle_approval(
         }
     };
 
-    cmd_tx.send(AgentCommand::Respond { id: req_id, value: decision }).ok();
+    let _ = runtime.respond(req_id, decision).await;
     Ok(())
 }
 
@@ -119,14 +128,26 @@ mod tests {
 
     #[test]
     fn decision_mapping_is_fail_closed() {
-        assert_eq!(outcome_to_decision("allow_once"), serde_json::json!({"decision":"allow"}));
+        assert_eq!(
+            outcome_to_decision("allow_once"),
+            serde_json::json!({"decision":"allow"})
+        );
         assert_eq!(
             outcome_to_decision("allow_always"),
             serde_json::json!({"decision":"allow","remember":true})
         );
-        assert_eq!(outcome_to_decision("reject_once"), serde_json::json!({"decision":"deny"}));
-        assert_eq!(outcome_to_decision("reject_always"), serde_json::json!({"decision":"deny"}));
-        assert_eq!(outcome_to_decision("anything_else"), serde_json::json!({"decision":"deny"}));
+        assert_eq!(
+            outcome_to_decision("reject_once"),
+            serde_json::json!({"decision":"deny"})
+        );
+        assert_eq!(
+            outcome_to_decision("reject_always"),
+            serde_json::json!({"decision":"deny"})
+        );
+        assert_eq!(
+            outcome_to_decision("anything_else"),
+            serde_json::json!({"decision":"deny"})
+        );
     }
 
     #[test]

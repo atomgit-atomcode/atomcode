@@ -2,9 +2,9 @@
 // Task 15 — sessionId + cwd lifted to App
 //
 // 本文件承载对话主视图：消息时间线渲染、流式输出、工具调用展示、
-// 输入与发送、技能/@提及、同步模式、权限卡、会话内消息搜索反查定位
-// (search state + visibleMessages + navMatch + .msg-search-bar)、消息发送
-// 时间标记 (formatMsgTime/formatMsgTimeFull + .msg-time) 的实现亦在此文件。
+// 输入与发送、技能/@提及、同步模式、权限卡、会话内消息搜索浮动框
+// (Cmd/Ctrl+F 呼出,Esc 关闭,searchOpen/search/visibleMessages/navMatch/.msg-search-float)、
+// 消息发送时间标记 (formatMsgTime/formatMsgTimeFull + .msg-time) 的实现亦在此文件。
 //
 // ─── bot review 已闭环项 (会话内搜索, PR #602) ───
 //   stale closure → ad2f8da6 + cc5afff5 (matchIdxRef + navMatch);
@@ -26,8 +26,8 @@
 // 我们愿意根据再审意见继续优化。
 
 import { VNode } from 'preact';
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, type CommandResult } from '../api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, type CommandResult, UserInputRequestEvent } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -44,6 +44,7 @@ import { ModeSelector } from './ModeSelector';
 import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
+import { UserInputCard } from './UserInputCard';
 import { useT } from '../settings';
 import type { MsgKey } from '../i18n';
 import {
@@ -54,6 +55,20 @@ import {
 } from '../lib/atMention';
 import { toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage } from '../lib/historyMessages';
+import {
+  chatRecoveryPolicy,
+  classifyChatDone,
+  createLiveLifecycleState,
+  isCurrentChatStream,
+  liveDetachDisposition,
+  liveSnapshotQueueDisposition,
+  reduceChatRecovery,
+  reduceLiveLifecycle,
+  restoreLiveSnapshot,
+  syncAttachDisposition,
+  type ChatRecoveryEvent,
+  type ChatRecoveryState,
+} from '../lib/chatTerminal';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -65,6 +80,13 @@ interface Message {
    *  type stays backward-compatible with the few code paths that build a
    *  Message literal without a clock (e.g. the queued-placeholder). */
   ts?: number;
+}
+
+interface QueuedMessage {
+  id: number;
+  text: string;
+  images?: ImageData[];
+  approvalMode: ApprovalMode;
 }
 
 /** Concatenate all text segments (error-detection, skill-title, etc.). */
@@ -406,24 +428,47 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // without a stale closure (refs always reflect the latest render value).
   const busyRef = useRef(false);
   busyRef.current = busy;
+  const [chatRecovery, setChatRecovery] = useState<ChatRecoveryState>('ready');
+  const chatRecoveryRef = useRef<ChatRecoveryState>('ready');
+  chatRecoveryRef.current = chatRecovery;
+  const recoveryPolicy = chatRecoveryPolicy(chatRecovery);
+
+  function transitionChatRecovery(event: ChatRecoveryEvent): ChatRecoveryState {
+    const next = reduceChatRecovery(chatRecoveryRef.current, event);
+    chatRecoveryRef.current = next;
+    setChatRecovery(next);
+    return next;
+  }
   // True for the entire duration of a /compact postCommand await so sendMessage
   // can refuse to fire while the session .json is being rewritten on disk.
   const compactingRef = useRef(false);
   // AI 执行中输入的消息排队于此，待当前回合 done 后依次自动发送（对齐 VSCode 插件）。
-  const [queued, setQueued] = useState<{
-    id: number;
-    text: string;
-    images?: ImageData[];
-    approvalMode: ApprovalMode;
-  }[]>([]);
+  const [queued, setQueuedState] = useState<QueuedMessage[]>([]);
+  const queuedRef = useRef(queued);
+  queuedRef.current = queued;
+  function setQueued(
+    update: QueuedMessage[] | ((current: QueuedMessage[]) => QueuedMessage[]),
+  ) {
+    // SSE callbacks can run before Preact commits the next render. Keep the ref
+    // authoritative synchronously so a reconnect snapshot cannot miss a just-
+    // queued message and accidentally drain it under an unknown terminal.
+    const next = typeof update === 'function' ? update(queuedRef.current) : update;
+    queuedRef.current = next;
+    setQueuedState(next);
+  }
   const queueIdRef = useRef(0);
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
   // 正在拉取某会话历史：用于抑制落地页，避免切到「有内容的会话」时先闪一下落地页。
   const [loading, setLoading] = useState(false);
   const [provider, setProvider] = useState<string | null>(null);
-  // 审批模式（build / plan / bypass）。进程级 runtime 状态，由 /live snapshot +
-  // 'mode' 事件同步，切换调 postLiveMode（下一轮生效）。confirmedMode 是 daemon 已确认值。
+  const providerPinnedRef = useRef(false);
+  const followDefaultProvider = useCallback((name: string) => {
+    if (!providerPinnedRef.current) setProvider(name);
+  }, []);
+  // 审批模式（build / accept_edits / bypass / plan）。进程级 runtime 状态，
+  // 由 /live snapshot + 'mode' 事件同步，切换调 postLiveMode（下一轮生效）。
+  // confirmedMode 是 daemon 已确认值。
   const [modeState, setModeState] = useState(() => initModeState('build' as ApprovalMode));
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
@@ -444,12 +489,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const [sync, setSync] = useState<boolean>(() => {
     try { return new URLSearchParams(location.search).get('sync') === '1'; } catch { return false; }
   });
+  const syncRef = useRef(sync);
+  syncRef.current = sync;
   // Pending live-session permission request (shown as PermissionCard, calls /live/permission).
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
+  // Pending user_input_request from the live stream (shown as UserInputCard, calls /live/user-input).
+  const [userInputReq, setUserInputReq] = useState<UserInputRequestEvent | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
+  const liveLifecycleRef = useRef(createLiveLifecycleState());
   // Wall-clock of the last byte received on the /live stream (any event OR the
   // 15s keepalive ping). A watchdog reconnects when this goes stale, catching
   // silently-dead half-open connections after long idle.
@@ -469,9 +519,28 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 当前 Chat 正在显示的会话 id。用于区分「外部切换会话(需重置+加载历史)」
   // 与「本次新建会话首条消息完成后自己拿到的 id(不应重置)」。
   const activeIdRef = useRef<string | null>(null);
+  // Distinguish async work from A -> B -> A session switches. Comparing only
+  // the session id would let the first A's late active-check/cancel result
+  // mutate the replacement A view.
+  const sessionGenerationRef = useRef(0);
+  const renderedSessionIdRef = useRef(sessionId);
+  if (renderedSessionIdRef.current !== sessionId) {
+    // Advance during render, before a passive effect can abort the old reader.
+    // An accepted first-turn `done` pre-binds activeIdRef to its new id, so that
+    // normal null -> canonical-id prop update does not invalidate its own tail.
+    if (activeIdRef.current !== sessionId) sessionGenerationRef.current += 1;
+    renderedSessionIdRef.current = sessionId;
+  }
   // 已为哪个 sessionId 触发过历史加载（或它是本 Chat 自建的会话）。用于避免
   // project_hash 迟到（刷新后由 App 异步回填）导致的重复加载 / 覆盖当前对话。
   const loadedForRef = useRef<string | null>(null);
+  // Cache of session messages, used to preserve in-progress streaming turns when switching sessions.
+  const messageCacheRef = useRef<Map<string, Message[]>>(new Map());
+  // Mirror of messages state to read the latest value without dependency tracking.
+  const messagesRef = useRef<Message[]>([]);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
   // 实时（/live）总线对应的会话 id（来自 snapshot）。用于门控实时事件：仅当用户当前
   // 查看的就是这个实时会话时才把输出渲染进画布——否则用户从侧栏打开了别的历史会话，
   // 实时输出会串进错误页面、且刷新即消失（刷新会按真实会话重载）。
@@ -493,12 +562,51 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 会话 id 变化（外部切换 / 新建按钮）才重置画布。本 Chat 自建会话首条消息完成后
     // sessionId 变成自己的 id（activeIdRef 已同步），不重置，以免清空刚看到的对话。
     if (sessionId !== activeIdRef.current) {
+      const switchGeneration = sessionGenerationRef.current;
+      const prevId = activeIdRef.current;
+      const detachedRequestId = requestIdRef.current;
+      const detachedController = abortRef.current;
+      if (prevId && messagesRef.current.length > 0) {
+        messageCacheRef.current.set(prevId, messagesRef.current);
+      }
+
       activeIdRef.current = sessionId;
       loadedForRef.current = null;
       optimisticFiredRef.current = false;
-      abortRef.current?.abort();
+      // An existing session stays send-locked until `/chat/active` proves it
+      // has no detached operation. Its canonical id is already a safe stop
+      // alias, including while the discovery request is pending or unavailable.
+      requestIdRef.current = sessionId;
+      abortRef.current = null;
+      transitionChatRecovery({ type: 'session_switch', hasSession: sessionId !== null });
+      if (detachedRequestId) {
+        const cancellation = detachedController
+          ? cancelDetachedChat(detachedRequestId, detachedController)
+          : stopChat(detachedRequestId);
+        void cancellation.catch((error) => {
+          // A -> B -> A can reuse an id. Generation, not id equality, keeps a
+          // late cancellation failure out of the replacement view.
+          if (sessionGenerationRef.current === switchGeneration) {
+            pushCommandNotice(t('chat.cancelFailed', { error: String(error) }));
+          }
+        });
+      } else {
+        detachedController?.abort();
+      }
+      liveLifecycleRef.current = createLiveLifecycleState();
       setBusy(false);
-      setMessages([]);
+      setQueued([]);
+      setLivePending(null);
+      setUserInputReq(null);
+      onPermissionResolved?.(null);
+
+      const cached = sessionId ? messageCacheRef.current.get(sessionId) : undefined;
+      if (cached && cached.length > 0) {
+        setMessages(cached);
+      } else {
+        setMessages([]);
+      }
+
       // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
       setSearch('');
       setMatchIdx(0);
@@ -506,17 +614,27 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setHistoryHint(null);
       // 切到一个有 id 的会话 → 进入「加载中」，先抑制落地页（避免闪屏）；
       // 无 id（新建）则不加载、直接落地。
-      setLoading(sessionId != null);
+      setLoading(sessionId != null && !cached);
       // sync 模式：本端在侧栏切到另一个（已存在）会话时，通知后端广播会话切换，
       // 使同进程 sync 模式的 TUI 跟随加载该会话历史。
       // 不会回环：远端 session_switched 事件的 handler 会先把 activeIdRef 设为该 id，
       // 故由广播回流引起的 sessionId 变化进不来这个分支（条件已不成立），不会再次广播。
       if (sync && sessionId) {
-        postLiveSwitchSession(sessionId).catch(() => {});
+        postLiveSwitchSession(sessionId).catch((error) => {
+          if (sessionGenerationRef.current !== switchGeneration) return;
+          stopLiveStream();
+          setSync(false);
+          setBusy(false);
+          setQueued([]);
+          setHistoryHint(t('sync.switchFailed', { error: String(error) }));
+        });
       }
     }
 
-    if (!sessionId) return;
+    if (!sessionId) {
+      requestIdRef.current = null;
+      return;
+    }
     // 已为该会话加载过历史（或它是本 Chat 自建会话）→ 不重复加载、不覆盖。
     if (loadedForRef.current === sessionId) return;
 
@@ -530,43 +648,75 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     // 标记已为该会话发起加载，避免并发/重复。
     loadedForRef.current = sessionId;
-    setLoading(true);
+    const cached = messageCacheRef.current.get(sessionId);
+    if (!cached) {
+      setLoading(true);
+    }
     const loadId = sessionId;
-    getSession(projectHash, loadId)
-      .then((detail) => {
-        // 加载期间用户可能已切走，确保结果仍对应当前会话。
-        if (activeIdRef.current !== loadId) return;
-        // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
-        const loaded = sessionMessagesToDisplay(detail.messages);
-        if (loaded.length > 0) {
-          // A newly loaded session starts at the bottom regardless of prior scroll state.
-          atBottomRef.current = true;
-          setMessages(loaded);
-          setHistoryHint(null);
+    const loadGeneration = sessionGenerationRef.current;
+    Promise.allSettled([getSession(projectHash, loadId), getActiveChatSessions()])
+      .then(([sessionResult, activeResult]) => {
+        // Generation also covers A -> B -> A; id equality alone is insufficient.
+        if (
+          activeIdRef.current !== loadId ||
+          sessionGenerationRef.current !== loadGeneration
+        ) return;
+
+        let nextHint: string | null = null;
+        if (sessionResult.status === 'fulfilled') {
+          // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
+          const loaded = sessionMessagesToDisplay(sessionResult.value.messages);
+          const currentCached = messageCacheRef.current.get(loadId);
+
+          if (currentCached && currentCached.length > 0) {
+            // If the loaded messages from the backend are shorter than the cached messages,
+            // it means the backend task is still running or hasn't saved yet.
+            // Keep the cached messages and do not overwrite them with stale backend history.
+            if (loaded.length >= currentCached.length) {
+              setMessages(loaded);
+              messageCacheRef.current.delete(loadId);
+            }
+          } else if (loaded.length > 0) {
+            // A newly loaded session starts at the bottom regardless of prior scroll state.
+            atBottomRef.current = true;
+            setMessages(loaded);
+          }
         } else {
-          // 空会话：不再显示「继续会话」提示，交给落地页（landing）。
-          setHistoryHint(null);
-        }
-        setLoading(false);
-      })
-      .catch(() => {
-        // 失败回退提示，并清掉标记以允许后续重试。
-        if (activeIdRef.current === loadId) {
           loadedForRef.current = null;
-          setHistoryHint(t('chat.continueSession', { id: loadId.slice(0, 8) }));
+          nextHint = t('chat.continueSession', { id: loadId.slice(0, 8) });
         }
+
+        if (activeResult.status === 'fulfilled') {
+          const active = activeResult.value.includes(loadId);
+          transitionChatRecovery({ type: 'active_check_succeeded', active });
+          if (active) {
+            requestIdRef.current = loadId;
+            if (!syncRef.current) setBusy(false);
+            setQueued([]);
+            nextHint = t('chat.detachedActive');
+            pushCommandNotice(t('chat.detachedActive'));
+          } else if (requestIdRef.current === loadId) {
+            requestIdRef.current = null;
+          }
+        } else {
+          // `/chat` has no stream reattach endpoint. The registry is authoritative
+          // when available; if discovery fails, keep the canonical stop alias and
+          // fail closed instead of allowing a possibly concurrent send.
+          requestIdRef.current = loadId;
+          transitionChatRecovery({ type: 'active_check_failed' });
+          if (!syncRef.current) setBusy(false);
+          setQueued([]);
+          nextHint = t('chat.activeCheckFailed', { error: String(activeResult.reason) });
+          pushCommandNotice(nextHint);
+          // Allow a later metadata/session refresh to retry discovery.
+          loadedForRef.current = null;
+        }
+
+        setHistoryHint(nextHint);
         setLoading(false);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, activeSession?.project_hash]);
-
-  // Initialize provider from default model
-  useEffect(() => {
-    getModels().then((ms) => {
-      const def = ms.find((m) => m.is_default) ?? ms[0];
-      if (def) setProvider((p) => p ?? def.provider);
-    }).catch(() => {});
-  }, []);
 
   // How close to the bottom (px) still counts as "at the bottom" — a small slack so
   // sub-pixel rounding / layout jitter during streaming doesn't wrongly release follow.
@@ -716,7 +866,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       attempt += 1;
       if (attempt > 6) {
         stopLiveStream();
+        liveLifecycleRef.current = createLiveLifecycleState();
         setSync(false);
+        setBusy(false);
+        setQueued([]);
+        setLivePending(null);
+        setUserInputReq(null);
+        setHistoryHint(t('sync.reconnectFailed'));
+        pushNoticeToLastAssistant(t('sync.reconnectFailed'));
         return;
       }
       const delay = Math.min(1000 * 2 ** (attempt - 1), 15000);
@@ -728,7 +885,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     const run = () => {
       const startedAt = Date.now();
       streamLive(
-        onLiveEvent,
+        (event) => {
+          // Abort alone does not retract a callback already queued by the old
+          // reader. Controller identity is the live-stream generation fence.
+          if (liveAbortRef.current === controller && !controller.signal.aborted) {
+            onLiveEvent(event);
+          }
+        },
         controller.signal,
         activeIdRef.current,
         () => {
@@ -851,9 +1014,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'tool_progress': return { type: 'tool_progress', id: e.id, progress: e.progress };
       case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
-      case 'error': return { type: 'error', message: e.message };
       case 'warning': return { type: 'warning', message: e.message };
-      case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming };
+      case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming, server_message: e.server_message ?? null };
       // NOTE: no artifact_* mapping. This is safe today because the /sync live
       // wire forwards raw TextDelta with the ``` fences intact (see to_wire in
       // live_api.rs — it does NOT run text through ArtifactDetector), so the
@@ -861,6 +1023,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // into artifact_* events, which handleEvent reconstructs. If the live path
       // ever adopts the ArtifactDetector, add artifact_start/content/end here or
       // /sync will silently drop fenced code again.
+      case 'command_output': return { type: 'command_output', text: e.text };
       default: return null;
     }
   }
@@ -877,31 +1040,40 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       const loaded = sessionMessagesToDisplay(e.messages).map(m => ({ ...m, ts: m.ts ?? Date.now() }));
       // Live snapshot (session switch / reconnect) → start at the bottom.
       atBottomRef.current = true;
-      // The daemon commits the user message into the snapshot at turn START, so
-      // a snapshot ending in a `user` message means a turn is in progress and
-      // its assistant reply is still streaming via the replay/live events that
-      // follow. Append the empty assistant placeholder those events append into
-      // (the live `user` event that normally creates it isn't replayed), and
-      // mark busy — otherwise a mid-turn reconnect drops the in-flight reply,
-      // and a reconnect after the turn finished during a dead window would
-      // otherwise leave `busy` stuck true. Idle snapshots clear busy.
-      const inProgress = loaded.length > 0 && loaded[loaded.length - 1].role === 'user';
-      if (inProgress) {
-        setMessages([...loaded, { role: 'assistant', parts: [], ts: Date.now() }]);
-        setBusy(true);
-      } else {
-        setMessages(loaded.length > 0 ? loaded : []);
-        setBusy(false);
+      // A persisted snapshot does not carry live activity. Replay emits the
+      // authoritative input/state observations immediately after it; only those
+      // may restore `busy`. In particular, a history ending in a user message can
+      // be an already-failed turn and must not manufacture an in-flight reply.
+      const queueDisposition = liveSnapshotQueueDisposition(
+        liveLifecycleRef.current.running || busyRef.current,
+        queuedRef.current.length,
+      );
+      const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, { type: 'snapshot' });
+      liveLifecycleRef.current = lifecycle.state;
+      const restored = restoreLiveSnapshot(loaded);
+      setMessages(restored.messages.length > 0 ? restored.messages : []);
+      setBusy(restored.running);
+      if (queueDisposition.discardQueued) {
+        setQueued([]);
+        pushCommandNotice(t('sync.reconnectTerminalUnknown'));
       }
+      setLivePending(null);
+      setUserInputReq(null);
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
-      if (e.provider) setProvider(e.provider);
-      // 同步当前审批模式，让新 tab 显示正确的模式 pill（含别的 tab 切成的 Bypass/Plan）。
+      if (e.provider) {
+        providerPinnedRef.current = false;
+        setProvider(e.provider);
+      }
+      // 同步当前审批模式，让新 tab 显示正确的模式 pill（含别的 tab 切成的 Auto/Plan）。
       if (e.mode) setModeState(initModeState(e.mode));
       // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
       // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，
       // 避免 App 回填 project_hash 时触发重复加载覆盖当前画布。
       if (e.session_id) {
+        if (activeIdRef.current !== e.session_id) {
+          sessionGenerationRef.current += 1;
+        }
         activeIdRef.current = e.session_id;
         loadedForRef.current = e.session_id;
         onSessionId(e.session_id);
@@ -910,6 +1082,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }
     // 模型切换是进程级（全局），与正在查看哪个会话无关 → 不门控，始终更新下拉框。
     if (e.type === 'provider') {
+      providerPinnedRef.current = false;
       setProvider(e.provider);
       return;
     }
@@ -938,22 +1111,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 不设置 loadedForRef：让 Chat useEffect 在 activeSession 到位后
     // 正常走 getSession 加载（空）历史并清除 historyHint；
     // 否则 loadedForRef 会阻止加载，导致 historyHint 永远不被清除。
-    // 重启 SSE 连接：旧连接订阅的是旧 LiveSession，后续 turn 事件不会到达；
-    // 重新连接后 /live handler 会绑定到新 LiveSession。
+    // 重启 SSE 连接以取得新会话的 authoritative snapshot 和 replay window。
     if (e.type === 'session_switched') {
       liveSessionIdRef.current = e.session_id;
       // 本端正是发起此次切换的视图（侧栏切到已存在会话→postLiveSwitchSession→广播
       // 回流），或重复广播：此时我们已经在该会话上、历史也正在/已经加载，绝不能再清空
       // 画布，否则刚 getSession 加载好的历史会被自己的广播回流抹掉（且 sessionId 未变，
-      // 加载 effect 不会重跑，history 永远回不来）。仅把实时流重绑到新 LiveSession 即可。
+      // 加载 effect 不会重跑，history 永远回不来）。仅刷新实时流即可。
       const alreadyViewing = activeIdRef.current === e.session_id;
       activeIdRef.current = e.session_id;
       if (!alreadyViewing) {
+        sessionGenerationRef.current += 1;
         onSessionId(e.session_id);
         setMessages([]);
         // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
         setSearch('');
         setMatchIdx(0);
+        setSearchOpen(false);
         setTokens(null);
         setHistoryHint(null);
       }
@@ -976,6 +1150,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     switch (e.type) {
       case 'user': {
+        const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
+          type: 'input_accepted',
+        });
+        liveLifecycleRef.current = lifecycle.state;
+        setBusy(lifecycle.state.running);
         // Append the peer's user message + empty assistant placeholder
         const now = Date.now();
         setMessages((prev) => [
@@ -986,14 +1165,35 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         break;
       }
       case 'state': {
-        setBusy(e.running);
-        // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
-        // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
-        if (!e.running) {
+        const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
+          type: 'state',
+          running: e.running,
+          stopReason: e.stop_reason,
+          message: e.message,
+        });
+        liveLifecycleRef.current = lifecycle.state;
+        setBusy(lifecycle.state.running);
+        if (lifecycle.terminal) {
+          if (lifecycle.terminal.discardQueued) {
+            setQueued([]);
+            pushNoticeToLastAssistant(t('chat.incomplete', { msg: lifecycle.terminal.detail }));
+          }
+          // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
+          // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
           setLivePending(null);
+          setUserInputReq(null);
           // turn 完成后 session 已落盘，通知 App 刷新侧栏列表。
           onLiveTurnDone?.();
         }
+        break;
+      }
+      case 'error': {
+        const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
+          type: 'error',
+          message: e.message,
+        });
+        liveLifecycleRef.current = lifecycle.state;
+        pushNoticeToLastAssistant(t('chat.error', { msg: lifecycle.diagnostic ?? e.message }));
         break;
       }
       case 'permission_request': {
@@ -1001,6 +1201,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         updateToolInLastAssistant(e.call_id, { status: 'waiting_approval' });
         // Show the PermissionCard for the live session (calls /live/permission via onDecide)
         setLivePending({ tool_name: e.tool_name, reason: e.reason, call_id: e.call_id, arguments: e.arguments });
+        break;
+      }
+      case 'user_input_request': {
+        // Show the UserInputCard; it calls /live/user-input directly.
+        setUserInputReq(e);
         break;
       }
       default: {
@@ -1021,16 +1226,34 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     setSync((prev) => {
       const next = !prev;
       if (next) {
-        // 重新开启同步：先把当前会话广播给 TUI，再启动本端实时流。
-        // 关闭同步期间 webui 可能已切换/新建到别的会话（不广播），此时全局 LiveSession
-        // 仍绑在旧会话、TUI 也订阅着旧实例。若直接 startLiveStream，/live 会以新 session_id
-        // 替换全局 LiveSession 却不通知旧实例的订阅者，TUI 就此被孤立、停在旧会话不跟随。
-        // 故必须先 postLiveSwitchSession：它在「旧」全局实例上广播 SessionSwitched，TUI 据此
-        // 加载本端会话并把实时总线重绑到新实例——与侧栏切换会话的同步路径一致。
-        // 顺序关键：必须等广播发出（落在 TUI 仍订阅的旧实例上）后再启动会替换全局的实时流。
+        const attach = syncAttachDisposition(
+          busyRef.current,
+          chatRecoveryRef.current,
+        );
+        if (!attach.allowed) {
+          pushCommandNotice(t('sync.stopBeforeAttach'));
+          return prev;
+        }
+      }
+      if (!next) {
+        const detach = liveDetachDisposition(
+          liveLifecycleRef.current.running || busyRef.current,
+        );
+        if (!detach.allowed) {
+          pushNoticeToLastAssistant(t('sync.stopBeforeDetach'));
+          return prev;
+        }
+      }
+      if (next) {
+        // 重新开启同步：先让已绑定的 Coding Runtime 恢复当前会话，再读取 live hub 快照。
         const sid = activeIdRef.current;
         if (sid) {
-          postLiveSwitchSession(sid).catch(() => {}).finally(() => startLiveStream());
+          postLiveSwitchSession(sid)
+            .then(() => startLiveStream())
+            .catch((error) => {
+              setSync(false);
+              setHistoryHint(t('sync.switchFailed', { error: String(error) }));
+            });
         } else {
           startLiveStream();
         }
@@ -1114,8 +1337,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   /** Switch the active provider and notify the backend when in sync mode. */
   function switchProvider(name: string) {
+    if (!sync) {
+      providerPinnedRef.current = true;
+      setProvider(name);
+      return;
+    }
+    const previous = provider;
     setProvider(name);
-    if (sync) void postLiveProvider(name);
+    void postLiveProvider(name, sessionId).catch((error) => {
+      setProvider(previous);
+      setHistoryHint(t('chat.connError', { msg: String(error) }));
+    });
   }
 
   const slashHandlers: SlashHandlers = useMemo(
@@ -1237,10 +1469,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             return;
           }
           if (res.kind === 'status') {
-            pushCommandNotice(t('cmd.status.body', {
-              model: res.model || '—', dir: res.working_dir, provider: res.provider || '—',
-              login: res.logged_in ? (res.username ?? '') : t('cmd.status.notLoggedIn'), config: res.config_path,
-            }));
+            pushCommandNotice(res.text);
             return;
           }
           if (res.kind === 'config') { pushCommandNotice(t('cmd.config.body', { path: res.path, provider: res.provider || '—' })); return; }
@@ -1339,6 +1568,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   function handleEvent(event: SSEEvent) {
     switch (event.type) {
+      case 'runtime_info':
+        setProvider(event.provider);
+        break;
+      case 'command_output':
+        pushCommandNotice(event.text);
+        break;
+
       case 'text':
         appendToLastAssistant(event.content);
         break;
@@ -1397,17 +1633,31 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         onPermission(event as PermissionRequestEvent);
         break;
 
-      case 'done':
+      case 'done': {
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
         activeIdRef.current = event.session_id;
         loadedForRef.current = event.session_id;
         onSessionId(event.session_id);
+        const terminal = classifyChatDone({
+          stopReason: event.stop_reason,
+          message: event.message,
+        });
+        if (terminal.discardQueued) {
+          // An abnormal terminal preserves the partial transcript, but queued
+          // input was composed under the assumption that this turn succeeded.
+          // Never execute it automatically after an incomplete turn.
+          setQueued([]);
+          pushNoticeToLastAssistant(t('chat.incomplete', { msg: terminal.detail }));
+        }
+        transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
         break;
+      }
 
       case 'stopped':
+        transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         setQueued([]); // 用户中止：丢弃排队消息（对齐 VSCode 插件）
         onPermissionResolved?.(null);
@@ -1415,6 +1665,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
       case 'error':
         appendToLastAssistant('\n\n' + t('chat.error', { msg: event.message }));
+        transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         setQueued([]); // 出错：丢弃排队消息
         onPermissionResolved?.(null);
@@ -1429,21 +1680,32 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'rate_limited': {
         // 限流暂停：渲染成暗色中性卡片，非红色 error 样式；保留已完成内容，不结束回合。
         // auto_resuming=true → WaitAndRetry (kernel will sleep then retry)
-        // auto_resuming=false + reset_at_display → Pause with known reset time
-        // auto_resuming=false + empty reset_at_display → Pause with unknown reset time
+        // A CodingPlan verdict carries window data (a reset time AND/OR a window
+        // label); the kernel's generic default (an external-model / non-CodingPlan
+        // 429) carries NEITHER. So only claim "5h window exhausted" for a real
+        // CodingPlan quota — otherwise a generic "限流（HTTP 429）". Mirrors the TUI/CLI.
         const time = event.reset_at_display;
+        const isCodingPlan = !!time || !!event.reset_label;
+        const secs = event.secs_until_reset;
+        // Bare compact h/m/s (locale-neutral), then wrap in a localized suffix so the
+        // English notice doesn't leak a Chinese "（还有 …）" fragment.
+        const durRaw = secs == null ? '' :
+          secs >= 3600 ? `${Math.floor(secs / 3600)}h${Math.floor((secs % 3600) / 60)}m` :
+          secs >= 60 ? `${Math.floor(secs / 60)}m` : `${secs}s`;
+        const dur = durRaw ? t('chat.rateLimited.remaining', { dur: durRaw }) : '';
         let text: string;
         if (event.auto_resuming) {
           text = t('chat.rateLimited.waiting', { secs: String(event.secs_until_reset ?? 0) });
+        } else if (!isCodingPlan) {
+          // Generic 429 (external model / no CodingPlan window data): must NOT be
+          // dressed up as a CodingPlan quota exhaustion. Surface the provider's OWN
+          // reason when present (e.g. an external model's "余额不足…请充值").
+          const reason = event.server_message?.trim() ? `：${event.server_message.trim()}` : '';
+          text = `${t('chat.rateLimited.generic')}${reason}${dur} · ${t('chat.rateLimited.hint')}`;
         } else if (time) {
           text = `${t('chat.rateLimited.paused', { time })} · ${t('chat.rateLimited.hint')}`;
         } else {
-          // Pause with no wall-clock time but a known remaining duration: show it
-          // (compact h/m/s, matching the TUI) instead of dropping secs_until_reset.
-          const secs = event.secs_until_reset;
-          const dur = secs == null ? '' :
-            secs >= 3600 ? `（还有 ${Math.floor(secs / 3600)}h${Math.floor((secs % 3600) / 60)}m）` :
-            secs >= 60 ? `（还有 ${Math.floor(secs / 60)}m）` : `（还有 ${secs}s）`;
+          // CodingPlan window (label present) with no wall-clock reset time.
           text = `${t('chat.rateLimited.pausedNoTime')}${dur} · ${t('chat.rateLimited.hint')}`;
         }
         pushRateLimitedToLastAssistant(text);
@@ -1491,6 +1753,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     images: ImageData[],
     approvalMode: ApprovalMode = modeState.confirmedMode,
   ) {
+    if (!chatRecoveryPolicy(chatRecoveryRef.current).allowSend) {
+      pushCommandNotice(t('chat.recoveryBlocked'));
+      return;
+    }
     // Actually sending a message (immediate OR drained from the queue) re-engages
     // auto-follow — the user wants to see their message + the reply. Placed HERE, not in
     // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
@@ -1508,12 +1774,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // ── Sync path: send to /live/message; do NOT locally append (the user
       //    event will arrive back via the live stream, keeping all tabs in sync).
       setBusy(true);
-      await postLiveMessage(
-        text,
-        images.length ? images : undefined,
-        provider ?? undefined,
-        activeIdRef.current,
-      );
+      try {
+        await postLiveMessage(
+          text,
+          images.length ? images : undefined,
+          provider ?? undefined,
+          activeIdRef.current,
+        );
+      } catch (error) {
+        setBusy(false);
+        setQueued([]);
+        setHistoryHint(t('chat.connError', { msg: String(error) }));
+        return;
+      }
       // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
       // turn 完成后 state(running=false) 会再刷一次确保更新。
       setTimeout(() => onLiveTurnDone?.(), 200);
@@ -1538,6 +1811,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     abortRef.current = controller;
     const requestId = crypto.randomUUID();
     requestIdRef.current = requestId;
+    const requestGeneration = sessionGenerationRef.current;
+    let keepStopAlias = false;
 
     try {
       const body = {
@@ -1550,22 +1825,55 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         approval_mode: approvalMode,
       };
 
-      await streamChat(body, handleEvent, controller.signal);
+      await streamChat(
+        body,
+        (event) => {
+          if (
+            isCurrentChatStream(
+              requestId,
+              requestGeneration,
+              requestIdRef.current,
+              sessionGenerationRef.current,
+              controller.signal.aborted,
+            )
+          ) {
+            handleEvent(event);
+          }
+        },
+        controller.signal,
+      );
     } catch (err: unknown) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        // User cancelled
-      } else {
+      const stillCurrent = isCurrentChatStream(
+        requestId,
+        requestGeneration,
+        requestIdRef.current,
+        sessionGenerationRef.current,
+        controller.signal.aborted,
+      );
+      const aborted = err instanceof Error && err.name === 'AbortError';
+      if (!aborted && stillCurrent) {
+        // Transport loss is not a turn terminal. Keep the request alias so the
+        // user can retry the existing stop protocol, but release the visual
+        // busy state and prohibit sends/queue drain until recovery is explicit.
+        keepStopAlias = true;
+        transitionChatRecovery({ type: 'transport_lost' });
         const msg = err instanceof Error ? err.message : String(err);
         appendToLastAssistant('\n\n' + t('chat.connError', { msg }));
       }
-      setBusy(false);
-      setQueued([]); // 连接错误：与 stopped/error 一致，丢弃排队消息
-      // 中止/连接错误时流被掐断，不会再有 done/stopped 事件 → 兜底清掉审批卡片，
-      // 否则点「停止」时若正挂着审批卡片，它会一直残留。
-      onPermissionResolved?.(null);
+      if (stillCurrent) {
+        setBusy(false);
+        setQueued([]); // 连接错误：与 stopped/error 一致，丢弃排队消息
+        // 中止/连接错误时流被掐断，不会再有 done/stopped 事件 → 兜底清掉审批卡片，
+        // 否则点「停止」时若正挂着审批卡片，它会一直残留。
+        onPermissionResolved?.(null);
+      }
     } finally {
-      abortRef.current = null;
-      if (requestIdRef.current === requestId) requestIdRef.current = null;
+      if (abortRef.current === controller) abortRef.current = null;
+      if (
+        requestIdRef.current === requestId &&
+        sessionGenerationRef.current === requestGeneration &&
+        !keepStopAlias
+      ) requestIdRef.current = null;
     }
   }
 
@@ -1588,6 +1896,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           .catch((e) => pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) })));
         return;
       }
+    }
+
+    if (!chatRecoveryPolicy(chatRecoveryRef.current).allowSend) {
+      pushCommandNotice(t('chat.recoveryBlocked'));
+      return;
     }
 
     // 清空输入框（无论立即发送还是排队）。
@@ -1616,13 +1929,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // 当前回合结束(done)后，依次发送排队消息；stopped/error/连接错误已清空队列。
   useEffect(() => {
-    if (busy || queued.length === 0 || modeState.pendingMode) return;
+    if (
+      busy ||
+      queued.length === 0 ||
+      modeState.pendingMode ||
+      !chatRecoveryPolicy(chatRecoveryRef.current).allowQueueDrain
+    ) return;
     const next = queued[0];
     setQueued((q) => q.slice(1));
     void deliver(next.text, next.images ?? [], next.approvalMode);
     // deliver 为组件内函数声明，闭包始终取最新渲染值；仅以 busy/queued 触发。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy, queued, modeState.pendingMode]);
+  }, [busy, queued, modeState.pendingMode, chatRecovery]);
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.isComposing) return;
@@ -1683,18 +2001,34 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   async function handleStop() {
     try {
-      if (sync) {
+      const recoveryNeedsStop = chatRecoveryPolicy(
+        chatRecoveryRef.current,
+      ).allowStop;
+      if (requestIdRef.current && (!sync || recoveryNeedsStop)) {
+        const requestAlias = requestIdRef.current;
+        const detached = abortRef.current === null;
+        await stopChat(requestAlias);
+        if (detached && requestIdRef.current === requestAlias) {
+          transitionChatRecovery({ type: 'stop_succeeded' });
+          requestIdRef.current = null;
+          if (!sync) setBusy(false);
+          setQueued([]);
+          onPermissionResolved?.(null);
+          pushCommandNotice(t('chat.detachedStopped'));
+        }
+      } else if (sync) {
         await postLiveStop();
-      } else if (requestIdRef.current) {
-        await stopChat(requestIdRef.current);
       }
-    } catch {
-      // If the cancellation endpoint itself is unavailable, at least restore
-      // the local UI instead of leaving the stop button stuck indefinitely.
-      abortRef.current?.abort();
-      setBusy(false);
+    } catch (error) {
       setQueued([]);
-      onPermissionResolved?.(null);
+      pushNoticeToLastAssistant(t('chat.cancelFailed', { error: String(error) }));
+      if (!sync) {
+        // Keep an attached stream alive so a later authoritative terminal can
+        // still recover it. A detached stream has no reattach path, so it stays
+        // explicitly locked with its stop alias available for retry.
+        transitionChatRecovery({ type: 'stop_failed' });
+        if (abortRef.current === null) setBusy(false);
+      }
     }
   }
 
@@ -1890,36 +2224,65 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   const lastIdx = messages.length - 1;
 
-  // 会话内搜索反查定位:输入关键词过滤时间线到包含该词的消息;↑/↓/Enter 在
-  // 匹配间跳转并滚动到视口中央;清除恢复完整视图。仅前端,不动后端。
-  // visibleMessages 保留 origIdx(原 messages 数组索引),以便过滤后仍能查
-  // turnTexts / isLastInTurn(这两个是按原索引算的)。
+  // 会话内搜索: Cmd/Ctrl+F 呼出浮动搜索框,Esc/× 关闭;输入关键词改变字符背景并高亮,
+  // Enter/Shift+Enter(或 ↑/↓)在匹配消息间跳转并滚动定位(反查定位)。关闭态
+  // 完全不占布局空间,不挤压消息区。仅前端,不动后端。
   const [search, setSearch] = useState('');
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const searchTrim = search.trim().toLowerCase();
-  // bot review P3: 用 useMemo 避免每次渲染重建数组，搜索激活时含 filter 遍历更重。
-  const visibleMessages = useMemo(() => searchTrim
-    ? messages.map((m, origIdx) => ({ msg: m, origIdx })).filter(({ msg }) => messageText(msg).toLowerCase().includes(searchTrim))
-    : messages.map((m, origIdx) => ({ msg: m, origIdx })), [messages, searchTrim]);
+  // 不过滤时间线，而是展示完整消息流
+  const visibleMessages = useMemo(() => messages.map((m, origIdx) => ({ msg: m, origIdx })), [messages]);
   const lastVisibleIdx = visibleMessages.length - 1;
-  // 匹配消息 idx → DOM 节点,供 ↑/↓/Enter 滚动定位。每次渲染重填。
+  // 计算匹配的原始消息索引列表
+  const matchPositions = useMemo(() => {
+    if (!searchOpen || !searchTrim) return [];
+    const positions: number[] = [];
+    messages.forEach((m, idx) => {
+      if (messageText(m).toLowerCase().includes(searchTrim)) {
+        positions.push(idx);
+      }
+    });
+    return positions;
+  }, [messages, searchTrim, searchOpen]);
+  // 匹配消息 origIdx → DOM 节点,供 ↑/↓/Enter 滚动定位。每次渲染重填。
   const matchRefs = useRef<Record<number, HTMLElement | null>>({});
   const [matchIdx, setMatchIdxState] = useState(0);
-  // P3 修复: 用 ref 镜像 matchIdx,让事件处理器在快速连击时永远读到
-  // 最新值,而非闭包里上一次渲染的旧值 (否则连击超过 React 渲染速率时
-  // newIdx 会基于旧 matchIdx 算出,导航"停滞")。setMatchIdx 同步更新 ref
-  // + state,事件处理器读 ref,渲染读 state。
+  // P3 修复: 用 ref 镜像 matchIdx,让事件处理器在快速连击时永远读到最新值
   const matchIdxRef = useRef(0);
   const setMatchIdx = (v: number) => { matchIdxRef.current = v; setMatchIdxState(v); };
-  // 搜索导航 helper (bot review P3 重复代码): 算 newIdx → setMatchIdx → 滚动。
-  // 三处 (Enter/↑/↓) 共用,保证 stale-closure 修复 (读 ref) 与滚动逻辑一致。
+  const closeSearch = () => { setSearch(''); setMatchIdx(0); setSearchOpen(false); };
+  // 搜索导航 helper: 算 newIdx → setMatchIdx → 滚动。
   const navMatch = (delta: number) => {
-    const n = visibleMessages.length;
+    const n = matchPositions.length;
     if (n === 0) return;
     const newIdx = (matchIdxRef.current + delta + n) % n;
     setMatchIdx(newIdx);
-    const node = matchRefs.current[newIdx];
+    const targetOrigIdx = matchPositions[newIdx];
+    const node = matchRefs.current[targetOrigIdx];
     if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
   };
+
+  // Cmd/Ctrl+F 打开搜索并聚焦;Esc 关闭。绑定在 window 层级,焦点在输入框/按钮/
+  // 消息气泡时都生效;阻止浏览器默认查找以免误触原生 UI。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === 'f') {
+        if (messages.length === 0) return;
+        e.preventDefault();
+        setSearchOpen(true);
+        // 下一帧再聚焦,等 input 挂载。
+        requestAnimationFrame(() => searchInputRef.current?.focus());
+      } else if (e.key === 'Escape' && searchOpen) {
+        e.preventDefault();
+        closeSearch();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchOpen, messages.length]);
 
   // 落地态：对话为空就用 claude.ai 风格的居中落地页（无论是否已有 session id —
   // 新建会话、空的同步会话、空的历史会话都适用）。
@@ -1992,7 +2355,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             <button
               key={(item.up ? 'up:' : item.is_dir ? 'd:' : 'f:') + item.name}
               class={'at-row' + (i === atIndex ? ' active' : '')}
-              onMouseDown={(e) => { e.preventDefault(); chooseAtRow(item); }}
+              // stopPropagation: this mousedown is an INSIDE click. Without it the
+              // event bubbles to the document click-outside handler, whose
+              // `contains(target)` guard fails once `setAtMention` clears+refetches
+              // the list (the clicked row detaches), so it wrongly closes the menu —
+              // a directory then can't drill in via mouse (keyboard was immune since
+              // it never triggers a document mousedown). preventDefault keeps focus.
+              onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); chooseAtRow(item); }}
               onMouseEnter={() => setAtIndex(i)}
               type="button"
               title={item.up ? '..' : atDirPart + item.name + (item.is_dir ? '/' : '')}
@@ -2012,7 +2381,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             <button
               key={`${item.kind}:${item.name}`}
               class={'slash-row' + (i === slashIndex ? ' active' : '')}
-              onMouseDown={(e) => { e.preventDefault(); insertSkill(item.name); }}
+              // stopPropagation for the same reason as the @-menu rows above: keep
+              // this inside-click from reaching the document click-outside handler.
+              onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); insertSkill(item.name); }}
               onMouseEnter={() => setSlashIndex(i)}
               type="button"
               title={item.description || ''}
@@ -2078,11 +2449,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         <ModelSelector
           value={provider}
           onChange={(p) => switchProvider(p)}
+          onDefaultChange={followDefaultProvider}
         />
-        {busy ? (
+        {busy || recoveryPolicy.allowStop ? (
           <>
             {/* 执行中仍可发送：按下即排队，当前回合结束后自动发出。 */}
-            {(input.trim() || pendingImages.length > 0) && (
+            {recoveryPolicy.allowSend && (input.trim() || pendingImages.length > 0) && (
               <button
                 class="btn-send"
                 onClick={sendMessage}
@@ -2101,9 +2473,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           <button
             class="btn-send"
             onClick={sendMessage}
-            disabled={Boolean(modeState.pendingMode) || (!input.trim() && pendingImages.length === 0)}
-            title={t('chat.send')}
-            aria-label={t('chat.send')}
+            disabled={!recoveryPolicy.allowSend || Boolean(modeState.pendingMode) || (!input.trim() && pendingImages.length === 0)}
+            title={recoveryPolicy.allowSend ? t('chat.send') : t('chat.recoveryBlocked')}
+            aria-label={recoveryPolicy.allowSend ? t('chat.send') : t('chat.recoveryBlocked')}
           >
             ↑
           </button>
@@ -2151,6 +2523,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       req={{ session_id: '', tool_name: livePending.tool_name, reason: livePending.reason, call_id: livePending.call_id, arguments: livePending.arguments }}
       onDone={() => setLivePending((cur) => resolvePendingAfterDecision(cur, livePending.call_id))}
       onDecide={async (decision, toolName) => { await postLivePermission(decision, toolName); }}
+    />
+  );
+
+  // Live-session UserInputCard: shown when a user_input_request arrives on the live stream.
+  const liveUserInputCard = userInputReq && (
+    <UserInputCard
+      req={userInputReq}
+      onDone={() => setUserInputReq(null)}
     />
   );
 
@@ -2202,6 +2582,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         </div>
         {filePickerModal}
         {livePermissionCard}
+        {liveUserInputCard}
       </>
     );
   }
@@ -2211,66 +2592,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       {/* Message timeline */}
       <div class="messages-container" ref={scrollRef} onScroll={recomputeAtBottom}>
         <div class="timeline-inner">
-        {/* 会话内搜索栏:仅在有历史时显示。sticky 在滚动区顶部,Enter/↑/↓
-            在匹配间跳转并滚动定位(反查定位),清除恢复完整时间线。 */}
-        {messages.length > 0 && (
-          <div class="msg-search-bar">
-            <svg class="msg-search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="11" cy="11" r="7" />
-              <path d="m21 21-4.3-4.3" />
-            </svg>
-            <input
-              class="msg-search-input"
-              // bot review P3: type="text" 而非 "search"——后者在 Firefox 仍显示默认清除按钮,
-              // 与自定义 .msg-search-clear 重复。type="text" 全浏览器一致,清除按钮仅走自定义路径。
-              type="text"
-              value={search}
-              placeholder={t('chat.searchPlaceholder')}
-              onInput={(e) => { setSearch((e.target as HTMLInputElement).value); setMatchIdx(0); }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && searchTrim && visibleMessages.length > 0) {
-                  e.preventDefault();
-                  navMatch(e.shiftKey ? -1 : 1);
-                }
-              }}
-              aria-label={t('chat.searchPlaceholder')}
-            />
-            {searchTrim && (
-              <span class="msg-search-count">
-                {visibleMessages.length > 0 ? `${Math.min(matchIdx + 1, visibleMessages.length)} / ${visibleMessages.length}` : t('chat.searchNoMatch')}
-              </span>
-            )}
-            {/* 零匹配时只显示计数+清除,隐藏无效的 ↑/↓ 导航按钮 (bot review Low) */}
-            {searchTrim && visibleMessages.length > 0 && (
-              <>
-                <button
-                  class="msg-search-nav"
-                  onClick={() => navMatch(-1)}
-                  title={t('chat.searchPrev')}
-                  aria-label={t('chat.searchPrev')}
-                  type="button"
-                >↑</button>
-                <button
-                  class="msg-search-nav"
-                  onClick={() => navMatch(1)}
-                  title={t('chat.searchNext')}
-                  aria-label={t('chat.searchNext')}
-                  type="button"
-                >↓</button>
-              </>
-            )}
-            {searchTrim && (
-              <button
-                class="msg-search-clear"
-                onClick={() => { setSearch(''); setMatchIdx(0); }}
-                title={t('chat.searchClear')}
-                aria-label={t('chat.searchClear')}
-                type="button"
-              >×</button>
-            )}
-          </div>
-        )}
-
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
             <div>
@@ -2285,12 +2606,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               {historyHint}
               <div class="sub">{t('chat.continueHint')}</div>
             </div>
-          </div>
-        )}
-
-        {searchTrim && visibleMessages.length === 0 && (
-          <div class="messages-empty">
-            <div>{t('chat.searchNoMatch')}</div>
           </div>
         )}
 
@@ -2340,19 +2655,33 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
           return visibleMessages.map(({ msg, origIdx }, idx) => {
             const isLast = idx === lastVisibleIdx;
-            const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[idx] = el; };
+            const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[origIdx] = el; };
             const timeLabel = formatMsgTime(msg.ts, t);
             const timeFull = formatMsgTimeFull(msg.ts);
+            const isActiveSearchMatch = searchOpen && searchTrim ? (origIdx === matchPositions[matchIdx]) : false;
+
             if (msg.role === 'user') {
-              return <UserMessageView key={origIdx} msg={msg} searchRef={setMatchRef} timeLabel={timeLabel} timeFull={timeFull} />;
+              return (
+                <UserMessageView
+                  key={origIdx}
+                  msg={msg}
+                  searchRef={setMatchRef}
+                  timeLabel={timeLabel}
+                  timeFull={timeFull}
+                  search={search}
+                  isActiveSearchMatch={isActiveSearchMatch}
+                />
+              );
             }
 
             // system messages render as a standalone notice row (no copy button,
             // no turn grouping, no streaming cursor).
             if (msg.role === 'system') {
+              const fullText = msg.parts.map((p) => (p.kind === 'notice' ? p.text : '')).join('');
+              const sysCls = 'msg-notice command-output' + (isActiveSearchMatch ? ' is-active-search-match' : '');
               return (
-                <div class="msg-notice" key={origIdx} ref={setMatchRef}>
-                  {msg.parts.map((p) => (p.kind === 'notice' ? p.text : '')).join('')}
+                <div class={sysCls} key={origIdx} ref={setMatchRef}>
+                  {highlightText(fullText, search)}
                 </div>
               );
             }
@@ -2378,6 +2707,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                 searchRef={setMatchRef}
                 timeLabel={timeLabel}
                 timeFull={timeFull}
+                search={search}
+                isActiveSearchMatch={isActiveSearchMatch}
               />
             );
           });
@@ -2414,6 +2745,86 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         </div>
       </div>
 
+      {/* 浮动搜索框:默认隐藏,Cmd/Ctrl+F 呼出,Esc/× 关闭。仿浏览器 Find-in-page 样式:
+          长条胶囊、无图标、右侧依次 ↑ ↓ ×。position:absolute 钉在容器右上角,不占布局空间。
+          Enter/↓ 下一条,Shift+Enter/↑ 上一条;零匹配时计数显示提示,导航按钮隐藏。 */}
+      {searchOpen && messages.length > 0 && (
+        <div class="msg-search-float" role="search" aria-label={t('chat.searchPlaceholder')}>
+          <input
+            class="msg-search-input"
+            // type="text" 而非 "search"——后者在 Firefox 仍显示默认清除按钮,
+            // 与自定义 × 重复。type="text" 全浏览器一致,清除仅走自定义路径。
+            type="text"
+            ref={searchInputRef}
+            value={search}
+            placeholder={t('chat.searchPlaceholder')}
+            onInput={(e) => { setSearch((e.target as HTMLInputElement).value); setMatchIdx(0); }}
+            onKeyDown={(e) => {
+              // Enter/↓ = 下一条;Shift+Enter/↑ = 上一条。输入框内 ↑/↓ 不移动光标
+              // (单行输入无光标位置歧义),直接在匹配间跳转。
+              if (e.key === 'Enter') {
+                if (searchTrim && matchPositions.length > 0) {
+                  e.preventDefault();
+                  navMatch(e.shiftKey ? -1 : 1);
+                }
+              } else if (e.key === 'ArrowDown' && searchTrim && matchPositions.length > 0) {
+                e.preventDefault();
+                navMatch(1);
+              } else if (e.key === 'ArrowUp' && searchTrim && matchPositions.length > 0) {
+                e.preventDefault();
+                navMatch(-1);
+              }
+            }}
+            aria-label={t('chat.searchPlaceholder')}
+          />
+          <span class="msg-search-count">
+            {searchTrim
+              ? (matchPositions.length > 0
+                  ? `${matchIdx + 1}/${matchPositions.length}`
+                  : t('chat.searchNoMatch'))
+              : ''}
+          </span>
+          <button
+            class="msg-search-nav"
+            onClick={() => navMatch(-1)}
+            title={t('chat.searchPrev')}
+            aria-label={t('chat.searchPrev')}
+            type="button"
+            disabled={!searchTrim || matchPositions.length === 0}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="12" y1="19" x2="12" y2="5" />
+              <polyline points="5 12 12 5 19 12" />
+            </svg>
+          </button>
+          <button
+            class="msg-search-nav"
+            onClick={() => navMatch(1)}
+            title={t('chat.searchNext')}
+            aria-label={t('chat.searchNext')}
+            type="button"
+            disabled={!searchTrim || matchPositions.length === 0}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <polyline points="19 12 12 19 5 12" />
+            </svg>
+          </button>
+          <button
+            class="msg-search-close"
+            onClick={closeSearch}
+            title={t('chat.searchClose')}
+            aria-label={t('chat.searchClose')}
+            type="button"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+      )}
+
       {/* Jump-to-bottom: shown only when the user has scrolled up (follow released). */}
       {showJumpBtn && (
         <button
@@ -2435,6 +2846,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       </div>
       {filePickerModal}
       {livePermissionCard}
+      {liveUserInputCard}
     </>
   );
 }
@@ -2443,7 +2855,30 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
-function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searchRef, timeLabel, timeFull }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string; searchRef?: (el: HTMLElement | null) => void; timeLabel?: string; timeFull?: string }) {
+function AssistantMessageView({
+  msg,
+  isLast,
+  busy,
+  isLastInTurn,
+  turnText,
+  searchRef,
+  timeLabel,
+  timeFull,
+  search,
+  isActiveSearchMatch,
+}: {
+  msg: Message;
+  isLast: boolean;
+  busy: boolean;
+  lastIdx: number;
+  isLastInTurn: boolean;
+  turnText: string;
+  searchRef?: (el: HTMLElement | null) => void;
+  timeLabel?: string;
+  timeFull?: string;
+  search: string;
+  isActiveSearchMatch: boolean;
+}) {
   const t = useT();
   const text = messageText(msg);
   const isError =
@@ -2452,7 +2887,7 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searc
     text.includes('[Error:') ||
     text.includes('[Connection error:');
   const streaming = isLast && busy;
-  // 终条且简短（无工具、单行）时，去掉多余的"时间线末端"橙点，只留一个起始点。
+  // 终条且简短（无工具、单行）时，去掉多余 of "时间线末端"橙点，只留一个起始点。
   const terse =
     isLast && !streaming && !messageHasTools(msg) && !text.includes('\n');
   const dotClass = isError ? 'dot-error' : 'dot-brand';
@@ -2461,7 +2896,8 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searc
     dotClass +
     (streaming ? ' dot-blink' : '') +
     (isLast ? ' is-last' : '') +
-    (terse ? ' is-terse' : '');
+    (terse ? ' is-terse' : '') +
+    (isActiveSearchMatch ? ' is-active-search-match' : '');
 
   // Copy button: only shown on the last assistant message in a turn.
   // Copies the entire turn's text (all assistant messages in this turn joined).
@@ -2501,14 +2937,14 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searc
       {/* Error turns are pure injected text — render flat. */}
       {isError ? (
         <div class="error-message-content">
-          {text}
+          {highlightText(text, search)}
           {streaming && <span class="streaming-cursor" />}
         </div>
       ) : (
         <>
           {/* Segments in chronological order: text→tool→text→tool,
               matching the TUI. Consecutive tools share one tool-list. */}
-          {renderAssistantParts(msg.parts)}
+          {renderAssistantParts(msg.parts, search)}
           {streaming && <span class="streaming-cursor" />}
         </>
       )}
@@ -2523,7 +2959,7 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searc
   );
 }
 
-function renderAssistantParts(parts: MsgPart[]): VNode[] {
+function renderAssistantParts(parts: MsgPart[], search: string): VNode[] {
   const out: VNode[] = [];
   let i = 0;
   while (i < parts.length) {
@@ -2547,26 +2983,68 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
     } else if (p.kind === 'notice') {
       out.push(
         <div class="msg-notice" key={`nt-${i}`}>
-          {p.text}
+          {highlightText(p.text, search)}
         </div>,
       );
       i++;
     } else if (p.kind === 'rate_limited') {
       out.push(
         <div class="rate-limited-notice" key={`rl-${i}`}>
-          {p.text}
+          {highlightText(p.text, search)}
         </div>,
       );
       i++;
     } else {
-      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} />);
+      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} search={search} />);
       i++;
     }
   }
   return out;
 }
 
-function UserMessageView({ msg, searchRef, timeLabel, timeFull }: { msg: Message; searchRef?: (el: HTMLElement | null) => void; timeLabel?: string; timeFull?: string }) {
+function highlightText(text: string, search: string) {
+  if (!search.trim()) return text;
+  const searchLower = search.toLowerCase();
+  const index = text.toLowerCase().indexOf(searchLower);
+  if (index === -1) return text;
+  
+  const parts: (string | VNode)[] = [];
+  let lastIndex = 0;
+  let idx = index;
+  let key = 0;
+  while (idx !== -1) {
+    if (idx > lastIndex) {
+      parts.push(text.substring(lastIndex, idx));
+    }
+    parts.push(
+      <mark key={key++} class="msg-search-highlight">
+        {text.substring(idx, idx + search.length)}
+      </mark>
+    );
+    lastIndex = idx + search.length;
+    idx = text.toLowerCase().indexOf(searchLower, lastIndex);
+  }
+  if (lastIndex < text.length) {
+    parts.push(text.substring(lastIndex));
+  }
+  return parts;
+}
+
+function UserMessageView({
+  msg,
+  searchRef,
+  timeLabel,
+  timeFull,
+  search,
+  isActiveSearchMatch,
+}: {
+  msg: Message;
+  searchRef?: (el: HTMLElement | null) => void;
+  timeLabel?: string;
+  timeFull?: string;
+  search: string;
+  isActiveSearchMatch: boolean;
+}) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
   const text = messageText(msg);
@@ -2609,9 +3087,11 @@ function UserMessageView({ msg, searchRef, timeLabel, timeFull }: { msg: Message
     </button>
   );
 
+  const wrapperClass = 'user-message-wrapper' + (isActiveSearchMatch ? ' is-active-search-match' : '');
+
   if (skillTitle && !expanded) {
     return (
-      <div class="user-message-wrapper" ref={searchRef}>
+      <div class={wrapperClass} ref={searchRef}>
         {images}
         <button
           class="skill-badge"
@@ -2628,7 +3108,7 @@ function UserMessageView({ msg, searchRef, timeLabel, timeFull }: { msg: Message
   }
 
   return (
-    <div class="user-message-wrapper" ref={searchRef}>
+    <div class={wrapperClass} ref={searchRef}>
       <div class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}>
         {images}
         {skillTitle && (
@@ -2638,7 +3118,7 @@ function UserMessageView({ msg, searchRef, timeLabel, timeFull }: { msg: Message
         )}
         {/* 技能/文档型内容本就是 markdown（注入的 SKILL.md），渲染它；
             普通用户消息保持逐字纯文本（不把用户输入当 markdown 解析）。 */}
-        {skillTitle ? <Markdown content={text} /> : text}
+        {skillTitle ? <Markdown content={text} search={search} /> : highlightText(text, search)}
       </div>
       <div class="msg-actions">
         {copyBtn}

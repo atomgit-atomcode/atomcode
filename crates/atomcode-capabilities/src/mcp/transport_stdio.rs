@@ -4,11 +4,11 @@
 
 use std::collections::BTreeMap;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -86,7 +86,8 @@ impl StdioClient {
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
 
         for (key, value) in &self.env {
             cmd.env(key, value);
@@ -412,14 +413,7 @@ fn wrap_cmd_script(command: &str, args: &[String], shell: &str) -> (String, Vec<
     /// Commands that are known to be `.cmd`/`.bat` scripts on Windows.
     /// Checked case-insensitively.
     const CMD_SCRIPTS: &[&str] = &[
-        "npx",
-        "npm",
-        "npx.cmd",
-        "npm.cmd",
-        "yarn",
-        "yarn.cmd",
-        "pnpm",
-        "pnpm.cmd",
+        "npx", "npm", "npx.cmd", "npm.cmd", "yarn", "yarn.cmd", "pnpm", "pnpm.cmd",
     ];
 
     let lower = command.to_ascii_lowercase();
@@ -470,7 +464,8 @@ mod tests {
 
     #[test]
     fn wrap_npx_cmd_suffix() {
-        let (cmd, args) = wrap_cmd_script("npx.cmd", &["-y".into(), "@pkg/server".into()], "cmd.exe");
+        let (cmd, args) =
+            wrap_cmd_script("npx.cmd", &["-y".into(), "@pkg/server".into()], "cmd.exe");
         assert_eq!(cmd, "cmd.exe");
         assert_eq!(args, vec!["/C", "npx.cmd", "-y", "@pkg/server"]);
     }

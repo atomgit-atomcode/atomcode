@@ -16,8 +16,7 @@ const MAX_TITLE_CHARS: usize = 40;
 
 /// True when `name` is still a placeholder (no real content yet): empty,
 /// the literal `default`, an auto `session-<ts>`, or a legacy `[...]`
-/// synthetic name. Mirrors `atomcode_core::session::should_auto_name_session`
-/// — kept local so this display helper doesn't depend on core internals.
+/// synthetic name. Kept local because it is a TUI display concern.
 fn is_placeholder_name(name: &str) -> bool {
     let t = name.trim();
     t.is_empty() || t == "default" || t.starts_with("session-") || t.starts_with('[')
@@ -64,6 +63,9 @@ fn phase_status_glyph(phase: UiPhase) -> Option<&'static str> {
         UiPhase::Idle => Some("🟢"),
         UiPhase::Streaming => Some("🟡"),
         UiPhase::Approval => Some("🔴"),
+        // Waiting on the user to answer an interactive question — same
+        // "needs-you" red as approval.
+        UiPhase::UserInput => Some("🔴"),
         UiPhase::Suspended => None,
     }
 }
@@ -72,7 +74,11 @@ fn phase_status_glyph(phase: UiPhase) -> Option<&'static str> {
 /// portion reuses [`session_terminal_title`] unchanged (so its truncation /
 /// scrubbing budget is untouched); the glyph is an extra 1-scalar + space
 /// prefix, so a status title is at most 2 chars longer than the plain one.
-pub(crate) fn session_terminal_title_with_status(name: &str, fallback: &str, glyph: Option<&str>) -> String {
+pub(crate) fn session_terminal_title_with_status(
+    name: &str,
+    fallback: &str,
+    glyph: Option<&str>,
+) -> String {
     let title = session_terminal_title(name, fallback);
     match glyph {
         Some(g) => format!("{g} {title}"),
@@ -85,11 +91,20 @@ pub(crate) fn session_terminal_title_with_status(name: &str, fallback: &str, gly
 /// phase, where the terminal is handed to an external child). When
 /// `glyph_enabled` is false, no dot is added — behaviour identical to before
 /// this feature.
-pub(crate) fn status_title(name: &str, fallback: &str, phase: UiPhase, glyph_enabled: bool) -> Option<String> {
+pub(crate) fn status_title(
+    name: &str,
+    fallback: &str,
+    phase: UiPhase,
+    glyph_enabled: bool,
+) -> Option<String> {
     if phase == UiPhase::Suspended {
         return None;
     }
-    let glyph = if glyph_enabled { phase_status_glyph(phase) } else { None };
+    let glyph = if glyph_enabled {
+        phase_status_glyph(phase)
+    } else {
+        None
+    };
     Some(session_terminal_title_with_status(name, fallback, glyph))
 }
 
@@ -107,7 +122,10 @@ mod tests {
 
     #[test]
     fn auto_session_timestamp_name_falls_back_to_version() {
-        assert_eq!(session_terminal_title("session-2026-07-02_15-04-05", FB), FB);
+        assert_eq!(
+            session_terminal_title("session-2026-07-02_15-04-05", FB),
+            FB
+        );
     }
 
     #[test]
@@ -135,12 +153,18 @@ mod tests {
     #[test]
     fn control_and_escape_sequences_are_scrubbed() {
         // An OSC title-injection embedded in the name must not survive.
-        assert_eq!(session_terminal_title("hi\x1b]2;pwned\x07there", FB), "hithere");
+        assert_eq!(
+            session_terminal_title("hi\x1b]2;pwned\x07there", FB),
+            "hithere"
+        );
     }
 
     #[test]
     fn newlines_collapse_to_single_space() {
-        assert_eq!(session_terminal_title("line one\nline two", FB), "line one line two");
+        assert_eq!(
+            session_terminal_title("line one\nline two", FB),
+            "line one line two"
+        );
     }
 
     #[test]
@@ -172,10 +196,7 @@ mod tests {
             session_terminal_title_with_status("fix login bug", FB, None),
             session_terminal_title("fix login bug", FB),
         );
-        assert_eq!(
-            session_terminal_title_with_status("default", FB, None),
-            FB,
-        );
+        assert_eq!(session_terminal_title_with_status("default", FB, None), FB,);
     }
 
     #[test]
@@ -200,7 +221,10 @@ mod tests {
 
     #[test]
     fn status_title_suspended_returns_none() {
-        assert_eq!(status_title("fix login bug", FB, UiPhase::Suspended, true), None);
+        assert_eq!(
+            status_title("fix login bug", FB, UiPhase::Suspended, true),
+            None
+        );
     }
 
     #[test]

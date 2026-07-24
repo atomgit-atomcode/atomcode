@@ -1105,7 +1105,11 @@ mod tests {
         assert_eq!(v["file_path"], "D:\\test\\foo.py");
         let s = v["file_path"].as_str().unwrap();
         assert!(!s.contains('\t'), "tab must not appear: got {:?}", s);
-        assert!(!s.contains('\u{000C}'), "form feed must not appear: got {:?}", s);
+        assert!(
+            !s.contains('\u{000C}'),
+            "form feed must not appear: got {:?}",
+            s
+        );
     }
 
     #[test]
@@ -1139,7 +1143,11 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let s = v["category"].as_str().unwrap();
         assert!(s.contains('\t'), "real \\t should remain a tab: {:?}", s);
-        assert!(s.contains('\n'), "real \\n should remain a newline: {:?}", s);
+        assert!(
+            s.contains('\n'),
+            "real \\n should remain a newline: {:?}",
+            s
+        );
     }
 
     #[test]
@@ -1152,7 +1160,11 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let s = v["label"].as_str().unwrap();
         assert!(s.contains('\n'), "newline should survive: got {:?}", s);
-        assert!(!s.contains('\\'), "no literal backslash should remain: got {:?}", s);
+        assert!(
+            !s.contains('\\'),
+            "no literal backslash should remain: got {:?}",
+            s
+        );
     }
 
     /// Reverted-fix regression pin. A previous attempt added a
@@ -1180,9 +1192,21 @@ mod tests {
         let out = repair_tool_args("read_file", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let p = v["file_path"].as_str().unwrap();
-        assert_eq!(p, "D:\\new\\foo.py", "loose Windows path with `\\n` substring must round-trip; got {:?}", p);
-        assert!(!p.contains('\n'), "no real newline must leak through: {:?}", p);
-        assert!(!p.contains('\u{000C}'), "no form feed must leak through: {:?}", p);
+        assert_eq!(
+            p, "D:\\new\\foo.py",
+            "loose Windows path with `\\n` substring must round-trip; got {:?}",
+            p
+        );
+        assert!(
+            !p.contains('\n'),
+            "no real newline must leak through: {:?}",
+            p
+        );
+        assert!(
+            !p.contains('\u{000C}'),
+            "no form feed must leak through: {:?}",
+            p
+        );
     }
 
     /// Python source like `class A:\n    pass\n` has a single
@@ -1371,8 +1395,9 @@ mod tests {
         // producing `{"k":"v{"}}` which fails to parse.
         let input = r#"{"old_string": "fn main() {"}"#;
         let repaired = repair_json(input);
-        let v: serde_json::Value = serde_json::from_str(&repaired)
-            .unwrap_or_else(|e| panic!("brace balance should not over-close; got {repaired:?}: {e}"));
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap_or_else(|e| {
+            panic!("brace balance should not over-close; got {repaired:?}: {e}")
+        });
         assert_eq!(v["old_string"], "fn main() {");
     }
 
@@ -1384,8 +1409,9 @@ mod tests {
         // and corrupting the JSON to boot.
         let input = r#"{"outer": "snippet { class: foo }", "n": 1}"#;
         let repaired = repair_json(input);
-        let v: serde_json::Value = serde_json::from_str(&repaired)
-            .unwrap_or_else(|e| panic!("unquoted-key fix must not touch string content; got {repaired:?}: {e}"));
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap_or_else(|e| {
+            panic!("unquoted-key fix must not touch string content; got {repaired:?}: {e}")
+        });
         assert_eq!(v["outer"], "snippet { class: foo }");
     }
 
@@ -1396,8 +1422,9 @@ mod tests {
         // rewritten to `}`.
         let input = r#"{"outer": "tail,}", "n": 1}"#;
         let repaired = repair_json(input);
-        let v: serde_json::Value = serde_json::from_str(&repaired)
-            .unwrap_or_else(|e| panic!("trailing-comma replace must not touch strings; got {repaired:?}: {e}"));
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap_or_else(|e| {
+            panic!("trailing-comma replace must not touch strings; got {repaired:?}: {e}")
+        });
         assert_eq!(v["outer"], "tail,}");
     }
 
@@ -1409,8 +1436,9 @@ mod tests {
         // nets to zero from the envelope's perspective.
         let input = r#"{"old_string": "fn x() { if y { return z; } }", "k": 1}"#;
         let repaired = repair_json(input);
-        let v: serde_json::Value = serde_json::from_str(&repaired)
-            .unwrap_or_else(|e| panic!("nested braces in string must not break repair; got {repaired:?}: {e}"));
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap_or_else(|e| {
+            panic!("nested braces in string must not break repair; got {repaired:?}: {e}")
+        });
         assert_eq!(v["old_string"], "fn x() { if y { return z; } }");
     }
 
@@ -1420,8 +1448,8 @@ mod tests {
         // unquoted-key fix on real unquoted keys.
         let input = r#"{path: "src/main.rs", depth: 2}"#;
         let repaired = repair_json(input);
-        let v: serde_json::Value = serde_json::from_str(&repaired)
-            .expect("legit unquoted keys must still be wrapped");
+        let v: serde_json::Value =
+            serde_json::from_str(&repaired).expect("legit unquoted keys must still be wrapped");
         assert_eq!(v["path"], "src/main.rs");
         assert_eq!(v["depth"], 2);
     }
@@ -1432,8 +1460,8 @@ mod tests {
         // trailing-comma removal on real trailing commas.
         let input = r#"{"k": "v",}"#;
         let repaired = repair_json(input);
-        let v: serde_json::Value = serde_json::from_str(&repaired)
-            .expect("legit trailing comma must still be stripped");
+        let v: serde_json::Value =
+            serde_json::from_str(&repaired).expect("legit trailing comma must still be stripped");
         assert_eq!(v["k"], "v");
     }
 }
@@ -1450,15 +1478,15 @@ use std::sync::Arc;
 
 /// Repairs a tool call's JSON arguments in place before the call executes.
 ///
-/// After the v1→v2 split, tools deserialize their arguments directly
+/// Kernel tools deserialize their arguments directly
 /// (`serde_json::from_str(&call.arguments)`), so any non-conforming JSON the
 /// model emits — trailing commas, single quotes, unescaped source-code quotes /
 /// newlines, markdown code fences, ambiguous Windows backslash paths — fails the
 /// *entire* tool call. Weaker models trip this constantly when writing files or
 /// editing code, which surfaces to the user as "write failed / nothing happens".
 ///
-/// v1 (the monolithic core) ran `repair_tool_args` over the arguments before
-/// dispatch; the layered kernel has no equivalent. This middleware restores that
+/// The former core dispatch ran `repair_tool_args` over arguments before execution;
+/// the layered kernel has no built-in equivalent. This middleware preserves that
 /// tolerance by rewriting `call.arguments` in [`before`](ToolMiddleware::before).
 ///
 /// **Register it FIRST** (ahead of any approval gate) so the bytes an approval
@@ -1518,10 +1546,13 @@ mod middleware_tests {
         // Common weak-model output: a trailing comma in write_file args, which
         // the kernel's `from_str` rejects outright.
         let mw = RepairToolArgsMiddleware;
-        let mut c = call("write_file", r#"{"file_path":"game.html","content":"<html>",}"#);
+        let mut c = call(
+            "write_file",
+            r#"{"file_path":"game.html","content":"<html>",}"#,
+        );
         mw.repair_call("write_file", &mut c);
-        let v: serde_json::Value =
-            serde_json::from_str(&c.arguments).expect("arguments should be valid JSON after repair");
+        let v: serde_json::Value = serde_json::from_str(&c.arguments)
+            .expect("arguments should be valid JSON after repair");
         assert_eq!(v["file_path"], "game.html");
     }
 
@@ -1591,9 +1622,11 @@ mod hardening_tests {
         let input = r#"{"file_path": "a.py", "old_string": "say "hi" now", "new_string": "x"}"#;
         let lower = repair_tool_args("edit_file", input);
         let mixed = repair_tool_args("Edit_File", input);
-        assert_eq!(lower, mixed, "tool-name casing must not change repair routing");
-        let v: serde_json::Value =
-            serde_json::from_str(&mixed).expect("recovered to valid JSON");
+        assert_eq!(
+            lower, mixed,
+            "tool-name casing must not change repair routing"
+        );
+        let v: serde_json::Value = serde_json::from_str(&mixed).expect("recovered to valid JSON");
         assert_eq!(v["file_path"], "a.py");
     }
 

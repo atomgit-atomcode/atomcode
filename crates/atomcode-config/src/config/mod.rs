@@ -54,7 +54,7 @@ pub fn platform_rules() -> &'static str {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoopConfig {
-    /// Hard cap on /loop iterations (both modes) before auto-stop.
+    /// Hard cap on /loop iterations (both modes) before auto-stop; `0` is unbounded.
     pub max_rounds: u32,
 }
 
@@ -64,24 +64,33 @@ impl Default for LoopConfig {
     }
 }
 
-/// Sub-agent execution policy (enable + resilience knobs).
-/// Drives `agent::parallel_edit::SubAgentTask::execute` and the
-/// `try_sub_agent_dispatch` config gate.
+/// `[subagent]` execution policy for the `task` subagent tool.
+///
+/// `max_concurrent`, `timeout_secs`, and `max_rounds` are the LIVE knobs: `coding::parts`
+/// reads them via `subagent_runtime_knobs` and wires them into `TaskTool`. Environment
+/// overrides are `ATOMCODE_SUBAGENT_TIMEOUT` and `ATOMCODE_SUBAGENT_MAX_ROUNDS`.
+/// The tool's master ON/OFF is the env gate `ATOMCODE_SUBAGENT`
+/// (default ON, opt out with `ATOMCODE_SUBAGENT=0`) — NOT `enabled` here; `enabled`,
+/// `initial_turns`, and `max_turns` are vestigial from the retired `parallel_edit` dispatch
+/// path and are not currently consulted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SubAgentConfig {
-    /// Master switch. `false` makes `try_sub_agent_dispatch` return None
-    /// immediately and the parent agent falls back to serial execution.
+    /// Vestigial: the live master switch is the env gate `ATOMCODE_SUBAGENT` (default ON),
+    /// not this field. Kept for config back-compat.
     pub enabled: bool,
-    /// Initial per-task turn budget. Adaptive logic may extend up to
-    /// `max_turns`. See `ResilienceConfig::initial_turns`.
+    /// Vestigial (retired resilience path); not currently read.
     pub initial_turns: usize,
-    /// Hard cap on per-task turns regardless of progress signals.
+    /// Vestigial (retired resilience path); not currently read.
     pub max_turns: usize,
-    /// Max parallel sub-agents per pool batch.
+    /// Max parallel subagents the `task` tool runs at once (floored to 1). Default 3.
     pub max_concurrent: usize,
-    /// Wall-time timeout for a single sub-agent (seconds).
+    /// Per-subtask wall-time timeout in seconds (floored to 30s). Default 900 (15 min).
+    /// Overridden by the `ATOMCODE_SUBAGENT_TIMEOUT` env var when set.
     pub timeout_secs: u64,
+    /// Per-subtask model-round high-water mark. Default 200; `0` means unbounded.
+    /// Overridden by `ATOMCODE_SUBAGENT_MAX_ROUNDS` when set.
+    pub max_rounds: u32,
 }
 
 impl Default for SubAgentConfig {
@@ -91,7 +100,9 @@ impl Default for SubAgentConfig {
             initial_turns: 4,
             max_turns: 12,
             max_concurrent: 3,
-            timeout_secs: 300,
+            // Matches the `task` tool's shipped default so wiring config is not a silent change.
+            timeout_secs: 900,
+            max_rounds: 200,
         }
     }
 }
@@ -142,8 +153,8 @@ pub struct Config {
     /// Only applies when working inside a git repository.
     #[serde(default)]
     pub auto_commit: bool,
-    /// Sub-agent execution policy. Missing from older configs → defaults to
-    /// enabled=true, initial_turns=4, max_turns=12, max_concurrent=3, timeout_secs=300.
+    /// `task` subagent tool policy. Missing from older configs uses the defaults in
+    /// [`SubAgentConfig`], including a configurable 200-round high-water mark.
     #[serde(default)]
     pub subagent: SubAgentConfig,
     /// /loop command policy. Missing from older configs → max_rounds=100.
@@ -548,7 +559,10 @@ fn default_notification_min_duration_secs() -> u64 {
 /// any other env value enables; `None` ⇒ use the config value.
 fn ai_session_naming_from_parts(env_val: Option<&str>, config_val: bool) -> bool {
     match env_val {
-        Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
         None => config_val,
     }
 }
@@ -569,6 +583,27 @@ pub fn todo_enabled_from_env(env: Option<&str>, cfg_value: bool) -> bool {
         Some(v) if v == "0" || v == "false" || v == "off" => false,
         Some(v) if v == "1" || v == "true" || v == "on" => true,
         _ => cfg_value,
+    }
+}
+
+/// Resolve the effective `request_user_input` tool switch: DEFAULT-ON semantics.
+/// Returns `false` only when `env` is `Some("")`/`"0"`/`"false"`/`"off"` (case-insensitive,
+/// trimmed).  `None` (unset) or any other value → `true`.
+///
+/// Opt-out: set `ATOMCODE_REQUEST_USER_INPUT=0` (or `false`/`off`) to disable.
+///
+/// Called by `atomcode-coding`'s persona gate (`request_user_input_switch_enabled`).
+///
+/// NOTE: `atomcode-capabilities`' tool-registration gate contains an INTENTIONAL
+/// DUPLICATE of this logic — it cannot call this helper because `atomcode-config` is not
+/// a dependency of the capabilities `tools` feature layer.  If you change the logic here
+/// you MUST mirror the change in
+/// `atomcode-capabilities/src/tools/mod.rs` (the `request_user_input_on` block), and
+/// vice versa.
+pub fn request_user_input_enabled_from_env(env: Option<&str>) -> bool {
+    match env.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(v) if v == "0" || v == "false" || v == "off" || v.is_empty() => false,
+        _ => true, // default ON — unset, or any other value
     }
 }
 
@@ -645,7 +680,9 @@ fn render_network_section(cfg: &NetworkConfig) -> String {
     let mut out = String::new();
     out.push_str("\n# Network proxy policy shared by all outbound HTTP clients.\n");
     out.push_str("# Modes:\n");
-    out.push_str("# - follow_system  -> follow the launch environment / system proxy state (default)\n");
+    out.push_str(
+        "# - follow_system  -> follow the launch environment / system proxy state (default)\n",
+    );
     out.push_str(
         "# - default_proxy  -> pin the proxy values below and reuse them on future launches\n",
     );
@@ -772,16 +809,22 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
-        let mut config: Config = toml::from_str(&content)
+        Self::parse_disk_content(&content, path)
+    }
+
+    pub(crate) fn parse_disk_content(content: &str, path: &Path) -> Result<Self> {
+        let mut config: Config = toml::from_str(content)
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         migrate_legacy_lsp_default(&mut config);
         Ok(config)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        crate::store::ConfigStore::new(path).replace(self)?;
+        Ok(())
+    }
+
+    pub(crate) fn serialize_for_disk(&self, disk: Option<&Config>) -> Result<String> {
         // Filter out ephemeral providers (e.g. OAuth /login) — they live in memory only.
         let mut persistent = self.clone();
         persistent.providers.retain(|_, v| !v.ephemeral);
@@ -793,8 +836,8 @@ impl Config {
             .unwrap_or(true)
         {
             // Restore original default from disk if possible
-            if let Ok(disk) = Config::load(path) {
-                persistent.default_provider = disk.default_provider;
+            if let Some(disk) = disk {
+                persistent.default_provider = disk.default_provider.clone();
             }
         }
         let mut content = toml::to_string_pretty(&persistent)?;
@@ -804,8 +847,7 @@ impl Config {
         content.push_str(&render_telemetry_section(&self.telemetry));
         content.push_str(&render_instructions_section());
         content.push_str(&render_hooks_json_section());
-        std::fs::write(path, content)?;
-        Ok(())
+        Ok(content)
     }
 
     pub fn active_provider(&self, override_name: Option<&str>) -> Result<&ProviderConfig> {
@@ -823,9 +865,7 @@ impl Config {
                 .keys()
                 .min()
                 .map(String::as_str)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("No providers configured — run /login or /provider")
-                })
+                .ok_or_else(|| anyhow::anyhow!("No providers configured — run /login or /provider"))
         };
         let name: &str = if name.is_empty() { fallback()? } else { name };
         match self.providers.get(name) {
@@ -895,9 +935,7 @@ impl Config {
         // provider — and because it exists, onboarding won't fire, so there's no
         // recovery hint. Reject it here so we fall back to onboarding instead.
         if seed.default_provider.is_empty() {
-            return SeedOutcome::Invalid(
-                "seed config has no default_provider set".to_string(),
-            );
+            return SeedOutcome::Invalid("seed config has no default_provider set".to_string());
         }
         if !seed.providers.contains_key(&seed.default_provider) {
             return SeedOutcome::Invalid(format!(
@@ -1037,8 +1075,7 @@ mod tests {
     fn seed_missing_source_file_is_invalid_not_panic() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("config.toml");
-        let outcome =
-            Config::seed_user_config(&target, Some(&dir.path().join("nope.toml")));
+        let outcome = Config::seed_user_config(&target, Some(&dir.path().join("nope.toml")));
         assert!(matches!(outcome, SeedOutcome::Invalid(_)));
         assert!(!target.exists());
     }
@@ -1125,7 +1162,26 @@ mod tests {
     fn ui_todo_env_off_overrides() {
         assert!(!super::todo_enabled_from_env(Some("0"), true));
         assert!(super::todo_enabled_from_env(Some("1"), false));
-        assert!(super::todo_enabled_from_env(None, true));  // 无 env → 用 config 值
+        assert!(super::todo_enabled_from_env(None, true)); // 无 env → 用 config 值
+    }
+
+    #[test]
+    fn request_user_input_enabled_default_on() {
+        // None (unset) → true (default-ON)
+        assert!(super::request_user_input_enabled_from_env(None));
+        // Explicit opt-out values → false
+        assert!(!super::request_user_input_enabled_from_env(Some("")));
+        assert!(!super::request_user_input_enabled_from_env(Some("0")));
+        assert!(!super::request_user_input_enabled_from_env(Some("false")));
+        assert!(!super::request_user_input_enabled_from_env(Some("FALSE")));
+        assert!(!super::request_user_input_enabled_from_env(Some("off")));
+        assert!(!super::request_user_input_enabled_from_env(Some("OFF")));
+        assert!(!super::request_user_input_enabled_from_env(Some("  off  ")));
+        // Any other value (truthy) → true
+        assert!(super::request_user_input_enabled_from_env(Some("1")));
+        assert!(super::request_user_input_enabled_from_env(Some("true")));
+        assert!(super::request_user_input_enabled_from_env(Some("yes")));
+        assert!(super::request_user_input_enabled_from_env(Some("on")));
     }
 
     /// Migration: on-disk config that looks like it was auto-written by

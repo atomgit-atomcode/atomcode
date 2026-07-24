@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.0</span>
+    <span class="dhdr-ver">v5.0.1</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -90,6 +92,20 @@
 
       <h2>AtomGit CodingPlan(推荐)</h2>
       <p>AtomGit 是 CSDN / 开放原子开源基金会旗下的开源代码托管平台,AtomCode 原生集成了它的 OAuth 和 CodingPlan。<code>/login</code> 是新用户最省事的入口,一次操作完成登录 → 申领免费 token 额度 → 自动根据额度内的模型列表写好 provider 配置。用完这条命令,直接就能开始聊天。已登录后再跑会幂等地同步最新模型列表,不会重复申领。</p>
+
+      <h3>CodingPlan 权益体系</h3>
+      <p>CodingPlan 目前提供三档方案,系统自动发放当前可获得的最高权益;调用额度按 5 小时滚动窗口计量:</p>
+      <table>
+        <thead>
+          <tr><th>方案</th><th>有效期</th><th>说明</th><th>支持模型</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Lite</strong></td><td>30 天</td><td>免费领取,限量 1000 人/日</td><td>deepseek-v4-flash、Qwen/Qwen3-VL-8B-Instruct</td></tr>
+          <tr><td><strong>Pro 体验版</strong></td><td>7 天</td><td>免费领取,每日 10:00 限量 100 人</td><td>额外支持 <strong>GLM-5.2</strong></td></tr>
+          <tr><td><strong>Pro</strong></td><td>30 天</td><td>免费领取,需在活动仓库合入 PR</td><td>额外支持 <strong>GLM-5.2</strong></td></tr>
+        </tbody>
+      </table>
+      <p>领取 Pro 及以上套餐后,在 AtomCode 中执行 <code>/login</code> 即可同步最新模型列表。更多详情请访问 <a href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">CodingPlan 页面</a>。</p>
 
       <h3>从首次运行启动向导接入</h3>
       <ol>

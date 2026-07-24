@@ -88,6 +88,124 @@ impl ProviderConfig {
     pub fn accepts_images(&self) -> bool {
         crate::util::model_name_suggests_vision(&self.model)
     }
+
+    /// Resolve the API key for this provider, taking environment variables into account.
+    ///
+    /// Resolution order:
+    /// 1. If `api_key` is configured as a non-empty string:
+    ///    a. If it contains `$`, expand environment variables (e.g. `$MY_KEY`, `${MY_KEY}`, `${MY_KEY:-default}`).
+    ///    b. If it matches an existing environment variable name (e.g. `api_key = "MY_KEY_VAR"`), return its value.
+    ///    c. Otherwise, return the configured string as a literal key.
+    /// 2. If `api_key` is `None` or empty (or expanded to empty):
+    ///    a. Check provider-type specific environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OLLAMA_API_KEY`).
+    ///    b. Check general environment variable `ATOMCODE_API_KEY`.
+    pub fn resolved_api_key(&self) -> Option<String> {
+        if let Some(key_str) = self.api_key.as_deref() {
+            let trimmed = key_str.trim();
+            if !trimmed.is_empty() {
+                if trimmed.contains('$') {
+                    let expanded = expand_env_vars(trimmed);
+                    if !expanded.trim().is_empty() {
+                        return Some(expanded);
+                    }
+                } else if let Ok(env_val) = std::env::var(trimmed) {
+                    if !env_val.trim().is_empty() {
+                        return Some(env_val);
+                    }
+                } else {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+
+        let env_var = match self.provider_type.as_str() {
+            "openai" | "openai-compat" | "openai_compat" => "OPENAI_API_KEY",
+            "claude" | "anthropic" => "ANTHROPIC_API_KEY",
+            "ollama" => "OLLAMA_API_KEY",
+            _ => "",
+        };
+
+        if !env_var.is_empty() {
+            if let Ok(val) = std::env::var(env_var) {
+                if !val.trim().is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+
+        if let Ok(val) = std::env::var("ATOMCODE_API_KEY") {
+            if !val.trim().is_empty() {
+                return Some(val);
+            }
+        }
+
+        None
+    }
+}
+
+/// Expand environment variables in a string.
+///
+/// Supports `$VAR`, `${VAR}`, `${VAR:-default}` syntax.
+pub fn expand_env_vars(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            if chars[i + 1] == '{' {
+                i += 2; // skip ${
+                let mut var_name = String::new();
+                let mut default_val = String::new();
+                let mut has_default = false;
+
+                while i < chars.len() && chars[i] != '}' {
+                    if !has_default && chars[i] == ':' && i + 1 < chars.len() && chars[i + 1] == '-'
+                    {
+                        has_default = true;
+                        i += 2;
+                        continue;
+                    }
+                    if has_default {
+                        default_val.push(chars[i]);
+                    } else {
+                        var_name.push(chars[i]);
+                    }
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == '}' {
+                    i += 1; // skip }
+                }
+
+                let val = std::env::var(&var_name)
+                    .ok()
+                    .filter(|v| !v.trim().is_empty());
+                if let Some(v) = val {
+                    result.push_str(&v);
+                } else if has_default {
+                    result.push_str(&default_val);
+                }
+            } else if chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_' {
+                i += 1; // skip $
+                let mut var_name = String::new();
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    var_name.push(chars[i]);
+                    i += 1;
+                }
+                if let Ok(val) = std::env::var(&var_name) {
+                    result.push_str(&val);
+                }
+            } else {
+                result.push(chars[i]);
+                i += 1;
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
 }
 
 fn default_context_window() -> usize {
@@ -257,8 +375,114 @@ mod tests {
         // Round-trips on save, and `None` is not emitted (existing configs stay clean).
         let s = toml::to_string(&cfg).expect("serialize");
         assert!(s.contains("capable_model = 1"), "set rank must serialize");
-        let none_cfg = ProviderConfig { capable_model: None, ..cfg };
+        let none_cfg = ProviderConfig {
+            capable_model: None,
+            ..cfg
+        };
         let s2 = toml::to_string(&none_cfg).expect("serialize");
         assert!(!s2.contains("capable_model"), "None must not be serialized");
+    }
+
+    #[test]
+    fn test_expand_env_vars() {
+        std::env::set_var("TEST_ENV_VAR_1", "secret_key_value");
+        std::env::set_var("TEST_ENV_VAR_2", "secondary_value");
+
+        assert_eq!(expand_env_vars("$TEST_ENV_VAR_1"), "secret_key_value");
+        assert_eq!(expand_env_vars("${TEST_ENV_VAR_1}"), "secret_key_value");
+        assert_eq!(
+            expand_env_vars("prefix_${TEST_ENV_VAR_1}_suffix"),
+            "prefix_secret_key_value_suffix"
+        );
+        assert_eq!(
+            expand_env_vars("${NON_EXISTENT_VAR:-fallback_value}"),
+            "fallback_value"
+        );
+        assert_eq!(
+            expand_env_vars("${TEST_ENV_VAR_1:-fallback_value}"),
+            "secret_key_value"
+        );
+        assert_eq!(expand_env_vars("plain_literal_key"), "plain_literal_key");
+    }
+
+    #[test]
+    fn test_resolved_api_key_env_expansion() {
+        std::env::set_var("TEST_API_KEY_ENV", "sk-from-env-var");
+
+        let cfg = ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("$TEST_API_KEY_ENV".into()),
+            model: "gpt-4o".into(),
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+            capable_model: None,
+        };
+
+        assert_eq!(cfg.resolved_api_key(), Some("sk-from-env-var".to_string()));
+    }
+
+    #[test]
+    fn test_resolved_api_key_direct_env_name() {
+        std::env::set_var("MY_CUSTOM_KEY_NAME", "sk-custom-123");
+
+        let cfg = ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("MY_CUSTOM_KEY_NAME".into()),
+            model: "gpt-4o".into(),
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+            capable_model: None,
+        };
+
+        assert_eq!(cfg.resolved_api_key(), Some("sk-custom-123".to_string()));
+    }
+
+    #[test]
+    fn test_resolved_api_key_fallback_to_standard_env() {
+        std::env::set_var("OPENAI_API_KEY", "sk-openai-std");
+
+        let cfg = ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: None,
+            model: "gpt-4o".into(),
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+            capable_model: None,
+        };
+
+        assert_eq!(cfg.resolved_api_key(), Some("sk-openai-std".to_string()));
     }
 }

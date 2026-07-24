@@ -18,7 +18,11 @@ async fn session_context_block_reaches_the_provider() {
         vec!["config", "user.email", "t@t"],
         vec!["config", "user.name", "t"],
     ] {
-        std::process::Command::new("git").args(&args).current_dir(d.path()).output().unwrap();
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(d.path())
+            .output()
+            .unwrap();
     }
 
     let provider = Arc::new(RecordingProvider::new(vec![vec![
@@ -29,7 +33,9 @@ async fn session_context_block_reaches_the_provider() {
 
     let cfg = CodingAgentConfig::new("k", "http://localhost", "test-model", d.path());
     let agent = build_coding_agent_with(&cfg, provider);
-    let _ = agent.run_to_completion("hello", AutoRespond::AllowAll).await;
+    let _ = agent
+        .run_to_completion("hello", AutoRespond::AllowAll)
+        .await;
 
     let recorded = calls.lock().unwrap();
     assert!(!recorded.is_empty(), "the provider must have been called");
@@ -41,7 +47,10 @@ async fn session_context_block_reaches_the_provider() {
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    assert!(sys.contains("SESSION CONTEXT"), "context block present:\n{sys}");
+    assert!(
+        sys.contains("SESSION CONTEXT"),
+        "context block present:\n{sys}"
+    );
     assert!(sys.contains("Working directory:"), "env block present");
     assert!(
         sys.contains("PROJECT INSTRUCTIONS") && sys.contains("PROJECT RULE: always foo"),
@@ -49,5 +58,8 @@ async fn session_context_block_reaches_the_provider() {
     );
     assert!(sys.contains("GIT STATUS"), "git snapshot present");
     // The persona's static parity sections ride along too.
-    assert!(sys.contains("## GIT COMMITS:"), "persona git-commit trailer rule present");
+    assert!(
+        sys.contains("## GIT COMMITS:"),
+        "persona git-commit trailer rule present"
+    );
 }

@@ -28,9 +28,9 @@ function sameProject(a: SessionLike, b: SessionLike): boolean {
 
 // Does the persisted session `s` represent the same conversation as the
 // `optimistic` entry? The two can carry DIFFERENT ids: the /live snapshot
-// realigns the optimistic id to the LIVE session id (v2 capabilities store),
-// while /sessions lists the core `.json` under its own id — so id-only dedup
-// leaves a duplicate row. Fall back to a content match within the SAME project:
+// can realign the optimistic id before the persisted session list catches up,
+// so id-only dedup can leave a duplicate row. Fall back to a content match
+// within the SAME project:
 //   - exact name → same session (this is what closes the short-name dup, e.g.
 //     "你好", which was never merged before because it is under MIN_PREFIX_MATCH_LEN);
 //   - otherwise the persisted auto-name must EXTEND the optimistic title (its

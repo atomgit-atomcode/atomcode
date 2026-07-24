@@ -16,8 +16,10 @@ atomcode-config = { path = "../atomcode-config" }
 atomcode-updater = { path = "../atomcode-updater" }
 # Askpass lives in atomcode-capabilities (`::askpass`, unix-only); the TUI drives the
 # server + password modal via that path.
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools", "memory", "notify"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools", "memory", "notify", "setup", "plugin", "mcp"] }
+atomcode-auth = { path = "../atomcode-auth" }
 atomcode-core = { path = "../atomcode-core" }
+atomcode-codingplan = { path = "../atomcode-codingplan" }
 # INIT_PROMPT: LLM-driven /init submits this constant as a user turn so the
 # coding agent explores the repo and writes AGENTS.md via its tools.
 atomcode-coding = { path = "../atomcode-coding" }
@@ -32,6 +34,7 @@ uuid = { version = "1", features = ["v4"] }
 crossterm = "0.29"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
+tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Async HTTPS client for the passive version_check latest.json fetch

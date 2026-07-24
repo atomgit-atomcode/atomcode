@@ -5,6 +5,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use atomcode_kernel::agent::ToolLoopPolicy;
+
 /// Everything [`build_review_agent`](crate::build_review_agent) needs.
 #[derive(Clone, Debug)]
 pub struct ReviewAgentConfig {
@@ -36,6 +38,9 @@ pub struct ReviewAgentConfig {
     /// callers (e.g. a CI/PR pipeline) set a bound via `--max-rounds` to stop a model from
     /// endlessly grepping a large repo; a bare CLI run stays unbounded.
     pub max_rounds: Option<u32>,
+    /// Exact no-progress loop policy. `None` permits intentional identical
+    /// repetition; any configured round/duration limits remain independent.
+    pub tool_loop_policy: Option<ToolLoopPolicy>,
     /// Absolute wall-clock cap on the whole review turn. `None` (default) ⇒ UNLIMITED.
     /// Enforced via the kernel's `cancel_token` seam (a timer cancels the turn on deadline),
     /// NOT a kernel change — it's the only guard that also fires while a provider stalls
@@ -79,6 +84,7 @@ impl ReviewAgentConfig {
             persona: None,
             persona_append: None,
             max_rounds: None,
+            tool_loop_policy: default_tool_loop_policy(),
             max_turn_duration: None,
             progress: None,
             no_web: false,
@@ -96,5 +102,52 @@ impl ReviewAgentConfig {
     pub fn with_persona_append(mut self, append: impl Into<String>) -> Self {
         self.persona_append = Some(append.into());
         self
+    }
+}
+
+fn default_tool_loop_policy() -> Option<ToolLoopPolicy> {
+    resolve_tool_loop_policy(
+        std::env::var("ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD")
+            .ok()
+            .as_deref(),
+        std::env::var("ATOMCODE_TOOL_LOOP_STOP_THRESHOLD")
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub(crate) fn resolve_tool_loop_policy(
+    warning_env: Option<&str>,
+    stop_env: Option<&str>,
+) -> Option<ToolLoopPolicy> {
+    let requested_stop = stop_env.and_then(|value| value.trim().parse::<u32>().ok());
+    if requested_stop == Some(0) {
+        return None;
+    }
+    let stop = requested_stop.filter(|value| *value >= 3).unwrap_or(4);
+    let fallback_warning = 3.min(stop - 1).max(2);
+    let warning = warning_env
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value >= 2 && *value < stop)
+        .unwrap_or(fallback_warning);
+    Some(
+        ToolLoopPolicy::new(warning, stop)
+            .expect("resolved review tool-loop thresholds satisfy the policy invariant"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_loop_policy_is_validated_and_can_be_disabled() {
+        let custom = resolve_tool_loop_policy(Some("10"), Some("12")).unwrap();
+        assert_eq!(custom.warning_threshold(), 10);
+        assert_eq!(custom.stop_threshold(), 12);
+        assert!(resolve_tool_loop_policy(Some("10"), Some("0")).is_none());
+
+        let fallback = resolve_tool_loop_policy(Some("99"), Some("4")).unwrap();
+        assert_eq!(fallback, ToolLoopPolicy::default());
     }
 }

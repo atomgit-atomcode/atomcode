@@ -5,6 +5,7 @@
 //! invisible to history-byte tests for a THIRD-PARTY hook — the kernel surfaces it at
 //! runtime as a Warning instead.
 
+use async_trait::async_trait;
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
@@ -12,7 +13,6 @@ use atomcode_kernel::message::Message;
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::{MockProvider, TailReminderHook};
 use atomcode_kernel::tool::ToolRegistry;
-use async_trait::async_trait;
 use std::sync::Arc;
 
 /// Rewrites the FIRST message every round — a PREFIX mutation that poisons the wire cache.
@@ -37,7 +37,13 @@ async fn warnings_for(hook: Arc<dyn LifecycleHooks>) -> Vec<String> {
         .hooks(hook)
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
     let mut warnings = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         match ev {

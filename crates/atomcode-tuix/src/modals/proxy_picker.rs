@@ -1,5 +1,5 @@
 use anyhow::Result;
-use atomcode_core::proxy::{self, ProxyMode};
+use atomcode_config::proxy::{self, ProxyMode};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
@@ -46,30 +46,29 @@ impl Modal for ProxyPicker {
                 Ok(ModalAction::Continue)
             }
             KeyCode::Enter => {
+                let mut desired = ctx.config.clone();
                 match self.selected {
                     0 => {
-                        ctx.config.network.proxy.mode = ProxyMode::FollowSystem;
+                        desired.network.proxy.mode = ProxyMode::FollowSystem;
                     }
                     1 => {
                         let pinned = proxy::ProxyConfig::capture_from_env();
-                        ctx.config.network.proxy.mode = ProxyMode::DefaultProxy;
-                        ctx.config.network.proxy.http = pinned.http;
-                        ctx.config.network.proxy.https = pinned.https;
-                        ctx.config.network.proxy.all = pinned.all;
-                        ctx.config.network.proxy.no_proxy = pinned.no_proxy;
+                        desired.network.proxy.mode = ProxyMode::DefaultProxy;
+                        desired.network.proxy.http = pinned.http;
+                        desired.network.proxy.https = pinned.https;
+                        desired.network.proxy.all = pinned.all;
+                        desired.network.proxy.no_proxy = pinned.no_proxy;
                     }
                     _ => {
-                        ctx.config.network.proxy.mode = ProxyMode::NoProxy;
+                        desired.network.proxy.mode = ProxyMode::NoProxy;
                     }
                 }
-                proxy::apply_process_proxy_config(&ctx.config.network.proxy);
-                save_and_reload(ctx, renderer);
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  Proxy mode: {}\n",
-                    ctx.config.network.proxy.summary()
-                )));
-                renderer.flush();
-                Ok(ModalAction::Close)
+                let success = format!("  Proxy mode: {}\n", desired.network.proxy.summary());
+                if save_and_reload(ctx, desired, renderer, success, false) {
+                    Ok(ModalAction::Close)
+                } else {
+                    Ok(ModalAction::Continue)
+                }
             }
             KeyCode::Esc => Ok(ModalAction::Close),
             _ => Ok(ModalAction::Continue),

@@ -16,14 +16,25 @@ fn make_builder() -> AgentBuilder {
     registry.register(Arc::new(RiskyWriteTool));
     let provider = Arc::new(MockProvider::new(vec![
         vec![
-            StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{\"text\":\"hello\"}".into() }),
+            StreamEvent::ToolCall(ToolCall {
+                id: "1".into(),
+                name: "echo".into(),
+                arguments: "{\"text\":\"hello\"}".into(),
+            }),
             StreamEvent::Done { truncated: false },
         ],
         vec![
-            StreamEvent::ToolCall(ToolCall { id: "2".into(), name: "risky_write".into(), arguments: "{\"path\":\"notes.md\"}".into() }),
+            StreamEvent::ToolCall(ToolCall {
+                id: "2".into(),
+                name: "risky_write".into(),
+                arguments: "{\"path\":\"notes.md\"}".into(),
+            }),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done.".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("done.".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     Agent::builder()
         .provider(provider)
@@ -35,7 +46,10 @@ fn make_builder() -> AgentBuilder {
 #[tokio::main]
 async fn main() {
     // ---- Driver A: one-shot (batch/CI) ----
-    let outcome = make_builder().build().run_to_completion("do the demo", AutoRespond::AllowAll).await;
+    let outcome = make_builder()
+        .build()
+        .run_to_completion("do the demo", AutoRespond::AllowAll)
+        .await;
     println!(
         "[one-shot] {} tool result(s); text={:?}",
         outcome.tool_results.len(),
@@ -45,7 +59,13 @@ async fn main() {
     // ---- Driver B: interactive (TUI/web/server shape) ----
     let handle = make_builder().build().spawn();
     let commands = handle.commands.clone();
-    handle.commands.send(AgentCommand::SendMessage { text: "do the demo".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "do the demo".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     let mut events = handle.events;
     while let Some(ev) = events.recv().await {
@@ -55,7 +75,12 @@ async fn main() {
             AgentEvent::ToolResult { result } => println!("[result: {}]", result.content),
             AgentEvent::Request { id, kind, payload } => {
                 println!("[{kind} for {}]", payload["tool"]);
-                commands.send(AgentCommand::Respond { id, value: serde_json::json!({"decision": "allow"}) }).unwrap();
+                commands
+                    .send(AgentCommand::Respond {
+                        id,
+                        value: serde_json::json!({"decision": "allow"}),
+                    })
+                    .unwrap();
             }
             AgentEvent::TurnComplete { reason } => {
                 println!("\n[turn complete: {reason:?}]");

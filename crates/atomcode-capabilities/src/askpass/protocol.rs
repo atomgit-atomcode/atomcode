@@ -36,14 +36,27 @@ mod tests {
     #[test]
     fn frame_roundtrips_request_and_response() {
         let mut buf: Vec<u8> = Vec::new();
-        write_frame(&mut buf, &Request { token: "t".into(), prompt: "[sudo] password:".into() }).unwrap();
+        write_frame(
+            &mut buf,
+            &Request {
+                token: "t".into(),
+                prompt: "[sudo] password:".into(),
+            },
+        )
+        .unwrap();
         let mut rdr = std::io::BufReader::new(&buf[..]);
         let got: Request = read_frame(&mut rdr).unwrap();
         assert_eq!(got.token, "t");
         assert_eq!(got.prompt, "[sudo] password:");
 
         let mut b2: Vec<u8> = Vec::new();
-        write_frame(&mut b2, &Response { password: Some("pw".into()) }).unwrap();
+        write_frame(
+            &mut b2,
+            &Response {
+                password: Some("pw".into()),
+            },
+        )
+        .unwrap();
         let mut r2 = std::io::BufReader::new(&b2[..]);
         let resp: Response = read_frame(&mut r2).unwrap();
         assert_eq!(resp.password.as_deref(), Some("pw"));

@@ -1,6 +1,6 @@
 //! `SessionContextHook` — injects the per-session "context block" (environment + project
 //! instructions + git snapshot) as ONE leading `Role::System` message at session start,
-//! the v2 port of v1's runtime-injected prompt sections (`agent/prompt.rs`).
+//! replacing the former core runtime-injected prompt sections.
 //!
 //! Cache-safe: the block is read ONCE at session start and frozen — a SNAPSHOT of where
 //! the session began, not a live view (the git section says so explicitly). The wire
@@ -31,12 +31,18 @@ pub struct SessionContextHook {
 
 impl SessionContextHook {
     pub fn new(working_dir: impl Into<PathBuf>) -> Self {
-        Self { working_dir: working_dir.into(), home: crate::paths::config_dir() }
+        Self {
+            working_dir: working_dir.into(),
+            home: crate::paths::config_dir(),
+        }
     }
 
     /// Test/embedder seam: supply an explicit config-root (global-instructions base).
     pub fn with_home(working_dir: impl Into<PathBuf>, home: impl Into<PathBuf>) -> Self {
-        Self { working_dir: working_dir.into(), home: home.into() }
+        Self {
+            working_dir: working_dir.into(),
+            home: home.into(),
+        }
     }
 
     /// Render the full context block. Always non-empty (the env sub-section is
@@ -86,7 +92,11 @@ impl SessionContextHook {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "(detached HEAD)".into());
-        let head = self.git(&["log", "-1", "--format=%h %s"]).unwrap_or_default().trim().to_string();
+        let head = self
+            .git(&["log", "-1", "--format=%h %s"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let raw = self.git(&["status", "--short"]).unwrap_or_default();
         let mut lines: Vec<&str> = raw.lines().collect();
         let status = if lines.len() > 20 {
@@ -96,7 +106,11 @@ impl SessionContextHook {
         } else {
             lines.join("\n")
         };
-        let status = if status.trim().is_empty() { "(working tree clean)".to_string() } else { status };
+        let status = if status.trim().is_empty() {
+            "(working tree clean)".to_string()
+        } else {
+            status
+        };
         Some(format!(
             "=== GIT STATUS (snapshot at session start, not live) ===\n\
              Branch: {branch}\nHEAD: {head}\n{status}\n\
@@ -125,7 +139,11 @@ impl LifecycleHooks for SessionContextHook {
         if !resumed {
             // FRESH: land right after the leading-system run (persona, and any context hook
             // registered before this one), before the first user message.
-            let at = convo.messages.iter().take_while(|m| m.role == Role::System).count();
+            let at = convo
+                .messages
+                .iter()
+                .take_while(|m| m.role == Role::System)
+                .count();
             convo.messages.insert(at, Message::system(block));
             return;
         }
@@ -138,7 +156,11 @@ impl LifecycleHooks for SessionContextHook {
         {
             Some(i) => convo.messages[i] = Message::system(block),
             None => {
-                let at = convo.messages.iter().take_while(|m| m.role == Role::System).count();
+                let at = convo
+                    .messages
+                    .iter()
+                    .take_while(|m| m.role == Role::System)
+                    .count();
                 convo.messages.insert(at, Message::system(block));
             }
         }
@@ -155,7 +177,11 @@ mod tests {
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
         ] {
-            std::process::Command::new("git").args(&args).current_dir(dir).output().unwrap();
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
         }
     }
 
@@ -170,8 +196,14 @@ mod tests {
         assert_eq!(convo.messages[0].text, "persona");
         let ctx = &convo.messages[1];
         assert_eq!(ctx.role, Role::System);
-        assert!(ctx.text.starts_with(CONTEXT_HEADER), "block leads with the header");
-        assert!(ctx.text.contains("Working directory:"), "env block always present");
+        assert!(
+            ctx.text.starts_with(CONTEXT_HEADER),
+            "block leads with the header"
+        );
+        assert!(
+            ctx.text.contains("Working directory:"),
+            "env block always present"
+        );
         assert!(ctx.text.contains("Platform:"));
     }
 
@@ -180,13 +212,19 @@ mod tests {
         // Not a repo → no git section.
         let bare = tempfile::tempdir().unwrap();
         let h1 = SessionContextHook::with_home(bare.path(), bare.path().join("nohome"));
-        assert!(!h1.render().contains("GIT STATUS"), "no git section outside a repo");
+        assert!(
+            !h1.render().contains("GIT STATUS"),
+            "no git section outside a repo"
+        );
 
         // A repo → git section present.
         let repo = tempfile::tempdir().unwrap();
         git_init(repo.path());
         let h2 = SessionContextHook::with_home(repo.path(), repo.path().join("nohome"));
-        assert!(h2.render().contains("=== GIT STATUS"), "git section inside a repo");
+        assert!(
+            h2.render().contains("=== GIT STATUS"),
+            "git section inside a repo"
+        );
     }
 
     #[tokio::test]
@@ -208,10 +246,20 @@ mod tests {
         convo.push(Message::system(format!("{CONTEXT_HEADER}\nstale snapshot")));
         convo.push(Message::user("earlier turn"));
         hook.session_start(&mut convo, true).await;
-        assert_eq!(convo.messages.len(), 3, "refresh replaces in place — no growth");
+        assert_eq!(
+            convo.messages.len(),
+            3,
+            "refresh replaces in place — no growth"
+        );
         assert!(convo.messages[1].text.starts_with(CONTEXT_HEADER));
-        assert!(convo.messages[1].text.contains("Working directory:"), "refreshed with live env");
-        assert!(!convo.messages[1].text.contains("stale snapshot"), "stale block replaced");
+        assert!(
+            convo.messages[1].text.contains("Working directory:"),
+            "refreshed with live env"
+        );
+        assert!(
+            !convo.messages[1].text.contains("stale snapshot"),
+            "stale block replaced"
+        );
         assert_eq!(convo.messages[2].text, "earlier turn", "history untouched");
     }
 
@@ -225,7 +273,10 @@ mod tests {
         convo.push(Message::user("earlier turn"));
         hook.session_start(&mut convo, true).await;
         assert_eq!(convo.messages.len(), 3);
-        assert!(convo.messages[1].text.starts_with(CONTEXT_HEADER), "lands after persona");
+        assert!(
+            convo.messages[1].text.starts_with(CONTEXT_HEADER),
+            "lands after persona"
+        );
         assert_eq!(convo.messages[2].text, "earlier turn");
     }
 }

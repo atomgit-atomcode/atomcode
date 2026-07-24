@@ -73,21 +73,37 @@ impl Tool for GrepTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => return err(format!("grep: invalid arguments: {e}. Expected {{\"pattern\":\"<regex>\"}}.")),
+            Err(e) => {
+                return err(format!(
+                    "grep: invalid arguments: {e}. Expected {{\"pattern\":\"<regex>\"}}."
+                ))
+            }
         };
         let raw = a.path.clone().unwrap_or_else(|| ".".to_string());
         let root = resolve_path(&raw, &ctx.working_dir);
         if tokio::fs::metadata(&root).await.is_err() {
-            return err(format!("grep: path not found: {}", crate::pathnorm::to_display(&root)));
+            return err(format!(
+                "grep: path not found: {}",
+                crate::pathnorm::to_display(&root)
+            ));
         }
-        let max = a.max_results.unwrap_or(DEFAULT_MAX_RESULTS).clamp(1, MAX_RESULTS_CAP);
+        let max = a
+            .max_results
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .clamp(1, MAX_RESULTS_CAP);
         let context = a.context.unwrap_or(DEFAULT_CONTEXT).min(MAX_CONTEXT);
 
         // Smart-case + literal fallback, as a streaming ripgrep matcher.
         let has_upper = a.pattern.chars().any(|c| c.is_uppercase());
-        let matcher = match RegexMatcherBuilder::new().case_insensitive(!has_upper).build(&a.pattern) {
+        let matcher = match RegexMatcherBuilder::new()
+            .case_insensitive(!has_upper)
+            .build(&a.pattern)
+        {
             Ok(m) => m,
-            Err(_) => match RegexMatcherBuilder::new().case_insensitive(!has_upper).build(&regex::escape(&a.pattern)) {
+            Err(_) => match RegexMatcherBuilder::new()
+                .case_insensitive(!has_upper)
+                .build(&regex::escape(&a.pattern))
+            {
                 Ok(m) => m,
                 Err(e) => return err(format!("grep: invalid pattern '{}': {e}", a.pattern)),
             },
@@ -96,7 +112,8 @@ impl Tool for GrepTool {
         let base = ctx.working_dir.clone();
         let pattern = a.pattern.clone();
         let display_path = raw.clone();
-        let res = tokio::task::spawn_blocking(move || search(&root, &matcher, max, context, &base)).await;
+        let res =
+            tokio::task::spawn_blocking(move || search(&root, &matcher, max, context, &base)).await;
         match res {
             Ok((lines, _, files)) if lines.is_empty() => ok(format!(
                 "No matches found for '{pattern}' in {display_path} ({files} files searched)"
@@ -168,12 +185,21 @@ fn search(
         if !path.is_file() {
             continue;
         }
-        if path.extension().map(|x| x.eq_ignore_ascii_case("log")).unwrap_or(false) {
+        if path
+            .extension()
+            .map(|x| x.eq_ignore_ascii_case("log"))
+            .unwrap_or(false)
+        {
             continue;
         }
         files_searched += 1;
         let rel = crate::pathnorm::to_display(path.strip_prefix(base).unwrap_or(path));
-        let sink = GrepSink { rel: &rel, out: &mut out, match_count: &mut match_count, max };
+        let sink = GrepSink {
+            rel: &rel,
+            out: &mut out,
+            match_count: &mut match_count,
+            max,
+        };
         // io / binary / decode errors ⇒ skip the file (same as the old read failure).
         let _ = searcher.search_path(matcher, path, sink);
     }
@@ -208,14 +234,16 @@ impl<'a> Sink for GrepSink<'a> {
 
     fn matched(&mut self, _s: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
         let n = mat.line_number().unwrap_or(0);
-        self.out.push(format!("{}:{n}:{}", self.rel, render_line(mat.bytes())));
+        self.out
+            .push(format!("{}:{n}:{}", self.rel, render_line(mat.bytes())));
         *self.match_count += 1;
         Ok(*self.match_count < self.max) // stop this file at the cap
     }
 
     fn context(&mut self, _s: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, std::io::Error> {
         let n = ctx.line_number().unwrap_or(0);
-        self.out.push(format!("{}-{n}-{}", self.rel, render_line(ctx.bytes())));
+        self.out
+            .push(format!("{}-{n}-{}", self.rel, render_line(ctx.bytes())));
         Ok(true)
     }
 
@@ -232,14 +260,25 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        }
     }
 
     #[tokio::test]
     async fn finds_matches_with_line_numbers() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("a.rs"), "fn main() {\n    let TODO = 1;\n    other();\n}\n").unwrap();
-        let r = GrepTool.execute(r#"{"pattern":"TODO","path":"."}"#, &ctx(d.path())).await;
+        std::fs::write(
+            d.path().join("a.rs"),
+            "fn main() {\n    let TODO = 1;\n    other();\n}\n",
+        )
+        .unwrap();
+        let r = GrepTool
+            .execute(r#"{"pattern":"TODO","path":"."}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("a.rs:2:"), "{}", r.content);
     }
@@ -248,9 +287,8 @@ mod tests {
     // or float (50.0 / "3.0") instead of an integer; the args must still deserialize.
     #[test]
     fn args_accept_lenient_numeric_max_results_and_context() {
-        let a: Args =
-            serde_json::from_str(r#"{"pattern":"x","max_results":"50","context":3.0}"#)
-                .expect("string max_results + float context must deserialize");
+        let a: Args = serde_json::from_str(r#"{"pattern":"x","max_results":"50","context":3.0}"#)
+            .expect("string max_results + float context must deserialize");
         assert_eq!(a.max_results, Some(50));
         assert_eq!(a.context, Some(3));
 
@@ -263,7 +301,9 @@ mod tests {
     async fn smart_case_is_insensitive_for_lowercase_pattern() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "Hello World\n").unwrap();
-        let r = GrepTool.execute(r#"{"pattern":"hello"}"#, &ctx(d.path())).await;
+        let r = GrepTool
+            .execute(r#"{"pattern":"hello"}"#, &ctx(d.path()))
+            .await;
         assert!(r.content.contains("a.txt:1:"), "{}", r.content);
     }
 
@@ -271,7 +311,9 @@ mod tests {
     async fn zero_matches_is_success() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "nothing here\n").unwrap();
-        let r = GrepTool.execute(r#"{"pattern":"absent_xyz"}"#, &ctx(d.path())).await;
+        let r = GrepTool
+            .execute(r#"{"pattern":"absent_xyz"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "zero matches must be a success: {}", r.content);
         assert!(r.content.contains("No matches found"), "{}", r.content);
     }
@@ -281,7 +323,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "value = foo(bar)\n").unwrap();
         // "foo(bar" is an invalid regex (unbalanced paren) → literal fallback finds it.
-        let r = GrepTool.execute(r#"{"pattern":"foo(bar"}"#, &ctx(d.path())).await;
+        let r = GrepTool
+            .execute(r#"{"pattern":"foo(bar"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("a.txt:1:"), "{}", r.content);
     }
@@ -299,15 +343,37 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(d.path().join("f.txt"), content + "\n").unwrap();
-        let r = GrepTool.execute(r#"{"pattern":"NEEDLE","context":1}"#, &ctx(d.path())).await;
+        let r = GrepTool
+            .execute(r#"{"pattern":"NEEDLE","context":1}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         // Match lines use `:`, context lines use `-`.
-        assert!(r.content.contains("f.txt:2:NEEDLE two"), "match line: {}", r.content);
-        assert!(r.content.contains("f.txt-1-line 1"), "before-context: {}", r.content);
-        assert!(r.content.contains("f.txt-3-line 3"), "after-context: {}", r.content);
-        assert!(r.content.contains("f.txt:8:NEEDLE eight"), "second match: {}", r.content);
+        assert!(
+            r.content.contains("f.txt:2:NEEDLE two"),
+            "match line: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("f.txt-1-line 1"),
+            "before-context: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("f.txt-3-line 3"),
+            "after-context: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("f.txt:8:NEEDLE eight"),
+            "second match: {}",
+            r.content
+        );
         // Non-contiguous groups are separated by `--`.
-        assert!(r.content.contains("\n--\n"), "group separator: {}", r.content);
+        assert!(
+            r.content.contains("\n--\n"),
+            "group separator: {}",
+            r.content
+        );
     }
 
     #[tokio::test]
@@ -318,9 +384,15 @@ mod tests {
         let mut big = "filler line\n".repeat(250_000); // ~3 MB
         big.push_str("HAYSTACK_NEEDLE at the end\n");
         std::fs::write(d.path().join("big.txt"), big).unwrap();
-        let r = GrepTool.execute(r#"{"pattern":"HAYSTACK_NEEDLE"}"#, &ctx(d.path())).await;
+        let r = GrepTool
+            .execute(r#"{"pattern":"HAYSTACK_NEEDLE"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("big.txt:250001:HAYSTACK_NEEDLE"), "{}", r.content);
+        assert!(
+            r.content.contains("big.txt:250001:HAYSTACK_NEEDLE"),
+            "{}",
+            r.content
+        );
     }
 
     #[tokio::test]
@@ -332,10 +404,19 @@ mod tests {
         giant.push_str(&"x".repeat(MAX_LINE_BUF_BYTES + 1024)); // > cap, no newline
         std::fs::write(d.path().join("min.js"), &giant).unwrap();
         std::fs::write(d.path().join("ok.txt"), "NEEDLE\n").unwrap();
-        let r = GrepTool.execute(r#"{"pattern":"NEEDLE"}"#, &ctx(d.path())).await;
+        let r = GrepTool
+            .execute(r#"{"pattern":"NEEDLE"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "grep must not error/hang on a giant line");
-        assert!(r.content.contains("ok.txt:1:"), "normal match found: {}", &r.content[..r.content.len().min(120)]);
-        assert!(!r.content.contains("min.js"), "over-cap single-line file must be skipped");
+        assert!(
+            r.content.contains("ok.txt:1:"),
+            "normal match found: {}",
+            &r.content[..r.content.len().min(120)]
+        );
+        assert!(
+            !r.content.contains("min.js"),
+            "over-cap single-line file must be skipped"
+        );
     }
 
     #[tokio::test]
@@ -343,14 +424,34 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         // 3 scattered matches at context 3 → ~23 output ROWS but only 3 MATCHES.
         let lines: Vec<String> = (1..=30)
-            .map(|i| if i % 10 == 5 { format!("HIT {i}") } else { format!("line {i}") })
+            .map(|i| {
+                if i % 10 == 5 {
+                    format!("HIT {i}")
+                } else {
+                    format!("line {i}")
+                }
+            })
             .collect();
         std::fs::write(d.path().join("f.txt"), lines.join("\n") + "\n").unwrap();
         // max_results 10: output rows (23) >= 10 but matches (3) < 10 → must NOT report capped.
-        let r = GrepTool.execute(r#"{"pattern":"HIT","max_results":10,"context":3}"#, &ctx(d.path())).await;
+        let r = GrepTool
+            .execute(
+                r#"{"pattern":"HIT","max_results":10,"context":3}"#,
+                &ctx(d.path()),
+            )
+            .await;
         assert!(!r.is_error, "{}", r.content);
-        assert_eq!(r.content.matches("HIT").count(), 3, "exactly 3 matches: {}", r.content);
-        assert!(!r.content.contains("Results capped"), "false 'capped' with only 3<10 matches: {}", r.content);
+        assert_eq!(
+            r.content.matches("HIT").count(),
+            3,
+            "exactly 3 matches: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("Results capped"),
+            "false 'capped' with only 3<10 matches: {}",
+            r.content
+        );
     }
 
     #[tokio::test]
@@ -359,9 +460,19 @@ mod tests {
         // A NUL byte ⇒ binary ⇒ the searcher quits and reports nothing for it.
         std::fs::write(d.path().join("blob"), b"\x00 NEEDLE inside binary\n").unwrap();
         std::fs::write(d.path().join("text.txt"), "NEEDLE\n").unwrap();
-        let r = GrepTool.execute(r#"{"pattern":"NEEDLE"}"#, &ctx(d.path())).await;
-        assert!(r.content.contains("text.txt:1:"), "text match: {}", r.content);
-        assert!(!r.content.contains("blob"), "binary file must be skipped: {}", r.content);
+        let r = GrepTool
+            .execute(r#"{"pattern":"NEEDLE"}"#, &ctx(d.path()))
+            .await;
+        assert!(
+            r.content.contains("text.txt:1:"),
+            "text match: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("blob"),
+            "binary file must be skipped: {}",
+            r.content
+        );
     }
 
     #[tokio::test]
@@ -370,8 +481,14 @@ mod tests {
         std::fs::create_dir(d.path().join("target")).unwrap();
         std::fs::write(d.path().join("target/junk.rs"), "NEEDLE\n").unwrap();
         std::fs::write(d.path().join("keep.rs"), "NEEDLE\n").unwrap();
-        let r = GrepTool.execute(r#"{"pattern":"NEEDLE"}"#, &ctx(d.path())).await;
+        let r = GrepTool
+            .execute(r#"{"pattern":"NEEDLE"}"#, &ctx(d.path()))
+            .await;
         assert!(r.content.contains("keep.rs:1:"), "{}", r.content);
-        assert!(!r.content.contains("junk.rs"), "target/ should be skipped: {}", r.content);
+        assert!(
+            !r.content.contains("junk.rs"),
+            "target/ should be skipped: {}",
+            r.content
+        );
     }
 }

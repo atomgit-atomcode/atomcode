@@ -80,6 +80,11 @@ pub struct MessageMeta {
     /// ADDITIVE: `#[serde(default)]`.
     #[serde(default)]
     pub provider_response_id: Option<String>,
+    /// The model identity reported by the provider for this response. This is kept
+    /// separately from the requested runtime model so routing mismatches are observable.
+    /// ADDITIVE: older snapshots deserialize it as `None`.
+    #[serde(default)]
+    pub provider_model: Option<String>,
     /// Injected session identity (mirrors `TurnCtx.session_id`) so a STORED message
     /// carries the FULL correlation set (session → turn → round/request) on its own.
     /// ADDITIVE.
@@ -663,7 +668,10 @@ impl Conversation {
             (
                 epoch_after,
                 removed,
-                Some(Conversation { messages: candidate, cache_epoch: epoch_after }),
+                Some(Conversation {
+                    messages: candidate,
+                    cache_epoch: epoch_after,
+                }),
             )
         } else {
             // REFUSE: messages byte-identical, epoch unchanged.
@@ -1198,6 +1206,7 @@ mod tests {
             turn_id: 1,
             request_id: 2,
             provider_response_id: Some("resp_abc".into()),
+            provider_model: Some("deepseek-v4-flash".into()),
             session_id: Some("sess-1".into()),
             finish_reason: "stop".into(),
         });

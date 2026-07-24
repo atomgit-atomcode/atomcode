@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use atomcode_config::locale::Locale;
+use atomcode_kernel::agent::ToolLoopPolicy;
+
 /// Everything [`build_coding_agent`](crate::build_coding_agent) needs: provider
 /// credentials, the working directory the tools are scoped to, and liveness bounds.
 ///
@@ -15,6 +18,12 @@ pub struct CodingAgentConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// Preferred language for natural-language commit subjects and bodies.
+    /// `None` means follow the current conversation language.
+    pub preferred_language: Option<Locale>,
+    /// Stable config/provider registry key exposed to drivers. This is distinct
+    /// from `provider_type`, which selects the adapter implementation.
+    pub provider_name: String,
     /// Directory the agent's tools see as their working dir — PINNED (via the kernel
     /// `working_dir` seam), not the process-global cwd, so concurrent agents don't race.
     pub working_dir: PathBuf,
@@ -35,12 +44,22 @@ pub struct CodingAgentConfig {
     pub request_timeout: Option<Duration>,
     /// Safety fuse: max edit-then-verify continuations per turn (kernel default is 50).
     pub max_continuations: u32,
+    /// Coarse safety fuse for LLM/tool rounds in one turn (`0` = unbounded).
+    /// This bounds varying-call runaways that the kernel's repetition guards cannot catch.
+    /// It is deliberately generous, produces an explicit incomplete terminal, and may be
+    /// overridden with `ATOMCODE_TURN_MAX_ROUNDS`.
+    pub max_rounds: u32,
+    /// Exact no-progress loop policy. `None` disables it for explicitly intentional
+    /// identical repetition. Defaults to 3/4 and is configurable through
+    /// `ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD` / `ATOMCODE_TOOL_LOOP_STOP_THRESHOLD`;
+    /// a stop threshold of `0` disables the policy.
+    pub tool_loop_policy: Option<ToolLoopPolicy>,
     /// Goal-mode round cap (0 = unbounded). Override via `ATOMCODE_GOAL_MAX_ROUNDS`.
     pub goal_max_rounds: u32,
     /// Goal-mode wall-clock cap in seconds (0 = unbounded). Override via
     /// `ATOMCODE_GOAL_MAX_DURATION_SECS`.
     pub goal_max_duration_secs: u64,
-    /// Self-paced `/loop` round cap. Default 100; the bridge overrides it from
+    /// Self-paced `/loop` round cap. Default 100; the runtime overrides it from
     /// `[loop_config] max_rounds`. Env override `ATOMCODE_LOOP_MAX_ROUNDS`.
     pub loop_max_rounds: u32,
     /// Per-call provider options (reasoning effort / max_tokens / temperature).
@@ -98,8 +117,10 @@ pub struct CodingAgentConfig {
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Sourced from `ProviderConfig::skip_tls_verify`; default false.
     pub skip_tls_verify: bool,
+    /// Full provider registry used to resolve task-tool fast/capable tiers.
+    pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
     /// Swap-aware, lazily-built FAST-tier provider for the `task` tool. `None` ⇒ the fast
-    /// tier reuses the host provider slot. Set by the bridge as a SHARED cell ([`TierProvider`])
+    /// tier reuses the host provider slot. Set by the runtime as a SHARED cell ([`TierProvider`])
     /// so a mid-session `/model` swap can `reset()` it — re-resolve the tier against the new
     /// host and drop the cache — and the already-built TaskTool picks up the new routing on its
     /// next dispatch (no `prepare` rerun). Built ON FIRST use, so startup stays cheap. NOT in
@@ -109,7 +130,159 @@ pub struct CodingAgentConfig {
     pub subagent_capable_provider: Option<Arc<TierProvider>>,
 }
 
-/// A thunk the bridge supplies that constructs a (gateway-signed) tier provider. `Some` on
+/// Host-resolved inputs shared by CLI and daemon runtime construction.
+/// This is a driver configuration object, not a legacy command protocol.
+#[derive(Clone)]
+pub struct CodingRuntimeConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+    pub preferred_language: Option<Locale>,
+    pub provider_name: String,
+    pub working_dir: PathBuf,
+    pub context_window: u32,
+    pub max_tokens: Option<u32>,
+    pub mcp: bool,
+    pub telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
+    pub reasoning_history: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub provider_type: String,
+    pub thinking_enabled: Option<bool>,
+    pub thinking_type: Option<String>,
+    pub thinking_keep: Option<String>,
+    pub dangerously_skip_permissions: bool,
+    pub interactive: bool,
+    pub keep_interrupted_context: bool,
+    pub user_agent: Option<String>,
+    pub skip_tls_verify: bool,
+    pub loop_max_rounds: u32,
+    pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
+}
+
+impl CodingRuntimeConfig {
+    pub fn from_config(
+        config: &atomcode_config::config::Config,
+        working_dir: &std::path::Path,
+        provider_override: Option<&str>,
+        telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
+        dangerously_skip_permissions: bool,
+        interactive: bool,
+    ) -> Self {
+        let requested_provider = provider_override
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&config.default_provider);
+        let provider_name = if config.providers.contains_key(requested_provider) {
+            requested_provider.to_string()
+        } else {
+            config.providers.keys().min().cloned().unwrap_or_default()
+        };
+        let provider = config.providers.get(&provider_name);
+        Self {
+            api_key: provider
+                .and_then(|provider| provider.resolved_api_key())
+                .unwrap_or_default(),
+            base_url: provider
+                .and_then(|provider| provider.base_url.clone())
+                .unwrap_or_default(),
+            model: provider
+                .map(|provider| provider.model.clone())
+                .unwrap_or_default(),
+            preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
+                None,
+                config.language,
+            )),
+            provider_name,
+            working_dir: working_dir.to_path_buf(),
+            context_window: provider
+                .map(|provider| provider.context_window as u32)
+                .unwrap_or(128_000),
+            max_tokens: provider
+                .and_then(|provider| provider.max_tokens)
+                .map(|value| value as u32),
+            mcp: true,
+            telemetry,
+            reasoning_history: provider.and_then(|provider| provider.reasoning_history.clone()),
+            reasoning_effort: provider.and_then(|provider| provider.reasoning_effort.clone()),
+            provider_type: provider
+                .map(|provider| provider.provider_type.clone())
+                .unwrap_or_else(|| "openai".into()),
+            thinking_enabled: provider.and_then(|provider| provider.thinking_enabled),
+            thinking_type: provider.and_then(|provider| provider.thinking_type.clone()),
+            thinking_keep: provider.and_then(|provider| provider.thinking_keep.clone()),
+            dangerously_skip_permissions,
+            interactive,
+            keep_interrupted_context: config.keep_interrupted_context,
+            user_agent: provider.and_then(|provider| provider.user_agent.clone()),
+            skip_tls_verify: provider
+                .map(|provider| provider.skip_tls_verify)
+                .unwrap_or(false),
+            loop_max_rounds: resolve_loop_max_rounds(
+                config.loop_config.max_rounds,
+                std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
+            ),
+            subagent_config: Some(Arc::new(config.clone())),
+        }
+    }
+
+    pub fn agent_config(&self) -> CodingAgentConfig {
+        let mut config = CodingAgentConfig::new(
+            &self.api_key,
+            &self.base_url,
+            &self.model,
+            &self.working_dir,
+        );
+        config.context_window = self.context_window;
+        config.preferred_language = self.preferred_language;
+        config.provider_name = self.provider_name.clone();
+        config.chat_options.max_tokens = self.max_tokens;
+        config.telemetry = self.telemetry.clone();
+        config.reasoning_history = self.reasoning_history.clone();
+        config.chat_options.reasoning_effort =
+            atomcode_kernel::provider::ReasoningEffort::from_config(
+                self.reasoning_effort.as_deref(),
+            );
+        config.provider_type = self.provider_type.clone();
+        config.thinking_enabled = self.thinking_enabled;
+        config.thinking_type = self.thinking_type.clone();
+        config.thinking_keep = self.thinking_keep.clone();
+        config.user_agent = self.user_agent.clone();
+        config.skip_tls_verify = self.skip_tls_verify;
+        config.loop_max_rounds = self.loop_max_rounds;
+        config.subagent_config = self.subagent_config.clone();
+        if self.interactive {
+            config.request_timeout = None;
+        }
+        config.keep_interrupted_context = self.keep_interrupted_context;
+        config
+    }
+}
+
+pub fn apply_provider_config(
+    config: &mut CodingAgentConfig,
+    provider: &atomcode_config::config::provider::ProviderConfig,
+) {
+    config.model = provider.model.clone();
+    if let Some(base_url) = &provider.base_url {
+        config.base_url = base_url.clone();
+    }
+    if let Some(api_key) = provider.resolved_api_key() {
+        config.api_key = api_key;
+    }
+    config.context_window = provider.context_window as u32;
+    config.chat_options.max_tokens = provider.max_tokens.map(|value| value as u32);
+    config.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
+        provider.reasoning_effort.as_deref(),
+    );
+    config.provider_type = provider.provider_type.clone();
+    config.reasoning_history = provider.reasoning_history.clone();
+    config.thinking_enabled = provider.thinking_enabled;
+    config.thinking_type = provider.thinking_type.clone();
+    config.thinking_keep = provider.thinking_keep.clone();
+    config.user_agent = provider.user_agent.clone();
+    config.skip_tls_verify = provider.skip_tls_verify;
+}
+
+/// A thunk the runtime supplies that constructs a (gateway-signed) tier provider. `Some` on
 /// success, `None` if construction failed (⇒ the tier falls back to the host provider).
 pub type SubagentProvider =
     Arc<dyn Fn() -> Option<Arc<dyn atomcode_kernel::provider::LlmProvider>> + Send + Sync>;
@@ -118,7 +291,7 @@ pub type SubagentProvider =
 /// on a `/model` swap) plus a lazily-populated build `cache`. `get()` builds on first use and
 /// caches (keeps startup cheap — no reqwest client until the first `task`); `reset()` re-points
 /// the thunk and drops the cache. Shared as an `Arc` between [`CodingAgentConfig`] and the
-/// already-built TaskTool, so the bridge can update tier routing on a model swap in place.
+/// already-built TaskTool, so the runtime can update tier routing on a model swap in place.
 struct TierInner {
     thunk: SubagentProvider,
     /// `None` = not built yet; `Some(inner)` = built exactly once (`inner == None` means the
@@ -142,7 +315,11 @@ pub struct TierProvider {
 impl TierProvider {
     pub fn new(thunk: SubagentProvider) -> Arc<Self> {
         Arc::new(Self {
-            inner: std::sync::Mutex::new(TierInner { thunk, cache: None, session_id: None }),
+            inner: std::sync::Mutex::new(TierInner {
+                thunk,
+                cache: None,
+                session_id: None,
+            }),
         })
     }
 
@@ -178,7 +355,7 @@ impl TierProvider {
     }
 
     /// Re-point at a freshly-resolved thunk and drop the cache — the next `get()` rebuilds.
-    /// Called by the bridge on a `/model` swap so tier routing re-resolves against the new host.
+    /// Called by the runtime on a `/model` swap so tier routing re-resolves against the new host.
     /// The recorded `session_id` PERSISTS (a model swap changes the tier model, not the
     /// conversation), so the rebuilt provider is re-bound to the same window on the next `get()`.
     pub fn reset(&self, thunk: SubagentProvider) {
@@ -204,6 +381,46 @@ fn default_goal_max_rounds() -> u32 {
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(200)
 }
+fn default_turn_max_rounds() -> u32 {
+    std::env::var("ATOMCODE_TURN_MAX_ROUNDS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(200)
+}
+
+fn default_tool_loop_policy() -> Option<ToolLoopPolicy> {
+    resolve_tool_loop_policy(
+        std::env::var("ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD")
+            .ok()
+            .as_deref(),
+        std::env::var("ATOMCODE_TOOL_LOOP_STOP_THRESHOLD")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn resolve_tool_loop_policy(
+    warning_env: Option<&str>,
+    stop_env: Option<&str>,
+) -> Option<ToolLoopPolicy> {
+    let requested_stop = stop_env.and_then(|value| value.trim().parse::<u32>().ok());
+    if requested_stop == Some(0) {
+        return None;
+    }
+    // Values below 3 cannot satisfy the public policy invariant (warning >= 2
+    // and warning < stop), so malformed/unsafe external input retains the shipped
+    // 3/4 policy instead of panicking or silently disabling protection.
+    let stop = requested_stop.filter(|value| *value >= 3).unwrap_or(4);
+    let fallback_warning = 3.min(stop - 1).max(2);
+    let warning = warning_env
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value >= 2 && *value < stop)
+        .unwrap_or(fallback_warning);
+    Some(
+        ToolLoopPolicy::new(warning, stop)
+            .expect("resolved tool-loop thresholds satisfy the policy invariant"),
+    )
+}
 fn default_goal_max_duration_secs() -> u64 {
     std::env::var("ATOMCODE_GOAL_MAX_DURATION_SECS")
         .ok()
@@ -211,10 +428,20 @@ fn default_goal_max_duration_secs() -> u64 {
         .unwrap_or(7200)
 }
 fn default_loop_max_rounds() -> u32 {
-    std::env::var("ATOMCODE_LOOP_MAX_ROUNDS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(100)
+    resolve_loop_max_rounds(
+        100,
+        std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
+    )
+}
+
+/// Resolve the product-level `/loop` round high-water mark.
+///
+/// Drivers with their own loop controller must use this resolver too so the
+/// `ATOMCODE_LOOP_MAX_ROUNDS` override, including `0 = unbounded`, has one
+/// meaning across runtime-owned and driver-owned loop modes.
+pub fn resolve_loop_max_rounds(configured: u32, env: Option<&str>) -> u32 {
+    env.and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(configured)
 }
 
 impl CodingAgentConfig {
@@ -225,15 +452,20 @@ impl CodingAgentConfig {
         model: impl Into<String>,
         working_dir: impl Into<PathBuf>,
     ) -> Self {
+        let model = model.into();
         Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
-            model: model.into(),
+            provider_name: model.clone(),
+            model,
+            preferred_language: None,
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
+            max_rounds: default_turn_max_rounds(),
+            tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
             goal_max_duration_secs: default_goal_max_duration_secs(),
             loop_max_rounds: default_loop_max_rounds(),
@@ -249,6 +481,7 @@ impl CodingAgentConfig {
             keep_interrupted_context: false,
             user_agent: None,
             skip_tls_verify: false,
+            subagent_config: None,
             subagent_fast_provider: None,
             subagent_capable_provider: None,
         }
@@ -260,10 +493,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn goal_caps_have_generous_defaults() {
+    fn round_caps_have_generous_defaults() {
         let c = CodingAgentConfig::new("k", "https://x/v1", "m", "/tmp");
+        assert_eq!(c.max_rounds, 200);
         assert_eq!(c.goal_max_rounds, 200);
         assert_eq!(c.goal_max_duration_secs, 7200);
+    }
+
+    #[test]
+    fn runtime_config_passes_preferred_language_to_agent() {
+        let mut source = atomcode_config::config::Config::default();
+        source.language = Some(Locale::ZhCn);
+        let runtime = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+
+        assert_eq!(runtime.preferred_language, Some(Locale::ZhCn));
+        assert_eq!(
+            runtime.agent_config().preferred_language,
+            Some(Locale::ZhCn)
+        );
+    }
+
+    #[test]
+    fn loop_round_env_override_wins_over_toml_and_preserves_zero() {
+        assert_eq!(resolve_loop_max_rounds(100, Some("250")), 250);
+        assert_eq!(resolve_loop_max_rounds(100, Some("0")), 0);
+        assert_eq!(resolve_loop_max_rounds(80, Some("invalid")), 80);
+        assert_eq!(resolve_loop_max_rounds(80, None), 80);
+    }
+
+    #[test]
+    fn tool_loop_env_policy_is_validated_and_can_be_disabled() {
+        let policy = resolve_tool_loop_policy(Some("10"), Some("12")).unwrap();
+        assert_eq!(policy.warning_threshold(), 10);
+        assert_eq!(policy.stop_threshold(), 12);
+        assert!(resolve_tool_loop_policy(Some("10"), Some("0")).is_none());
+
+        let fallback = resolve_tool_loop_policy(Some("99"), Some("4")).unwrap();
+        assert_eq!(fallback.warning_threshold(), 3);
+        assert_eq!(fallback.stop_threshold(), 4);
     }
 
     #[test]
@@ -313,7 +587,11 @@ mod tests {
         // A /model swap resets the cell: new thunk + dropped cache → next get rebuilds.
         cell.reset(mk("glm", builds.clone()));
         assert_eq!(cell.get().unwrap().model_name(), "glm");
-        assert_eq!(builds.load(Ordering::SeqCst), 2, "reset forces a rebuild with the new model");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "reset forces a rebuild with the new model"
+        );
     }
 
     #[test]
@@ -331,7 +609,11 @@ mod tests {
         let cell = TierProvider::new(thunk);
         assert!(cell.get().is_none());
         assert!(cell.get().is_none());
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "None result must be cached, thunk called once");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "None result must be cached, thunk called once"
+        );
     }
 
     #[test]
@@ -383,11 +665,14 @@ impl std::fmt::Debug for CodingAgentConfig {
         f.debug_struct("CodingAgentConfig")
             .field("base_url", &self.base_url)
             .field("model", &self.model)
+            .field("provider_name", &self.provider_name)
             .field("working_dir", &self.working_dir)
             .field("context_window", &self.context_window)
             .field("stream_timeout", &self.stream_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("max_continuations", &self.max_continuations)
+            .field("max_rounds", &self.max_rounds)
+            .field("tool_loop_policy", &self.tool_loop_policy)
             .field("goal_max_rounds", &self.goal_max_rounds)
             .field("goal_max_duration_secs", &self.goal_max_duration_secs)
             .field("chat_options", &self.chat_options)

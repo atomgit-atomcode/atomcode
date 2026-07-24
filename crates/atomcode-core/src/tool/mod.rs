@@ -12,7 +12,6 @@ pub mod grep;
 pub mod list_dir;
 pub mod list_symbols;
 pub mod open_file;
-pub mod parallel_edit;
 pub mod read;
 pub mod read_symbol;
 pub mod result_store;
@@ -101,11 +100,8 @@ pub fn diagnose_args(
              Re-issue: {example}"
         ));
     }
-    let value: serde_json::Value = serde_json::from_str(args).map_err(|_| {
-        format!(
-            "{tool} arguments are not valid JSON. Re-issue: {example}"
-        )
-    })?;
+    let value: serde_json::Value = serde_json::from_str(args)
+        .map_err(|_| format!("{tool} arguments are not valid JSON. Re-issue: {example}"))?;
     let obj = match value.as_object() {
         Some(o) => o,
         None => {
@@ -335,11 +331,7 @@ fn windows_rooted_path(path: &str) -> Option<&str> {
 
 fn strip_windows_drive_prefix(path: &str) -> Option<&str> {
     let bytes = path.as_bytes();
-    if bytes.len() < 3
-        || !bytes[0].is_ascii_alphabetic()
-        || bytes[1] != b':'
-        || bytes[2] != b'\\'
-    {
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
         return None;
     }
 
@@ -373,7 +365,7 @@ pub fn real_home_dir() -> Option<PathBuf> {
             return Some(home);
         }
     }
-    
+
     // Fall back to the standard home directory
     dirs::home_dir()
 }
@@ -384,16 +376,16 @@ pub fn real_home_dir() -> Option<PathBuf> {
 fn get_user_home(username: &str) -> Option<PathBuf> {
     use std::ffi::CString;
     use std::ptr;
-    
+
     // SAFETY: We're calling getpwnam which is thread-safe on modern systems
     // when using getpwnam_r
     let username_c = CString::new(username).ok()?;
-    
+
     unsafe {
         let mut pwd: libc::passwd = std::mem::zeroed();
         let mut buf = vec![0u8; 4096]; // Buffer for string fields
         let mut result: *mut libc::passwd = ptr::null_mut();
-        
+
         let ret = libc::getpwnam_r(
             username_c.as_ptr(),
             &mut pwd,
@@ -401,7 +393,7 @@ fn get_user_home(username: &str) -> Option<PathBuf> {
             buf.len(),
             &mut result,
         );
-        
+
         if ret == 0 && !result.is_null() {
             let home = std::ffi::CStr::from_ptr(pwd.pw_dir)
                 .to_string_lossy()
@@ -409,7 +401,7 @@ fn get_user_home(username: &str) -> Option<PathBuf> {
             return Some(PathBuf::from(home));
         }
     }
-    
+
     None
 }
 
@@ -664,7 +656,9 @@ fn is_sensitive_path(path: &Path) -> bool {
 /// those directories are trusted so they don't prompt for approval every
 /// time a skill loads its bundled documentation index.
 fn is_atomcode_owned_path(path: &Path) -> bool {
-    let Some(home) = real_home_dir() else { return false };
+    let Some(home) = real_home_dir() else {
+        return false;
+    };
     let trusted_roots: &[PathBuf] = &[
         home.join(".atomcode").join("plugins"),
         home.join(".atomcode").join("skills"),
@@ -860,7 +854,10 @@ pub enum ApprovalRequirement {
     /// re-prompting once approved, while every other sensitive resource still
     /// requires its own confirmation. Unlike a tool-wide grant, a scoped grant
     /// only covers the matching `scope`.
-    RequireApprovalScoped { reason: String, scope: String },
+    RequireApprovalScoped {
+        reason: String,
+        scope: String,
+    },
 }
 
 /// The resolved decision returned by `PermissionStore::check` or by an
@@ -952,7 +949,6 @@ impl PermissionStore {
     pub fn grant_session_scope(&mut self, scope: &str) {
         self.session_scope_grants.insert(scope.to_string());
     }
-
 }
 
 /// Shared execution context passed to every tool invocation.
@@ -980,13 +976,6 @@ pub struct ToolContext {
     pub semantic: Arc<Mutex<crate::semantic::SemanticSearcher>>,
     pub file_history: Arc<Mutex<file_history::FileHistory>>,
     pub graph: Arc<RwLock<crate::graph::CodeGraph>>,
-    /// Remaining context tokens budget. Set by TurnRunner before each tool batch.
-    /// read_file uses this to decide full content vs skeleton.
-    pub ctx_budget_hint: Arc<std::sync::atomic::AtomicUsize>,
-    /// Per-file token budget for read_file. Set by runner.rs Layer B before each
-    /// tool batch: `ctx_budget / (5 * num_reads)`. read.rs compares file_tokens
-    /// against this to decide full vs skeleton. Defaults to ctx_budget/5 (single file).
-    pub read_budget_tokens: Arc<std::sync::atomic::AtomicUsize>,
     /// Per-session read-file output cache. Hit is valid only when on-disk mtime
     /// still matches. Avoids redoing UTF-8 parsing + semantic skeleton generation
     /// when the model re-reads the same file — these are CPU-heavy, not just I/O.
@@ -1010,19 +999,6 @@ pub struct ToolContext {
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Shared LSP manager for diagnostics tool. `None` when LSP is disabled.
     pub lsp: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
-    /// Optional event sender for real-time tool output streaming (e.g., bash stdout).
-    /// When set, tools like bash can send output chunks as they're produced.
-    pub event_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<crate::turn::event::TurnEvent>>>,
-    /// Current tool call ID for event correlation.
-    pub current_call_id: Option<String>,
-    /// Shared registry handle for tools that dispatch fork sub-agents
-    /// (currently only `parallel_edit_files`). Set by `AgentLoop::new`
-    /// after the registry is wrapped in `Arc`. Reading the registry via
-    /// `ctx` instead of holding it in the tool struct avoids creating a
-    /// `Tool ↔ Registry` `Arc` cycle that would otherwise leak memory
-    /// for the lifetime of the process. `None` in headless / test
-    /// contexts that don't need fork dispatch.
-    pub tool_registry: Option<Arc<ToolRegistry>>,
     /// D3 file content store. read_file pushes large file content
     /// here transparently and consults it on subsequent reads of any
     /// range — disk hit only on first read or after edit. Conversation
@@ -1055,16 +1031,11 @@ impl ToolContext {
             working_dir: Arc::new(RwLock::new(working_dir)),
             semantic: Arc::new(Mutex::new(crate::semantic::SemanticSearcher::new())),
             file_history: Arc::new(Mutex::new(file_history::FileHistory::new(session_id))),
-            ctx_budget_hint: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
-            read_budget_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             graph: Arc::new(RwLock::new(crate::graph::CodeGraph::new())),
             read_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             first_error_signatures: Arc::new(RwLock::new(Vec::new())),
             telemetry,
             lsp: None,
-            event_tx: None,
-            current_call_id: None,
-            tool_registry: None,
             file_store: Arc::new(RwLock::new(crate::ctx::file_store::FileStore::new())),
         }
     }
@@ -1074,11 +1045,8 @@ impl ToolContext {
     ///
     /// Fields that are NOT copied from the original:
     /// - `read_cache`: reset — subagent re-reads files (acceptable for isolation)
-    /// - `event_tx`: reset — subagent has its own event channel
     /// - `tool_registry`: reset — subagent gets filtered tools
     /// - `first_error_signatures`: reset — subagent has independent error state
-    /// - `ctx_budget_hint`: reset to MAX — subagent has its own budget
-    /// - `read_budget_tokens`: reset to MAX — subagent has own budget
     pub async fn isolate(&self) -> Self {
         let wd = self.working_dir.read().await.clone();
         let mut ctx = Self::new(wd);
@@ -1237,7 +1205,11 @@ impl ToolRegistry {
     /// Iterate over all registered tools (async, acquires read lock).
     pub async fn iter(&self) -> impl Iterator<Item = (String, Arc<dyn Tool>)> {
         let tools = self.tools.read().await;
-        tools.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>().into_iter()
+        tools
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// Register a tool from an Arc (for building filtered registries from parent).
@@ -1253,7 +1225,9 @@ impl ToolRegistry {
     /// `recover_tool_args` falls back to its permissive branch).
     pub async fn expected_top_keys(&self, name: &str) -> Vec<String> {
         let tools = self.tools.read().await;
-        let Some(tool) = tools.get(name) else { return Vec::new() };
+        let Some(tool) = tools.get(name) else {
+            return Vec::new();
+        };
         let def = tool.definition();
         def.parameters
             .get("properties")
@@ -1279,7 +1253,6 @@ impl ToolRegistry {
         }
         n
     }
-
 }
 
 /// Wrapper key names atomgit's gateway has been observed to inject around
@@ -1380,7 +1353,9 @@ pub fn recover_tool_args(raw: &str, expected_top_keys: &[String]) -> Option<Stri
 }
 
 fn has_expected_key(v: &serde_json::Value, expected: &[String]) -> bool {
-    let Some(map) = v.as_object() else { return false };
+    let Some(map) = v.as_object() else {
+        return false;
+    };
     expected.iter().any(|k| map.contains_key(k.as_str()))
 }
 
@@ -1390,7 +1365,9 @@ fn has_expected_key(v: &serde_json::Value, expected: &[String]) -> bool {
 /// untouched, even if some of those keys happen to overlap with
 /// `ARGS_WRAPPER_KEYS` (e.g. `content` in write/todo).
 fn all_keys_in_expected(v: &serde_json::Value, expected: &[String]) -> bool {
-    let Some(map) = v.as_object() else { return false };
+    let Some(map) = v.as_object() else {
+        return false;
+    };
     if map.is_empty() {
         return false;
     }
@@ -1398,7 +1375,9 @@ fn all_keys_in_expected(v: &serde_json::Value, expected: &[String]) -> bool {
 }
 
 fn has_wrapper_shape(v: &serde_json::Value) -> bool {
-    let Some(map) = v.as_object() else { return false };
+    let Some(map) = v.as_object() else {
+        return false;
+    };
     ARGS_WRAPPER_KEYS.iter().any(|k| {
         map.get(*k).is_some_and(|inner| {
             // Wrapper if the wrapper key's value is itself an object, or is
@@ -1480,9 +1459,15 @@ mod tests {
         let upper = path_case_key(Path::new("/Users/danan/Proj"));
         let lower = path_case_key(Path::new("/users/danan/proj"));
         #[cfg(any(target_os = "windows", target_os = "macos"))]
-        assert_eq!(upper, lower, "case-insensitive FS: case variants share a key");
+        assert_eq!(
+            upper, lower,
+            "case-insensitive FS: case variants share a key"
+        );
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        assert_ne!(upper, lower, "case-sensitive FS: case variants stay distinct");
+        assert_ne!(
+            upper, lower,
+            "case-sensitive FS: case variants stay distinct"
+        );
     }
 
     #[test]
@@ -1492,7 +1477,10 @@ mod tests {
         // (separator + verbatim + trailing-slash normalization is not case-folding).
         let a = path_case_key(Path::new(r"\\?\C:\proj\sub"));
         let b = path_case_key(Path::new("C:/proj/sub/"));
-        assert_eq!(a, b, "verbatim/separator/trailing-slash spellings share a key");
+        assert_eq!(
+            a, b,
+            "verbatim/separator/trailing-slash spellings share a key"
+        );
     }
 
     struct DummyTool;
@@ -1729,7 +1717,6 @@ mod tests {
         assert!(matches!(decision, PermissionDecision::Allow));
     }
 
-
     #[test]
     fn approval_for_non_sensitive_read_outside_workspace_requires_confirmation() {
         let workspace = TempDir::new().unwrap();
@@ -1812,7 +1799,9 @@ mod tests {
                 // this machine, so just assert the scope string is non-empty.
                 assert!(!scope.is_empty(), "scope should be a non-empty path");
             }
-            _ => panic!("expected RequireApprovalScoped for sensitive enumeration outside workspace"),
+            _ => {
+                panic!("expected RequireApprovalScoped for sensitive enumeration outside workspace")
+            }
         }
     }
 
@@ -1847,7 +1836,9 @@ mod tests {
     /// We exercise both an existing path and a not-yet-created one.
     #[test]
     fn approval_for_write_under_atomcode_home_is_auto() {
-        let _guard = ATOMCODE_HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ATOMCODE_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = TempDir::new().unwrap();
         let prev = std::env::var("ATOMCODE_HOME").ok();
         unsafe {
@@ -1891,7 +1882,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn approval_for_write_through_atomcode_home_symlink_is_auto() {
-        let _guard = ATOMCODE_HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ATOMCODE_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = TempDir::new().unwrap();
         let prev = std::env::var("ATOMCODE_HOME").ok();
         unsafe {
@@ -1963,7 +1956,10 @@ mod tests {
             other => panic!("expected scoped approval for workspace escape, got {other:?}"),
         };
         let mut store = PermissionStore::new();
-        assert!(matches!(store.check("edit_file", &approval), PermissionDecision::Ask(_)));
+        assert!(matches!(
+            store.check("edit_file", &approval),
+            PermissionDecision::Ask(_)
+        ));
         store.grant_session_scope(&scope); // user pressed [A]
         let again = tool.approval_with_context(&args, &ctx);
         assert!(
@@ -2130,7 +2126,12 @@ mod tests {
         vec!["file_path".into(), "offset".into(), "limit".into()]
     }
     fn grep_keys() -> Vec<String> {
-        vec!["pattern".into(), "path".into(), "max_results".into(), "context".into()]
+        vec![
+            "pattern".into(),
+            "path".into(),
+            "max_results".into(),
+            "context".into(),
+        ]
     }
     fn write_keys() -> Vec<String> {
         vec!["file_path".into(), "content".into()]
@@ -2340,9 +2341,15 @@ mod tests {
     fn test_real_home_dir_returns_something() {
         // In normal conditions, real_home_dir should return a valid path
         let home = real_home_dir();
-        assert!(home.is_some(), "real_home_dir should return Some in normal conditions");
+        assert!(
+            home.is_some(),
+            "real_home_dir should return Some in normal conditions"
+        );
         let path = home.unwrap();
-        assert!(path.is_absolute(), "Home directory should be an absolute path");
+        assert!(
+            path.is_absolute(),
+            "Home directory should be an absolute path"
+        );
     }
 
     #[test]
@@ -2350,14 +2357,14 @@ mod tests {
         // Save original state
         let original_sudo_user = std::env::var("SUDO_USER").ok();
         let original_home = std::env::var("HOME").ok();
-        
+
         // Simulate sudo scenario: HOME=/root, SUDO_USER=<current_user>
         // We can't actually change to root, but we can verify the logic works
         #[cfg(unix)]
         {
             // Get current user's home from dirs::home_dir()
             let normal_home = dirs::home_dir();
-            
+
             // Set SUDO_USER to a user that exists (the current user)
             // This tests that get_user_home() works correctly
             if let Some(ref home) = normal_home {
@@ -2365,14 +2372,14 @@ mod tests {
                 assert!(home.is_absolute());
             }
         }
-        
+
         // Restore original state
         if let Some(orig) = original_sudo_user {
             std::env::set_var("SUDO_USER", orig);
         } else {
             std::env::remove_var("SUDO_USER");
         }
-        
+
         if let Some(orig) = original_home {
             std::env::set_var("HOME", orig);
         }
@@ -2384,11 +2391,11 @@ mod tests {
         let home = real_home_dir().unwrap();
         let expanded = expand_user_path("~/test");
         assert_eq!(expanded, home.join("test"));
-        
+
         // Test that ~ alone expands to home
         let expanded = expand_user_path("~");
         assert_eq!(expanded, home);
-        
+
         // Test that non-tilde paths are preserved
         let expanded = expand_user_path("/absolute/path");
         assert_eq!(expanded, PathBuf::from("/absolute/path"));
@@ -2397,15 +2404,21 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn approval_for_windows_system_protected_prefix_requires_always() {
-        assert!(is_sensitive_path(Path::new(r"C:\Windows\System32\config.sys")));
-        assert!(is_sensitive_path(Path::new(r"C:\Program Files\SomeApp\app.exe")));
+        assert!(is_sensitive_path(Path::new(
+            r"C:\Windows\System32\config.sys"
+        )));
+        assert!(is_sensitive_path(Path::new(
+            r"C:\Program Files\SomeApp\app.exe"
+        )));
         assert!(is_sensitive_path(Path::new(r"C:\ProgramData\secrets.txt")));
     }
 
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn approval_for_unix_system_protected_prefix_requires_always() {
-        assert!(is_sensitive_path(Path::new("/System/Library/CoreServices/boot.efi")));
+        assert!(is_sensitive_path(Path::new(
+            "/System/Library/CoreServices/boot.efi"
+        )));
         assert!(is_sensitive_path(Path::new("/etc/passwd")));
         assert!(is_sensitive_path(Path::new("/var/log/syslog")));
     }
@@ -2414,9 +2427,13 @@ mod tests {
     fn config_dir_and_bare_config_no_longer_sensitive() {
         let home = real_home_dir().expect("home");
         // ~/.config/<app>/settings is ordinary app config, not a secret.
-        assert!(!is_sensitive_path(&home.join(".config").join("app").join("settings.toml")));
+        assert!(!is_sensitive_path(
+            &home.join(".config").join("app").join("settings.toml")
+        ));
         // A bare file named `config` outside the workspace is not a secret.
-        assert!(!is_sensitive_path(std::path::Path::new("/tmp/somewhere/config")));
+        assert!(!is_sensitive_path(std::path::Path::new(
+            "/tmp/somewhere/config"
+        )));
     }
 
     #[test]

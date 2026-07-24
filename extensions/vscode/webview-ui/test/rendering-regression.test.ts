@@ -37,6 +37,40 @@ function startAssistantState() {
   }, { type: 'START_GENERATION' });
 }
 
+function testLogoutRequiresSetupOnlyForLoginDependentProvider() {
+  const provider = (name: string, requiresLogin: boolean) => ({
+    name,
+    type: 'openai',
+    model: 'model',
+    has_api_key: false,
+    requires_login: requiresLogin,
+    is_default: true,
+    context_window: 128_000,
+    skip_tls_verify: false,
+  });
+  const signedOut = {
+    logged_in: false,
+    expired: false,
+    auth_path: '/tmp/auth.toml',
+    user: null,
+  };
+
+  let state = chatReducer(initialState, {
+    type: 'SET_PROVIDERS',
+    providers: [provider('custom', false)],
+    defaultProvider: 'custom',
+  });
+  state = chatReducer(state, { type: 'SET_AUTH', auth: signedOut });
+  assert.equal(state.setupRequired, false);
+
+  state = chatReducer(state, {
+    type: 'SET_PROVIDERS',
+    providers: [provider('gateway', true)],
+    defaultProvider: 'gateway',
+  });
+  assert.equal(state.setupRequired, true);
+}
+
 function testToolDurationFormattingUsesMillisecondsBelowOneSecond() {
   assert.equal(formatToolDuration(0), '1ms');
   assert.equal(formatToolDuration(1), '1ms');
@@ -90,6 +124,34 @@ function testDoneMarksRunningToolsIncompleteWithoutResult() {
   const tool = state.messages[0].toolCalls?.[0];
   assert.equal(tool?.status, 'incomplete');
   assert.equal(state.messages[0].blocks?.[0].type === 'tool' ? state.messages[0].blocks[0].tool.status : undefined, 'incomplete');
+}
+
+function testResumeStreamingReplayIsIdempotent() {
+  let state = startAssistantState();
+  state = chatReducer(state, { type: 'APPEND_TEXT', content: 'already streamed' });
+  state = chatReducer(state, { type: 'RESUME_STREAMING' });
+
+  assert.equal(
+    state.messages.filter((message) => message.role === 'assistant' && message.streaming).length,
+    1,
+    'replaying resumeStreaming must not append a second live assistant bubble',
+  );
+}
+
+function testToolBatchReplayUpsertsCallsById() {
+  let state = startAssistantState();
+  const action = {
+    type: 'TOOL_BATCH_START' as const,
+    calls: [{ id: 'tool-1', name: 'read_file', args: '{"path":"a.ts"}' }],
+  };
+  state = chatReducer(state, action);
+  state = chatReducer(state, action);
+
+  assert.equal(state.messages[0].toolCalls?.length, 1);
+  assert.equal(
+    state.messages[0].blocks?.filter((block) => block.type === 'tool').length,
+    1,
+  );
 }
 
 function testErrorMarksRunningToolsError() {
@@ -822,7 +884,9 @@ function testUserMessageRendersPlainTextInsteadOfMarkdown() {
   assert.doesNotMatch(source, /import\s+\{\s*Markdown\s*\}/);
   assert.doesNotMatch(source, /<Markdown\s+content=\{message\.text\}/);
   assert.match(source, /className="user-message-plain-text"/);
-  assert.match(source, /\{message\.text\}/);
+  // When no search query is active, the raw message text is rendered as-is
+  // (search highlights are injected only when a query is present).
+  assert.match(source, /: message\.text\}/);
 }
 
 function testUserPlainTextCssPreservesLiteralInput() {
@@ -1003,7 +1067,7 @@ function testGenerationDoneReloadsFinishedSessionHistory() {
   const onDone = source.match(/onDone:\s*\([^)]*\)\s*=>\s*\{[\s\S]*?\n\s*\},\n\s*onStopped:/)?.[0] ?? '';
 
   assert.match(onDone, /const doneSessionId = sessionId \|\| streamSessionId/);
-  assert.match(onDone, /this\._reloadFinishedSessionHistory\(doneSessionId\)/);
+  assert.match(onDone, /this\._reloadFinishedSessionHistory\(doneSessionId, streamGeneration\)/);
 }
 
 testDiffLikeTypedCodeIsRenderedAsDiffRows();
@@ -1059,10 +1123,13 @@ testMarkdownTableRepairDoesNotChangeFencedCodeSamples();
 testMarkdownTableRepairDoesNotChangeHtmlBlocks();
 testMarkdownTableRepairKeepsMarkedOneColumnRows();
 testGenerationDoneReloadsFinishedSessionHistory();
+testLogoutRequiresSetupOnlyForLoginDependentProvider();
 testToolDurationFormattingUsesMillisecondsBelowOneSecond();
 testWarningAddsStatusBlockToStreamingAssistantMessage();
 testRateLimitedStatusBlockIsUpdatedInPlace();
 testDoneMarksRunningToolsIncompleteWithoutResult();
+testResumeStreamingReplayIsIdempotent();
+testToolBatchReplayUpsertsCallsById();
 testErrorMarksRunningToolsError();
 testToolProgressReplacesLatestActivity();
 testPartialReviewResultIsMarkedIncomplete();

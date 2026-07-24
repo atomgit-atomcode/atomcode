@@ -1,186 +1,180 @@
 //! Kernel-native session agent for ACP sessions.
 //!
-//! Replicates the bridge's provider + config construction without depending on
-//! `atomcode-bridge` (or `atomcode-core`). The single entry point [`spawn_session`]
+//! Builds native provider + runtime configuration without depending on
+//! `atomcode-core`. The single entry point [`spawn_session`]
 //! runs the two-phase `prepare → assemble → spawn` pipeline and hands back a live
-//! [`AgentHandle`] the session table (Task 6) can drive.
+//! [`CodingRuntime`] the session table can drive.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use atomcode_coding::config::CodingAgentConfig;
-use atomcode_coding::parts::{assemble, prepare, PrepareOptions};
-use atomcode_kernel::agent::AgentHandle;
-use atomcode_kernel::provider::LlmProvider;
+use atomcode_coding::parts::PrepareOptions;
+use atomcode_coding::{
+    CodingProviderFactory, CodingRuntime, CodingRuntimeStart, DefaultCodingProviderFactory,
+    StaticPluginHookSource,
+};
 
-/// Provider + model inputs for a single ACP session.
+/// Complete agent configuration template for ACP sessions.
 ///
-/// Constructed by the session dispatcher (Task 6) from the ACP `initialize`
-/// handshake and the global provider configuration.
+/// Constructed by the session dispatcher from the ACP `initialize` handshake and
+/// the global provider configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    pub api_key: String,
-    pub base_url: String,
-    pub model: String,
-    /// Provider adapter kind: `"openai"` (default), `"anthropic"`/`"claude"`,
-    /// or `"ollama"`.  Empty / unknown → OpenAI-compatible.
-    pub provider_type: String,
-    /// Model context window in tokens.
-    pub context_window: u32,
-    /// Per-call output cap (`ChatOptions::max_tokens`).  `None` → provider default.
-    pub max_tokens: Option<u32>,
+    config: CodingAgentConfig,
 }
 
 impl EngineConfig {
+    pub fn from_coding_config(config: CodingAgentConfig) -> Self {
+        Self { config }
+    }
+
     /// Build the `CodingAgentConfig` for this session's working directory.
     ///
-    /// Sets only the fields that exist on this branch's `CodingAgentConfig`.
     /// `request_timeout` is cleared (`None`) so approval prompts park until the
     /// ACP client answers — the interactive contract, not the headless fail-closed one.
     pub fn to_coding_config(&self, cwd: PathBuf) -> CodingAgentConfig {
-        let mut cfg = CodingAgentConfig::new(&self.api_key, &self.base_url, &self.model, cwd);
-        cfg.context_window = self.context_window;
-        cfg.chat_options.max_tokens = self.max_tokens;
-        cfg.provider_type = self.provider_type.clone();
+        let mut cfg = self.config.clone();
+        cfg.working_dir = cwd;
         // ACP sessions are long-lived and interactive: park on approval, not fail-closed.
         cfg.request_timeout = None;
         cfg
     }
 }
 
-/// Fallback output cap: `context_window / 4` clamped to `[8 000, 16 384]`.
-///
-/// Mirrors `atomcode-bridge`'s `default_max_tokens` so the per-provider fallback is
-/// proportionate for large windows without overflowing the API's hard limit.
-fn default_max_tokens(context_window: u32) -> u32 {
-    (context_window / 4).clamp(8_000, 16_384)
-}
-
-/// Returns `true` if `base_url` points at the AtomGit AI gateway.
-///
-/// Used as a fail-fast guard inside `build_provider`: the fallback OpenAI-compat
-/// path cannot produce an authenticated (signed) request for the AtomGit gateway,
-/// so we bail out clearly instead of generating silent 401s.
-fn is_atomgit_gateway(base_url: &str) -> bool {
-    let lower = base_url.to_ascii_lowercase();
-    lower.contains("atomgit.com") || lower.contains("api-ai.gitcode.com")
-}
-
-/// Build a provider adapter for the given config.
-///
-/// Mirrors `atomcode-bridge::runtime::build_provider` but without the AtomGit
-/// gateway signer — the `acp` module does not use `atomcode-core`, and ACP
-/// sessions must use an externally-issued `api_key` rather than a signed gateway.
-///
-/// The three branches (anthropic / ollama / openai-compat) are kept in sync with
-/// the bridge; field assignments use the exact same real config structs.
-pub fn build_provider(cfg: &CodingAgentConfig) -> anyhow::Result<Arc<dyn LlmProvider>> {
-    use atomcode_capabilities::provider::{
-        AnthropicConfig, AnthropicProvider, OllamaConfig, OllamaProvider, OpenAiCompatConfig,
-        OpenAiCompatProvider, ReasoningPolicy,
-    };
-
-    match cfg.provider_type.as_str() {
-        "claude" | "anthropic" => {
-            let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
-            ac.context_window = cfg.context_window;
-            // Thread the config's byte-idle liveness knob down to the L1 adapter (kept in
-            // sync with `atomcode-bridge::runtime::build_provider`). Without this the
-            // adapter's hardcoded 120s default kills a thinking model's legitimate >120s
-            // mid-reasoning silence as a spurious `[Error: stream idle timeout]`.
-            ac.idle_timeout = cfg.stream_timeout;
-            ac.max_tokens = default_max_tokens(cfg.context_window);
-            ac.thinking = cfg.thinking_enabled.unwrap_or(false);
-            Ok(Arc::new(
-                AnthropicProvider::new(ac).map_err(|e| anyhow::anyhow!(e.message))?,
-            ))
-        }
-        "ollama" => {
-            let mut oc = OllamaConfig::new(&cfg.base_url, &cfg.model);
-            oc.api_key = cfg.api_key.clone();
-            oc.context_window = cfg.context_window;
-            // Same liveness-threading rationale as the Anthropic branch above.
-            oc.idle_timeout = cfg.stream_timeout;
-            oc.max_tokens = Some(default_max_tokens(cfg.context_window));
-            oc.think = cfg.thinking_enabled.unwrap_or(false);
-            Ok(Arc::new(
-                OllamaProvider::new(oc).map_err(|e| anyhow::anyhow!(e.message))?,
-            ))
-        }
-        // "openai" (default) + any unknown → OpenAI-compatible.
-        _ => {
-            let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
-            pc.context_window = cfg.context_window;
-            // Same liveness-threading rationale as the Anthropic branch above.
-            pc.idle_timeout = cfg.stream_timeout;
-            pc.max_tokens = Some(default_max_tokens(cfg.context_window));
-            // Honor `reasoning_history` override; unset → None → adapter auto-detects.
-            // A typo fails fast (parity with the legacy engine and the bridge).
-            pc.reasoning_policy =
-                ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
-                    .map_err(|e| anyhow::anyhow!(e))?;
-            pc.thinking_type = cfg.thinking_type.clone();
-            pc.thinking_keep = cfg.thinking_keep.clone();
-            if is_atomgit_gateway(&cfg.base_url) {
-                anyhow::bail!(
-                    "ACP engine cannot build an authenticated provider for the AtomGit gateway ({}); \
-                     the CLI must supply a pre-built (signed) provider",
-                    cfg.base_url
-                );
-            }
-            Ok(Arc::new(
-                OpenAiCompatProvider::new(pc).map_err(|e| anyhow::anyhow!(e.message))?,
-            ))
-        }
-    }
-}
-
 /// Spawn a kernel-native agent for a new ACP session.
 ///
 /// Runs the two-phase `prepare → assemble → spawn` pipeline and returns a live
-/// [`AgentHandle`] the session dispatcher (Task 6) can drive.
+/// [`CodingRuntime`] the session dispatcher can drive.
 ///
-/// `provider` — when `Some`, the pre-built (authenticated) provider is used
-/// directly; when `None`, [`build_provider`] constructs a fallback from the
-/// engine config (valid for non-gateway endpoints only).
 pub async fn spawn_session(
     engine: &EngineConfig,
     cwd: PathBuf,
-    provider: Option<Arc<dyn LlmProvider>>,
-) -> anyhow::Result<AgentHandle> {
+    provider_factory: Option<Arc<dyn CodingProviderFactory>>,
+) -> anyhow::Result<CodingRuntime> {
     let cfg = engine.to_coding_config(cwd);
-    // Production-parity defaults: MCP, memory, web, review, fresh session.
-    let mut parts = prepare(&cfg, PrepareOptions::default())
-        .await
-        .map_err(|e| anyhow::anyhow!("acp prepare failed: {e}"))?;
-    let provider = match provider {
-        Some(p) => p,
-        None => build_provider(&cfg)?,
-    };
-    let agent = assemble(&mut parts, &cfg, provider)
-        .map_err(|e| anyhow::anyhow!("acp assemble failed: {e}"))?;
-    Ok(agent.spawn())
+    let provider_factory = provider_factory.unwrap_or_else(|| {
+        Arc::new(DefaultCodingProviderFactory::new(concat!(
+            "atomcode/",
+            env!("CARGO_PKG_VERSION")
+        )))
+    });
+    CodingRuntime::start(CodingRuntimeStart {
+        agent: cfg,
+        prepare: PrepareOptions::default(),
+        provider_factory,
+        plugin_hooks: Arc::new(StaticPluginHookSource::default()),
+        image_preprocessor: None,
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("acp runtime start failed: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct RecordingProviderFactory {
+        session_ids: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl CodingProviderFactory for RecordingProviderFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            session_id: Option<&str>,
+        ) -> Result<
+            Arc<dyn atomcode_kernel::provider::LlmProvider>,
+            atomcode_coding::ProviderBuildError,
+        > {
+            self.session_ids
+                .lock()
+                .unwrap()
+                .push(session_id.map(str::to_owned));
+            Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(
+                Vec::new(),
+            )))
+        }
+    }
+
     #[test]
     fn engine_config_builds_coding_config() {
-        let e = EngineConfig {
-            api_key: "k".into(),
-            base_url: "https://x".into(),
-            model: "m".into(),
-            provider_type: "openai".into(),
-            context_window: 200_000,
-            max_tokens: Some(8192),
-        };
+        let mut base = CodingAgentConfig::new("k", "https://x", "m", "/original");
+        base.context_window = 200_000;
+        base.chat_options.max_tokens = Some(8192);
+        base.provider_type = "openai".into();
+        let e = EngineConfig::from_coding_config(base);
         let cfg = e.to_coding_config(std::path::PathBuf::from("/tmp/work"));
         assert_eq!(cfg.model, "m");
         assert_eq!(cfg.context_window, 200_000);
         assert_eq!(cfg.provider_type, "openai");
         assert_eq!(cfg.working_dir, std::path::PathBuf::from("/tmp/work"));
         assert_eq!(cfg.chat_options.max_tokens, Some(8192));
+    }
+
+    #[test]
+    fn engine_config_preserves_provider_and_runtime_semantics() {
+        let mut original = CodingAgentConfig::new(
+            "k",
+            "https://internal.example/v1",
+            "reasoning-model",
+            "/original",
+        );
+        original.provider_type = "anthropic".into();
+        original.skip_tls_verify = true;
+        original.user_agent = Some("custom-agent/1".into());
+        original.reasoning_history = Some("preserve".into());
+        original.chat_options.reasoning_effort =
+            Some(atomcode_kernel::provider::ReasoningEffort::High);
+        original.thinking_enabled = Some(true);
+        original.thinking_type = Some("enabled".into());
+        original.thinking_keep = Some("all".into());
+        original.keep_interrupted_context = true;
+        original.loop_max_rounds = 41;
+
+        let cfg = EngineConfig::from_coding_config(original)
+            .to_coding_config(std::path::PathBuf::from("/session"));
+
+        assert!(cfg.skip_tls_verify);
+        assert_eq!(cfg.user_agent.as_deref(), Some("custom-agent/1"));
+        assert_eq!(cfg.reasoning_history.as_deref(), Some("preserve"));
+        assert_eq!(
+            cfg.chat_options.reasoning_effort,
+            Some(atomcode_kernel::provider::ReasoningEffort::High)
+        );
+        assert_eq!(cfg.thinking_enabled, Some(true));
+        assert_eq!(cfg.thinking_type.as_deref(), Some("enabled"));
+        assert_eq!(cfg.thinking_keep.as_deref(), Some("all"));
+        assert!(cfg.keep_interrupted_context);
+        assert_eq!(cfg.loop_max_rounds, 41);
+        assert_eq!(cfg.working_dir, std::path::PathBuf::from("/session"));
+        assert_eq!(cfg.request_timeout, None);
+    }
+
+    #[tokio::test]
+    async fn shared_factory_builds_each_session_with_its_own_identity() {
+        let mut base = CodingAgentConfig::new("k", "https://example.test/v1", "m", "/original");
+        base.context_window = 200_000;
+        base.chat_options.max_tokens = Some(8192);
+        let engine = EngineConfig::from_coding_config(base);
+        let cwd = tempfile::tempdir().unwrap();
+        let factory = Arc::new(RecordingProviderFactory::default());
+
+        let first = spawn_session(&engine, cwd.path().to_path_buf(), Some(factory.clone()))
+            .await
+            .unwrap();
+        let second = spawn_session(&engine, cwd.path().to_path_buf(), Some(factory.clone()))
+            .await
+            .unwrap();
+
+        let ids = factory.session_ids.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2);
+        assert!(ids[0].is_some());
+        assert!(ids[1].is_some());
+        assert_ne!(ids[0], ids[1]);
+
+        first.handle.shutdown().await.unwrap();
+        second.handle.shutdown().await.unwrap();
     }
 }

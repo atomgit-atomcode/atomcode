@@ -4,10 +4,6 @@ version.workspace = true
 edition.workspace = true
 build = "build.rs"
 
-[build-dependencies]
-zstd = "0.13"
-tar = "0.4"
-
 [dependencies]
 # Config system is being extracted here (leaf crate); core re-exports it during the
 # transition. See docs/superpowers/plans/2026-07-11-extract-atomcode-config.md.
@@ -20,10 +16,19 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 http = "1"
+# `rustls-tls` (webpki base roots) — an INFALLIBLE base so `.build()` never
+# hard-fails on certs. OS native roots + SSL_CERT_FILE are layered on TOP,
+# gracefully, in `build_http_client` (see `add_trusted_roots`). We deliberately
+# do NOT use `rustls-tls-native-roots`: reqwest reads native roots / SSL_CERT_FILE
+# STRICTLY there and fails the build ("zero valid certificates …") on a bad
+# SSL_CERT_FILE or empty store — which cascades into panics at every `.build()`
+# call site. Graceful, additive loading (codex-style) avoids that. See #514.
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "blocking"], default-features = false }
+# OS native root store loader (Windows cert manager / macOS keychain / Linux
+# /etc/ssl/certs) for corporate MITM-proxy CAs. Loaded best-effort. See #514.
+rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "sync", "time", "net"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
@@ -56,32 +61,21 @@ bincode = "1"
 encoding_rs = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
-# Project-level advisory file lock (POSIX flock / Windows LockFileEx) for setup.
-fs2 = "0.4"
-# Used by setup::lock for log lines on stale/force lock takeover. The setup
-# module is the first consumer; other crates emit logs via println!.
 getrandom = "0.2"
 thiserror = "1"
 tracing = "0.1"
 atomcode-telemetry = { path = "../atomcode-telemetry" }
-# Embedded setup seeds (rust-best-practices.md, /review command, etc.) are
-# packed into a tar.zst by build.rs and extracted at first run. The same crates
-# are listed under [build-dependencies] for the packer; runtime needs them too
-# (separate dependency trees).
-zstd = "0.13"
-tar = "0.4"
 
 # AtomCode request-signing crate. Stub in the open-source tree; the
 # official build pipeline replaces `crates/atomcode-codingplan-crypto/`
 # with the closed-source overlay and turns the feature on. Off by
 # default — the stub crate is linked only when this feature is enabled,
 # never in standard `cargo build`.
-atomcode-codingplan-crypto = { path = "../atomcode-codingplan-crypto", optional = true }
 htmd = "0.5.4"
 
 [features]
 default = []
-codingplan-crypto = ["dep:atomcode-codingplan-crypto"]
+codingplan-crypto = ["atomcode-auth/codingplan-crypto"]
 
 # Non-blocking poll on stdin in the OAuth callback path so the stdin
 # reader thread can exit cleanly when the HTTP listener wins — otherwise

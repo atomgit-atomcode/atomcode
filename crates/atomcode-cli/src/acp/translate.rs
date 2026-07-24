@@ -8,13 +8,18 @@ pub fn tool_kind(name: &str) -> ToolKind {
     let n = name.to_ascii_lowercase();
     if n.contains("read") || n.contains("cat") {
         ToolKind::Read
-    } else if n.contains("edit") || n.contains("write") || n.contains("replace") || n.contains("apply") {
+    } else if n.contains("edit")
+        || n.contains("write")
+        || n.contains("replace")
+        || n.contains("apply")
+    {
         ToolKind::Edit
     } else if n.contains("delete") || n.contains("rm") {
         ToolKind::Delete
     } else if n.contains("move") || n.contains("mv") || n.contains("rename") {
         ToolKind::Move
-    } else if n.contains("grep") || n.contains("search") || n.contains("glob") || n.contains("find") {
+    } else if n.contains("grep") || n.contains("search") || n.contains("glob") || n.contains("find")
+    {
         ToolKind::Search
     } else if n.contains("fetch") || n.contains("http") || n.contains("web") {
         ToolKind::Fetch
@@ -27,12 +32,12 @@ pub fn tool_kind(name: &str) -> ToolKind {
 
 pub fn event_to_update(ev: &AgentEvent) -> Option<SessionUpdate> {
     match ev {
-        AgentEvent::TextDelta(s) => Some(SessionUpdate::AgentMessageChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(s.clone()))),
-        )),
-        AgentEvent::Reasoning(s) => Some(SessionUpdate::AgentThoughtChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(s.clone()))),
-        )),
+        AgentEvent::TextDelta(s) => Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(s.clone())),
+        ))),
+        AgentEvent::Reasoning(s) => Some(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(s.clone())),
+        ))),
         AgentEvent::ToolStarted { call } => Some(SessionUpdate::ToolCall(
             AcpToolCall::new(ToolCallId::new(call.id.clone()), call.name.clone())
                 .kind(tool_kind(&call.name))
@@ -58,14 +63,17 @@ pub fn event_to_update(ev: &AgentEvent) -> Option<SessionUpdate> {
     }
 }
 
-use agent_client_protocol::schema::v1::ToolCallContent;
 use agent_client_protocol::schema::v1::StopReason as AcpStop;
+use agent_client_protocol::schema::v1::ToolCallContent;
 use atomcode_kernel::event::StopReason as KStop;
 
 pub fn stop_reason(r: KStop) -> Result<AcpStop, &'static str> {
     match r {
         KStop::Stopped => Ok(AcpStop::EndTurn),
-        KStop::MaxRounds | KStop::MaxContinuations => Ok(AcpStop::MaxTurnRequests),
+        KStop::MaxRounds
+        | KStop::MaxContinuations
+        | KStop::RepeatLoop
+        | KStop::ToolLoopDetected => Ok(AcpStop::MaxTurnRequests),
         KStop::Cancelled => Ok(AcpStop::Cancelled),
         KStop::PromptRejected => Ok(AcpStop::Refusal),
         KStop::ProviderError => Err("provider error"),
@@ -80,7 +88,10 @@ mod tests {
     use atomcode_kernel::event::AgentEvent;
 
     fn tag(u: &agent_client_protocol::schema::v1::SessionUpdate) -> String {
-        serde_json::to_value(u).unwrap()["sessionUpdate"].as_str().unwrap().to_string()
+        serde_json::to_value(u).unwrap()["sessionUpdate"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     #[test]
@@ -105,7 +116,11 @@ mod tests {
     #[test]
     fn tool_started_maps_to_tool_call_with_kind() {
         use atomcode_kernel::tool::ToolCall;
-        let call = ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() };
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
         let u = event_to_update(&AgentEvent::ToolStarted { call }).unwrap();
         let v = serde_json::to_value(&u).unwrap();
         assert_eq!(v["sessionUpdate"], "tool_call");
@@ -146,7 +161,15 @@ mod tests {
         use atomcode_kernel::event::StopReason as K;
         assert_eq!(stop_reason(K::Stopped).unwrap(), Acp::EndTurn);
         assert_eq!(stop_reason(K::MaxRounds).unwrap(), Acp::MaxTurnRequests);
-        assert_eq!(stop_reason(K::MaxContinuations).unwrap(), Acp::MaxTurnRequests);
+        assert_eq!(
+            stop_reason(K::MaxContinuations).unwrap(),
+            Acp::MaxTurnRequests
+        );
+        assert_eq!(
+            stop_reason(K::ToolLoopDetected).unwrap(),
+            Acp::MaxTurnRequests
+        );
+        assert_eq!(stop_reason(K::RepeatLoop).unwrap(), Acp::MaxTurnRequests);
         assert_eq!(stop_reason(K::Cancelled).unwrap(), Acp::Cancelled);
         assert_eq!(stop_reason(K::PromptRejected).unwrap(), Acp::Refusal);
         assert!(stop_reason(K::ProviderError).is_err());

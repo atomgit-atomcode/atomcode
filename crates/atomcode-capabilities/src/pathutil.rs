@@ -49,8 +49,61 @@ fn tilde_rest(raw: &str) -> Option<&str> {
     if raw == "~" {
         return Some("");
     }
-    raw.strip_prefix("~/")
-        .or_else(|| if cfg!(windows) { raw.strip_prefix(r"~\") } else { None })
+    raw.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            raw.strip_prefix(r"~\")
+        } else {
+            None
+        }
+    })
+}
+
+/// The user's real home directory, resolving `SUDO_USER` first (so `atomcode`
+/// launched under `sudo` still finds the invoking user's home, not root's).
+/// Falls back to `dirs::home_dir()`. Ported from `core::tool::real_home_dir`
+/// for the `plugin` feature (installer `~` expansion).
+#[cfg(feature = "plugin")]
+pub fn real_home_dir() -> Option<PathBuf> {
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        if let Some(home) = get_user_home(&sudo_user) {
+            return Some(home);
+        }
+    }
+    dirs::home_dir()
+}
+
+/// Look up a user's home via `getpwnam_r` (Unix). Returns `None` off-Unix.
+#[cfg(all(feature = "plugin", unix))]
+fn get_user_home(username: &str) -> Option<PathBuf> {
+    use std::ffi::CString;
+    use std::ptr;
+
+    let username_c = CString::new(username).ok()?;
+    // SAFETY: getpwnam_r is the thread-safe passwd lookup; buffers are sized and owned here.
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut buf = vec![0u8; 4096];
+        let mut result: *mut libc::passwd = ptr::null_mut();
+        let ret = libc::getpwnam_r(
+            username_c.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        );
+        if ret == 0 && !result.is_null() {
+            let home = std::ffi::CStr::from_ptr(pwd.pw_dir)
+                .to_string_lossy()
+                .into_owned();
+            return Some(PathBuf::from(home));
+        }
+    }
+    None
+}
+
+#[cfg(all(feature = "plugin", not(unix)))]
+fn get_user_home(_username: &str) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(test)]
@@ -65,8 +118,14 @@ mod tests {
             Some(PathBuf::from("/Users/csdn/.atomcode/x"))
         );
         // A bare `~` (and `~/`) is the home dir itself.
-        assert_eq!(expand_tilde_with_home("~", Some(home)), Some(PathBuf::from("/Users/csdn")));
-        assert_eq!(expand_tilde_with_home("~/", Some(home)), Some(PathBuf::from("/Users/csdn")));
+        assert_eq!(
+            expand_tilde_with_home("~", Some(home)),
+            Some(PathBuf::from("/Users/csdn"))
+        );
+        assert_eq!(
+            expand_tilde_with_home("~/", Some(home)),
+            Some(PathBuf::from("/Users/csdn"))
+        );
     }
 
     #[test]
@@ -78,7 +137,10 @@ mod tests {
             expand_tilde_with_home("~//etc/passwd", Some(home)),
             Some(PathBuf::from("/Users/csdn/etc/passwd"))
         );
-        assert_eq!(expand_tilde_with_home("~//", Some(home)), Some(PathBuf::from("/Users/csdn")));
+        assert_eq!(
+            expand_tilde_with_home("~//", Some(home)),
+            Some(PathBuf::from("/Users/csdn"))
+        );
     }
 
     #[test]
@@ -103,7 +165,10 @@ mod tests {
     #[test]
     fn backslash_is_literal_on_unix() {
         // On Unix `\` is an ordinary filename char, so `~\foo` is not a tilde form.
-        assert_eq!(expand_tilde_with_home(r"~\foo", Some(Path::new("/Users/csdn"))), None);
+        assert_eq!(
+            expand_tilde_with_home(r"~\foo", Some(Path::new("/Users/csdn"))),
+            None
+        );
     }
 
     #[cfg(windows)]
@@ -119,5 +184,16 @@ mod tests {
             expand_tilde_with_home(r"~\\Windows", Some(home)),
             Some(PathBuf::from(r"C:\Users\csdn\Windows"))
         );
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn real_home_dir_without_sudo_matches_dirs_home() {
+        // In the normal (non-sudo) test process there is no SUDO_USER, so real_home_dir
+        // must equal dirs::home_dir(). (We do not mutate SUDO_USER — env is process-global
+        // and would race other tests.)
+        if std::env::var("SUDO_USER").is_err() {
+            assert_eq!(super::real_home_dir(), dirs::home_dir());
+        }
     }
 }

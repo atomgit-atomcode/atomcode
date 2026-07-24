@@ -75,13 +75,12 @@ fn is_pinyin_identifier(s: &str) -> bool {
     // common English fragments (e.g., "ge", "tu", "se", "he", "de", "le") to avoid
     // false positives on English identifiers like "getUser".
     let pinyin_syllables = [
-        "ba", "bai", "bei", "biao", "chang", "chu", "da", "dan", "di", "ding",
-        "dong", "duan", "duo", "er", "fen", "gao", "guo", "hao", "hou", "hu",
-        "huai", "ji", "jian", "jiu", "kuai", "kuan", "leng", "li", "lie", "lu",
-        "man", "miao", "ming", "mu", "nan", "nei", "nian", "qi", "qian", "re",
-        "ren", "ri", "san", "shang", "shao", "shen", "shi", "shu", "si", "tian",
-        "wai", "wan", "wen", "wu", "xi", "xia", "xiao", "xin", "xing", "yi",
-        "yong", "you", "yue", "zhai", "zhong", "zuo",
+        "ba", "bai", "bei", "biao", "chang", "chu", "da", "dan", "di", "ding", "dong", "duan",
+        "duo", "er", "fen", "gao", "guo", "hao", "hou", "hu", "huai", "ji", "jian", "jiu", "kuai",
+        "kuan", "leng", "li", "lie", "lu", "man", "miao", "ming", "mu", "nan", "nei", "nian", "qi",
+        "qian", "re", "ren", "ri", "san", "shang", "shao", "shen", "shi", "shu", "si", "tian",
+        "wai", "wan", "wen", "wu", "xi", "xia", "xiao", "xin", "xing", "yi", "yong", "you", "yue",
+        "zhai", "zhong", "zuo",
     ];
 
     let lower = s.to_lowercase();

@@ -14,7 +14,7 @@
 //!
 //! - **不砍 system prompt**：tool schema 作为独立参数传给 LLM API，
 //!   不在 `system_prompt: &str` 里。真要简化 system prompt 需要在
-//!   [`crate::agent::prompt`] 层面做。
+//!   coding runtime 的 prompt 组装层做。
 //! - **不改工具集筛选**：哪些工具暴露给模型是 [`crate::tool::ToolRegistry`]
 //!   的职责,与 ctx 无关。
 //! - **不重写 render 管道**：`build_messages`
@@ -27,10 +27,10 @@
 //! 需要以上行为时,在上层扩展相应模块,不在 ctx 里做。
 
 use super::CtxBuilder;
-use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::Message;
 use crate::conversation::{ContextStats, Conversation};
 use crate::tool::ToolResult;
+use atomcode_config::config::provider::ProviderConfig;
 
 /// 本地 Ollama 模型的上下文策略。
 #[derive(Debug, Clone)]
@@ -157,8 +157,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-
-}
+        }
     }
 
     #[test]

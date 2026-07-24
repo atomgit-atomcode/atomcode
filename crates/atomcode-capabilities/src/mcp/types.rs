@@ -146,6 +146,7 @@ pub struct CallToolResult {
 pub enum ServerStatus {
     Connecting,
     Connected,
+    BlockedUntrusted,
     Failed(String),
     Disconnected,
 }
@@ -155,6 +156,7 @@ impl std::fmt::Display for ServerStatus {
         match self {
             ServerStatus::Connecting => write!(f, "connecting"),
             ServerStatus::Connected => write!(f, "connected"),
+            ServerStatus::BlockedUntrusted => write!(f, "blocked: untrusted project"),
             ServerStatus::Failed(e) => write!(f, "failed: {}", e),
             ServerStatus::Disconnected => write!(f, "disconnected"),
         }
@@ -202,6 +204,9 @@ mod tests {
             "annotations": { "readOnlyHint": true, "destructiveHint": true }
         }))
         .unwrap();
-        assert!(!contradictory.is_read_only(), "destructiveHint:true must veto readOnlyHint");
+        assert!(
+            !contradictory.is_read_only(),
+            "destructiveHint:true must veto readOnlyHint"
+        );
     }
 }

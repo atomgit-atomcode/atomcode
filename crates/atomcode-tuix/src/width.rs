@@ -134,38 +134,99 @@ fn is_wide_emoji_symbol(ch: char) -> bool {
     }
     // Sorted, non-overlapping inclusive ranges → binary search.
     const RANGES: &[(u32, u32)] = &[
-        (0x203C, 0x203C), (0x2049, 0x2049), (0x2122, 0x2122), (0x2139, 0x2139),
-        (0x2194, 0x2199), (0x21A9, 0x21AA), (0x231A, 0x231B), (0x2328, 0x2328),
+        (0x203C, 0x203C),
+        (0x2049, 0x2049),
+        (0x2122, 0x2122),
+        (0x2139, 0x2139),
+        (0x2194, 0x2199),
+        (0x21A9, 0x21AA),
+        (0x231A, 0x231B),
+        (0x2328, 0x2328),
         // NOTE: U+23F8..23FA (⏸⏹⏺ pause/stop/record) are deliberately NOT here.
         // They are Emoji_Presentation=No — bare (without VS16) they default to
         // TEXT presentation and render NARROW (width 1), like the text-default
         // ©/® excluded above. Listing them as wide made the status-line `⏸ plan`
         // badge over-reserve a cell, leaving a stale-glyph residual after ⏸.
-        (0x23CF, 0x23CF), (0x23E9, 0x23F3), (0x24C2, 0x24C2),
-        (0x25AA, 0x25AB), (0x25B6, 0x25B6), (0x25C0, 0x25C0), (0x25FB, 0x25FE),
+        (0x23CF, 0x23CF),
+        (0x23E9, 0x23F3),
+        (0x24C2, 0x24C2),
+        (0x25AA, 0x25AB),
+        (0x25B6, 0x25B6),
+        (0x25C0, 0x25C0),
+        (0x25FB, 0x25FE),
         // NOTE: U+2611 (☑ ballot box with check) is deliberately NOT here. Like
         // ⏸ (see the 0x23F8 note above), it is Emoji_Presentation=No — bare (no
         // VS16) it renders NARROW (width 1). It is the `☑ Todos` panel marker
         // (`todo_marker`), emitted bare; listing it wide over-reserved a cell and
         // desynced the cursor, intermittently blanking a following glyph ("Todos"→
         // "To os"). Text-default symbols belong at their unicode-width (1).
-        (0x2600, 0x2604), (0x260E, 0x260E), (0x2614, 0x2615),
-        (0x2618, 0x2618), (0x261D, 0x261D), (0x2620, 0x2620), (0x2622, 0x2623),
-        (0x2626, 0x2626), (0x262A, 0x262A), (0x262E, 0x262F), (0x2638, 0x263A),
-        (0x2640, 0x2640), (0x2642, 0x2642), (0x2648, 0x2653), (0x265F, 0x2660),
-        (0x2663, 0x2663), (0x2665, 0x2666), (0x2668, 0x2668), (0x267B, 0x267B),
-        (0x267E, 0x267F), (0x2692, 0x2697), (0x2699, 0x2699), (0x269B, 0x269C),
-        (0x26A0, 0x26A1), (0x26A7, 0x26A7), (0x26AA, 0x26AB), (0x26B0, 0x26B1),
-        (0x26BD, 0x26BE), (0x26C4, 0x26C5), (0x26C8, 0x26C8), (0x26CE, 0x26CF),
-        (0x26D1, 0x26D1), (0x26D3, 0x26D4), (0x26E9, 0x26EA), (0x26F0, 0x26F5),
-        (0x26F7, 0x26FA), (0x26FD, 0x26FD), (0x2702, 0x2702), (0x2705, 0x2705),
-        (0x2708, 0x270D), (0x270F, 0x270F), (0x2712, 0x2712), (0x2714, 0x2714),
-        (0x2716, 0x2716), (0x271D, 0x271D), (0x2721, 0x2721), (0x2728, 0x2728),
-        (0x2733, 0x2734), (0x2744, 0x2744), (0x2747, 0x2747), (0x274C, 0x274C),
-        (0x274E, 0x274E), (0x2753, 0x2755), (0x2757, 0x2757), (0x2763, 0x2764),
-        (0x2795, 0x2797), (0x27A1, 0x27A1), (0x27B0, 0x27B0), (0x27BF, 0x27BF),
-        (0x2934, 0x2935), (0x2B05, 0x2B07), (0x2B1B, 0x2B1C), (0x2B50, 0x2B50),
-        (0x2B55, 0x2B55), (0x3030, 0x3030), (0x303D, 0x303D), (0x3297, 0x3297),
+        (0x2600, 0x2604),
+        (0x260E, 0x260E),
+        (0x2614, 0x2615),
+        (0x2618, 0x2618),
+        (0x261D, 0x261D),
+        (0x2620, 0x2620),
+        (0x2622, 0x2623),
+        (0x2626, 0x2626),
+        (0x262A, 0x262A),
+        (0x262E, 0x262F),
+        (0x2638, 0x263A),
+        (0x2640, 0x2640),
+        (0x2642, 0x2642),
+        (0x2648, 0x2653),
+        (0x265F, 0x2660),
+        (0x2663, 0x2663),
+        (0x2665, 0x2666),
+        (0x2668, 0x2668),
+        (0x267B, 0x267B),
+        (0x267E, 0x267F),
+        (0x2692, 0x2697),
+        (0x2699, 0x2699),
+        (0x269B, 0x269C),
+        (0x26A0, 0x26A1),
+        (0x26A7, 0x26A7),
+        (0x26AA, 0x26AB),
+        (0x26B0, 0x26B1),
+        (0x26BD, 0x26BE),
+        (0x26C4, 0x26C5),
+        (0x26C8, 0x26C8),
+        (0x26CE, 0x26CF),
+        (0x26D1, 0x26D1),
+        (0x26D3, 0x26D4),
+        (0x26E9, 0x26EA),
+        (0x26F0, 0x26F5),
+        (0x26F7, 0x26FA),
+        (0x26FD, 0x26FD),
+        (0x2702, 0x2702),
+        (0x2705, 0x2705),
+        (0x2708, 0x270D),
+        (0x270F, 0x270F),
+        (0x2712, 0x2712),
+        (0x2714, 0x2714),
+        (0x2716, 0x2716),
+        (0x271D, 0x271D),
+        (0x2721, 0x2721),
+        (0x2728, 0x2728),
+        (0x2733, 0x2734),
+        (0x2744, 0x2744),
+        (0x2747, 0x2747),
+        (0x274C, 0x274C),
+        (0x274E, 0x274E),
+        (0x2753, 0x2755),
+        (0x2757, 0x2757),
+        (0x2763, 0x2764),
+        (0x2795, 0x2797),
+        (0x27A1, 0x27A1),
+        (0x27B0, 0x27B0),
+        (0x27BF, 0x27BF),
+        (0x2934, 0x2935),
+        (0x2B05, 0x2B07),
+        (0x2B1B, 0x2B1C),
+        (0x2B50, 0x2B50),
+        (0x2B55, 0x2B55),
+        (0x3030, 0x3030),
+        (0x303D, 0x303D),
+        (0x3297, 0x3297),
         (0x3299, 0x3299),
     ];
     RANGES
@@ -643,8 +704,8 @@ mod tests {
         assert!(is_wide_emoji_symbol('❄')); // U+2744 snowflake
         assert!(is_wide_emoji_symbol('⭐')); // U+2B50 star
         assert!(is_wide_emoji_symbol('⚡')); // U+26A1 high voltage
-        // NOT emoji — must stay narrow, or we'd regress ordinary ambiguous
-        // text symbols (the whole point of scoping to the Emoji set).
+                                             // NOT emoji — must stay narrow, or we'd regress ordinary ambiguous
+                                             // text symbols (the whole point of scoping to the Emoji set).
         assert!(!is_wide_emoji_symbol('✓')); // U+2713 check mark (Emoji=No)
         assert!(!is_wide_emoji_symbol('°')); // U+00B0 degree sign
         assert!(!is_wide_emoji_symbol('◆')); // U+25C6 black diamond
@@ -662,7 +723,7 @@ mod tests {
         let sun = if emoji_wide_enabled() { 2 } else { 1 };
         assert_eq!(display_width("☀"), sun);
         assert_eq!(display_width("☀ 晴"), sun + 1 + 2); // sun + space + CJK
-        // Ambiguous-but-not-emoji content is never widened by this path.
+                                                        // Ambiguous-but-not-emoji content is never widened by this path.
         assert_eq!(display_width("✓"), 1);
         assert_eq!(display_width("20°C"), 4);
     }
@@ -675,13 +736,13 @@ mod tests {
         assert!(is_narrow_emoji_1f000('\u{1F396}')); // 🎖 military medal
         assert!(is_narrow_emoji_1f000('\u{1F5FA}')); // 🗺 world map
         assert!(is_narrow_emoji_1f000('\u{1F700}')); // 🜀 alchemical symbol
-        // U+1F1E6..=U+1F1FF (Regional Indicator) are excluded.
+                                                     // U+1F1E6..=U+1F1FF (Regional Indicator) are excluded.
         assert!(!is_narrow_emoji_1f000('\u{1F1E6}')); // 🇦 Regional Indicator A
         assert!(!is_narrow_emoji_1f000('\u{1F1FF}')); // 🇿 Regional Indicator Z
-        // Wide emoji (EA=W) are NOT in this set — they're already width 2.
+                                                      // Wide emoji (EA=W) are NOT in this set — they're already width 2.
         assert!(!is_narrow_emoji_1f000('\u{1F4C5}')); // 📅 calendar (EA=W)
         assert!(!is_narrow_emoji_1f000('\u{1F4A7}')); // 💧 droplet (EA=W)
-        // Outside range.
+                                                      // Outside range.
         assert!(!is_narrow_emoji_1f000('a'));
         assert!(!is_narrow_emoji_1f000('你'));
     }
@@ -906,10 +967,7 @@ mod tests {
     #[test]
     fn truncate_path_cjk_segment() {
         // CJK project name: "项目" = 4 cols, ".../项目" = 8 cols.
-        assert_eq!(
-            truncate_path("~/Documents/工作/项目", 20),
-            ".../项目"
-        );
+        assert_eq!(truncate_path("~/Documents/工作/项目", 20), ".../项目");
     }
 
     #[test]
@@ -926,7 +984,12 @@ mod tests {
         // it must fit in a 10-col budget with no wrap.
         let tinted = "\x1b[38;2;198;120;221mlet\x1b[23;39m x = 1;";
         let chunks = wrap_line_to_width(tinted, 10);
-        assert_eq!(chunks.len(), 1, "must not wrap when visible width fits, got: {:?}", chunks);
+        assert_eq!(
+            chunks.len(),
+            1,
+            "must not wrap when visible width fits, got: {:?}",
+            chunks
+        );
         // The tinted line is returned verbatim — escapes still present.
         assert!(chunks[0].contains("\x1b[38;2;198;120;221m"));
     }
@@ -981,7 +1044,11 @@ mod tests {
         assert_eq!(display_width("\u{23F8} plan"), 6, "the whole plan badge");
         // ☑ U+2611 (todo panel marker, emitted bare) is likewise text-default → width 1.
         assert_eq!(display_width("\u{2611}"), 1, "☑ ballot box with check");
-        assert_eq!(display_width("\u{2611} Todos"), 7, "the todo header marker + title");
+        assert_eq!(
+            display_width("\u{2611} Todos"),
+            7,
+            "the todo header marker + title"
+        );
         // With VS16 they DO become emoji (width 2) — the exclusion is bare-only.
         assert_eq!(display_width("\u{23F8}\u{FE0F}"), 2, "⏸️ with VS16");
     }

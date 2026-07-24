@@ -1,9 +1,10 @@
-import React, { useRef, useEffect, useCallback, useState } from 'react';
+import React, { useRef, useEffect, useCallback, useState, useMemo } from 'react';
 import { useChatContext } from '../state/ChatProvider';
 import { UserMessage } from './UserMessage';
 import { AssistantMessage } from './AssistantMessage';
 import { SearchBar } from './SearchBar';
 import { useT } from '../i18n';
+import { highlightPlainText } from '../utils/search';
 
 export function MessageList() {
   const { state } = useChatContext();
@@ -35,9 +36,21 @@ export function MessageList() {
     }
   }, [state.messages, state.queuedMessages, state.isGenerating]);
 
-  const query = state.searchQuery.toLowerCase();
-  const hasSearch = query.length > 0;
+  const query = state.searchQuery;
+  const hasSearch = query.trim().length > 0;
   const lastMessageId = state.messages[state.messages.length - 1]?.id;
+
+  // Build a set of message ids that contain matches, plus the id of the
+  // message that holds the currently focused match.
+  const matchedIds = useMemo(() => {
+    if (!hasSearch) return new Set<string>();
+    return new Set(state.search.matches.map((m) => m.messageId));
+  }, [hasSearch, state.search.matches]);
+
+  const currentMatchMessageId = useMemo(() => {
+    if (!hasSearch || state.search.matches.length === 0) return undefined;
+    return state.search.matches[state.search.currentMatchIndex]?.messageId;
+  }, [hasSearch, state.search]);
 
   return (
     <>
@@ -48,24 +61,57 @@ export function MessageList() {
         onScroll={handleScroll}
       >
         {state.messages.map((msg) => {
-          const matches = hasSearch && msg.text.toLowerCase().includes(query);
-          const highlightClass = `${matches ? ' highlighted' : ''}${msg.id === lastMessageId ? ' is-last' : ''}`;
+          const isMatch = hasSearch && matchedIds.has(msg.id);
+          const isCurrentMatch = msg.id === currentMatchMessageId;
+          const highlightClass = `${isMatch ? ' highlighted' : ''}${msg.id === lastMessageId ? ' is-last' : ''}`;
 
-          if (msg.role === 'user') return <UserMessage key={msg.id} message={msg} className={highlightClass} />;
-          if (msg.role === 'assistant') return <AssistantMessage key={msg.id} message={msg} className={highlightClass} />;
+          if (msg.role === 'user') {
+            return (
+              <UserMessage
+                key={msg.id}
+                message={msg}
+                className={highlightClass}
+                searchQuery={hasSearch ? query : undefined}
+                isCurrentMatch={isCurrentMatch}
+              />
+            );
+          }
+          if (msg.role === 'assistant') {
+            return (
+              <AssistantMessage
+                key={msg.id}
+                message={msg}
+                className={highlightClass}
+                searchQuery={hasSearch ? query : undefined}
+                isCurrentMatch={isCurrentMatch}
+              />
+            );
+          }
           if (msg.role === 'error') {
             return (
               <div key={msg.id} className={`timeline-message dot-error${highlightClass}`}>
-                <div className="error-message-content">{msg.text}</div>
+                <div className="error-message-content">
+                  {hasSearch
+                    ? <span dangerouslySetInnerHTML={{ __html: highlightPlainText(msg.text ?? '', query) }} />
+                    : msg.text}
+                </div>
               </div>
             );
           }
           return null;
         })}
         {state.queuedMessages.map((msg) => {
-          const matches = hasSearch && msg.text.toLowerCase().includes(query);
-          const highlightClass = matches ? ' highlighted' : '';
-          return <UserMessage key={msg.id} message={msg} className={highlightClass} />;
+          const isMatch = hasSearch && matchedIds.has(msg.id);
+          const highlightClass = isMatch ? ' highlighted' : '';
+          return (
+            <UserMessage
+              key={msg.id}
+              message={msg}
+              className={highlightClass}
+              searchQuery={hasSearch ? query : undefined}
+              isCurrentMatch={false}
+            />
+          );
         })}
         <div ref={bottomRef} />
         {isUserScrolledUp && (

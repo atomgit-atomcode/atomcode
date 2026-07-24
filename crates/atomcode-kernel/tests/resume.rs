@@ -59,7 +59,11 @@ fn is_strict_prefix(a: &str, b: &str) -> bool {
 }
 
 fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
-    ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args.into(),
+    }
 }
 
 fn fresh_agent(provider: Arc<RecordingProvider>) -> Agent {
@@ -87,7 +91,13 @@ fn resumed_agent(provider: Arc<RecordingProvider>, snapshot: SessionSnapshot) ->
 }
 
 async fn drive_one_turn(handle: &mut AgentHandle, text: &str) {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: text.into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -117,7 +127,10 @@ async fn resume_preserves_cache_prefix() {
             StreamEvent::ToolCall(tool_call("c1", "echo", "{\"text\":\"hi\"}")),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("first turn done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("first turn done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let mut handle1 = fresh_agent(provider1).spawn();
@@ -129,7 +142,10 @@ async fn resume_preserves_cache_prefix() {
     // Sanity: the snapshot is non-trivial and lossless (carries a tool_call + a
     // tool_result id — the very fields the OLD MessageSnapshot dropped).
     assert_eq!(snapshot.version, atomcode_kernel::message::SNAPSHOT_VERSION);
-    assert!(matches!(snapshot.messages[0].role, Role::System), "leads with persona");
+    assert!(
+        matches!(snapshot.messages[0].role, Role::System),
+        "leads with persona"
+    );
     assert!(
         snapshot.messages.iter().any(|m| !m.tool_calls.is_empty()),
         "snapshot must carry an assistant tool_call (lossless)"
@@ -141,7 +157,8 @@ async fn resume_preserves_cache_prefix() {
 
     // --- Disk round-trip: serialize → deserialize (simulating persistence).
     let json = serde_json::to_string(&snapshot).expect("SessionSnapshot serializes");
-    let restored: SessionSnapshot = serde_json::from_str(&json).expect("SessionSnapshot deserializes");
+    let restored: SessionSnapshot =
+        serde_json::from_str(&json).expect("SessionSnapshot deserializes");
     assert_eq!(restored, snapshot, "disk round-trip must be lossless");
 
     // The exact saved-history bytes the prefix cache was warmed on.
@@ -160,7 +177,10 @@ async fn resume_preserves_cache_prefix() {
     let _ = handle2.task.await;
 
     let calls2 = calls2.lock().unwrap();
-    assert!(!calls2.is_empty(), "the resumed session must make at least one LLM call");
+    assert!(
+        !calls2.is_empty(),
+        "the resumed session must make at least one LLM call"
+    );
 
     // The resumed provider's FIRST call: persona NOT re-injected (still exactly one
     // System message, byte-identical to the saved one), and the new user turn was
@@ -168,8 +188,14 @@ async fn resume_preserves_cache_prefix() {
     // provider saw. History continues append-only across the resume boundary →
     // the prefix cache survives.
     let first_resumed = &calls2[0].0;
-    let system_count = first_resumed.iter().filter(|m| matches!(m.role, Role::System)).count();
-    assert_eq!(system_count, 1, "persona must NOT be re-injected on resume (exactly one System message)");
+    let system_count = first_resumed
+        .iter()
+        .filter(|m| matches!(m.role, Role::System))
+        .count();
+    assert_eq!(
+        system_count, 1,
+        "persona must NOT be re-injected on resume (exactly one System message)"
+    );
 
     let resumed_repr = history_repr(first_resumed);
     assert!(
@@ -182,7 +208,10 @@ async fn resume_preserves_cache_prefix() {
     // LEADING messages of the resumed call (strict prefix proves the bytes; this
     // makes the "same messages, in order" claim explicit per message).
     let saved_len = saved_repr.matches('\u{2}').count();
-    assert!(first_resumed.len() > saved_len, "the new user turn must have been appended");
+    assert!(
+        first_resumed.len() > saved_len,
+        "the new user turn must have been appended"
+    );
     assert_eq!(
         history_repr(&first_resumed[..saved_len]),
         saved_repr,
@@ -220,13 +249,21 @@ async fn unsupported_snapshot_version_errors_and_starts_empty() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
     let mut warned = false;
     while let Some(ev) = handle.events.recv().await {
         match ev {
             // Non-fatal degradation → Warning (not Error): an Error here would be
             // captured into Outcome.error and make a later clean turn look failed.
-            AgentEvent::Warning(message) if message.contains("unsupported snapshot version 9999") => {
+            AgentEvent::Warning(message)
+                if message.contains("unsupported snapshot version 9999") =>
+            {
                 warned = true;
             }
             AgentEvent::TurnComplete { .. } => break,
@@ -236,18 +273,30 @@ async fn unsupported_snapshot_version_errors_and_starts_empty() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
-    assert!(warned, "an unsupported snapshot version must emit a Warning event");
+    assert!(
+        warned,
+        "an unsupported snapshot version must emit a Warning event"
+    );
 
     let calls = calls.lock().unwrap();
-    assert!(!calls.is_empty(), "the turn still runs (started empty, not panicked)");
+    assert!(
+        !calls.is_empty(),
+        "the turn still runs (started empty, not panicked)"
+    );
     // Started EMPTY: the only thing before the new turn is the new user message —
     // none of the ghost snapshot messages leaked in.
     let first = &calls[0].0;
     assert!(
-        !first.iter().any(|m| m.text == "ghost" || m.text == "should be ignored"),
+        !first
+            .iter()
+            .any(|m| m.text == "ghost" || m.text == "should be ignored"),
         "ghost snapshot messages from an unsupported version must NOT seed the conversation"
     );
-    assert_eq!(first.len(), 1, "started empty: only the new user message is present");
+    assert_eq!(
+        first.len(),
+        1,
+        "started empty: only the new user message is present"
+    );
     assert_eq!(first[0].text, "go");
 }
 
@@ -281,8 +330,10 @@ async fn resume_from_dangling_snapshot_is_repaired_to_api_valid() {
     let msgs = &calls[0].0;
 
     // API-VALIDITY: every assistant tool_call id must have a matching tool_result.
-    let result_ids: std::collections::HashSet<&str> =
-        msgs.iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+    let result_ids: std::collections::HashSet<&str> = msgs
+        .iter()
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
     for m in msgs {
         for tc in &m.tool_calls {
             assert!(
@@ -298,7 +349,10 @@ async fn resume_from_dangling_snapshot_is_repaired_to_api_valid() {
         .iter()
         .find(|m| m.tool_call_id.as_deref() == Some("c_dangle"))
         .expect("c_dangle must have a backfilled result");
-    assert!(backfilled.is_error, "backfilled cancelled result must be is_error");
+    assert!(
+        backfilled.is_error,
+        "backfilled cancelled result must be is_error"
+    );
     assert_eq!(backfilled.text, "(cancelled)");
 }
 
@@ -337,7 +391,9 @@ async fn resume_heals_orphan_tool_result_snapshot() {
 
     // The orphan must be GONE from the first resumed request.
     assert!(
-        !msgs.iter().any(|m| m.tool_call_id.as_deref() == Some("c_orphan")),
+        !msgs
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("c_orphan")),
         "orphan tool_result must be removed on resume (pair-validity)"
     );
     // PAIR-VALIDITY: every tool_result has a preceding assistant tool_call.
@@ -367,7 +423,13 @@ async fn resume_heals_orphan_tool_result_snapshot() {
 // otherwise the session would run with hook injections but NO system identity.
 #[tokio::test]
 async fn unsupported_snapshot_fallback_seeds_persona_like_fresh() {
-    let bogus = SessionSnapshot { version: 9999, messages: vec![Message::user("ghost")], cache_epoch: 0, turn_counter: 0, request_counter: 0 };
+    let bogus = SessionSnapshot {
+        version: 9999,
+        messages: vec![Message::user("ghost")],
+        cache_epoch: 0,
+        turn_counter: 0,
+        request_counter: 0,
+    };
 
     let provider = Arc::new(RecordingProvider::new(vec![vec![
         StreamEvent::TextDelta("ok".into()),
@@ -385,7 +447,13 @@ async fn unsupported_snapshot_fallback_seeds_persona_like_fresh() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -398,8 +466,14 @@ async fn unsupported_snapshot_fallback_seeds_persona_like_fresh() {
     let first = &calls[0].0;
     assert_eq!(first.len(), 2, "persona + the new user message");
     assert_eq!(first[0].role, Role::System);
-    assert_eq!(first[0].text, PERSONA, "fallback must seed the persona like a fresh start");
-    assert!(!first.iter().any(|m| m.text == "ghost"), "ghost history must not leak");
+    assert_eq!(
+        first[0].text, PERSONA,
+        "fallback must seed the persona like a fresh start"
+    );
+    assert!(
+        !first.iter().any(|m| m.text == "ghost"),
+        "ghost history must not leak"
+    );
 }
 
 // CLAIM 18e: a resume CONTINUES the session's monotonic id sequence. The snapshot
@@ -428,8 +502,14 @@ async fn resume_continues_turn_id_sequence() {
 
     // --- Session 1: two turns (ids 1, 2).
     let provider1 = Arc::new(RecordingProvider::new(vec![
-        vec![StreamEvent::TextDelta("t1".into()), StreamEvent::Done { truncated: false }],
-        vec![StreamEvent::TextDelta("t2".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("t1".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("t2".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let ids1 = Arc::new(Mutex::new(Vec::new()));
     let mut reg = ToolRegistry::new();
@@ -446,9 +526,22 @@ async fn resume_continues_turn_id_sequence() {
     handle1.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle1.task.await;
 
-    assert_eq!(ids1.lock().unwrap().iter().map(|(t, _)| *t).collect::<Vec<_>>(), vec![1, 2]);
-    assert_eq!(snapshot.turn_counter, 2, "snapshot carries the turn high-water mark");
-    assert!(snapshot.request_counter >= 2, "snapshot carries the request high-water mark");
+    assert_eq!(
+        ids1.lock()
+            .unwrap()
+            .iter()
+            .map(|(t, _)| *t)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        snapshot.turn_counter, 2,
+        "snapshot carries the turn high-water mark"
+    );
+    assert!(
+        snapshot.request_counter >= 2,
+        "snapshot carries the request high-water mark"
+    );
 
     // --- Session 2: resume → the next turn must be 3, NOT 1.
     let provider2 = Arc::new(RecordingProvider::new(vec![vec![
@@ -470,7 +563,11 @@ async fn resume_continues_turn_id_sequence() {
     let _ = handle2.task.await;
 
     let ids2 = ids2.lock().unwrap();
-    assert_eq!(ids2.iter().map(|(t, _)| *t).collect::<Vec<_>>(), vec![3], "turn ids continue across resume");
+    assert_eq!(
+        ids2.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        vec![3],
+        "turn ids continue across resume"
+    );
     assert!(ids2[0].1 >= 3, "request ids continue across resume too");
 }
 
@@ -531,5 +628,9 @@ async fn old_snapshot_without_counter_fields_resumes_monotonically() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
-    assert_eq!(*ids.lock().unwrap(), vec![6], "derive-from-meta fallback seeds past turn 5");
+    assert_eq!(
+        *ids.lock().unwrap(),
+        vec![6],
+        "derive-from-meta fallback seeds past turn 5"
+    );
 }

@@ -43,7 +43,9 @@ impl Tool for ListSymbolsTool {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => {
-                return err(format!("list_symbols: invalid arguments: {e}. Expected {{\"file_path\":\"<path>\"}}."))
+                return err(format!(
+                    "list_symbols: invalid arguments: {e}. Expected {{\"file_path\":\"<path>\"}}."
+                ))
             }
         };
         let path = resolve_path(&a.file_path, &ctx.working_dir);
@@ -58,7 +60,11 @@ impl Tool for ListSymbolsTool {
 fn render(path: &Path, display: &str) -> ToolResult {
     let lang = match Lang::detect(path) {
         Some(l) => l,
-        None => return err(format!("list_symbols: unsupported file type: {display} (no tree-sitter grammar for it)")),
+        None => {
+            return err(format!(
+                "list_symbols: unsupported file type: {display} (no tree-sitter grammar for it)"
+            ))
+        }
     };
     let source = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -71,7 +77,10 @@ fn render(path: &Path, display: &str) -> ToolResult {
             for s in &syms {
                 // Both line numbers right-aligned (matches production) so the columns
                 // stay aligned across rows for easy scanning.
-                out.push_str(&format!("  {:>4}-{:>4}  {}  ({})\n", s.start_line, s.end_line, s.name, s.kind));
+                out.push_str(&format!(
+                    "  {:>4}-{:>4}  {}  ({})\n",
+                    s.start_line, s.end_line, s.name, s.kind
+                ));
             }
             out.push_str("\n[Use read_symbol to read any symbol's full source.]");
             ok(out)
@@ -87,14 +96,25 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        }
     }
 
     #[tokio::test]
     async fn lists_rust_symbols() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("m.rs"), "struct S;\nfn alpha() {}\nfn beta() {}\n").unwrap();
-        let r = ListSymbolsTool.execute(r#"{"file_path":"m.rs"}"#, &ctx(d.path())).await;
+        std::fs::write(
+            d.path().join("m.rs"),
+            "struct S;\nfn alpha() {}\nfn beta() {}\n",
+        )
+        .unwrap();
+        let r = ListSymbolsTool
+            .execute(r#"{"file_path":"m.rs"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("alpha"), "{}", r.content);
         assert!(r.content.contains("beta"), "{}", r.content);
@@ -105,7 +125,9 @@ mod tests {
     async fn unsupported_extension_errors() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.xyzlang"), "stuff").unwrap();
-        let r = ListSymbolsTool.execute(r#"{"file_path":"a.xyzlang"}"#, &ctx(d.path())).await;
+        let r = ListSymbolsTool
+            .execute(r#"{"file_path":"a.xyzlang"}"#, &ctx(d.path()))
+            .await;
         assert!(r.is_error);
         assert!(r.content.contains("unsupported file type"), "{}", r.content);
     }
@@ -113,7 +135,9 @@ mod tests {
     #[tokio::test]
     async fn missing_file_errors() {
         let d = tempfile::tempdir().unwrap();
-        let r = ListSymbolsTool.execute(r#"{"file_path":"nope.rs"}"#, &ctx(d.path())).await;
+        let r = ListSymbolsTool
+            .execute(r#"{"file_path":"nope.rs"}"#, &ctx(d.path()))
+            .await;
         assert!(r.is_error);
         assert!(r.content.contains("cannot read"), "{}", r.content);
     }

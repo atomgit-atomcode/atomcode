@@ -47,7 +47,11 @@ impl Tool for FileDependenciesTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => return err(format!("file_dependencies: invalid arguments: {e}. Expected {{\"file\":\"<path>\"}}.")),
+            Err(e) => {
+                return err(format!(
+                    "file_dependencies: invalid arguments: {e}. Expected {{\"file\":\"<path>\"}}."
+                ))
+            }
         };
         let index = self.index.clone();
         let root = ctx.working_dir.clone();
@@ -67,7 +71,11 @@ fn render(index: &CodeIndex, root: &Path, file: &Path, display: &str) -> ToolRes
     let file: &Path = &cfile;
     let symbols = match g.symbols_in_file(file) {
         Some(s) if !s.is_empty() => s.clone(),
-        _ => return err(format!("File '{display}' not found in the code graph (no indexed symbols).")),
+        _ => {
+            return err(format!(
+                "File '{display}' not found in the code graph (no indexed symbols)."
+            ))
+        }
     };
 
     let mut uses: HashSet<std::path::PathBuf> = HashSet::new();
@@ -123,10 +131,19 @@ mod tests {
         std::fs::write(d.path().join("mid.rs"), "fn mid() { dep_fn(); }\n").unwrap();
         std::fs::write(d.path().join("top.rs"), "fn top() { mid(); }\n").unwrap();
         let tool = FileDependenciesTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
         let r = tool.execute(r#"{"file":"mid.rs"}"#, &ctx).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("File dependencies for mid.rs"), "{}", r.content);
+        assert!(
+            r.content.contains("File dependencies for mid.rs"),
+            "{}",
+            r.content
+        );
         // mid uses dep.rs, used by top.rs
         assert!(r.content.contains("dep.rs"), "uses: {}", r.content);
         assert!(r.content.contains("top.rs"), "used by: {}", r.content);

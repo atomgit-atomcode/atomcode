@@ -15,31 +15,31 @@
 
 pub(crate) mod bg_runtime;
 pub(crate) mod commands;
+pub(crate) mod desktop;
 pub(crate) mod file_index;
-pub(crate) mod live_sync;
 pub(crate) mod loop_ctrl;
 pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
+pub(crate) mod ui_event;
 pub(crate) mod usage_monitor;
-pub(crate) mod desktop;
-use commands::{
-    attach_live_session, dispatch_undo, execute_slash_command, format_rate_limited_line,
-};
+use commands::{dispatch_undo, execute_slash_command, format_rate_limited_line};
 pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::session::{Session, SessionId};
 use anyhow::Result;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCompletion};
 use atomcode_coding::CodingRuntimeHandle;
-use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent, AgentPhase};
 use atomcode_config::config::Config;
-use atomcode_core::session::{SessionId, SessionManager};
+use atomcode_config::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};
+use atomcode_daemon::legacy_convert::snapshot_to_core;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use ui_event::{UiAgentPhase as AgentPhase, UiEvent as AgentEvent};
 
 use atomcode_core::conversation::message::ImagePart;
 use base64::Engine;
@@ -52,6 +52,110 @@ use crate::input::InputEvent;
 use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::ThinkStripper;
+
+fn runtime_mode(mode: crate::state::AgentMode) -> atomcode_coding::RuntimeMode {
+    match mode {
+        crate::state::AgentMode::Build => atomcode_coding::RuntimeMode::Build,
+        crate::state::AgentMode::AcceptEdits => atomcode_coding::RuntimeMode::AcceptEdits,
+        crate::state::AgentMode::Auto => atomcode_coding::RuntimeMode::Auto,
+        crate::state::AgentMode::Plan => atomcode_coding::RuntimeMode::Plan,
+    }
+}
+
+fn runtime_user_input(text: String, images: Vec<ImagePart>) -> atomcode_coding::UserInput {
+    atomcode_coding::UserInput {
+        text,
+        images: images
+            .iter()
+            .map(atomcode_daemon::legacy_convert::image_to_kernel)
+            .collect(),
+    }
+}
+
+fn submit_foreground_runtime(ctx: &LoopCtx, input: atomcode_coding::UserInput) -> bool {
+    if ctx.live_binding.is_some() {
+        atomcode_daemon::native_live::submit(input).is_ok()
+    } else {
+        ctx.runtime
+            .dispatch(atomcode_coding::DriverCommand::Submit(input))
+            .is_ok()
+    }
+}
+
+fn reload_runtime_provider(ctx: &LoopCtx) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+    reload_runtime_provider_from(ctx, &ctx.config)
+}
+
+fn reload_runtime_provider_from(
+    ctx: &LoopCtx,
+    source: &Config,
+) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+    let mut config = atomcode_coding::CodingRuntimeConfig::from_config(
+        source,
+        &ctx.working_dir,
+        None,
+        Some(ctx.telemetry.clone()),
+        ctx.dangerously_skip_permissions,
+        true,
+    );
+    // Preserve a process-level CLI language override for ordinary provider reloads.
+    // A changed config language (from `/language` or external reload) intentionally wins.
+    if source.language == ctx.config.language {
+        config.preferred_language = Some(crate::i18n::current_locale());
+    }
+    ctx.runtime.reload_provider(
+        config.agent_config(),
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+    )
+}
+
+pub(crate) fn request_context_stats_render(
+    runtime: &RuntimeControl,
+    runtime_id: bg_runtime::RuntimeId,
+    event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    pending_render: &mut Option<bool>,
+    show_prompt: bool,
+) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+    runtime.refresh_context_stats(runtime_id, event_tx)?;
+    *pending_render = Some(show_prompt);
+    Ok(())
+}
+
+fn deactivate_runtime_provider(ctx: &LoopCtx) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+    ctx.runtime.deactivate_provider(
+        atomcode_coding::ProviderUnavailableReason::AuthenticationRequired,
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+    )
+}
+
+pub(crate) fn deactivate_runtime_provider_after_logout(
+    ctx: &mut LoopCtx,
+) -> Result<bool, atomcode_coding::RuntimeUnavailable> {
+    let auth = AuthObservation::read();
+    ctx.telemetry.set_account_id(auth.user_id.clone());
+    let availability = ctx.runtime.ui_availability();
+    if availability == RuntimeUiAvailability::Starting
+        && provider_requires_atomgit_auth(&ctx.config)
+    {
+        // Reconcile again once startup settles; the provider may have been
+        // assembled from credentials that disappeared during construction.
+        ctx.observed_auth = None;
+        return Ok(false);
+    }
+    if !should_deactivate_for_missing_auth(&ctx.config, availability) {
+        commit_auth_observation(&mut ctx.observed_auth, auth, true);
+        return Ok(false);
+    }
+    if let Err(error) = deactivate_runtime_provider(ctx) {
+        commit_auth_observation(&mut ctx.observed_auth, auth, false);
+        return Err(error);
+    }
+    commit_auth_observation(&mut ctx.observed_auth, auth, true);
+    ctx.pending_provider_deactivation = true;
+    Ok(true)
+}
 
 /// Encode raw RGBA pixel data as a PNG image in memory.
 fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
@@ -72,6 +176,29 @@ fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
 /// bytes directly (screenshots, Preview Copy). If that fails, falls back
 /// to reading a file:// URL from the clipboard text (Finder Cmd+C case)
 /// and loading the image from that path.
+/// Whether a key event is the "paste clipboard image" chord.
+///
+/// `Ctrl+V` is the canonical binding. `Ctrl+Alt+V` is an alternate for
+/// terminals — notably **Windows Terminal** — that bind plain `Ctrl+V` to their
+/// own text-paste action and never forward the key to the app, so plain `Ctrl+V`
+/// can't reach this handler there. The clipboard read (arboard, native Win32)
+/// works regardless; only the trigger key needs an alternate that the terminal
+/// doesn't intercept. `Ctrl+Shift+V` is deliberately NOT matched so a terminal's
+/// "paste as plain text" chord passes through untouched.
+///
+/// Known trade-off (same as Codex's `ctrl_alt(v)` binding): on Windows the
+/// **AltGr** key is delivered as `Ctrl+Alt`, so on the rare keyboard layout
+/// where `AltGr+V` is a printable glyph, that keystroke triggers image-paste
+/// instead of inserting the glyph. Accepted as an inherent cost of the chord.
+fn is_paste_image_chord(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
+    code == crossterm::event::KeyCode::Char('v')
+        && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+        && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+}
+
 /// Returns the image data and a fingerprint hash.
 /// bytes (not the PNG-encoded base64) — same hash function the status
 /// poll uses, so paste-side and poll-side fingerprints line up for the
@@ -468,6 +595,30 @@ mod image_path_tests {
     use std::io::Write as _;
     use tempfile::tempdir;
 
+    #[test]
+    fn paste_image_chord_accepts_ctrl_v_and_ctrl_alt_v_only() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let v = KeyCode::Char('v');
+        // Canonical + the Windows-Terminal alternate both trigger.
+        assert!(is_paste_image_chord(v, KeyModifiers::CONTROL));
+        assert!(is_paste_image_chord(
+            v,
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ));
+        // Ctrl+Shift+V stays a terminal "paste as plain text" passthrough.
+        assert!(!is_paste_image_chord(
+            v,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        ));
+        // Not a paste chord without Ctrl, or on a different key.
+        assert!(!is_paste_image_chord(v, KeyModifiers::ALT));
+        assert!(!is_paste_image_chord(v, KeyModifiers::NONE));
+        assert!(!is_paste_image_chord(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL
+        ));
+    }
+
     /// Materialise a small file at `<dir>/<name>` whose contents are
     /// `bytes`. Returned absolute path is what the user-facing paste
     /// detector sees on iTerm2 Cmd+V or Finder drag.
@@ -703,130 +854,1994 @@ mod compute_input_attachments_tests {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct McpReloadProgress {
-    pub total: usize,
-    pub done: usize,
-    pub connected: usize,
-    pub failed: usize,
-    pub started_at: std::time::Instant,
+pub(crate) struct PendingSessionResume {
+    pub project_bucket: String,
+    pub session: Session,
+    pub working_dir: PathBuf,
+    pub committed: Option<atomcode_coding::SessionChanged>,
 }
 
-/// The two command planes that must move together when the TUI switches runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingSessionResumePreparation {
+    pub project_bucket: String,
+    pub session_id: String,
+    pub working_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingSessionTransition {
+    pub operation: atomcode_coding::ReconfigureKind,
+    pub requested_working_dir: PathBuf,
+    pub committed: Option<atomcode_coding::SessionChanged>,
+    pub effect: SessionTransitionEffect,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) enum SessionTransitionEffect {
+    #[default]
+    None,
+    CdCommand {
+        echo: String,
+    },
+    EnterWorktree {
+        original_dir: PathBuf,
+    },
+    LeaveWorktree {
+        original_dir: PathBuf,
+        branch: Option<String>,
+    },
+    CleanupCurrentWorktree {
+        manager_dir: PathBuf,
+        target_dir: PathBuf,
+        branch: String,
+        force: bool,
+    },
+}
+
+impl SessionTransitionEffect {
+    pub(crate) fn commit_marker(&self, marker: &mut Option<PathBuf>) {
+        match self {
+            Self::EnterWorktree { original_dir } => *marker = Some(original_dir.clone()),
+            Self::LeaveWorktree { .. } | Self::CleanupCurrentWorktree { .. } => *marker = None,
+            Self::None | Self::CdCommand { .. } => {}
+        }
+    }
+}
+
+fn commit_pending_projection<T, E>(
+    pending: &mut Option<T>,
+    project: impl FnOnce(&T) -> Result<(), E>,
+) -> Result<Option<T>, E> {
+    let Some(value) = pending.as_ref() else {
+        return Ok(None);
+    };
+    project(value)?;
+    Ok(pending.take())
+}
+
+fn session_resume_matches(
+    pending: &PendingSessionResume,
+    changed: &atomcode_coding::SessionChanged,
+) -> bool {
+    changed.session_id.as_deref() == Some(pending.session.id.as_str())
+        && changed.working_dir == pending.working_dir
+}
+
+fn session_transition_matches(
+    pending: &PendingSessionTransition,
+    operation: atomcode_coding::ReconfigureKind,
+    changed: &atomcode_coding::SessionChanged,
+) -> bool {
+    let requested = atomcode_capabilities::pathnorm::canonicalize(&pending.requested_working_dir)
+        .unwrap_or_else(|_| pending.requested_working_dir.clone());
+    pending.operation == operation
+        && atomcode_capabilities::session::SessionManager::project_hash(&requested)
+            == atomcode_capabilities::session::SessionManager::project_hash(&changed.working_dir)
+}
+
+#[cfg(test)]
+mod session_resume_tests {
+    use super::{
+        commit_pending_projection, session_resume_matches, PendingSessionResume,
+        SessionTransitionEffect,
+    };
+    use crate::session::Session;
+    use std::path::PathBuf;
+
+    #[test]
+    fn terminal_must_match_id_and_directory() {
+        let working_dir = PathBuf::from("/project");
+        let mut session = Session::default_session(working_dir.clone());
+        session.id = "target-session".into();
+        let pending = PendingSessionResume {
+            project_bucket: "1111111111111111".into(),
+            session,
+            working_dir: working_dir.clone(),
+            committed: None,
+        };
+        let exact = atomcode_coding::SessionChanged {
+            generation: atomcode_coding::RuntimeGeneration(1),
+            session_id: Some("target-session".into()),
+            working_dir: working_dir.clone(),
+        };
+
+        assert!(session_resume_matches(&pending, &exact));
+
+        let wrong_directory = atomcode_coding::SessionChanged {
+            working_dir: PathBuf::from("/other-project"),
+            ..exact
+        };
+        assert!(!session_resume_matches(&pending, &wrong_directory));
+    }
+
+    #[test]
+    fn projection_failure_keeps_pending_operation_for_retry() {
+        let mut pending = Some("transition");
+        let result = commit_pending_projection(&mut pending, |_| Err::<(), _>("hub unavailable"));
+
+        assert_eq!(result, Err("hub unavailable"));
+        assert_eq!(pending, Some("transition"));
+
+        commit_pending_projection(&mut pending, |_| Ok::<(), &str>(())).unwrap();
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn worktree_marker_changes_only_when_transition_commits() {
+        let original = PathBuf::from("/repo");
+        let mut marker = None;
+        let enter = SessionTransitionEffect::EnterWorktree {
+            original_dir: original.clone(),
+        };
+
+        assert_eq!(marker, None);
+        enter.commit_marker(&mut marker);
+        assert_eq!(marker, Some(original.clone()));
+
+        let cd = SessionTransitionEffect::CdCommand {
+            echo: "/cd /other".into(),
+        };
+        cd.commit_marker(&mut marker);
+        assert_eq!(marker, Some(original.clone()));
+
+        let leave = SessionTransitionEffect::LeaveWorktree {
+            original_dir: original,
+            branch: Some("feature".into()),
+        };
+        leave.commit_marker(&mut marker);
+        assert_eq!(marker, None);
+    }
+}
+
+/// The native runtime control plane transferred when the TUI switches sessions.
 #[derive(Clone)]
 pub struct RuntimeEndpoint {
-    pub legacy: AgentClient,
-    pub native: CodingRuntimeHandle,
+    pub native: RuntimeControl,
+}
+
+/// TUI-local control facade for runtimes whose asynchronous preparation may still
+/// be in flight. Both variants ultimately execute the command on `CodingRuntime`.
+#[derive(Clone)]
+pub enum RuntimeControl {
+    Ready(ReadyRuntimeControl),
+    Deferred(DeferredRuntimeControl),
+}
+
+#[derive(Clone)]
+pub struct DeferredRuntimeControl {
+    command_tx: mpsc::UnboundedSender<atomcode_coding::DriverCommand>,
+    state: watch::Receiver<atomcode_coding::DeferredRuntimeState>,
+    closing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeUiAvailability {
+    Starting,
+    Available,
+    Reconfiguring,
+    AwaitingProvider,
+    Failed,
+    Stopped,
+}
+
+fn runtime_ui_availability(phase: atomcode_coding::RuntimePhase) -> RuntimeUiAvailability {
+    match phase {
+        atomcode_coding::RuntimePhase::AwaitingProvider => RuntimeUiAvailability::AwaitingProvider,
+        atomcode_coding::RuntimePhase::Failed => RuntimeUiAvailability::Failed,
+        atomcode_coding::RuntimePhase::ShuttingDown | atomcode_coding::RuntimePhase::Stopped => {
+            RuntimeUiAvailability::Stopped
+        }
+        atomcode_coding::RuntimePhase::Reconfiguring => RuntimeUiAvailability::Reconfiguring,
+        atomcode_coding::RuntimePhase::Ready
+        | atomcode_coding::RuntimePhase::InTurn
+        | atomcode_coding::RuntimePhase::WaitingApproval => RuntimeUiAvailability::Available,
+    }
+}
+
+/// Decide whether a foreground submit that the runtime can't accept yet should
+/// be HELD (queued into the type-ahead queue and auto-replayed once the
+/// provider is ready) instead of being dropped with a "provider unavailable"
+/// error.
+///
+/// A brand-new session boots its provider in `RecoverAuthentication` mode; if
+/// the stored auth is momentarily unreadable (or, in daemon mode, the deferred
+/// runtime is still constructing) the runtime lands in `AwaitingProvider` /
+/// `Starting` with no kernel agent, and the first prompt's `Submit` is rejected
+/// (`runtime_phase_accepts_command`). Recovery arrives asynchronously
+/// (`poll_external_auth` → provider reassembly, or startup completion), so the
+/// right behavior is to hold the prompt and let the existing type-ahead drain
+/// send it once the runtime reaches `Available` — not to lose it.
+///
+/// Local bootstrap readiness is owned by the local facade. Reconfiguration is
+/// different: it is an authoritative CodingRuntime phase shared by local and
+/// live submissions, so both paths must hold until the replacement commits.
+/// Fatal states (`Failed` / `Stopped`) still surface the error.
+fn hold_submit_until_ready(live: bool, availability: RuntimeUiAvailability) -> bool {
+    availability == RuntimeUiAvailability::Reconfiguring
+        || (!live
+            && matches!(
+                availability,
+                RuntimeUiAvailability::AwaitingProvider | RuntimeUiAvailability::Starting
+            ))
+}
+
+/// Guard for the type-ahead drain: a queued message must only be replayed when
+/// the local foreground runtime is actually `Available`. Without this, a
+/// foreground event arriving while the runtime is still `AwaitingProvider` /
+/// `Starting` (i.e. before recovery completes) would pop a held message and
+/// submit it into a not-ready runtime, dropping it. The live path has separate
+/// bootstrap readiness, but it shares the runtime's reconfiguration boundary.
+fn drain_blocked_until_ready(live: bool, availability: RuntimeUiAvailability) -> bool {
+    availability == RuntimeUiAvailability::Reconfiguring
+        || (!live && !matches!(availability, RuntimeUiAvailability::Available))
+}
+
+fn provider_transition_blocks_queue_drain(
+    provider_transition_pending: bool,
+    live: bool,
+    availability: RuntimeUiAvailability,
+) -> bool {
+    provider_transition_pending || drain_blocked_until_ready(live, availability)
+}
+
+/// What an observed runtime event is allowed to do to the type-ahead queue.
+///
+/// Kernel `AgentEvent::Error` is deliberately absent: it is diagnostic and can
+/// precede the runtime-owned turn terminal. Only `TurnFinished(Stopped)` opens
+/// one FIFO drain slot; every other authoritative terminal drops queued work so
+/// an incomplete turn cannot silently start another one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeAheadQueueAction {
+    None,
+    DrainOne,
+    Clear,
+}
+
+fn stop_reason_queue_action(reason: atomcode_kernel::event::StopReason) -> TypeAheadQueueAction {
+    if matches!(reason, atomcode_kernel::event::StopReason::Stopped) {
+        TypeAheadQueueAction::DrainOne
+    } else {
+        TypeAheadQueueAction::Clear
+    }
+}
+
+fn native_queue_action(event: &CodingRuntimeEvent) -> TypeAheadQueueAction {
+    match event {
+        CodingRuntimeEvent::TurnFinished(atomcode_coding::TurnCompletion::Completed {
+            reason,
+            ..
+        }) => stop_reason_queue_action(*reason),
+        CodingRuntimeEvent::TurnFinished(
+            atomcode_coding::TurnCompletion::SnapshotUnavailable { .. },
+        )
+        | CodingRuntimeEvent::RuntimeStopped(_) => TypeAheadQueueAction::Clear,
+        _ => TypeAheadQueueAction::None,
+    }
+}
+
+fn type_ahead_queue_action(event: &bg_runtime::RuntimeEventPayload) -> TypeAheadQueueAction {
+    match event {
+        bg_runtime::RuntimeEventPayload::Native(event) => native_queue_action(event),
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => {
+            native_queue_action(&envelope.event)
+        }
+        // Transitional UI terminals may close presentation state, but they are
+        // not runtime-owned proof that a new submit is safe.
+        bg_runtime::RuntimeEventPayload::Ui(
+            AgentEvent::TurnComplete { .. } | AgentEvent::TurnCancelled { .. },
+        ) => TypeAheadQueueAction::Clear,
+        _ => TypeAheadQueueAction::None,
+    }
+}
+
+/// What a runtime event is allowed to do to a fixed-interval prompt loop.
+/// A normal runtime-owned terminal releases the next scheduled iteration;
+/// every authoritative failure tears the loop down. Presentation-only natural
+/// completion deliberately does neither and therefore cannot race ahead of
+/// `TurnFinished`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixedIntervalLoopAction {
+    None,
+    Release,
+    Clear,
+}
+
+fn fixed_interval_loop_action(event: &bg_runtime::RuntimeEventPayload) -> FixedIntervalLoopAction {
+    match event {
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => fixed_interval_loop_action(
+            &bg_runtime::RuntimeEventPayload::Native(envelope.event.clone()),
+        ),
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+            atomcode_coding::TurnCompletion::Completed { reason, .. },
+        )) => {
+            if matches!(reason, atomcode_kernel::event::StopReason::Stopped) {
+                FixedIntervalLoopAction::Release
+            } else {
+                FixedIntervalLoopAction::Clear
+            }
+        }
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+            atomcode_coding::TurnCompletion::SnapshotUnavailable { .. },
+        ))
+        | bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::RuntimeStopped(_))
+        | bg_runtime::RuntimeEventPayload::Ui(AgentEvent::TurnCancelled { .. }) => {
+            FixedIntervalLoopAction::Clear
+        }
+        bg_runtime::RuntimeEventPayload::Ui(AgentEvent::TurnComplete { stop_reason, .. }) => {
+            if matches!(stop_reason, ui_event::UiTurnStopReason::Natural) {
+                FixedIntervalLoopAction::None
+            } else {
+                FixedIntervalLoopAction::Clear
+            }
+        }
+        _ => FixedIntervalLoopAction::None,
+    }
+}
+
+fn apply_fixed_interval_loop_action(
+    action: FixedIntervalLoopAction,
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+) {
+    match action {
+        FixedIntervalLoopAction::None => {}
+        FixedIntervalLoopAction::Release => {
+            if let Some(controller) = ctx.loop_ctrl.as_mut() {
+                controller.mark_turn_stopped_normally();
+            }
+        }
+        FixedIntervalLoopAction::Clear => {
+            ctx.loop_ctrl = None;
+            state.loop_label = None;
+            state.loop_round = 0;
+            state.loop_started_at = None;
+        }
+    }
+}
+
+fn apply_type_ahead_queue_action<T>(
+    action: TypeAheadQueueAction,
+    queue: &mut VecDeque<T>,
+    drain_authorized: &mut bool,
+) {
+    match action {
+        TypeAheadQueueAction::None => {}
+        TypeAheadQueueAction::DrainOne => *drain_authorized = true,
+        TypeAheadQueueAction::Clear => {
+            queue.clear();
+            *drain_authorized = false;
+        }
+    }
+}
+
+fn pop_authorized_type_ahead<T>(queue: &mut VecDeque<T>, drain_authorized: &mut bool) -> Option<T> {
+    if !*drain_authorized {
+        return None;
+    }
+    *drain_authorized = false;
+    queue.pop_front()
+}
+
+fn is_provider_reload_failure(event: &bg_runtime::RuntimeEventPayload) -> bool {
+    match event {
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::ProviderReloadFinished(
+            Err(_),
+        )) => true,
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => matches!(
+            &envelope.event,
+            CodingRuntimeEvent::ProviderReloadFinished(Err(_))
+        ),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod submit_hold_tests {
+    use super::*;
+
+    fn native_turn_finished(
+        reason: atomcode_kernel::event::StopReason,
+    ) -> bg_runtime::RuntimeEventPayload {
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+            atomcode_coding::TurnCompletion::Completed {
+                turn_id: 1,
+                reason,
+                snapshot: std::sync::Arc::new(atomcode_kernel::message::SessionSnapshot::new(
+                    Vec::new(),
+                )),
+                stats: Default::default(),
+            },
+        ))
+    }
+
+    #[test]
+    fn only_natural_turn_terminal_authorizes_type_ahead_drain() {
+        assert_eq!(
+            type_ahead_queue_action(&native_turn_finished(
+                atomcode_kernel::event::StopReason::Stopped,
+            )),
+            TypeAheadQueueAction::DrainOne
+        );
+        assert_eq!(
+            type_ahead_queue_action(&native_turn_finished(
+                atomcode_kernel::event::StopReason::MaxRounds,
+            )),
+            TypeAheadQueueAction::Clear
+        );
+
+        let presentation_only = bg_runtime::RuntimeEventPayload::Ui(AgentEvent::TurnComplete {
+            duration: Duration::default(),
+            total_tokens: 0,
+            turn_count: 0,
+            tool_call_count: 0,
+            stop_reason: ui_event::UiTurnStopReason::Natural,
+            snapshot: Default::default(),
+        });
+        assert_eq!(
+            type_ahead_queue_action(&presentation_only),
+            TypeAheadQueueAction::Clear
+        );
+
+        let snapshot_unavailable =
+            bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+                atomcode_coding::TurnCompletion::SnapshotUnavailable {
+                    turn_id: 1,
+                    reason: atomcode_kernel::event::StopReason::Stopped,
+                    error: atomcode_coding::RuntimeSnapshotError {
+                        message: "snapshot failed".into(),
+                    },
+                    stats: Default::default(),
+                },
+            ));
+        assert_eq!(
+            type_ahead_queue_action(&snapshot_unavailable),
+            TypeAheadQueueAction::Clear
+        );
+    }
+
+    #[test]
+    fn max_rounds_continuations_and_tool_loop_clear_type_ahead() {
+        for reason in [
+            atomcode_kernel::event::StopReason::MaxRounds,
+            atomcode_kernel::event::StopReason::MaxContinuations,
+            atomcode_kernel::event::StopReason::RepeatLoop,
+            atomcode_kernel::event::StopReason::ToolLoopDetected,
+            atomcode_kernel::event::StopReason::Cancelled,
+            atomcode_kernel::event::StopReason::ProviderError,
+            atomcode_kernel::event::StopReason::Timeout,
+            atomcode_kernel::event::StopReason::PromptRejected,
+            atomcode_kernel::event::StopReason::RateLimited,
+        ] {
+            assert_eq!(
+                stop_reason_queue_action(reason),
+                TypeAheadQueueAction::Clear
+            );
+        }
+        assert_eq!(
+            stop_reason_queue_action(atomcode_kernel::event::StopReason::Stopped),
+            TypeAheadQueueAction::DrainOne
+        );
+    }
+
+    #[test]
+    fn agent_error_is_diagnostic_and_does_not_touch_type_ahead() {
+        let event = bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+            atomcode_kernel::event::AgentEvent::Error {
+                message: "round limit reached".into(),
+                http_status: None,
+                code: None,
+            },
+        ));
+        assert_eq!(type_ahead_queue_action(&event), TypeAheadQueueAction::None);
+
+        let mut queue = VecDeque::from(["next"]);
+        let mut authorized = false;
+        apply_type_ahead_queue_action(TypeAheadQueueAction::None, &mut queue, &mut authorized);
+        assert_eq!(queue, VecDeque::from(["next"]));
+        assert!(!authorized);
+    }
+
+    #[test]
+    fn fixed_interval_loop_continues_only_after_authoritative_stopped() {
+        assert_eq!(
+            fixed_interval_loop_action(&native_turn_finished(
+                atomcode_kernel::event::StopReason::Stopped,
+            )),
+            FixedIntervalLoopAction::Release
+        );
+        for reason in [
+            atomcode_kernel::event::StopReason::MaxRounds,
+            atomcode_kernel::event::StopReason::MaxContinuations,
+            atomcode_kernel::event::StopReason::RepeatLoop,
+            atomcode_kernel::event::StopReason::ToolLoopDetected,
+            atomcode_kernel::event::StopReason::ProviderError,
+            atomcode_kernel::event::StopReason::Timeout,
+            atomcode_kernel::event::StopReason::Cancelled,
+            atomcode_kernel::event::StopReason::PromptRejected,
+            atomcode_kernel::event::StopReason::RateLimited,
+        ] {
+            assert_eq!(
+                fixed_interval_loop_action(&native_turn_finished(reason)),
+                FixedIntervalLoopAction::Clear
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_and_runtime_stop_fail_closed_even_if_snapshot_reason_is_stopped() {
+        let snapshot_unavailable =
+            bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+                atomcode_coding::TurnCompletion::SnapshotUnavailable {
+                    turn_id: 1,
+                    reason: atomcode_kernel::event::StopReason::Stopped,
+                    error: atomcode_coding::RuntimeSnapshotError {
+                        message: "snapshot failed".into(),
+                    },
+                    stats: Default::default(),
+                },
+            ));
+        assert_eq!(
+            fixed_interval_loop_action(&snapshot_unavailable),
+            FixedIntervalLoopAction::Clear
+        );
+
+        let runtime_stopped = bg_runtime::RuntimeEventPayload::Native(
+            CodingRuntimeEvent::RuntimeStopped(atomcode_coding::RuntimeExit {
+                reason: atomcode_coding::RuntimeExitReason::OwnerStopped,
+                forced: false,
+            }),
+        );
+        assert_eq!(
+            fixed_interval_loop_action(&runtime_stopped),
+            FixedIntervalLoopAction::Clear
+        );
+    }
+
+    #[test]
+    fn legacy_turn_complete_respects_stop_reason_without_authorizing_continuation() {
+        let legacy = |stop_reason| {
+            bg_runtime::RuntimeEventPayload::Ui(AgentEvent::TurnComplete {
+                duration: Duration::default(),
+                total_tokens: 0,
+                turn_count: 0,
+                tool_call_count: 0,
+                stop_reason,
+                snapshot: Default::default(),
+            })
+        };
+
+        assert_eq!(
+            fixed_interval_loop_action(&legacy(ui_event::UiTurnStopReason::Natural)),
+            FixedIntervalLoopAction::None
+        );
+        assert_eq!(
+            fixed_interval_loop_action(&legacy(ui_event::UiTurnStopReason::TurnLimit)),
+            FixedIntervalLoopAction::Clear
+        );
+    }
+
+    #[test]
+    fn abnormal_terminal_revokes_drain_and_clears_all_queued_work() {
+        let mut queue = VecDeque::from(["next", "later"]);
+        let mut authorized = true;
+        apply_type_ahead_queue_action(TypeAheadQueueAction::Clear, &mut queue, &mut authorized);
+        assert!(queue.is_empty());
+        assert!(!authorized);
+    }
+
+    #[test]
+    fn natural_terminal_releases_exactly_one_fifo_entry() {
+        let mut queue = VecDeque::from(["first", "second"]);
+        let mut authorized = false;
+        apply_type_ahead_queue_action(TypeAheadQueueAction::DrainOne, &mut queue, &mut authorized);
+
+        assert_eq!(
+            pop_authorized_type_ahead(&mut queue, &mut authorized),
+            Some("first")
+        );
+        assert!(!authorized);
+        assert_eq!(queue, VecDeque::from(["second"]));
+        assert_eq!(pop_authorized_type_ahead(&mut queue, &mut authorized), None);
+        assert_eq!(queue, VecDeque::from(["second"]));
+    }
+
+    #[test]
+    fn diagnostic_error_then_turn_limit_never_advances_type_ahead() {
+        let diagnostic = bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+            atomcode_kernel::event::AgentEvent::Error {
+                message: "maximum rounds reached".into(),
+                http_status: None,
+                code: None,
+            },
+        ));
+        let mut state = UiState::new();
+        state.on_submit();
+        let mut queue = VecDeque::from(["must not run"]);
+        let mut authorized = false;
+
+        state.on_error();
+        apply_type_ahead_queue_action(
+            type_ahead_queue_action(&diagnostic),
+            &mut queue,
+            &mut authorized,
+        );
+        assert_eq!(state.phase, UiPhase::Streaming);
+        assert_eq!(queue, VecDeque::from(["must not run"]));
+        assert!(!authorized);
+
+        state.on_turn_complete();
+        apply_type_ahead_queue_action(
+            type_ahead_queue_action(&native_turn_finished(
+                atomcode_kernel::event::StopReason::MaxRounds,
+            )),
+            &mut queue,
+            &mut authorized,
+        );
+        assert_eq!(state.phase, UiPhase::Idle);
+        assert!(queue.is_empty());
+        assert!(!authorized);
+    }
+
+    #[test]
+    fn holds_first_submit_only_for_transient_bootstrap_states() {
+        // Recoverable: a new session still awaiting auth recovery, or a daemon
+        // deferred runtime still constructing — hold the prompt.
+        assert!(hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::AwaitingProvider
+        ));
+        assert!(hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::Starting
+        ));
+        assert!(hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::Reconfiguring
+        ));
+
+        // Fatal / normal states: never hold — either it would submit fine
+        // (Available) or recovery isn't coming (Failed/Stopped) so the error
+        // must surface.
+        assert!(!hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::Available
+        ));
+        assert!(!hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::Failed
+        ));
+        assert!(!hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::Stopped
+        ));
+    }
+
+    #[test]
+    fn live_path_only_holds_authoritative_reconfiguration() {
+        // The live (webui bridge) runtime manages readiness separately; its
+        // ctx.runtime availability is unrelated to live submit readiness, so we
+        // must never divert a live submit into the type-ahead queue.
+        for availability in [
+            RuntimeUiAvailability::AwaitingProvider,
+            RuntimeUiAvailability::Starting,
+            RuntimeUiAvailability::Available,
+            RuntimeUiAvailability::Failed,
+            RuntimeUiAvailability::Stopped,
+        ] {
+            assert!(!hold_submit_until_ready(true, availability));
+        }
+        assert!(hold_submit_until_ready(
+            true,
+            RuntimeUiAvailability::Reconfiguring
+        ));
+    }
+
+    #[test]
+    fn drain_only_when_local_runtime_available() {
+        // The type-ahead drain must replay a held message only when the local
+        // runtime is actually Available — otherwise it would pop the message and
+        // submit it into a not-ready runtime, dropping it.
+        assert!(!drain_blocked_until_ready(
+            false,
+            RuntimeUiAvailability::Available
+        ));
+        assert!(drain_blocked_until_ready(
+            false,
+            RuntimeUiAvailability::AwaitingProvider
+        ));
+        assert!(drain_blocked_until_ready(
+            false,
+            RuntimeUiAvailability::Starting
+        ));
+        assert!(drain_blocked_until_ready(
+            false,
+            RuntimeUiAvailability::Failed
+        ));
+        assert!(drain_blocked_until_ready(
+            false,
+            RuntimeUiAvailability::Stopped
+        ));
+        assert!(drain_blocked_until_ready(
+            false,
+            RuntimeUiAvailability::Reconfiguring
+        ));
+    }
+
+    #[test]
+    fn live_drain_only_blocks_authoritative_reconfiguration() {
+        // Live type-ahead readiness is not derived from ctx.runtime availability,
+        // so the guard must never block a live drain regardless of the local
+        // runtime phase.
+        for availability in [
+            RuntimeUiAvailability::AwaitingProvider,
+            RuntimeUiAvailability::Starting,
+            RuntimeUiAvailability::Available,
+            RuntimeUiAvailability::Failed,
+            RuntimeUiAvailability::Stopped,
+        ] {
+            assert!(!drain_blocked_until_ready(true, availability));
+        }
+        assert!(drain_blocked_until_ready(
+            true,
+            RuntimeUiAvailability::Reconfiguring
+        ));
+    }
+
+    #[test]
+    fn reload_failure_only_blocks_queue_when_runtime_or_transition_is_still_blocked() {
+        assert!(!provider_transition_blocks_queue_drain(
+            false,
+            false,
+            RuntimeUiAvailability::Available,
+        ));
+        assert!(provider_transition_blocks_queue_drain(
+            true,
+            false,
+            RuntimeUiAvailability::Available,
+        ));
+        assert!(provider_transition_blocks_queue_drain(
+            false,
+            false,
+            RuntimeUiAvailability::Failed,
+        ));
+    }
+}
+
+fn command_allowed_while_starting(command: &atomcode_coding::DriverCommand) -> bool {
+    use atomcode_coding::DriverCommand;
+    matches!(
+        command,
+        DriverCommand::Cancel
+            | DriverCommand::SetMode(_)
+            | DriverCommand::QueueLocalContext(_)
+            | DriverCommand::StopGoal
+            | DriverCommand::StopLoop
+            | DriverCommand::Shutdown
+    )
+}
+
+#[derive(Clone)]
+pub struct ReadyRuntimeControl {
+    handle: CodingRuntimeHandle,
+    queue: std::sync::Arc<std::sync::Mutex<ReadyRuntimeQueue>>,
+    event_tx: std::sync::Arc<
+        std::sync::Mutex<Option<mpsc::UnboundedSender<bg_runtime::RuntimeEventPayload>>>,
+    >,
+}
+
+#[derive(Default)]
+struct ReadyRuntimeQueue {
+    pending: VecDeque<ReadyRuntimeRequest>,
+    draining: bool,
+}
+
+enum ReadyRuntimeRequest {
+    Compact(Option<String>),
+    Dispatch(atomcode_coding::DriverCommand),
+    Undo {
+        nth: Option<usize>,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    ContextStats {
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    RestoreSnapshot {
+        snapshot: atomcode_kernel::message::SessionSnapshot,
+        correlation_id: u64,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    ResumeSession {
+        id: String,
+        working_dir: PathBuf,
+        lease: atomcode_capabilities::session::SessionLease,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    FreshSession {
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    ChangeDirectory {
+        directory: PathBuf,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    ReloadCapabilities {
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    ReloadProvider {
+        next: atomcode_coding::CodingAgentConfig,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    DeactivateProvider {
+        reason: atomcode_coding::ProviderUnavailableReason,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+}
+
+impl ReadyRuntimeControl {
+    fn new(handle: CodingRuntimeHandle) -> Self {
+        Self {
+            handle,
+            queue: std::sync::Arc::new(std::sync::Mutex::new(ReadyRuntimeQueue::default())),
+            event_tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn with_event_tx(
+        handle: CodingRuntimeHandle,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEventPayload>,
+    ) -> Self {
+        Self {
+            handle,
+            queue: std::sync::Arc::new(std::sync::Mutex::new(ReadyRuntimeQueue::default())),
+            event_tx: std::sync::Arc::new(std::sync::Mutex::new(Some(event_tx))),
+        }
+    }
+
+    fn report_delivery_failure(&self, operation: &str) {
+        let event_tx = self
+            .event_tx
+            .lock()
+            .expect("runtime delivery event sender poisoned")
+            .clone();
+        let Some(event_tx) = event_tx else {
+            return;
+        };
+        let _ = event_tx.send(bg_runtime::RuntimeEventPayload::Native(
+            CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Error {
+                message: format!("coding runtime {operation} delivery failed"),
+                http_status: None,
+                code: None,
+            }),
+        ));
+    }
+
+    fn enqueue(
+        &self,
+        request: ReadyRuntimeRequest,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        if self.handle.is_stopped() {
+            return Err(atomcode_coding::RuntimeUnavailable);
+        }
+        let phase = self.handle.status().phase;
+        let allowed = match &request {
+            ReadyRuntimeRequest::ReloadProvider { .. }
+            | ReadyRuntimeRequest::DeactivateProvider { .. } => matches!(
+                phase,
+                atomcode_coding::RuntimePhase::Ready
+                    | atomcode_coding::RuntimePhase::InTurn
+                    | atomcode_coding::RuntimePhase::WaitingApproval
+                    | atomcode_coding::RuntimePhase::AwaitingProvider
+                    | atomcode_coding::RuntimePhase::Failed
+            ),
+            ReadyRuntimeRequest::Dispatch(command) => self.handle.accepts(command),
+            ReadyRuntimeRequest::Compact(_)
+            | ReadyRuntimeRequest::Undo { .. }
+            | ReadyRuntimeRequest::ContextStats { .. }
+            | ReadyRuntimeRequest::RestoreSnapshot { .. }
+            | ReadyRuntimeRequest::ResumeSession { .. }
+            | ReadyRuntimeRequest::FreshSession { .. }
+            | ReadyRuntimeRequest::ChangeDirectory { .. }
+            | ReadyRuntimeRequest::ReloadCapabilities { .. } => matches!(
+                phase,
+                atomcode_coding::RuntimePhase::Ready
+                    | atomcode_coding::RuntimePhase::InTurn
+                    | atomcode_coding::RuntimePhase::WaitingApproval
+            ),
+        };
+        if !allowed {
+            return Err(atomcode_coding::RuntimeUnavailable);
+        }
+        let should_spawn = {
+            let mut queue = self.queue.lock().expect("runtime queue poisoned");
+            queue.pending.push_back(request);
+            if queue.draining {
+                false
+            } else {
+                queue.draining = true;
+                true
+            }
+        };
+        if should_spawn {
+            let ready = self.clone();
+            tokio::spawn(async move { ready.drain().await });
+        }
+        Ok(())
+    }
+
+    async fn drain(self) {
+        loop {
+            let request = {
+                let mut queue = self.queue.lock().expect("runtime queue poisoned");
+                match queue.pending.pop_front() {
+                    Some(request) => request,
+                    None => {
+                        queue.draining = false;
+                        return;
+                    }
+                }
+            };
+            match request {
+                ReadyRuntimeRequest::Compact(focus) => {
+                    if self.handle.compact(focus).is_err() {
+                        self.report_delivery_failure("compact");
+                    }
+                }
+                ReadyRuntimeRequest::Dispatch(command) => {
+                    if self.handle.dispatch(command).is_err() {
+                        self.report_delivery_failure("command");
+                    }
+                }
+                ReadyRuntimeRequest::Undo {
+                    nth,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.undo_to_prompt(nth).await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::UndoFinished(result),
+                    );
+                }
+                ReadyRuntimeRequest::ContextStats {
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.context_stats().await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::ContextStatsRefreshed(result),
+                    );
+                }
+                ReadyRuntimeRequest::RestoreSnapshot {
+                    snapshot,
+                    correlation_id,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = async {
+                        self.handle.restore_snapshot(snapshot).await?;
+                        self.handle.snapshot().await
+                    }
+                    .await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::SnapshotRestoreFinished {
+                            correlation_id,
+                            result,
+                        },
+                    );
+                }
+                ReadyRuntimeRequest::ResumeSession {
+                    id,
+                    working_dir,
+                    lease,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self
+                        .handle
+                        .resume_session_with_lease(id, working_dir, lease)
+                        .await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::SessionResumeFinished(result),
+                    );
+                }
+                ReadyRuntimeRequest::FreshSession {
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.fresh_session().await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::SessionTransitionFinished {
+                                operation: atomcode_coding::ReconfigureKind::FreshSession,
+                                result,
+                            },
+                        ),
+                    });
+                }
+                ReadyRuntimeRequest::ChangeDirectory {
+                    directory,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.change_directory(directory).await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::SessionTransitionFinished {
+                                operation: atomcode_coding::ReconfigureKind::ChangeDirectory,
+                                result,
+                            },
+                        ),
+                    });
+                }
+                ReadyRuntimeRequest::ReloadCapabilities {
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.reload_capabilities().await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::CapabilitiesReloadFinished { result },
+                        ),
+                    });
+                }
+                ReadyRuntimeRequest::ReloadProvider {
+                    next,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.reassemble_provider(next).await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::ProviderReloadFinished(result),
+                    );
+                }
+                ReadyRuntimeRequest::DeactivateProvider {
+                    reason,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.deactivate_provider(reason).await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::ProviderDeactivationFinished(result),
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl DeferredRuntimeControl {
+    fn ui_availability(&self) -> RuntimeUiAvailability {
+        if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return RuntimeUiAvailability::Stopped;
+        }
+        match &*self.state.borrow() {
+            atomcode_coding::DeferredRuntimeState::Starting => RuntimeUiAvailability::Starting,
+            atomcode_coding::DeferredRuntimeState::Ready(handle) => {
+                runtime_ui_availability(handle.status().phase)
+            }
+            atomcode_coding::DeferredRuntimeState::Failed(_) => RuntimeUiAvailability::Failed,
+        }
+    }
+
+    fn normal_operation_allowed(&self) -> bool {
+        match &*self.state.borrow() {
+            atomcode_coding::DeferredRuntimeState::Ready(handle) => matches!(
+                handle.status().phase,
+                atomcode_coding::RuntimePhase::Ready
+                    | atomcode_coding::RuntimePhase::InTurn
+                    | atomcode_coding::RuntimePhase::WaitingApproval
+            ),
+            atomcode_coding::DeferredRuntimeState::Starting
+            | atomcode_coding::DeferredRuntimeState::Failed(_) => false,
+        }
+    }
+
+    fn provider_operation_allowed(&self) -> bool {
+        if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        match &*self.state.borrow() {
+            atomcode_coding::DeferredRuntimeState::Starting => false,
+            atomcode_coding::DeferredRuntimeState::Ready(handle) => matches!(
+                handle.status().phase,
+                atomcode_coding::RuntimePhase::Ready
+                    | atomcode_coding::RuntimePhase::InTurn
+                    | atomcode_coding::RuntimePhase::WaitingApproval
+                    | atomcode_coding::RuntimePhase::AwaitingProvider
+                    | atomcode_coding::RuntimePhase::Failed
+            ),
+            atomcode_coding::DeferredRuntimeState::Failed(_) => false,
+        }
+    }
+
+    fn dispatch_allowed(&self, command: &atomcode_coding::DriverCommand) -> bool {
+        if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return matches!(command, atomcode_coding::DriverCommand::Shutdown);
+        }
+        match &*self.state.borrow() {
+            atomcode_coding::DeferredRuntimeState::Starting => {
+                command_allowed_while_starting(command)
+            }
+            atomcode_coding::DeferredRuntimeState::Ready(handle) => handle.accepts(command),
+            atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                matches!(command, atomcode_coding::DriverCommand::Shutdown)
+            }
+        }
+    }
+
+    fn send(
+        &self,
+        command: atomcode_coding::DriverCommand,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        let shutdown = matches!(command, atomcode_coding::DriverCommand::Shutdown);
+        if shutdown {
+            self.closing
+                .store(true, std::sync::atomic::Ordering::Release);
+        } else if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(atomcode_coding::RuntimeUnavailable);
+        }
+        self.command_tx
+            .send(command)
+            .map_err(|_| atomcode_coding::RuntimeUnavailable)
+    }
+}
+
+impl RuntimeControl {
+    fn active_handle(&self) -> Option<CodingRuntimeHandle> {
+        match self {
+            Self::Ready(ready) => Some(ready.handle.clone()),
+            Self::Deferred(deferred) => match &*deferred.state.borrow() {
+                atomcode_coding::DeferredRuntimeState::Ready(handle) => Some(handle.clone()),
+                atomcode_coding::DeferredRuntimeState::Starting
+                | atomcode_coding::DeferredRuntimeState::Failed(_) => None,
+            },
+        }
+    }
+
+    pub async fn mcp_status(
+        &self,
+    ) -> Result<atomcode_coding::McpStatusSnapshot, atomcode_coding::RuntimeError> {
+        let handle = self
+            .active_handle()
+            .ok_or(atomcode_coding::RuntimeError::Unavailable)?;
+        handle.mcp_status().await
+    }
+
+    pub async fn mcp_tools(
+        &self,
+        server: String,
+    ) -> Result<atomcode_coding::McpToolsSnapshot, atomcode_coding::RuntimeError> {
+        let handle = self
+            .active_handle()
+            .ok_or(atomcode_coding::RuntimeError::Unavailable)?;
+        handle.mcp_tools(server).await
+    }
+
+    pub async fn withdraw_mcp_tools(&self) -> Result<(), atomcode_coding::RuntimeError> {
+        let handle = self
+            .active_handle()
+            .ok_or(atomcode_coding::RuntimeError::Unavailable)?;
+        handle.withdraw_mcp_tools().await
+    }
+
+    fn current_generation(&self) -> Option<atomcode_coding::RuntimeGeneration> {
+        match self {
+            Self::Ready(ready) => Some(atomcode_coding::RuntimeGeneration(
+                ready.handle.status().generation,
+            )),
+            Self::Deferred(deferred) => match &*deferred.state.borrow() {
+                atomcode_coding::DeferredRuntimeState::Ready(handle) => Some(
+                    atomcode_coding::RuntimeGeneration(handle.status().generation),
+                ),
+                atomcode_coding::DeferredRuntimeState::Starting
+                | atomcode_coding::DeferredRuntimeState::Failed(_) => None,
+            },
+        }
+    }
+
+    pub fn detach_delivery_event_tx(&self) {
+        if let Self::Ready(ready) = self {
+            ready
+                .event_tx
+                .lock()
+                .expect("runtime delivery event sender poisoned")
+                .take();
+        }
+    }
+
+    pub fn ready_with_event_tx(
+        handle: CodingRuntimeHandle,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEventPayload>,
+    ) -> Self {
+        Self::Ready(ReadyRuntimeControl::with_event_tx(handle, event_tx))
+    }
+
+    pub fn deferred(
+        command_tx: mpsc::UnboundedSender<atomcode_coding::DriverCommand>,
+        state: watch::Receiver<atomcode_coding::DeferredRuntimeState>,
+    ) -> Self {
+        Self::Deferred(DeferredRuntimeControl {
+            command_tx,
+            state,
+            closing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    pub fn is_closed(&self) -> bool {
+        match self {
+            Self::Ready(ready) => ready.handle.is_stopped(),
+            Self::Deferred(deferred) => {
+                deferred.command_tx.is_closed()
+                    || matches!(deferred.ui_availability(), RuntimeUiAvailability::Stopped)
+            }
+        }
+    }
+
+    fn ui_availability(&self) -> RuntimeUiAvailability {
+        match self {
+            Self::Ready(ready) => runtime_ui_availability(ready.handle.status().phase),
+            Self::Deferred(deferred) => deferred.ui_availability(),
+        }
+    }
+
+    fn send_native_result(
+        event_tx: &mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+        runtime_id: bg_runtime::RuntimeId,
+        event: CodingRuntimeEvent,
+    ) {
+        let _ = event_tx.send(bg_runtime::RuntimeEvent {
+            runtime_id,
+            event: bg_runtime::RuntimeEventPayload::Native(event),
+        });
+    }
+
+    pub fn compact(
+        &self,
+        focus: Option<String>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::Compact(focus)),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::Compact(focus))
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn dispatch(
+        &self,
+        command: atomcode_coding::DriverCommand,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::Dispatch(command)),
+            Self::Deferred(deferred) if deferred.dispatch_allowed(&command) => {
+                deferred.send(command)
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    /// Queue a command that intentionally belongs to a runtime still preparing.
+    /// Foreground input must use `dispatch`, which rejects Submit until the
+    /// authoritative handle is ready; background startup uses this explicit path
+    /// for its initial prompt and does not enter the foreground streaming UI.
+    pub(crate) fn dispatch_when_ready(
+        &self,
+        command: atomcode_coding::DriverCommand,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(_) => self.dispatch(command),
+            Self::Deferred(deferred) => match &*deferred.state.borrow() {
+                atomcode_coding::DeferredRuntimeState::Starting => deferred.send(command),
+                atomcode_coding::DeferredRuntimeState::Ready(handle)
+                    if handle.accepts(&command) =>
+                {
+                    deferred.send(command)
+                }
+                atomcode_coding::DeferredRuntimeState::Ready(_)
+                | atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                    Err(atomcode_coding::RuntimeUnavailable)
+                }
+            },
+        }
+    }
+
+    pub fn undo_to_prompt(
+        &self,
+        nth: Option<usize>,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::Undo {
+                nth,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::UndoToPrompt(nth))
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn refresh_context_stats(
+        &self,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ContextStats {
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::RefreshContextStats)
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn restore_snapshot_correlated(
+        &self,
+        snapshot: atomcode_kernel::message::SessionSnapshot,
+        correlation_id: u64,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::RestoreSnapshot {
+                snapshot,
+                correlation_id,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::RestoreSnapshotCorrelated {
+                    snapshot,
+                    correlation_id,
+                })
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn resume_session(
+        &self,
+        id: String,
+        working_dir: PathBuf,
+        lease: atomcode_capabilities::session::SessionLease,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ResumeSession {
+                id,
+                working_dir,
+                lease,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                let handle = match &*deferred.state.borrow() {
+                    atomcode_coding::DeferredRuntimeState::Ready(handle) => handle.clone(),
+                    atomcode_coding::DeferredRuntimeState::Starting
+                    | atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                        return Err(atomcode_coding::RuntimeUnavailable);
+                    }
+                };
+                tokio::spawn(async move {
+                    let result = handle
+                        .resume_session_with_lease(id, working_dir, lease)
+                        .await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::SessionResumeFinished(result),
+                    );
+                });
+                Ok(())
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn fresh_session(
+        &self,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::FreshSession {
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                let handle = match &*deferred.state.borrow() {
+                    atomcode_coding::DeferredRuntimeState::Ready(handle) => handle.clone(),
+                    atomcode_coding::DeferredRuntimeState::Starting
+                    | atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                        return Err(atomcode_coding::RuntimeUnavailable);
+                    }
+                };
+                tokio::spawn(async move {
+                    let result = handle.fresh_session().await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::SessionTransitionFinished {
+                                operation: atomcode_coding::ReconfigureKind::FreshSession,
+                                result,
+                            },
+                        ),
+                    });
+                });
+                Ok(())
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn change_directory(
+        &self,
+        directory: PathBuf,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ChangeDirectory {
+                directory,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                let handle = match &*deferred.state.borrow() {
+                    atomcode_coding::DeferredRuntimeState::Ready(handle) => handle.clone(),
+                    atomcode_coding::DeferredRuntimeState::Starting
+                    | atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                        return Err(atomcode_coding::RuntimeUnavailable);
+                    }
+                };
+                tokio::spawn(async move {
+                    let result = handle.change_directory(directory).await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::SessionTransitionFinished {
+                                operation: atomcode_coding::ReconfigureKind::ChangeDirectory,
+                                result,
+                            },
+                        ),
+                    });
+                });
+                Ok(())
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn reload_capabilities(
+        &self,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ReloadCapabilities {
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
+                let handle = match &*deferred.state.borrow() {
+                    atomcode_coding::DeferredRuntimeState::Ready(handle) => handle.clone(),
+                    atomcode_coding::DeferredRuntimeState::Starting
+                    | atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                        return Err(atomcode_coding::RuntimeUnavailable);
+                    }
+                };
+                tokio::spawn(async move {
+                    let result = handle.reload_capabilities().await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::CapabilitiesReloadFinished { result },
+                        ),
+                    });
+                });
+                Ok(())
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn reload_provider(
+        &self,
+        next: atomcode_coding::CodingAgentConfig,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ReloadProvider {
+                next,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.provider_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::ReloadProvider(next))
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn deactivate_provider(
+        &self,
+        reason: atomcode_coding::ProviderUnavailableReason,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::DeactivateProvider {
+                reason,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.provider_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::DeactivateProvider(reason))
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+}
+
+impl From<CodingRuntimeHandle> for RuntimeControl {
+    fn from(handle: CodingRuntimeHandle) -> Self {
+        Self::Ready(ReadyRuntimeControl::new(handle))
+    }
+}
+
+impl atomcode_daemon::live_hub::LiveRuntimeControl for RuntimeControl {
+    fn status(&self) -> atomcode_coding::RuntimeStatus {
+        match self {
+            Self::Ready(ready) => ready.handle.status(),
+            Self::Deferred(deferred) => match &*deferred.state.borrow() {
+                atomcode_coding::DeferredRuntimeState::Starting => atomcode_coding::RuntimeStatus {
+                    generation: 0,
+                    phase: atomcode_coding::RuntimePhase::Reconfiguring,
+                },
+                atomcode_coding::DeferredRuntimeState::Ready(handle) => handle.status(),
+                atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                    atomcode_coding::RuntimeStatus {
+                        generation: 0,
+                        phase: atomcode_coding::RuntimePhase::Failed,
+                    }
+                }
+            },
+        }
+    }
+
+    fn dispatch(
+        &self,
+        command: atomcode_coding::DriverCommand,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        RuntimeControl::dispatch(self, command)
+    }
+
+    fn handle(&self) -> Option<CodingRuntimeHandle> {
+        match self {
+            Self::Ready(ready) => Some(ready.handle.clone()),
+            Self::Deferred(deferred) => match &*deferred.state.borrow() {
+                atomcode_coding::DeferredRuntimeState::Ready(handle) => Some(handle.clone()),
+                atomcode_coding::DeferredRuntimeState::Starting
+                | atomcode_coding::DeferredRuntimeState::Failed(_) => None,
+            },
+        }
+    }
 }
 
 /// A newly spawned runtime endpoint and its single-consumer ordered event stream.
 pub struct SpawnedRuntime {
     pub endpoint: RuntimeEndpoint,
     pub event_rx: mpsc::UnboundedReceiver<bg_runtime::RuntimeEventPayload>,
+    pub session_id: Option<String>,
 }
 
 /// Spawns agent runtimes for in-TUI session switches (`/session`, `/bg`, disk
-/// `/resume`). The cli injects the engine-v2 bridge here. It receives the
+/// `/resume`). The CLI injects the CodingRuntime factory here. It receives the
 /// CURRENT config + working dir (so it tracks `/model` / `/provider` / `/cd`)
-/// and returns both command planes with the event receiver.
-pub type RuntimeSpawnOverride = std::sync::Arc<
-    dyn Fn(&Config, &std::path::Path) -> SpawnedRuntime + Send + Sync,
->;
-
-/// Runtime-owned handoff state while leaving Live sync mode. Keeping the
-/// fallback receiver and LiveSession here makes rollback an ownership transfer,
-/// not an attempt to reconstruct state after an asynchronous failure.
-pub(crate) struct PendingLocalRuntimeSync {
-    pub(crate) restore_id: u64,
-    pub(crate) runtime_id: bg_runtime::RuntimeId,
-    pub(crate) session_id: atomcode_core::session::SessionId,
-    pub(crate) live_session: std::sync::Arc<atomcode_core::live::LiveSession>,
-    pub(crate) handoff: atomcode_core::live::IdleHandoff,
-    pub(crate) deadline: std::time::Instant,
-}
-
-impl PendingLocalRuntimeSync {
-    fn matches_current(&self, restore_id: u64, ctx: &LoopCtx) -> bool {
-        local_restore_scope_matches(
-            self.restore_id,
-            self.runtime_id,
-            &self.session_id,
-            restore_id,
-            ctx.foreground_runtime_id,
-            &ctx.current_session.id,
-        )
-    }
-
-    fn timed_out(&self) -> bool {
-        std::time::Instant::now() >= self.deadline
-    }
-}
-
-fn local_restore_scope_matches(
-    expected_restore_id: u64,
-    expected_runtime_id: bg_runtime::RuntimeId,
-    expected_session_id: &atomcode_core::session::SessionId,
-    restore_id: u64,
-    runtime_id: bg_runtime::RuntimeId,
-    session_id: &atomcode_core::session::SessionId,
-) -> bool {
-    expected_restore_id == restore_id
-        && expected_runtime_id == runtime_id
-        && expected_session_id == session_id
-}
+/// and returns the runtime control plane with its event receiver.
+pub type RuntimeSpawnOverride =
+    std::sync::Arc<dyn Fn(&Config, &std::path::Path, &Session) -> SpawnedRuntime + Send + Sync>;
 
 #[cfg(test)]
 mod local_restore_scope_tests {
-    use super::{bg_runtime::RuntimeId, local_restore_scope_matches};
-    use atomcode_core::session::SessionId;
+    use super::{
+        bg_runtime, bg_runtime::RuntimeId, complete_mcp_reload_notice,
+        request_context_stats_render, RuntimeControl, RuntimeUiAvailability,
+    };
+    use atomcode_coding::runtime::{
+        coding_runtime_control_channel, noop_agent_handle, spawn_runtime_owner,
+        CodingRuntimeControl,
+    };
+    use atomcode_coding::{
+        CodingAgentConfig, DeferredRuntimeState, DriverCommand, ProviderUnavailableReason,
+        UserInput,
+    };
+    use tokio::sync::{mpsc, watch};
+
+    #[tokio::test]
+    async fn ready_runtime_preserves_undo_before_later_submit() {
+        let (handle, mut owner) = coding_runtime_control_channel();
+        let runtime = RuntimeControl::from(handle);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<bg_runtime::RuntimeEvent>();
+
+        runtime
+            .undo_to_prompt(None, RuntimeId::new(1), event_tx)
+            .unwrap();
+        runtime
+            .dispatch(DriverCommand::Submit(UserInput::from("later")))
+            .unwrap();
+
+        assert!(matches!(
+            owner.recv().await,
+            Some(CodingRuntimeControl::Snapshot { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn fresh_session_reports_completion_only_after_runtime_terminal() {
+        let (handle, mut owner) = coding_runtime_control_channel();
+        let runtime = RuntimeControl::from(handle);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<bg_runtime::RuntimeEvent>();
+        let runtime_id = RuntimeId::new(7);
+
+        runtime
+            .fresh_session(runtime_id, event_tx)
+            .expect("fresh request accepted");
+        let request = owner.recv().await.expect("runtime reprepare request");
+        assert!(matches!(request, CodingRuntimeControl::Reprepare { .. }));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), event_rx.recv())
+                .await
+                .is_err(),
+            "the driver must not project success before the runtime terminal"
+        );
+
+        let changed = atomcode_coding::SessionChanged {
+            generation: atomcode_coding::RuntimeGeneration(1),
+            session_id: Some("fresh-session".into()),
+            working_dir: std::path::PathBuf::from("/project"),
+        };
+        if let CodingRuntimeControl::Reprepare { done, .. } = request {
+            done.send(Ok(changed.clone())).unwrap();
+        } else {
+            unreachable!("checked above");
+        }
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(bg_runtime::RuntimeEvent {
+                runtime_id: received_id,
+                event: bg_runtime::RuntimeEventPayload::Driver(
+                    bg_runtime::DriverEvent::SessionTransitionFinished {
+                        operation: atomcode_coding::ReconfigureKind::FreshSession,
+                        result: Ok(result),
+                    },
+                ),
+            }) if received_id == runtime_id && result == changed
+        ));
+    }
 
     #[test]
-    fn acknowledgement_requires_restore_runtime_and_session_identity() {
-        let expected_session = SessionId::from_string("session-a".into());
-        let other_session = SessionId::from_string("session-b".into());
-        let runtime = RuntimeId::new(3);
+    fn mcp_reload_success_notice_requires_a_successful_runtime_terminal() {
+        let mut pending = Some(1);
+        assert!(complete_mcp_reload_notice(&mut pending, false).is_none());
+        assert!(pending.is_none());
 
-        assert!(local_restore_scope_matches(
-            7,
-            runtime,
-            &expected_session,
-            7,
-            runtime,
-            &expected_session,
+        let mut pending = Some(0);
+        assert!(complete_mcp_reload_notice(&mut pending, true).is_some());
+        assert!(pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn ready_runtime_reports_later_submit_delivery_failure_after_undo_channel_closes() {
+        let (handle, mut owner) = coding_runtime_control_channel();
+        let (failure_tx, mut failure_rx) =
+            mpsc::unbounded_channel::<bg_runtime::RuntimeEventPayload>();
+        let runtime = RuntimeControl::ready_with_event_tx(handle, failure_tx);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<bg_runtime::RuntimeEvent>();
+
+        runtime
+            .undo_to_prompt(None, RuntimeId::new(1), event_tx)
+            .unwrap();
+        let snapshot = owner.recv().await.expect("undo snapshot request");
+        assert!(matches!(snapshot, CodingRuntimeControl::Snapshot { .. }));
+
+        runtime
+            .dispatch(DriverCommand::Submit(UserInput::from("later")))
+            .unwrap();
+        drop(snapshot);
+        drop(owner);
+
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), failure_rx.recv()).await,
+            Ok(Some(bg_runtime::RuntimeEventPayload::Native(
+                atomcode_coding::CodingRuntimeEvent::Agent(
+                    atomcode_kernel::event::AgentEvent::Error { message, .. }
+                )
+            ))) if message.contains("delivery failed")
         ));
-        assert!(!local_restore_scope_matches(
-            7,
-            runtime,
-            &expected_session,
-            8,
-            runtime,
-            &expected_session,
+    }
+
+    #[tokio::test]
+    async fn ready_runtime_delivery_event_sender_detaches_with_runtime_forwarder() {
+        let (handle, _owner) = coding_runtime_control_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<bg_runtime::RuntimeEventPayload>();
+        let runtime = RuntimeControl::ready_with_event_tx(handle, event_tx.clone());
+
+        runtime.detach_delivery_event_tx();
+        drop(event_tx);
+
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv()).await,
+            Ok(None)
         ));
-        assert!(!local_restore_scope_matches(
-            7,
-            runtime,
-            &expected_session,
-            7,
-            RuntimeId::new(4),
-            &expected_session,
+    }
+
+    #[tokio::test]
+    async fn ready_runtime_rejects_submit_before_ui_enters_streaming() {
+        let (handle, owner) = coding_runtime_control_channel();
+        let (runtime_tx, _runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner(noop_agent_handle(), owner, runtime_tx, true);
+        handle
+            .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+            .await
+            .unwrap();
+        let runtime = RuntimeControl::from(handle);
+
+        assert_eq!(
+            runtime.ui_availability(),
+            RuntimeUiAvailability::AwaitingProvider
+        );
+        assert!(runtime
+            .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
+            .is_err());
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_ready_runtime_still_accepts_shutdown() {
+        let (handle, owner) = coding_runtime_control_channel();
+        let (runtime_tx, _runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner(noop_agent_handle(), owner, runtime_tx, true);
+        handle
+            .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+            .await
+            .unwrap();
+        let runtime = RuntimeControl::from(handle);
+
+        assert!(runtime.dispatch(DriverCommand::Shutdown).is_ok());
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_runtime_projects_awaiting_provider_and_rejects_submit() {
+        let (handle, owner) = coding_runtime_control_channel();
+        let (runtime_tx, _runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner(noop_agent_handle(), owner, runtime_tx, true);
+        handle
+            .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+            .await
+            .unwrap();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (_state_tx, state_rx) = watch::channel(DeferredRuntimeState::Ready(handle));
+        let runtime = RuntimeControl::deferred(command_tx, state_rx);
+
+        assert_eq!(
+            runtime.ui_availability(),
+            RuntimeUiAvailability::AwaitingProvider
+        );
+        assert!(runtime
+            .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
+            .is_err());
+        assert!(runtime.dispatch(DriverCommand::Shutdown).is_ok());
+        assert!(matches!(
+            command_rx.recv().await,
+            Some(DriverCommand::Shutdown)
         ));
-        assert!(!local_restore_scope_matches(
-            7,
-            runtime,
-            &expected_session,
-            7,
-            runtime,
-            &other_session,
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_starting_rejects_foreground_submit_but_can_queue_background_startup() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (_state_tx, state_rx) = watch::channel(DeferredRuntimeState::Starting);
+        let runtime = RuntimeControl::deferred(command_tx, state_rx);
+        let prompt = DriverCommand::Submit(UserInput::from("background task"));
+
+        assert_eq!(runtime.ui_availability(), RuntimeUiAvailability::Starting);
+        assert!(runtime.dispatch(prompt.clone()).is_err());
+        assert!(runtime.dispatch_when_ready(prompt).is_ok());
+        assert!(matches!(
+            command_rx.recv().await,
+            Some(DriverCommand::Submit(input)) if input.text == "background task"
         ));
+    }
+
+    #[test]
+    fn deferred_starting_rejects_provider_reload_without_queueing_it() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (_state_tx, state_rx) = watch::channel(DeferredRuntimeState::Starting);
+        let runtime = RuntimeControl::deferred(command_tx, state_rx);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        assert!(runtime
+            .reload_provider(
+                CodingAgentConfig::new("", "", "model", "/project"),
+                RuntimeId::new(1),
+                event_tx,
+            )
+            .is_err());
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn deferred_shutdown_closes_all_later_non_shutdown_operations() {
+        let (handle, owner) = coding_runtime_control_channel();
+        let (runtime_tx, _runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner(noop_agent_handle(), owner, runtime_tx, true);
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (_state_tx, state_rx) = watch::channel(DeferredRuntimeState::Ready(handle));
+        let runtime = RuntimeControl::deferred(command_tx, state_rx);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        assert!(runtime.dispatch(DriverCommand::Shutdown).is_ok());
+        assert!(matches!(
+            command_rx.recv().await,
+            Some(DriverCommand::Shutdown)
+        ));
+        assert!(runtime
+            .reload_provider(
+                CodingAgentConfig::new("", "", "model", "/project"),
+                RuntimeId::new(1),
+                event_tx,
+            )
+            .is_err());
+        assert!(runtime
+            .dispatch_when_ready(DriverCommand::Submit(UserInput::from("late")))
+            .is_err());
+        assert!(command_rx.try_recv().is_err());
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_is_not_reported_as_missing_provider() {
+        let (handle, owner) = coding_runtime_control_channel();
+        let (runtime_tx, _runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner(noop_agent_handle(), owner, runtime_tx, false);
+        let runtime = RuntimeControl::from(handle);
+
+        assert_eq!(runtime.ui_availability(), RuntimeUiAvailability::Failed);
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn rejected_context_refresh_does_not_leave_a_pending_render() {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let (_state_tx, state_rx) = watch::channel(DeferredRuntimeState::Starting);
+        let runtime = RuntimeControl::deferred(command_tx, state_rx);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut pending = None;
+
+        assert!(request_context_stats_render(
+            &runtime,
+            RuntimeId::new(1),
+            event_tx,
+            &mut pending,
+            true,
+        )
+        .is_err());
+        assert_eq!(pending, None);
     }
 }
 
 /// Bag of handles passed into the loop.
+pub(crate) struct PendingProviderReload {
+    origin_generation: Option<atomcode_coding::RuntimeGeneration>,
+    desired_config: Config,
+    persisted_revision: Option<ConfigRevision>,
+    rollback_persisted_config: Option<Config>,
+    rollback_runtime_config: Option<Config>,
+    previous_model_name: Option<String>,
+    announce: Option<String>,
+    manual_reload_announce: bool,
+    selection_mode_after_success: Option<crate::ProviderSelectionMode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderProjectionObservation {
+    generation: atomcode_coding::RuntimeGeneration,
+    provider: String,
+    model: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AuthObservation {
+    user_id: Option<String>,
+}
+
+impl AuthObservation {
+    fn read() -> Self {
+        Self {
+            user_id: atomcode_auth::get_stored_auth().map(|auth| auth.user.id),
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        self.user_id.is_some()
+    }
+}
+
 pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
-    pub agent: AgentClient,
-    pub runtime: CodingRuntimeHandle,
+    pub(crate) provider_selection_mode: crate::ProviderSelectionMode,
+    pub(crate) config_store: ConfigStore,
+    pub(crate) observed_config_revision: Option<ConfigRevision>,
+    pub(crate) pending_provider_reload: Option<PendingProviderReload>,
+    pub(crate) pending_provider_projection: Option<ProviderProjectionObservation>,
+    pub(crate) observed_auth: Option<AuthObservation>,
+    pub(crate) pending_provider_deactivation: bool,
+    pub runtime: RuntimeControl,
+    pub pending_runtime_request_id: Option<atomcode_kernel::event::RequestId>,
+    /// Cache of "Always Allow" tool/command decisions for the active TUI session.
+    pub allowed_always: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pub native_tools: std::collections::HashMap<String, (String, std::time::Instant)>,
     /// Force-exit watchdog deadline. Armed by [`arm_shutdown_watchdog`] when the
     /// user genuinely asks to leave (`/quit`, `/exit`, a confirmed Ctrl+C). The
     /// normal exit is the graceful break (Idle + `cmd_tx` closed); this is the
@@ -841,6 +2856,10 @@ pub struct LoopCtx {
     pub foreground_runtime_id: bg_runtime::RuntimeId,
     pub runtime_event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     pub runtime_event_rx: mpsc::UnboundedReceiver<bg_runtime::RuntimeEvent>,
+    /// Events captured while a runtime was backgrounded. `/bg <slot>` moves
+    /// them here and the loop drains them before reading the shared transport
+    /// again, preserving Request-before-terminal ordering.
+    pub foreground_replay_events: VecDeque<bg_runtime::RuntimeEventPayload>,
     pub working_dir: PathBuf,
     pub previous_dir: Option<PathBuf>,
     /// Recently visited project directories, most recent first (max 5).
@@ -851,13 +2870,12 @@ pub struct LoopCtx {
     pub history: History,
     pub input_rx: mpsc::UnboundedReceiver<InputEvent>,
     pub commands: CommandRegistry,
-    pub session_manager: SessionManager,
     /// Session actively being accumulated. Updated on TurnComplete /
     /// TurnCancelled (both carry the latest `messages` slice), saved to
     /// disk via `session_manager` on the same events so `/resume` after
     /// a quit sees the conversation. Replaced wholesale when the user
     /// resumes another session via `/resume` + SessionPicker.
-    pub current_session: atomcode_core::session::Session,
+    pub current_session: Session,
     /// Shared "new version available" hint. Populated by the detached
     /// version-check task spawned from `run()`; read by `build_status`
     /// on each redraw. `None` = no hint (either check still pending,
@@ -885,8 +2903,7 @@ pub struct LoopCtx {
     /// TurnComplete (30s cooldown). Read on every redraw to construct
     /// the right-aligned usage hint when usage_percent ≥ 80% and the
     /// current model is on a CodingPlan provider.
-    pub usage_slot:
-        std::sync::Arc<std::sync::Mutex<Option<atomcode_core::coding_plan::types::UsageInfo>>>,
+    pub usage_slot: std::sync::Arc<std::sync::Mutex<Option<atomcode_codingplan::types::UsageInfo>>>,
     /// Last time `usage_monitor::spawn_check` was invoked. Used to
     /// enforce `usage_monitor::USAGE_COOLDOWN` on TurnComplete-triggered
     /// refreshes. `None` = no check has run yet this session.
@@ -937,8 +2954,8 @@ pub struct LoopCtx {
     /// clone/pull and pushes a `PluginJobEvent` here when done. Mirrors the
     /// `upgrade_tx`/`rx` layout so the event loop only has to add a single
     /// `select!` arm. Unbounded — events are tiny terminal results.
-    pub plugin_job_tx: mpsc::UnboundedSender<atomcode_core::plugin::PluginJobEvent>,
-    pub plugin_job_rx: mpsc::UnboundedReceiver<atomcode_core::plugin::PluginJobEvent>,
+    pub plugin_job_tx: mpsc::UnboundedSender<atomcode_capabilities::plugin::PluginJobEvent>,
+    pub plugin_job_rx: mpsc::UnboundedReceiver<atomcode_capabilities::plugin::PluginJobEvent>,
     /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
     /// option 0 (Set up CodingPlan). The event loop drains this on
     /// modal close and runs the full `/login` flow (OAuth if needed →
@@ -951,23 +2968,6 @@ pub struct LoopCtx {
     /// Modal-to-Modal transition that needs mutable `active_modal`
     /// access only the event loop has.
     pub pending_open_provider_wizard: bool,
-    /// MCP server registry for `/mcp` status display. `None` when no MCP
-    /// servers are configured or all failed to connect.
-    pub mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
-    /// Channel for receiving MCP connection status events (Connected/Failed).
-    /// Events are rendered into scrollback as they arrive during startup.
-    pub mcp_connect_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
-    /// When `/mcp reload` is invoked, we track progress until every configured
-    /// server reports Connected/Failed, then emit a one-line summary.
-    pub mcp_reload: Option<McpReloadProgress>,
-    /// Channel for receiving LSP connection status events (Started / Failed
-    /// / Warning). Same plumbing as `mcp_connect_rx` — wired in TUI mode
-    /// so the manager's start failures land in scrollback as `✗ LSP server
-    /// 'rust-analyzer' for .rs failed: ...` instead of leaking to stderr
-    /// and printing inside the input box.
-    pub lsp_connect_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
     /// Telemetry handle — used to emit `UseCommand` at each slash dispatch.
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Original working dir before `/worktree create`, for `/worktree done`.
@@ -991,28 +2991,62 @@ pub struct LoopCtx {
     pub caps: crate::terminal::TerminalCaps,
     /// Session loaded by the CLI auto-continue path (`atomcode -c` /
     /// `--continue`). Replayed into scrollback AND restored into the
-    /// agent's model context via `AgentCommand::SetConversation` on first
+    /// runtime model context through native restore on first
     /// `run_loop` entry, then dropped — matching `/resume` behaviour.
-    pub replay_on_start: Option<atomcode_core::session::Session>,
+    pub replay_on_start: Option<Session>,
+    /// One-shot launch notice produced by the CLI when interactive `-c` had to
+    /// fork a session owned by another runtime. Kept separate from replay data
+    /// so presentation-only diagnostics never enter the provider snapshot.
+    pub startup_notice: Option<String>,
     /// Lazy file/dir index for `@`-mention popup. Built on first `@`
     /// keystroke via `FileIndex::filter`; session-life cache.
     pub file_index: file_index::FileIndex,
     /// Active session id once `/resume` has loaded one. Required by the
     /// `/rename` slash command to know which session file to update.
     pub current_session_id: Option<SessionId>,
+    /// Physical catalog bucket of the current session. This can intentionally
+    /// differ from the hash of `working_dir` for historical fragmented buckets.
+    pub current_session_project_bucket: Option<String>,
+    /// Exact picker selection waiting for CodingRuntime's resume terminal.
+    /// UI/session projections are committed only after this operation succeeds.
+    pub(crate) pending_session_resume: Option<PendingSessionResume>,
+    /// Exact picker selection whose catalog convergence and lease acquisition run
+    /// off the input thread before the runtime resume is accepted.
+    pub(crate) pending_session_resume_preparation: Option<PendingSessionResumePreparation>,
+    /// `/resume` catalog scan result loaded off the UI thread, waiting to be
+    /// installed into the session picker by the main loop (which owns `app`).
+    /// Carries the dir the scan was for so install can drop a result the user has
+    /// navigated away from — the working dir can change (async transition) between
+    /// stash and install while the install is deferred behind another modal.
+    pub(crate) pending_session_picker: Option<(
+        std::path::PathBuf,
+        Result<Vec<crate::session::SessionMeta>, String>,
+    )>,
+    /// Fresh-session and directory transitions accepted by CodingRuntime but
+    /// not yet committed. The input buffer remains authoritative while this is set.
+    pub(crate) pending_session_transition: Option<PendingSessionTransition>,
+    /// A runtime-owned session terminal whose TUI/live projection has not yet
+    /// committed. Input remains blocked and retries this exact identity.
+    pub(crate) pending_external_session_projection: Option<atomcode_coding::SessionChanged>,
+    /// Capability rebuild is also an awaitable runtime replacement. While it
+    /// is pending, prompts remain buffered instead of racing Reconfiguring.
+    pub(crate) pending_capability_reload: bool,
+    /// Server count captured by an explicit `/mcp reload`. Its success message
+    /// is emitted only after the correlated runtime terminal succeeds.
+    pub(crate) pending_mcp_reload_server_count: Option<usize>,
+    /// Successful capability terminal waiting for the live binding generation
+    /// and snapshot projection to commit.
+    pub(crate) pending_capability_projection: Option<atomcode_coding::SessionChanged>,
     /// Cached "clipboard currently holds an image" flag, with a short TTL
     /// so the right-aligned `Image in clipboard · ctrl+v to paste` hint
     /// stays current without thrashing the system clipboard on every
     /// redraw. Refreshed lazily inside `build_status`.
     pub clipboard_check: std::sync::Arc<std::sync::Mutex<ClipboardCheckState>>,
-    /// 同步模式：Some 时输入投 LiveSession、渲染来自 live_sync 转发任务。None=独立（默认）。
-    pub sync_session: Option<std::sync::Arc<atomcode_core::live::LiveSession>>,
-    /// live 转发任务句柄（分离同步时 abort）。
-    pub sync_forwarder: Option<tokio::task::JoinHandle<()>>,
-    /// Live → local runtime handoff awaiting a tokened runtime read-back.
-    pub(crate) pending_local_runtime_sync: Option<PendingLocalRuntimeSync>,
-    /// Monotonic correlation id for Live → local conversation restores.
-    pub(crate) next_local_runtime_restore_id: u64,
+    /// Bound live-view identity when web/app views share the foreground runtime.
+    pub live_binding: Option<atomcode_daemon::live_hub::LiveBinding>,
+    /// 实时观察转发任务（将 hub 的 InputAccepted 转发为 UserEcho 给 TUI 事件循环）。
+    /// 每次 /app 连接时重新创建，旧任务自动取消，避免重复转发导致消息重复。
+    pub live_observation_task: Option<tokio::task::JoinHandle<()>>,
     /// `/app` 拉起的 relay-client 子进程。`kill_on_drop(true)`，所以 TUI 退出或
     /// `/app stop` 时随之清理，不留僵尸进程。None=未开启 App 远程访问。
     pub app_relay_child: Option<tokio::process::Child>,
@@ -1042,7 +3076,8 @@ pub struct LoopCtx {
     /// the real value); `None` means the arm is inert. Unix-only — sudo/SSH
     /// askpass is not supported on Windows.
     #[cfg(unix)]
-    pub askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_capabilities::askpass::server::AskpassPrompt>>,
+    pub askpass_rx:
+        Option<tokio::sync::mpsc::Receiver<atomcode_capabilities::askpass::server::AskpassPrompt>>,
     /// Active fixed-interval loop controller. `None` when no `/loop N …` is
     /// running. Task 12 wires the timer that flips `due` and fires the payload.
     pub loop_ctrl: Option<loop_ctrl::LoopController>,
@@ -1328,6 +3363,12 @@ impl Buffer {
                 if line.is_empty() {
                     return BufferResult::Redraw;
                 }
+                // A committed entry is no longer being browsed, even when it
+                // originated from HistoryPrev. Both idle submission and the
+                // streaming type-ahead path render again after Commit, so
+                // clearing the navigation marker here keeps the input rule
+                // from showing a stale `History N/N` during output.
+                self.history_idx = None;
                 BufferResult::Commit(line)
             }
             Action::InsertNewline => {
@@ -1676,6 +3717,167 @@ mod buffer_tests {
     }
 
     #[test]
+    fn footer_report_esc_is_consumed_without_changing_streaming_phase() {
+        let mut state = UiState::new();
+        state.phase = UiPhase::Streaming;
+        state.footer_command_output = Some("usage report".into());
+
+        assert!(dismiss_footer_command_output(&mut state));
+        assert!(state.footer_command_output.is_none());
+        assert_eq!(
+            state.phase,
+            UiPhase::Streaming,
+            "dismissing the report must not cancel or otherwise end the turn"
+        );
+        assert!(
+            !dismiss_footer_command_output(&mut state),
+            "a second Esc must fall through to the normal streaming action"
+        );
+    }
+
+    fn empty_usage_panel() -> crate::modals::usage::UsageModal {
+        crate::modals::usage::UsageModal::new(crate::modals::usage::UsageData {
+            window: None,
+            plan: None,
+            usage: None,
+            overview: None,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn footer_usage_tab_key_switches_tab_and_refreshes_report() {
+        use crate::modals::usage::Tab;
+        let mut state = UiState::new();
+        state.phase = UiPhase::Streaming;
+        state.footer_usage = Some(empty_usage_panel());
+        state.footer_command_output = Some("stale".into());
+
+        // Tab advances to the next tab and re-renders the footer snapshot.
+        // (buffer_empty = true: the user isn't composing a queued message.)
+        assert!(handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Tab,
+            true,
+            true,
+            true
+        ));
+        assert_eq!(state.footer_usage.as_ref().unwrap().tab, Tab::Overview);
+        assert_ne!(
+            state.footer_command_output.as_deref(),
+            Some("stale"),
+            "footer must be re-rendered from the newly active tab"
+        );
+
+        // BackTab / arrows also steer the same panel.
+        assert!(handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Right,
+            true,
+            true,
+            true
+        ));
+        assert_eq!(state.footer_usage.as_ref().unwrap().tab, Tab::Models);
+        assert!(handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::BackTab,
+            true,
+            true,
+            true
+        ));
+        assert_eq!(state.footer_usage.as_ref().unwrap().tab, Tab::Overview);
+    }
+
+    #[test]
+    fn footer_usage_tab_key_never_steals_character_keys() {
+        use crate::modals::usage::Tab;
+        let mut state = UiState::new();
+        state.phase = UiPhase::Streaming;
+        state.footer_usage = Some(empty_usage_panel());
+
+        // Even on an empty buffer, a digit is message text: it must start a queued
+        // message ("3 retries"), NOT jump to the Models tab. Digit tab-jump stays
+        // modal-only; the streaming footer only owns pure navigation keys.
+        assert!(!handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Char('3'),
+            true,
+            true,
+            true
+        ));
+        assert!(!handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Char('x'),
+            true,
+            true,
+            true
+        ));
+        assert_eq!(
+            state.footer_usage.as_ref().unwrap().tab,
+            Tab::Current,
+            "character keys must never switch tabs"
+        );
+    }
+
+    #[test]
+    fn footer_usage_tab_key_yields_to_type_ahead_composition() {
+        use crate::modals::usage::Tab;
+        let mut state = UiState::new();
+        state.phase = UiPhase::Streaming;
+        state.footer_usage = Some(empty_usage_panel());
+
+        // buffer_empty = false: the user is typing a queued message. Even the nav
+        // keys must edit the buffer (cursor movement / agent-mode Tab), NOT steer
+        // the report.
+        assert!(!handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Tab,
+            false,
+            true,
+            true
+        ));
+        assert!(!handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Left,
+            false,
+            true,
+            true
+        ));
+        assert_eq!(
+            state.footer_usage.as_ref().unwrap().tab,
+            Tab::Current,
+            "composing must not switch tabs"
+        );
+    }
+
+    #[test]
+    fn footer_usage_tab_key_noop_without_panel() {
+        let mut state = UiState::new();
+        // `/cost` shows a report but installs no panel — tab keys must fall through.
+        state.footer_command_output = Some("cost report".into());
+        assert!(!handle_footer_usage_tab_key(
+            &mut state,
+            KeyCode::Tab,
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn dismiss_footer_report_clears_usage_panel() {
+        let mut state = UiState::new();
+        state.footer_command_output = Some("usage report".into());
+        state.footer_usage = Some(empty_usage_panel());
+
+        assert!(dismiss_footer_command_output(&mut state));
+        assert!(
+            state.footer_usage.is_none(),
+            "dismissing the report must drop the panel so stale tab keys are inert"
+        );
+    }
+
+    #[test]
     fn spinner_label_never_shows_stall_hint() {
         // The "· esc to cancel" stall hint was removed by request: even a model
         // stream silent well past the threshold must NOT advertise it in the
@@ -1693,13 +3895,43 @@ mod buffer_tests {
     }
 
     #[test]
+    fn spinner_label_shows_parenthesized_clock_and_token_activity() {
+        let mut s = UiState::new();
+        s.on_submit();
+        // No output yet: parenthesized whole-seconds clock (never `Xms`), no tokens.
+        let bare = format_spinner_label(&s, 0, None);
+        assert!(bare.contains("(0s)"), "expected `(0s)` clock, got {bare:?}");
+        assert!(
+            !bare.contains("ms"),
+            "clock must not show millis, got {bare:?}"
+        );
+        assert!(
+            !bare.contains("tokens"),
+            "no token count before any output, got {bare:?}"
+        );
+
+        // Once output streams, the `↑ N tokens` liveness counter joins the clock
+        // inside the parens (49_600 chars ≈ 12.4K tokens at 4 chars/token,
+        // formatted by the shared `fmt_tokens` → `12.40K`).
+        s.turn_output_chars = 49_600;
+        let active = format_spinner_label(&s, 0, None);
+        assert!(
+            active.contains("(0s \u{b7} \u{2191} 12.40K tokens)"),
+            "expected `(0s · ↑ 12.40K tokens)`, got {active:?}"
+        );
+    }
+
+    #[test]
     fn spinner_label_shows_subagent_activity_when_present() {
         // While a `task` fan-out is running, the spinner shows the children's latest
         // live activity in place of the generic thinking word — and reverts when cleared.
         let mut s = UiState::new();
         s.on_submit();
         let thinking = format_spinner_label(&s, 0, None);
-        assert!(!thinking.contains("explore#4"), "baseline must be the thinking word: {thinking:?}");
+        assert!(
+            !thinking.contains("explore#4"),
+            "baseline must be the thinking word: {thinking:?}"
+        );
 
         s.subagent_activity = Some("explore#4 · grep unwrap".to_string());
         let active = format_spinner_label(&s, 0, None);
@@ -1712,7 +3944,10 @@ mod buffer_tests {
         s.on_turn_complete();
         s.on_submit();
         let after = format_spinner_label(&s, 0, None);
-        assert!(!after.contains("explore#4"), "activity must not leak past turn end: {after:?}");
+        assert!(
+            !after.contains("explore#4"),
+            "activity must not leak past turn end: {after:?}"
+        );
     }
 
     #[test]
@@ -2156,6 +4391,34 @@ mod buffer_tests {
     }
 
     #[test]
+    fn submitting_recalled_history_exits_history_mode() {
+        use crate::input::history::HistoryEntry;
+
+        let reg = CommandRegistry::builtin();
+        let history = vec![HistoryEntry {
+            text: "recalled prompt".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
+        let mut b = Buffer::new();
+
+        assert!(matches!(
+            b.apply(Action::HistoryPrev, &history, &reg),
+            BufferResult::Redraw
+        ));
+        assert!(b.is_in_history());
+
+        assert!(matches!(
+            b.apply(Action::Submit, &history, &reg),
+            BufferResult::Commit(line) if line == "recalled prompt"
+        ));
+        assert!(
+            !b.is_in_history(),
+            "committing recalled input must hide the history position"
+        );
+    }
+
+    #[test]
     fn submit_with_backslash_not_before_cursor_commits_normally() {
         // Backslash exists in the buffer but cursor isn't right after
         // it — Enter should still submit, not insert a newline.
@@ -2243,6 +4506,55 @@ mod menu_tests {
     use super::*;
     use crate::custom_commands::CustomCommand;
     use crate::custom_commands::CustomCommandRegistry;
+
+    #[test]
+    fn pending_transition_routes_enter_through_common_commit_gate() {
+        assert!(!menu_handles_selection_key(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+            true,
+        ));
+        assert!(menu_handles_selection_key(
+            KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+            true,
+        ));
+        assert!(menu_handles_selection_key(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+            false,
+        ));
+    }
+
+    #[test]
+    fn streaming_slash_enter_commits_the_highlighted_command() {
+        assert_eq!(
+            streaming_top_level_slash_selection("/usa", "usage", false, KeyCode::Enter),
+            Some(("/usage".into(), true))
+        );
+    }
+
+    #[test]
+    fn streaming_slash_tab_and_arg_commands_only_complete() {
+        assert_eq!(
+            streaming_top_level_slash_selection("/usa", "usage", false, KeyCode::Tab),
+            Some(("/usage ".into(), false))
+        );
+        assert_eq!(
+            streaming_top_level_slash_selection("/sk", "skills", true, KeyCode::Enter),
+            Some(("/skills ".into(), false))
+        );
+        assert_eq!(
+            streaming_top_level_slash_selection(
+                "/skills br",
+                "brainstorming",
+                false,
+                KeyCode::Enter
+            ),
+            None,
+            "second-level palettes must keep their dedicated routing"
+        );
+    }
 
     #[test]
     fn non_slash_input_returns_no_menu() {
@@ -2347,6 +4659,64 @@ mod menu_tests {
                 "crates/atomcode-bridge/src/",
                 "crates/atomcode-bridge/Cargo.toml",
             ]
+        );
+    }
+
+    /// Guards the streaming-phase `@`-mention selection arm added to
+    /// `handle_streaming_key` (mod.rs ~11386). That arm's trigger condition
+    /// is `detect_at_mention_range(buf, cursor).is_some()`, so verifying
+    /// these two boundary behaviours pins the arm's reach without spinning
+    /// up a full App + ctx + renderer (the streaming handler's integration
+    /// test would be disproportionate).
+    #[test]
+    fn streaming_at_mention_selection_arm_guard_boundaries() {
+        // `@`-mention menu active: bare `@<partial>` token at cursor —
+        // the new arm MUST match (Enter completes, not submits).
+        let buf = "@crates";
+        let cursor = buf.len();
+        assert!(
+            file_index::detect_at_mention_range(buf, cursor).is_some(),
+            "@-mention token at cursor must satisfy the new arm guard"
+        );
+        // Cursor positioned INSIDE the token (mid-token Enter) also
+        // matches — the arm should complete at any cursor within the
+        // @-token, mirroring idle behaviour.
+        assert!(
+            file_index::detect_at_mention_range(buf, buf.len() - 2).is_some(),
+            "cursor inside an @-token must still satisfy the guard"
+        );
+
+        // Slash command menu: buffer starts with `/` — the new arm
+        // MUST NOT match, so slash selection falls through to the
+        // existing commit arm's "slash commands are disabled while a
+        // turn is running" hint. Bug would be silently swallowing slash
+        // Enter mid-stream.
+        let slash_buf = "/he";
+        assert!(
+            file_index::detect_at_mention_range(slash_buf, slash_buf.len()).is_none(),
+            "slash command buffer must NOT satisfy the @-mention guard"
+        );
+
+        // Empty buffer / no `@` at all — arm must not match.
+        assert!(
+            file_index::detect_at_mention_range("", 0).is_none(),
+            "empty buffer must not satisfy the @-mention guard"
+        );
+        assert!(
+            file_index::detect_at_mention_range("plain text", 9).is_none(),
+            "buffer with no @ must not satisfy the guard"
+        );
+
+        // Replacement format: directory selections keep the trailing
+        // slash so the token stays drill-down-ready. This is the exact
+        // shape the arm writes into the buffer on Enter/Tab.
+        assert_eq!(
+            file_index::format_at_mention_replacement("crates/atomcode-tuix/"),
+            "@crates/atomcode-tuix/",
+        );
+        assert_eq!(
+            file_index::format_at_mention_replacement("Cargo.toml"),
+            "@Cargo.toml ",
         );
     }
 
@@ -3787,9 +6157,19 @@ mod tool_format_tests {
         let bash_name = "bash";
         let bash_detail = "cd /tmp && ls";
         let bash_text = if bash_name.eq_ignore_ascii_case("bash") {
-            format!("  {} {} {}", child_glyph, display_tool_name_short(bash_name), bash_detail)
+            format!(
+                "  {} {} {}",
+                child_glyph,
+                display_tool_name_short(bash_name),
+                bash_detail
+            )
         } else {
-            format!("  {} {}({})", child_glyph, display_tool_name_short(bash_name), bash_detail)
+            format!(
+                "  {} {}({})",
+                child_glyph,
+                display_tool_name_short(bash_name),
+                bash_detail
+            )
         };
         assert!(
             bash_text.contains("Bash cd /tmp"),
@@ -3806,9 +6186,19 @@ mod tool_format_tests {
         let grep_name = "grep";
         let grep_detail = "foo";
         let grep_text = if grep_name.eq_ignore_ascii_case("bash") {
-            format!("  {} {} {}", child_glyph, display_tool_name_short(grep_name), grep_detail)
+            format!(
+                "  {} {} {}",
+                child_glyph,
+                display_tool_name_short(grep_name),
+                grep_detail
+            )
         } else {
-            format!("  {} {}({})", child_glyph, display_tool_name_short(grep_name), grep_detail)
+            format!(
+                "  {} {}({})",
+                child_glyph,
+                display_tool_name_short(grep_name),
+                grep_detail
+            )
         };
         assert!(
             grep_text.contains("Grep(foo)"),
@@ -3845,18 +6235,37 @@ mod tool_format_tests {
     /// bash) must NOT say "in parallel" — they run serially behind the write-lock.
     #[test]
     fn tool_batch_label_serial_calls_omit_in_parallel() {
-        use atomcode_core::turn::event::ToolBatchCall;
+        use atomcode_kernel::event::ToolBatchCall;
         // Simulate two bash calls — parallel_safe:false (write-lock, serial)
         let calls: Vec<ToolBatchCall> = vec![
-            ToolBatchCall { id: "1".into(), name: "bash".into(), arguments: "{}".into(), parallel_safe: false },
-            ToolBatchCall { id: "2".into(), name: "bash".into(), arguments: "{}".into(), parallel_safe: false },
+            ToolBatchCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+                parallel_safe: false,
+            },
+            ToolBatchCall {
+                id: "2".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+                parallel_safe: false,
+            },
         ];
         let count = calls.len();
         let concurrent = calls.iter().filter(|c| c.parallel_safe).count() >= 2;
-        let unique_names: std::collections::HashSet<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        let unique_names: std::collections::HashSet<&str> =
+            calls.iter().map(|c| c.name.as_str()).collect();
         let label = match (unique_names.len() == 1, concurrent) {
-            (true, true) => format!("Running {} {} calls in parallel", count, unique_names.iter().next().copied().unwrap_or("tool")),
-            (true, false) => format!("Running {} {} calls", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (true, true) => format!(
+                "Running {} {} calls in parallel",
+                count,
+                unique_names.iter().next().copied().unwrap_or("tool")
+            ),
+            (true, false) => format!(
+                "Running {} {} calls",
+                count,
+                unique_names.iter().next().copied().unwrap_or("tool")
+            ),
             (false, true) => format!("Running {} tools in parallel", count),
             (false, false) => format!("Running {} tools", count),
         };
@@ -3874,18 +6283,37 @@ mod tool_format_tests {
     /// read_file) MUST say "in parallel" — they run concurrently.
     #[test]
     fn tool_batch_label_parallel_safe_calls_include_in_parallel() {
-        use atomcode_core::turn::event::ToolBatchCall;
+        use atomcode_kernel::event::ToolBatchCall;
         // Simulate two read_file calls — parallel_safe:true (read-lock, concurrent)
         let calls: Vec<ToolBatchCall> = vec![
-            ToolBatchCall { id: "1".into(), name: "read_file".into(), arguments: "{}".into(), parallel_safe: true },
-            ToolBatchCall { id: "2".into(), name: "read_file".into(), arguments: "{}".into(), parallel_safe: true },
+            ToolBatchCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+                parallel_safe: true,
+            },
+            ToolBatchCall {
+                id: "2".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+                parallel_safe: true,
+            },
         ];
         let count = calls.len();
         let concurrent = calls.iter().filter(|c| c.parallel_safe).count() >= 2;
-        let unique_names: std::collections::HashSet<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        let unique_names: std::collections::HashSet<&str> =
+            calls.iter().map(|c| c.name.as_str()).collect();
         let label = match (unique_names.len() == 1, concurrent) {
-            (true, true) => format!("Running {} {} calls in parallel", count, unique_names.iter().next().copied().unwrap_or("tool")),
-            (true, false) => format!("Running {} {} calls", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (true, true) => format!(
+                "Running {} {} calls in parallel",
+                count,
+                unique_names.iter().next().copied().unwrap_or("tool")
+            ),
+            (true, false) => format!(
+                "Running {} {} calls",
+                count,
+                unique_names.iter().next().copied().unwrap_or("tool")
+            ),
             (false, true) => format!("Running {} tools in parallel", count),
             (false, false) => format!("Running {} tools", count),
         };
@@ -3903,17 +6331,36 @@ mod tool_format_tests {
     /// fewer than 2 concurrent, so NO "in parallel" even though one is read-only.
     #[test]
     fn tool_batch_label_mixed_one_safe_one_not_omits_in_parallel() {
-        use atomcode_core::turn::event::ToolBatchCall;
+        use atomcode_kernel::event::ToolBatchCall;
         let calls: Vec<ToolBatchCall> = vec![
-            ToolBatchCall { id: "1".into(), name: "read_file".into(), arguments: "{}".into(), parallel_safe: true },
-            ToolBatchCall { id: "2".into(), name: "bash".into(), arguments: "{}".into(), parallel_safe: false },
+            ToolBatchCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+                parallel_safe: true,
+            },
+            ToolBatchCall {
+                id: "2".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+                parallel_safe: false,
+            },
         ];
         let count = calls.len();
         let concurrent = calls.iter().filter(|c| c.parallel_safe).count() >= 2;
-        let unique_names: std::collections::HashSet<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        let unique_names: std::collections::HashSet<&str> =
+            calls.iter().map(|c| c.name.as_str()).collect();
         let label = match (unique_names.len() == 1, concurrent) {
-            (true, true) => format!("Running {} {} calls in parallel", count, unique_names.iter().next().copied().unwrap_or("tool")),
-            (true, false) => format!("Running {} {} calls", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (true, true) => format!(
+                "Running {} {} calls in parallel",
+                count,
+                unique_names.iter().next().copied().unwrap_or("tool")
+            ),
+            (true, false) => format!(
+                "Running {} {} calls",
+                count,
+                unique_names.iter().next().copied().unwrap_or("tool")
+            ),
             (false, true) => format!("Running {} tools in parallel", count),
             (false, false) => format!("Running {} tools", count),
         };
@@ -3974,6 +6421,11 @@ pub struct App {
     /// finishes. Matches CC's "type-ahead" UX — queue the next prompt
     /// while the model is still thinking and it fires automatically.
     pub message_queue: VecDeque<crate::state::QueuedMessage>,
+    /// A queue entry may be submitted only after an explicit safe boundary:
+    /// either the runtime accepted a natural turn terminal, or an idle submit
+    /// was deliberately held while the provider was starting/reconfiguring.
+    /// Diagnostic events never arm this latch.
+    queue_drain_authorized: bool,
     /// Streaming-state `<think>…</think>` stripper. Kept on App (not
     /// a local in the streaming arm) because it carries state across
     /// agent events — a tag straddling two chunks would break if the
@@ -4000,7 +6452,7 @@ pub struct App {
     /// True while a setup skill turn is in flight. On `TurnComplete`,
     /// skill/command registries are reloaded so newly-created skills
     /// become visible to the LLM immediately. Cleared on
-    /// TurnComplete / TurnCancelled / Error.
+    /// an authoritative TurnComplete / TurnCancelled terminal.
     pub setup_pending: bool,
     /// Accumulates reasoning/thinking content for display in verbose mode.
     /// Flushed on newline or when buffer exceeds threshold.
@@ -4045,9 +6497,55 @@ fn intercept_empty_bare_esc(
     }
 }
 
+/// Consume the footer report owned by `/usage` or `/cost`. Key handlers call
+/// this before their normal Esc action; `true` means the key was fully handled
+/// and must not reach turn cancellation or double-Esc undo.
+fn dismiss_footer_command_output(state: &mut UiState) -> bool {
+    // Drop the panel alongside the text so a stale tab key can't steer a
+    // report that's no longer on screen.
+    state.footer_usage = None;
+    state.footer_command_output.take().is_some()
+}
+
+/// Steer the streaming `/usage` footer report between its tabs. The interactive
+/// modal can't install mid-turn (live token redraws own the footer), so the
+/// report re-renders the newly active tab into `footer_command_output` in
+/// place. Returns `true` when the key was a tab-navigation key AND a panel is
+/// present — the caller must then repaint and consume the key so it never
+/// reaches turn cancellation. Any other key (or no panel) returns `false` and
+/// falls through untouched.
+///
+/// Two gates keep this from stealing message input:
+///  - Character keys (digits, letters) are NEVER stolen — a queued message may
+///    start with a digit ("3 retries"), so digit tab-jump stays modal-only and
+///    the streaming footer owns only pure navigation keys (Tab/BackTab/←/→).
+///  - `buffer_empty`: while composing a queued (type-ahead) message even those
+///    nav keys belong to the draft (cursor movement, agent-mode Tab), so the
+///    report only owns them when the input box is empty.
+fn handle_footer_usage_tab_key(
+    state: &mut UiState,
+    code: KeyCode,
+    buffer_empty: bool,
+    caps_colors: bool,
+    caps_unicode: bool,
+) -> bool {
+    if !buffer_empty || matches!(code, KeyCode::Char(_)) {
+        return false;
+    }
+    let Some(panel) = state.footer_usage.as_mut() else {
+        return false;
+    };
+    if panel.handle_tab_nav(code) {
+        state.footer_command_output = Some(panel.active_snapshot_text(caps_colors, caps_unicode));
+        true
+    } else {
+        false
+    }
+}
+
 /// Grace period after a quit request before the force-exit watchdog fires. The
 /// graceful path (engine teardown closes `cmd_tx`) normally completes in well
-/// under a second; the bridge bounds its own kernel-teardown wait at 5s, so 8s
+/// under a second; the runtime bounds kernel teardown at 5s, so 8s
 /// here only ever trips when even that fails — at which point hard-exiting is
 /// strictly better than trapping the user. See [`arm_shutdown_watchdog`].
 const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(8);
@@ -4055,11 +6553,12 @@ const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(8);
 impl App {
     fn new(caps: &crate::terminal::TerminalCaps) -> Self {
         Self {
-            state: UiState::with_unicode(caps.unicode_symbols),
+            state: UiState::with_caps(caps.unicode_symbols, caps.colors),
             buf: Buffer::new(),
             menu: MenuState::new(),
             active_modal: None,
             message_queue: VecDeque::new(),
+            queue_drain_authorized: false,
             think: ThinkStripper::new(),
             pending_tools: std::collections::HashMap::new(),
             exit_pending: None,
@@ -4120,13 +6619,9 @@ pub(crate) fn handle_loop_decision(
         None => return,
     };
     match action {
-        crate::event_loop::loop_ctrl::LoopAction::Fire => commands::fire_interval_payload(
-            state,
-            ctx,
-            renderer,
-            active_modal,
-            setup_pending,
-        ),
+        crate::event_loop::loop_ctrl::LoopAction::Fire => {
+            commands::fire_interval_payload(state, ctx, renderer, active_modal, setup_pending)
+        }
         crate::event_loop::loop_ctrl::LoopAction::Skip => {}
         crate::event_loop::loop_ctrl::LoopAction::Stop => {
             ctx.loop_ctrl = None;
@@ -4200,6 +6695,33 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             crate::i18n::t(crate::i18n::Msg::OfflineModeActive).into_owned(),
         ));
     }
+    // One-line notice when installed plugins ship hooks the user has not yet
+    // trusted. Shown once at startup so the user knows why those hooks are
+    // inactive and how to enable them. Mirrors the offline advisory above:
+    // UiLine::Warning (yellow) rather than Error — informational, not a failure.
+    {
+        // Run migration first so pre-existing plugins are grandfathered before
+        // we query trust status — prevents the banner from wrongly listing them.
+        atomcode_capabilities::plugin::hook_trust::ensure_migrated();
+        let untrusted: Vec<_> = atomcode_capabilities::plugin::installed_plugin_hook_trust_status()
+            .into_iter()
+            .filter(|s| !s.trusted)
+            .collect();
+        if !untrusted.is_empty() {
+            let names = untrusted
+                .iter()
+                .map(|s| s.plugin.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            renderer.render(UiLine::Warning(
+                crate::i18n::t(crate::i18n::Msg::PluginHooksUntrusted {
+                    count: untrusted.len(),
+                    names: &names,
+                })
+                .into_owned(),
+            ));
+        }
+    }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
     // the subcommand stashes its rendered SetupReport here instead of
     // printing to stdout, so the user sees the ✓/✗ lines in the chat
@@ -4268,11 +6790,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // /resume reuse the SAME id. The -c replay block below rebinds if present.
     commands::bind_telemetry_to_session(&ctx, &ctx.current_session);
 
+    if let Some(notice) = ctx.startup_notice.take() {
+        renderer.render(UiLine::Warning(notice));
+    }
+
     // Auto-continue: if the CLI loaded the most recent session for this
     // working dir (via `atomcode -c` / `--continue`), replay its messages
-    // into scrollback AND restore the agent's model context so follow-up
-    // questions can reference prior conversation. This mirrors the `/resume`
-    // slash command's behaviour: visual replay + AgentCommand::SetConversation.
+    // into scrollback. The runtime already restored the same native snapshot;
+    // when the source was busy, both values identify the independently
+    // persisted fork instead. This mirrors `/resume` visually without ever
+    // allowing two runtimes to own one session id.
     if let Some(session) = ctx.replay_on_start.take() {
         if !session.messages.is_empty() {
             crate::modals::session_picker::replay_session(
@@ -4281,18 +6808,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 &session,
                 false,
             );
-            // Sync messages into the agent loop so the LLM has full context.
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::SetConversation {
-                    snapshot: session.to_conversation_snapshot(),
-                    restore_id: None,
-                })
-                .ok();
-            // Continue accumulating into the same session file — future
-            // TurnComplete saves overwrite it instead of creating a new one.
-            // Header + telemetry = this continued session's persistent id, so
-            // `-c` reuses the saved session's id (not a fresh per-process one).
+            // The runtime was prepared against this exact external session id and
+            // snapshot before the TUI started; replay here is display-only.
+            // Continue accumulating into the runtime-owned session file. That
+            // is the original id after an uncontended resume or the new fork id
+            // after contention; header and telemetry must follow that exact id.
             commands::bind_telemetry_to_session(&ctx, &session);
             ctx.current_session = session;
             app.state.on_turn_complete();
@@ -4354,7 +6874,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             buf: String::new(),
             cursor_byte: 0,
             menu: None,
-            status: build_status(&app.state, &ctx),
+            status: build_input_status(&app.state, &ctx, &app.buf),
             attachments: Vec::new(),
         });
         renderer.flush();
@@ -4443,6 +6963,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     deferred_render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     deferred_render_tick.tick().await; // consume the immediate fire
 
+    // Cross-process config observer. Provider/model changes are prepared only
+    // while idle, so an in-flight turn and its approvals keep one generation.
+    let mut config_poll_tick = tokio::time::interval(Duration::from_millis(500));
+    config_poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    config_poll_tick.tick().await;
+
     // Last emitted integer percent for the /upgrade download line.
     // Gate on change so we don't spam the renderer with a progress
     // line for every chunk (a 10 MB binary at 64 KiB chunks would be
@@ -4521,6 +7047,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 renderer.flush_deferred();
             }
 
+            _ = config_poll_tick.tick() => {
+                let idle_boundary = matches!(app.state.phase, UiPhase::Idle)
+                    && app.active_modal.is_none();
+                let projection_changed = idle_boundary
+                    && ctx.pending_provider_reload.is_none()
+                    && retry_pending_provider_projection(&mut ctx, &mut app.state, renderer);
+                let config_changed = idle_boundary && poll_external_config(&mut ctx);
+                let auth_changed = poll_external_auth(&mut ctx);
+                if idle_boundary && (projection_changed || config_changed || auth_changed) {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                }
+            }
+
             // ── Spinner tick (from background task) ──
             // Skip the spinner repaint while a capturing modal (the password
             // prompt) is up — the spinner repaints the same footer/input
@@ -4568,18 +7107,24 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // Preserve an active `/` command menu — don't blindly call
             // `redraw_idle_plain(menu: None)` which would erase it.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
-                let items = menu_for_display(&app.buf, &ctx);
-                if let Some(items) = items {
-                    redraw_with_menu(
-                        &app.buf,
-                        &items,
-                        app.menu.selected,
-                        &app.state,
-                        &ctx,
-                        renderer,
-                    );
+                if let Some(modal) = app.active_modal.as_mut() {
+                    if modal.poll_background() {
+                        modal.draw(&app.buf, &app.state, &ctx, renderer);
+                    }
                 } else {
-                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    let items = menu_for_display(&app.buf, &ctx);
+                    if let Some(items) = items {
+                        redraw_with_menu(
+                            &app.buf,
+                            &items,
+                            app.menu.selected,
+                            &app.state,
+                            &ctx,
+                            renderer,
+                        );
+                    } else {
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    }
                 }
             }
 
@@ -4645,145 +7190,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 }
             }
 
-            // ── MCP connection events ──
-            // Render connection success/failure into scrollback as they arrive.
-            // Also register tools dynamically when servers connect.
-            Some(ev) = async {
-                if let Some(rx) = ctx.mcp_connect_rx.as_mut() {
-                    rx.recv().await
-                } else {
-                    None
-                }
-            }, if ctx.mcp_connect_rx.is_some() => {
-                use atomcode_core::mcp::{McpConnectEvent, register_mcp_tools_async};
-                match &ev {
-                    McpConnectEvent::Connected { name } => {
-                        // Silent on success (parity with codex/opencode: they never
-                        // print a per-server "connected" line in scrollback). Failures
-                        // and warnings below are still surfaced; `/mcp` shows the full
-                        // inventory on demand.
-                        // Register tools from this newly connected server.
-                        // Important: do this in a background task so a slow `tools/list`
-                        // can't block the TUI event loop and freeze input.
-                        if let Some(registry) = &ctx.mcp_registry {
-                            let registry = registry.clone();
-                            let tools = ctx.agent.tool_registry.clone();
-                            let name = name.clone();
-                            let tx = registry.event_sender();
-                            tokio::spawn(async move {
-                                let list_timeout = registry.list_tools_timeout(&name).await;
-                                let server_tools = match tokio::time::timeout(
-                                    list_timeout,
-                                    registry.list_tools_for_server(&name),
-                                )
-                                .await
-                                {
-                                    Ok(v) => v,
-                                    Err(_) => {
-                                        if let Some(tx) = tx {
-                                            let _ = tx.send(McpConnectEvent::Warning {
-                                                name,
-                                                message: format!(
-                                                    "tools/list timed out after {}s during auto-registration",
-                                                    list_timeout.as_secs()
-                                                ),
-                                            });
-                                        }
-                                        return;
-                                    }
-                                };
-                                if !server_tools.is_empty() {
-                                    register_mcp_tools_async(&tools, registry, server_tools).await;
-                                }
-                            });
-                        }
-                    }
-                    McpConnectEvent::Failed { name, error } => {
-                        renderer.render(UiLine::Error(
-                            crate::i18n::t(crate::i18n::Msg::McpServerFailed { name, error }).into_owned(),
-                        ));
-                    }
-                    McpConnectEvent::Warning { name, message } => {
-                        // Default: keep MCP startup/runtime noise out of scrollback.
-                        //
-                        // Exception: `/mcp tools <server>` uses Warning events to return the tool list
-                        // (and related timeouts) from a background task. Those should be user-visible.
-                        if message.starts_with("tools:\n")
-                            || message.contains("tools/list timed out")
-                            || message.contains("tools/list failed")
-                        {
-                            renderer.render(UiLine::CommandOutput(format!(
-                                "  [mcp:{}] {}\n",
-                                name,
-                                message.trim_end()
-                            )));
-                        } else {
-                            // Route to the opt-in tuix trace log instead (safe for raw-mode TUI).
-                            crate::tuix_trace!("MCP", "server='{}' warning: {}", name, message);
-                        }
-                    }
-                }
-
-                // `/mcp reload` progress: once every configured server has reported a
-                // terminal state (Connected/Failed), emit a summary line.
-                if let Some(p) = ctx.mcp_reload.as_mut() {
-                    match &ev {
-                        McpConnectEvent::Connected { .. } => {
-                            p.done = p.done.saturating_add(1);
-                            p.connected = p.connected.saturating_add(1)
-                        }
-                        McpConnectEvent::Failed { .. } => {
-                            p.done = p.done.saturating_add(1);
-                            p.failed = p.failed.saturating_add(1)
-                        }
-                        McpConnectEvent::Warning { .. } => {}
-                    }
-                    if p.done >= p.total {
-                        let elapsed_ms = p.started_at.elapsed().as_millis();
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  MCP reload complete: {} connected, {} failed ({}ms)\n",
-                            p.connected, p.failed, elapsed_ms
-                        )));
-                        ctx.mcp_reload = None;
-                    }
-                }
-                renderer.flush();
-            }
-
-            // ── LSP server start / failure ──
-            // Mirrors the MCP arm above. Without this, `LspManager`'s
-            // raw `eprintln!` on a failed server start would land in the
-            // input box (TUI owns the screen, stderr-fd writes hit
-            // wherever the cursor sits — between the cyan rules).
-            // Started → ✓ in scrollback. Failed → ✗ as an Error line.
-            // Warning is non-actionable noise (e.g. shutdown teardown
-            // errors) and routed to the trace log instead.
-            Some(ev) = async {
-                if let Some(rx) = ctx.lsp_connect_rx.as_mut() {
-                    rx.recv().await
-                } else {
-                    None
-                }
-            }, if ctx.lsp_connect_rx.is_some() => {
-                use atomcode_core::lsp::LspConnectEvent;
-                match &ev {
-                    LspConnectEvent::Started { command, ext } => {
-                        renderer.render(UiLine::CommandOutput(
-                            crate::i18n::t(crate::i18n::Msg::LspServerStarted { name: command, ext }).into_owned(),
-                        ));
-                    }
-                    LspConnectEvent::Failed { command, ext, error } => {
-                        renderer.render(UiLine::Error(
-                            crate::i18n::t(crate::i18n::Msg::LspServerFailed { name: command, ext, error }).into_owned(),
-                        ));
-                    }
-                    LspConnectEvent::Warning { ext, message } => {
-                        crate::tuix_trace!("LSP", "ext='{}' warning: {}", ext, message);
-                    }
-                }
-                renderer.flush();
-            }
-
             // ── /upgrade progress ──
             Some(ev) = ctx.upgrade_rx.recv() => {
                 handle_upgrade_event(ev, &mut upgrade_last_pct, &mut upgrade_done, &mut ctx, renderer);
@@ -4822,18 +7228,28 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Agent events ──
-            // Consumed regardless of phase. Gating on Streaming missed
-            // the TurnComplete that arrives *after* an Error event: the
-            // Error handler flips phase to Idle, so the very next event
-            // on the channel is stuck until the user submits again —
-            // which is what "得发两次你好才结束" looked like in the UI.
-            // Phase-specific behaviour (spinner redraw, type-ahead queue
-            // drain) lives inside the match arms on `app.state.phase`.
+            // Consumed regardless of phase. A diagnostic Error may precede the
+            // authoritative TurnFinished, so terminal and queue decisions are
+            // derived from the runtime event itself rather than UI phase.
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let provider_reload_failed =
+                        is_provider_reload_failure(&runtime_event.event);
+                    let queue_action = type_ahead_queue_action(&runtime_event.event);
+                    let loop_action = fixed_interval_loop_action(&runtime_event.event);
+                    if let Err(error) = publish_live_runtime_event(&ctx, &runtime_event.event) {
+                        renderer.render(UiLine::Error(error));
+                        renderer.flush();
+                    }
                     let pre_phase = app.state.phase;
+                    apply_fixed_interval_loop_action(loop_action, &mut app.state, &mut ctx);
                     handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    apply_type_ahead_queue_action(
+                        queue_action,
+                        &mut app.message_queue,
+                        &mut app.queue_drain_authorized,
+                    );
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
                     // that asked for it finished or timed out); dismiss it so `Password:`
                     // doesn't linger in the input box.
@@ -4845,28 +7261,44 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle)
-                        && ctx.pending_local_runtime_sync.is_none()
-                    {
-                        // Turn just ended — drain the type-ahead queue.
-                        // Pop the oldest queued message, echo as a User
-                        // line, dispatch to the agent, and transition
-                        // back to Streaming. Remaining queue entries
-                        // fire in order on subsequent completions.
-                        if let Some(queued) = app.message_queue.pop_front() {
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        // The end of a turn is the first safe provider reload
+                        // boundary. Reconcile before draining type-ahead so the
+                        // next queued message cannot start on the stale model.
+                        let config_redraw = poll_shared_state(&mut ctx);
+                        // Pop exactly one FIFO entry only when a natural
+                        // TurnFinished (or an explicitly held idle submit)
+                        // authorized it. Other idle events may redraw, but can
+                        // never advance type-ahead work.
+                        if !app.queue_drain_authorized {
+                            redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        } else if provider_transition_blocks_queue_drain(
+                            provider_transition_pending(&ctx),
+                            ctx.live_binding.is_some(),
+                            ctx.runtime.ui_availability(),
+                        ) {
+                            // Not a safe drain boundary yet: a provider switch is
+                            // mid-flight or the runtime is still recovering
+                            // (AwaitingProvider/Starting/Failed). A reload failure
+                            // that rolled back to Ready must not strand the queue.
+                            if config_redraw || provider_reload_failed {
+                                redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                            }
+                        } else if let Some(queued) = pop_authorized_type_ahead(
+                            &mut app.message_queue,
+                            &mut app.queue_drain_authorized,
+                        ) {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                            if let Some(live) = &ctx.sync_session {
-                                // 同步模式：投 LiveSession，不本地渲染用户行。
-                                use atomcode_core::live::UserInput;
-                                live.send_input(UserInput { text: queued.text, images: queued.images });
+                            if submit_foreground_runtime(
+                                &ctx,
+                                runtime_user_input(queued.text, queued.images),
+                            ) {
                                 app.state.on_submit();
                             } else {
-                                ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                                    text: queued.text,
-                                    images: queued.images,
-                                    image_markers: queued.image_markers,
-                                }).ok();
-                                app.state.on_submit();
+                                renderer.render(UiLine::Error(
+                                    crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable)
+                                        .into_owned(),
+                                ));
                             }
                             draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         } else {
@@ -4878,7 +7310,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     ctx.bg_manager.apply_background_event(
                         runtime_event.runtime_id,
                         runtime_event.event,
-                        &ctx.session_manager,
                     );
                 }
             }
@@ -4953,6 +7384,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         tokio::select! {
             biased;
 
+            _ = config_poll_tick.tick() => {
+                let idle_boundary = matches!(app.state.phase, UiPhase::Idle)
+                    && app.active_modal.is_none();
+                let projection_changed = idle_boundary
+                    && ctx.pending_provider_reload.is_none()
+                    && retry_pending_provider_projection(&mut ctx, &mut app.state, renderer);
+                let config_changed = idle_boundary && poll_external_config(&mut ctx);
+                let auth_changed = poll_external_auth(&mut ctx);
+                if idle_boundary && (projection_changed || config_changed || auth_changed) {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                }
+            }
+
             // ── Windows OS-level Ctrl+C ──
             // Fallback for conhost configurations where the keystroke
             // never lands in the input buffer. Healthy terminals fire
@@ -5025,18 +7469,24 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // `redraw_idle_plain` — otherwise the menu gets erased when
             // this fires a second or two after the user types `/`.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
-                let items = menu_for_display(&app.buf, &ctx);
-                if let Some(items) = items {
-                    redraw_with_menu(
-                        &app.buf,
-                        &items,
-                        app.menu.selected,
-                        &app.state,
-                        &ctx,
-                        renderer,
-                    );
+                if let Some(modal) = app.active_modal.as_mut() {
+                    if modal.poll_background() {
+                        modal.draw(&app.buf, &app.state, &ctx, renderer);
+                    }
                 } else {
-                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    let items = menu_for_display(&app.buf, &ctx);
+                    if let Some(items) = items {
+                        redraw_with_menu(
+                            &app.buf,
+                            &items,
+                            app.menu.selected,
+                            &app.state,
+                            &ctx,
+                            renderer,
+                        );
+                    } else {
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    }
                 }
             }
 
@@ -5102,142 +7552,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 }
             }
 
-            // ── MCP connection events ──
-            // Render connection success/failure into scrollback as they arrive.
-            // Also register tools dynamically when servers connect.
-            Some(ev) = async {
-                if let Some(rx) = ctx.mcp_connect_rx.as_mut() {
-                    rx.recv().await
-                } else {
-                    None
-                }
-            }, if ctx.mcp_connect_rx.is_some() => {
-                use atomcode_core::mcp::{McpConnectEvent, register_mcp_tools_async};
-                match &ev {
-                    McpConnectEvent::Connected { name } => {
-                        renderer.render(UiLine::CommandOutput(
-                            crate::i18n::t(crate::i18n::Msg::McpServerConnected { name }).into_owned(),
-                        ));
-                        // Register tools from this newly connected server (backgrounded).
-                        if let Some(registry) = &ctx.mcp_registry {
-                            let registry = registry.clone();
-                            let tools = ctx.agent.tool_registry.clone();
-                            let name = name.clone();
-                            let tx = registry.event_sender();
-                            tokio::spawn(async move {
-                                let list_timeout = registry.list_tools_timeout(&name).await;
-                                let server_tools = match tokio::time::timeout(
-                                    list_timeout,
-                                    registry.list_tools_for_server(&name),
-                                )
-                                .await
-                                {
-                                    Ok(v) => v,
-                                    Err(_) => {
-                                        if let Some(tx) = tx {
-                                            let _ = tx.send(McpConnectEvent::Warning {
-                                                name,
-                                                message: format!(
-                                                    "tools/list timed out after {}s during auto-registration",
-                                                    list_timeout.as_secs()
-                                                ),
-                                            });
-                                        }
-                                        return;
-                                    }
-                                };
-                                if !server_tools.is_empty() {
-                                    register_mcp_tools_async(&tools, registry, server_tools).await;
-                                }
-                            });
-                        }
-                    }
-                    McpConnectEvent::Failed { name, error } => {
-                        renderer.render(UiLine::Error(
-                            crate::i18n::t(crate::i18n::Msg::McpServerFailed { name, error }).into_owned(),
-                        ));
-                    }
-                    McpConnectEvent::Warning { name, message } => {
-                        // Default: keep MCP startup/runtime noise out of scrollback.
-                        //
-                        // Exception: `/mcp tools <server>` uses Warning events to return the tool list
-                        // (and related timeouts) from a background task. Those should be user-visible.
-                        if message.starts_with("tools:\n")
-                            || message.contains("tools/list timed out")
-                            || message.contains("tools/list failed")
-                        {
-                            renderer.render(UiLine::CommandOutput(format!(
-                                "  [mcp:{}] {}\n",
-                                name,
-                                message.trim_end()
-                            )));
-                        } else {
-                            // Route to the opt-in tuix trace log instead (safe for raw-mode TUI).
-                            crate::tuix_trace!("MCP", "server='{}' warning: {}", name, message);
-                        }
-                    }
-                }
-
-                // `/mcp reload` progress: once every configured server has reported a
-                // terminal state (Connected/Failed), emit a summary line.
-                if let Some(p) = ctx.mcp_reload.as_mut() {
-                    match &ev {
-                        McpConnectEvent::Connected { .. } => {
-                            p.done = p.done.saturating_add(1);
-                            p.connected = p.connected.saturating_add(1)
-                        }
-                        McpConnectEvent::Failed { .. } => {
-                            p.done = p.done.saturating_add(1);
-                            p.failed = p.failed.saturating_add(1)
-                        }
-                        McpConnectEvent::Warning { .. } => {}
-                    }
-                    if p.done >= p.total {
-                        let elapsed_ms = p.started_at.elapsed().as_millis();
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  MCP reload complete: {} connected, {} failed ({}ms)\n",
-                            p.connected, p.failed, elapsed_ms
-                        )));
-                        ctx.mcp_reload = None;
-                    }
-                }
-                renderer.flush();
-            }
-
-            // ── LSP server start / failure ──
-            // Mirrors the MCP arm above. Without this, `LspManager`'s
-            // raw `eprintln!` on a failed server start would land in the
-            // input box (TUI owns the screen, stderr-fd writes hit
-            // wherever the cursor sits — between the cyan rules).
-            // Started → ✓ in scrollback. Failed → ✗ as an Error line.
-            // Warning is non-actionable noise (e.g. shutdown teardown
-            // errors) and routed to the trace log instead.
-            Some(ev) = async {
-                if let Some(rx) = ctx.lsp_connect_rx.as_mut() {
-                    rx.recv().await
-                } else {
-                    None
-                }
-            }, if ctx.lsp_connect_rx.is_some() => {
-                use atomcode_core::lsp::LspConnectEvent;
-                match &ev {
-                    LspConnectEvent::Started { command, ext } => {
-                        renderer.render(UiLine::CommandOutput(
-                            crate::i18n::t(crate::i18n::Msg::LspServerStarted { name: command, ext }).into_owned(),
-                        ));
-                    }
-                    LspConnectEvent::Failed { command, ext, error } => {
-                        renderer.render(UiLine::Error(
-                            crate::i18n::t(crate::i18n::Msg::LspServerFailed { name: command, ext, error }).into_owned(),
-                        ));
-                    }
-                    LspConnectEvent::Warning { ext, message } => {
-                        crate::tuix_trace!("LSP", "ext='{}' warning: {}", ext, message);
-                    }
-                }
-                renderer.flush();
-            }
-
             // ── /upgrade progress ──
             Some(ev) = ctx.upgrade_rx.recv() => {
                 handle_upgrade_event(ev, &mut upgrade_last_pct, &mut upgrade_done, &mut ctx, renderer);
@@ -5276,18 +7590,28 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Agent events ──
-            // Consumed regardless of phase. Gating on Streaming missed
-            // the TurnComplete that arrives *after* an Error event: the
-            // Error handler flips phase to Idle, so the very next event
-            // on the channel is stuck until the user submits again —
-            // which is what "得发两次你好才结束" looked like in the UI.
-            // Phase-specific behaviour (spinner redraw, type-ahead queue
-            // drain) lives inside the match arms on `app.state.phase`.
+            // Consumed regardless of phase. A diagnostic Error may precede the
+            // authoritative TurnFinished, so terminal and queue decisions are
+            // derived from the runtime event itself rather than UI phase.
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let provider_reload_failed =
+                        is_provider_reload_failure(&runtime_event.event);
+                    let queue_action = type_ahead_queue_action(&runtime_event.event);
+                    let loop_action = fixed_interval_loop_action(&runtime_event.event);
+                    if let Err(error) = publish_live_runtime_event(&ctx, &runtime_event.event) {
+                        renderer.render(UiLine::Error(error));
+                        renderer.flush();
+                    }
                     let pre_phase = app.state.phase;
+                    apply_fixed_interval_loop_action(loop_action, &mut app.state, &mut ctx);
                     handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    apply_type_ahead_queue_action(
+                        queue_action,
+                        &mut app.message_queue,
+                        &mut app.queue_drain_authorized,
+                    );
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
                     // that asked for it finished or timed out); dismiss it so `Password:`
                     // doesn't linger in the input box.
@@ -5299,23 +7623,37 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle)
-                        && ctx.pending_local_runtime_sync.is_none()
-                    {
-                        if let Some(queued) = app.message_queue.pop_front() {
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        let config_redraw = poll_shared_state(&mut ctx);
+                        if !app.queue_drain_authorized {
+                            redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        } else if provider_transition_blocks_queue_drain(
+                            provider_transition_pending(&ctx),
+                            ctx.live_binding.is_some(),
+                            ctx.runtime.ui_availability(),
+                        ) {
+                            // Not a safe drain boundary yet: a provider switch is
+                            // mid-flight or the runtime is still recovering
+                            // (AwaitingProvider/Starting/Failed). A reload failure
+                            // that rolled back to Ready must not strand the queue.
+                            if config_redraw || provider_reload_failed {
+                                redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                            }
+                        } else if let Some(queued) = pop_authorized_type_ahead(
+                            &mut app.message_queue,
+                            &mut app.queue_drain_authorized,
+                        ) {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                            if let Some(live) = &ctx.sync_session {
-                                // 同步模式：投 LiveSession，不本地渲染用户行。
-                                use atomcode_core::live::UserInput;
-                                live.send_input(UserInput { text: queued.text, images: queued.images });
+                            if submit_foreground_runtime(
+                                &ctx,
+                                runtime_user_input(queued.text, queued.images),
+                            ) {
                                 app.state.on_submit();
                             } else {
-                                ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                                    text: queued.text,
-                                    images: queued.images,
-                                    image_markers: queued.image_markers,
-                                }).ok();
-                                app.state.on_submit();
+                                renderer.render(UiLine::Error(
+                                    crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable)
+                                        .into_owned(),
+                                ));
                             }
                             draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         } else {
@@ -5327,27 +7665,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     ctx.bg_manager.apply_background_event(
                         runtime_event.runtime_id,
                         runtime_event.event,
-                        &ctx.session_manager,
                     );
                 }
             }
         }
 
-        if ctx
-            .pending_local_runtime_sync
-            .as_ref()
-            .is_some_and(PendingLocalRuntimeSync::timed_out)
-        {
-            let restored_live = commands::rollback_pending_local_runtime_sync(&mut ctx);
-            let message = if restored_live {
-                crate::i18n::t(crate::i18n::Msg::LocalRuntimeRestoreTimedOut).into_owned()
-            } else {
-                "本地 runtime 恢复超时，且当前会话已变化，无法自动接回旧 Live 会话"
-                    .to_string()
-            };
-            renderer.render(UiLine::Error(message));
-            renderer.flush();
-        }
+        drain_foreground_replay_events(&mut app, &mut ctx, renderer);
+        install_pending_session_picker(&mut app, &mut ctx, renderer);
 
         // ── Fixed-interval /loop decision (turn-completion driven) ──
         // Runs after EVERY select! wakeup, so it sees both edges that matter:
@@ -5367,14 +7691,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             );
         }
 
-        if matches!(app.state.phase, UiPhase::Idle) && ctx.agent.cmd_tx.is_closed() {
+        if matches!(app.state.phase, UiPhase::Idle) && ctx.runtime.is_closed() {
             break;
         }
 
         // Force-exit watchdog. The graceful break above is the normal path; this
         // only fires when a quit was requested (deadline armed by
         // `arm_shutdown_watchdog`) but the engine teardown never closed `cmd_tx`
-        // in time — a wedged kernel/bridge await would otherwise trap the user at
+        // in time — a wedged runtime teardown would otherwise trap the user at
         // the prompt no matter how many times they press /quit. Re-checked every
         // ~5ms via `deferred_render_tick`, so it trips promptly once the deadline
         // passes. Restore the terminal first, then hard-exit (skips Drop, which is
@@ -5390,17 +7714,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             let _ = ctx.history.save();
             renderer.render(UiLine::ClearTransient);
             renderer.shutdown();
-            // `renderer.shutdown()` restores mouse / Kitty-keyboard / scroll-region
-            // state, but NOT bracketed paste — disabling that is `TerminalGuard::Drop`'s
-            // job (lib.rs), and `process::exit(0)` skips every Drop. Emit `?2004l`
-            // directly so a force-exit doesn't strand the user's shell wrapping every
-            // paste in literal `200~`/`201~` markers.
-            {
-                use std::io::Write as _;
-                let mut out = std::io::stdout().lock();
-                let _ = out.write_all(b"\x1b[?2004l");
-                let _ = out.flush();
-            }
+            // `process::exit(0)` skips `TerminalGuard` and `ReaderHandle` drops.
+            // Reuse the complete panic/signal restore contract so focus reporting,
+            // bracketed paste, and every other armed terminal mode are disabled.
+            crate::panic_restore_terminal();
             let _ = crossterm::terminal::disable_raw_mode();
             std::process::exit(0);
         }
@@ -5423,14 +7740,1042 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     }
 }
 
-/// If another atomcode process just ran `/codingplan` (i.e. the shared
-/// sync marker file advanced since we last looked), pull the fresh
-/// config from disk, clear our stale drift warning, and hand the new
-/// config to the agent. Cheap on every keystroke: a single file-read
-/// + serde parse. Idempotent — when no other process has synced, the
-/// early return skips all work.
+fn resolved_provider_fingerprint(config: &Config) -> Option<Vec<u8>> {
+    let requested = config.default_provider.as_str();
+    let name = if config.providers.contains_key(requested) {
+        requested
+    } else {
+        config.providers.keys().min()?.as_str()
+    };
+    serde_json::to_vec(&(name, config.providers.get(name)?)).ok()
+}
+
+fn provider_requires_atomgit_auth(config: &Config) -> bool {
+    config
+        .active_provider(None)
+        .ok()
+        .and_then(|provider| provider.base_url.as_deref())
+        .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway)
+}
+
+fn should_reload_provider(
+    mode: crate::ProviderSelectionMode,
+    current: &Config,
+    desired: &Config,
+    runtime_availability: RuntimeUiAvailability,
+    auth_available: bool,
+) -> bool {
+    let requires_atomgit_auth = provider_requires_atomgit_auth(desired);
+    if requires_atomgit_auth && !auth_available {
+        return false;
+    }
+    let recovering_atomgit_auth =
+        requires_atomgit_auth && runtime_availability == RuntimeUiAvailability::AwaitingProvider;
+    let prompt_language_changed = current.language != desired.language;
+    recovering_atomgit_auth
+        || prompt_language_changed
+        || (mode == crate::ProviderSelectionMode::FollowGlobalDefault
+            && !current
+                .providers
+                .get(&current.default_provider)
+                .is_some_and(|provider| provider.ephemeral)
+            && resolved_provider_fingerprint(current) != resolved_provider_fingerprint(desired))
+}
+
+fn should_deactivate_for_missing_auth(
+    config: &Config,
+    runtime_availability: RuntimeUiAvailability,
+) -> bool {
+    provider_requires_atomgit_auth(config)
+        && runtime_availability == RuntimeUiAvailability::Available
+}
+
+/// Merge freshly-persisted config on top of the running one while keeping the
+/// pinned provider SELECTION. Ephemeral providers exist only at runtime (never
+/// on disk) so their runtime copy is always kept. The active named provider is
+/// normally kept from the runtime too — that's how an external default change
+/// can't retarget a pinned session — but when `adopt_active_edits` is set (an
+/// explicit `/reload`) its on-disk edits (`context_window`, model, …) are
+/// adopted so the settings of the model you're using actually take effect;
+/// the runtime copy is used only when disk lacks that provider entirely.
+/// `default_provider` is always pinned to the running selection.
+fn merge_persisted_config_preserving_active(
+    current: &Config,
+    mut persisted: Config,
+    adopt_active_edits: bool,
+) -> Config {
+    let active_name = current.default_provider.clone();
+    for (name, provider) in &current.providers {
+        let is_active = name == &active_name;
+        let keep_runtime_copy = provider.ephemeral
+            || (is_active && !(adopt_active_edits && persisted.providers.contains_key(name)));
+        if keep_runtime_copy {
+            persisted.providers.insert(name.clone(), provider.clone());
+        }
+    }
+    persisted.default_provider = active_name;
+    persisted
+}
+
+/// Whether the active provider's resolved config differs between the running
+/// config and a desired one (ignoring ephemeral providers, which are never
+/// reloaded from disk). Used to decide whether an explicit `/reload` that keeps
+/// the same pinned provider must still reconfigure the runtime to apply edits.
+fn active_provider_config_changed(current: &Config, desired: &Config) -> bool {
+    !current
+        .providers
+        .get(&current.default_provider)
+        .is_some_and(|provider| provider.ephemeral)
+        && resolved_provider_fingerprint(current) != resolved_provider_fingerprint(desired)
+}
+
+fn config_for_persistence(
+    desired: &Config,
+    persisted: &Config,
+    persist_runtime_provider_as_default: bool,
+) -> Config {
+    let mut saved = desired.clone();
+    if !persist_runtime_provider_as_default {
+        if let Some(provider) = persisted.providers.get(&persisted.default_provider) {
+            saved
+                .providers
+                .entry(persisted.default_provider.clone())
+                .or_insert_with(|| provider.clone());
+        }
+        saved.default_provider = persisted.default_provider.clone();
+    }
+    saved
+}
+
+struct DesiredConfigCommit {
+    commit: ConfigCommit,
+    previous: Config,
+}
+
+fn commit_desired_config(
+    store: &ConfigStore,
+    observed_revision: Option<&ConfigRevision>,
+    desired: &Config,
+    persist_runtime_provider_as_default: bool,
+) -> Result<DesiredConfigCommit, anyhow::Error> {
+    let revision = observed_revision_for_write(observed_revision)?;
+    let mut previous = None;
+    let commit = store
+        .update_if_revision(&revision, |persisted| {
+            previous = Some(persisted.clone());
+            *persisted =
+                config_for_persistence(desired, persisted, persist_runtime_provider_as_default);
+            Ok(())
+        })?
+        .ok_or_else(|| anyhow::anyhow!("config changed in another process; retry"))?;
+    Ok(DesiredConfigCommit {
+        commit,
+        previous: previous.expect("successful ConfigStore update observed the previous snapshot"),
+    })
+}
+
+fn commit_language_without_reload(
+    store: &ConfigStore,
+    observed_revision: Option<&ConfigRevision>,
+    current: &Config,
+    locale: atomcode_config::locale::Locale,
+) -> Result<DesiredConfigCommit, anyhow::Error> {
+    let mut desired = current.clone();
+    desired.language = Some(locale);
+    commit_desired_config(store, observed_revision, &desired, false)
+}
+
+fn observed_revision_for_write(
+    observed: Option<&ConfigRevision>,
+) -> Result<ConfigRevision, anyhow::Error> {
+    observed
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("configuration state is not synchronized; retry"))
+}
+
+#[cfg(test)]
+mod external_config_tests {
+    use super::*;
+    use atomcode_config::ProviderConfig;
+
+    fn config(model: &str, ephemeral: bool) -> Config {
+        config_with_url(model, ephemeral, "https://example.test/v1")
+    }
+
+    fn config_with_url(model: &str, ephemeral: bool, base_url: &str) -> Config {
+        let mut config = Config::with_default_provider("main");
+        config.providers.insert(
+            "main".into(),
+            ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: None,
+                model: model.into(),
+                base_url: Some(base_url.into()),
+                system_prompt: None,
+                user_agent: None,
+                context_window: 128_000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                skip_tls_verify: false,
+                ephemeral,
+                capable_model: None,
+            },
+        );
+        config
+    }
+
+    fn atomgit_config(model: &str) -> Config {
+        config_with_url(model, false, "https://llm-api.atomgit.com/v1")
+    }
+
+    #[test]
+    fn follow_global_detects_model_change_inside_same_provider() {
+        assert!(should_reload_provider(
+            crate::ProviderSelectionMode::FollowGlobalDefault,
+            &config("model-a", false),
+            &config("model-b", false),
+            RuntimeUiAvailability::Available,
+            true,
+        ));
+    }
+
+    #[test]
+    fn explicit_selection_does_not_follow_external_default() {
+        assert!(!should_reload_provider(
+            crate::ProviderSelectionMode::Pinned,
+            &config("model-a", false),
+            &config("model-b", false),
+            RuntimeUiAvailability::Available,
+            true,
+        ));
+    }
+
+    #[test]
+    fn language_change_reloads_prompt_even_for_pinned_provider() {
+        let mut current = config("model-a", false);
+        current.language = Some(atomcode_config::locale::Locale::En);
+        let mut desired = current.clone();
+        desired.language = Some(atomcode_config::locale::Locale::ZhCn);
+
+        assert!(should_reload_provider(
+            crate::ProviderSelectionMode::Pinned,
+            &current,
+            &desired,
+            RuntimeUiAvailability::Available,
+            true,
+        ));
+    }
+
+    #[test]
+    fn active_ephemeral_provider_is_not_replaced_from_disk() {
+        assert!(!should_reload_provider(
+            crate::ProviderSelectionMode::FollowGlobalDefault,
+            &config("oauth-model", true),
+            &config("disk-model", false),
+            RuntimeUiAvailability::Available,
+            true,
+        ));
+    }
+
+    #[test]
+    fn pinned_selection_keeps_active_provider_but_accepts_other_persisted_fields() {
+        let mut current = config("pinned-model", false);
+        current.language = Some(atomcode_config::locale::Locale::En);
+        let mut persisted = config("global-model", false);
+        persisted.language = Some(atomcode_config::locale::Locale::ZhCn);
+        persisted
+            .providers
+            .insert("new-provider".into(), persisted.providers["main"].clone());
+
+        let merged = merge_persisted_config_preserving_active(&current, persisted, false);
+
+        assert_eq!(merged.default_provider, "main");
+        assert_eq!(merged.providers["main"].model, "pinned-model");
+        assert!(merged.providers.contains_key("new-provider"));
+        assert_eq!(merged.language, Some(atomcode_config::locale::Locale::ZhCn));
+    }
+
+    #[test]
+    fn manual_reload_adopts_active_provider_window_edit_but_keeps_selection() {
+        // The reported bug: editing the ACTIVE provider's `context_window` in
+        // config.toml + /reload was silently ignored. With `adopt_active_edits`
+        // (manual /reload), the edited disk window is now applied while the
+        // pinned selection (`main`) is preserved.
+        let current = config("m", false); // running: window 128000
+        let mut persisted = config("m", false);
+        persisted.providers.get_mut("main").unwrap().context_window = 32_000; // disk edit
+
+        let merged = merge_persisted_config_preserving_active(&current, persisted, true);
+
+        assert_eq!(merged.default_provider, "main"); // selection preserved
+        assert_eq!(merged.providers["main"].context_window, 32_000); // edit applied
+        // And the change is detected, so the runtime is actually reconfigured.
+        assert!(active_provider_config_changed(&current, &merged));
+    }
+
+    #[test]
+    fn external_reload_preserves_active_provider_window() {
+        // Background external config polls must NOT disturb a pinned session:
+        // the active provider's runtime window is kept, edit or not.
+        let current = config("m", false); // running: window 128000
+        let mut persisted = config("m", false);
+        persisted.providers.get_mut("main").unwrap().context_window = 32_000;
+
+        let merged = merge_persisted_config_preserving_active(&current, persisted, false);
+
+        assert_eq!(merged.providers["main"].context_window, 128_000);
+        assert!(!active_provider_config_changed(&current, &merged));
+    }
+
+    #[test]
+    fn active_provider_change_ignores_ephemeral_active_provider() {
+        // An ephemeral (runtime-only, off-disk) active provider is never
+        // reloaded from disk, so a differing disk copy must not trigger a reload.
+        let current = config("m", true); // ephemeral active
+        let mut desired = config("m", false);
+        desired.providers.get_mut("main").unwrap().context_window = 32_000;
+        assert!(!active_provider_config_changed(&current, &desired));
+    }
+
+    #[test]
+    fn runtime_local_selection_is_not_written_back_as_shared_default() {
+        let mut persisted = config("global-model", false);
+        let global = persisted.providers.remove("main").unwrap();
+        persisted.providers.insert("global".into(), global);
+        persisted.default_provider = "global".into();
+        let mut desired = config("previous-local-model", false);
+        desired.providers.insert(
+            "local".into(),
+            ProviderConfig {
+                model: "local-model".into(),
+                ..desired.providers["main"].clone()
+            },
+        );
+        desired.default_provider = "local".into();
+        desired.language = Some(atomcode_config::locale::Locale::ZhCn);
+
+        let saved = config_for_persistence(&desired, &persisted, false);
+
+        assert_eq!(saved.default_provider, "global");
+        assert_eq!(saved.providers["global"].model, "global-model");
+        assert_eq!(saved.language, Some(atomcode_config::locale::Locale::ZhCn));
+        assert_eq!(saved.providers["local"].model, "local-model");
+    }
+
+    #[test]
+    fn config_save_without_an_observed_revision_fails_closed() {
+        assert!(observed_revision_for_write(None).is_err());
+    }
+
+    #[test]
+    fn config_cas_conflict_does_not_commit_the_staged_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        let initial = store.replace(&config("runtime-model", false)).unwrap();
+        let external = store.replace(&config("external-model", false)).unwrap();
+        let desired = config("staged-model", false);
+
+        assert!(
+            commit_desired_config(&store, Some(&initial.snapshot.revision), &desired, false,)
+                .is_err()
+        );
+        let persisted = store.read().unwrap();
+        assert_eq!(persisted.config.providers["main"].model, "external-model");
+        assert_eq!(persisted.revision, external.snapshot.revision);
+    }
+
+    #[test]
+    fn same_language_confirmation_rejects_a_stale_disk_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        let mut english = config("runtime-model", false);
+        english.language = Some(atomcode_config::locale::Locale::En);
+        let observed = store.replace(&english).unwrap();
+        let mut chinese = english.clone();
+        chinese.language = Some(atomcode_config::locale::Locale::ZhCn);
+        let external = store.replace(&chinese).unwrap();
+
+        assert!(commit_language_without_reload(
+            &store,
+            Some(&observed.snapshot.revision),
+            &english,
+            atomcode_config::locale::Locale::En,
+        )
+        .is_err());
+        assert_eq!(store.read().unwrap().revision, external.snapshot.revision);
+    }
+
+    #[test]
+    fn explicit_default_update_can_change_shared_default() {
+        let persisted = config("global-model", false);
+        let mut desired = persisted.clone();
+        desired.providers.insert(
+            "next".into(),
+            ProviderConfig {
+                model: "next-model".into(),
+                ..desired.providers["main"].clone()
+            },
+        );
+        desired.default_provider = "next".into();
+
+        let saved = config_for_persistence(&desired, &persisted, true);
+
+        assert_eq!(saved.default_provider, "next");
+    }
+
+    #[test]
+    fn persisted_default_update_does_not_retarget_a_pinned_open_session() {
+        let opened = config("opened-model", false);
+        let mut next_default = opened.clone();
+        next_default.providers.insert(
+            "next".into(),
+            ProviderConfig {
+                model: "next-model".into(),
+                ..opened.providers["main"].clone()
+            },
+        );
+        next_default.default_provider = "next".into();
+
+        let visible = merge_persisted_config_preserving_active(&opened, next_default.clone(), false);
+
+        assert_eq!(visible.default_provider, "main");
+        assert_eq!(visible.providers["main"].model, "opened-model");
+        assert_eq!(visible.providers["next"].model, "next-model");
+        assert_eq!(next_default.default_provider, "next");
+        assert_eq!(next_default.providers["next"].model, "next-model");
+    }
+
+    #[test]
+    fn atomgit_auth_dependency_uses_gateway_not_provider_name() {
+        let mut renamed = atomgit_config("model-a");
+        let provider = renamed.providers.remove("main").unwrap();
+        renamed
+            .providers
+            .insert("renamed-provider".into(), provider);
+        renamed.default_provider = "renamed-provider".into();
+
+        assert!(provider_requires_atomgit_auth(&renamed));
+        assert!(!provider_requires_atomgit_auth(&config("model-a", false)));
+    }
+
+    #[test]
+    fn awaiting_atomgit_runtime_recovers_even_when_config_is_unchanged() {
+        let current = atomgit_config("model-a");
+
+        assert!(should_reload_provider(
+            crate::ProviderSelectionMode::FollowGlobalDefault,
+            &current,
+            &current,
+            RuntimeUiAvailability::AwaitingProvider,
+            true,
+        ));
+        assert!(should_reload_provider(
+            crate::ProviderSelectionMode::Pinned,
+            &current,
+            &current,
+            RuntimeUiAvailability::AwaitingProvider,
+            true,
+        ));
+    }
+
+    #[test]
+    fn ready_runtime_does_not_reload_for_unchanged_config() {
+        let current = atomgit_config("model-a");
+
+        assert!(!should_reload_provider(
+            crate::ProviderSelectionMode::FollowGlobalDefault,
+            &current,
+            &current,
+            RuntimeUiAvailability::Available,
+            true,
+        ));
+    }
+
+    #[test]
+    fn missing_atomgit_auth_defers_config_reload_until_login() {
+        assert!(!should_reload_provider(
+            crate::ProviderSelectionMode::FollowGlobalDefault,
+            &atomgit_config("model-a"),
+            &atomgit_config("model-b"),
+            RuntimeUiAvailability::Available,
+            false,
+        ));
+    }
+
+    #[test]
+    fn atomgit_logout_deactivates_only_atomgit_provider() {
+        assert!(should_deactivate_for_missing_auth(
+            &atomgit_config("model-a"),
+            RuntimeUiAvailability::Available,
+        ));
+        assert!(!should_deactivate_for_missing_auth(
+            &config("model-a", false),
+            RuntimeUiAvailability::Available,
+        ));
+    }
+
+    #[test]
+    fn failed_auth_transition_keeps_the_previous_observation_for_retry() {
+        let previous = AuthObservation {
+            user_id: Some("user-a".into()),
+        };
+        let missing = AuthObservation { user_id: None };
+        let mut observed = Some(previous.clone());
+
+        commit_auth_observation(&mut observed, missing.clone(), false);
+        assert_eq!(observed, Some(previous));
+
+        commit_auth_observation(&mut observed, missing.clone(), true);
+        assert_eq!(observed, Some(missing));
+    }
+
+    #[test]
+    fn explicit_reload_joins_the_same_automatic_config_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        let first = store.replace(&config("model-a", false)).unwrap();
+        let second = store.replace(&config("model-b", false)).unwrap();
+
+        assert_eq!(
+            manual_reload_disposition(
+                Some(Some(&second.snapshot.revision)),
+                &second.snapshot.revision,
+            ),
+            ManualReloadDisposition::Join,
+        );
+        assert_eq!(
+            manual_reload_disposition(
+                Some(Some(&first.snapshot.revision)),
+                &second.snapshot.revision,
+            ),
+            ManualReloadDisposition::Busy,
+        );
+        assert_eq!(
+            manual_reload_disposition(Some(None), &second.snapshot.revision),
+            ManualReloadDisposition::Busy,
+        );
+        assert_eq!(
+            manual_reload_disposition(None, &second.snapshot.revision),
+            ManualReloadDisposition::Start,
+        );
+    }
+
+    #[test]
+    fn committed_live_provider_projection_rejects_unknown_names() {
+        let current = config("model-a", false);
+        let (selected, model) = select_committed_provider(current.clone(), "main", Some("model-a"))
+            .expect("known provider/model");
+        assert_eq!(selected.default_provider, "main");
+        assert_eq!(model, "model-a");
+        assert!(select_committed_provider(current.clone(), "main", Some("stale-model")).is_none());
+        assert!(select_committed_provider(current, "missing", None).is_none());
+    }
+
+    #[test]
+    fn unordered_provider_observation_requires_the_current_default() {
+        let mut current = config("model-a", false);
+        current
+            .providers
+            .insert("new-default".into(), current.providers["main"].clone());
+        current.default_provider = "new-default".into();
+
+        assert!(!config_commits_provider(&current, "main"));
+        assert!(config_commits_provider(&current, "new-default"));
+    }
+
+    #[test]
+    fn provider_reload_terminal_requires_the_current_exact_generation() {
+        assert!(provider_reload_terminal_matches(
+            atomcode_coding::RuntimeGeneration(5),
+            Some(atomcode_coding::RuntimeGeneration(5)),
+        ));
+        assert!(!provider_reload_terminal_matches(
+            atomcode_coding::RuntimeGeneration(4),
+            Some(atomcode_coding::RuntimeGeneration(5)),
+        ));
+        assert!(!provider_reload_terminal_matches(
+            atomcode_coding::RuntimeGeneration(5),
+            Some(atomcode_coding::RuntimeGeneration(4)),
+        ));
+        assert!(!provider_reload_terminal_matches(
+            atomcode_coding::RuntimeGeneration(5),
+            None,
+        ));
+    }
+
+    #[test]
+    fn stale_sequenced_provider_changed_cannot_overwrite_projection() {
+        assert!(sequenced_event_matches_provider_generation(
+            true,
+            5,
+            Some(atomcode_coding::RuntimeGeneration(5)),
+        ));
+        assert!(!sequenced_event_matches_provider_generation(
+            true,
+            4,
+            Some(atomcode_coding::RuntimeGeneration(5)),
+        ));
+        assert!(!sequenced_event_matches_provider_generation(true, 4, None));
+        assert!(sequenced_event_matches_provider_generation(
+            false,
+            4,
+            Some(atomcode_coding::RuntimeGeneration(5)),
+        ));
+    }
+
+    #[test]
+    fn failed_projection_attempt_retains_the_authoritative_observation() {
+        let observation = ProviderProjectionObservation {
+            generation: atomcode_coding::RuntimeGeneration(5),
+            provider: "provider-b".into(),
+            model: Some("model-b".into()),
+        };
+        let mut pending = Some(observation.clone());
+
+        assert_eq!(
+            current_provider_projection(
+                pending.as_ref(),
+                Some(atomcode_coding::RuntimeGeneration(5)),
+            ),
+            Some(observation.clone()),
+        );
+        finish_provider_projection_attempt(
+            &mut pending,
+            &observation,
+            ProviderProjectionResult::Deferred,
+        );
+        assert_eq!(pending, Some(observation.clone()));
+
+        finish_provider_projection_attempt(
+            &mut pending,
+            &observation,
+            ProviderProjectionResult::Current,
+        );
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn durable_reload_success_requires_the_same_config_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        let first = store.replace(&config("model-a", false)).unwrap();
+        let second = store.replace(&config("model-b", false)).unwrap();
+
+        assert!(provider_reload_terminal_can_announce(
+            Some(&first.snapshot.revision),
+            Some(&first.snapshot.revision),
+        ));
+        assert!(!provider_reload_terminal_can_announce(
+            Some(&first.snapshot.revision),
+            Some(&second.snapshot.revision),
+        ));
+        assert!(!provider_reload_terminal_can_announce(
+            Some(&first.snapshot.revision),
+            None,
+        ));
+        assert!(provider_reload_terminal_can_announce(None, None));
+    }
+
+    #[test]
+    fn reload_failure_from_an_older_generation_is_superseded() {
+        let generation = |value| Some(atomcode_coding::RuntimeGeneration(value));
+
+        assert!(!provider_reload_failure_was_superseded(
+            generation(4),
+            generation(4),
+        ));
+        assert!(provider_reload_failure_was_superseded(
+            generation(4),
+            generation(5),
+        ));
+        assert!(provider_reload_failure_was_superseded(generation(4), None));
+    }
+
+    #[test]
+    fn repeated_provider_observation_is_projection_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        let persisted = store.replace(&config("model-a", false)).unwrap();
+
+        assert!(provider_projection_is_current(
+            "main",
+            "model-a",
+            Some(&persisted.snapshot.revision),
+            "main",
+            "model-a",
+            Some(&persisted.snapshot.revision),
+        ));
+        assert!(!provider_projection_is_current(
+            "main",
+            "model-a",
+            Some(&persisted.snapshot.revision),
+            "main",
+            "model-b",
+            Some(&persisted.snapshot.revision),
+        ));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManualReloadDisposition {
+    Start,
+    Join,
+    Busy,
+}
+
+fn manual_reload_disposition(
+    pending_revision: Option<Option<&ConfigRevision>>,
+    desired_revision: &ConfigRevision,
+) -> ManualReloadDisposition {
+    match pending_revision {
+        None => ManualReloadDisposition::Start,
+        Some(Some(pending)) if pending == desired_revision => ManualReloadDisposition::Join,
+        Some(Some(_)) | Some(None) => ManualReloadDisposition::Busy,
+    }
+}
+
+fn provider_reload_terminal_matches(
+    returned: atomcode_coding::RuntimeGeneration,
+    current: Option<atomcode_coding::RuntimeGeneration>,
+) -> bool {
+    current == Some(returned)
+}
+
+fn sequenced_event_matches_provider_generation(
+    is_provider_changed: bool,
+    event_generation: u64,
+    current: Option<atomcode_coding::RuntimeGeneration>,
+) -> bool {
+    !is_provider_changed || current.is_some_and(|generation| generation.0 == event_generation)
+}
+
+fn provider_reload_terminal_can_announce(
+    persisted_revision: Option<&ConfigRevision>,
+    current_revision: Option<&ConfigRevision>,
+) -> bool {
+    persisted_revision.is_none_or(|expected| current_revision == Some(expected))
+}
+
+fn provider_reload_failure_was_superseded(
+    origin: Option<atomcode_coding::RuntimeGeneration>,
+    current: Option<atomcode_coding::RuntimeGeneration>,
+) -> bool {
+    origin != current
+}
+
+fn current_provider_projection(
+    pending: Option<&ProviderProjectionObservation>,
+    current: Option<atomcode_coding::RuntimeGeneration>,
+) -> Option<ProviderProjectionObservation> {
+    let observation = pending?;
+    (current == Some(observation.generation)).then(|| observation.clone())
+}
+
+fn provider_projection_is_current(
+    current_provider: &str,
+    current_model: &str,
+    observed_revision: Option<&ConfigRevision>,
+    provider: &str,
+    model: &str,
+    revision: Option<&ConfigRevision>,
+) -> bool {
+    current_provider == provider
+        && current_model == model
+        && match revision {
+            Some(revision) => observed_revision == Some(revision),
+            None => true,
+        }
+}
+
+fn config_commits_provider(config: &Config, provider: &str) -> bool {
+    config.default_provider == provider
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PersistedConfigReload {
+    Applied { provider: String, model: String },
+    Queued,
+    Joined,
+}
+
+fn resolved_provider_and_model(config: &Config) -> (String, String) {
+    let provider = if config.providers.contains_key(&config.default_provider) {
+        config.default_provider.clone()
+    } else {
+        config.providers.keys().min().cloned().unwrap_or_default()
+    };
+    let model = config
+        .providers
+        .get(&provider)
+        .map(|provider| provider.model.clone())
+        .unwrap_or_else(|| provider.clone());
+    (provider, model)
+}
+
+fn select_committed_provider(
+    mut config: Config,
+    provider: &str,
+    expected_model: Option<&str>,
+) -> Option<(Config, String)> {
+    let model = config.providers.get(provider)?.model.clone();
+    if expected_model.is_some_and(|expected| expected != model) {
+        return None;
+    }
+    config.default_provider = provider.to_string();
+    Some((config, model))
+}
+
+/// `manual_reload` is set for an explicit `/reload` (vs a background external
+/// config poll): only then does a pinned session adopt on-disk edits to its
+/// active provider (see `merge_persisted_config_preserving_active`).
+fn desired_config_from_snapshot(
+    ctx: &LoopCtx,
+    mut persisted: Config,
+    manual_reload: bool,
+) -> Config {
+    let active_is_ephemeral = ctx
+        .config
+        .providers
+        .get(&ctx.config.default_provider)
+        .is_some_and(|provider| provider.ephemeral);
+    for (name, provider) in &ctx.config.providers {
+        if provider.ephemeral {
+            persisted
+                .providers
+                .entry(name.clone())
+                .or_insert_with(|| provider.clone());
+        }
+    }
+    if ctx.provider_selection_mode == crate::ProviderSelectionMode::Pinned || active_is_ephemeral {
+        merge_persisted_config_preserving_active(&ctx.config, persisted, manual_reload)
+    } else {
+        persisted
+    }
+}
+
+fn reconcile_persisted_config(
+    ctx: &mut LoopCtx,
+    snapshot: ConfigSnapshot,
+    manual_reload_announce: bool,
+) -> Result<PersistedConfigReload, anyhow::Error> {
+    let desired = desired_config_from_snapshot(ctx, snapshot.config, manual_reload_announce);
+    let auth_available = AuthObservation::read().is_available();
+
+    // An explicit `/reload` on a pinned session keeps the same provider but must
+    // still reconfigure the runtime when that provider's own settings were edited
+    // (e.g. `context_window`) — otherwise the running provider keeps the stale
+    // window and `/context` / the footer never update. `should_reload_provider`
+    // only follows shared-default changes, so add the manual-edit trigger here.
+    let wants_reload = should_reload_provider(
+        ctx.provider_selection_mode,
+        &ctx.config,
+        &desired,
+        ctx.runtime.ui_availability(),
+        auth_available,
+    ) || (manual_reload_announce && active_provider_config_changed(&ctx.config, &desired));
+
+    if !wants_reload {
+        let (provider, model) = resolved_provider_and_model(&desired);
+        if ctx.config.language != desired.language {
+            crate::i18n::set_locale(atomcode_config::i18n::resolve_initial_locale(
+                None,
+                desired.language,
+            ));
+        }
+        ctx.config = desired;
+        ctx.model_name = model.clone();
+        atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        ctx.observed_config_revision = Some(snapshot.revision);
+        // The active provider may have changed from a custom endpoint to an
+        // AtomGit gateway while logged out. Force the auth observer to
+        // reconcile that new dependency even when auth.toml itself did not
+        // change.
+        ctx.observed_auth = None;
+        return Ok(PersistedConfigReload::Applied { provider, model });
+    }
+
+    let origin_generation = ctx.runtime.current_generation();
+    atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+    if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+        atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        return Err(anyhow::anyhow!(
+            "provider reload could not be started: {error}"
+        ));
+    }
+    ctx.observed_config_revision = Some(snapshot.revision.clone());
+    ctx.pending_provider_reload = Some(PendingProviderReload {
+        origin_generation,
+        desired_config: desired,
+        persisted_revision: Some(snapshot.revision),
+        rollback_persisted_config: None,
+        rollback_runtime_config: None,
+        previous_model_name: None,
+        announce: None,
+        manual_reload_announce,
+        selection_mode_after_success: None,
+    });
+    Ok(PersistedConfigReload::Queued)
+}
+
+/// Explicit `/reload`: read the exact ConfigStore selected at startup, join an
+/// automatic reload of the same disk revision, and never project success before
+/// the matching runtime terminal.
+pub(crate) fn reload_persisted_config(
+    ctx: &mut LoopCtx,
+) -> Result<PersistedConfigReload, anyhow::Error> {
+    let snapshot = ctx.config_store.read()?;
+    if ctx.pending_provider_deactivation {
+        anyhow::bail!("provider transition is already in progress");
+    }
+    let pending_revision = ctx
+        .pending_provider_reload
+        .as_ref()
+        .map(|pending| pending.persisted_revision.as_ref());
+    match manual_reload_disposition(pending_revision, &snapshot.revision) {
+        ManualReloadDisposition::Join => {
+            if let Some(pending) = ctx.pending_provider_reload.as_mut() {
+                pending.manual_reload_announce = true;
+            }
+            Ok(PersistedConfigReload::Joined)
+        }
+        ManualReloadDisposition::Busy => {
+            anyhow::bail!("a different provider configuration is still being applied")
+        }
+        ManualReloadDisposition::Start => reconcile_persisted_config(ctx, snapshot, true),
+    }
+}
+
+/// Observe the shared config at an idle boundary. Normal interactive sessions
+/// keep their opened provider/model; shared defaults apply to sessions opened
+/// afterwards. The visible config is committed only after any requested runtime
+/// reload terminal.
+fn poll_external_config(ctx: &mut LoopCtx) -> bool {
+    if provider_transition_pending(ctx) {
+        return false;
+    }
+    let snapshot = match ctx.config_store.read() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            crate::tuix_trace!("CONFIG", "external config poll failed: {error:#}");
+            return false;
+        }
+    };
+    if ctx.observed_config_revision.as_ref() == Some(&snapshot.revision) {
+        return false;
+    }
+    match reconcile_persisted_config(ctx, snapshot, false) {
+        Ok(PersistedConfigReload::Applied { .. }) => true,
+        Ok(PersistedConfigReload::Queued | PersistedConfigReload::Joined) => false,
+        Err(error) => {
+            crate::tuix_trace!(
+                "CONFIG",
+                "external provider reload could not be queued: {error:#}"
+            );
+            false
+        }
+    }
+}
+
+pub(crate) fn provider_transition_pending(ctx: &LoopCtx) -> bool {
+    ctx.pending_provider_reload.is_some() || ctx.pending_provider_deactivation
+}
+
+fn commit_auth_observation(
+    observed: &mut Option<AuthObservation>,
+    current: AuthObservation,
+    reconciled: bool,
+) {
+    if reconciled {
+        *observed = Some(current);
+    }
+}
+
+/// Reconcile the shared AtomGit credential file independently from config.toml.
+/// Only availability/identity is observed; tokens never enter UI state, logs, or
+/// the cross-process protocol. Token refreshes for the same account therefore do
+/// not cause provider reassembly, while logout/login transitions do.
+fn poll_external_auth(ctx: &mut LoopCtx) -> bool {
+    let current = AuthObservation::read();
+    let changed = ctx.observed_auth.as_ref() != Some(&current);
+    if !changed || provider_transition_pending(ctx) {
+        return false;
+    }
+
+    ctx.telemetry.set_account_id(current.user_id.clone());
+    let availability = ctx.runtime.ui_availability();
+    if availability == RuntimeUiAvailability::Starting {
+        // Runtime construction and auth.toml may race. Leave this observation
+        // uncommitted so the first stable runtime phase is reconciled.
+        return true;
+    }
+
+    let mut reconciled = true;
+    if current.is_available()
+        && provider_requires_atomgit_auth(&ctx.config)
+        && availability == RuntimeUiAvailability::AwaitingProvider
+    {
+        let origin_generation = ctx.runtime.current_generation();
+        atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        match reload_runtime_provider(ctx) {
+            Ok(()) => {
+                ctx.pending_provider_reload = Some(PendingProviderReload {
+                    origin_generation,
+                    desired_config: ctx.config.clone(),
+                    persisted_revision: None,
+                    rollback_persisted_config: None,
+                    rollback_runtime_config: None,
+                    previous_model_name: None,
+                    announce: None,
+                    manual_reload_announce: false,
+                    selection_mode_after_success: None,
+                });
+            }
+            Err(error) => {
+                reconciled = false;
+                crate::tuix_trace!(
+                    "AUTH",
+                    "provider recovery after external login could not be queued: {error}"
+                );
+            }
+        }
+    } else if !current.is_available()
+        && should_deactivate_for_missing_auth(&ctx.config, availability)
+    {
+        match deactivate_runtime_provider(ctx) {
+            Ok(()) => ctx.pending_provider_deactivation = true,
+            Err(error) => {
+                reconciled = false;
+                crate::tuix_trace!(
+                    "AUTH",
+                    "provider deactivation after external logout could not be queued: {error}"
+                );
+            }
+        }
+    }
+
+    // Commit the observation after the transition was queued (or proven
+    // irrelevant). A later opposite transition remains visible while an async
+    // provider operation is pending because the early return above does not
+    // overwrite this value.
+    commit_auth_observation(&mut ctx.observed_auth, current, reconciled);
+    true
+}
+
+fn poll_shared_state(ctx: &mut LoopCtx) -> bool {
+    let config_changed = poll_external_config(ctx);
+    let auth_changed = poll_external_auth(ctx);
+    config_changed || auth_changed
+}
+
+/// If another atomcode process just ran `/codingplan`, clear stale plan hints.
+/// Provider/model reconciliation is handled generically by `poll_external_config`.
 fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
-    let current = atomcode_core::coding_plan::read_last_sync();
+    let current = atomcode_codingplan::read_last_sync();
     let advanced = match (current, ctx.monitor_last_sync_seen) {
         (Some(new), Some(old)) => new > old,
         (Some(_), None) => true, // marker just appeared
@@ -5440,21 +8785,6 @@ fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
         return;
     }
     ctx.monitor_last_sync_seen = current;
-
-    // Hot-reload the config file. Fail silently: if the other process
-    // wrote a malformed config (shouldn't happen — it would have
-    // rejected its own reload), leave our in-memory snapshot alone.
-    let path = atomcode_config::config::Config::default_path();
-    if let Ok(fresh) = atomcode_config::config::Config::load(&path) {
-        ctx.config = fresh;
-        if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
-            ctx.model_name = p.model.clone();
-        }
-        let _ = ctx
-            .agent
-            .cmd_tx
-            .send(AgentCommand::ReloadConfig(ctx.config.clone()));
-    }
 
     // Sync marker = another process just reconciled config with
     // server, so any drift warning we're still showing is stale by
@@ -5666,9 +8996,13 @@ fn handle_input(
 ) -> Result<()> {
     use crate::modals::ModalAction;
 
-    // Pick up any cross-process `/codingplan` that ran since the last
-    // input — hot-reloads config + clears stale drift hint before we
-    // act on the current keystroke.
+    if matches!(app.state.phase, UiPhase::Idle)
+        && app.active_modal.is_none()
+        && poll_shared_state(ctx)
+    {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    }
+    // `/codingplan` has extra warning/quota caches beyond the generic config.
     refresh_after_cross_process_codingplan_sync(ctx);
 
     crate::tuix_trace!(
@@ -5727,6 +9061,12 @@ fn handle_input(
                     other => deferred.push(other),
                 }
             }
+            // NOTE: do NOT `clear_screen()` here when a modal is open — that
+            // calls `reset()`, which drops `body_log`, so the `on_resize` reflow
+            // below would replay an empty transcript and wipe the conversation
+            // ("从大屏到小屏之后就会丢失上面的内容", seen with /view & /diff).
+            // `on_resize` already fully wipes+reflows the terminal and drops the
+            // stale modal overlay itself (so #1158 duplication stays fixed).
             renderer.on_resize(cols, rows);
             // A resize invalidates any open modal's cached overlay
             // geometry (it was built for the old size). Rebuild it now so
@@ -5866,6 +9206,20 @@ fn handle_input(
                 .as_ref()
                 .is_some_and(|m| m.captures_all_keys())
             {
+                // Ctrl+C is a global exit shortcut and must NOT be trappable by a
+                // capturing modal either — but only for the ones that open while
+                // Idle (the `/view` file viewer, the `/diff` panel). The password
+                // prompt captures mid-turn (Streaming) and legitimately needs
+                // Ctrl+C to cancel the turn, not quit; the Idle gate excludes it.
+                // Mirrors the non-capturing Ctrl+C guard just below.
+                if matches!(app.state.phase, UiPhase::Idle)
+                    && code == KeyCode::Char('c')
+                    && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                {
+                    app.active_modal = None;
+                    arm_shutdown_watchdog(ctx);
+                    return Ok(());
+                }
                 let streaming = matches!(app.state.phase, UiPhase::Streaming);
                 if let Some(modal) = app.active_modal.as_mut() {
                     let action = modal.handle_key(
@@ -5980,15 +9334,12 @@ fn handle_input(
             //
             // Gated to Idle / Streaming. Approval and Suspended don't
             // accept input; modals (handled above) get first refusal.
-            // Shift / Alt with Ctrl+V are excluded so reserved chords
-            // (e.g. terminal-emulator-defined Ctrl+Shift+V "Paste as
-            // Plain Text") still pass through to whatever else might
-            // bind them in the future.
+            // Chord matching lives in `is_paste_image_chord`: Ctrl+V AND
+            // Ctrl+Alt+V (the Windows-Terminal alternate) both trigger; only
+            // Ctrl+Shift+V is excluded so a terminal's "paste as plain text"
+            // chord still passes through.
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming)
-                && code == crossterm::event::KeyCode::Char('v')
-                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
-                && !modifiers.contains(crossterm::event::KeyModifiers::ALT)
+                && is_paste_image_chord(code, modifiers)
             {
                 let img_hash = try_paste_clipboard_image();
                 if attach_image_to_input(app, ctx, renderer, img_hash)? {
@@ -6030,6 +9381,7 @@ fn handle_input(
                 UiPhase::Idle => handle_idle_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Streaming => handle_streaming_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Approval => handle_approval_key(app, ctx, renderer, code, modifiers)?,
+                UiPhase::UserInput => handle_user_input_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Suspended => {}
             }
         }
@@ -6038,6 +9390,43 @@ fn handle_input(
         InputEvent::Key(_) => {}
     }
     Ok(())
+}
+
+fn provider_transition_allows_idle_commit(line: &str) -> bool {
+    parse_slash_line(line).is_some_and(|(command, _)| {
+        matches!(
+            command.to_ascii_lowercase().as_str(),
+            "reload" | "context" | "status" | "keys" | "quit" | "exit"
+        )
+    })
+}
+
+#[cfg(test)]
+mod provider_transition_input_tests {
+    use super::provider_transition_allows_idle_commit;
+
+    #[test]
+    fn provider_transition_keeps_runtime_mutations_blocked_but_allows_observers() {
+        for command in [
+            "/reload",
+            "/context",
+            "/context prompt",
+            "/status",
+            "/keys",
+            "/quit",
+        ] {
+            assert!(
+                provider_transition_allows_idle_commit(command),
+                "{command} should remain executable while a provider reload is pending"
+            );
+        }
+        for command in ["hello", "/session", "/resume", "/model"] {
+            assert!(
+                !provider_transition_allows_idle_commit(command),
+                "{command} must wait for the provider terminal"
+            );
+        }
+    }
 }
 
 /// Try handling a scroll-related key (PageUp/PageDown/Home/End).
@@ -6369,6 +9758,45 @@ fn menu_for_display(buf: &Buffer, ctx: &LoopCtx) -> Option<Vec<(String, String)>
     )
 }
 
+fn session_projection_pending(ctx: &LoopCtx) -> bool {
+    ctx.pending_session_transition.is_some()
+        || ctx.pending_session_resume.is_some()
+        || ctx.pending_session_resume_preparation.is_some()
+        || ctx.pending_external_session_projection.is_some()
+        || ctx.pending_capability_reload
+}
+
+fn idle_commit_gate_pending(ctx: &LoopCtx) -> bool {
+    provider_transition_pending(ctx) || session_projection_pending(ctx)
+}
+
+fn menu_handles_selection_key(
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    commit_gate_pending: bool,
+) -> bool {
+    matches!(code, KeyCode::Enter | KeyCode::Tab)
+        && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+        && !(code == KeyCode::Enter && commit_gate_pending)
+}
+
+fn streaming_top_level_slash_selection(
+    buffer: &str,
+    selected_name: &str,
+    needs_args: bool,
+    code: KeyCode,
+) -> Option<(String, bool)> {
+    let prefix = buffer.strip_prefix('/')?;
+    if prefix.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let submit = code == KeyCode::Enter && !needs_args;
+    Some((
+        format!("/{selected_name}{}", if submit { "" } else { " " }),
+        submit,
+    ))
+}
+
 fn handle_idle_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -6376,28 +9804,13 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
-    let restore_blocks_key = ctx.pending_local_runtime_sync.is_some()
-        && pending_restore_blocks_idle_action(
-            code,
-            modifiers,
-            &app.buf.text,
-            menu_for_display(&app.buf, ctx).is_some(),
-            app.state.goal_condition.is_some(),
-        );
-    if restore_blocks_key {
-        renderer.render(UiLine::Error(
-            crate::i18n::t(crate::i18n::Msg::LocalRuntimeRestorePending).into_owned(),
-        ));
-        renderer.flush();
-        return Ok(());
-    }
     // GOAL ESCAPE HATCH (Idle). A `/goal` continuation is driven SERVER-SIDE,
     // so the TUI can legitimately sit in Idle while the agent keeps looping
     // rounds. From Idle, Esc/Ctrl+C otherwise just clear the input / arm exit —
     // they never reach the cancel path (that lives in `handle_streaming_key`),
     // which is why a goal felt uninterruptible. When a goal is active, route
     // Ctrl+C and a bare Esc (empty buffer — don't steal Esc from clearing a
-    // draft the user is editing to nudge the goal) to `Cancel`: the bridge
+    // draft the user is editing to nudge the goal) to `Cancel`: the runtime
     // turns that into "clear the goal + cancel the running turn", and the
     // follow-up GoalUpdate(active=false) resets the local goal state. Belt and
     // suspenders alongside `on_thinking` keeping the TUI in Streaming.
@@ -6461,8 +9874,8 @@ fn handle_idle_key(
                 );
                 return Ok(());
             }
-            (KeyCode::Enter | KeyCode::Tab, m)
-                if !m.contains(crossterm::event::KeyModifiers::SHIFT) =>
+            (selection_key @ (KeyCode::Enter | KeyCode::Tab), m)
+                if menu_handles_selection_key(selection_key, m, idle_commit_gate_pending(ctx)) =>
             {
                 // Tab and Enter both pick the highlighted entry, but
                 // they diverge on no-arg top-level commands:
@@ -6781,6 +10194,12 @@ fn handle_idle_key(
         return Ok(());
     }
 
+    if code == KeyCode::Esc && modifiers.is_empty() && dismiss_footer_command_output(&mut app.state)
+    {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
     if code == KeyCode::Esc
         && modifiers.is_empty()
         && menu_items.is_none()
@@ -6965,6 +10384,31 @@ fn handle_idle_key(
             }
         }
         BufferResult::Commit(line) => {
+            if provider_transition_pending(ctx) && !provider_transition_allows_idle_commit(&line) {
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+                ));
+                renderer.flush();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            if session_projection_pending(ctx) {
+                if let Err(error) = retry_pending_session_projections(&mut app.state, renderer, ctx)
+                {
+                    renderer.render(UiLine::Error(error));
+                    renderer.flush();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    return Ok(());
+                }
+            }
+            if session_projection_pending(ctx) {
+                renderer.render(UiLine::Warning(
+                    crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
+                ));
+                renderer.flush();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
             renderer.render(UiLine::ClearTransient);
             app.buf.text.clear();
             app.buf.cursor = 0;
@@ -7055,12 +10499,7 @@ fn handle_idle_key(
                     images: Vec::new(),
                     pastes: Vec::new(),
                 });
-                ctx.agent
-                    .cmd_tx
-                    .send(AgentCommand::LocalShell {
-                        cmd: bash_cmd.to_string(),
-                    })
-                    .ok();
+                run_local_shell_command(bash_cmd.to_string(), ctx);
                 // `!` lines carry no pastes/images; submit consumes the buffer.
                 app.buf.clear_pastes();
                 if matches!(app.state.phase, UiPhase::Idle) {
@@ -7194,6 +10633,15 @@ fn handle_idle_key(
                         kept_markers.push(n);
                     }
                 }
+                // Remember the authoritative pasted (image, marker) pairing —
+                // captured HERE, before typed-path attachment — so a VL
+                // preprocessing failure can re-attach the images with their
+                // exact markers rather than re-deriving from text (which can
+                // misorder when images are pasted out of cursor order). Typed
+                // paths are intentionally excluded: their retry rides the file
+                // path restored into the buffer via `last_submitted_message`.
+                app.state.last_submitted_pasted_images = images.clone();
+                app.state.last_submitted_pasted_markers = kept_markers.clone();
                 // Recognize bare image paths that were typed / pasted as
                 // keystrokes (notably Windows conhost paste) and never went
                 // through the `InputEvent::Paste` image detection. Mutates
@@ -7202,7 +10650,7 @@ fn handle_idle_key(
                 // already cached above from the raw form, so Ctrl+C edit
                 // restores the editable path, not the marker.
                 attach_typed_image_paths(app, ctx, &mut expanded, &mut images, &mut kept_markers);
-                if ctx.sync_session.is_none() {
+                if ctx.live_binding.is_none() {
                     // Echo the EXACT text the agent receives (`expanded`): the
                     // full pasted body with `[Pasted #N …]` placeholders expanded
                     // and typed image paths already rewritten to `[Image #N]`
@@ -7225,42 +10673,75 @@ fn handle_idle_key(
                 if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
                     *slot = None;
                 }
-                if let Some(live) = &ctx.sync_session {
-                    // 同步模式：投递到 LiveSession。
-                    use atomcode_core::live::UserInput;
-                    live.send_input(UserInput {
-                        text: expanded,
-                        images,
-                    });
-                    app.state.on_submit();
-                } else {
-                    // —— 原有逻辑，原样保留 ——
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SendMessage {
+                {
+                    let availability = ctx.runtime.ui_availability();
+                    if hold_submit_until_ready(ctx.live_binding.is_some(), availability) {
+                        // New session whose provider is still recovering auth
+                        // (AwaitingProvider) or still starting (daemon deferred).
+                        // The message was already echoed above; hold it in the
+                        // type-ahead queue and let the drain auto-send it once the
+                        // runtime reaches Available (ProviderChanged / startup done)
+                        // rather than dropping it with a "provider unavailable" error.
+                        crate::tuix_trace!("QUE", "hold first submit until provider ready");
+                        app.message_queue.push_back(crate::state::QueuedMessage {
                             text: expanded,
                             images,
                             image_markers: kept_markers,
-                        })
-                        .ok();
-                    app.state.on_submit();
-                    // CodingPlan drift check — fire before every turn sent
-                    // to a CodingPlan-managed provider, gated by a 15-min
-                    // cooldown so rapid-fire messages don't spam the API.
-                    // Non-CodingPlan users skip entirely (zero network).
-                    if monitor::is_codingplan_provider(&ctx.config.default_provider) {
-                        let cooled = ctx
-                            .monitor_last_check_at
-                            .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
-                            .unwrap_or(true);
-                        if cooled {
-                            ctx.monitor_last_check_at = Some(std::time::Instant::now());
-                            monitor::spawn_check(
-                                ctx.config.clone(),
-                                ctx.model_name.clone(),
-                                ctx.monitor_warning.clone(),
-                                ctx.wake_tx.clone(),
-                            );
+                        });
+                        // This is not type-ahead from an active turn. The user
+                        // submitted while idle and we intentionally deferred it
+                        // until the runtime becomes available, so readiness may
+                        // consume it without waiting for a turn terminal.
+                        app.queue_drain_authorized = true;
+                        // AwaitingProvider covers both a transient auth race (user
+                        // IS logged in, recovery imminent) and genuinely-not-logged-in.
+                        // For the latter, keep the old actionable guidance to run
+                        // /login — the held message auto-sends once auth lands.
+                        let hint = if availability == RuntimeUiAvailability::AwaitingProvider
+                            && !AuthObservation::read().is_available()
+                        {
+                            crate::i18n::Msg::SubmitHeldUntilLogin
+                        } else {
+                            crate::i18n::Msg::SubmitHeldUntilProviderReady
+                        };
+                        renderer.render(UiLine::CommandOutput(crate::i18n::t(hint).into_owned()));
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        renderer.flush();
+                    } else {
+                        let submitted =
+                            submit_foreground_runtime(ctx, runtime_user_input(expanded, images));
+                        if submitted {
+                            app.state.on_submit();
+                            // CodingPlan drift check — fire before every turn sent
+                            // to a CodingPlan-managed provider, gated by a 15-min
+                            // cooldown so rapid-fire messages don't spam the API.
+                            // Non-CodingPlan users skip entirely (zero network).
+                            if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+                                let cooled = ctx
+                                    .monitor_last_check_at
+                                    .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
+                                    .unwrap_or(true);
+                                if cooled {
+                                    ctx.monitor_last_check_at = Some(std::time::Instant::now());
+                                    monitor::spawn_check(
+                                        ctx.config.clone(),
+                                        ctx.model_name.clone(),
+                                        ctx.monitor_warning.clone(),
+                                        ctx.wake_tx.clone(),
+                                    );
+                                }
+                            }
+                        } else {
+                            app.state.on_submit_rejected();
+                            renderer.render(UiLine::Error(
+                                crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable)
+                                    .into_owned(),
+                            ));
+                            // Commit cleared the input buffer before dispatch. Render that
+                            // empty prompt so the retained renderer does not keep displaying
+                            // the pre-commit text after the synchronous rejection.
+                            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                            renderer.flush();
                         }
                     }
                 }
@@ -7284,81 +10765,6 @@ fn handle_idle_key(
         }
     }
     Ok(())
-}
-
-fn pending_restore_blocks_idle_action(
-    code: KeyCode,
-    modifiers: crossterm::event::KeyModifiers,
-    input: &str,
-    menu_active: bool,
-    goal_active: bool,
-) -> bool {
-    use crossterm::event::KeyModifiers;
-
-    if code == KeyCode::Enter && !modifiers.contains(KeyModifiers::SHIFT) {
-        let safe_exit = parse_slash_line(input).is_some_and(|(command, argument)| {
-            matches!(command.to_ascii_lowercase().as_str(), "quit" | "exit")
-                && argument.trim().is_empty()
-        });
-        return !safe_exit;
-    }
-    if matches!(code, KeyCode::Tab | KeyCode::BackTab) && !menu_active {
-        return true;
-    }
-    if code == KeyCode::Char('t') && modifiers.contains(KeyModifiers::CONTROL) {
-        return true;
-    }
-
-    let bare_escape = code == KeyCode::Esc && modifiers.is_empty() && input.is_empty();
-    let goal_cancel = goal_active
-        && (bare_escape
-            || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL)));
-    goal_cancel || (bare_escape && !menu_active)
-}
-
-#[cfg(test)]
-mod pending_restore_key_tests {
-    use super::{pending_restore_blocks_idle_action, KeyCode};
-    use crossterm::event::KeyModifiers;
-
-    #[test]
-    fn restore_gate_blocks_runtime_actions_but_keeps_explicit_exit() {
-        assert!(pending_restore_blocks_idle_action(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            "hello",
-            false,
-            false,
-        ));
-        assert!(pending_restore_blocks_idle_action(
-            KeyCode::Tab,
-            KeyModifiers::NONE,
-            "",
-            false,
-            false,
-        ));
-        assert!(pending_restore_blocks_idle_action(
-            KeyCode::Esc,
-            KeyModifiers::NONE,
-            "",
-            false,
-            false,
-        ));
-        assert!(!pending_restore_blocks_idle_action(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            "/quit",
-            false,
-            false,
-        ));
-        assert!(!pending_restore_blocks_idle_action(
-            KeyCode::Tab,
-            KeyModifiers::NONE,
-            "/qu",
-            true,
-            false,
-        ));
-    }
 }
 
 fn redraw_with_menu(
@@ -7386,7 +10792,7 @@ fn redraw_with_menu(
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
         menu: Some(payload),
-        status: build_status(state, ctx),
+        status: build_input_status(state, ctx, buf),
         attachments,
     });
     // Footer-only UiLines (InputPrompt / StreamingBox) update widget
@@ -7523,8 +10929,14 @@ mod bash_input_hint_tests {
         assert_eq!(cmd.1, HintSeverity::Shell, "!cmd hint is brand purple");
         // Distinct affordance vs actionable text (bare "! for shell mode" vs
         // "Enter to run…") without pinning the active locale's exact strings.
-        assert_ne!(bare.0, cmd.0, "bare ! and runnable !cmd show different text");
-        assert_eq!(resolved("  !git status").map(|(_, s)| s), Some(HintSeverity::Shell));
+        assert_ne!(
+            bare.0, cmd.0,
+            "bare ! and runnable !cmd show different text"
+        );
+        assert_eq!(
+            resolved("  !git status").map(|(_, s)| s),
+            Some(HintSeverity::Shell)
+        );
         // Not shell mode → no hint (so a normal `/webui` etc. keeps the slot).
         assert!(resolved("ls").is_none());
         assert!(resolved("").is_none());
@@ -7551,17 +10963,13 @@ mod bash_input_hint_tests {
 enum SubmitRoute {
     SendIdle,
     SteerNow,
-    Queue,
 }
 
-/// Where a submitted prompt goes. On the ASYNC kernel path, a submit DURING a
-/// running turn steers (sent to the kernel immediately, folded into the turn).
-/// On the SYNC/LiveSession path, keep the local-queue behavior. Idle → normal send.
-fn midturn_submit_route(streaming: bool, sync: bool) -> SubmitRoute {
-    match (streaming, sync) {
-        (true, false) => SubmitRoute::SteerNow,
-        (true, true) => SubmitRoute::Queue,
-        (false, _) => SubmitRoute::SendIdle,
+/// A submit during a running native turn is steering; an idle submit starts a turn.
+fn midturn_submit_route(streaming: bool) -> SubmitRoute {
+    match streaming {
+        true => SubmitRoute::SteerNow,
+        false => SubmitRoute::SendIdle,
     }
 }
 
@@ -7570,16 +10978,14 @@ mod midturn_submit_route_tests {
     use super::{midturn_submit_route, SubmitRoute};
 
     #[test]
-    fn midturn_submit_steers_on_async_queues_on_sync() {
-        assert_eq!(midturn_submit_route(true, false), SubmitRoute::SteerNow);
-        assert_eq!(midturn_submit_route(true, true), SubmitRoute::Queue);
-        assert_eq!(midturn_submit_route(false, false), SubmitRoute::SendIdle);
-        assert_eq!(midturn_submit_route(false, true), SubmitRoute::SendIdle);
+    fn midturn_submit_steers_native_runtime() {
+        assert_eq!(midturn_submit_route(true), SubmitRoute::SteerNow);
+        assert_eq!(midturn_submit_route(false), SubmitRoute::SendIdle);
     }
 }
 
 /// Switch execution mode from a single place. Used by Tab, Shift+Tab, and the
-/// /build /auto /plan commands. Sends the unified SetMode to the bridge, mirrors
+/// /build /auto /plan commands. Sends the unified SetMode to the runtime, mirrors
 /// to the daemon LIVE mode (cross-tab / webui sync), prints a feedback line, and
 /// repaints the footer.
 pub(crate) fn set_agent_mode(
@@ -7595,17 +11001,27 @@ pub(crate) fn set_agent_mode(
     if mode == crate::state::AgentMode::Build {
         app.state.build_badge_visible = true;
     }
-    ctx.agent.cmd_tx.send(AgentCommand::SetMode(mode)).ok();
+    ctx.runtime
+        .dispatch(atomcode_coding::DriverCommand::SetMode(runtime_mode(mode)))
+        .ok();
     atomcode_daemon::live_set_mode(mode); // daemon ApprovalMode == core Mode
-    // The footer persistently shows the current mode, so a scrollback feedback line
-    // is redundant in the interactive renderer — and it spams on rapid Tab / Shift+Tab
-    // cycling. Emit it ONLY in plain mode (pipe / CI), which has no persistent footer.
+                                          // The footer persistently shows the current mode, so a scrollback feedback line
+                                          // is redundant in the interactive renderer — and it spams on rapid Tab / Shift+Tab
+                                          // cycling. Emit it ONLY in plain mode (pipe / CI), which has no persistent footer.
     if ctx.is_plain_renderer {
         let msg = match mode {
-            crate::state::AgentMode::Auto => crate::i18n::t(crate::i18n::Msg::CmdSwitchedAutoMode).into_owned(),
-            crate::state::AgentMode::AcceptEdits => crate::i18n::t(crate::i18n::Msg::CmdSwitchedAcceptEditsMode).into_owned(),
-            crate::state::AgentMode::Plan => crate::i18n::t(crate::i18n::Msg::CmdSwitchedPlanMode).into_owned(),
-            crate::state::AgentMode::Build => crate::i18n::t(crate::i18n::Msg::CmdSwitchedBuildMode).into_owned(),
+            crate::state::AgentMode::Auto => {
+                crate::i18n::t(crate::i18n::Msg::CmdSwitchedAutoMode).into_owned()
+            }
+            crate::state::AgentMode::AcceptEdits => {
+                crate::i18n::t(crate::i18n::Msg::CmdSwitchedAcceptEditsMode).into_owned()
+            }
+            crate::state::AgentMode::Plan => {
+                crate::i18n::t(crate::i18n::Msg::CmdSwitchedPlanMode).into_owned()
+            }
+            crate::state::AgentMode::Build => {
+                crate::i18n::t(crate::i18n::Msg::CmdSwitchedBuildMode).into_owned()
+            }
         };
         renderer.render(UiLine::CommandOutput(msg));
         renderer.flush();
@@ -7615,7 +11031,7 @@ pub(crate) fn set_agent_mode(
 
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
     let attachments = compute_input_attachments(state, &buf.text);
-    let mut status = build_status(state, ctx);
+    let mut status = build_input_status(state, ctx, buf);
     // Discoverability: while composing a `!` shell command, surface a brand-purple
     // footer hint (bare `!` → "! for shell mode"; `!cmd` → "Enter to run…").
     // Fill the slot only when it's free, so the shell hint still yields to any
@@ -7649,7 +11065,7 @@ pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
     if ctx.is_plain_renderer {
         return false;
     }
-    ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none()
+    ctx.config.providers.is_empty() && atomcode_auth::get_stored_auth().is_none()
 }
 
 /// Extract current + latest version from the `ALREADY_LATEST` error
@@ -7701,7 +11117,10 @@ mod image_marker_tests {
 
 #[cfg(test)]
 mod streaming_slash_tests {
-    use super::streaming_executable_slash as exec;
+    use super::{
+        provider_transition_blocks_streaming_command as blocks_provider_transition,
+        streaming_executable_slash as exec,
+    };
 
     #[test]
     fn goal_halt_subcommands_run_mid_stream() {
@@ -7744,6 +11163,51 @@ mod streaming_slash_tests {
         assert_eq!(exec("/bg go do a thing"), None);
         assert_eq!(exec("/goal write all the tests"), None);
         assert_eq!(exec("/goal"), None); // bare /goal = status, not whitelisted
+    }
+
+    #[test]
+    fn provider_transition_blocks_only_the_runtime_identity_switch() {
+        assert!(blocks_provider_transition("bg", true));
+        assert!(!blocks_provider_transition("goal", true));
+        assert!(!blocks_provider_transition("loop", true));
+        assert!(!blocks_provider_transition("bg", false));
+    }
+
+    #[test]
+    fn readonly_reports_run_mid_stream() {
+        // The reported request: check usage / relabel without waiting for the turn.
+        // These render to scrollback (no modal) and don't touch the conversation.
+        // (`/usage` detects Streaming and renders text instead of its modal.)
+        for cmd in ["status", "cost", "diff", "usage"] {
+            assert_eq!(
+                exec(&format!("/{cmd}")),
+                Some((cmd.to_string(), String::new())),
+                "cmd={cmd}"
+            );
+        }
+        // `/rename <name>` runs mid-stream; a bare `/rename` (would only error) does not.
+        assert_eq!(
+            exec("/rename my session"),
+            Some(("rename".to_string(), "my session".to_string()))
+        );
+        assert_eq!(exec("/rename"), None);
+        assert_eq!(exec("/rename   "), None);
+    }
+
+    #[test]
+    fn mutating_and_modal_commands_stay_blocked_mid_stream() {
+        // Conversation-mutating / turn-boundary commands must still wait.
+        for line in [
+            "/clear",
+            "/compact",
+            "/new",
+            "/resume",
+            "/model gpt",
+            "/undo",
+            "/context",
+        ] {
+            assert_eq!(exec(line), None, "line={line}");
+        }
     }
 
     #[test]
@@ -7802,6 +11266,64 @@ fn redraw_after_slash(
 /// whether) to surface the warnings — the TUI gates them behind verbose
 /// mode (Ctrl+O) and always shows a `N loaded / M skipped` summary on
 /// /plugin install. Non-summary callers can ignore both values.
+pub(crate) fn request_capability_reload(ctx: &mut LoopCtx) -> Result<(), String> {
+    if ctx.pending_session_transition.is_some()
+        || ctx.pending_session_resume.is_some()
+        || ctx.pending_session_resume_preparation.is_some()
+        || ctx.pending_capability_reload
+    {
+        return Err(crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned());
+    }
+    ctx.runtime
+        .reload_capabilities(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
+        .map_err(|error| {
+            crate::i18n::t(crate::i18n::Msg::CmdCapabilityReloadFailed {
+                error: &error.to_string(),
+            })
+            .into_owned()
+        })?;
+    ctx.pending_capability_reload = true;
+    Ok(())
+}
+
+/// Fail-closed barrier for MCP config, trust, and auth changes. The TUI must
+/// await this before mutating disk so a rejected reload cannot leave the old
+/// model-facing authority mounted.
+pub(crate) fn withdraw_mcp_tools(ctx: &mut LoopCtx) -> Result<(), String> {
+    if ctx.pending_session_transition.is_some()
+        || ctx.pending_session_resume.is_some()
+        || ctx.pending_session_resume_preparation.is_some()
+        || ctx.pending_capability_reload
+        || provider_transition_pending(ctx)
+    {
+        return Err(crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned());
+    }
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(ctx.runtime.withdraw_mcp_tools())
+            .map_err(|error| {
+                crate::i18n::t(crate::i18n::Msg::CmdCapabilityReloadFailed {
+                    error: &error.to_string(),
+                })
+                .into_owned()
+            })
+    })
+}
+
+fn complete_mcp_reload_notice(
+    pending_server_count: &mut Option<usize>,
+    succeeded: bool,
+) -> Option<String> {
+    let configured = pending_server_count.take()?;
+    succeeded.then(|| {
+        if configured == 0 {
+            crate::i18n::t(crate::i18n::Msg::McpClearedNoServers).into_owned()
+        } else {
+            crate::i18n::t(crate::i18n::Msg::McpClearedReconnecting).into_owned()
+        }
+    })
+}
+
 pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
     let mut loaded = 0usize;
     let mut warnings = Vec::new();
@@ -7813,22 +11335,127 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
     // Hook executor lives on the agent loop. Send a one-shot rebuild signal
     // so plugin-contributed hooks (especially UserPromptSubmit) fire on the
     // next user message rather than waiting for /cd or restart.
-    let _ = ctx
-        .agent
-        .cmd_tx
-        .send(atomcode_core::agent::AgentCommand::ReloadHooks);
+    if let Err(error) = request_capability_reload(ctx) {
+        warnings.push(error);
+    }
     (loaded, warnings)
 }
 
-pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
-    let path = Config::default_path();
-    match ctx.config.save(&path) {
-        Ok(()) => {
-            atomcode_core::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
-            let _ = ctx
-                .agent
-                .cmd_tx
-                .send(AgentCommand::ReloadConfig(ctx.config.clone()));
+struct PendingProviderRollback {
+    error: Option<String>,
+    persisted_superseded: bool,
+}
+
+fn rollback_pending_provider_reload(
+    ctx: &mut LoopCtx,
+    pending: PendingProviderReload,
+) -> PendingProviderRollback {
+    let PendingProviderReload {
+        persisted_revision,
+        rollback_persisted_config,
+        rollback_runtime_config,
+        previous_model_name,
+        ..
+    } = pending;
+    let (error, persisted_superseded) = match (persisted_revision, rollback_persisted_config) {
+        (Some(revision), Some(previous)) => {
+            match ctx.config_store.update_if_revision(&revision, |config| {
+                *config = previous;
+                Ok(())
+            }) {
+                Ok(Some(commit)) => {
+                    ctx.observed_config_revision = Some(commit.snapshot.revision);
+                    (None, false)
+                }
+                Ok(None) => (None, true),
+                Err(error) => (Some(error.to_string()), true),
+            }
+        }
+        (Some(revision), None) => match ctx.config_store.read() {
+            Ok(snapshot) => (None, snapshot.revision != revision),
+            Err(error) => (Some(error.to_string()), true),
+        },
+        (None, _) => (None, false),
+    };
+    if let Some(previous) = rollback_runtime_config {
+        ctx.config = previous;
+    }
+    if let Some(model) = previous_model_name {
+        ctx.model_name = model;
+    }
+    atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+    PendingProviderRollback {
+        error,
+        persisted_superseded,
+    }
+}
+
+pub(crate) fn save_and_reload(
+    ctx: &mut LoopCtx,
+    desired: Config,
+    renderer: &mut dyn Renderer,
+    success_message: String,
+    persist_runtime_provider_as_default: bool,
+) -> bool {
+    if provider_transition_pending(ctx) {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+        ));
+        renderer.flush();
+        return false;
+    }
+    let store = ctx.config_store.clone();
+    let previous_runtime_config = ctx.config.clone();
+    let previous_model_name = ctx.model_name.clone();
+    match commit_desired_config(
+        &store,
+        ctx.observed_config_revision.as_ref(),
+        &desired,
+        persist_runtime_provider_as_default,
+    ) {
+        Ok(DesiredConfigCommit { commit, previous }) => {
+            let rollback_persisted_config = Some(previous);
+            let rollback_runtime_config = Some(previous_runtime_config);
+            let origin_generation = ctx.runtime.current_generation();
+            atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+            if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+                let rollback = rollback_pending_provider_reload(
+                    ctx,
+                    PendingProviderReload {
+                        origin_generation,
+                        desired_config: desired,
+                        persisted_revision: Some(commit.snapshot.revision),
+                        rollback_persisted_config,
+                        rollback_runtime_config,
+                        previous_model_name: Some(previous_model_name),
+                        announce: None,
+                        manual_reload_announce: false,
+                        selection_mode_after_success: None,
+                    },
+                );
+                let suffix = rollback
+                    .error
+                    .map(|error| format!("; config rollback failed: {error}"))
+                    .unwrap_or_default();
+                renderer.render(UiLine::Error(format!(
+                    "provider reload could not be started: {error}{suffix}"
+                )));
+                renderer.flush();
+                return false;
+            }
+            ctx.observed_config_revision = Some(commit.snapshot.revision.clone());
+            ctx.pending_provider_reload = Some(PendingProviderReload {
+                origin_generation,
+                desired_config: desired,
+                persisted_revision: Some(commit.snapshot.revision),
+                rollback_persisted_config,
+                rollback_runtime_config,
+                previous_model_name: Some(previous_model_name),
+                announce: Some(success_message),
+                manual_reload_announce: false,
+                selection_mode_after_success: None,
+            });
+            true
         }
         Err(e) => {
             renderer.render(UiLine::Error(
@@ -7838,7 +11465,228 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                 .into_owned(),
             ));
             renderer.flush();
+            false
         }
+    }
+}
+
+pub(crate) fn save_language_and_reload(
+    ctx: &mut LoopCtx,
+    locale: atomcode_config::locale::Locale,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    if ctx.config.language == Some(locale) && crate::i18n::current_locale() == locale {
+        if provider_transition_pending(ctx) {
+            renderer.render(UiLine::Error(
+                crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+            ));
+            renderer.flush();
+            return false;
+        }
+        let commit = match commit_language_without_reload(
+            &ctx.config_store,
+            ctx.observed_config_revision.as_ref(),
+            &ctx.config,
+            locale,
+        ) {
+            Ok(committed) => committed.commit,
+            Err(error) => {
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
+                        error: &error.to_string(),
+                    })
+                    .into_owned(),
+                ));
+                renderer.flush();
+                return false;
+            }
+        };
+        ctx.observed_config_revision = Some(commit.snapshot.revision);
+        let label = match locale {
+            atomcode_config::locale::Locale::En => "English",
+            atomcode_config::locale::Locale::ZhCn => "简体中文",
+        };
+        renderer.render(UiLine::CommandOutput(
+            crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
+                label,
+                locale: &locale.to_string(),
+            })
+            .into_owned(),
+        ));
+        renderer.flush();
+        return true;
+    }
+
+    let mut desired = ctx.config.clone();
+    desired.language = Some(locale);
+    save_and_reload(ctx, desired, renderer, String::new(), false)
+}
+
+/// Switch only this `CodingRuntime`. The shared `config.toml` default remains a
+/// startup default for other processes; the explicit provider-management action
+/// below is the only interactive path that changes it.
+pub(crate) fn select_provider_and_reload(
+    ctx: &mut LoopCtx,
+    provider_name: &str,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    if provider_transition_pending(ctx) {
+        return false;
+    }
+    let Some(selected) = ctx.config.providers.get(provider_name) else {
+        renderer.render(UiLine::Error(format!(
+            "provider {provider_name:?} is no longer available"
+        )));
+        renderer.flush();
+        return false;
+    };
+    let selected_model = selected.model.clone();
+    let mut desired = ctx.config.clone();
+    desired.default_provider = provider_name.to_string();
+    let origin_generation = ctx.runtime.current_generation();
+    atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+    if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+        atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        renderer.render(UiLine::Error(format!(
+            "provider reload could not be started: {error}"
+        )));
+        renderer.flush();
+        return false;
+    }
+
+    ctx.pending_provider_reload = Some(PendingProviderReload {
+        origin_generation,
+        desired_config: desired,
+        persisted_revision: None,
+        rollback_persisted_config: None,
+        rollback_runtime_config: None,
+        previous_model_name: None,
+        announce: Some(
+            crate::i18n::t(crate::i18n::Msg::ModelSwitched {
+                provider: provider_name,
+                model: &selected_model,
+            })
+            .into_owned(),
+        ),
+        manual_reload_announce: false,
+        selection_mode_after_success: Some(crate::ProviderSelectionMode::Pinned),
+    });
+    true
+}
+
+/// Persist the new default provider and reload only this runtime transactionally.
+/// Other opened runtimes remain pinned; sessions opened afterwards use the new
+/// default. Ephemeral providers remain current-runtime-only.
+pub(crate) fn set_default_provider_and_reload(
+    ctx: &mut LoopCtx,
+    provider_name: &str,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    if provider_transition_pending(ctx) {
+        return false;
+    }
+    let Some(selected) = ctx.config.providers.get(provider_name) else {
+        renderer.render(UiLine::Error(format!(
+            "provider {provider_name:?} is no longer available"
+        )));
+        renderer.flush();
+        return false;
+    };
+    if selected.ephemeral {
+        return select_provider_and_reload(ctx, provider_name, renderer);
+    }
+    let selected_model = selected.model.clone();
+    let store = ctx.config_store.clone();
+    let mut previous_persisted = None;
+    let commit = match store.update(|config| {
+        if !config.providers.contains_key(provider_name) {
+            anyhow::bail!("provider {provider_name:?} is no longer available");
+        }
+        previous_persisted = Some(config.clone());
+        config.default_provider = provider_name.to_string();
+        Ok(())
+    }) {
+        Ok(commit) => commit,
+        Err(error) => {
+            renderer.render(UiLine::Error(
+                crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
+                    error: &error.to_string(),
+                })
+                .into_owned(),
+            ));
+            renderer.flush();
+            return false;
+        }
+    };
+
+    let mut desired = commit.snapshot.config.clone();
+    for (name, provider) in &ctx.config.providers {
+        if provider.ephemeral {
+            desired
+                .providers
+                .entry(name.clone())
+                .or_insert_with(|| provider.clone());
+        }
+    }
+    let origin_generation = ctx.runtime.current_generation();
+    atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+    if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+        let rollback = rollback_pending_provider_reload(
+            ctx,
+            PendingProviderReload {
+                origin_generation,
+                desired_config: desired,
+                persisted_revision: Some(commit.snapshot.revision),
+                rollback_persisted_config: previous_persisted,
+                rollback_runtime_config: Some(ctx.config.clone()),
+                previous_model_name: Some(ctx.model_name.clone()),
+                announce: None,
+                manual_reload_announce: false,
+                selection_mode_after_success: None,
+            },
+        );
+        let suffix = rollback
+            .error
+            .map(|error| format!("; config rollback failed: {error}"))
+            .unwrap_or_default();
+        renderer.render(UiLine::Error(format!(
+            "provider reload could not be started: {error}{suffix}"
+        )));
+        renderer.flush();
+        return false;
+    }
+
+    ctx.observed_config_revision = Some(commit.snapshot.revision.clone());
+    ctx.pending_provider_reload = Some(PendingProviderReload {
+        origin_generation,
+        desired_config: desired,
+        persisted_revision: Some(commit.snapshot.revision),
+        rollback_persisted_config: previous_persisted,
+        rollback_runtime_config: Some(ctx.config.clone()),
+        previous_model_name: Some(ctx.model_name.clone()),
+        announce: Some(
+            crate::i18n::t(crate::i18n::Msg::ModelSwitchedAndDefault {
+                provider: provider_name,
+                model: &selected_model,
+            })
+            .into_owned(),
+        ),
+        manual_reload_announce: false,
+        selection_mode_after_success: Some(crate::ProviderSelectionMode::Pinned),
+    });
+    true
+}
+
+pub(crate) fn apply_persisted_config(
+    ctx: &mut LoopCtx,
+    config: Config,
+    revision: ConfigRevision,
+    renderer: &mut dyn Renderer,
+) {
+    if let Err(error) = reconcile_persisted_config(ctx, ConfigSnapshot { config, revision }, false)
+    {
+        renderer.render(UiLine::Error(error.to_string()));
+        renderer.flush();
     }
 }
 
@@ -7853,6 +11701,7 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
 /// up within a frame.
 fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, ctx: &LoopCtx) {
     app.message_queue.clear();
+    app.queue_drain_authorized = false;
     if let Some(msg) = app.state.last_submitted_message.take() {
         // Cursor at the end (edit-and-resend), but suppress the slash menu
         // for one frame so a restored `/command` doesn't re-pop the list.
@@ -7884,7 +11733,7 @@ fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, 
 ///   - `/goal clear|stop|off|reset|none|cancel` — halt a server-driven `/goal`
 ///     loop. Load-bearing: a goal keeps the TUI in Streaming (see `on_thinking`)
 ///     where commands are otherwise blocked, so without this a typed
-///     `/goal clear` never reaches the bridge and the goal is uninterruptible by
+///     `/goal clear` never reaches the runtime and the goal is uninterruptible by
 ///     command (Esc/Ctrl+C bypass the command system; a typed command does not).
 ///
 /// A NEW goal (`/goal <condition>`) and `/goal status` are intentionally NOT
@@ -7919,7 +11768,34 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
             return Some(("loop".to_string(), arg.trim().to_string()));
         }
     }
+    // READ-ONLY / METADATA commands that are SAFE mid-turn — they don't mutate
+    // the running conversation. This is the reported
+    // request: rename the session or check usage without waiting for the turn to end.
+    //   /status, /diff, /cost, /usage — transient footer reports below the input box;
+    //   Esc dismisses the report without cancelling the live turn. Mid-turn they land
+    //   in the footer snapshot, not conversation scrollback, so live tool output can't
+    //   interleave with them. `/usage` avoids its interactive modal here because
+    //   streaming redraws would paint over that overlay.
+    if matches!(
+        cmd.to_ascii_lowercase().as_str(),
+        "status" | "cost" | "diff" | "usage"
+    ) && arg.trim().is_empty()
+    {
+        return Some((cmd.to_ascii_lowercase(), String::new()));
+    }
+    //   /rename <name> — relabels the session in the catalog. Safe mid-turn: it sets
+    //   `user_renamed`, so a mid-turn AI auto-name suggestion from the running turn
+    //   can't clobber it, and the catalog write is independent of the turn's
+    //   conversation persistence. A bare `/rename` (no name) is NOT run — it would just
+    //   error, and errors mid-stream are noise.
+    if cmd.eq_ignore_ascii_case("rename") && !arg.trim().is_empty() {
+        return Some(("rename".to_string(), arg.trim().to_string()));
+    }
     None
+}
+
+fn provider_transition_blocks_streaming_command(cmd: &str, pending: bool) -> bool {
+    pending && cmd == "bg"
 }
 
 fn handle_streaming_key(
@@ -7975,6 +11851,44 @@ fn handle_streaming_key(
             app.state.spinner_label
         );
         restore_cancelled_message_to_buf(app, renderer, ctx);
+        return Ok(());
+    }
+
+    // A live `/usage` report owns the navigation keys: Tab/←→ cycle between its
+    // Current/Overview/Models tabs, re-rendering in place. Consume before
+    // cancellation so switching tabs can never stop the turn. Only when the
+    // input box is empty — a queued draft keeps its own keys (digits included).
+    if handle_footer_usage_tab_key(
+        &mut app.state,
+        code,
+        app.buf.text.is_empty(),
+        ctx.caps.colors,
+        ctx.caps.unicode_symbols,
+    ) {
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+        return Ok(());
+    }
+
+    // A visible read-only report owns the first bare Esc. Dismiss it and
+    // consume the key before the cancellation path below so inspecting
+    // `/usage` or `/cost` can never make Esc stop the running response.
+    if code == KeyCode::Esc && modifiers.is_empty() && dismiss_footer_command_output(&mut app.state)
+    {
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
         return Ok(());
     }
 
@@ -8070,6 +11984,77 @@ fn handle_streaming_key(
                 );
                 return Ok(());
             }
+            // `@`-mention selection mid-stream: insert `@<full_path>` at the
+            // token range and STAY in the input box. Without this arm Enter
+            // fell through to `classify` → `Action::Submit` → `BufferResult::Commit`,
+            // which mid-stream steers/queues the half-finished `@…` token as a
+            // message — the user's selection was "sent" instead of completed.
+            // Mirrors `handle_idle_key`'s @-mention completion branch. Slash
+            // menu selection is handled separately below so its highlighted
+            // command reaches the common streaming command gate.
+            //
+            // Xshell over SSH reproduces this most readily (the streaming-phase
+            // menu is the only path where @-mention + Enter lands here), but
+            // the bug is terminal-agnostic — any terminal that opens the
+            // streaming @-mention menu hits the same missing arm.
+            KeyCode::Enter | KeyCode::Tab
+                if !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+                    && !items.is_empty()
+                    && file_index::detect_at_mention_range(&app.buf.text, app.buf.cursor)
+                        .is_some() =>
+            {
+                let (at_pos, end) =
+                    file_index::detect_at_mention_range(&app.buf.text, app.buf.cursor)
+                        .expect("guarded above");
+                let selected_path = items[app.menu.selected].0.clone();
+                let replacement = file_index::format_at_mention_replacement(&selected_path);
+                app.buf.text.replace_range(at_pos..end, &replacement);
+                app.buf.cursor = at_pos + replacement.len();
+                app.menu.selected = 0;
+                // Menu shape may have changed — surface on next redraw via
+                // draw_spinner_now (the streaming footer stays visible).
+                draw_spinner_now(
+                    &mut app.state,
+                    &app.buf,
+                    ctx,
+                    renderer,
+                    app.message_queue.len(),
+                    app.menu.selected,
+                );
+                return Ok(());
+            }
+            KeyCode::Enter | KeyCode::Tab
+                if !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+                    && !items.is_empty() =>
+            {
+                let name = items[app.menu.selected].0.clone();
+                let needs_args = ctx
+                    .commands
+                    .find(&name)
+                    .map(|command| command.needs_args)
+                    .unwrap_or(false);
+                if let Some((completed, submit)) =
+                    streaming_top_level_slash_selection(&app.buf.text, &name, needs_args, code)
+                {
+                    app.buf.text = completed;
+                    app.buf.cursor = app.buf.text.len();
+                    app.menu.selected = 0;
+                    if !submit {
+                        draw_spinner_now(
+                            &mut app.state,
+                            &app.buf,
+                            ctx,
+                            renderer,
+                            app.message_queue.len(),
+                            app.menu.selected,
+                        );
+                        return Ok(());
+                    }
+                    // Enter on an argument-free command continues through the
+                    // common Commit path below. The buffer now contains the
+                    // highlighted command rather than the typed prefix.
+                }
+            }
             _ => {} // fall through to buffer edits
         }
     }
@@ -8145,8 +12130,38 @@ fn handle_streaming_key(
             // `streaming_executable_slash`): `/bg` (background the current turn)
             // and `/goal`'s halt sub-commands — a server-driven `/goal` keeps the
             // TUI in Streaming, so without this a typed `/goal clear` could never
-            // reach the bridge and the goal was uninterruptible by command.
+            // reach the runtime and the goal was uninterruptible by command.
             if let Some((cmd, arg)) = streaming_executable_slash(&line) {
+                if provider_transition_blocks_streaming_command(
+                    &cmd,
+                    provider_transition_pending(ctx),
+                ) {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+                    ));
+                    renderer.flush();
+                    // Keep the command in the input buffer: the provider
+                    // terminal may switch foreground runtime identity, and
+                    // clearing `/bg` here would turn a rejected action into a
+                    // silent loss.
+                    draw_spinner_now(
+                        &mut app.state,
+                        &app.buf,
+                        ctx,
+                        renderer,
+                        app.message_queue.len(),
+                        app.menu.selected,
+                    );
+                    return Ok(());
+                }
+                // Only the TURN-ENDING commands (bg backgrounds it; quit/exit kill it;
+                // goal/loop halt the driver that owns the stream) tear down the turn's
+                // live UI state. Everything else the allowlist admits is a read-only
+                // report that MUST preserve that state (the
+                // type-ahead queue, in-flight tools, thinking/reasoning buffers). Framed
+                // as "read-only is the safe default" so a future allowlisted report can't
+                // silently corrupt a running turn by being forgotten in this list.
+                let readonly = !matches!(cmd.as_str(), "bg" | "quit" | "exit" | "goal" | "loop");
                 if matches!(cmd.as_str(), "quit" | "exit") {
                     cancel_active_turn(ctx);
                     clear_capturing_modal_on_cancel(app);
@@ -8160,13 +12175,31 @@ fn handle_streaming_key(
                     &mut app.active_modal,
                     &mut app.setup_pending,
                 )?;
-                app.message_queue.clear();
-                app.pending_tools.clear();
-                app.think.reset();
-                app.reasoning_buffer.clear();
+                if !readonly {
+                    app.message_queue.clear();
+                    app.queue_drain_authorized = false;
+                    app.pending_tools.clear();
+                    app.think.reset();
+                    app.reasoning_buffer.clear();
+                }
                 app.buf.text.clear();
                 app.buf.cursor = 0;
                 app.menu.selected = 0;
+                if readonly {
+                    // Restore the streaming footer/spinner after executing the report.
+                    // Mid-turn read-only reports (`/usage`, `/cost`, `/status`, `/diff`)
+                    // are all carried in the footer snapshot itself, below the input
+                    // box — they must not enter conversation scrollback, where live
+                    // tool output would interleave with them.
+                    draw_spinner_now(
+                        &mut app.state,
+                        &app.buf,
+                        ctx,
+                        renderer,
+                        app.message_queue.len(),
+                        app.menu.selected,
+                    );
+                }
                 return Ok(());
             }
             let is_known_slash = parse_slash_line(&line)
@@ -8228,7 +12261,7 @@ fn handle_streaming_key(
                     q_markers.push(n);
                 }
             }
-            if ctx.sync_session.is_none() {
+            if ctx.live_binding.is_none() {
                 // Same as the idle submit path: echo the EXACT text queued for
                 // the agent (`expanded`) — the full pasted body, no
                 // `[Pasted #N …]` placeholder — while history keeps the folded
@@ -8245,22 +12278,23 @@ fn handle_streaming_key(
                 // queued message re-expands its folded paste (#843).
                 pastes: app.buf.pastes.clone(),
             });
-            match midturn_submit_route(true, ctx.sync_session.is_some()) {
+            match midturn_submit_route(true) {
                 SubmitRoute::SteerNow => {
                     // Steer into the running turn: the kernel folds this at the next
                     // round boundary (see AgentEvent::Steered). No local queue. Count
                     // it as PENDING now; the Steered event drains it once folded.
-                    ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                        text: expanded,
-                        images: q_images,
-                        image_markers: q_markers,
-                    }).ok();
-                    app.state.on_steer_sent();
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  ↳ {}: {}\n",
-                        crate::i18n::t(crate::i18n::Msg::SteerFoldedHint),
-                        line
-                    )));
+                    if submit_foreground_runtime(ctx, runtime_user_input(expanded, q_images)) {
+                        app.state.on_steer_sent();
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  ↳ {}: {}\n",
+                            crate::i18n::t(crate::i18n::Msg::SteerFoldedHint),
+                            line
+                        )));
+                    } else {
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable).into_owned(),
+                        ));
+                    }
                 }
                 _ => {
                     app.message_queue.push_back(crate::state::QueuedMessage {
@@ -8306,7 +12340,9 @@ fn handle_streaming_key(
 /// NOT for the `/upgrade` restart path: that must exit via
 /// `ExitReason::UpgradeRestart` to re-exec, so it sends `Shutdown` directly.
 fn arm_shutdown_watchdog(ctx: &mut LoopCtx) {
-    ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+    ctx.runtime
+        .dispatch(atomcode_coding::DriverCommand::Shutdown)
+        .ok();
     // Don't re-arm (push the deadline back) on a repeated /quit — keep the
     // earliest deadline so spamming the key can't indefinitely defer the exit.
     if ctx.shutdown_deadline.is_none() {
@@ -8346,60 +12382,133 @@ fn dismiss_orphan_capturing_modal(app: &mut App, ctx: &LoopCtx, renderer: &mut d
     }
 }
 
-/// Cancel the executor that owns the foreground turn.
-///
-/// In sync mode the turn belongs to `LiveSession`; the local agent is idle and
-/// sending it `AgentCommand::Cancel` is a no-op. Outside sync mode the local
-/// agent remains the owner and keeps the existing command-channel path.
+/// Cancel the bound Coding Runtime through the hub, or the standalone runtime directly.
 fn cancel_active_turn(ctx: &LoopCtx) -> bool {
-    if ctx.sync_forwarder.is_some() {
-        let Some(session) = atomcode_daemon::current_live_session() else {
-            return false;
-        };
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(session.cancel_current_turn())
-        })
+    if ctx.live_binding.is_some() {
+        atomcode_daemon::native_live::cancel().is_ok()
     } else {
-        ctx.agent.cmd_tx.send(AgentCommand::Cancel).is_ok()
+        ctx.runtime
+            .dispatch(atomcode_coding::DriverCommand::Cancel)
+            .is_ok()
     }
 }
 
-/// Deliver a tool-approval decision to whichever turn is actually waiting.
-///
-/// In **sync mode** the running turn belongs to the in-process LiveSession
-/// coordinator (`DaemonTurnExecutor`), not this TUI's own agent — so the
-/// decision must go to the LiveSession's approver slot
-/// (`current_live_session().approve`), exactly like the webui's
-/// `/live/permission`. Sending it to the TUI agent (which isn't running this
-/// turn) leaves the tool blocked forever: the "Running … 141s, and the webui
-/// approval card never closes" bug. `ApproveToolAlways` sends `AllowAlways` so
-/// the LiveSession's decider persists a session grant (grant_session /
-/// grant_session_scope), exactly like the webui's "always allow this session"
-/// path. In normal (non-sync) mode the decision goes to the TUI agent
-/// as before.
-fn deliver_approval(ctx: &mut LoopCtx, cmd: AgentCommand) {
-    if ctx.sync_forwarder.is_some() {
-        let decision = approval_command_to_decision(&cmd);
-        if let Some(session) = atomcode_daemon::current_live_session() {
-            let _ = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(session.approve(decision))
-            });
+/// Deliver a tool-approval decision to the pending request on the same runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApprovalChoice {
+    Allow,
+    AllowAlways,
+    Deny,
+}
+
+fn deliver_approval(ctx: &mut LoopCtx, choice: ApprovalChoice) {
+    if let Some(id) = ctx.pending_runtime_request_id.take() {
+        use atomcode_capabilities::tools::ApprovalResponse;
+        let response = match choice {
+            ApprovalChoice::Allow => ApprovalResponse::allow(),
+            ApprovalChoice::AllowAlways => ApprovalResponse::allow_always(),
+            ApprovalChoice::Deny => ApprovalResponse::deny(),
+        };
+        let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+        if ctx.live_binding.is_some() {
+            if let Err(error) = atomcode_daemon::native_live::respond(id, value) {
+                crate::tuix_trace!("LIVE", "approval response failed: {error:?}");
+            }
+        } else {
+            if let Err(error) = ctx
+                .runtime
+                .dispatch(atomcode_coding::DriverCommand::Respond { id, value })
+            {
+                crate::tuix_trace!("LIVE", "approval response failed: {error:?}");
+            }
+        }
+    }
+}
+
+/// Send a `request_user_input` answer through the native runtime protocol.
+fn deliver_user_input(
+    ctx: &mut LoopCtx,
+    id: u64,
+    resp: atomcode_capabilities::tools::request_user_input::UserInputResponse,
+) {
+    let value = serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null);
+    if ctx.pending_runtime_request_id == Some(id) {
+        ctx.pending_runtime_request_id = None;
+    }
+    if ctx.live_binding.is_some() {
+        if let Err(error) = atomcode_daemon::native_live::respond(id, value) {
+            crate::tuix_trace!("LIVE", "user-input response failed: {error:?}");
         }
     } else {
-        ctx.agent.cmd_tx.send(cmd).ok();
+        if let Err(error) = ctx
+            .runtime
+            .dispatch(atomcode_coding::DriverCommand::Respond { id, value })
+        {
+            crate::tuix_trace!("LIVE", "user-input response failed: {error:?}");
+        }
     }
 }
 
-/// Map an approval `AgentCommand` to the `PermissionDecision` the sync-mode
-/// LiveSession applies. Pulled out of `deliver_approval` as a pure function so
-/// the command↔decision contract (notably that an auto-approve sends `Allow`,
-/// not `Deny`/`Ask`) is unit-testable without building a `LoopCtx`.
-fn approval_command_to_decision(cmd: &AgentCommand) -> atomcode_core::tool::PermissionDecision {
+/// Fail-close: respond with `Null` so the tool round-trip resolves as
+/// "not supported in this environment" instead of hanging the turn.
+fn deliver_user_input_null(ctx: &mut LoopCtx, id: u64) {
+    if ctx.pending_runtime_request_id == Some(id) {
+        ctx.pending_runtime_request_id = None;
+    }
+    if ctx.live_binding.is_some() {
+        if let Err(error) = atomcode_daemon::native_live::respond(id, serde_json::Value::Null) {
+            crate::tuix_trace!("LIVE", "null user-input response failed: {error:?}");
+        }
+    } else {
+        if let Err(error) = ctx
+            .runtime
+            .dispatch(atomcode_coding::DriverCommand::Respond {
+                id,
+                value: serde_json::Value::Null,
+            })
+        {
+            crate::tuix_trace!("LIVE", "null user-input response failed: {error:?}");
+        }
+    }
+}
+
+/// Pure predicate: should a `request_user_input` tool call be auto-skipped
+/// without showing the interactive panel?
+///
+/// Only Bypass / 免审批 mode (`Mode::Auto`) skips the panel.  Build and Plan
+/// modes always show the panel (asking during coding/planning is intentional).
+/// Extracted as a pure function so the contract is unit-testable without a
+/// full `LoopCtx`.
+#[inline]
+pub(crate) fn user_input_should_auto_skip(mode: crate::state::AgentMode) -> bool {
+    mode.is_auto()
+}
+
+/// Pure mapping used by approval compatibility tests.
+#[cfg(test)]
+fn approval_choice_to_decision(choice: ApprovalChoice) -> atomcode_core::tool::PermissionDecision {
     use atomcode_core::tool::PermissionDecision;
-    match cmd {
-        AgentCommand::ApproveTool => PermissionDecision::Allow,
-        AgentCommand::ApproveToolAlways => PermissionDecision::AllowAlways,
-        _ => PermissionDecision::Deny,
+    match choice {
+        ApprovalChoice::Allow => PermissionDecision::Allow,
+        ApprovalChoice::AllowAlways => PermissionDecision::AllowAlways,
+        ApprovalChoice::Deny => PermissionDecision::Deny,
+    }
+}
+
+fn get_approval_cache_key(tool: &str, args: &str) -> String {
+    if tool == "bash" {
+        let command = if let Ok(val) = serde_json::from_str::<serde_json::Value>(args) {
+            val.get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            args.to_string()
+        };
+        let normalized = atomcode_capabilities::tools::normalize_command_for_grant(&command);
+        format!("bash::{normalized}")
+    } else {
+        format!("{tool}::")
     }
 }
 
@@ -8413,6 +12522,10 @@ pub(crate) fn build_approval_options(tool: &str) -> Vec<crate::state::ApprovalOp
     // Display names (snake→Pascal) of the directory-scoped write tools.
     let always_label = if matches!(tool, "WriteFile" | "EditFile") {
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowFolder).into_owned()
+    } else if tool == "bash" {
+        // bash's grant is scoped to THIS COMMAND (not the whole tool), so don't imply
+        // "Always allow bash" — say "this command".
+        crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned()
     } else {
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool }).into_owned()
     };
@@ -8437,25 +12550,25 @@ pub(crate) fn build_approval_options(tool: &str) -> Vec<crate::state::ApprovalOp
 
 /// The `AgentCommand` for a chosen approval option kind. Pure seam so the
 /// key handler's decision mapping is unit-testable.
-pub(crate) fn approval_kind_to_command(kind: crate::state::ApprovalKind) -> AgentCommand {
+fn approval_kind_to_choice(kind: crate::state::ApprovalKind) -> ApprovalChoice {
     use crate::state::ApprovalKind;
     match kind {
-        ApprovalKind::AllowOnce => AgentCommand::ApproveTool,
-        ApprovalKind::AlwaysAllow => AgentCommand::ApproveToolAlways,
-        ApprovalKind::Deny => AgentCommand::DenyTool,
+        ApprovalKind::AllowOnce => ApprovalChoice::Allow,
+        ApprovalKind::AlwaysAllow => ApprovalChoice::AllowAlways,
+        ApprovalKind::Deny => ApprovalChoice::Deny,
     }
 }
 
 /// The approval command a BYPASS-mode TUI issues for an `ApprovalNeeded` it
 /// auto-resolves. A named function so the `handle_agent_event` short-circuit
 /// and its test share one source of truth.
-fn bypass_approval_command() -> AgentCommand {
-    AgentCommand::ApproveTool
+fn bypass_approval_choice() -> ApprovalChoice {
+    ApprovalChoice::Allow
 }
 
 #[cfg(test)]
 mod bypass_approval_tests {
-    use super::{approval_command_to_decision, bypass_approval_command, AgentCommand};
+    use super::{approval_choice_to_decision, bypass_approval_choice, ApprovalChoice};
     use atomcode_core::tool::PermissionDecision;
 
     // The auto-approve invariant now lives on `approval_should_auto_bypass(mode)`
@@ -8468,7 +12581,7 @@ mod bypass_approval_tests {
     // sailing through — exactly the regression this test pins.
     #[test]
     fn bypass_command_resolves_to_allow() {
-        let decision = approval_command_to_decision(&bypass_approval_command());
+        let decision = approval_choice_to_decision(bypass_approval_choice());
         assert!(
             matches!(decision, PermissionDecision::Allow),
             "BYPASS must auto-approve with Allow, got {decision:?}"
@@ -8479,15 +12592,15 @@ mod bypass_approval_tests {
     #[test]
     fn approval_command_decision_mapping() {
         assert!(matches!(
-            approval_command_to_decision(&AgentCommand::ApproveTool),
+            approval_choice_to_decision(ApprovalChoice::Allow),
             PermissionDecision::Allow
         ));
         assert!(matches!(
-            approval_command_to_decision(&AgentCommand::ApproveToolAlways),
+            approval_choice_to_decision(ApprovalChoice::AllowAlways),
             PermissionDecision::AllowAlways
         ));
         assert!(matches!(
-            approval_command_to_decision(&AgentCommand::DenyTool),
+            approval_choice_to_decision(ApprovalChoice::Deny),
             PermissionDecision::Deny
         ));
     }
@@ -8497,9 +12610,19 @@ mod bypass_approval_tests {
         use crate::state::ApprovalKind;
         let opts = super::build_approval_options("bash");
         assert_eq!(opts.len(), 3);
-        assert_eq!((opts[0].kind, opts[0].accel), (ApprovalKind::AllowOnce, 'y'));
-        assert_eq!((opts[1].kind, opts[1].accel), (ApprovalKind::AlwaysAllow, 'a'));
-        assert!(opts[1].label.contains("bash"), "always-allow label names the tool: {}", opts[1].label);
+        assert_eq!(
+            (opts[0].kind, opts[0].accel),
+            (ApprovalKind::AllowOnce, 'y')
+        );
+        assert_eq!(
+            (opts[1].kind, opts[1].accel),
+            (ApprovalKind::AlwaysAllow, 'a')
+        );
+        assert_eq!(
+            opts[1].label,
+            crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned(),
+            "bash grants are command-scoped and must not imply tool-wide approval"
+        );
         assert_eq!((opts[2].kind, opts[2].accel), (ApprovalKind::Deny, 'n'));
     }
 
@@ -8523,9 +12646,460 @@ mod bypass_approval_tests {
     #[test]
     fn approval_kind_command_mapping() {
         use crate::state::ApprovalKind;
-        assert!(matches!(super::approval_kind_to_command(ApprovalKind::AllowOnce), AgentCommand::ApproveTool));
-        assert!(matches!(super::approval_kind_to_command(ApprovalKind::AlwaysAllow), AgentCommand::ApproveToolAlways));
-        assert!(matches!(super::approval_kind_to_command(ApprovalKind::Deny), AgentCommand::DenyTool));
+        assert!(matches!(
+            super::approval_kind_to_choice(ApprovalKind::AllowOnce),
+            ApprovalChoice::Allow
+        ));
+        assert!(matches!(
+            super::approval_kind_to_choice(ApprovalKind::AlwaysAllow),
+            ApprovalChoice::AllowAlways
+        ));
+        assert!(matches!(
+            super::approval_kind_to_choice(ApprovalKind::Deny),
+            ApprovalChoice::Deny
+        ));
+    }
+}
+
+#[cfg(test)]
+mod user_input_key_tests {
+    use super::user_input_response_for;
+    use crate::state::UserInputPanel;
+    use atomcode_capabilities::tools::request_user_input::{
+        UserInputMode, UserInputOption, UserInputRequest,
+    };
+    use crossterm::event::KeyCode;
+
+    fn panel(mode: UserInputMode) -> UserInputPanel {
+        UserInputPanel::new(
+            42,
+            &UserInputRequest {
+                header: "H".into(),
+                question: "Q?".into(),
+                mode,
+                options: vec![
+                    UserInputOption {
+                        label: "A".into(),
+                        description: None,
+                    },
+                    UserInputOption {
+                        label: "B".into(),
+                        description: None,
+                    },
+                ],
+                custom: true,
+            },
+        )
+    }
+
+    // Esc always declines, regardless of mode.
+    #[test]
+    fn esc_declines_in_every_mode() {
+        for m in [
+            UserInputMode::Single,
+            UserInputMode::Multiple,
+            UserInputMode::Text,
+        ] {
+            let resp = user_input_response_for(&panel(m), KeyCode::Esc).expect("Esc resolves");
+            assert!(resp.declined, "Esc must decline");
+        }
+    }
+
+    // Single: cursor on option 2 (B) + Enter → {selected:["B"]} (cursor-as-radio).
+    #[test]
+    fn single_enter_on_option_submits_immediately() {
+        let mut p = panel(UserInputMode::Single);
+        p.move_down(); // cursor → "B" (index 1)
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter on option submits");
+        assert!(!resp.declined);
+        assert_eq!(resp.selected, vec!["B".to_string()]);
+        assert_eq!(resp.text, None);
+    }
+
+    // Single: cursor on the "Other" row, custom_text="foo", Enter → {selected:["foo"]}.
+    #[test]
+    fn single_custom_row_enter_submits_custom_text() {
+        let mut p = panel(UserInputMode::Single);
+        // options=2 → "Other" row is index 2.
+        p.move_down(); // → B
+        p.move_down(); // → Other row
+        assert!(p.is_other_row());
+        p.push_custom('f');
+        p.push_custom('o');
+        p.push_custom('o');
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("custom text submits");
+        assert!(!resp.declined);
+        assert_eq!(resp.selected, vec!["foo".to_string()]);
+    }
+
+    // Single: cursor on "Other" row, empty custom_text → Enter is a no-op (None).
+    #[test]
+    fn single_custom_row_empty_enter_is_noop() {
+        let mut p = panel(UserInputMode::Single);
+        p.move_down();
+        p.move_down();
+        assert!(p.is_other_row());
+        assert!(p.custom_text.is_empty());
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "empty custom text on Other row must not submit"
+        );
+    }
+
+    // Single: move_down() stops at the "Other" row (options.len()); no submit row.
+    #[test]
+    fn single_has_no_submit_row() {
+        let mut p = panel(UserInputMode::Single);
+        for _ in 0..10 {
+            p.move_down();
+        }
+        assert_eq!(
+            p.cursor,
+            p.options.len(),
+            "single cursor must stop at Other row"
+        );
+        assert!(p.is_other_row(), "last row is the Other row");
+    }
+
+    // Single: typing a custom answer on the "Other" row submits custom_text.
+    #[test]
+    fn single_custom_text_supersedes_option() {
+        let mut p = panel(UserInputMode::Single);
+        p.move_down(); // → B
+        p.move_down(); // → Other row
+        assert!(p.is_other_row());
+        p.push_custom('h');
+        p.push_custom('i');
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("custom text submits");
+        assert_eq!(resp.selected, vec!["hi".to_string()]);
+    }
+
+    // Multiple: Enter on the Submit row yields all checked labels + appended
+    // custom text when non-empty. Enter on option/Other rows returns None (caller
+    // toggles concrete options; Other row Enter is a no-op).
+    #[test]
+    fn multiple_submit_appends_custom_text() {
+        let mut p = panel(UserInputMode::Multiple);
+        p.toggle(); // check "A" (cursor 0)
+        p.move_down();
+        p.toggle(); // check "B" (cursor 1)
+        p.push_custom('x'); // custom_text="x"; no separate auto-check needed
+                            // Enter on option/Other rows is NOT a submit — returns None.
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "Enter on option row must NOT submit in multiple mode"
+        );
+        // Move to Submit row (index 3 for 2-option panel: options 0,1 + Other 2 + Submit 3).
+        p.move_down(); // cursor 2 (Other)
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "Enter on Other row must NOT submit in multiple mode"
+        );
+        p.move_down(); // cursor 3 (Submit)
+        assert!(p.is_submit_row(), "cursor should be on Submit row");
+        let resp =
+            user_input_response_for(&p, KeyCode::Enter).expect("Enter on Submit row resolves");
+        assert_eq!(
+            resp.selected,
+            vec!["A".to_string(), "B".to_string(), "x".to_string()]
+        );
+        assert_eq!(resp.text, None);
+    }
+
+    // FIX 1: Multiple — typing custom text then Submit includes it REGARDLESS of
+    // any prior Enter on the Other row (Enter on Other is a no-op; inclusion is
+    // text-derived, so it cannot be toggled off by Enter).
+    #[test]
+    fn multiple_custom_text_included_after_enter_on_other_row() {
+        let mut p = panel(UserInputMode::Multiple);
+        p.toggle(); // check "A"
+                    // Move to Other row and type custom text.
+        p.move_down(); // cursor 1 (B)
+        p.move_down(); // cursor 2 (Other)
+        assert!(p.is_other_row());
+        p.push_custom('h');
+        p.push_custom('i');
+        // Enter on Other row must be a no-op — does NOT toggle anything off.
+        // (Simulated by user_input_response_for returning None, which is what
+        // handle_user_input_key would see and NOT call toggle().)
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "Enter on Other row must NOT submit (or toggle)"
+        );
+        // custom_text is still "hi" — not wiped by Enter.
+        assert_eq!(p.custom_text, "hi");
+        // Navigate to Submit and confirm.
+        p.move_down(); // cursor 3 (Submit)
+        assert!(p.is_submit_row());
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter on Submit resolves");
+        // Both checked "A" and custom "hi" must appear.
+        assert!(
+            resp.selected.contains(&"A".to_string()),
+            "checked option included"
+        );
+        assert!(
+            resp.selected.contains(&"hi".to_string()),
+            "custom text included despite Enter on Other"
+        );
+    }
+
+    // FIX 1: Multiple — number key on Other row's index moves cursor (not toggle).
+    #[test]
+    fn multiple_number_key_on_other_index_moves_cursor() {
+        let mut p = panel(UserInputMode::Multiple);
+        assert_eq!(p.cursor, 0);
+        // The Other row is index 2 (options.len() for 2-option panel), number key '3'.
+        // Simulating what handle_user_input_key does: idx == other_index → set cursor.
+        p.cursor = p.other_index(); // simulate number key '3' moving cursor to Other
+        assert!(p.is_other_row(), "cursor moved to Other row");
+        // No checkbox was toggled — checked[other_index] should still be false
+        // (but that field is unused for Other; the invariant is that custom_text is empty).
+        assert!(
+            p.custom_text.is_empty(),
+            "custom_text untouched by cursor move"
+        );
+        // build_response with nothing checked and no custom text → None.
+        // Move to Submit.
+        p.move_down();
+        assert!(p.is_submit_row());
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "empty Other + nothing checked → no-op"
+        );
+    }
+
+    // Text: Enter yields the buffer via `text`, never `selected`.
+    #[test]
+    fn text_enter_yields_buffer() {
+        let mut p = panel(UserInputMode::Text);
+        p.text.push_str("hi there");
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter resolves");
+        assert!(!resp.declined);
+        assert!(resp.selected.is_empty());
+        assert_eq!(resp.text.as_deref(), Some("hi there"));
+    }
+
+    // Navigation / typing keys do NOT resolve (return None so the caller mutates
+    // in place instead of closing the panel).
+    #[test]
+    fn navigation_keys_do_not_resolve() {
+        assert!(user_input_response_for(&panel(UserInputMode::Single), KeyCode::Up).is_none());
+        assert!(user_input_response_for(&panel(UserInputMode::Single), KeyCode::Down).is_none());
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Multiple), KeyCode::Char(' ')).is_none()
+        );
+        assert!(user_input_response_for(&panel(UserInputMode::Text), KeyCode::Char('x')).is_none());
+        assert!(user_input_response_for(&panel(UserInputMode::Text), KeyCode::Backspace).is_none());
+    }
+
+    // Ctrl+C must NOT be handled by `user_input_response_for` (which is
+    // modifier-unaware): the plain `Char('c')` key must pass through as None so
+    // it does not accidentally type 'c' into a text buffer.  The actual Ctrl+C
+    // cancel path is handled upstream in `handle_user_input_key` before this
+    // function is called.
+    #[test]
+    fn ctrl_c_char_does_not_resolve_via_pure_fn() {
+        // Char('c') without a modifier check is a navigation/typing key → None.
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Text), KeyCode::Char('c')).is_none(),
+            "Char('c') alone must not resolve — Ctrl+C is handled upstream with modifier check"
+        );
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Single), KeyCode::Char('c')).is_none(),
+        );
+    }
+
+    // Ctrl+C sends a declined response — verify the shape UserInputResponse::declined()
+    // produces, since that is what handle_user_input_key delivers on Ctrl+C.
+    #[test]
+    fn ctrl_c_delivers_declined_response() {
+        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
+        let resp = UserInputResponse::declined();
+        assert!(resp.declined, "Ctrl+C must produce a declined response");
+        assert!(
+            resp.selected.is_empty(),
+            "declined response must have no selections"
+        );
+        assert!(resp.text.is_none(), "declined response must have no text");
+    }
+
+    // FIX 4: Text mode — Enter with an empty buffer is a no-op (panel stays open).
+    #[test]
+    fn text_empty_enter_is_noop() {
+        let p = panel(UserInputMode::Text);
+        assert!(p.text.is_empty());
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "Enter on an empty text buffer must not submit"
+        );
+    }
+
+    // FIX 3: Multiple mode — Enter on Submit row with nothing checked is a no-op.
+    #[test]
+    fn multiple_empty_submit_is_noop() {
+        let mut p = panel(UserInputMode::Multiple);
+        // Move to the Submit row (options.len()+1 = 3 for 2-option panel).
+        for _ in 0..=p.options.len() {
+            p.move_down();
+        }
+        assert!(p.is_submit_row(), "cursor must be on Submit row");
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "submit with nothing selected must be a no-op"
+        );
+    }
+
+    // Single: number key '2' selects the 2nd option's label via cursor-as-radio.
+    #[test]
+    fn single_number_key_selects_option() {
+        let mut p = panel(UserInputMode::Single);
+        // Simulate the number-key handler: single → move cursor to idx.
+        p.cursor = 1; // '2' → index 1 ("B")
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter submits");
+        assert_eq!(resp.selected, vec!["B".to_string()]);
+    }
+
+    // Multiple: toggle_index flips a specific row's checkbox.
+    #[test]
+    fn multiple_toggle_index_flips_checkbox() {
+        let mut p = panel(UserInputMode::Multiple);
+        p.toggle_index(0); // '1' → check "A"
+        p.toggle_index(1); // '2' → check "B"
+        p.toggle_index(0); // '1' again → uncheck "A"
+                           // Navigate to Submit row and confirm.
+        for _ in 0..=p.options.len() {
+            p.move_down();
+        }
+        assert!(p.is_submit_row(), "cursor must be on Submit row");
+        let resp =
+            user_input_response_for(&p, KeyCode::Enter).expect("Enter on Submit row resolves");
+        assert_eq!(resp.selected, vec!["B".to_string()]);
+    }
+
+    // Multiple: cursor on an option row + Enter → returns None (does NOT submit;
+    // handle_user_input_key toggles the row). Caller must be on Submit row to confirm.
+    #[test]
+    fn multiple_enter_on_option_row_does_not_submit() {
+        let mut p = panel(UserInputMode::Multiple);
+        p.toggle(); // check "A" at cursor 0
+                    // Enter on cursor 0 (option "A") must NOT resolve.
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "Enter on option row in multiple must NOT submit"
+        );
+        p.move_down(); // cursor 1 (option "B")
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "Enter on option row B in multiple must NOT submit"
+        );
+        p.move_down(); // cursor 2 (Other)
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "Enter on Other row in multiple must NOT submit"
+        );
+    }
+
+    // Multiple: move_down() can reach the Submit row (last row = options.len()+1).
+    #[test]
+    fn multiple_move_down_reaches_submit_row() {
+        let mut p = panel(UserInputMode::Multiple);
+        // 2 options + Other + Submit → last navigable index = 3.
+        for _ in 0..10 {
+            p.move_down();
+        }
+        let expected = p.options.len() + 1;
+        assert_eq!(
+            p.cursor, expected,
+            "cursor must stop at Submit row (index {expected})"
+        );
+        assert!(
+            p.is_submit_row(),
+            "is_submit_row() must be true at Submit row"
+        );
+        assert!(
+            !p.is_other_row(),
+            "is_other_row() must be false at Submit row"
+        );
+    }
+
+    // Single: unchanged — has no Submit row; cursor stops at Other (options.len()).
+    #[test]
+    fn single_move_down_stops_at_other_no_submit_row() {
+        let mut p = panel(UserInputMode::Single);
+        for _ in 0..10 {
+            p.move_down();
+        }
+        assert_eq!(
+            p.cursor,
+            p.options.len(),
+            "single cursor must stop at Other row"
+        );
+        assert!(p.is_other_row(), "is_other_row() must be true");
+        assert!(!p.is_submit_row(), "single must have no Submit row");
+        assert!(
+            p.submit_index().is_none(),
+            "submit_index() must be None for single"
+        );
+    }
+
+    // Row-count equality: multiple panel's row_count must count the Submit row.
+    // Single panel's row_count must NOT include a Submit row.
+    #[test]
+    fn row_count_includes_submit_row_for_multiple_not_single() {
+        use atomcode_capabilities::tools::request_user_input::{
+            UserInputMode, UserInputOption, UserInputRequest,
+        };
+        let req = UserInputRequest {
+            header: "H".into(),
+            question: "Q?".into(),
+            mode: UserInputMode::Multiple,
+            options: vec![
+                UserInputOption {
+                    label: "A".into(),
+                    description: None,
+                },
+                UserInputOption {
+                    label: "B".into(),
+                    description: None,
+                },
+            ],
+            custom: true,
+        };
+        let p_multi = UserInputPanel::new(1, &req);
+        // last_row for multiple = options.len()+1 = 3
+        assert_eq!(p_multi.options.len() + 1, 3);
+        // last navigable row must be Submit
+        let mut pm = p_multi;
+        for _ in 0..10 {
+            pm.move_down();
+        }
+        assert!(pm.is_submit_row());
+
+        let req_single = UserInputRequest {
+            mode: UserInputMode::Single,
+            ..UserInputRequest {
+                header: "H".into(),
+                question: "Q?".into(),
+                mode: UserInputMode::Single,
+                options: vec![
+                    UserInputOption {
+                        label: "A".into(),
+                        description: None,
+                    },
+                    UserInputOption {
+                        label: "B".into(),
+                        description: None,
+                    },
+                ],
+                custom: true,
+            }
+        };
+        let mut ps = UserInputPanel::new(2, &req_single);
+        for _ in 0..10 {
+            ps.move_down();
+        }
+        assert!(ps.is_other_row(), "single stops at Other");
+        assert!(!ps.is_submit_row(), "single has no Submit row");
     }
 }
 
@@ -8550,7 +13124,7 @@ fn handle_approval_key(
             // The goal (if any) continues; Claude Code's /goal works the same way.
             // A second Ctrl+C within the window triggers Shutdown above.
             app.exit_pending = Some(now);
-            deliver_approval(ctx, AgentCommand::DenyTool);
+            deliver_approval(ctx, ApprovalChoice::Deny);
             app.state.on_approval_resolved();
             renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
@@ -8600,24 +13174,402 @@ fn handle_approval_key(
                 }
             }
             // Letter accelerator fallback (y/a/n).
-            p.accel_index(c).and_then(|i| p.options.get(i).map(|o| o.kind))
+            p.accel_index(c)
+                .and_then(|i| p.options.get(i).map(|o| o.kind))
         }),
         _ => None,
     };
     let Some(kind) = kind else {
         return Ok(());
     };
-    let cmd = approval_kind_to_command(kind);
-    deliver_approval(ctx, cmd);
+    let choice = approval_kind_to_choice(kind);
+    if choice == ApprovalChoice::AllowAlways {
+        if let Some(p) = &app.state.approval_panel {
+            if !p.cache_key.is_empty() {
+                let mut guard = ctx.allowed_always.lock().unwrap();
+                guard.insert(p.cache_key.clone());
+            }
+        }
+    }
+    deliver_approval(ctx, choice);
     app.state.on_approval_resolved(); // clears approval_panel + phase → Streaming
-    // Repaint the footer NOW so the approval panel disappears immediately, the
-    // same way the `ApprovalNeeded` handler and the Up/Down arms redraw. Without
-    // this, the retained renderer keeps painting its cached `self.status`
-    // (approval still `Some`) until the next event that carries a fresh
-    // `StatusLine`, leaving a ghost panel over the input box (the inverse of
-    // issue #455's "输入框没了" — here the panel lingers after a decision).
+                                      // Repaint the footer NOW so the approval panel disappears immediately, the
+                                      // same way the `ApprovalNeeded` handler and the Up/Down arms redraw. Without
+                                      // this, the retained renderer keeps painting its cached `self.status`
+                                      // (approval still `Some`) until the next event that carries a fresh
+                                      // `StatusLine`, leaving a ghost panel over the input box (the inverse of
+                                      // issue #455's "输入框没了" — here the panel lingers after a decision).
     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     Ok(())
+}
+
+/// Pure resolver for `request_user_input` keys that FINISH the prompt (produce a
+/// response), extracted so the mode→response contract is unit-testable without a
+/// `LoopCtx` / channel. Returns:
+///   - `Some(resp)` — this key resolves the panel; caller should clear + deliver.
+///   - `None`       — this key is navigation / typing / ignored; caller mutates
+///                    the panel in place (handled in `handle_user_input_key`).
+///
+/// Esc always declines. In **single** mode Enter confirms the cursor row: a
+/// concrete option → `{selected:[label]}`; the "Other" row →
+/// `{selected:[custom_text]}` when non-empty, otherwise `None` (no-op). In
+/// **multiple** mode Enter on the **Submit row** (`options.len() + 1`) confirms
+/// the checked set + Other custom text (returning `None` when nothing selected);
+/// Enter on any other row (option or Other) returns `None` so the caller can
+/// toggle that row instead. Text mode: Enter submits the buffer. Nav / typing /
+/// number keys return `None` (the caller mutates the panel in place).
+pub(crate) fn user_input_response_for(
+    panel: &crate::state::UserInputPanel,
+    code: KeyCode,
+) -> Option<atomcode_capabilities::tools::request_user_input::UserInputResponse> {
+    use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputResponse};
+    match (&panel.mode, code) {
+        (_, KeyCode::Esc) => Some(UserInputResponse::declined()),
+        (UserInputMode::Text, KeyCode::Enter) => {
+            if panel.text.trim().is_empty() {
+                None // empty buffer → no-op, keep panel open
+            } else {
+                Some(UserInputResponse {
+                    declined: false,
+                    selected: vec![],
+                    text: Some(panel.text.clone()),
+                })
+            }
+        }
+        // Single: Enter confirms the cursor row (concrete option or Other).
+        (UserInputMode::Single, KeyCode::Enter) => panel.try_immediate_response(),
+        // Multiple: Enter on the Submit row confirms; Enter on any other row
+        // returns None (the caller will toggle that row instead).
+        (UserInputMode::Multiple, KeyCode::Enter) => {
+            if panel.is_submit_row() {
+                panel.build_response()
+            } else {
+                None // not on Submit row → caller toggles the current row
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Key handling while `UiPhase::UserInput`. Mirrors `handle_approval_key`:
+/// resolving keys (Esc / Enter) clear the panel and deliver an
+/// `DriverCommand::Respond`; navigation / typing mutate the panel in place and
+/// repaint. `user_input_response_for` owns the (mode, key) → response contract.
+fn handle_user_input_key(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> Result<()> {
+    use atomcode_capabilities::tools::request_user_input::UserInputMode;
+    // A multi-question batch is handled by its own self-contained handler (keeps the
+    // single-question path below untouched → N==1 behavior is literally unchanged).
+    if app.state.user_input_batch.is_some() {
+        return handle_user_input_batch_key(app, ctx, renderer, code, modifiers);
+    }
+    let Some(panel) = app.state.user_input_panel.as_ref() else {
+        return Ok(());
+    };
+    let id = panel.request_id;
+    let mode = panel.mode.clone();
+
+    // Ctrl+C: decline the pending request (so the tool round-trip is answered,
+    // not left hanging) and then cancel the running turn — exactly like Ctrl+C
+    // during Streaming stops generation.  Checked BEFORE the Char(c) arm so
+    // Ctrl+C does not type 'c' into a text-mode buffer.
+    use crossterm::event::KeyModifiers;
+    if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
+        app.state.on_user_input_resolved();
+        deliver_user_input(ctx, id, UserInputResponse::declined());
+        cancel_active_turn(ctx);
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    // Resolving keys (Esc / Enter): compute the response, clear the panel, and
+    // deliver it. Repaint so the panel disappears immediately.
+    if let Some(resp) = user_input_response_for(panel, code) {
+        app.state.on_user_input_resolved();
+        deliver_user_input(ctx, id, resp);
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    // Multiple + Enter on a non-Submit row: toggle concrete option rows; the
+    // "Other" row is text-based so Enter there is a no-op (the user types to
+    // include it, then navigates to Submit to confirm).
+    // `user_input_response_for` returned None for this case so we handle it here.
+    if matches!(mode, UserInputMode::Multiple) && code == KeyCode::Enter {
+        if let Some(p) = app.state.user_input_panel.as_mut() {
+            if !p.is_submit_row() && !p.is_other_row() {
+                // Concrete option row: toggle the checkbox.
+                p.toggle();
+            }
+            // Other row: no-op — inclusion is derived from custom_text, not a checkbox.
+        }
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    // Non-resolving keys: mutate the panel in place, then repaint.
+    match (mode, code) {
+        (UserInputMode::Text, KeyCode::Char(c)) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.text.push(c);
+            }
+        }
+        (UserInputMode::Text, KeyCode::Backspace) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.text.pop();
+            }
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Up) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.move_up();
+            }
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Down) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.move_down();
+            }
+        }
+        // Number keys 1..9: select the Nth navigable row (concrete options 1..N,
+        // then "Other" as N+1). Single → move the cursor there (cursor is the
+        // radio). Multiple → toggle that concrete row's checkbox, OR move the
+        // cursor to the Other row (so the user can type a custom answer).
+        // Only when NOT already editing the "Other" row (so digits can be typed
+        // into a custom answer).
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(c))
+            if c.is_ascii_digit()
+                && c != '0'
+                && !app
+                    .state
+                    .user_input_panel
+                    .as_ref()
+                    .map(|p| p.is_other_row())
+                    .unwrap_or(false) =>
+        {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < p.options.len() {
+                    match p.mode {
+                        UserInputMode::Multiple => p.toggle_index(idx),
+                        // Single: cursor-as-radio — move to it (this IS selecting it).
+                        _ => p.cursor = idx,
+                    }
+                } else if idx == p.other_index() && p.custom {
+                    // Number key for the Other row (only when offered): move cursor to it
+                    // (focus for typing). Inclusion is text-derived, not toggled by a number.
+                    p.cursor = p.other_index();
+                }
+            }
+        }
+        // Backspace edits the "Other" custom-text buffer when the cursor is on it.
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Backspace) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                if p.is_other_row() {
+                    p.pop_custom();
+                }
+            }
+        }
+        // Space: on the "Other" row it types a literal space; on a concrete
+        // option row it toggles (multiple) / moves the radio (single, no-op).
+        // On the Submit row (multiple only) it is a no-op.
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(' ')) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                if p.is_submit_row() {
+                    return Ok(()); // no-op on Submit row
+                } else if p.is_other_row() {
+                    p.push_custom(' ');
+                } else {
+                    p.toggle();
+                }
+            }
+        }
+        // Any other printable char types into the "Other" row (only when the
+        // cursor is on it); ignored on concrete option rows and the Submit row.
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(c)) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                if p.is_other_row() {
+                    p.push_custom(c);
+                } else {
+                    return Ok(());
+                }
+            }
+        }
+        // Any other key is ignored (no state change, no repaint needed).
+        _ => return Ok(()),
+    }
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    Ok(())
+}
+
+/// Key handling for a multi-question `request_user_input` batch. Tab/Shift+Tab move
+/// between questions (and the Submit stop); within a question the keys mirror the
+/// single-question handler on the current panel; Enter on the Submit stop delivers
+/// the whole batch; Esc / Ctrl+C decline every question.
+fn handle_user_input_batch_key(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> Result<()> {
+    use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputResponse};
+    use crossterm::event::KeyModifiers;
+    let Some(batch) = app.state.user_input_batch.as_ref() else {
+        return Ok(());
+    };
+    let id = batch.request_id;
+    let n = batch.questions.len();
+
+    // Ctrl+C: decline the whole batch, then cancel the running turn.
+    if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+        app.state.on_user_input_resolved();
+        deliver_user_input_batch(ctx, id, vec![UserInputResponse::declined(); n]);
+        cancel_active_turn(ctx);
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+    // Esc: decline the whole batch (partial-submit philosophy — the user opts out).
+    if code == KeyCode::Esc {
+        app.state.on_user_input_resolved();
+        deliver_user_input_batch(ctx, id, vec![UserInputResponse::declined(); n]);
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+    // Tab / Shift+Tab: move between questions (cycling through the Submit stop).
+    if code == KeyCode::Tab {
+        if let Some(b) = app.state.user_input_batch.as_mut() {
+            b.next_question();
+        }
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+    if code == KeyCode::BackTab {
+        if let Some(b) = app.state.user_input_batch.as_mut() {
+            b.prev_question();
+        }
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    // On the Submit stop: Enter delivers all answers (untouched → declined).
+    if batch.on_submit_stop() {
+        if code == KeyCode::Enter {
+            let resps = batch.build_batch_response();
+            app.state.on_user_input_resolved();
+            deliver_user_input_batch(ctx, id, resps);
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        }
+        return Ok(()); // other keys are no-ops on the Submit stop
+    }
+
+    // On a question: operate on the current panel (mirrors the single-question keys).
+    let cur = batch.current;
+    let mode = batch.questions[cur].mode.clone();
+
+    // Enter: toggle a concrete multiple-mode option; otherwise advance to the next stop.
+    if code == KeyCode::Enter {
+        if let Some(b) = app.state.user_input_batch.as_mut() {
+            let p = &mut b.questions[cur];
+            if matches!(mode, UserInputMode::Multiple) && !p.is_submit_row() && !p.is_other_row() {
+                p.toggle();
+            } else {
+                b.next_question();
+            }
+        }
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    match (mode, code) {
+        (UserInputMode::Text, KeyCode::Char(c)) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur]
+                .text
+                .push(c);
+        }
+        (UserInputMode::Text, KeyCode::Backspace) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur]
+                .text
+                .pop();
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Up) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_up();
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Down) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_down();
+        }
+        // Number keys 1..9: select the Nth navigable row (concrete options, then "Other").
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(c))
+            if c.is_ascii_digit()
+                && c != '0'
+                && !app.state.user_input_batch.as_ref().unwrap().questions[cur].is_other_row() =>
+        {
+            let p = &mut app.state.user_input_batch.as_mut().unwrap().questions[cur];
+            let idx = (c as usize) - ('1' as usize);
+            if idx < p.options.len() {
+                match p.mode {
+                    UserInputMode::Multiple => p.toggle_index(idx),
+                    _ => p.cursor = idx,
+                }
+            } else if idx == p.other_index() && p.custom {
+                p.cursor = p.other_index();
+            }
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Backspace) => {
+            let p = &mut app.state.user_input_batch.as_mut().unwrap().questions[cur];
+            if p.is_other_row() {
+                p.pop_custom();
+            }
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(' ')) => {
+            let p = &mut app.state.user_input_batch.as_mut().unwrap().questions[cur];
+            if p.is_submit_row() {
+                return Ok(());
+            } else if p.is_other_row() {
+                p.push_custom(' ');
+            } else {
+                p.toggle();
+            }
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(c)) => {
+            let p = &mut app.state.user_input_batch.as_mut().unwrap().questions[cur];
+            if p.is_other_row() {
+                p.push_custom(c);
+            } else {
+                return Ok(());
+            }
+        }
+        _ => return Ok(()),
+    }
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    Ok(())
+}
+
+/// Deliver a batched multi-question answer: responds `{ "responses": [...] }` over the
+/// same seam as [`deliver_user_input`].
+fn deliver_user_input_batch(
+    ctx: &mut LoopCtx,
+    id: u64,
+    resps: Vec<atomcode_capabilities::tools::request_user_input::UserInputResponse>,
+) {
+    let value = serde_json::json!({ "responses": resps });
+    if ctx.pending_runtime_request_id == Some(id) {
+        ctx.pending_runtime_request_id = None;
+    }
+    if ctx.live_binding.is_some() {
+        if let Err(error) = atomcode_daemon::native_live::respond(id, value) {
+            crate::tuix_trace!("LIVE", "user-input batch response failed: {error:?}");
+        }
+    } else if let Err(error) = ctx
+        .runtime
+        .dispatch(atomcode_coding::DriverCommand::Respond { id, value })
+    {
+        crate::tuix_trace!("LIVE", "user-input batch response failed: {error:?}");
+    }
 }
 
 /// Render one streamed upgrade event. Mutates the percent tracker so
@@ -8629,20 +13581,18 @@ fn handle_approval_key(
 /// emitted by the previous synchronous path in `handle_plugin` so users see
 /// the same wording — only the timing changes.
 pub(super) fn handle_plugin_job_event(
-    ev: atomcode_core::plugin::PluginJobEvent,
+    ev: atomcode_capabilities::plugin::PluginJobEvent,
     ctx: &mut LoopCtx,
     state: &mut crate::state::UiState,
     renderer: &mut dyn Renderer,
 ) {
-    use atomcode_core::plugin::PluginJobEvent;
+    use atomcode_capabilities::plugin::PluginJobEvent;
     match ev {
         PluginJobEvent::MarketplaceAdded(info) => {
             // Marketplace add by itself doesn't load any skills (those come
             // from installed plugins) — show only the marketplace summary.
-            // `✓` prefix + col-0 alignment mirrors the MCP-connect toast
-            // (`McpServerConnected`) emitted from the same body region, so
-            // every "background install completed" line lands at the same
-            // left edge regardless of which subsystem owns it.
+            // Keep the completion line aligned at column 0 with other
+            // background-operation results.
             let _ = reload_plugins(ctx);
             let short_commit = &info.git_commit[..7.min(info.git_commit.len())];
             // Adding a marketplace does NOT install its plugins — list them + the install
@@ -8747,14 +13697,17 @@ pub(super) fn handle_plugin_job_event(
                 ));
                 renderer.flush();
             }
-            // Startup marketplace auto-update runs in the background and is
-            // NON-FATAL (a failed pull — stale repo, offline, git safe.directory
-            // ownership mismatch — never affects chat). Surface it as a CALM
-            // one-line yellow Warning (first line only, dropping the multi-line
-            // git stderr / "To add an exception…" block) instead of a red
-            // multi-line "错误" dump that reads like a crash. User-initiated plugin
+            // Startup marketplace bootstrap — auto-install (fresh clone on first
+            // launch), per-plugin auto-install-plugin, and auto-update (`git pull`
+            // on every launch) — all run in the background and are NON-FATAL (a
+            // failed clone/pull/plugin-install — offline, upstream down, git
+            // safe.directory ownership mismatch, no working git, one bad plugin —
+            // never affects chat). Surface them as a CALM one-line yellow Warning
+            // (first line only, dropping the multi-line git stderr / xcode-select /
+            // "To add an exception…" block) instead of a red multi-line "错误" dump
+            // that reads like a crash on a brand-new install. User-initiated plugin
             // ops keep the red Error so genuine failures stay prominent.
-            if op == "auto-update" {
+            if op == "auto-update" || op == "auto-install" || op == "auto-install-plugin" {
                 let detail = msg.lines().next().unwrap_or(msg.as_str());
                 renderer.render(UiLine::Warning(
                     crate::i18n::t(crate::i18n::Msg::PluginAutoUpdateSkipped { detail })
@@ -8860,7 +13813,9 @@ pub(super) fn handle_upgrade_event(
             // renamed `.atomcode.rolling` after `replace_binary`).
             *done = Some(exe);
             // Tell the agent to shut down so the loop exits cleanly.
-            ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+            ctx.runtime
+                .dispatch(atomcode_coding::DriverCommand::Shutdown)
+                .ok();
         }
         UpgradeEvent::Failed(msg) => {
             if msg.contains(atomcode_updater::PACKAGE_MANAGED) {
@@ -8877,10 +13832,7 @@ pub(super) fn handle_upgrade_event(
                 // strings out so each locale formats the full sentence
                 // itself instead of pasting English into a translated
                 // wrapper.
-                let friendly = msg.replace(
-                    &format!("{}: ", atomcode_updater::ALREADY_LATEST),
-                    "",
-                );
+                let friendly = msg.replace(&format!("{}: ", atomcode_updater::ALREADY_LATEST), "");
                 let (current, latest) =
                     parse_already_latest_versions(&friendly).unwrap_or(("?", "?"));
                 renderer.render(UiLine::CommandOutput(
@@ -8902,7 +13854,9 @@ pub(super) fn handle_upgrade_event(
                 .into_owned(),
             ));
             *done = Some(exe);
-            ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+            ctx.runtime
+                .dispatch(atomcode_coding::DriverCommand::Shutdown)
+                .ok();
         }
     }
     renderer.flush();
@@ -8928,6 +13882,14 @@ fn turn_summary_label(
     dur: &str,
 ) -> String {
     if errored {
+        // FOLD the captured failure cause into the separator itself
+        // (`✗ 已中断：账户余额不足（HTTP 402） · …`) so the reason rides the
+        // always-visible summary — the standalone mid-turn red line is emitted
+        // while the spinner is live (phase Streaming) and a real terminal's
+        // Streaming→Idle redraw can clobber it, but this line renders cleanly at
+        // Idle. `.take()` consumes it so it can't leak into a later turn.
+        let reason = state.last_turn_error.take();
+        let reason = reason.as_deref().map(summary_reason_headline);
         // An errored turn already rendered a red Error line just above; a
         // celebratory "✓ Nailed it" under it is contradictory, and we don't
         // burn a DONE_LABELS rotation slot on a failure.
@@ -8936,9 +13898,14 @@ fn turn_summary_label(
             tool_call_count,
             duration: dur,
             total_tokens,
+            reason: reason.as_deref(),
         })
         .into_owned()
     } else {
+        // A clean turn clears any stale reason left by an error path that
+        // produced no summary (SnapshotUnavailable / RuntimeStopped), so it can
+        // never fold into a LATER errored summary.
+        state.last_turn_error = None;
         let done = state.next_done_label();
         crate::i18n::t(crate::i18n::Msg::TurnSummary {
             done,
@@ -8949,6 +13916,72 @@ fn turn_summary_label(
             cached_pct,
         })
         .into_owned()
+    }
+}
+
+/// Squeeze a captured failure reason into a SHORT headline that folds cleanly
+/// into the one-line interrupted-turn summary: first line only (a provider body
+/// can be multi-line), capped by DISPLAY WIDTH (CJK counts 2) with an ellipsis.
+/// Provider billing/auth errors are already concise (`账户余额不足（HTTP 402）`);
+/// this only bites long ones (e.g. the repeat-loop fuse message).
+fn summary_reason_headline(reason: &str) -> String {
+    const MAX_COLS: usize = 40;
+    let first = reason.lines().next().unwrap_or(reason).trim();
+    if crate::width::display_width(first) <= MAX_COLS {
+        return first.to_string();
+    }
+    let mut out = String::new();
+    let mut cols = 0usize;
+    for ch in first.chars() {
+        let w = crate::width::display_width(ch.encode_utf8(&mut [0u8; 4]));
+        if cols + w > MAX_COLS.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+        cols += w;
+    }
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod turn_error_reason_tests {
+    use super::*;
+
+    #[test]
+    fn errored_summary_folds_reason_and_consumes_it() {
+        let mut state = UiState::new();
+        state.last_turn_error = Some("账户余额不足（HTTP 402）".to_string());
+        let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "3.2s");
+        // Reason folded into the separator label (not a separate line).
+        assert!(label.contains("账户余额不足（HTTP 402）"), "{label}");
+        assert!(
+            label.contains("已中断") || label.contains("Stopped"),
+            "{label}"
+        );
+        // Consumed: cannot leak into the next turn.
+        assert!(state.last_turn_error.is_none());
+    }
+
+    #[test]
+    fn clean_summary_has_no_reason_and_clears_stale() {
+        let mut state = UiState::new();
+        // A stale reason from a prior no-summary error path.
+        state.last_turn_error = Some("陈旧原因".to_string());
+        let label = turn_summary_label(&mut state, false, 1, 0, 0, None, "1s");
+        assert!(!label.contains("陈旧原因"), "{label}");
+        // Cleared so it can't fold into a LATER errored summary.
+        assert!(state.last_turn_error.is_none());
+    }
+
+    #[test]
+    fn long_reason_is_width_truncated_with_ellipsis() {
+        let long = "stopped: the model repeated the same tool call for 6 consecutive rounds without progress";
+        let head = summary_reason_headline(long);
+        assert!(head.ends_with('…'), "{head}");
+        assert!(crate::width::display_width(&head) <= 40, "{head}");
+        // Multi-line collapses to the first line.
+        assert_eq!(summary_reason_headline("头一行\n第二行"), "头一行");
     }
 }
 
@@ -9055,14 +14088,14 @@ mod approval_retract_tests {
     }
 }
 
-/// Map the v1 engine's turn-stop reason onto the notification layer's own
-/// `NotifyStopReason` (capabilities is L0 and cannot see `core::agent`). Total
+/// Map the TUI turn-stop reason onto the notification layer's own
+/// `NotifyStopReason`. Total
 /// 1:1 mapping — the two enums mirror each other variant-for-variant.
 fn notify_stop_reason(
-    reason: atomcode_core::agent::TurnStopReason,
+    reason: ui_event::UiTurnStopReason,
 ) -> atomcode_capabilities::notify::NotifyStopReason {
     use atomcode_capabilities::notify::NotifyStopReason as N;
-    use atomcode_core::agent::TurnStopReason as T;
+    use ui_event::UiTurnStopReason as T;
     match reason {
         T::Natural => N::Natural,
         T::Cancelled => N::Cancelled,
@@ -9085,9 +14118,9 @@ fn empty_completion_notice(
     tool_call_count: usize,
     saw_reasoning: bool,
     show_reasoning: bool,
-    stop_reason: atomcode_core::agent::TurnStopReason,
+    stop_reason: ui_event::UiTurnStopReason,
 ) -> Option<String> {
-    use atomcode_core::agent::TurnStopReason;
+    use ui_event::UiTurnStopReason as TurnStopReason;
     // Only a NATURAL stop (finish_reason=stop) can be silently blank. Budget,
     // error, and cancel finishes already render their own labels/banners.
     if !matches!(stop_reason, TurnStopReason::Natural) {
@@ -9113,7 +14146,7 @@ fn empty_completion_notice(
 #[cfg(test)]
 mod empty_completion_notice_tests {
     use super::empty_completion_notice;
-    use atomcode_core::agent::TurnStopReason;
+    use super::ui_event::UiTurnStopReason as TurnStopReason;
 
     #[test]
     fn reasoning_only_hidden_gets_ctrl_o_hint() {
@@ -9288,6 +14321,417 @@ mod ctrl_o_hint_gating_tests {
     }
 }
 
+fn kernel_stop_reason(reason: atomcode_kernel::event::StopReason) -> ui_event::UiTurnStopReason {
+    use atomcode_kernel::event::StopReason as Kernel;
+    use ui_event::UiTurnStopReason as Core;
+    match reason {
+        Kernel::Stopped => Core::Natural,
+        Kernel::MaxRounds | Kernel::MaxContinuations => Core::TurnLimit,
+        Kernel::RepeatLoop | Kernel::ToolLoopDetected => Core::StepLimit,
+        Kernel::Cancelled => Core::Cancelled,
+        Kernel::ProviderError | Kernel::Timeout | Kernel::PromptRejected | Kernel::RateLimited => {
+            Core::Error
+        }
+        _ => Core::Error,
+    }
+}
+
+fn turn_is_incomplete(reason: ui_event::UiTurnStopReason) -> bool {
+    !matches!(reason, ui_event::UiTurnStopReason::Natural)
+}
+
+fn should_run_setup_post_turn(reason: ui_event::UiTurnStopReason) -> bool {
+    matches!(reason, ui_event::UiTurnStopReason::Natural)
+}
+
+#[cfg(test)]
+mod kernel_terminal_projection_tests {
+    use super::{kernel_stop_reason, should_run_setup_post_turn, turn_is_incomplete};
+    use crate::event_loop::ui_event::UiTurnStopReason;
+    use atomcode_kernel::event::StopReason;
+
+    #[test]
+    fn detected_tool_loops_are_step_limits_not_success() {
+        for stop in [StopReason::RepeatLoop, StopReason::ToolLoopDetected] {
+            let reason = kernel_stop_reason(stop);
+            assert_eq!(reason, UiTurnStopReason::StepLimit);
+            assert!(turn_is_incomplete(reason));
+        }
+    }
+
+    #[test]
+    fn every_non_natural_terminal_is_persisted_as_incomplete() {
+        assert!(!turn_is_incomplete(UiTurnStopReason::Natural));
+        for reason in [
+            UiTurnStopReason::TurnLimit,
+            UiTurnStopReason::StepLimit,
+            UiTurnStopReason::Cancelled,
+            UiTurnStopReason::Error,
+        ] {
+            assert!(turn_is_incomplete(reason));
+        }
+    }
+
+    #[test]
+    fn setup_post_run_side_effects_require_natural_completion() {
+        assert!(should_run_setup_post_turn(UiTurnStopReason::Natural));
+        for reason in [
+            UiTurnStopReason::TurnLimit,
+            UiTurnStopReason::StepLimit,
+            UiTurnStopReason::Cancelled,
+            UiTurnStopReason::Error,
+        ] {
+            assert!(!should_run_setup_post_turn(reason));
+        }
+    }
+}
+
+fn project_kernel_event(
+    event: atomcode_kernel::event::AgentEvent,
+    ctx: &mut LoopCtx,
+) -> Option<AgentEvent> {
+    use atomcode_kernel::event::AgentEvent as Kernel;
+    match event {
+        Kernel::TurnStarted => Some(AgentEvent::PhaseChange(AgentPhase::Thinking)),
+        Kernel::TextDelta(text) => Some(AgentEvent::TextDelta(text)),
+        Kernel::Reasoning(text) => Some(AgentEvent::ReasoningDelta(text)),
+        Kernel::ToolCallStreaming {
+            name, arguments, ..
+        } => {
+            let arg_chars = arguments.chars().count();
+            Some(AgentEvent::ToolCallStreaming {
+                name: name.unwrap_or_else(|| "tool".into()),
+                hint: arguments.chars().take(80).collect(),
+                arg_chars,
+            })
+        }
+        Kernel::ToolBatchStarted { batch_id, calls } => {
+            Some(AgentEvent::ToolBatchStarted { batch_id, calls })
+        }
+        Kernel::ToolBatchCompleted {
+            batch_id,
+            ok,
+            total,
+            elapsed_ms,
+        } => Some(AgentEvent::ToolBatchCompleted {
+            batch_id,
+            ok,
+            total,
+            elapsed_ms,
+        }),
+        Kernel::ToolStarted { call } => {
+            ctx.native_tools.insert(
+                call.id.clone(),
+                (call.name.clone(), std::time::Instant::now()),
+            );
+            Some(AgentEvent::ToolCallStarted {
+                id: call.id,
+                name: call.name,
+                arguments: call.arguments,
+            })
+        }
+        Kernel::ToolProgress { call_id, message } => Some(AgentEvent::ToolOutputChunk {
+            call_id,
+            chunk: message,
+        }),
+        Kernel::ToolResult { result } => {
+            let (name, started) = ctx
+                .native_tools
+                .remove(&result.call_id)
+                .unwrap_or_else(|| ("tool".into(), std::time::Instant::now()));
+            Some(AgentEvent::ToolCallResult {
+                call_id: result.call_id,
+                name,
+                output: result.content,
+                success: !result.is_error,
+                duration: started.elapsed(),
+            })
+        }
+        Kernel::Usage(meta) => Some(AgentEvent::TokenUsage(atomcode_core::stream::TokenUsage {
+            prompt_tokens: meta.tokens.prompt as usize,
+            completion_tokens: meta.tokens.completion as usize,
+            cached_tokens: meta.tokens.cached as usize,
+        })),
+        Kernel::Error { message, .. } => Some(AgentEvent::Error {
+            error: message,
+            snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+        }),
+        Kernel::Warning(message) => Some(AgentEvent::Warning(message)),
+        Kernel::RateLimited {
+            reset_at_display,
+            reset_label,
+            secs_until_reset,
+            auto_resuming,
+            server_message,
+        } => Some(AgentEvent::RateLimited {
+            reset_at_display,
+            reset_label,
+            secs_until_reset,
+            auto_resuming,
+            server_message,
+        }),
+        Kernel::Steered { count } => Some(AgentEvent::Steered { count }),
+        Kernel::Cancelled
+        | Kernel::Request { .. }
+        | Kernel::Snapshot { .. }
+        | Kernel::TurnComplete { .. }
+        | Kernel::CompactionStarted { .. }
+        | Kernel::Compacted { .. }
+        | Kernel::CompactionFailed { .. } => None,
+        _ => None,
+    }
+}
+
+fn apply_provider_projection(
+    ctx: &mut LoopCtx,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    provider: String,
+    model: String,
+) {
+    ctx.model_name = model;
+    atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+    state.on_model_window_changed(ctx.config.default_context_window());
+    sync_reasoning_effort_from_provider(ctx);
+    if let Ok(mut warning) = ctx.monitor_warning.lock() {
+        *warning = None;
+    }
+    if let Ok(mut usage) = ctx.usage_slot.lock() {
+        *usage = None;
+    }
+    if monitor::is_codingplan_provider(&provider) {
+        ctx.monitor_last_check_at = Some(std::time::Instant::now());
+        monitor::spawn_check(
+            ctx.config.clone(),
+            ctx.model_name.clone(),
+            ctx.monitor_warning.clone(),
+            ctx.wake_tx.clone(),
+        );
+        ctx.usage_last_check_at = Some(std::time::Instant::now());
+        usage_monitor::spawn_check(ctx.usage_slot.clone(), ctx.wake_tx.clone());
+    }
+    let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+    renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
+}
+
+fn discard_pending_provider_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer, reason: &str) {
+    let visible = ctx
+        .pending_provider_reload
+        .as_ref()
+        .is_some_and(|pending| pending.manual_reload_announce || pending.announce.is_some());
+    ctx.pending_provider_reload = None;
+    ctx.observed_config_revision = None;
+    atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+    crate::tuix_trace!("CONFIG", "discarded staged provider reload: {reason}");
+    if visible {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::CmdReloadFailed { error: reason }).into_owned(),
+        ));
+        renderer.flush();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderProjectionResult {
+    Applied,
+    Current,
+    Deferred,
+}
+
+fn finish_provider_projection_attempt(
+    pending: &mut Option<ProviderProjectionObservation>,
+    observation: &ProviderProjectionObservation,
+    result: ProviderProjectionResult,
+) {
+    if result != ProviderProjectionResult::Deferred && pending.as_ref() == Some(observation) {
+        *pending = None;
+    }
+}
+
+fn stage_provider_projection(
+    ctx: &mut LoopCtx,
+    generation: atomcode_coding::RuntimeGeneration,
+    provider: String,
+    model: Option<String>,
+) {
+    if ctx
+        .pending_provider_projection
+        .as_ref()
+        .is_some_and(|current| {
+            current.generation == generation
+                && current.provider == provider
+                && model.is_none()
+                && current.model.is_some()
+        })
+    {
+        return;
+    }
+    ctx.pending_provider_projection = Some(ProviderProjectionObservation {
+        generation,
+        provider,
+        model,
+    });
+}
+
+fn sync_provider_projection(
+    ctx: &mut LoopCtx,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    observation: &ProviderProjectionObservation,
+) -> ProviderProjectionResult {
+    let snapshot = match ctx.config_store.read() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            crate::tuix_trace!(
+                "CONFIG",
+                "provider projection could not read ConfigStore: {error:#}"
+            );
+            return ProviderProjectionResult::Deferred;
+        }
+    };
+    sync_provider_projection_from_snapshot(ctx, state, renderer, observation, snapshot)
+}
+
+fn sync_provider_projection_from_snapshot(
+    ctx: &mut LoopCtx,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    observation: &ProviderProjectionObservation,
+    snapshot: ConfigSnapshot,
+) -> ProviderProjectionResult {
+    let provider = &observation.provider;
+    let runtime_model = observation.model.as_deref();
+    let follows_persisted_default = config_commits_provider(&snapshot.config, provider);
+    let revision = snapshot.revision;
+    // Post-reload UI projection, not an edit-application path — preserve the
+    // active provider as-is (no manual-edit adoption).
+    let desired = desired_config_from_snapshot(ctx, snapshot.config, false);
+    let Some((config, configured_model)) =
+        select_committed_provider(desired, provider, runtime_model)
+    else {
+        crate::tuix_trace!(
+            "CONFIG",
+            "provider projection rejected unknown provider/model provider={provider:?} model={runtime_model:?}"
+        );
+        return ProviderProjectionResult::Deferred;
+    };
+    let model = runtime_model.unwrap_or(&configured_model).to_string();
+    if provider_projection_is_current(
+        &ctx.config.default_provider,
+        &ctx.model_name,
+        ctx.observed_config_revision.as_ref(),
+        &provider,
+        &model,
+        Some(&revision),
+    ) {
+        return ProviderProjectionResult::Current;
+    }
+    ctx.config = config;
+    ctx.observed_config_revision = Some(revision);
+    ctx.observed_auth = None;
+    if !follows_persisted_default {
+        ctx.provider_selection_mode = crate::ProviderSelectionMode::Pinned;
+    }
+    apply_provider_projection(ctx, state, renderer, provider.clone(), model);
+    ProviderProjectionResult::Applied
+}
+
+fn retry_pending_provider_projection(
+    ctx: &mut LoopCtx,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    let current_generation = ctx.runtime.current_generation();
+    if current_generation.is_none() {
+        return false;
+    }
+    let Some(observation) =
+        current_provider_projection(ctx.pending_provider_projection.as_ref(), current_generation)
+    else {
+        if ctx.pending_provider_projection.is_some() {
+            crate::tuix_trace!(
+                "CONFIG",
+                "discarded stale provider projection generation={:?} current={:?}",
+                ctx.pending_provider_projection
+                    .as_ref()
+                    .map(|observation| observation.generation.0),
+                current_generation.map(|generation| generation.0),
+            );
+            ctx.pending_provider_projection = None;
+        }
+        return false;
+    };
+    let result = sync_provider_projection(ctx, state, renderer, &observation);
+    finish_provider_projection_attempt(&mut ctx.pending_provider_projection, &observation, result);
+    match result {
+        ProviderProjectionResult::Applied => true,
+        ProviderProjectionResult::Current => false,
+        ProviderProjectionResult::Deferred => false,
+    }
+}
+
+/// Install a `/resume` picker once its catalog has loaded off the UI thread.
+/// Runs in the main loop where `app.active_modal` is reachable (the event handler
+/// that received the result cannot touch it). No-op unless a result is pending.
+fn install_pending_session_picker(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    if ctx.pending_session_picker.is_none() {
+        return;
+    }
+    // The user has another modal open (opened one while the scan ran, or an
+    // askpass prompt appeared) — DEFER: leave the result stashed so it installs
+    // once the modal closes, rather than dropping it and stranding the user on a
+    // stale "Loading…" line.
+    if app.active_modal.is_some() {
+        return;
+    }
+    let (scanned_dir, result) = ctx
+        .pending_session_picker
+        .take()
+        .expect("pending_session_picker checked Some above");
+    // Re-validate here, not just at stash time: while deferred behind a modal the
+    // working dir can change (async session/dir transition), and the picker must
+    // not show the previous project's sessions.
+    if scanned_dir != ctx.working_dir {
+        return;
+    }
+    match result {
+        Ok(sessions) if sessions.is_empty() => {
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::CmdNoSessions).into_owned(),
+            ));
+            renderer.flush();
+        }
+        Ok(sessions) => {
+            let picker: Box<dyn crate::modals::Modal> =
+                Box::new(crate::modals::SessionPicker::open(sessions));
+            picker.draw(&app.buf, &app.state, ctx, renderer);
+            app.active_modal = Some(picker);
+        }
+        Err(error) => {
+            renderer.render(UiLine::Error(
+                crate::i18n::t(crate::i18n::Msg::SessionListFailed { error: &error }).into_owned(),
+            ));
+            renderer.flush();
+        }
+    }
+}
+
+fn drain_foreground_replay_events(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    while let Some(event) = ctx.foreground_replay_events.pop_front() {
+        handle_runtime_event(
+            event,
+            &mut app.state,
+            &mut app.think,
+            renderer,
+            &mut app.pending_tools,
+            ctx,
+            &mut app.setup_pending,
+            &mut app.reasoning_buffer,
+            &mut app.buf,
+        );
+    }
+}
+
 fn handle_runtime_event(
     event: bg_runtime::RuntimeEventPayload,
     state: &mut UiState,
@@ -9300,7 +14744,50 @@ fn handle_runtime_event(
     buf: &mut Buffer,
 ) {
     match event {
-        bg_runtime::RuntimeEventPayload::Legacy(event) => handle_agent_event(
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => {
+            let is_provider_changed =
+                matches!(&envelope.event, CodingRuntimeEvent::ProviderChanged { .. });
+            let current_generation = ctx.runtime.current_generation();
+            if !sequenced_event_matches_provider_generation(
+                is_provider_changed,
+                envelope.generation,
+                current_generation,
+            ) {
+                crate::tuix_trace!(
+                    "CONFIG",
+                    "ignored stale ProviderChanged generation={} current={:?}",
+                    envelope.generation,
+                    current_generation.map(|generation| generation.0),
+                );
+                return;
+            }
+            if let CodingRuntimeEvent::ProviderChanged { provider, model } = &envelope.event {
+                stage_provider_projection(
+                    ctx,
+                    atomcode_coding::RuntimeGeneration(envelope.generation),
+                    provider.clone(),
+                    Some(model.clone()),
+                );
+                if ctx.pending_provider_reload.is_none()
+                    && retry_pending_provider_projection(ctx, state, renderer)
+                {
+                    renderer.flush();
+                }
+                return;
+            }
+            handle_runtime_event(
+                bg_runtime::RuntimeEventPayload::Native(envelope.event),
+                state,
+                think,
+                renderer,
+                pending_tools,
+                ctx,
+                setup_pending,
+                reasoning_buffer,
+                buf,
+            )
+        }
+        bg_runtime::RuntimeEventPayload::Ui(event) => handle_agent_event(
             event,
             state,
             think,
@@ -9312,10 +14799,1335 @@ fn handle_runtime_event(
             buf,
         ),
         bg_runtime::RuntimeEventPayload::Native(event) => {
-            let mirror_persisted = persist_native_compaction_snapshot(&event, ctx, renderer);
-            handle_coding_runtime_event(event, state, think, renderer, mirror_persisted);
+            if let CodingRuntimeEvent::Request(request) = &event {
+                ctx.pending_runtime_request_id = Some(request.id);
+            }
+            match event {
+                CodingRuntimeEvent::Agent(event) => {
+                    if let Some(event) = project_kernel_event(event, ctx) {
+                        handle_agent_event(
+                            event,
+                            state,
+                            think,
+                            renderer,
+                            pending_tools,
+                            ctx,
+                            setup_pending,
+                            reasoning_buffer,
+                            buf,
+                        );
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::Request(request) => {
+                    use atomcode_capabilities::tools::{
+                        request_user_input::{
+                            UserInputRequest, UserInputResponse, REQUEST_USER_INPUT_KIND,
+                        },
+                        ApprovalRequest, APPROVAL_KIND,
+                    };
+                    if request.kind == REQUEST_USER_INPUT_KIND {
+                        // Batch form: a non-empty `questions` array. Handled before the
+                        // single path so a multi-question request never hits the flat parse.
+                        if let Some(qs) = request
+                            .payload
+                            .get("questions")
+                            .and_then(serde_json::Value::as_array)
+                        {
+                            let reqs: Vec<UserInputRequest> = qs
+                                .iter()
+                                .filter_map(|q| {
+                                    serde_json::from_value::<UserInputRequest>(q.clone()).ok()
+                                })
+                                .collect();
+                            if reqs.is_empty() {
+                                deliver_user_input(ctx, request.id, UserInputResponse::declined());
+                                return;
+                            }
+                            if user_input_should_auto_skip(state.agent_mode) {
+                                deliver_user_input_batch(
+                                    ctx,
+                                    request.id,
+                                    vec![UserInputResponse::declined(); reqs.len()],
+                                );
+                                return;
+                            }
+                            state.user_input_batch =
+                                Some(crate::state::UserInputBatch::new(request.id, &reqs));
+                            state.phase = UiPhase::UserInput;
+                            redraw_idle_plain(buf, state, ctx, renderer);
+                            return;
+                        }
+                        if user_input_should_auto_skip(state.agent_mode) {
+                            deliver_user_input(ctx, request.id, UserInputResponse::declined());
+                            return;
+                        }
+                        match serde_json::from_value::<UserInputRequest>(request.payload) {
+                            Ok(input) => {
+                                state.user_input_panel =
+                                    Some(crate::state::UserInputPanel::new(request.id, &input));
+                                state.phase = UiPhase::UserInput;
+                                redraw_idle_plain(buf, state, ctx, renderer);
+                            }
+                            Err(_) => {
+                                deliver_user_input(ctx, request.id, UserInputResponse::declined())
+                            }
+                        }
+                        return;
+                    }
+                    if request.kind != APPROVAL_KIND {
+                        deliver_user_input_null(ctx, request.id);
+                        return;
+                    }
+                    let approval: ApprovalRequest = match serde_json::from_value(request.payload) {
+                        Ok(approval) => approval,
+                        Err(error) => {
+                            ctx.runtime
+                                .dispatch(atomcode_coding::DriverCommand::Respond {
+                                    id: request.id,
+                                    value: serde_json::Value::Null,
+                                })
+                                .ok();
+                            renderer.render(UiLine::Error(format!(
+                                "invalid approval request: {error}"
+                            )));
+                            renderer.flush();
+                            return;
+                        }
+                    };
+                    let snapshot = request
+                        .snapshot
+                        .as_deref()
+                        .map(snapshot_to_core)
+                        .unwrap_or_default();
+                    handle_agent_event(
+                        AgentEvent::ApprovalNeeded {
+                            tool_name: approval.tool.clone(),
+                            reason: "Requires approval".into(),
+                            call: atomcode_core::tool::ToolCall {
+                                id: approval.call_id,
+                                name: approval.tool,
+                                arguments: approval.args,
+                            },
+                            snapshot,
+                        },
+                        state,
+                        think,
+                        renderer,
+                        pending_tools,
+                        ctx,
+                        setup_pending,
+                        reasoning_buffer,
+                        buf,
+                    );
+                    return;
+                }
+                CodingRuntimeEvent::TurnFinished(completion) => {
+                    ctx.pending_runtime_request_id = None;
+                    let snapshot_unavailable = matches!(
+                        &completion,
+                        atomcode_coding::TurnCompletion::SnapshotUnavailable { .. }
+                    );
+                    let event = match completion {
+                        atomcode_coding::TurnCompletion::Completed {
+                            reason,
+                            snapshot,
+                            stats: _,
+                            ..
+                        } if matches!(reason, atomcode_kernel::event::StopReason::Cancelled) => {
+                            AgentEvent::TurnCancelled {
+                                snapshot: snapshot_to_core(snapshot.as_ref()),
+                            }
+                        }
+                        atomcode_coding::TurnCompletion::Completed {
+                            reason,
+                            snapshot,
+                            stats,
+                            ..
+                        } => {
+                            let total_tokens = stats
+                                .last_usage
+                                .as_ref()
+                                .map(|meta| (meta.tokens.prompt + meta.tokens.completion) as usize)
+                                .unwrap_or_default();
+                            AgentEvent::TurnComplete {
+                                duration: stats.duration,
+                                total_tokens,
+                                turn_count: stats.turn_count,
+                                tool_call_count: stats.tool_call_count,
+                                stop_reason: kernel_stop_reason(reason),
+                                snapshot: snapshot_to_core(snapshot.as_ref()),
+                            }
+                        }
+                        atomcode_coding::TurnCompletion::SnapshotUnavailable { error, .. } => {
+                            AgentEvent::Error {
+                                error: error.message,
+                                snapshot: Default::default(),
+                            }
+                        }
+                    };
+                    handle_agent_event(
+                        event,
+                        state,
+                        think,
+                        renderer,
+                        pending_tools,
+                        ctx,
+                        setup_pending,
+                        reasoning_buffer,
+                        buf,
+                    );
+                    if snapshot_unavailable {
+                        finish_failed_turn_without_snapshot(
+                            state,
+                            think,
+                            pending_tools,
+                            setup_pending,
+                            reasoning_buffer,
+                        );
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::RuntimeStopped(_) => {
+                    ctx.pending_runtime_request_id = None;
+                    if matches!(
+                        state.phase,
+                        UiPhase::Streaming | UiPhase::Approval | UiPhase::UserInput
+                    ) {
+                        handle_agent_event(
+                            AgentEvent::Error {
+                                error: "coding runtime stopped before turn terminal".into(),
+                                snapshot: Default::default(),
+                            },
+                            state,
+                            think,
+                            renderer,
+                            pending_tools,
+                            ctx,
+                            setup_pending,
+                            reasoning_buffer,
+                            buf,
+                        );
+                        finish_failed_turn_without_snapshot(
+                            state,
+                            think,
+                            pending_tools,
+                            setup_pending,
+                            reasoning_buffer,
+                        );
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::ModeChanged { mode } => {
+                    let agent_mode = match mode {
+                        atomcode_coding::RuntimeMode::Build => crate::state::AgentMode::Build,
+                        atomcode_coding::RuntimeMode::AcceptEdits => {
+                            crate::state::AgentMode::AcceptEdits
+                        }
+                        atomcode_coding::RuntimeMode::Auto => crate::state::AgentMode::Auto,
+                        atomcode_coding::RuntimeMode::Plan => crate::state::AgentMode::Plan,
+                    };
+                    state.agent_mode = agent_mode;
+                    atomcode_daemon::live_set_mode(agent_mode);
+                    return;
+                }
+                CodingRuntimeEvent::WorkingDirectoryChanged(directory) => {
+                    if ctx
+                        .pending_session_transition
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.operation == atomcode_coding::ReconfigureKind::ChangeDirectory
+                        })
+                    {
+                        // The correlated transition terminal commits cwd + session as one
+                        // projection. Do not expose a half-switched directory meanwhile.
+                        return;
+                    }
+                    handle_agent_event(
+                        AgentEvent::WorkingDirChanged(directory),
+                        state,
+                        think,
+                        renderer,
+                        pending_tools,
+                        ctx,
+                        setup_pending,
+                        reasoning_buffer,
+                        buf,
+                    );
+                    return;
+                }
+                CodingRuntimeEvent::SessionChanged(changed) => {
+                    if let Some(session_id) = changed.session_id.clone() {
+                        if ctx.pending_session_resume.as_ref().is_some_and(|pending| {
+                            pending.session.id == session_id
+                                && pending.working_dir == changed.working_dir
+                        }) {
+                            // Runtime committed, but the correlated terminal still owns
+                            // the exact catalog projection used by the picker.
+                            return;
+                        }
+                        if ctx.pending_session_transition.is_some() || ctx.pending_capability_reload
+                        {
+                            // Fresh/cd completion owns the atomic projection commit.
+                            return;
+                        }
+                        if let Err(error) = apply_native_session_changed(
+                            session_id,
+                            changed.working_dir.clone(),
+                            state,
+                            renderer,
+                            ctx,
+                        ) {
+                            ctx.pending_external_session_projection = Some(changed);
+                            renderer.render(UiLine::Error(error));
+                            renderer.flush();
+                        }
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::SessionNameSuggested { name } => {
+                    handle_agent_event(
+                        AgentEvent::SessionRenamed { name },
+                        state,
+                        think,
+                        renderer,
+                        pending_tools,
+                        ctx,
+                        setup_pending,
+                        reasoning_buffer,
+                        buf,
+                    );
+                    return;
+                }
+                CodingRuntimeEvent::GoalChanged(progress) => {
+                    handle_agent_event(
+                        AgentEvent::GoalUpdate {
+                            active: progress.active,
+                            round: progress.round,
+                            elapsed_secs: progress.elapsed_secs,
+                            condition: progress.condition,
+                            last_reason: progress.last_reason,
+                        },
+                        state,
+                        think,
+                        renderer,
+                        pending_tools,
+                        ctx,
+                        setup_pending,
+                        reasoning_buffer,
+                        buf,
+                    );
+                    return;
+                }
+                CodingRuntimeEvent::LoopChanged(progress) => {
+                    handle_agent_event(
+                        AgentEvent::LoopUpdate {
+                            active: progress.active,
+                            round: progress.round,
+                            elapsed_secs: progress.elapsed_secs,
+                            label: progress.label,
+                            last_reason: progress.last_reason,
+                        },
+                        state,
+                        think,
+                        renderer,
+                        pending_tools,
+                        ctx,
+                        setup_pending,
+                        reasoning_buffer,
+                        buf,
+                    );
+                    return;
+                }
+                CodingRuntimeEvent::ControllerWarning(message) => {
+                    renderer.render(UiLine::Warning(message));
+                    renderer.flush();
+                    return;
+                }
+                CodingRuntimeEvent::VisionPreprocessSuccess {
+                    vl_model,
+                    char_count,
+                } => {
+                    // Reuse the existing UiEvent handler so the "✓ VL recognised
+                    // image, returned N chars · <model>" toast renders identically
+                    // to the pre-bridge-retirement behavior.
+                    handle_agent_event(
+                        AgentEvent::VisionPreprocessSuccess {
+                            vl_model,
+                            char_count,
+                        },
+                        state,
+                        think,
+                        renderer,
+                        pending_tools,
+                        ctx,
+                        setup_pending,
+                        reasoning_buffer,
+                        buf,
+                    );
+                    return;
+                }
+                CodingRuntimeEvent::VisionPreprocessFailed { reason } => {
+                    renderer.render(UiLine::Warning(
+                        crate::i18n::t(crate::i18n::Msg::VisionPreprocessFailed {
+                            reason: &reason,
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+                    // Re-attach the images so the user can retry without
+                    // re-pasting (parity with the old bridge). Uses the
+                    // AUTHORITATIVE (image, marker) pairing stashed at submit —
+                    // not re-derived from text — so `└ [Image #N]` echoes match.
+                    // The RestorePendingImages handler also restores the caption
+                    // from `last_submitted_message`.
+                    let images = std::mem::take(&mut state.last_submitted_pasted_images);
+                    let markers = std::mem::take(&mut state.last_submitted_pasted_markers);
+                    if !images.is_empty() {
+                        handle_agent_event(
+                            AgentEvent::RestorePendingImages { images, markers },
+                            state,
+                            think,
+                            renderer,
+                            pending_tools,
+                            ctx,
+                            setup_pending,
+                            reasoning_buffer,
+                            buf,
+                        );
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::UndoFinished(result) => {
+                    match result {
+                        Ok(result) => handle_undo_success(
+                            snapshot_to_core(result.snapshot.as_ref()),
+                            result.restored_prompt,
+                            result.target_n,
+                            result.prompts_before,
+                            state,
+                            renderer,
+                            ctx,
+                            buf,
+                        ),
+                        Err(atomcode_coding::RuntimeError::UndoOutOfRange {
+                            requested,
+                            available,
+                        }) => handle_undo_failure(requested, available, renderer),
+                        Err(error) => {
+                            renderer.render(UiLine::Error(format!("undo failed: {error}")));
+                            renderer.flush();
+                        }
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::ContextStatsRefreshed(result) => {
+                    match result {
+                        Ok(stats) => {
+                            state.on_context_stats(
+                                0,
+                                stats.used_tokens as usize,
+                                0,
+                                0,
+                                0,
+                                stats.context_window as usize,
+                                "coding-runtime",
+                                "",
+                            );
+                            if let Some(show_prompt) = state.pending_context_render.take() {
+                                renderer.render(UiLine::CommandOutput(
+                                    commands::render_context_report(state, ctx, show_prompt),
+                                ));
+                                renderer.flush();
+                            }
+                        }
+                        Err(error) => {
+                            state.pending_context_render = None;
+                            renderer.render(UiLine::Error(format!(
+                                "refresh context stats failed: {error}"
+                            )));
+                            renderer.flush();
+                        }
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::SnapshotRestoreFinished { .. } => return,
+                CodingRuntimeEvent::SessionResumeFinished(result) => {
+                    match result {
+                        Err(error) => {
+                            ctx.pending_session_resume = None;
+                            let message = error.to_string();
+                            renderer.render(UiLine::Error(
+                                crate::i18n::t(crate::i18n::Msg::SessionLoadFailed {
+                                    error: &message,
+                                })
+                                .into_owned(),
+                            ));
+                            renderer.flush();
+                        }
+                        Ok(changed) => {
+                            let matches = ctx
+                                .pending_session_resume
+                                .as_ref()
+                                .is_some_and(|pending| session_resume_matches(pending, &changed));
+                            if matches {
+                                ctx.pending_session_resume
+                                    .as_mut()
+                                    .expect("checked above")
+                                    .committed = Some(changed);
+                                if let Err(error) =
+                                    retry_pending_session_projections(state, renderer, ctx)
+                                {
+                                    renderer.render(UiLine::Error(error));
+                                    renderer.flush();
+                                }
+                            } else {
+                                ctx.pending_session_resume = None;
+                                renderer.render(UiLine::Error(
+                                    "session resume returned an unexpected identity; following the runtime owner"
+                                        .into(),
+                                ));
+                                renderer.flush();
+                                ctx.pending_external_session_projection = Some(changed);
+                                if let Err(error) =
+                                    retry_pending_session_projections(state, renderer, ctx)
+                                {
+                                    renderer.render(UiLine::Error(error));
+                                    renderer.flush();
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::ProviderChanged { provider, model } => {
+                    // Ready and deferred runtimes forward ProviderChanged and the
+                    // awaitable reload terminal through different tasks, so their
+                    // arrival order is not a commit contract. Sequenced observations
+                    // that arrive during a staged reload are retained above; reaching
+                    // this branch means no local transition still owns the projection.
+                    if let Some(generation) = ctx.runtime.current_generation() {
+                        stage_provider_projection(ctx, generation, provider, Some(model));
+                        if ctx.pending_provider_reload.is_none()
+                            && retry_pending_provider_projection(ctx, state, renderer)
+                        {
+                            renderer.flush();
+                        }
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::ProviderReloadFinished(Err(error)) => {
+                    let mut message = format!("provider reload failed: {error}");
+                    let mut retry_provider_projection = false;
+                    if let Some(pending) = ctx.pending_provider_reload.take() {
+                        let current_generation = ctx.runtime.current_generation();
+                        if provider_reload_failure_was_superseded(
+                            pending.origin_generation,
+                            current_generation,
+                        ) {
+                            // Err has no generation. If the runtime advanced
+                            // since enqueue, this terminal can be the losing
+                            // side of a concurrent live/config-watcher race.
+                            // Do not roll back or seal the same disk revision as
+                            // failed; project the authoritative winning event.
+                            ctx.observed_config_revision = None;
+                            retry_provider_projection = current_provider_projection(
+                                ctx.pending_provider_projection.as_ref(),
+                                current_generation,
+                            )
+                            .is_some();
+                            message.push_str(
+                                "; a newer runtime generation won the transition; following the runtime owner",
+                            );
+                        } else {
+                            if ctx
+                                .pending_provider_projection
+                                .as_ref()
+                                .is_some_and(|observation| {
+                                    Some(observation.generation) == pending.origin_generation
+                                })
+                            {
+                                ctx.pending_provider_projection = None;
+                            }
+                            let rollback = rollback_pending_provider_reload(ctx, pending);
+                            if rollback.persisted_superseded {
+                                // A newer disk commit won the CAS/read race.
+                                // Ordinary failures retain their observed bad
+                                // revision to avoid a hot automatic retry loop.
+                                ctx.observed_config_revision = None;
+                            }
+                            if let Some(rollback_error) = rollback.error {
+                                message.push_str(&format!(
+                                    "; config rollback failed: {rollback_error}"
+                                ));
+                            }
+                        }
+                    }
+                    if retry_provider_projection {
+                        retry_pending_provider_projection(ctx, state, renderer);
+                    }
+                    atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+                    renderer.render(UiLine::Error(message));
+                    renderer.flush();
+                    return;
+                }
+                CodingRuntimeEvent::ProviderReloadFinished(Ok(generation)) => {
+                    let current_generation = ctx.runtime.current_generation();
+                    if !provider_reload_terminal_matches(generation, current_generation) {
+                        // The runtime no longer confirms this exact generation.
+                        // Force the ConfigStore observer to reconcile that state;
+                        // never announce or project an unmatched terminal.
+                        let reason = format!(
+                            "runtime advanced while reload was in flight (terminal {}, current {:?}); reconciling latest config",
+                            generation.0,
+                            current_generation.map(|generation| generation.0),
+                        );
+                        let retry_provider_projection = current_provider_projection(
+                            ctx.pending_provider_projection.as_ref(),
+                            current_generation,
+                        )
+                        .is_some();
+                        discard_pending_provider_reload(ctx, renderer, &reason);
+                        if retry_provider_projection {
+                            retry_pending_provider_projection(ctx, state, renderer);
+                            renderer.flush();
+                        }
+                        crate::tuix_trace!(
+                            "CONFIG",
+                            "ignored unmatched provider reload terminal generation={} current={:?}",
+                            generation.0,
+                            current_generation.map(|generation| generation.0),
+                        );
+                        return;
+                    }
+                    let expected_persisted_revision = ctx
+                        .pending_provider_reload
+                        .as_ref()
+                        .and_then(|pending| pending.persisted_revision.as_ref())
+                        .cloned();
+                    let (current_persisted_revision, persisted_verification_error) =
+                        match expected_persisted_revision.as_ref() {
+                            Some(_) => match ctx.config_store.read() {
+                                Ok(snapshot) => (Some(snapshot.revision), None),
+                                Err(error) => (None, Some(format!(
+                                "runtime reloaded, but the active config revision could not be verified: {error}"
+                                ))),
+                            },
+                            None => (None, None),
+                        };
+                    let can_announce = provider_reload_terminal_can_announce(
+                        expected_persisted_revision.as_ref(),
+                        current_persisted_revision.as_ref(),
+                    );
+                    let Some(pending) = ctx.pending_provider_reload.take() else {
+                        return;
+                    };
+                    let PendingProviderReload {
+                        desired_config,
+                        announce,
+                        manual_reload_announce,
+                        selection_mode_after_success,
+                        ..
+                    } = pending;
+                    let previous_language = ctx.config.language;
+                    let (provider, model) = resolved_provider_and_model(&desired_config);
+                    ctx.config = desired_config;
+                    let language_changed = previous_language != ctx.config.language;
+                    if language_changed {
+                        crate::i18n::set_locale(atomcode_config::i18n::resolve_initial_locale(
+                            None,
+                            ctx.config.language,
+                        ));
+                    }
+                    if let Some(mode) = selection_mode_after_success {
+                        ctx.provider_selection_mode = mode;
+                    }
+                    apply_provider_projection(
+                        ctx,
+                        state,
+                        renderer,
+                        provider.clone(),
+                        model.clone(),
+                    );
+                    if ctx
+                        .pending_provider_projection
+                        .as_ref()
+                        .is_some_and(|observation| {
+                            observation.generation == generation
+                                && observation.provider == provider
+                                && observation
+                                    .model
+                                    .as_deref()
+                                    .is_none_or(|value| value == model)
+                        })
+                    {
+                        ctx.pending_provider_projection = None;
+                    }
+                    if !can_announce {
+                        ctx.observed_config_revision = None;
+                        let error = persisted_verification_error.unwrap_or_else(|| {
+                            "configuration changed again while reload was in flight; the runtime result is active temporarily and the latest configuration will be reconciled"
+                                .to_string()
+                        });
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::CmdReloadFailed { error: &error })
+                                .into_owned(),
+                        ));
+                    } else {
+                        if language_changed {
+                            let locale = crate::i18n::current_locale();
+                            let label = match locale {
+                                atomcode_config::locale::Locale::En => "English",
+                                atomcode_config::locale::Locale::ZhCn => "简体中文",
+                            };
+                            renderer.render(UiLine::CommandOutput(
+                                crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
+                                    label,
+                                    locale: &locale.to_string(),
+                                })
+                                .into_owned(),
+                            ));
+                        }
+                        if let Some(announcement) = announce.filter(|value| !value.is_empty()) {
+                            renderer.render(UiLine::CommandOutput(announcement));
+                        }
+                        if manual_reload_announce {
+                            renderer.render(UiLine::CommandOutput(
+                                crate::i18n::t(crate::i18n::Msg::CmdReloadDone {
+                                    provider: &provider,
+                                    model: &model,
+                                })
+                                .into_owned(),
+                            ));
+                        }
+                    }
+                    renderer.flush();
+                    return;
+                }
+                CodingRuntimeEvent::ProviderDeactivationFinished(Ok(_)) => {
+                    ctx.pending_provider_deactivation = false;
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CmdLogoutDone).into_owned(),
+                    ));
+                    renderer.flush();
+                    return;
+                }
+                CodingRuntimeEvent::ProviderDeactivationFinished(Err(error)) => {
+                    ctx.pending_provider_deactivation = false;
+                    // Credentials are already gone. Keep the missing-auth
+                    // transition observable so the next poll retries the
+                    // fail-closed deactivation instead of leaving a live
+                    // AtomGit provider behind after a transient runtime race.
+                    ctx.observed_auth = None;
+                    let message =
+                        format!("credentials removed, but provider deactivation failed: {error}");
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::CmdLogoutFailed { error: &message })
+                            .into_owned(),
+                    ));
+                    renderer.flush();
+                    return;
+                }
+                event => {
+                    let mirror_persisted =
+                        persist_native_compaction_snapshot(&event, ctx, renderer);
+                    handle_coding_runtime_event(event, state, think, renderer, mirror_persisted);
+                    return;
+                }
+            }
+        }
+        bg_runtime::RuntimeEventPayload::Driver(bg_runtime::DriverEvent::LocalShellFinished {
+            output,
+            failed,
+        }) => {
+            if failed {
+                renderer.render(UiLine::Error(output));
+            } else {
+                renderer.render(UiLine::CommandOutput(output));
+            }
+            renderer.flush();
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionResumePrepared {
+                project_bucket,
+                session_id,
+                working_dir,
+                result,
+            },
+        ) => {
+            let expected = PendingSessionResumePreparation {
+                project_bucket,
+                session_id,
+                working_dir,
+            };
+            if ctx.pending_session_resume_preparation.as_ref() != Some(&expected) {
+                return;
+            }
+            ctx.pending_session_resume_preparation = None;
+            let prepared = match result {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &error })
+                            .into_owned(),
+                    ));
+                    renderer.flush();
+                    return;
+                }
+            };
+            let prepared_working_dir = std::path::Path::new(&prepared.view.meta.working_dir);
+            if prepared.project_bucket != expected.project_bucket
+                || atomcode_capabilities::pathnorm::path_case_key(prepared_working_dir)
+                    != atomcode_capabilities::pathnorm::path_case_key(&expected.working_dir)
+            {
+                let error = format!(
+                    "selected session moved outside project {} while resume was preparing",
+                    expected.working_dir.display()
+                );
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &error })
+                        .into_owned(),
+                ));
+                renderer.flush();
+                return;
+            }
+            let project_bucket = prepared.project_bucket;
+            let session = match Session::from_catalog_view(prepared.view) {
+                Ok(session) => session,
+                Err(error) => {
+                    let message = error.to_string();
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &message })
+                            .into_owned(),
+                    ));
+                    renderer.flush();
+                    return;
+                }
+            };
+            if let Err(error) = ctx.runtime.resume_session(
+                session.id.clone(),
+                expected.working_dir.clone(),
+                prepared.lease,
+                ctx.foreground_runtime_id,
+                ctx.runtime_event_tx.clone(),
+            ) {
+                let message = error.to_string();
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &message })
+                        .into_owned(),
+                ));
+                renderer.flush();
+                return;
+            }
+            ctx.pending_session_resume = Some(PendingSessionResume {
+                project_bucket,
+                session,
+                working_dir: expected.working_dir,
+                committed: None,
+            });
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionCatalogLoaded {
+                working_dir,
+                result,
+            },
+        ) => {
+            // Stash for the app-owning main loop to install (this handler has no
+            // `active_modal`). Carry `working_dir` so install can re-validate — it
+            // may be deferred behind a modal past a later dir change.
+            ctx.pending_session_picker = Some((working_dir, result));
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionTransitionFinished { operation, result },
+        ) => match result {
+            Err(error) => {
+                ctx.pending_session_transition = None;
+                let message = error.to_string();
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionFailed {
+                        error: &message,
+                    })
+                    .into_owned(),
+                ));
+                renderer.flush();
+            }
+            Ok(changed) => {
+                if !ctx
+                    .pending_session_transition
+                    .as_ref()
+                    .is_some_and(|pending| session_transition_matches(pending, operation, &changed))
+                {
+                    ctx.pending_session_transition = None;
+                    renderer.render(UiLine::Error(
+                            "session switch returned an unexpected identity; following the runtime owner"
+                                .into(),
+                        ));
+                    renderer.flush();
+                    ctx.pending_external_session_projection = Some(changed);
+                } else {
+                    ctx.pending_session_transition
+                        .as_mut()
+                        .expect("checked above")
+                        .committed = Some(changed);
+                }
+                if let Err(error) = retry_pending_session_projections(state, renderer, ctx) {
+                    renderer.render(UiLine::Error(error));
+                    renderer.flush();
+                }
+            }
+        },
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::CapabilitiesReloadFinished { result },
+        ) => match result {
+            Err(error) => {
+                ctx.pending_capability_reload = false;
+                ctx.pending_capability_projection = None;
+                complete_mcp_reload_notice(&mut ctx.pending_mcp_reload_server_count, false);
+                let message = error.to_string();
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::CmdCapabilityReloadFailed { error: &message })
+                        .into_owned(),
+                ));
+                renderer.flush();
+            }
+            Ok(changed) => {
+                if let Some(message) =
+                    complete_mcp_reload_notice(&mut ctx.pending_mcp_reload_server_count, true)
+                {
+                    renderer.render(UiLine::CommandOutput(message));
+                    renderer.flush();
+                }
+                ctx.pending_capability_projection = Some(changed);
+                if let Err(error) = retry_pending_session_projections(state, renderer, ctx) {
+                    renderer.render(UiLine::Error(error));
+                    renderer.flush();
+                }
+            }
+        },
+    }
+}
+
+/// Close the local presentation only for an authoritative failure terminal
+/// that cannot be projected as a normal `TurnComplete` (missing snapshot or a
+/// runtime stop that violated the turn-terminal contract).
+fn finish_failed_turn_without_snapshot(
+    state: &mut UiState,
+    think: &mut ThinkStripper,
+    pending_tools: &mut std::collections::HashMap<String, (String, String, bool)>,
+    setup_pending: &mut bool,
+    reasoning_buffer: &mut String,
+) {
+    state.response_finalized = true;
+    state.on_turn_complete();
+    think.reset();
+    pending_tools.clear();
+    reasoning_buffer.clear();
+    *setup_pending = false;
+}
+
+fn publish_live_runtime_event(
+    ctx: &LoopCtx,
+    event: &bg_runtime::RuntimeEventPayload,
+) -> Result<(), String> {
+    let Some(binding) = &ctx.live_binding else {
+        return Ok(());
+    };
+    let result = match event {
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => {
+            atomcode_daemon::native_live::publish(binding, envelope.clone())
+        }
+        // Driver-correlated completion is consumed only by this TUI. Publishing
+        // it as an unsequenced live event would advance the hub sequence outside
+        // CodingRuntime's authoritative event stream.
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::SessionResumeFinished(_)) => {
+            return Ok(());
+        }
+        bg_runtime::RuntimeEventPayload::Native(event) => {
+            atomcode_daemon::native_live::publish_unsequenced(binding, event.clone())
+        }
+        _ => return Ok(()),
+    };
+    match result {
+        Ok(()) | Err(atomcode_daemon::live_hub::HubError::StaleEvent) => Ok(()),
+        Err(error) => Err(format!("Live event synchronization failed: {error:?}")),
+    }
+}
+
+fn retry_pending_session_projections(
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+) -> Result<(), String> {
+    if ctx
+        .pending_session_resume
+        .as_ref()
+        .is_some_and(|pending| pending.committed.is_some())
+    {
+        let mut pending = ctx.pending_session_resume.take();
+        let result = commit_pending_projection(&mut pending, |pending| {
+            let changed = pending
+                .committed
+                .as_ref()
+                .expect("checked committed resume above");
+            commit_native_session_changed(
+                pending.session.clone(),
+                changed.working_dir.clone(),
+                state,
+                renderer,
+                ctx,
+            )?;
+            ctx.current_session_project_bucket = Some(pending.project_bucket.clone());
+            Ok::<(), String>(())
+        });
+        ctx.pending_session_resume = pending;
+        result?;
+    }
+
+    if ctx
+        .pending_session_transition
+        .as_ref()
+        .is_some_and(|pending| pending.committed.is_some())
+    {
+        let mut pending = ctx.pending_session_transition.take();
+        let committed = commit_pending_projection(&mut pending, |pending| {
+            let changed = pending
+                .committed
+                .as_ref()
+                .expect("checked committed transition above");
+            let session_id = changed
+                .session_id
+                .clone()
+                .ok_or_else(|| "session switch completed without a session identity".to_string())?;
+            apply_native_session_changed(
+                session_id,
+                changed.working_dir.clone(),
+                state,
+                renderer,
+                ctx,
+            )
+        });
+        ctx.pending_session_transition = pending;
+        if let Some(committed) = committed? {
+            commands::complete_session_transition_effect(committed.effect, ctx, renderer);
         }
     }
+
+    if ctx.pending_external_session_projection.is_some() {
+        let mut pending = ctx.pending_external_session_projection.take();
+        let result = commit_pending_projection(&mut pending, |changed| {
+            let session_id = changed
+                .session_id
+                .clone()
+                .ok_or_else(|| "session switch completed without a session identity".to_string())?;
+            apply_native_session_changed(
+                session_id,
+                changed.working_dir.clone(),
+                state,
+                renderer,
+                ctx,
+            )
+        });
+        ctx.pending_external_session_projection = pending;
+        result?;
+    }
+
+    if ctx.pending_capability_projection.is_some() {
+        let mut pending = ctx.pending_capability_projection.take();
+        let committed = commit_pending_projection(&mut pending, |changed| {
+            commit_live_capability_projection(changed, ctx)
+        });
+        ctx.pending_capability_projection = pending;
+        if committed?.is_some() {
+            ctx.pending_capability_reload = false;
+        }
+    }
+
+    Ok(())
+}
+
+fn commit_live_capability_projection(
+    changed: &atomcode_coding::SessionChanged,
+    ctx: &mut LoopCtx,
+) -> Result<(), String> {
+    if changed.session_id.as_deref() != Some(ctx.current_session.id.as_str())
+        || changed.working_dir != ctx.working_dir
+    {
+        return Err("capability reload returned an unexpected session identity".into());
+    }
+    let Some(binding) = ctx.live_binding.clone() else {
+        return Ok(());
+    };
+    let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
+        &ctx.current_session.to_conversation_snapshot(),
+    );
+    ctx.live_binding = Some(
+        atomcode_daemon::native_live::commit_runtime_snapshot(
+            &binding,
+            ctx.current_session.id.to_string(),
+            ctx.working_dir.clone(),
+            snapshot,
+        )
+        .map_err(|error| format!("Failed to update live capability snapshot: {error:?}"))?,
+    );
+    Ok(())
+}
+
+fn apply_native_session_changed(
+    session_id: String,
+    working_dir: PathBuf,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+) -> Result<(), String> {
+    if ctx.current_session.id == session_id {
+        return Ok(());
+    }
+    let project_bucket = atomcode_capabilities::session::SessionManager::project_hash(&working_dir);
+    let session = match atomcode_daemon::legacy_convert::load_catalog_session_view_in_project(
+        &project_bucket,
+        &session_id,
+    ) {
+        Ok(Some(session)) => match Session::from_catalog_view(session) {
+            Ok(session) => session,
+            Err(error) => return Err(format!("Failed to decode session {session_id}: {error}")),
+        },
+        Ok(None) => {
+            return Err(format!(
+                "Session {session_id} disappeared after runtime switch"
+            ))
+        }
+        Err(error) => return Err(format!("Failed to resolve session {session_id}: {error}")),
+    };
+
+    commit_native_session_changed(session, working_dir, state, renderer, ctx)
+}
+
+fn commit_native_session_changed(
+    session: Session,
+    working_dir: PathBuf,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+) -> Result<(), String> {
+    let session_id = session.id.clone();
+    let working_dir = atomcode_capabilities::pathnorm::strip_verbatim_path(&working_dir);
+    let next_live_binding = if let Some(binding) = ctx.live_binding.clone() {
+        let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
+            &session.to_conversation_snapshot(),
+        );
+        Some(
+            atomcode_daemon::native_live::replace_snapshot(
+                &binding,
+                session_id.clone(),
+                working_dir.clone(),
+                snapshot,
+            )
+            .map_err(|error| format!("Failed to update live session snapshot: {error:?}"))?,
+        )
+    } else {
+        None
+    };
+
+    commit_working_dir_projection(ctx, working_dir);
+    ctx.current_session_id = Some(session_id.clone());
+    ctx.current_session_project_bucket =
+        Some(atomcode_capabilities::session::SessionManager::project_hash(&ctx.working_dir));
+    ctx.loop_ctrl = None;
+    state.loop_label = None;
+    state.loop_round = 0;
+    state.loop_started_at = None;
+    state.total_tokens = 0;
+    state.prompt_tokens = 0;
+    state.completion_tokens = 0;
+    state.cached_tokens = 0;
+    state.last_context = None;
+    state.pending_context_render = None;
+    state.thinking_idx = 0;
+    state.on_turn_complete();
+    state.on_session_replaced();
+    state.active_todos = None;
+    sync_todo_titles(state);
+    state.approval_panel = None;
+    commands::bind_telemetry_to_session(ctx, &session);
+    ctx.current_session = session;
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
+    if let Some(binding) = next_live_binding {
+        ctx.live_binding = Some(binding);
+    }
+
+    renderer.begin_sync();
+    renderer.reset();
+    if ctx.current_session.messages.is_empty() {
+        let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+        renderer.render(UiLine::Welcome {
+            model: ctx.model_name.clone(),
+            working_dir: dir_display,
+        });
+        renderer.render(UiLine::CommandOutput(
+            crate::i18n::t(crate::i18n::Msg::CmdNewSession).into_owned(),
+        ));
+    } else {
+        crate::modals::session_picker::replay_session(renderer, state, &ctx.current_session, true);
+    }
+    renderer.flush();
+    renderer.end_sync();
+    Ok(())
+}
+
+/// Commit the TUI-side projection of a runtime-owned working directory.
+///
+/// Session metadata is not authoritative for the physical project bucket:
+/// legacy imports can retain a stale embedded path. Runtime transitions and
+/// `/bg` resumes must funnel through this helper so every path-sensitive TUI
+/// projection changes together.
+pub(crate) fn commit_working_dir_projection(ctx: &mut LoopCtx, working_dir: PathBuf) {
+    let Some(working_dir) = planned_runtime_working_dir(&ctx.working_dir, &working_dir) else {
+        return;
+    };
+    ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, working_dir.clone()));
+    ctx.file_index.reset(working_dir.clone());
+    commands::push_recent_dir(&mut ctx.recent_dirs, working_dir.clone());
+    commands::save_recent_dirs(&ctx.recent_dirs);
+    atomcode_daemon::live_set_working_dir(working_dir);
+}
+
+fn planned_runtime_working_dir(
+    current: &std::path::Path,
+    incoming: &std::path::Path,
+) -> Option<PathBuf> {
+    let incoming = atomcode_capabilities::pathnorm::strip_verbatim_path(incoming);
+    (current != incoming).then_some(incoming)
+}
+
+#[cfg(test)]
+mod working_dir_projection_tests {
+    use super::planned_runtime_working_dir;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn runtime_working_dir_plan_normalizes_before_comparing() {
+        assert_eq!(
+            planned_runtime_working_dir(Path::new("/old"), Path::new(r"\\?\C:\repo")),
+            Some(PathBuf::from(r"C:\repo"))
+        );
+        assert_eq!(
+            planned_runtime_working_dir(Path::new("/same"), Path::new("/same")),
+            None
+        );
+    }
+}
+
+fn truncate_local_shell_output(mut output: String) -> String {
+    const LIMIT: usize = 128 * 1024;
+    if output.len() <= LIMIT {
+        return output;
+    }
+    let mut boundary = LIMIT;
+    while !output.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    output.truncate(boundary);
+    output.push_str("\n[output truncated at 128 KiB]");
+    output
+}
+
+fn escape_runtime_context(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn run_local_shell_command(command: String, ctx: &LoopCtx) {
+    use atomcode_kernel::tool::Tool;
+
+    let working_dir = ctx.working_dir.clone();
+    let runtime = ctx.runtime.clone();
+    let runtime_id = ctx.foreground_runtime_id;
+    let event_tx = ctx.runtime_event_tx.clone();
+    tokio::spawn(async move {
+        let tool = atomcode_capabilities::tools::BashTool;
+        let args = serde_json::json!({ "command": command.clone() }).to_string();
+        let tool_ctx = atomcode_kernel::tool::ToolContext {
+            working_dir,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let result = tool.execute(&args, &tool_ctx).await;
+        let output = truncate_local_shell_output(result.content);
+        let context = format!(
+            "<bash-input>{}</bash-input>\n<bash-output>{}</bash-output>",
+            escape_runtime_context(&command),
+            escape_runtime_context(&output)
+        );
+        let queue_failed = runtime
+            .dispatch(atomcode_coding::DriverCommand::QueueLocalContext(
+                atomcode_coding::LocalContextInput { content: context },
+            ))
+            .is_err();
+        let failed = result.is_error || queue_failed;
+        let output = if queue_failed {
+            format!("{output}\n[failed to add shell output to runtime context]")
+        } else {
+            output
+        };
+        let _ = event_tx.send(bg_runtime::RuntimeEvent {
+            runtime_id,
+            event: bg_runtime::RuntimeEventPayload::Driver(
+                bg_runtime::DriverEvent::LocalShellFinished { output, failed },
+            ),
+        });
+    });
+}
+
+fn handle_undo_success(
+    snapshot: atomcode_core::conversation::ConversationSnapshot,
+    restored_prompt: String,
+    target_n: usize,
+    prompts_before: usize,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+    buf: &mut Buffer,
+) {
+    let new_len = snapshot.messages.len();
+    commands::stop_active_loop(state, ctx);
+    ctx.current_session
+        .update_from_conversation_snapshot(snapshot);
+    ctx.current_session.retain_turn_stats_after_undo(new_len);
+    ctx.current_session.touch();
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
+    crate::modals::session_picker::replay_session(renderer, state, &ctx.current_session, true);
+    buf.set_restored_text(restored_prompt);
+    renderer.render(UiLine::CommandOutput(
+        crate::i18n::t(crate::i18n::Msg::CmdUndoDone {
+            target: target_n,
+            last: prompts_before,
+        })
+        .into_owned(),
+    ));
+    renderer.render(UiLine::CommandOutput(
+        crate::i18n::t(crate::i18n::Msg::CmdUndoDiskWarning).into_owned(),
+    ));
+    renderer.flush();
+    state.on_turn_complete();
+}
+
+fn handle_undo_failure(requested: usize, available: usize, renderer: &mut dyn Renderer) {
+    let line = if available == 0 {
+        crate::i18n::t(crate::i18n::Msg::CmdUndoNoTurns).into_owned()
+    } else {
+        crate::i18n::t(crate::i18n::Msg::CmdUndoOutOfRange {
+            requested,
+            available,
+        })
+        .into_owned()
+    };
+    renderer.render(UiLine::CommandOutput(line));
+    renderer.flush();
 }
 
 /// Persist the exact committed kernel working set into the TUI's transitional
@@ -9342,95 +16154,8 @@ fn persist_native_compaction_snapshot(
         return false;
     };
 
-    let core_snapshot = kernel_snapshot_to_core(snapshot);
+    let core_snapshot = snapshot_to_core(snapshot);
     persist_current_session(ctx, core_snapshot, renderer)
-}
-
-fn kernel_snapshot_to_core(
-    snapshot: &atomcode_kernel::message::SessionSnapshot,
-) -> atomcode_core::conversation::ConversationSnapshot {
-    use atomcode_core::conversation::{
-        LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
-    };
-
-    let mut messages = Vec::with_capacity(snapshot.messages.len());
-    let mut cold_summaries = Vec::new();
-    for message in &snapshot.messages {
-        if message.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN) {
-            if let Some(summary) = message.text.strip_prefix(LEGACY_COLD_SUMMARY_PREFIX) {
-                cold_summaries.push(summary.to_string());
-                continue;
-            }
-        }
-        messages.push(kernel_message_to_core(message));
-    }
-    atomcode_core::conversation::ConversationSnapshot {
-        messages,
-        cold_summaries,
-    }
-}
-
-fn kernel_message_to_core(
-    message: &atomcode_kernel::message::Message,
-) -> atomcode_core::conversation::message::Message {
-    use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
-    use atomcode_kernel::message::Role as KernelRole;
-
-    let role = match message.role {
-        KernelRole::System => Role::System,
-        KernelRole::User => Role::User,
-        KernelRole::Assistant => Role::Assistant,
-        KernelRole::Tool => Role::Tool,
-    };
-    let content = if message.role == KernelRole::Tool {
-        MessageContent::ToolResult(atomcode_core::tool::ToolResult {
-            call_id: message.tool_call_id.clone().unwrap_or_default(),
-            output: message.text.clone(),
-            success: !message.is_error,
-        })
-    } else if !message.tool_calls.is_empty() {
-        MessageContent::AssistantWithToolCalls {
-            text: (!message.text.is_empty()).then(|| message.text.clone()),
-            tool_calls: message
-                .tool_calls
-                .iter()
-                .map(|call| atomcode_core::tool::ToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                })
-                .collect(),
-            reasoning_content: message.reasoning.clone(),
-            thinking_blocks: message
-                .reasoning_blocks
-                .iter()
-                .map(|block| atomcode_core::conversation::message::ThinkingBlock {
-                    text: block.text.clone(),
-                    signature: block.opaque.clone().unwrap_or_default(),
-                })
-                .collect(),
-        }
-    } else if !message.images.is_empty() {
-        MessageContent::MultiPart {
-            text: (!message.text.is_empty()).then(|| message.text.clone()),
-            images: message
-                .images
-                .iter()
-                .map(|image| ImagePart {
-                    media_type: image.media_type.clone(),
-                    data: image.data.clone(),
-                })
-                .collect(),
-        }
-    } else {
-        MessageContent::Text(message.text.clone())
-    };
-    Message {
-        role,
-        content,
-        synthetic: message.synthetic,
-        internal_origin: message.internal_origin.clone(),
-    }
 }
 
 fn handle_coding_runtime_event(
@@ -9506,7 +16231,24 @@ fn handle_coding_runtime_event(
                 state.compaction_forced_streaming = false;
                 state.phase = UiPhase::Idle;
                 state.spinner_label.clear();
+                // This Streaming→Idle path bypasses on_turn_complete/cancelled, so
+                // drop the interactive `/usage` panel here too — otherwise a panel
+                // armed during a forced-streaming compaction would bleed its tab
+                // keys into the next real streaming turn.
+                state.footer_usage = None;
             }
+        }
+        CodingRuntimeEvent::ProviderUnavailable { reason, .. } => {
+            let message = match reason {
+                atomcode_coding::ProviderUnavailableReason::NotConfigured => {
+                    crate::i18n::t(crate::i18n::Msg::CmdNoActiveProvider)
+                }
+                atomcode_coding::ProviderUnavailableReason::AuthenticationRequired => {
+                    crate::i18n::t(crate::i18n::Msg::CmdWhoamiNotSignedIn)
+                }
+            };
+            renderer.render(UiLine::CommandOutput(message.into_owned()));
+            renderer.flush();
         }
         _ => {}
     }
@@ -9569,7 +16311,13 @@ mod coding_runtime_event_tests {
             provider: Some("anthropic".into()),
         }];
 
-        let projected = kernel_message_to_core(&message);
+        let projected = snapshot_to_core(&atomcode_kernel::message::SessionSnapshot::new(vec![
+            message,
+        ]))
+        .messages
+        .into_iter()
+        .next()
+        .expect("projected message");
         let atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
             thinking_blocks,
             ..
@@ -9584,9 +16332,7 @@ mod coding_runtime_event_tests {
 
     #[test]
     fn kernel_projection_restores_legacy_cold_summaries() {
-        use atomcode_core::conversation::{
-            LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
-        };
+        use atomcode_core::conversation::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
         let mut summary = atomcode_kernel::message::Message::user(format!(
             "{LEGACY_COLD_SUMMARY_PREFIX}older context"
         ));
@@ -9597,7 +16343,7 @@ mod coding_runtime_event_tests {
             atomcode_kernel::message::Message::user("recent"),
         ]);
 
-        let projected = kernel_snapshot_to_core(&snapshot);
+        let projected = snapshot_to_core(&snapshot);
 
         assert_eq!(projected.cold_summaries, vec!["older context"]);
         assert_eq!(projected.messages.len(), 1);
@@ -9664,7 +16410,8 @@ mod coding_runtime_event_tests {
                 CodingRuntimeEvent::CompactionFinished {
                     completion: CompactionCompletion::Interrupted {
                         trigger: CompactTrigger::Manual { focus: None },
-                        reason: atomcode_coding::runtime::CompactionInterruption::RuntimeReconfigured,
+                        reason:
+                            atomcode_coding::runtime::CompactionInterruption::RuntimeReconfigured,
                     },
                 },
                 &mut state,
@@ -9756,7 +16503,10 @@ mod coding_runtime_event_tests {
             );
         }
 
-        assert!(output.is_empty(), "success marker must wait for the session mirror save");
+        assert!(
+            output.is_empty(),
+            "success marker must wait for the session mirror save"
+        );
     }
 
     #[test]
@@ -9827,9 +16577,9 @@ fn handle_agent_event(
             | AgentEvent::ToolCallStreaming { .. }
             | AgentEvent::ToolCallStarted { .. }
             | AgentEvent::ApprovalNeeded { .. }
-            | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::Thinking)
-            | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::CallingTool(_))
-            | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::WaitingApproval)
+            | AgentEvent::PhaseChange(AgentPhase::Thinking)
+            | AgentEvent::PhaseChange(AgentPhase::CallingTool(_))
+            | AgentEvent::PhaseChange(AgentPhase::WaitingApproval)
             | AgentEvent::GoalUpdate { active: true, .. }
             // LoopUpdate(active=true) signals a new loop round beginning — flush any
             // buffered separator as `⚡ loop round N` before the round's first event.
@@ -9843,6 +16593,9 @@ fn handle_agent_event(
 
     match ev {
         AgentEvent::TextDelta(text) => {
+            // Count streamed output for the spinner's `↑ N tokens` liveness
+            // indicator (before `text` is moved into the renderer).
+            state.turn_output_chars += text.chars().count();
             render_assistant_text(text, state, think, renderer);
         }
         AgentEvent::ReasoningDelta(text) => {
@@ -9850,6 +16603,8 @@ fn handle_agent_event(
             // visibility — the blank-turn notice uses it to say "only reasoning,
             // press Ctrl+O" vs "no output at all".
             state.turn_saw_reasoning = true;
+            // Reasoning counts as streamed output for the `↑ N tokens` indicator.
+            state.turn_output_chars += text.chars().count();
             // Display reasoning/thinking content in verbose mode (Ctrl+O)
             // Only show when the user has enabled it
             if state.show_reasoning {
@@ -9863,7 +16618,13 @@ fn handle_agent_event(
                 }
             }
         }
-        AgentEvent::ToolCallStreaming { name, .. } => {
+        AgentEvent::ToolCallStreaming {
+            name, arg_chars, ..
+        } => {
+            // A turn that spends minutes emitting one huge tool call (e.g. a
+            // giant script) would otherwise show no motion; count its argument
+            // stream so `↑ N tokens` keeps ticking and it doesn't look hung.
+            state.turn_output_chars += arg_chars;
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
         AgentEvent::ToolCallStarted {
@@ -9879,7 +16640,11 @@ fn handle_agent_event(
             // the incremental `{action}` shape; a resumed session may also carry legacy `todo`
             // calls. Distinguish by ARG SHAPE, not tool name.
             let is_todo_call = name == "todowrite" || name == "todo";
-            let todo_plan = if is_todo_call { todo_progress_from_args(&arguments) } else { None };
+            let todo_plan = if is_todo_call {
+                todo_progress_from_args(&arguments)
+            } else {
+                None
+            };
             let is_todo_action = is_todo_call
                 && todo_plan.is_none()
                 && serde_json::from_str::<serde_json::Value>(&arguments)
@@ -9946,7 +16711,6 @@ fn handle_agent_event(
                 state.on_tool_call_started(&display);
                 return;
             }
-
 
             // Emit the ▸ line immediately so users can see what command
             // is running, especially for long-running bash commands.
@@ -10179,7 +16943,45 @@ fn handle_agent_event(
                     } else {
                         summarise(&output)
                     };
-                    renderer.render(UiLine::ToolResult { success, summary });
+                    // The inline colored `(+N -N)` is the edit result's only
+                    // metadata. Drop the tool's older parenthesized replacement
+                    // label so the count sits directly after the file name.
+                    let summary = if name == "edit_file" && success {
+                        summary
+                            .split_once(" (")
+                            .map(|(file, _)| file.to_string())
+                            .unwrap_or(summary)
+                    } else {
+                        summary
+                    };
+                    let diff_entries = if matches!(
+                        name.as_str(),
+                        "edit_file" | "write_file" | "create_file" | "search_replace"
+                    ) {
+                        let entries = crate::render::diff::parse_unified_diff(&output, 120);
+                        (!entries.is_empty()).then_some(entries)
+                    } else {
+                        None
+                    };
+                    let diff_stats = diff_entries.as_ref().map(|entries| {
+                        let added = entries
+                            .iter()
+                            .filter(|entry| entry.kind == crate::render::DiffKind::Add)
+                            .count();
+                        let removed = entries
+                            .iter()
+                            .filter(|entry| entry.kind == crate::render::DiffKind::Del)
+                            .count();
+                        (added, removed)
+                    });
+                    renderer.render(UiLine::ToolResult {
+                        success,
+                        summary,
+                        diff_stats,
+                    });
+                    if let Some(entries) = diff_entries {
+                        renderer.render(UiLine::EditDiffBlock(entries));
+                    }
                 }
             }
             // Collect diff lines into a single batch — N individual
@@ -10197,16 +16999,6 @@ fn handle_agent_event(
             // tools that actually emit diff payloads (`edit_file`,
             // `write_file`, `create_file`, `search_replace`) closes
             // that without losing the diff render where it's wanted.
-            let emits_diff = matches!(
-                name.as_str(),
-                "edit_file" | "write_file" | "create_file" | "search_replace"
-            );
-            if emits_diff {
-                let diff_entries = crate::render::diff::parse_unified_diff(&output, 120);
-                if !diff_entries.is_empty() {
-                    renderer.render(UiLine::DiffBlock(diff_entries));
-                }
-            }
             // Flush any pending diff renders before the next event.
             renderer.flush();
             let _ = name;
@@ -10217,20 +17009,20 @@ fn handle_agent_event(
             snapshot,
             ..
         } => {
+            let cache_key = get_approval_cache_key(&tool_name, &call.arguments);
+            let already_allowed = {
+                let guard = ctx.allowed_always.lock().unwrap();
+                guard.contains(&cache_key)
+            };
+            if already_allowed {
+                deliver_approval(ctx, ApprovalChoice::AllowAlways);
+                return;
+            }
             // BYPASS mode (`--dangerously-skip-permissions`): auto-approve and
-            // skip the prompt entirely. In LOCAL mode the core decider already
-            // short-circuits, so this event never fires there. But in SYNC mode
-            // the daemon's LiveSession runs an InteractivePermissionDecider
-            // (auto_approve=false, see live_api.rs) that ALWAYS asks and forwards
-            // ApprovalRequested → here (live_sync.rs); the TUI's bypass flag would
-            // otherwise be ignored, surfacing prompts whenever a turn drives tool
-            // calls — e.g. a `/skills` expansion. Honor bypass at the TUI seam
-            // rather than flipping the shared daemon executor (which would leak
-            // bypass to webui peers attached to the same LiveSession).
-            // `deliver_approval` routes to LiveSession.approve(Allow) in sync mode
-            // and to the local agent otherwise.
+            // skip the prompt. The response goes through the hub when shared, so
+            // all views observe the same pending request lifecycle.
             if state.agent_mode.is_auto() {
-                deliver_approval(ctx, bypass_approval_command());
+                deliver_approval(ctx, bypass_approval_choice());
                 return;
             }
             // Persist mid-turn messages to session so /bg can recover
@@ -10238,7 +17030,7 @@ fn handle_agent_event(
             if !snapshot.messages.is_empty() {
                 apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
-                    .set_foreground_session(ctx.current_session.clone());
+                    .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
             }
 
             // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
@@ -10288,6 +17080,7 @@ fn handle_agent_event(
                 detail: detail.clone(),
                 options: build_approval_options(&display),
                 selected: 0,
+                cache_key,
             });
             renderer.flush();
             atomcode_capabilities::notify::notify(
@@ -10308,7 +17101,7 @@ fn handle_agent_event(
             // Y/A/N in response. Without this, a prior
             // on_approval_resolved() transition to Streaming may
             // have left the footer stale — especially when
-            // TurnRunner dispatches the second approval before any
+            // runtime dispatches the second approval before any
             // spinner tick fires (issue #455: "待审批输入 Y 后，
             // 输入框没了"). Use redraw_idle_plain instead of
             // draw_spinner_now because the spinner label may be
@@ -10360,7 +17153,7 @@ fn handle_agent_event(
             }
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
-            let errored = matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error);
+            let errored = turn_is_incomplete(stop_reason);
             // Footer token count: bill output + UNCACHED input (re-reading the
             // cached prefix each round is near-free). The event's `total_tokens`
             // is the v2 gross sum (prompt+completion per round) which overstates
@@ -10451,13 +17244,14 @@ fn handle_agent_event(
                 .unwrap_or((0, 0));
             ctx.current_session
                 .turn_stats
-                .push(atomcode_core::session::TurnStat {
+                .push(crate::session::TurnStat {
                     after_message: snapshot.messages.len(),
+                    position_valid: true,
                     turn_count,
                     tool_call_count,
                     duration_ms: duration.as_millis() as u64,
                     total_tokens,
-                    errored: matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error),
+                    errored: turn_is_incomplete(stop_reason),
                     used_tokens: last_used,
                     ctx_window: last_window,
                 });
@@ -10483,7 +17277,8 @@ fn handle_agent_event(
             // setup post-run side effects — only on successful TurnComplete.
             // Reload skills/commands so newly-created skills become visible
             // to the LLM immediately.
-            if std::mem::take(setup_pending) {
+            let setup_was_pending = std::mem::take(setup_pending);
+            if setup_was_pending && should_run_setup_post_turn(stop_reason) {
                 let (skills_loaded, warnings) = reload_plugins(ctx);
                 let warn_count = warnings.len();
                 renderer.render(UiLine::CommandOutput(
@@ -10534,6 +17329,7 @@ fn handle_agent_event(
                 renderer.render(UiLine::ToolResult {
                     success: false,
                     summary: "(cancelled)".into(),
+                    diff_stats: None,
                 });
             }
             renderer.render(UiLine::TurnCancelled);
@@ -10554,88 +17350,51 @@ fn handle_agent_event(
             target_n,
             prompts_before,
         } => {
-            let new_len = snapshot.messages.len();
-            // Persist the truncated conversation: messages + prune stale
-            // per-turn dividers (anchored by message-count) so /resume won't
-            // replay dividers for removed turns.
-            // /undo rewrites the conversation the loop was driving — stop any active
-            // /loop so its interval controller can't keep firing into the truncated
-            // history (and clear the stale footer).
-            commands::stop_active_loop(state, ctx);
-            ctx.current_session
-                .update_from_conversation_snapshot(snapshot);
-            ctx.current_session
-                .turn_stats
-                .retain(|s| s.after_message <= new_len);
-            ctx.current_session.touch();
-            ctx.bg_manager
-                .set_foreground_session(ctx.current_session.clone());
-            if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
-                renderer.render(UiLine::Error(
-                    crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
-                        error: &e.to_string(),
-                    })
-                    .into_owned(),
-                ));
-            }
-            // Redraw scrollback from the truncated history — reuses the
-            // /resume replay path (clears screen, re-renders turn dividers).
-            crate::modals::session_picker::replay_session(
-                renderer,
+            handle_undo_success(
+                snapshot,
+                restored_prompt,
+                target_n,
+                prompts_before,
                 state,
-                &ctx.current_session,
-                true,
+                renderer,
+                ctx,
+                buf,
             );
-            // Put the rolled-back prompt back in the input box for editing.
-            buf.set_restored_text(restored_prompt);
-            // Confirmation + disk-divergence warning.
-            renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::CmdUndoDone {
-                    target: target_n,
-                    last: prompts_before,
-                })
-                .into_owned(),
-            ));
-            renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::CmdUndoDiskWarning).into_owned(),
-            ));
-            renderer.flush();
-            state.on_turn_complete();
         }
         AgentEvent::UndoFailed {
             requested,
             available,
         } => {
-            let line = if available == 0 {
-                crate::i18n::t(crate::i18n::Msg::CmdUndoNoTurns).into_owned()
-            } else {
-                crate::i18n::t(crate::i18n::Msg::CmdUndoOutOfRange {
-                    requested,
-                    available,
-                })
-                .into_owned()
-            };
-            renderer.render(UiLine::CommandOutput(line));
-            renderer.flush();
+            handle_undo_failure(requested, available, renderer);
         }
         AgentEvent::Error { error, snapshot } => {
-            // Seal the reply buffer (any text streamed before the error stays
-            // copyable via `/copy`).
-            state.response_finalized = true;
+            // A `reasoning_effort` rejection (openai_compat's
+            // `effort_unsupported_error`) auto-disables the field at the provider
+            // for the rest of the session. Clear the footer indicator so it stops
+            // showing e.g. `[max]` for a value that is no longer being sent. The
+            // config value is untouched (a fresh session re-syncs it and re-heals).
+            // Coupled to the token in that error message; must be checked BEFORE
+            // `error` is moved into the render below.
+            if error.contains("reasoning_effort") {
+                ctx.reasoning_effort = None;
+            }
+            // Capture the reason so the errored turn-summary can carry it: the
+            // standalone red line below is rendered mid-turn (Streaming, spinner
+            // active) and can be clobbered by the physical Streaming→Idle redraw
+            // on a real terminal — the `✗ 已中断` summary renders cleanly at Idle,
+            // so binding the reason to it guarantees the user sees the cause.
+            state.last_turn_error = Some(error.clone());
             renderer.render(UiLine::Error(error));
             renderer.flush();
-            *setup_pending = false;
+            // Diagnostic only. The runtime emits the authoritative
+            // `TurnFinished` after kernel errors such as MaxRounds, RepeatLoop and
+            // ToolLoopDetected; that terminal owns phase, buffer and setup
+            // cleanup. Ending the turn here races queued input into the still
+            // active runtime.
             state.on_error();
-            // Same reset rationale as TurnComplete / TurnCancelled — an
-            // aborted turn is another way to leave `<think>` half-open.
-            think.reset();
-            // Persist on Error too — without this, a first-turn LLM
-            // failure (auth, rate limit, gateway 5xx, our own 5-min
-            // total-request timeout, etc.) silently drops the user's
-            // typed message from disk so the next `/resume` shows
-            // nothing for that conversation. Empty `messages` from
-            // the streaming-error forwarder is treated as a no-op
-            // by persist_current_session.
+            // Preserve a non-empty diagnostic snapshot without treating it as
+            // a terminal. Native kernel diagnostics currently carry an empty
+            // snapshot, so this is normally a no-op.
             persist_current_session(ctx, snapshot, renderer);
         }
         AgentEvent::Warning(w) => {
@@ -10652,14 +17411,20 @@ fn handle_agent_event(
                 *slot = Some(msg);
             }
         }
-        AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
+        AgentEvent::VisionPreprocessSuccess {
+            vl_model,
+            char_count,
+        } => {
             // Format here (not in agent) so we can localize / restyle
             // without bumping the AgentEvent contract. Char count helps
             // users notice degenerate near-zero VL outputs that would
             // mislead the main model into "image failed" responses.
             let msg = crate::i18n::t(crate::i18n::Msg::VisionPreprocessSuccess { char_count })
                 .into_owned();
-            renderer.render(UiLine::VisionPreprocessSuccess { msg, model: vl_key });
+            renderer.render(UiLine::VisionPreprocessSuccess {
+                msg,
+                model: vl_model,
+            });
             renderer.flush();
         }
         AgentEvent::RestorePendingImages { images, markers } => {
@@ -10721,39 +17486,33 @@ fn handle_agent_event(
             state.turn_cached_tokens += u.cached_tokens;
         }
         AgentEvent::WorkingDirChanged(new_dir) => {
-            // Fires when a tool (change_dir / bash cd) or an AgentCommand::ChangeDir
-            // mutated the shared cwd. Sync the footer's view so the status row
+            // Fires when a tool (change_dir / bash cd) or
+            // CodingRuntime changed the shared cwd. Sync the footer's view so the status row
             // reflects the new directory on the next redraw (spinner tick if
             // streaming, idle redraw after turn complete). Without this the
             // footer is stuck on the old path until the user types `/cd` or
             // restarts the session.
             //
-            // Strip the Windows `\\?\` verbatim prefix: the emitter (bridge / core
+            // Strip the Windows `\\?\` verbatim prefix: the emitter (runtime / kernel
             // turn runner) canonicalizes the target, so `new_dir` can arrive as
             // `\\?\C:\…` and would otherwise re-verbatim `ctx.working_dir` (and
-            // recent_dirs) after `apply_cd` just stripped it. This is the one
-            // `working_dir` writer that does not funnel through `apply_cd`.
-            let new_dir = atomcode_core::tool::strip_verbatim_prefix_path(&new_dir);
-            if ctx.working_dir != new_dir {
-                ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
-                commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
-            }
+            // recent_dirs) after `apply_cd` just stripped it. The shared projection
+            // helper normalizes this event and updates every path-sensitive sink.
+            commit_working_dir_projection(ctx, new_dir);
+            ctx.bg_manager
+                .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
         }
         AgentEvent::ProjectSwitched(new_dir) => {
             // A webui /cd switched the project directory (delivered via the
-            // live-sync forwarder in sync mode). Follow it: change cwd like
-            // `/cd` (updates working_dir + @-file index + recent dirs +
-            // tells the running agent), THEN open a fresh session in the new
-            // dir like `/session`. Distinct from WorkingDirChanged (agent's own
-            // `cd`, conversation preserved). No-op when already there to avoid
-            // resetting on a redundant broadcast.
-            if ctx.working_dir != new_dir {
-                commands::apply_cd(ctx, new_dir.clone());
-                // 新项目的会话要存进新项目的 hash 目录。session_manager 只在启动
-                // 时按初始目录构建，不重建的话切项目后的新会话会写进旧项目，
-                // /resume 与手机端项目列表都会在错误的项目下看到它。
-                ctx.session_manager = atomcode_core::session::SessionManager::new(&new_dir);
-                commands::reset_to_new_session(ctx, state, renderer);
+            // bound native runtime in sync mode). ChangeDirectory already means
+            // "fresh session in the target directory" at the runtime boundary;
+            // issuing a second FreshSession here would race two replacements.
+            if !commands::paths_same(&ctx.working_dir, &new_dir) {
+                // Silent on success (fast transition); status only via guards.
+                if let Err(error) = commands::apply_cd(ctx, new_dir) {
+                    renderer.render(UiLine::Error(error));
+                }
+                renderer.flush();
             }
         }
         AgentEvent::RemoteSlashCommand(line) => {
@@ -10766,16 +17525,26 @@ fn handle_agent_event(
                     renderer.render(UiLine::CommandOutput(format!("（手机端执行 {display}）")));
                     renderer.render(UiLine::CommandOutput(txt.clone()));
                     renderer.flush();
-                    if let Some(live) = &ctx.sync_session {
-                        live.notify_command_output(format!("{display}\n{txt}"));
+                    if let Err(error) = atomcode_daemon::native_live::publish_command_output(
+                        format!("{display}\n{txt}"),
+                    ) {
+                        renderer.render(UiLine::Error(format!(
+                            "Remote command output synchronization failed: {error:?}"
+                        )));
+                        renderer.flush();
                     }
                 }
                 None => {
-                    if let Some(live) = &ctx.sync_session {
-                        live.notify_command_output(format!(
+                    if let Err(error) =
+                        atomcode_daemon::native_live::publish_command_output(format!(
                             "{display}\n  该命令需要在桌面端执行（手机端仅支持 \
                              /status /cost /whoami /diff）"
-                        ));
+                        ))
+                    {
+                        renderer.render(UiLine::Error(format!(
+                            "Remote command rejection synchronization failed: {error:?}"
+                        )));
+                        renderer.flush();
                     }
                 }
             }
@@ -10804,7 +17573,7 @@ fn handle_agent_event(
             );
             // If `/context` is waiting for fresh stats, the rich emission
             // (ctx_window > 0) is the signal to render. Narrow emissions
-            // from TurnRunner leave ctx_window at 0 and must not trigger
+            // from the narrow runtime projection leave ctx_window at 0 and must not trigger
             // a report render (they'd race ahead of the pending refresh
             // and print partial data). Clears the flag on fire so a
             // single dispatch yields a single render even when multiple
@@ -11204,83 +17973,17 @@ fn handle_agent_event(
             state.on_sub_agent_dispatch_end();
         }
         AgentEvent::MessagesSync { snapshot } => {
-            // Response to AgentCommand::SyncMessages. Persist the
-            // snapshot to the current session so /bg can recover
-            // the conversation state.
-            // A tokened SetConversation has its own response variants; ignore a
-            // stale generic sync while that handoff owns the session boundary.
-            if ctx.pending_local_runtime_sync.is_none()
-                && (!snapshot.messages.is_empty() || !snapshot.cold_summaries.is_empty())
-            {
+            // Persist an explicitly synchronized presentation snapshot so /bg can
+            // recover the conversation state. A correlated native restore has its
+            // own completion event; ignore a stale generic sync while that handoff
+            // owns the session boundary.
+            if !snapshot.messages.is_empty() || !snapshot.cold_summaries.is_empty() {
                 apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
-                    .set_foreground_session(ctx.current_session.clone());
+                    .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
             }
         }
-        AgentEvent::ConversationRestored {
-            restore_id,
-            snapshot,
-        } => {
-            let matches = ctx
-                .pending_local_runtime_sync
-                .as_ref()
-                .is_some_and(|pending| pending.matches_current(restore_id, ctx));
-            if !matches {
-                crate::tuix_trace!(
-                    "SYNC",
-                    "ignored stale conversation restore id={}",
-                    restore_id
-                );
-                return;
-            }
-
-            let _completed = ctx.pending_local_runtime_sync.take();
-            ctx.current_session
-                .update_from_conversation_snapshot(snapshot);
-            ctx.current_session.touch();
-            ctx.bg_manager
-                .set_foreground_session(ctx.current_session.clone());
-            if let Err(error) = ctx.session_manager.save(&ctx.current_session) {
-                renderer.render(UiLine::Error(
-                    crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
-                        error: &error.to_string(),
-                    })
-                    .into_owned(),
-                ));
-            }
-            renderer.render(UiLine::CommandOutput(
-                "本地会话已接管 runtime 实际快照".to_string(),
-            ));
-            renderer.flush();
-        }
-        AgentEvent::ConversationRestoreFailed {
-            restore_id,
-            error,
-        } => {
-            let matches = ctx
-                .pending_local_runtime_sync
-                .as_ref()
-                .is_some_and(|pending| pending.matches_current(restore_id, ctx));
-            if !matches {
-                crate::tuix_trace!(
-                    "SYNC",
-                    "ignored stale conversation restore failure id={}: {}",
-                    restore_id,
-                    error
-                );
-                return;
-            }
-            let restored_live = commands::rollback_pending_local_runtime_sync(ctx);
-            let suffix = if restored_live {
-                "；已恢复 Live 同步"
-            } else {
-                "；原 Live 会话上下文已变化，无法自动恢复"
-            };
-            renderer.render(UiLine::Error(format!(
-                "本地 runtime 接管失败：{error}{suffix}"
-            )));
-            renderer.flush();
-        }
+        AgentEvent::ConversationRestored { .. } | AgentEvent::ConversationRestoreFailed { .. } => {}
         AgentEvent::UserEcho(text) => {
             let markers = image_markers_in_order(&text);
             renderer.render(UiLine::UserWithAttachments {
@@ -11307,34 +18010,17 @@ fn handle_agent_event(
         }
         AgentEvent::ProviderChanged(provider) => {
             // Live-sync: another view (webui dropdown) switched the model —
-            // mirror it into the TUI's active provider + header. Skip when it's
-            // already our provider (the echo of the TUI's own /model switch, which
-            // already applied + persisted). Persistence is done by whoever
-            // originated the switch (webui → /live/provider endpoint; TUI → the
-            // /model picker's save_and_reload), so here we only sync in-memory
-            // state and notify the agent — no second disk write.
-            if ctx.config.default_provider != provider
-                && ctx.config.providers.contains_key(&provider)
-            {
-                ctx.config.default_provider = provider.clone();
-                ctx.model_name = ctx
-                    .config
-                    .providers
-                    .get(&provider)
-                    .map(|p| p.model.clone())
-                    .unwrap_or(provider);
-                // Footer context window follows the mirrored switch too (see
-                // model_picker) — otherwise the denominator lags a turn behind
-                // a webui-driven model change.
-                state.on_model_window_changed(ctx.config.default_context_window());
-                let _ = ctx
-                    .agent
-                    .cmd_tx
-                    .send(AgentCommand::ReloadConfig(ctx.config.clone()));
-                let dir_display =
-                    crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-                renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
-                renderer.flush();
+            // mirror the already-committed runtime state into the TUI without
+            // persisting it as the shared default. Sending another reload here
+            // would create an untracked second transition and break single-flight
+            // ordering.
+            if let Some(generation) = ctx.runtime.current_generation() {
+                stage_provider_projection(ctx, generation, provider, None);
+                if ctx.pending_provider_reload.is_none()
+                    && retry_pending_provider_projection(ctx, state, renderer)
+                {
+                    renderer.flush();
+                }
             }
         }
         AgentEvent::ModeChanged { plan, bypass } => {
@@ -11349,134 +18035,14 @@ fn handle_agent_event(
             if mode == crate::state::AgentMode::Build {
                 state.build_badge_visible = true;
             }
-            let _ = ctx.agent.cmd_tx.send(AgentCommand::SetMode(mode));
+            let _ = ctx
+                .runtime
+                .dispatch(atomcode_coding::DriverCommand::SetMode(runtime_mode(mode)));
             renderer.render(UiLine::CommandOutput(format!(
                 "  Switched to {} mode.\n",
                 mode.label()
             )));
             renderer.flush();
-        }
-        AgentEvent::SessionSwitched(session_id) => {
-            // 另一端（webui 新建对话 / webui 侧栏切到已存在会话）切换了会话，
-            // 同步模式的 TUI 跟随。按 session_id 跨项目定位会话文件：
-            //  - webui「新建」：文件已落盘但为空 → 回放空历史 = 干净空白会话；
-            //  - webui 切到「已存在」会话：把该会话的历史一并加载、回放进 TUI。
-            // 二者统一走 load_any，省掉「新建/切换」分支。找不到文件（罕见）才退回
-            // 到「按指定 id 建空白会话」的旧行为。
-            crate::tuix_trace!(
-                "TUI",
-                "SessionSwitched: session_id={}, sync_session={}",
-                session_id,
-                ctx.sync_session.is_some()
-            );
-            let sid = atomcode_core::session::SessionId::from_string(session_id);
-            // 自回声守卫：TUI 自己发起的切换（/new、/resume 等，见 sync_local_session_switch）
-            // 会经 live_switch_session 广播、再经转发器回流到这里。此时本地切换已完成、
-            // ctx.current_session.id 已是目标 id，无需重复清场/回放/重挂——直接忽略，避免
-            // 双重渲染。仅「另一端发起」的切换（id 与当前不同）才走下面的完整跟随逻辑。
-            // 与 ProviderChanged 臂同款的自回声去重。
-            if ctx.current_session.id == sid {
-                crate::tuix_trace!(
-                    "TUI",
-                    "SessionSwitched: self-echo for current session, ignoring"
-                );
-                return;
-            }
-            let loaded = atomcode_core::session::SessionManager::load_any(&sid).ok();
-
-            // 重置对话与计数（无论加载成功与否都先清场）。
-            ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
-            state.total_tokens = 0;
-            state.prompt_tokens = 0;
-            state.completion_tokens = 0;
-            state.cached_tokens = 0;
-            state.last_context = None;
-            state.pending_context_render = None;
-            state.thinking_idx = 0;
-            state.on_turn_complete();
-            state.active_todos = None;
-            sync_todo_titles(state); // drop prior session's titles
-            state.approval_panel = None;
-
-            // 目标会话所属目录：已存在会话用其自身 working_dir；建不出来时沿用当前目录。
-            let target_session = match loaded {
-                Some(session) => {
-                    // 该会话属于另一个项目 → 先像 /cd 一样切目录（与 webui handleSelectSession
-                    // 的 setCwd 对齐），保证后续回合在正确项目里执行、@-索引/会话列表也跟随。
-                    if ctx.working_dir != session.working_dir {
-                        commands::apply_cd(ctx, session.working_dir.clone());
-                    }
-                    ctx.current_session_id = Some(sid.clone());
-                    session
-                }
-                None => {
-                    // 罕见：磁盘上找不到该会话（如 webui 刚新建、广播早于落盘）。
-                    // 退回旧行为：用指定 id 建一个空白会话，保证三端落同一文件。
-                    ctx.current_session_id = None;
-                    let mut new_session =
-                        atomcode_core::session::Session::default_session(ctx.working_dir.clone());
-                    new_session.id = sid;
-                    new_session
-                }
-            };
-
-            // 切换会话：停掉任何进行中的 /loop，避免其 TUI 侧定时器把旧 payload 打进
-            // 新会话（并清掉残留的 footer）。ClearLoop 在下面 SetConversation 之前送达。
-            commands::stop_active_loop(state, ctx);
-            // 把历史灌进 agent 会话，使后续回合带上下文（空会话则等价于清空）。
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::SetConversation {
-                    snapshot: target_session.to_conversation_snapshot(),
-                    restore_id: None,
-                })
-                .ok();
-            commands::bind_telemetry_to_session(ctx, &target_session);
-            ctx.current_session = target_session;
-            ctx.bg_manager
-                .set_foreground_session(ctx.current_session.clone());
-
-            // 重绘画布并回放目标会话历史（/resume 同款干净回放，不带「同步快照」分隔）。
-            renderer.begin_sync();
-            renderer.reset();
-            if ctx.current_session.messages.is_empty() {
-                let dir_display =
-                    crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-                renderer.render(UiLine::Welcome {
-                    model: ctx.model_name.clone(),
-                    working_dir: dir_display,
-                });
-                renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::CmdNewSession).into_owned(),
-                ));
-            } else {
-                crate::modals::session_picker::replay_session(
-                    renderer,
-                    state,
-                    &ctx.current_session,
-                    true,
-                );
-            }
-            renderer.flush();
-            renderer.end_sync();
-
-            // 同步模式：用「带历史」的 session_id 重新附着 LiveSession，使三端
-            // （TUI / webui / 磁盘）落到同一会话、同一对话。render_snapshot=false：
-            // 历史已在上面 replay 过，避免重复刷。
-            if ctx.sync_session.is_some() {
-                let session = atomcode_daemon::ensure_live_session(
-                    ctx.working_dir.clone(),
-                    ctx.telemetry.clone(),
-                    Some(ctx.current_session.id.clone()),
-                    ctx.current_session.to_conversation_snapshot(),
-                );
-                crate::tuix_trace!(
-                    "TUI",
-                    "SessionSwitched: attaching LiveSession ptr={:#x}",
-                    std::sync::Arc::as_ptr(&session) as usize
-                );
-                attach_live_session(ctx, renderer, session, false);
-            }
         }
         AgentEvent::SessionRenamed { name } => {
             // AI session-namer renamed the active session (fire-and-forget after
@@ -11492,11 +18058,14 @@ fn handle_agent_event(
             reset_label,
             secs_until_reset,
             auto_resuming,
+            server_message,
         } => {
             // Non-error pause line: dim/plain body row, never red.
-            // auto_resuming=true  (WaitAndRetry): "⏳ 限流，Ns 后自动继续…"
-            // auto_resuming=false (Pause, has time): "⏸ 5小时窗口已用尽，约 HH:MM 恢复…"
-            // auto_resuming=false (Pause, no time):  "⏸ 5小时窗口已用尽，稍后恢复…"
+            // auto_resuming=true (WaitAndRetry): "⏳ 限流，Ns 后自动继续…"
+            // auto_resuming=false + CodingPlan window data (reset time and/or label):
+            //   "⏸ 5小时窗口已用尽，约 HH:MM 恢复…" / "…稍后恢复…"
+            // auto_resuming=false + NO window data (external-model / generic 429):
+            //   "⏸ 限流（HTTP 429）[：<provider reason>]…" — not a CodingPlan quota.
             // UiLine::Muted: dim DarkGrey, no forced prefix, non-bold.
             // Rate-limit is a pause, not an error/warning — it must not
             // render with the yellow `! ` prefix that Warning applies.
@@ -11505,7 +18074,17 @@ fn handle_agent_event(
                 &reset_label,
                 secs_until_reset,
                 auto_resuming,
+                server_message.as_deref(),
             );
+            // A `Pause` (auto_resuming=false) ENDS the turn with
+            // `StopReason::RateLimited` → the errored `✗ 已中断` summary. Bind the
+            // pause reason to that summary too (same rationale as the Error arm),
+            // so a 429 the user can't act on still shows WHY. A WaitAndRetry
+            // (auto_resuming=true) is not terminal — the turn continues — so it
+            // must NOT be captured as a turn-ending reason.
+            if !auto_resuming {
+                state.last_turn_error = Some(line.clone());
+            }
             renderer.render(UiLine::Muted(line));
             renderer.flush();
         }
@@ -11520,28 +18099,35 @@ fn handle_agent_event(
 /// would re-truncate the name). Auto-name semantics: does NOT set
 /// `user_renamed`, so a later explicit `/rename` still wins.
 fn apply_ai_session_name(ctx: &mut LoopCtx, name: String, renderer: &mut dyn Renderer) {
-    if !atomcode_core::agent::session_title::should_accept_ai_name(
+    if !atomcode_coding::session_title::should_accept_ai_name(
         ctx.current_session.user_renamed,
         ctx.current_session.ai_named,
     ) {
         return;
     }
+    let project_bucket = commands::active_session_project_bucket(&ctx.working_dir);
+    match atomcode_daemon::legacy_convert::apply_ai_catalog_name_in_project(
+        &project_bucket,
+        ctx.current_session.id.as_str(),
+        &name,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("session save failed: {e}")));
+            renderer.flush();
+            return;
+        }
+    }
     ctx.current_session.name = name;
     ctx.current_session.ai_named = true;
     ctx.current_session.touch();
     ctx.bg_manager
-        .set_foreground_session(ctx.current_session.clone());
-    if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
-        renderer.render(UiLine::Error(format!("session save failed: {e}")));
-        renderer.flush();
-    }
+        .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
 }
 
-/// Copy the latest conversation into `ctx.current_session`, auto-name
-/// the session from the first real user message, and write the session
-/// file to disk. Called on every TurnComplete and TurnCancelled so
-/// `/resume` can find the conversation after a quit. No-op only when both
-/// the recent working set and compressed history are empty.
+/// Keep the transitional UI projection in sync. Durable persistence belongs to
+/// the native runtime hooks; this function must never write core JSON.
 fn persist_current_session(
     ctx: &mut LoopCtx,
     snapshot: atomcode_core::conversation::ConversationSnapshot,
@@ -11552,27 +18138,13 @@ fn persist_current_session(
     }
     apply_session_snapshot(&mut ctx.current_session, snapshot);
     ctx.bg_manager
-        .set_foreground_session(ctx.current_session.clone());
-    // Surface save failures instead of silently swallowing them.
-    // Previously this was `let _ = session_manager.save(...)`, which
-    // hid disk-full / permission / read-only / invalid-path errors —
-    // users would `/resume` on the next launch, see nothing, and
-    // assume "the session was lost" with no idea anything went wrong.
-    if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
-        renderer.render(UiLine::Error(
-            crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
-                error: &e.to_string(),
-            })
-            .into_owned(),
-        ));
-        renderer.flush();
-        return false;
-    }
+        .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
+    let _ = renderer;
     true
 }
 
 pub(crate) fn apply_session_snapshot(
-    session: &mut atomcode_core::session::Session,
+    session: &mut crate::session::Session,
     snapshot: atomcode_core::conversation::ConversationSnapshot,
 ) {
     if snapshot.messages.is_empty() && snapshot.cold_summaries.is_empty() {
@@ -11630,13 +18202,12 @@ fn is_synthetic_user_text(text: &str) -> bool {
 #[cfg(test)]
 mod session_naming_tests {
     use super::{apply_session_snapshot, is_synthetic_user_text};
+    use crate::session::Session;
 
     #[test]
     fn apply_session_snapshot_renames_from_first_real_user() {
         use atomcode_core::conversation::message::{Message, Role};
-        let mut session = atomcode_core::session::Session::default_session(
-            std::path::PathBuf::from("/tmp/project"),
-        );
+        let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
         let messages = vec![
             Message::new(Role::User, "[System meta · not a user message]\nread this"),
             Message::new(Role::User, "implement background sessions\nwith tests"),
@@ -11657,9 +18228,7 @@ mod session_naming_tests {
     #[test]
     fn apply_session_snapshot_preserves_custom_name() {
         use atomcode_core::conversation::message::{Message, Role};
-        let mut session = atomcode_core::session::Session::default_session(
-            std::path::PathBuf::from("/tmp/project"),
-        );
+        let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
         session.name = "manual name".to_string();
 
         apply_session_snapshot(
@@ -11679,9 +18248,7 @@ mod session_naming_tests {
             message::{Message, Role},
             ConversationSnapshot,
         };
-        let mut session = atomcode_core::session::Session::default_session(
-            std::path::PathBuf::from("/tmp/project"),
-        );
+        let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
 
         apply_session_snapshot(
             &mut session,
@@ -11700,9 +18267,7 @@ mod session_naming_tests {
             message::{Message, Role},
             ConversationSnapshot,
         };
-        let mut session = atomcode_core::session::Session::default_session(
-            std::path::PathBuf::from("/tmp/project"),
-        );
+        let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
         session.messages = vec![Message::new(Role::User, "stale recent turn")];
 
         apply_session_snapshot(
@@ -11745,7 +18310,7 @@ mod session_naming_tests {
 
     #[test]
     fn ai_rename_applies_unless_user_renamed_or_already_ai_named() {
-        use atomcode_core::agent::session_title::should_accept_ai_name;
+        use atomcode_coding::session_title::should_accept_ai_name;
         // Not user-renamed and not yet AI-named → accept (the AI title wins
         // over the first-turn truncation the auto-namer set).
         assert!(should_accept_ai_name(false, false));
@@ -11784,14 +18349,19 @@ fn clipboard_image_hash(cache: &std::sync::Mutex<ClipboardCheckState>) -> Option
 pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
     let cwd = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
     // Priority:
-    //   1. No provider configured + not logged in — show "configure" nudge.
-    //      This wins over the upgrade hint because without a provider the
+    //   1. Provider unavailable at runtime (or absent from config/auth) — show
+    //      the configure nudge. This wins over the upgrade hint because the
     //      app literally cannot answer any message; the user needs to know
     //      why before they're told to upgrade.
     //   2. Upgrade-available hint (existing behavior).
     //   3. None.
-    let no_provider =
-        ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none();
+    let runtime_availability = ctx.runtime.ui_availability();
+    let no_provider = matches!(
+        runtime_availability,
+        RuntimeUiAvailability::AwaitingProvider
+    ) || (ctx.config.providers.is_empty()
+        && atomcode_auth::get_stored_auth().is_none());
+    let runtime_failed = matches!(runtime_availability, RuntimeUiAvailability::Failed);
     // Open-source build pointed at an AtomGit gateway: any chat will
     // fail-fast with `CpOfficialBuildRequired`. Surface that diagnosis
     // up front (red, beats every other hint) so the user doesn't have
@@ -11803,8 +18373,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         .ok()
         .and_then(|p| p.base_url.clone())
         .unwrap_or_default();
-    let needs_official_build = !atomcode_core::coding_plan::signer_available()
-        && atomcode_core::coding_plan::is_atomgit_gateway(&active_base_url);
+    let needs_official_build = !atomcode_capabilities::provider::signer_available()
+        && atomcode_capabilities::provider::is_atomgit_gateway(&active_base_url);
     // Priority: needs-official-build (Warning red) > no-provider (Warning
     // red) > CodingPlan drift monitor (Warning red) > CodingPlan
     // token-usage hint (Info ≥80%, Warning ≥95%) > upgrade banner
@@ -11819,6 +18389,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else if no_provider {
         Some((
             crate::i18n::t(crate::i18n::Msg::StatusNoProvider).into_owned(),
+            crate::render::HintSeverity::Warning,
+        ))
+    } else if runtime_failed {
+        Some((
+            crate::i18n::t(crate::i18n::Msg::StatusRuntimeUnavailable).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
     } else if let Some(warning) = monitor::is_codingplan_provider(&ctx.config.default_provider)
@@ -12006,15 +18581,66 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         .active_todos
         .clone()
         .filter(|p| p.total > 0 && p.completed < p.total);
-    let approval = state.approval_panel.as_ref().map(|p| crate::render::ApprovalPanelView {
-        tool: p.tool.clone(),
-        detail: p.detail.clone(),
-        options: p.options.iter().map(|o| o.label.clone()).collect(),
-        selected: p.selected,
-    });
+    let approval = state
+        .approval_panel
+        .as_ref()
+        .map(|p| crate::render::ApprovalPanelView {
+            tool: p.tool.clone(),
+            detail: p.detail.clone(),
+            options: p.options.iter().map(|o| o.label.clone()).collect(),
+            selected: p.selected,
+        });
+    // A pending batch takes precedence over a single panel (mutually exclusive in
+    // practice). The view carries the CURRENT question's fields plus batch navigator
+    // metadata; on the Submit stop the panel fields are a placeholder (the renderer
+    // draws the submit screen and ignores them).
+    let user_input = if let Some(b) = state.user_input_batch.as_ref() {
+        let total = b.questions.len();
+        let idx = b.current.min(total.saturating_sub(1));
+        let p = &b.questions[idx];
+        let answered = (0..total).map(|i| b.is_answered(i)).collect();
+        Some(crate::render::UserInputPanelView {
+            header: p.header.clone(),
+            question: p.question.clone(),
+            mode: p.mode.clone(),
+            options: p.options.clone(),
+            cursor: p.cursor,
+            checked: p.checked.clone(),
+            text: p.text.clone(),
+            custom_text: p.custom_text.clone(),
+            custom: p.custom,
+            batch: Some(crate::render::UserInputBatchMeta {
+                total,
+                // 1-based current question; clamped so the Submit stop (current==total)
+                // never reports total+1 (the renderer ignores it there, but keep the
+                // contract honest).
+                index: (b.current + 1).min(total),
+                answered,
+                on_submit: b.on_submit_stop(),
+            }),
+        })
+    } else {
+        state
+            .user_input_panel
+            .as_ref()
+            .map(|p| crate::render::UserInputPanelView {
+                header: p.header.clone(),
+                question: p.question.clone(),
+                mode: p.mode.clone(),
+                options: p.options.clone(),
+                cursor: p.cursor,
+                checked: p.checked.clone(),
+                text: p.text.clone(),
+                custom_text: p.custom_text.clone(),
+                custom: p.custom,
+                batch: None,
+            })
+    };
     crate::render::StatusLine {
         model,
         cwd,
+        history: None,
+        command_output: state.footer_command_output.clone(),
         ctx_used,
         ctx_window,
         hint,
@@ -12030,6 +18656,57 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         loop_status,
         todo,
         approval,
+        user_input,
+    }
+}
+
+fn build_input_status(state: &UiState, ctx: &LoopCtx, buf: &Buffer) -> crate::render::StatusLine {
+    let mut status = build_status(state, ctx);
+    status.history = input_history_position(buf, ctx.history.entries().len());
+    status
+}
+
+fn input_history_position(buf: &Buffer, total: usize) -> Option<crate::render::HistoryPosition> {
+    buf.history_idx()
+        .filter(|index| *index < total)
+        .map(|index| crate::render::HistoryPosition {
+            current: index + 1,
+            total,
+        })
+}
+
+#[cfg(test)]
+mod input_history_position_tests {
+    use super::{input_history_position, Buffer};
+
+    #[test]
+    fn visible_only_while_recalling_history() {
+        let mut buf = Buffer::new();
+        assert_eq!(input_history_position(&buf, 100), None);
+
+        buf.history_idx = Some(99);
+        let latest = input_history_position(&buf, 100).expect("history position");
+        assert_eq!((latest.current, latest.total), (100, 100));
+
+        buf.history_idx = Some(42);
+        let older = input_history_position(&buf, 100).expect("history position");
+        assert_eq!((older.current, older.total), (43, 100));
+
+        buf.history_idx = None;
+        assert_eq!(
+            input_history_position(&buf, 100),
+            None,
+            "returning to the draft hides the indicator"
+        );
+    }
+
+    #[test]
+    fn stale_or_empty_index_is_hidden() {
+        let mut buf = Buffer::new();
+        buf.history_idx = Some(0);
+        assert_eq!(input_history_position(&buf, 0), None);
+        buf.history_idx = Some(3);
+        assert_eq!(input_history_position(&buf, 2), None);
     }
 }
 
@@ -12059,7 +18736,7 @@ fn draw_spinner_now(
         None
     };
     let label = format_spinner_label(state, queue_len, effort);
-    let status = build_status(state, ctx);
+    let status = build_input_status(state, ctx, buf);
     let menu = menu_for_display(buf, ctx).map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
         let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
@@ -12109,7 +18786,7 @@ fn format_spinner_label(
         };
         let mut out = base.into_owned();
         if let Some(d) = state.phase_elapsed() {
-            out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
+            out.push_str(&format!(" · {}", fmt_elapsed(d.as_millis() as u64)));
         }
         return out;
     }
@@ -12153,13 +18830,26 @@ fn format_spinner_label(
     // (The mid-stream "· esc to cancel" stall hint was removed by request — esc
     // still cancels, it's just no longer advertised in the spinner. The stall
     // machinery (`stream_stalled`) stays for the compaction-slow variant.)
-    // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
-    // `Running ReadFile… 4s`. CC behaviour: timer resets on every phase
-    // transition so the user reads "this thing has been running for N
-    // seconds", not "the whole turn so far is 1301s". LAST, so its per-frame
-    // width changes never shift anything after it.
+    // Phase elapsed + live output counter, grouped in parens at the very end —
+    // `Noodling… (49m44s · ↑ 12.4k tokens)`, matching Claude Code. Phase elapsed
+    // (NOT total turn) so the timer reads "this operation has run N seconds",
+    // resetting on every phase transition. `fmt_elapsed` starts at whole seconds
+    // (never `340ms`) so the clock doesn't flicker millisecond digits. The token
+    // estimate is the liveness proof — it keeps ticking through a long single
+    // generation (text / reasoning / tool-call args) so the turn never looks
+    // hung. Shown only once output has started (no `↑ 0 tokens`). LAST, so its
+    // per-frame width changes never shift anything before it.
     if let Some(d) = state.phase_elapsed() {
-        out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
+        let elapsed = fmt_elapsed(d.as_millis() as u64);
+        let tokens = state.turn_output_token_estimate();
+        if tokens > 0 {
+            out.push_str(&format!(
+                " ({elapsed} · \u{2191} {} tokens)",
+                crate::i18n::fmt_tokens(tokens)
+            ));
+        } else {
+            out.push_str(&format!(" ({elapsed})"));
+        }
     }
     out
 }
@@ -12340,8 +19030,14 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                     Some("working_tree") => "working tree".to_string(),
                     Some("staged") => "staged changes".to_string(),
                     Some("range") => {
-                        let base = scope.get("base").and_then(|value| value.as_str()).unwrap_or("");
-                        let head = scope.get("head").and_then(|value| value.as_str()).unwrap_or("HEAD");
+                        let base = scope
+                            .get("base")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        let head = scope
+                            .get("head")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("HEAD");
                         format!("{base}..{head}")
                     }
                     Some("commit") => scope
@@ -12857,7 +19553,9 @@ pub(crate) fn format_shell_command(cmd: &str, width: usize) -> Vec<String> {
         let tok = tokens[i];
         if tok == "\\" {
             // 反斜杠续行留在段尾,断段。
-            if !cur.is_empty() { cur.push(' '); }
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
             cur.push_str(tok);
             segments.push(std::mem::take(&mut cur));
         } else if tok == "&&" || tok == "||" || tok == "|" {
@@ -12871,12 +19569,16 @@ pub(crate) fn format_shell_command(cmd: &str, width: usize) -> Vec<String> {
             segments.push(std::mem::take(&mut cur));
             cur.push_str(tok);
         } else {
-            if !cur.is_empty() { cur.push(' '); }
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
             cur.push_str(tok);
         }
         i += 1;
     }
-    if !cur.is_empty() { segments.push(cur); }
+    if !cur.is_empty() {
+        segments.push(cur);
+    }
 
     // 2) 每段再按 width 软折(优先空格断);续行缩进 4 空格。
     let indent = "    ";
@@ -12913,7 +19615,11 @@ pub(crate) fn format_shell_command(cmd: &str, width: usize) -> Vec<String> {
                 }
                 continue;
             }
-            let need = if line_len == lead.len() { wlen } else { wlen + 1 };
+            let need = if line_len == lead.len() {
+                wlen
+            } else {
+                wlen + 1
+            };
             if line_len > lead.len() && line_len + need > width {
                 out.push(std::mem::take(&mut line));
                 line.push_str(indent);
@@ -13094,13 +19800,21 @@ fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
 
 /// Persist the current reasoning_effort to config.toml
 fn persist_reasoning_effort(ctx: &mut LoopCtx) {
-    let path = Config::default_path();
     let default_provider = ctx.config.default_provider.clone();
     if let Some(p) = ctx.config.providers.get_mut(&default_provider) {
         p.reasoning_effort = ctx.reasoning_effort.clone();
     }
-    if let Err(e) = ctx.config.save(&path) {
-        eprintln!("[reasoning_effort] failed to save config: {e}");
+    let effort = ctx.reasoning_effort.clone();
+    match ctx.config_store.update(|config| {
+        let provider = config
+            .providers
+            .get_mut(&default_provider)
+            .ok_or_else(|| anyhow::anyhow!("provider {default_provider:?} not found"))?;
+        provider.reasoning_effort = effort;
+        Ok(())
+    }) {
+        Ok(commit) => ctx.observed_config_revision = Some(commit.snapshot.revision),
+        Err(e) => eprintln!("[reasoning_effort] failed to save config: {e}"),
     }
 }
 
@@ -13187,10 +19901,22 @@ pub(crate) fn patch_live_todos_from_action(state: &mut crate::state::UiState, ar
     let mut items: Vec<TodoItem> = state
         .active_todos
         .as_ref()
-        .map(|p| p.items.iter().map(|(s, c)| TodoItem { status: *s, content: c.clone() }).collect())
+        .map(|p| {
+            p.items
+                .iter()
+                .map(|(s, c)| TodoItem {
+                    status: *s,
+                    content: c.clone(),
+                })
+                .collect()
+        })
         .unwrap_or_default();
     apply_todo_action(&mut items, args);
-    state.active_todos = if items.is_empty() { None } else { Some(todo_progress_from_items(&items)) };
+    state.active_todos = if items.is_empty() {
+        None
+    } else {
+        Some(todo_progress_from_items(&items))
+    };
     sync_todo_titles(state);
 }
 
@@ -13281,7 +20007,11 @@ mod todo_block_tests {
             role: Role::Assistant,
             content: MessageContent::AssistantWithToolCalls {
                 text: None,
-                tool_calls: vec![ToolCall { id: id.into(), name: "todowrite".into(), arguments: args.into() }],
+                tool_calls: vec![ToolCall {
+                    id: id.into(),
+                    name: "todowrite".into(),
+                    arguments: args.into(),
+                }],
                 reasoning_content: None,
                 thinking_blocks: vec![],
             },
@@ -13290,7 +20020,10 @@ mod todo_block_tests {
         };
         let msgs = vec![
             mk("1", r#"{"todos":[{"content":"old","status":"pending"}]}"#),
-            mk("2", r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}"#),
+            mk(
+                "2",
+                r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}"#,
+            ),
         ];
         let p = todo_progress_from_messages(&msgs).expect("last valid todowrite → Some");
         assert_eq!((p.completed, p.total), (1, 2)); // LAST call wins
@@ -13309,7 +20042,11 @@ mod todo_block_tests {
             role: Role::Assistant,
             content: MessageContent::AssistantWithToolCalls {
                 text: None,
-                tool_calls: vec![ToolCall { id: id.into(), name: name.into(), arguments: args.into() }],
+                tool_calls: vec![ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: args.into(),
+                }],
                 reasoning_content: None,
                 thinking_blocks: vec![],
             },
@@ -13317,16 +20054,32 @@ mod todo_block_tests {
             internal_origin: None,
         };
         let msgs = vec![
-            call("1", "todowrite", r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"pending"}]}"#),
-            call("2", "todo", r#"{"action":"update","id":1,"status":"completed"}"#),
+            call(
+                "1",
+                "todowrite",
+                r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"pending"}]}"#,
+            ),
+            call(
+                "2",
+                "todo",
+                r#"{"action":"update","id":1,"status":"completed"}"#,
+            ),
             call("3", "todo", r#"{"action":"add","content":"c"}"#),
-            call("4", "todo", r#"{"action":"update","id":3,"status":"in_progress"}"#),
+            call(
+                "4",
+                "todo",
+                r#"{"action":"update","id":3,"status":"in_progress"}"#,
+            ),
         ];
         use atomcode_capabilities::tools::todo::TodoStatus;
         let p = todo_progress_from_messages(&msgs).expect("Some");
         assert_eq!(p.total, 3, "the added task is counted");
         assert_eq!(p.completed, 1);
-        assert_eq!(p.current.as_deref(), Some("c"), "the in_progress item is #3 'c'");
+        assert_eq!(
+            p.current.as_deref(),
+            Some("c"),
+            "the in_progress item is #3 'c'"
+        );
         assert_eq!(p.items[0], (TodoStatus::Completed, "a".to_string()));
     }
 }
@@ -13446,6 +20199,7 @@ mod install_password_modal_tests {
             unicode_symbols: false,
             legacy_conhost: false,
             jediterm: false,
+            modern_emulator: false,
         }
     }
 
@@ -13465,7 +20219,10 @@ mod format_shell_command_tests {
 
     #[test]
     fn short_command_stays_one_line() {
-        assert_eq!(format_shell_command("ls -la", 80), vec!["ls -la".to_string()]);
+        assert_eq!(
+            format_shell_command("ls -la", 80),
+            vec!["ls -la".to_string()]
+        );
     }
 
     #[test]
@@ -13473,15 +20230,27 @@ mod format_shell_command_tests {
         let out = format_shell_command("sed -i '' \\ -e 's/a/b/' \\ -e 's/c/d/'", 80);
         // 每个 `\` 续行段独立成行,续行缩进 4 空格
         assert!(out.len() >= 3, "got {:?}", out);
-        assert!(out[0].ends_with('\\'), "first line keeps its trailing backslash: {:?}", out);
-        assert!(out[1].starts_with("    "), "continuation is indented: {:?}", out);
+        assert!(
+            out[0].ends_with('\\'),
+            "first line keeps its trailing backslash: {:?}",
+            out
+        );
+        assert!(
+            out[1].starts_with("    "),
+            "continuation is indented: {:?}",
+            out
+        );
     }
 
     #[test]
     fn breaks_on_and_and() {
         let out = format_shell_command("cd /tmp && make build && make test", 80);
         assert!(out.len() >= 2, "got {:?}", out);
-        assert!(out.iter().any(|l| l.contains("&& make build")), "got {:?}", out);
+        assert!(
+            out.iter().any(|l| l.contains("&& make build")),
+            "got {:?}",
+            out
+        );
     }
 
     #[test]
@@ -13489,7 +20258,11 @@ mod format_shell_command_tests {
         // 能装下的 token(width 60 容得下)绝不被切,整体留一行。
         let long = "s/mb-2.5/mb-VERYLONGTOKENWITHOUTSPACES-0123456789/g";
         let out = format_shell_command(long, 60);
-        assert!(out.iter().any(|l| l.contains(long)), "fitting token stays intact: {:?}", out);
+        assert!(
+            out.iter().any(|l| l.contains(long)),
+            "fitting token stays intact: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -13499,7 +20272,11 @@ mod format_shell_command_tests {
         let long = "s/mb-2.5/mb-VERYLONGTOKENWITHOUTSPACES-0123456789/g";
         let width = 20;
         let out = format_shell_command(long, width);
-        assert!(out.len() > 1, "over-wide token must wrap across lines: {:?}", out);
+        assert!(
+            out.len() > 1,
+            "over-wide token must wrap across lines: {:?}",
+            out
+        );
         for l in &out {
             assert!(
                 crate::width::display_width(l) <= width,
@@ -13511,9 +20288,19 @@ mod format_shell_command_tests {
         let rejoined: String = out
             .iter()
             .enumerate()
-            .map(|(i, l)| if i == 0 { l.clone() } else { l.strip_prefix("    ").unwrap_or(l).to_string() })
+            .map(|(i, l)| {
+                if i == 0 {
+                    l.clone()
+                } else {
+                    l.strip_prefix("    ").unwrap_or(l).to_string()
+                }
+            })
             .collect();
-        assert_eq!(rejoined, long, "reassembled token must equal the original: {:?}", out);
+        assert_eq!(
+            rejoined, long,
+            "reassembled token must equal the original: {:?}",
+            out
+        );
         assert!(!out.join("\n").contains('…'), "no ellipsis: {:?}", out);
     }
 
@@ -13535,9 +20322,19 @@ mod format_shell_command_tests {
         let rejoined: String = out
             .iter()
             .enumerate()
-            .map(|(i, l)| if i == 0 { l.clone() } else { l.strip_prefix("    ").unwrap_or(l).to_string() })
+            .map(|(i, l)| {
+                if i == 0 {
+                    l.clone()
+                } else {
+                    l.strip_prefix("    ").unwrap_or(l).to_string()
+                }
+            })
             .collect();
-        assert_eq!(rejoined, cmd, "CJK token must be fully preserved: {:?}", out);
+        assert_eq!(
+            rejoined, cmd,
+            "CJK token must be fully preserved: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -13562,7 +20359,13 @@ mod format_shell_command_tests {
         let rejoined: String = out
             .iter()
             .enumerate()
-            .map(|(i, l)| if i == 0 { l.clone() } else { l.strip_prefix("    ").unwrap_or(l).to_string() })
+            .map(|(i, l)| {
+                if i == 0 {
+                    l.clone()
+                } else {
+                    l.strip_prefix("    ").unwrap_or(l).to_string()
+                }
+            })
             .collect();
         assert_eq!(rejoined, token, "emoji token fully preserved: {:?}", out);
         // Every family emoji stays a single intact cluster (none split across a line).
@@ -13600,7 +20403,66 @@ mod format_shell_command_tests {
         assert!(!out.join("\n").contains('…'), "no ellipsis: {:?}", out);
         // 每行至少有一个非空字符(无鬼空行)。
         for line in &out {
-            assert!(!line.trim().is_empty(), "no empty line in output: {:?}", out);
+            assert!(
+                !line.trim().is_empty(),
+                "no empty line in output: {:?}",
+                out
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod user_input_bypass_tests {
+    use super::user_input_should_auto_skip;
+    use crate::state::AgentMode;
+
+    /// Bypass (Auto) mode → panel must be skipped.
+    #[test]
+    fn bypass_mode_skips_panel() {
+        assert!(
+            user_input_should_auto_skip(AgentMode::Auto),
+            "Bypass/Auto mode must auto-skip the user_input panel"
+        );
+    }
+
+    /// Build mode → panel must be shown (no skip).
+    #[test]
+    fn build_mode_shows_panel() {
+        assert!(
+            !user_input_should_auto_skip(AgentMode::Build),
+            "Build mode must NOT skip the user_input panel"
+        );
+    }
+
+    /// Plan mode → panel must be shown (planning explicitly asks the user).
+    #[test]
+    fn plan_mode_shows_panel() {
+        assert!(
+            !user_input_should_auto_skip(AgentMode::Plan),
+            "Plan mode must NOT skip the user_input panel"
+        );
+    }
+
+    /// AcceptEdits mode → panel must be shown (only file edits are auto-approved).
+    #[test]
+    fn accept_edits_mode_shows_panel() {
+        assert!(
+            !user_input_should_auto_skip(AgentMode::AcceptEdits),
+            "AcceptEdits mode must NOT skip the user_input panel"
+        );
+    }
+
+    /// Confirm the shape of the auto-answer: `declined()` encodes `declined: true`.
+    /// The Bypass mode delivers this response — `format_result` turns it into a non-error
+    /// "No answer was provided…" message so the model proceeds with its own judgment
+    /// instead of treating the decline as an error to recover from.
+    #[test]
+    fn declined_response_shape() {
+        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
+        let r = UserInputResponse::declined();
+        assert!(r.declined, "declined() must set declined=true");
+        assert!(r.text.is_none(), "declined() must have no text");
+        assert!(r.selected.is_empty(), "declined() must have no selections");
     }
 }

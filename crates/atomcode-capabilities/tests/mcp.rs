@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use atomcode_capabilities::mcp::config::{McpConfigSource, McpServerConfig, McpTransportConfig};
-use atomcode_capabilities::mcp::{connect_and_adapt, McpRegistry, McpToolAdapter};
+use atomcode_capabilities::mcp::{McpRegistry, McpToolAdapter, CONNECT_TIMEOUT};
 use atomcode_kernel::conformance;
 use atomcode_kernel::tool::{ProgressSink, RiskLevel, Tool, ToolContext};
 use tokio_util::sync::CancellationToken;
@@ -43,6 +43,7 @@ fn ctx() -> ToolContext {
         working_dir: std::env::temp_dir(),
         cancel: CancellationToken::new(),
         progress: ProgressSink::noop(),
+        requester: None,
     }
 }
 
@@ -89,7 +90,10 @@ async fn adapter_maps_bad_arguments_to_tool_error() {
     let adapter = McpToolAdapter::new(registry, infos.into_iter().next().unwrap());
 
     let result = adapter.execute("not json", &ctx()).await;
-    assert!(result.is_error, "invalid JSON args must become a tool error");
+    assert!(
+        result.is_error,
+        "invalid JSON args must become a tool error"
+    );
     assert!(result.content.contains("invalid MCP tool arguments"));
 }
 
@@ -105,18 +109,33 @@ async fn adapter_passes_kernel_tool_conformance() {
         .expect("stdio MCP server should connect");
     let registry = registry.share();
     let infos = registry.list_all_tools().await;
-    let adapter: Arc<dyn Tool> =
-        Arc::new(McpToolAdapter::new(registry, infos.into_iter().next().unwrap()));
+    let adapter: Arc<dyn Tool> = Arc::new(McpToolAdapter::new(
+        registry,
+        infos.into_iter().next().unwrap(),
+    ));
 
     let report = conformance::tool::check(adapter, &[r#"{"message":"x"}"#]).await;
     report.assert_conformant();
 }
 
-/// The high-level integration entry: `connect_and_adapt` loads a project `.mcp.json`,
-/// connects, and returns ready-to-mount adapters. Isolates `$ATOMCODE_HOME` to an
-/// empty temp dir so only the project config is read (hermetic).
+/// Write a trust store file that marks `project_dir` as trusted.
+/// Mirrors the format written by `atomcode_core::mcp::trust::trust_project`.
+fn write_trusted_store(store_path: &std::path::Path, project_dir: &std::path::Path) {
+    let key = atomcode_capabilities::mcp::registry::project_trust_key(project_dir);
+    let store = serde_json::json!({
+        "version": 1,
+        "projects": {
+            key: { "path": project_dir.display().to_string() }
+        }
+    });
+    std::fs::write(store_path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+}
+
+/// Background config loading discovers a trusted project's tools without imposing
+/// session-transition policy on the capability layer.
 #[tokio::test]
-async fn connect_and_adapt_reads_project_mcp_json() {
+#[serial_test::serial]
+async fn background_registry_reads_project_mcp_json() {
     let home = tempfile::tempdir().unwrap();
     // SAFETY: edition 2021; this is the only test that reads global MCP config, and
     // it only ever points ATOMCODE_HOME at an empty dir (no user mcp.json), so a
@@ -124,18 +143,36 @@ async fn connect_and_adapt_reads_project_mcp_json() {
     std::env::set_var("ATOMCODE_HOME", home.path());
 
     let project = tempfile::tempdir().unwrap();
+
+    // Pre-trust the project so the security gate allows its servers through.
+    // Point ATOMCODE_MCP_TRUST_STORE at a store inside our isolated home dir.
+    let trust_store = home.path().join("mcp_trust.json");
+    // SAFETY: test-only env mutation; #[serial] prevents concurrent tests from
+    // racing on this variable.
+    unsafe {
+        std::env::set_var("ATOMCODE_MCP_TRUST_STORE", &trust_store);
+    }
+    write_trusted_store(&trust_store, project.path());
+
     let server = env!("CARGO_BIN_EXE_mcp-test-server");
     let mcp_json = serde_json::json!({
         "mcpServers": { "proj": { "command": server, "args": [], "timeout_ms": 5000 } }
     });
     std::fs::write(project.path().join(".mcp.json"), mcp_json.to_string()).unwrap();
 
-    let (registry, adapters, _events) = connect_and_adapt(project.path()).await;
+    let registry = McpRegistry::from_config_background(project.path()).share();
+    registry.wait_for_initial_connections(CONNECT_TIMEOUT).await;
+    let adapters: Vec<Arc<dyn Tool>> = registry
+        .list_all_tools()
+        .await
+        .into_iter()
+        .map(|info| Arc::new(McpToolAdapter::new(registry.clone(), info)) as Arc<dyn Tool>)
+        .collect();
 
     let names: Vec<String> = adapters.iter().map(|a| a.name().to_string()).collect();
     assert!(
         names.iter().any(|n| n == "mcp__proj__echo"),
-        "connect_and_adapt should surface the project server's echo tool; got {names:?}"
+        "background discovery should surface the project server's echo tool; got {names:?}"
     );
     let statuses = registry.server_statuses().await;
     assert!(

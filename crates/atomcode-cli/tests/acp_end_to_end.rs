@@ -10,8 +10,8 @@
 //!
 //! The stub is `atomcode_kernel::testkit::MockProvider`, the kernel's own
 //! scriptable `LlmProvider` (exported unconditionally — no feature flag). It is
-//! injected via `AcpServeOptions.provider`, so `engine::spawn_session` skips
-//! `build_provider` entirely: the agent never touches the network. The fact that
+//! injected via `AcpServeOptions.provider_factory`, so each session gets a
+//! factory-built stub and the agent never touches the network. The fact that
 //! `session/new` returns a sessionId at all proves the real
 //! `prepare → assemble → spawn` pipeline ran with the injected stub.
 
@@ -26,20 +26,35 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Channel, Client, ConnectionTo};
 use atomcode::acp::engine::EngineConfig;
 use atomcode::acp::{serve_over, AcpServeOptions};
+use atomcode_coding::{CodingAgentConfig, CodingProviderFactory, ProviderBuildError};
+use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::testkit::MockProvider;
+
+struct StubProviderFactory(Arc<dyn LlmProvider>);
+
+impl CodingProviderFactory for StubProviderFactory {
+    fn build(
+        &self,
+        _config: &CodingAgentConfig,
+        _session_id: Option<&str>,
+    ) -> Result<Arc<dyn LlmProvider>, ProviderBuildError> {
+        Ok(Arc::clone(&self.0))
+    }
+}
 
 /// A dummy, non-routable engine config. The provider is injected, so none of
 /// these reach the network — `base_url` is never dialed.
 fn dummy_engine() -> EngineConfig {
-    EngineConfig {
-        api_key: "test-key".into(),
-        base_url: "http://127.0.0.1:1".into(),
-        model: "stub-model".into(),
-        provider_type: "openai".into(),
-        context_window: 200_000,
-        max_tokens: Some(8192),
-    }
+    let mut config = atomcode_coding::CodingAgentConfig::new(
+        "test-key",
+        "http://127.0.0.1:1",
+        "stub-model",
+        ".",
+    );
+    config.context_window = 200_000;
+    config.chat_options.max_tokens = Some(8192);
+    EngineConfig::from_coding_config(config)
 }
 
 // `#[serial]`: both tests in this binary mutate the process-global `ATOMCODE_HOME`
@@ -69,7 +84,7 @@ async fn initialize_new_prompt_streams_and_stops() {
     let (agent_channel, client_channel) = Channel::duplex();
     let opts = AcpServeOptions {
         engine: Some(dummy_engine()),
-        provider: Some(Arc::new(stub)),
+        provider_factory: Some(Arc::new(StubProviderFactory(Arc::new(stub)))),
         auto_approve: false,
     };
     let agent_task = tokio::spawn(async move { serve_over(opts, agent_channel).await });
@@ -128,7 +143,11 @@ async fn initialize_new_prompt_streams_and_stops() {
 
     // initialize: protocol echoed + image prompt capability advertised.
     let init_json = serde_json::to_value(&init).unwrap();
-    assert_eq!(init.protocol_version, ProtocolVersion::V1, "protocol echoed");
+    assert_eq!(
+        init.protocol_version,
+        ProtocolVersion::V1,
+        "protocol echoed"
+    );
     assert_eq!(
         init_json["agentCapabilities"]["promptCapabilities"]["image"], true,
         "image prompt capability must be advertised: {init_json}"
@@ -143,7 +162,9 @@ async fn initialize_new_prompt_streams_and_stops() {
 
     // streaming: an agent_message_chunk carrying exactly "hello" was received.
     let got = updates.lock().unwrap().clone();
-    let hello = got.iter().find(|u| u["sessionUpdate"] == "agent_message_chunk");
+    let hello = got
+        .iter()
+        .find(|u| u["sessionUpdate"] == "agent_message_chunk");
     let hello = hello.unwrap_or_else(|| panic!("no agent_message_chunk in updates: {got:?}"));
     assert_eq!(
         hello["content"]["text"], "hello",
@@ -192,7 +213,7 @@ async fn error_turn_does_not_poison_next_prompt_on_same_session() {
     let (agent_channel, client_channel) = Channel::duplex();
     let opts = AcpServeOptions {
         engine: Some(dummy_engine()),
-        provider: Some(Arc::new(stub)),
+        provider_factory: Some(Arc::new(StubProviderFactory(Arc::new(stub)))),
         auto_approve: false,
     };
     let agent_task = tokio::spawn(async move { serve_over(opts, agent_channel).await });
@@ -265,8 +286,11 @@ async fn error_turn_does_not_poison_next_prompt_on_same_session() {
         "second prompt must end with end_turn (not be poisoned by stale TurnComplete): {second_json}"
     );
     let got = updates.lock().unwrap().clone();
-    let hello = got.iter().find(|u| u["sessionUpdate"] == "agent_message_chunk");
-    let hello = hello.unwrap_or_else(|| panic!("no agent_message_chunk from second prompt: {got:?}"));
+    let hello = got
+        .iter()
+        .find(|u| u["sessionUpdate"] == "agent_message_chunk");
+    let hello =
+        hello.unwrap_or_else(|| panic!("no agent_message_chunk from second prompt: {got:?}"));
     assert_eq!(
         hello["content"]["text"], "hello",
         "second prompt must stream 'hello': {hello}"

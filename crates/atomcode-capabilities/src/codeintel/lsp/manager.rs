@@ -26,7 +26,11 @@ impl LspManager {
         Self::with_registry(LspServerRegistry::with_defaults())
     }
     pub fn with_registry(registry: LspServerRegistry) -> Self {
-        Self { clients: Mutex::new(HashMap::new()), registry, settle_delay_ms: SETTLE_DELAY_MS }
+        Self {
+            clients: Mutex::new(HashMap::new()),
+            registry,
+            settle_delay_ms: SETTLE_DELAY_MS,
+        }
     }
     pub fn settle_delay_ms(&self) -> u64 {
         self.settle_delay_ms
@@ -76,7 +80,9 @@ impl LspManager {
         };
         let client = self.clients.lock().await.get(&ext).cloned();
         if let Some(client) = client {
-            let _ = client.sync_document(path, content, &extension_to_language_id(&ext)).await;
+            let _ = client
+                .sync_document(path, content, &extension_to_language_id(&ext))
+                .await;
             true
         } else {
             false
@@ -123,7 +129,11 @@ mod tests {
         let mut r = LspServerRegistry::empty();
         r.insert(
             "rs",
-            LspServerConfig { command: "atomcode-no-such-lsp-binary-xyz".into(), args: vec![], root_markers: vec![] },
+            LspServerConfig {
+                command: "atomcode-no-such-lsp-binary-xyz".into(),
+                args: vec![],
+                root_markers: vec![],
+            },
         );
         r
     }

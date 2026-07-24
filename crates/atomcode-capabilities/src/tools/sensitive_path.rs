@@ -1,10 +1,10 @@
 //! `SensitivePathGate` — require approval before a normally-Safe READ tool touches a
 //! sensitive path (SSH keys, cloud creds, `.env`, …).
 //!
-//! v2's approval is risk-based: `read_file` / `grep` / `glob` / `list_dir` are `Safe`, so
+//! Kernel approval is risk-based: `read_file` / `grep` / `glob` / `list_dir` are `Safe`, so
 //! they NEVER prompt — meaning an agent can silently read `~/.ssh/id_rsa` or `.env` and the
 //! contents ride a tool result straight to the LLM provider (secret exfiltration). This
-//! gate restores the per-path protection the legacy engine had, in v2's middleware idiom:
+//! gate preserves the existing per-path protection in a native middleware:
 //! it acts ONLY on tools that would otherwise bypass approval (`Safe`) AND whose args name
 //! a sensitive path, then runs the SAME approval round-trip as [`ApprovalMiddleware`]
 //! (allow-once / allow-always / deny). `Risky` tools already go through approval, so this
@@ -82,7 +82,10 @@ fn env_dot_reference_is_sensitive(a: &str) -> bool {
     while let Some(pos) = rest.find(".env.") {
         let after = &rest[pos + ".env.".len()..];
         // Leading alphanumeric run is the variant keyword (stops at quote, dot, slash, …).
-        let suffix: String = after.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+        let suffix: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
         if !ENV_TEMPLATE_SUFFIXES.contains(&suffix.as_str()) {
             return true;
         }
@@ -108,30 +111,64 @@ fn home_dir() -> Option<PathBuf> {
 pub fn path_is_sensitive(path: &Path) -> bool {
     #[cfg(not(target_os = "windows"))]
     const SYSTEM_PROTECTED_PREFIXES: &[&str] = &[
-        "/System", "/bin", "/sbin", "/usr", "/var", "/private/etc", "/private/var", "/etc",
-        "/root", "/var/root", "/private/var/root",
+        "/System",
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/var",
+        "/private/etc",
+        "/private/var",
+        "/etc",
+        "/root",
+        "/var/root",
+        "/private/var/root",
     ];
     #[cfg(target_os = "windows")]
-    const SYSTEM_PROTECTED_PREFIXES: &[&str] =
-        &[r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)", r"C:\ProgramData", r"C:\PerfLogs"];
+    const SYSTEM_PROTECTED_PREFIXES: &[&str] = &[
+        r"C:\Windows",
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
+        r"C:\ProgramData",
+        r"C:\PerfLogs",
+    ];
     #[cfg(not(target_os = "windows"))]
     const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[
-        "/usr/local", "/private/usr/local", "/Applications", "/Library", "/var/folders",
-        "/private/var/folders", "/var/tmp", "/private/var/tmp",
+        "/usr/local",
+        "/private/usr/local",
+        "/Applications",
+        "/Library",
+        "/var/folders",
+        "/private/var/folders",
+        "/var/tmp",
+        "/private/var/tmp",
     ];
     #[cfg(target_os = "windows")]
     const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[];
     const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg"];
     const SECRET_FILE_NAMES: &[&str] = &[
-        ".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".zshenv", ".npmrc", ".pypirc", ".env",
-        ".env.local", "credentials", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+        ".bashrc",
+        ".bash_profile",
+        ".zshrc",
+        ".zprofile",
+        ".zshenv",
+        ".npmrc",
+        ".pypirc",
+        ".env",
+        ".env.local",
+        "credentials",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
     ];
     const SECRET_EXTS: &[&str] = &["pem", "key", "p12", "pfx", "der", "crt", "cer"];
 
-    let has_protected_prefix =
-        SYSTEM_PROTECTED_PREFIXES.iter().any(|p| path == Path::new(p) || path.starts_with(p));
-    let has_exception_prefix =
-        SYSTEM_PROTECTED_EXCEPTIONS.iter().any(|p| path == Path::new(p) || path.starts_with(p));
+    let has_protected_prefix = SYSTEM_PROTECTED_PREFIXES
+        .iter()
+        .any(|p| path == Path::new(p) || path.starts_with(p));
+    let has_exception_prefix = SYSTEM_PROTECTED_EXCEPTIONS
+        .iter()
+        .any(|p| path == Path::new(p) || path.starts_with(p));
     if has_protected_prefix && !has_exception_prefix {
         return true;
     }
@@ -149,7 +186,11 @@ pub fn path_is_sensitive(path: &Path) -> bool {
         }
     }
 
-    if path.file_name().and_then(|n| n.to_str()).is_some_and(|name| SECRET_FILE_NAMES.contains(&name)) {
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| SECRET_FILE_NAMES.contains(&name))
+    {
         return true;
     }
     path.extension()
@@ -165,7 +206,10 @@ pub struct SensitivePathGate {
 
 impl Default for SensitivePathGate {
     fn default() -> Self {
-        Self { store: Arc::new(InMemoryPermissionStore::new()), kind: APPROVAL_KIND.to_string() }
+        Self {
+            store: Arc::new(InMemoryPermissionStore::new()),
+            kind: APPROVAL_KIND.to_string(),
+        }
     }
 }
 
@@ -175,7 +219,10 @@ impl SensitivePathGate {
     }
     /// Use a caller-supplied (e.g. shared / persisted) grant store.
     pub fn with_store(store: Arc<dyn PermissionStore>) -> Self {
-        Self { store, kind: APPROVAL_KIND.to_string() }
+        Self {
+            store,
+            kind: APPROVAL_KIND.to_string(),
+        }
     }
 }
 
@@ -230,23 +277,55 @@ mod tests {
     #[test]
     fn detects_credential_paths_not_ordinary_content() {
         // Credential stores → flagged.
-        assert!(references_sensitive_path(r#"{"file_path":"/home/u/.ssh/id_rsa"}"#));
-        assert!(references_sensitive_path(r#"{"file_path":"/home/u/.ssh"}"#), "the .ssh dir too");
+        assert!(references_sensitive_path(
+            r#"{"file_path":"/home/u/.ssh/id_rsa"}"#
+        ));
+        assert!(
+            references_sensitive_path(r#"{"file_path":"/home/u/.ssh"}"#),
+            "the .ssh dir too"
+        );
         assert!(references_sensitive_path(r#"{"file_path":"/proj/.env"}"#));
-        assert!(references_sensitive_path(r#"{"file_path":"/proj/.env.local"}"#));
-        assert!(references_sensitive_path(r#"{"file_path":"/proj/.env.production"}"#), "real secret variant");
+        assert!(references_sensitive_path(
+            r#"{"file_path":"/proj/.env.local"}"#
+        ));
+        assert!(
+            references_sensitive_path(r#"{"file_path":"/proj/.env.production"}"#),
+            "real secret variant"
+        );
         // Placeholder templates (committed to VCS, no real secrets) → NOT flagged.
-        assert!(!references_sensitive_path(r#"{"file_path":"/proj/.env.example"}"#), ".env.example is a template");
-        assert!(!references_sensitive_path(r#"{"file_path":"/proj/.env.sample"}"#));
-        assert!(!references_sensitive_path(r#"{"file_path":"/proj/.env.template"}"#));
-        assert!(!references_sensitive_path(r#"{"file_path":"/proj/.env.dist"}"#));
-        assert!(references_sensitive_path(r#"{"path":"/home/u/.aws/credentials"}"#));
-        assert!(references_sensitive_path(r#"{"file_path":"/etc/ssl/server.pem"}"#));
-        assert!(references_sensitive_path(r#"{"file_path":"C:\\Users\\u\\.ssh\\id_ed25519"}"#), "windows key");
+        assert!(
+            !references_sensitive_path(r#"{"file_path":"/proj/.env.example"}"#),
+            ".env.example is a template"
+        );
+        assert!(!references_sensitive_path(
+            r#"{"file_path":"/proj/.env.sample"}"#
+        ));
+        assert!(!references_sensitive_path(
+            r#"{"file_path":"/proj/.env.template"}"#
+        ));
+        assert!(!references_sensitive_path(
+            r#"{"file_path":"/proj/.env.dist"}"#
+        ));
+        assert!(references_sensitive_path(
+            r#"{"path":"/home/u/.aws/credentials"}"#
+        ));
+        assert!(references_sensitive_path(
+            r#"{"file_path":"/etc/ssl/server.pem"}"#
+        ));
+        assert!(
+            references_sensitive_path(r#"{"file_path":"C:\\Users\\u\\.ssh\\id_ed25519"}"#),
+            "windows key"
+        );
         // Ordinary reads / searches → NOT flagged.
         assert!(!references_sensitive_path(r#"{"file_path":"src/main.rs"}"#));
-        assert!(!references_sensitive_path(r#"{"pattern":"secret","path":"src/"}"#), "grep word 'secret'");
-        assert!(!references_sensitive_path(r#"{"path":"/proj/.environment/cfg"}"#), "no .env false-trip");
+        assert!(
+            !references_sensitive_path(r#"{"pattern":"secret","path":"src/"}"#),
+            "grep word 'secret'"
+        );
+        assert!(
+            !references_sensitive_path(r#"{"path":"/proj/.environment/cfg"}"#),
+            "no .env false-trip"
+        );
     }
 
     fn silent_rt() -> RequestCtx {
@@ -259,8 +338,11 @@ mod tests {
     async fn safe_ordinary_read_passes_without_round_trip() {
         let gate = SensitivePathGate::new();
         let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool::default());
-        let mut call =
-            ToolCall { id: "1".into(), name: "read_file".into(), arguments: r#"{"file_path":"src/main.rs"}"#.into() };
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"file_path":"src/main.rs"}"#.into(),
+        };
         // Ordinary path → Proceed WITHOUT awaiting the (silent) driver.
         assert!(!gate.before(&mut call, &tool, &silent_rt()).await.is_deny());
     }
@@ -289,7 +371,10 @@ mod tests {
             arguments: r#"{"file_path":"/home/u/.ssh/id_rsa"}"#.into(),
         };
         let res = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(res.is_deny(), "a sensitive read with no approval must fail closed");
+        assert!(
+            res.is_deny(),
+            "a sensitive read with no approval must fail closed"
+        );
         assert!(res.deny_reason().unwrap().contains("sensitive path"));
     }
 }

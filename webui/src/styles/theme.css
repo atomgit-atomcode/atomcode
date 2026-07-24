@@ -7,6 +7,7 @@
    neutrals (claude.ai's warm-ivory light + warm-charcoal dark); radii are
    softened; fonts add a sans body + a serif display stack (greeting). */
 :root {
+  color-scheme: dark;
   --app-brand:#d97757; --app-brand-button:#c2613f; --app-brand-ivory:#faf9f5; --app-brand-slate:#141413;
   --app-primary-foreground:#e8e6df; --app-primary-background:#262624; --app-brand-text:#f5f4ee;
   --app-secondary-foreground:#b0ada4; --app-secondary-background:#1f1e1d;
@@ -31,6 +32,7 @@
 /* Light palette — claude.ai warm ivory paper. Shared by the explicit-light
    and system-light selectors. Accent (clay) is inherited from :root. */
 :root[data-theme='light'] {
+  color-scheme: light;
   --app-primary-foreground:#1f1e1d; --app-primary-background:#faf9f5; --app-brand-text:#29261f;
   --app-secondary-foreground:#6b6a63; --app-secondary-background:#f0eee6;
   --app-input-foreground:#1f1e1d; --app-input-background:#ffffff; --app-input-border:#e6e2d6;
@@ -45,6 +47,7 @@
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme='dark']):not([data-theme='light']) {
+    color-scheme: light;
     --app-primary-foreground:#1f1e1d; --app-primary-background:#faf9f5; --app-brand-text:#29261f;
     --app-secondary-foreground:#6b6a63; --app-secondary-background:#f0eee6;
     --app-input-foreground:#1f1e1d; --app-input-background:#ffffff; --app-input-border:#e6e2d6;
@@ -58,3 +61,30 @@
     --app-diff-deletion-foreground:#cf222e;
   }
 }
+
+/* Themed scrollbars. Without this the browser paints its NATIVE scrollbar, which is
+   light in dark mode (jarring white bar in Edge/Chrome). `color-scheme` above fixes the
+   native fallback + form controls; the rules below give a thin, subtle, theme-following
+   thumb across every scroll area — the left session list AND the right chat pane. */
+/* Standard properties — the ONLY path Chrome/Edge 121+ and Firefox use. Once these
+   are set, Chromium IGNORES the ::-webkit-scrollbar rules below (they remain purely as
+   a Safari fallback, which doesn't support the standard props yet). 55% keeps the thin
+   bar findable — a too-faint thumb defeats the purpose. No hover on this path (the
+   standard props can't style :hover), so the base opacity carries visibility. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--app-secondary-foreground) 55%, transparent) transparent;
+}
+/* Safari fallback only (Chrome/Edge/Firefox render via the standard props above). */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--app-secondary-foreground) 55%, transparent);
+  border-radius: var(--corner-radius-small);
+  border: 2px solid transparent;                     /* inset the thumb via padding-box */
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {                     /* background-clip inherits from base */
+  background: color-mix(in srgb, var(--app-secondary-foreground) 75%, transparent);
+}
+::-webkit-scrollbar-corner { background: transparent; }

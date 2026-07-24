@@ -4,6 +4,84 @@
 
 use crate::render::{DiffEntry, DiffKind};
 
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedDiffFile {
+    pub entries: Vec<DiffEntry>,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedDiff {
+    pub files: Vec<ParsedDiffFile>,
+    pub truncated: bool,
+}
+
+/// Split a regular `git diff` stream into file-scoped blocks. The existing
+/// hunk parser remains the single source of line-number and separator semantics.
+pub(crate) fn parse_unified_diff_files(diff: &str, max_entries: usize) -> ParsedDiff {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            if let Some(chunk) = current.take() {
+                chunks.push(chunk);
+            }
+            current = Some(String::new());
+        } else if let Some(body) = current.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if let Some(chunk) = current {
+        chunks.push(chunk);
+    }
+    if chunks.is_empty() && !diff.trim().is_empty() {
+        chunks.push(diff.to_string());
+    }
+
+    let mut files = Vec::with_capacity(chunks.len());
+    let mut total_entries = 0usize;
+    let mut truncated = false;
+    for body in chunks {
+        let remaining = max_entries.saturating_sub(total_entries);
+        let has_hunk = body.lines().any(|line| line.starts_with("@@"));
+        let mut entries = if remaining == 0 {
+            Vec::new()
+        } else {
+            parse_unified_diff(&body, remaining.saturating_add(2))
+        };
+        if entries.len() > remaining {
+            entries.truncate(remaining);
+            truncated = true;
+        } else if remaining == 0 && has_hunk {
+            truncated = true;
+        }
+        total_entries = total_entries.saturating_add(entries.len());
+
+        let summary_lines: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.starts_with("Binary files ")
+                    || *line == "GIT binary patch"
+                    || line.starts_with("old mode ")
+                    || line.starts_with("new mode ")
+                    || line.starts_with("deleted file mode ")
+                    || line.starts_with("new file mode ")
+                    || line.starts_with("similarity index ")
+                    || line.starts_with("rename from ")
+                    || line.starts_with("rename to ")
+            })
+            .take(8)
+            .collect();
+        let summary = (!summary_lines.is_empty()).then(|| summary_lines.join("\n"));
+
+        files.push(ParsedDiffFile { entries, summary });
+    }
+
+    ParsedDiff { files, truncated }
+}
+
 /// Parse a git unified diff (`@@ -a,b +c,d @@` hunks + ` `/`+`/`-` lines) into
 /// line-numbered entries. Everything before the first `@@` hunk — the `Edited …`
 /// preamble and any `--- `/`+++ ` file headers — is ignored. Stops after
@@ -185,8 +263,14 @@ Edited a.rs (1 replacement)
         let e = parse_unified_diff(diff, 100);
         assert_eq!(e.len(), 3, "context + del + add, none dropped: {e:?}");
         assert_eq!(e[0].kind, DiffKind::Context);
-        assert_eq!((e[1].kind, e[1].text.as_str(), e[1].old_lineno), (DiffKind::Del, "--", Some(2)));
-        assert_eq!((e[2].kind, e[2].text.as_str(), e[2].new_lineno), (DiffKind::Add, "++new", Some(2)));
+        assert_eq!(
+            (e[1].kind, e[1].text.as_str(), e[1].old_lineno),
+            (DiffKind::Del, "--", Some(2))
+        );
+        assert_eq!(
+            (e[2].kind, e[2].text.as_str(), e[2].new_lineno),
+            (DiffKind::Add, "++new", Some(2))
+        );
     }
 
     #[test]
@@ -220,11 +304,79 @@ Edited a.rs (1 replacement)
     }
 
     #[test]
+    fn splits_git_diff_by_file() {
+        let diff = "\
+diff --git a/a.txt b/a.txt
+index 7898192..6178079 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-old-a
++new-a
+diff --git a/b.txt b/b.txt
+index 6178079..f2ad6c7 100644
+--- a/b.txt
++++ b/b.txt
+@@ -3 +3 @@
+-old-b
++new-b";
+
+        let parsed = parse_unified_diff_files(diff, 100);
+
+        assert!(!parsed.truncated);
+        assert_eq!(parsed.files.len(), 2);
+        assert_eq!(parsed.files[0].entries.len(), 2);
+        assert_eq!(parsed.files[0].entries[0].text, "old-a");
+        assert_eq!(parsed.files[0].entries[1].text, "new-a");
+        assert_eq!(parsed.files[1].entries[0].text, "old-b");
+        assert_eq!(parsed.files[1].entries[1].text, "new-b");
+    }
+
+    #[test]
+    fn file_parser_marks_entry_limit_and_keeps_binary_fallback() {
+        let diff = "\
+diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,2 @@
+-old-a
++new-a
+-old-b
++new-b
+diff --git a/image.png b/image.png
+Binary files a/image.png and b/image.png differ";
+
+        let parsed = parse_unified_diff_files(diff, 3);
+
+        assert!(parsed.truncated);
+        assert_eq!(parsed.files[0].entries.len(), 3);
+        assert_eq!(
+            parsed.files[1].summary.as_deref(),
+            Some("Binary files a/image.png and b/image.png differ")
+        );
+    }
+
+    #[test]
     fn gutter_width_and_row_format() {
         let entries = vec![
-            DiffEntry { kind: DiffKind::Context, old_lineno: Some(9), new_lineno: Some(9), text: "ctx".into() },
-            DiffEntry { kind: DiffKind::Add, old_lineno: None, new_lineno: Some(10), text: "added".into() },
-            DiffEntry { kind: DiffKind::Del, old_lineno: Some(10), new_lineno: None, text: "removed".into() },
+            DiffEntry {
+                kind: DiffKind::Context,
+                old_lineno: Some(9),
+                new_lineno: Some(9),
+                text: "ctx".into(),
+            },
+            DiffEntry {
+                kind: DiffKind::Add,
+                old_lineno: None,
+                new_lineno: Some(10),
+                text: "added".into(),
+            },
+            DiffEntry {
+                kind: DiffKind::Del,
+                old_lineno: Some(10),
+                new_lineno: None,
+                text: "removed".into(),
+            },
         ];
         let w = diff_gutter_width(&entries);
         assert_eq!(w, 2); // largest line number is 10 → width 2

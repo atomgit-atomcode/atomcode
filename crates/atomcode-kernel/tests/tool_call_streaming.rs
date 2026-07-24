@@ -18,7 +18,12 @@ async fn tool_call_deltas_are_forwarded_as_streaming_events() {
             name: Some("search".into()),
             arguments: "{\"q\":".into(),
         },
-        StreamEvent::ToolCallDelta { index: 0, id: None, name: None, arguments: "\"hi\"}".into() },
+        StreamEvent::ToolCallDelta {
+            index: 0,
+            id: None,
+            name: None,
+            arguments: "\"hi\"}".into(),
+        },
         StreamEvent::Done { truncated: false },
     ]]));
     let mut handle = Agent::builder()
@@ -27,12 +32,23 @@ async fn tool_call_deltas_are_forwarded_as_streaming_events() {
         .build()
         .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     let mut streaming = Vec::new();
     while let Some(ev) = handle.events.recv().await {
         match ev {
-            AgentEvent::ToolCallStreaming { index, id, name, arguments } => {
+            AgentEvent::ToolCallStreaming {
+                index,
+                id,
+                name,
+                arguments,
+            } => {
                 streaming.push((index, id, name, arguments));
             }
             AgentEvent::TurnComplete { .. } => break,
@@ -42,7 +58,19 @@ async fn tool_call_deltas_are_forwarded_as_streaming_events() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
-    assert_eq!(streaming.len(), 2, "both streaming fragments must reach the driver");
-    assert_eq!(streaming[0], (0, Some("c1".into()), Some("search".into()), "{\"q\":".into()));
+    assert_eq!(
+        streaming.len(),
+        2,
+        "both streaming fragments must reach the driver"
+    );
+    assert_eq!(
+        streaming[0],
+        (
+            0,
+            Some("c1".into()),
+            Some("search".into()),
+            "{\"q\":".into()
+        )
+    );
     assert_eq!(streaming[1], (0, None, None, "\"hi\"}".into()));
 }

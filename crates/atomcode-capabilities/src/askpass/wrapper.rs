@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 pub fn write_askpass_script(exe: &Path, dir: &Path) -> std::io::Result<PathBuf> {
     let p = dir.join("askpass.sh");
-    std::fs::write(&p, format!("#!/bin/sh\nexec \"{}\" __askpass \"$@\"\n", exe.display()))?;
+    std::fs::write(
+        &p,
+        format!("#!/bin/sh\nexec \"{}\" __askpass \"$@\"\n", exe.display()),
+    )?;
     std::fs::set_permissions(&p, PermissionsExt::from_mode(0o700))?;
     Ok(p)
 }
@@ -17,7 +20,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = write_askpass_script(std::path::Path::new("/usr/bin/atomcode"), &dir).unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
-        assert!(body.contains(r#"exec "/usr/bin/atomcode" __askpass "$@""#), "{body}");
+        assert!(
+            body.contains(r#"exec "/usr/bin/atomcode" __askpass "$@""#),
+            "{body}"
+        );
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&p).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700, "must be 0700");

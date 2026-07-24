@@ -8,14 +8,14 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
-use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
+use atomcode_config::config::provider::ProviderConfig;
 
 use crate::auth::oauth::{get_stored_auth, refresh_access_token};
-use crate::coding_plan::crypto::{self, SignError, SignInput};
 use crate::i18n::{t, Msg};
+use atomcode_auth::gateway_crypto::{self as crypto, SignError, SignInput};
 
 use super::{LlmProvider, ReasoningPolicy};
 
@@ -190,7 +190,7 @@ impl OpenAiProvider {
             },
         };
         Ok(Self {
-            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify),
+            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify)?,
             api_key: std::sync::Arc::new(tokio::sync::RwLock::new(api_key)),
             model: config.model.clone(),
             base_url: config
@@ -505,7 +505,7 @@ struct ChunkChoice {
 struct ChunkDelta {
     content: Option<String>,
     /// MiniMax M2.7 / DeepSeek R1 send thinking via this field. We forward
-    /// it as `StreamEvent::Reasoning` so `TurnRunner` can promote it to
+    /// it as `StreamEvent::Reasoning` so the kernel agent can promote it to
     /// the final text if `content` ends up empty — some gateways route
     /// *entire* responses to `reasoning_content` for these models, which
     /// previously showed up as a silent 0-token "Nailed it" turn.
@@ -1870,8 +1870,8 @@ mod tests {
         // `reasoning_history = "exclude"` forces Exclude even on a model that
         // the heuristic would route to Include (deepseek-v4-pro).
         use super::OpenAiProvider;
-        use atomcode_config::config::provider::ProviderConfig;
         use crate::provider::{LlmProvider, ReasoningPolicy};
+        use atomcode_config::config::provider::ProviderConfig;
         let cfg = ProviderConfig {
             provider_type: "openai".into(),
             api_key: Some("sk-test".into()),
@@ -2079,7 +2079,7 @@ mod tests {
 
     #[test]
     fn placeholder_send_side_matches_shared_constant() {
-        // `TurnRunner::Done` skips reasoning→text promotion when the
+        // The kernel agent skips reasoning→text promotion when the
         // accumulated reasoning_buf equals exactly this placeholder.
         // Send-side (format_messages, three call sites) MUST emit the
         // same byte string — otherwise a buggy gateway echoing it
@@ -2440,8 +2440,8 @@ mod tests {
     //   * 1 short chunk + tool_call + abrupt close     → Done(truncated=true)
     //     (model was making tool progress; let resume retry try again)
 
-    use atomcode_config::config::provider::ProviderConfig;
     use crate::provider::LlmProvider;
+    use atomcode_config::config::provider::ProviderConfig;
     use futures::StreamExt;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

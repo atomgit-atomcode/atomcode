@@ -2,7 +2,11 @@ use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
-use atomcode_kernel::testkit::{ApprovalMiddleware, ArgRewriteMiddleware, BlockToolMiddleware, BudgetReminderHook, ContinueOnceHook, DangerousBashTool, DropToolsHook, EchoTool, MockProvider, RecorderHook, RedactHook, RejectPromptHook, RiskyWriteTool, RoundBudgetHook, TruncateMiddleware};
+use atomcode_kernel::testkit::{
+    ApprovalMiddleware, ArgRewriteMiddleware, BlockToolMiddleware, BudgetReminderHook,
+    ContinueOnceHook, DangerousBashTool, DropToolsHook, EchoTool, MockProvider, RecorderHook,
+    RedactHook, RejectPromptHook, RiskyWriteTool, RoundBudgetHook, TruncateMiddleware,
+};
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;
 
@@ -14,10 +18,17 @@ async fn neutral_turn_runs_without_persona_or_middleware() {
     reg.register(Arc::new(EchoTool));
     let provider = Arc::new(MockProvider::new(vec![
         vec![
-            StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "echo".into(), arguments: "{\"text\":\"hi\"}".into() }),
+            StreamEvent::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "echo".into(),
+                arguments: "{\"text\":\"hi\"}".into(),
+            }),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let handle = Agent::builder()
@@ -25,7 +36,13 @@ async fn neutral_turn_runs_without_persona_or_middleware() {
         .tools(reg.mount(&["echo"]))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "hi".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "hi".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     let mut events = handle.events;
     let (mut echoed, mut completed, mut requested) = (false, false, false);
@@ -33,7 +50,10 @@ async fn neutral_turn_runs_without_persona_or_middleware() {
         match ev {
             AgentEvent::ToolResult { result } if result.content.contains("echo: ") => echoed = true,
             AgentEvent::Request { .. } => requested = true,
-            AgentEvent::TurnComplete { .. } => { completed = true; break; }
+            AgentEvent::TurnComplete { .. } => {
+                completed = true;
+                break;
+            }
             _ => {}
         }
     }
@@ -50,7 +70,11 @@ async fn approval_middleware_gates_risky_tool_via_id_roundtrip() {
     reg.register(Arc::new(RiskyWriteTool));
     let provider = Arc::new(MockProvider::new(vec![
         vec![
-            StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "risky_write".into(), arguments: "{\"path\":\"/tmp/x\"}".into() }),
+            StreamEvent::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "risky_write".into(),
+                arguments: "{\"path\":\"/tmp/x\"}".into(),
+            }),
             StreamEvent::Done { truncated: false },
         ],
         vec![StreamEvent::Done { truncated: false }],
@@ -63,7 +87,13 @@ async fn approval_middleware_gates_risky_tool_via_id_roundtrip() {
         .build()
         .spawn();
     let commands = handle.commands.clone();
-    handle.commands.send(AgentCommand::SendMessage { text: "write".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "write".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     let mut events = handle.events;
     let (mut asked, mut wrote) = (false, false);
@@ -72,7 +102,12 @@ async fn approval_middleware_gates_risky_tool_via_id_roundtrip() {
             AgentEvent::Request { id, kind, .. } => {
                 assert_eq!(kind, "approval");
                 asked = true;
-                commands.send(AgentCommand::Respond { id, value: serde_json::json!({"decision": "allow"}) }).unwrap();
+                commands
+                    .send(AgentCommand::Respond {
+                        id,
+                        value: serde_json::json!({"decision": "allow"}),
+                    })
+                    .unwrap();
             }
             AgentEvent::ToolResult { result } if result.content.contains("wrote: ") => wrote = true,
             AgentEvent::TurnComplete { .. } => break,
@@ -91,10 +126,17 @@ async fn one_shot_adapter_auto_answers_and_aggregates() {
     reg.register(Arc::new(RiskyWriteTool));
     let provider = Arc::new(MockProvider::new(vec![
         vec![
-            StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "risky_write".into(), arguments: "{}".into() }),
+            StreamEvent::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "risky_write".into(),
+                arguments: "{}".into(),
+            }),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("ok".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("ok".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let agent = Agent::builder()
@@ -102,10 +144,15 @@ async fn one_shot_adapter_auto_answers_and_aggregates() {
         .tools(reg.mount(&["risky_write"]))
         .middleware(Arc::new(ApprovalMiddleware::new()))
         .build();
-    let outcome = agent.run_to_completion("write it", AutoRespond::AllowAll).await;
+    let outcome = agent
+        .run_to_completion("write it", AutoRespond::AllowAll)
+        .await;
 
     assert!(
-        outcome.tool_results.iter().any(|r| r.content.contains("wrote: ")),
+        outcome
+            .tool_results
+            .iter()
+            .any(|r| r.content.contains("wrote: ")),
         "one-shot adapter should auto-approve and aggregate the tool result"
     );
     assert!(outcome.text.contains("ok"));
@@ -114,11 +161,18 @@ async fn one_shot_adapter_auto_answers_and_aggregates() {
 // CLAIM 5: the driver seam is wire-compatible (serde round-trips).
 #[test]
 fn events_and_commands_are_wire_serializable() {
-    let ev = AgentEvent::Request { id: 7, kind: "approval".into(), payload: serde_json::json!({"tool": "risky_write"}) };
+    let ev = AgentEvent::Request {
+        id: 7,
+        kind: "approval".into(),
+        payload: serde_json::json!({"tool": "risky_write"}),
+    };
     let s = serde_json::to_string(&ev).expect("AgentEvent must serialize");
     let _back: AgentEvent = serde_json::from_str(&s).expect("AgentEvent must deserialize");
 
-    let cmd = AgentCommand::Respond { id: 7, value: serde_json::json!({"decision": "allow"}) };
+    let cmd = AgentCommand::Respond {
+        id: 7,
+        value: serde_json::json!({"decision": "allow"}),
+    };
     let s2 = serde_json::to_string(&cmd).expect("AgentCommand must serialize");
     let _back2: AgentCommand = serde_json::from_str(&s2).expect("AgentCommand must deserialize");
 }
@@ -132,12 +186,22 @@ async fn lifecycle_hook_injects_and_continues_loop() {
     // Step 1: model stops (no tool calls). Step 2 (after the injected reminder):
     // calls echo. Step 3: stops again → hook returns None → complete.
     let provider = Arc::new(MockProvider::new(vec![
-        vec![StreamEvent::TextDelta("stopping".into()), StreamEvent::Done { truncated: false }],
         vec![
-            StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "echo".into(), arguments: "{}".into() }),
+            StreamEvent::TextDelta("stopping".into()),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("really done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("really done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let handle = Agent::builder()
@@ -146,7 +210,13 @@ async fn lifecycle_hook_injects_and_continues_loop() {
         .hooks(Arc::new(ContinueOnceHook::new()))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     let mut events = handle.events;
     let (mut turn_started, mut echoed, mut completed) = (false, false, false);
@@ -154,13 +224,25 @@ async fn lifecycle_hook_injects_and_continues_loop() {
         match ev {
             AgentEvent::TurnStarted => turn_started = true,
             AgentEvent::ToolResult { result } if result.content.contains("echo: ") => echoed = true,
-            AgentEvent::TurnComplete { .. } => { completed = true; break; }
+            AgentEvent::TurnComplete { .. } => {
+                completed = true;
+                break;
+            }
             _ => {}
         }
     }
-    assert!(turn_started, "TurnStarted must be observable (perception granularity)");
-    assert!(echoed, "offer_continuation injection must continue the loop into another step (the echo step)");
-    assert!(completed, "loop must complete after the hook stops injecting");
+    assert!(
+        turn_started,
+        "TurnStarted must be observable (perception granularity)"
+    );
+    assert!(
+        echoed,
+        "offer_continuation injection must continue the loop into another step (the echo step)"
+    );
+    assert!(
+        completed,
+        "loop must complete after the hook stops injecting"
+    );
 }
 
 // CLAIM 7: the kernel wires the FULL LifecycleHooks surface — every lifecycle
@@ -172,8 +254,16 @@ async fn lifecycle_hooks_complete_surface_all_fire() {
     reg.register(Arc::new(EchoTool));
     let provider = Arc::new(MockProvider::new(vec![
         vec![
-            StreamEvent::ToolCall(ToolCall { id: "a".into(), name: "echo".into(), arguments: "{}".into() }),
-            StreamEvent::ToolCall(ToolCall { id: "b".into(), name: "does_not_exist".into(), arguments: "{}".into() }),
+            StreamEvent::ToolCall(ToolCall {
+                id: "a".into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+            }),
+            StreamEvent::ToolCall(ToolCall {
+                id: "b".into(),
+                name: "does_not_exist".into(),
+                arguments: "{}".into(),
+            }),
             StreamEvent::Done { truncated: false },
         ],
         vec![
@@ -192,7 +282,13 @@ async fn lifecycle_hooks_complete_surface_all_fire() {
         .hooks(recorder)
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
@@ -204,11 +300,23 @@ async fn lifecycle_hooks_complete_surface_all_fire() {
 
     let fired = log.lock().unwrap().clone();
     for point in [
-        "session_start", "user_prompt_submit", "turn_start", "pre_request",
-        "on_request", "on_text_delta", "on_reasoning_delta", "on_model_response",
-        "on_error", "offer_continuation", "turn_complete", "session_end",
+        "session_start",
+        "user_prompt_submit",
+        "turn_start",
+        "pre_request",
+        "on_request",
+        "on_text_delta",
+        "on_reasoning_delta",
+        "on_model_response",
+        "on_error",
+        "offer_continuation",
+        "turn_complete",
+        "session_end",
     ] {
-        assert!(fired.contains(&point.to_string()), "hook '{point}' was never called; fired = {fired:?}");
+        assert!(
+            fired.contains(&point.to_string()),
+            "hook '{point}' was never called; fired = {fired:?}"
+        );
     }
 }
 
@@ -222,12 +330,20 @@ async fn execution_state_recorded_projected_to_llm_and_cache_safe() {
     let provider = Arc::new(
         MockProvider::new(vec![
             vec![
-                StreamEvent::Usage(TokenUsage { prompt: 100, completion: 5, cached: 0 }),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 100,
+                    completion: 5,
+                    cached: 0,
+                }),
                 StreamEvent::TextDelta("reply A".into()),
                 StreamEvent::Done { truncated: false },
             ],
             vec![
-                StreamEvent::Usage(TokenUsage { prompt: 300, completion: 5, cached: 0 }),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 300,
+                    completion: 5,
+                    cached: 0,
+                }),
                 StreamEvent::TextDelta("reply B".into()),
                 StreamEvent::Done { truncated: false },
             ],
@@ -246,7 +362,13 @@ async fn execution_state_recorded_projected_to_llm_and_cache_safe() {
     let mut usage_utils: Vec<f32> = Vec::new();
 
     // Turn A
-    handle.commands.send(AgentCommand::SendMessage { text: "first".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "first".into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::Usage(m) => usage_utils.push(m.utilization),
@@ -255,7 +377,13 @@ async fn execution_state_recorded_projected_to_llm_and_cache_safe() {
         }
     }
     // Turn B
-    handle.commands.send(AgentCommand::SendMessage { text: "second".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "second".into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::Usage(m) => usage_utils.push(m.utilization),
@@ -280,11 +408,22 @@ async fn execution_state_recorded_projected_to_llm_and_cache_safe() {
 
     let b = &calls[1];
     // (2) CACHE-SAFETY: the historical user message is byte-identical, not rewritten.
-    assert_eq!(b[0], calls[0][0], "historical message must not be rewritten (prefix-cache safety)");
+    assert_eq!(
+        b[0], calls[0][0],
+        "historical message must not be rewritten (prefix-cache safety)"
+    );
     // (3) SIDECAR: the assistant message text stays clean — cost is NOT baked into content.
-    assert_eq!(b[1], ("Assistant".to_string(), "reply A".to_string()), "assistant text must stay clean (meta is sidecar)");
+    assert_eq!(
+        b[1],
+        ("Assistant".to_string(), "reply A".to_string()),
+        "assistant text must stay clean (meta is sidecar)"
+    );
     // (4) PROJECTION: the LAST message is the tail utilization reminder the LLM perceives.
-    assert_eq!(b.last().unwrap(), &("User".to_string(), "[ctx 10%]".to_string()), "tail reminder must project utilization to the LLM");
+    assert_eq!(
+        b.last().unwrap(),
+        &("User".to_string(), "[ctx 10%]".to_string()),
+        "tail reminder must project utilization to the LLM"
+    );
 }
 
 // CLAIM 9: per-turn round budget — kernel tracks `round` (recorded in Message.meta),
@@ -296,11 +435,39 @@ async fn round_budget_projected_to_llm_and_hard_capped() {
     reg.register(Arc::new(EchoTool));
     // The model calls a tool EVERY round (never stops) — exercises the cap at max=3.
     let provider = Arc::new(MockProvider::new(vec![
-        vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done { truncated: false }],
-        vec![StreamEvent::ToolCall(ToolCall { id: "2".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done { truncated: false }],
-        vec![StreamEvent::ToolCall(ToolCall { id: "3".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "1".into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "2".into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "3".into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
         // a 4th is scripted but must NEVER be requested (hard-capped at 3)
-        vec![StreamEvent::ToolCall(ToolCall { id: "4".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "4".into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let received = provider.received.clone();
 
@@ -311,7 +478,13 @@ async fn round_budget_projected_to_llm_and_hard_capped() {
         .max_rounds(3)
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     let mut rounds_seen: Vec<u32> = Vec::new();
     let mut capped = false;
@@ -328,16 +501,40 @@ async fn round_budget_projected_to_llm_and_hard_capped() {
 
     let calls = received.lock().unwrap();
     // hard cap: only 3 LLM calls; the scripted 4th was never requested
-    assert_eq!(calls.len(), 3, "round 4 must be hard-capped; got {} calls", calls.len());
+    assert_eq!(
+        calls.len(),
+        3,
+        "round 4 must be hard-capped; got {} calls",
+        calls.len()
+    );
     assert!(capped, "max-rounds cap must emit an Error event");
     // projection escalates each round, ending with the final-round warning
-    assert_eq!(calls[0].last().unwrap(), &("User".to_string(), "[round 1/3]".to_string()));
-    assert_eq!(calls[1].last().unwrap(), &("User".to_string(), "[round 2/3]".to_string()));
-    assert_eq!(calls[2].last().unwrap(), &("User".to_string(), "[round 3/3 - final round, wrap up now]".to_string()));
+    assert_eq!(
+        calls[0].last().unwrap(),
+        &("User".to_string(), "[round 1/3]".to_string())
+    );
+    assert_eq!(
+        calls[1].last().unwrap(),
+        &("User".to_string(), "[round 2/3]".to_string())
+    );
+    assert_eq!(
+        calls[2].last().unwrap(),
+        &(
+            "User".to_string(),
+            "[round 3/3 - final round, wrap up now]".to_string()
+        )
+    );
     // recording: each assistant message carried its round (1,2,3)
-    assert_eq!(rounds_seen, vec![1, 2, 3], "Message.meta.round must be recorded per round");
+    assert_eq!(
+        rounds_seen,
+        vec![1, 2, 3],
+        "Message.meta.round must be recorded per round"
+    );
     // cache-safety: the original user message is byte-identical across rounds
-    assert_eq!(calls[2][0], calls[0][0], "history must not be rewritten (prefix-cache safety)");
+    assert_eq!(
+        calls[2][0], calls[0][0],
+        "history must not be rewritten (prefix-cache safety)"
+    );
 }
 
 // CLAIM 10: on_model_response receives the response as `&mut Message` and can
@@ -347,7 +544,11 @@ async fn round_budget_projected_to_llm_and_hard_capped() {
 async fn on_model_response_can_transform_response_into_storage() {
     let reg = ToolRegistry::new();
     let provider = Arc::new(MockProvider::new(vec![vec![
-        StreamEvent::Usage(TokenUsage { prompt: 50, completion: 10, cached: 0 }),
+        StreamEvent::Usage(TokenUsage {
+            prompt: 50,
+            completion: 10,
+            cached: 0,
+        }),
         StreamEvent::TextDelta("my password is SECRET".into()),
         StreamEvent::Done { truncated: false },
     ]]));
@@ -358,7 +559,13 @@ async fn on_model_response_can_transform_response_into_storage() {
         .hooks(Arc::new(RedactHook))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
@@ -378,13 +585,22 @@ async fn on_model_response_can_transform_response_into_storage() {
     let _ = handle.task.await;
 
     use atomcode_kernel::message::Role;
-    let assistant = snap.iter().find(|m| m.role == Role::Assistant).expect("assistant message stored");
+    let assistant = snap
+        .iter()
+        .find(|m| m.role == Role::Assistant)
+        .expect("assistant message stored");
     // (1) the hook's transform of the response landed in storage
-    assert_eq!(assistant.text, "my password is [redacted]", "on_model_response transform must land in storage");
+    assert_eq!(
+        assistant.text, "my password is [redacted]",
+        "on_model_response transform must land in storage"
+    );
     assert!(!assistant.text.contains("SECRET"), "secret must be gone");
     // (2) the hook saw the kernel-filled meta on the response
     assert!(
-        assistant.meta.as_ref().is_some_and(|m| m.tokens.prompt == 50),
+        assistant
+            .meta
+            .as_ref()
+            .is_some_and(|m| m.tokens.prompt == 50),
         "kernel meta must be present on the response the hook received"
     );
 }
@@ -395,7 +611,11 @@ async fn dropping_tool_calls_in_on_model_response_prevents_execution() {
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(EchoTool));
     let provider = Arc::new(MockProvider::new(vec![vec![
-        StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }),
+        StreamEvent::ToolCall(ToolCall {
+            id: "1".into(),
+            name: "echo".into(),
+            arguments: "{}".into(),
+        }),
         StreamEvent::Done { truncated: false },
     ]]));
     let mut handle = Agent::builder()
@@ -404,20 +624,32 @@ async fn dropping_tool_calls_in_on_model_response_prevents_execution() {
         .hooks(Arc::new(DropToolsHook))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     let mut executed = false;
     let mut completed = false;
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::ToolStarted { .. } | AgentEvent::ToolResult { .. } => executed = true,
-            AgentEvent::TurnComplete { .. } => { completed = true; break; }
+            AgentEvent::TurnComplete { .. } => {
+                completed = true;
+                break;
+            }
             _ => {}
         }
     }
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
-    assert!(!executed, "a tool call dropped by on_model_response must NOT execute");
+    assert!(
+        !executed,
+        "a tool call dropped by on_model_response must NOT execute"
+    );
     assert!(completed, "turn completes since pending became empty");
 }
 
@@ -431,7 +663,14 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool));
         let provider = Arc::new(MockProvider::new(vec![
-            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{\"x\":1}".into() }), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "1".into(),
+                    name: "echo".into(),
+                    arguments: "{\"x\":1}".into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
             vec![StreamEvent::Done { truncated: false }],
         ]));
         let mut handle = Agent::builder()
@@ -440,7 +679,13 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
             .middleware(Arc::new(ArgRewriteMiddleware))
             .build()
             .spawn();
-        handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "go".into(),
+                images: vec![],
+            })
+            .unwrap();
         let mut echoed = String::new();
         while let Some(ev) = handle.events.recv().await {
             match ev {
@@ -451,14 +696,24 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
         }
         handle.commands.send(AgentCommand::Shutdown).unwrap();
         let _ = handle.task.await;
-        assert!(echoed.contains("rewritten"), "before-rewritten args must reach execution; got {echoed}");
+        assert!(
+            echoed.contains("rewritten"),
+            "before-rewritten args must reach execution; got {echoed}"
+        );
     }
     // (b) before blocks → no ghost ToolStarted, blocked ToolResult
     {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool));
         let provider = Arc::new(MockProvider::new(vec![
-            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "1".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
             vec![StreamEvent::Done { truncated: false }],
         ]));
         let mut handle = Agent::builder()
@@ -467,7 +722,13 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
             .middleware(Arc::new(BlockToolMiddleware))
             .build()
             .spawn();
-        handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "go".into(),
+                images: vec![],
+            })
+            .unwrap();
         let mut started = false;
         let mut blocked = false;
         while let Some(ev) = handle.events.recv().await {
@@ -484,7 +745,10 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
         }
         handle.commands.send(AgentCommand::Shutdown).unwrap();
         let _ = handle.task.await;
-        assert!(!started, "a tool blocked by middleware must NOT emit a ghost ToolStarted");
+        assert!(
+            !started,
+            "a tool blocked by middleware must NOT emit a ghost ToolStarted"
+        );
         assert!(blocked, "a blocked tool still yields a ToolResult");
     }
     // (c) after transforms the result
@@ -492,7 +756,14 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool));
         let provider = Arc::new(MockProvider::new(vec![
-            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "echo".into(), arguments: "{}".into() }), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "1".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
             vec![StreamEvent::Done { truncated: false }],
         ]));
         let mut handle = Agent::builder()
@@ -501,7 +772,13 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
             .middleware(Arc::new(TruncateMiddleware))
             .build()
             .spawn();
-        handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "go".into(),
+                images: vec![],
+            })
+            .unwrap();
         let mut content = String::new();
         while let Some(ev) = handle.events.recv().await {
             match ev {
@@ -512,7 +789,10 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
         }
         handle.commands.send(AgentCommand::Shutdown).unwrap();
         let _ = handle.task.await;
-        assert!(content.starts_with("[truncated]"), "after must transform the result; got {content}");
+        assert!(
+            content.starts_with("[truncated]"),
+            "after must transform the result; got {content}"
+        );
     }
 }
 
@@ -526,7 +806,14 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(DangerousBashTool));
         let provider = Arc::new(MockProvider::new(vec![
-            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "bash".into(), arguments: "{\"cmd\":\"ls\"}".into() }), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "1".into(),
+                    name: "bash".into(),
+                    arguments: "{\"cmd\":\"ls\"}".into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
             vec![StreamEvent::Done { truncated: false }],
         ]));
         let mut handle = Agent::builder()
@@ -535,13 +822,21 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
             .middleware(Arc::new(ApprovalMiddleware::new()))
             .build()
             .spawn();
-        handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "go".into(),
+                images: vec![],
+            })
+            .unwrap();
         let mut asked = 0;
         let mut ran = false;
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::Request { kind, .. } if kind == "approval" => asked += 1,
-                AgentEvent::ToolResult { result } if result.content.starts_with("ran:") => ran = true,
+                AgentEvent::ToolResult { result } if result.content.starts_with("ran:") => {
+                    ran = true
+                }
                 AgentEvent::TurnComplete { .. } => break,
                 _ => {}
             }
@@ -557,9 +852,23 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(DangerousBashTool));
         let provider = Arc::new(MockProvider::new(vec![
-            vec![StreamEvent::ToolCall(ToolCall { id: "1".into(), name: "bash".into(), arguments: "{\"cmd\":\"rm -rf /tmp/x\"}".into() }), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "1".into(),
+                    name: "bash".into(),
+                    arguments: "{\"cmd\":\"rm -rf /tmp/x\"}".into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
             vec![StreamEvent::Done { truncated: false }],
-            vec![StreamEvent::ToolCall(ToolCall { id: "2".into(), name: "bash".into(), arguments: "{\"cmd\":\"rm -rf /tmp/x\"}".into() }), StreamEvent::Done { truncated: false }],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "2".into(),
+                    name: "bash".into(),
+                    arguments: "{\"cmd\":\"rm -rf /tmp/x\"}".into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
             vec![StreamEvent::Done { truncated: false }],
         ]));
         let mut handle = Agent::builder()
@@ -574,13 +883,21 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
         let mut turns_done = 0;
         let mut sent_second = false;
 
-        commands.send(AgentCommand::SendMessage { text: "one".into(), images: vec![] }).unwrap();
+        commands
+            .send(AgentCommand::SendMessage {
+                text: "one".into(),
+                images: vec![],
+            })
+            .unwrap();
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::Request { id, kind, .. } if kind == "approval" => {
                     asked += 1;
                     commands
-                        .send(AgentCommand::Respond { id, value: serde_json::json!({"decision":"allow","remember":true}) })
+                        .send(AgentCommand::Respond {
+                            id,
+                            value: serde_json::json!({"decision":"allow","remember":true}),
+                        })
                         .unwrap();
                 }
                 AgentEvent::ToolResult { result } if result.content.starts_with("ran:") => ran += 1,
@@ -588,7 +905,12 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
                     turns_done += 1;
                     if turns_done == 1 && !sent_second {
                         sent_second = true;
-                        commands.send(AgentCommand::SendMessage { text: "two".into(), images: vec![] }).unwrap();
+                        commands
+                            .send(AgentCommand::SendMessage {
+                                text: "two".into(),
+                                images: vec![],
+                            })
+                            .unwrap();
                     } else if turns_done >= 2 {
                         break;
                     }
@@ -598,8 +920,14 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
         }
         commands.send(AgentCommand::Shutdown).unwrap();
         let _ = handle.task.await;
-        assert_eq!(asked, 1, "an identical dangerous command must be approved once then cached; asked={asked}");
-        assert_eq!(ran, 2, "both dangerous calls execute (first after approval, second from cache)");
+        assert_eq!(
+            asked, 1,
+            "an identical dangerous command must be approved once then cached; asked={asked}"
+        );
+        assert_eq!(
+            ran, 2,
+            "both dangerous calls execute (first after approval, second from cache)"
+        );
     }
 }
 
@@ -608,14 +936,22 @@ async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached()
 #[tokio::test]
 async fn user_prompt_submit_can_block_a_prompt() {
     let reg = ToolRegistry::new();
-    let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Done { truncated: false }]])); // never reached
+    let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Done {
+        truncated: false,
+    }]])); // never reached
     let mut handle = Agent::builder()
         .provider(provider)
         .tools(reg.mount(&[]))
         .hooks(Arc::new(RejectPromptHook))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "do something bad".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "do something bad".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     let mut rejected = false;
     let mut turn_started = false;
@@ -671,7 +1007,13 @@ async fn model_reasoning_is_stored_on_assistant_message_and_still_emitted_live()
         .tools(reg.mount(&[]))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "think then answer".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "think then answer".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     // The LIVE reasoning channel must STILL fire (storage did not replace it).
     let mut live_reasoning_seen = false;
@@ -682,7 +1024,10 @@ async fn model_reasoning_is_stored_on_assistant_message_and_still_emitted_live()
             _ => {}
         }
     }
-    assert!(live_reasoning_seen, "AgentEvent::Reasoning must STILL be emitted live");
+    assert!(
+        live_reasoning_seen,
+        "AgentEvent::Reasoning must STILL be emitted live"
+    );
 
     // The STORED assistant Message must carry the reasoning + the answer text.
     handle.commands.send(AgentCommand::Snapshot).unwrap();
@@ -706,7 +1051,10 @@ async fn model_reasoning_is_stored_on_assistant_message_and_still_emitted_live()
         Some("let me think"),
         "the prior turn's reasoning must be STORED on the assistant message"
     );
-    assert_eq!(last_assistant.text, "answer", "the visible answer text is stored too");
+    assert_eq!(
+        last_assistant.text, "answer",
+        "the visible answer text is stored too"
+    );
 }
 
 // CLAIM 29 (negative): a turn with NO reasoning stream stores `reasoning == None`
@@ -724,7 +1072,13 @@ async fn no_reasoning_stream_stores_none() {
         .tools(reg.mount(&[]))
         .build()
         .spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "answer".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "answer".into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -765,40 +1119,84 @@ async fn signed_reasoning_blocks_are_finalized_per_signature_in_order() {
     let reg = ToolRegistry::new();
     let provider = Arc::new(MockProvider::new(vec![vec![
         StreamEvent::Reasoning("plan A".into()),
-        StreamEvent::ReasoningSignature { opaque: "sigA".into(), provider: "anthropic".into() },
+        StreamEvent::ReasoningSignature {
+            opaque: "sigA".into(),
+            provider: "anthropic".into(),
+        },
         StreamEvent::Reasoning("plan B".into()),
-        StreamEvent::ReasoningSignature { opaque: "sigB".into(), provider: "anthropic".into() },
+        StreamEvent::ReasoningSignature {
+            opaque: "sigB".into(),
+            provider: "anthropic".into(),
+        },
         // a redacted block: signature with no preceding text.
-        StreamEvent::ReasoningSignature { opaque: "redacted".into(), provider: "anthropic".into() },
+        StreamEvent::ReasoningSignature {
+            opaque: "redacted".into(),
+            provider: "anthropic".into(),
+        },
         StreamEvent::TextDelta("done".into()),
         StreamEvent::Done { truncated: false },
     ]]));
 
-    let mut handle = Agent::builder().provider(provider).tools(reg.mount(&[])).build().spawn();
-    handle.commands.send(AgentCommand::SendMessage { text: "think".into(), images: vec![] }).unwrap();
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[]))
+        .build()
+        .spawn();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "think".into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
-        if matches!(ev, AgentEvent::TurnComplete { .. }) { break; }
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
+            break;
+        }
     }
     handle.commands.send(AgentCommand::Snapshot).unwrap();
     let mut messages: Vec<Message> = Vec::new();
     while let Some(ev) = handle.events.recv().await {
-        if let AgentEvent::Snapshot { snapshot } = ev { messages = snapshot.messages; break; }
+        if let AgentEvent::Snapshot { snapshot } = ev {
+            messages = snapshot.messages;
+            break;
+        }
     }
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
-    let a = messages.iter().rev().find(|m| m.role == Role::Assistant).expect("assistant message");
+    let a = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant)
+        .expect("assistant message");
     assert_eq!(
         a.reasoning_blocks,
         vec![
-            ReasoningBlock { text: "plan A".into(), opaque: Some("sigA".into()), provider: Some("anthropic".into()) },
-            ReasoningBlock { text: "plan B".into(), opaque: Some("sigB".into()), provider: Some("anthropic".into()) },
-            ReasoningBlock { text: String::new(), opaque: Some("redacted".into()), provider: Some("anthropic".into()) },
+            ReasoningBlock {
+                text: "plan A".into(),
+                opaque: Some("sigA".into()),
+                provider: Some("anthropic".into())
+            },
+            ReasoningBlock {
+                text: "plan B".into(),
+                opaque: Some("sigB".into()),
+                provider: Some("anthropic".into())
+            },
+            ReasoningBlock {
+                text: String::new(),
+                opaque: Some("redacted".into()),
+                provider: Some("anthropic".into())
+            },
         ],
         "one ReasoningBlock finalized per signature, in order"
     );
     // The flat reasoning string still carries ALL the thinking text (OpenAI path back-compat).
-    assert_eq!(a.reasoning.as_deref(), Some("plan Aplan B"), "flat reasoning still accumulates all text");
+    assert_eq!(
+        a.reasoning.as_deref(),
+        Some("plan Aplan B"),
+        "flat reasoning still accumulates all text"
+    );
     assert_eq!(a.text, "done");
 }
 
@@ -820,12 +1218,23 @@ async fn shared_cwd_change_is_reflected_in_a_later_tool_call() {
     }
     #[async_trait]
     impl Tool for SetCwd {
-        fn name(&self) -> &str { "set_cwd" }
-        fn description(&self) -> &str { "test: set the shared cwd" }
-        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type":"object"}) }
+        fn name(&self) -> &str {
+            "set_cwd"
+        }
+        fn description(&self) -> &str {
+            "test: set the shared cwd"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
         async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
             *self.cwd.write().unwrap() = self.target.clone();
-            ToolResult { call_id: String::new(), content: "set".into(), is_error: false, images: vec![] }
+            ToolResult {
+                call_id: String::new(),
+                content: "set".into(),
+                is_error: false,
+                images: vec![],
+            }
         }
     }
     // Records what working_dir the kernel handed it.
@@ -834,12 +1243,23 @@ async fn shared_cwd_change_is_reflected_in_a_later_tool_call() {
     }
     #[async_trait]
     impl Tool for GetCwd {
-        fn name(&self) -> &str { "get_cwd" }
-        fn description(&self) -> &str { "test: report ctx.working_dir" }
-        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type":"object"}) }
+        fn name(&self) -> &str {
+            "get_cwd"
+        }
+        fn description(&self) -> &str {
+            "test: report ctx.working_dir"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
         async fn execute(&self, _args: &str, ctx: &ToolContext) -> ToolResult {
             *self.seen.lock().unwrap() = Some(ctx.working_dir.clone());
-            ToolResult { call_id: String::new(), content: "got".into(), is_error: false, images: vec![] }
+            ToolResult {
+                call_id: String::new(),
+                content: "got".into(),
+                is_error: false,
+                images: vec![],
+            }
         }
     }
 
@@ -850,17 +1270,31 @@ async fn shared_cwd_change_is_reflected_in_a_later_tool_call() {
     let seen = Arc::new(Mutex::new(None));
 
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(SetCwd { cwd: shared.clone(), target: target.clone() }));
+    reg.register(Arc::new(SetCwd {
+        cwd: shared.clone(),
+        target: target.clone(),
+    }));
     reg.register(Arc::new(GetCwd { seen: seen.clone() }));
 
     // Round 1: assistant calls set_cwd THEN get_cwd. Round 2: final answer (ends turn).
     let provider = Arc::new(MockProvider::new(vec![
         vec![
-            StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "set_cwd".into(), arguments: "{}".into() }),
-            StreamEvent::ToolCall(ToolCall { id: "c2".into(), name: "get_cwd".into(), arguments: "{}".into() }),
+            StreamEvent::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "set_cwd".into(),
+                arguments: "{}".into(),
+            }),
+            StreamEvent::ToolCall(ToolCall {
+                id: "c2".into(),
+                name: "get_cwd".into(),
+                arguments: "{}".into(),
+            }),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let outcome = Agent::builder()

@@ -4,11 +4,13 @@ import { useT } from '../settings';
 import { MsgKey } from '../i18n';
 
 // Approval modes shown in the pill dropdown. Order = display order.
-// `bypass` (免审批) is a safety-consequential mode → styled with a warning accent.
+// The Auto mode keeps the `bypass` wire value for protocol compatibility and
+// remains safety-consequential, so it is styled with a warning accent.
 const MODE_OPTIONS: { val: ApprovalMode; label: MsgKey; desc: MsgKey }[] = [
   { val: 'build', label: 'mode.build', desc: 'mode.build.desc' },
+  { val: 'accept_edits', label: 'mode.accept_edits', desc: 'mode.accept_edits.desc' },
+  { val: 'bypass', label: 'mode.auto', desc: 'mode.auto.desc' },
   { val: 'plan', label: 'mode.plan', desc: 'mode.plan.desc' },
-  { val: 'bypass', label: 'mode.bypass', desc: 'mode.bypass.desc' },
 ];
 
 export function ModeSelector({
@@ -32,11 +34,11 @@ export function ModeSelector({
     return () => document.removeEventListener('mousedown', h);
   }, [open]);
   const current = MODE_OPTIONS.find((o) => o.val === value) ?? MODE_OPTIONS[0];
-  const isBypass = value === 'bypass';
+  const isAuto = value === 'bypass';
   return (
     <div class="model-selector model-selector-up mode-selector" ref={ref}>
       <button
-        class={'model-selector-trigger mode-selector-trigger' + (isBypass ? ' mode-bypass' : '')}
+        class={'model-selector-trigger mode-selector-trigger' + (isAuto ? ' mode-bypass' : '')}
         onClick={() => {
           if (!disabled) setOpen((o) => !o);
         }}

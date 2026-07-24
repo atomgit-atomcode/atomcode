@@ -246,6 +246,8 @@ Compatible with Claude Code plugin's `.hooks.json`. Load paths:
 
 Supported `event` values: `pre_tool_use`, `post_tool_use`, `session_start`, `session_end`, `user_prompt_submit`.
 
+> **Case/style-insensitive:** the loader accepts both CC PascalCase (`PreToolUse`, `PostToolUse`, `SessionStart`, `UserPromptSubmit`) and snake_case (`pre_tool_use`, `session_start`, …) — the two spellings are equivalent.
+
 Hooks receive context via environment variables (`ATOMCODE_HOOK_EVENT`, `ATOMCODE_HOOK_CONTEXT`, `ATOMCODE_TOOL_NAME`, etc.). The stdout protocol varies by event:
 
 - **`pre_tool_use`** — output `{"action":"allow"}` / `{"action":"block","reason":"..."}` / `{"action":"modify","args":{...}}` (`args` replaces the tool-call arguments)

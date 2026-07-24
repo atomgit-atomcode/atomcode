@@ -58,7 +58,10 @@ impl Tool for WriteFileTool {
         let path = resolve_path(&a.file_path, &ctx.working_dir);
 
         // Capture pre-existing line count for an overwrite diff message.
-        let old_lines = tokio::fs::read_to_string(&path).await.ok().map(|s| s.lines().count());
+        let old_lines = tokio::fs::read_to_string(&path)
+            .await
+            .ok()
+            .map(|s| s.lines().count());
 
         if let Some(parent) = path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -81,8 +84,9 @@ impl Tool for WriteFileTool {
             Some(old) => {
                 let diff = new_lines as i64 - old as i64;
                 let sign = if diff >= 0 { "+" } else { "" };
-                let mut m =
-                    format!("Overwrote {disp} (was {old} lines, now {new_lines} lines, {sign}{diff})");
+                let mut m = format!(
+                    "Overwrote {disp} (was {old} lines, now {new_lines} lines, {sign}{diff})"
+                );
                 // Warn on a large shrink — the model may have dropped content.
                 if old > 20 && new_lines < old / 2 {
                     m.push_str(&format!(
@@ -105,14 +109,22 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        }
     }
 
     #[tokio::test]
     async fn creates_new_file_and_parents() {
         let d = tempfile::tempdir().unwrap();
         let r = WriteFileTool
-            .execute(r#"{"file_path":"nested/dir/a.txt","content":"hello\nworld\n"}"#, &ctx(d.path()))
+            .execute(
+                r#"{"file_path":"nested/dir/a.txt","content":"hello\nworld\n"}"#,
+                &ctx(d.path()),
+            )
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.starts_with("Created"), "{}", r.content);
@@ -125,10 +137,17 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "1\n2\n3\n").unwrap();
         let r = WriteFileTool
-            .execute(r#"{"file_path":"a.txt","content":"1\n2\n3\n4\n5\n"}"#, &ctx(d.path()))
+            .execute(
+                r#"{"file_path":"a.txt","content":"1\n2\n3\n4\n5\n"}"#,
+                &ctx(d.path()),
+            )
             .await;
         assert!(r.content.contains("Overwrote"), "{}", r.content);
-        assert!(r.content.contains("was 3 lines, now 5 lines, +2"), "{}", r.content);
+        assert!(
+            r.content.contains("was 3 lines, now 5 lines, +2"),
+            "{}",
+            r.content
+        );
     }
 
     #[tokio::test]
@@ -136,7 +155,12 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let big: String = (0..100).map(|i| format!("line {i}\n")).collect();
         std::fs::write(d.path().join("a.txt"), big).unwrap();
-        let r = WriteFileTool.execute(r#"{"file_path":"a.txt","content":"tiny\n"}"#, &ctx(d.path())).await;
+        let r = WriteFileTool
+            .execute(
+                r#"{"file_path":"a.txt","content":"tiny\n"}"#,
+                &ctx(d.path()),
+            )
+            .await;
         assert!(r.content.contains("WARNING: file shrank"), "{}", r.content);
     }
 

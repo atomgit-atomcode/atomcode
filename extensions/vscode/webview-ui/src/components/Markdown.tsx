@@ -4,6 +4,7 @@ import DOMPurify from 'dompurify';
 import { postMessage } from '../vscode';
 import { escapeHtml, renderCodeBlockHtml } from './codeBlockRendering';
 import { prepareMarkdownForRender } from './streamingMarkdown';
+import { highlightHtml } from '../utils/search';
 import { useT } from '../i18n';
 
 marked.setOptions({
@@ -14,6 +15,7 @@ marked.setOptions({
 interface MarkdownProps {
   content: string;
   streaming?: boolean;
+  searchQuery?: string;
 }
 
 export function markdownToHtml(
@@ -32,7 +34,7 @@ export function markdownToHtml(
   return marked.parse(source, { renderer }) as string;
 }
 
-export function Markdown({ content, streaming = false }: MarkdownProps) {
+export function Markdown({ content, streaming = false, searchQuery }: MarkdownProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const t = useT();
 
@@ -68,8 +70,11 @@ export function Markdown({ content, streaming = false }: MarkdownProps) {
 
   const html = useMemo(() => {
     const raw = markdownToHtml(content, streaming, { copy: t('assistant.copy') });
-    return DOMPurify.sanitize(raw);
-  }, [content, streaming, t]);
+    const highlighted = searchQuery && searchQuery.trim()
+      ? highlightHtml(raw, searchQuery)
+      : raw;
+    return DOMPurify.sanitize(highlighted);
+  }, [content, streaming, t, searchQuery]);
 
   return (
     <div ref={containerRef} className="markdown-root" dangerouslySetInnerHTML={{ __html: html }} />

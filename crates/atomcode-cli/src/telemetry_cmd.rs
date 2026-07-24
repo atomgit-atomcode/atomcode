@@ -50,9 +50,7 @@ pub fn status(atomcode_dir: &std::path::Path, cfg: &TelemetryConfig) -> Result<(
     // Enrich with persistent health counters if available.
     let health_path = atomcode_dir.join("telemetry/health.json");
     if let Ok(json) = std::fs::read_to_string(&health_path) {
-        if let Ok(h) =
-            serde_json::from_str::<atomcode_telemetry::CountersSnapshot>(&json)
-        {
+        if let Ok(h) = serde_json::from_str::<atomcode_telemetry::CountersSnapshot>(&json) {
             let last_post = if h.last_post_unix_ms == 0 {
                 "never".to_string()
             } else {

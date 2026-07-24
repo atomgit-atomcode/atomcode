@@ -1,15 +1,16 @@
 // crates/atomcode-tuix/src/state.rs
 
-/// Execution mode (unified). Alias of the shared core enum so TUI, daemon,
+/// Execution mode (unified). Alias of the shared coding runtime enum so TUI, daemon,
 /// webui share one type. Build = interactive approval; Auto = auto-approve all
 /// (bypass); Plan = read-only. Cycled by Tab / Shift+Tab.
-pub use atomcode_core::agent::Mode as AgentMode;
+pub use atomcode_coding::RuntimeMode as AgentMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiPhase {
     Idle,
     Streaming,
     Approval,
+    UserInput,
     Suspended,
 }
 
@@ -38,6 +39,7 @@ pub struct ApprovalPanel {
     pub detail: String,
     pub options: Vec<ApprovalOption>,
     pub selected: usize,
+    pub cache_key: String,
 }
 
 impl ApprovalPanel {
@@ -64,6 +66,496 @@ impl ApprovalPanel {
     }
 }
 
+/// The active `request_user_input` prompt, shown as a footer panel while
+/// `UiPhase::UserInput`. `None` when no interactive question is pending.
+/// Mirrors `ApprovalPanel`: it replaces the input box and the user answers with
+/// arrow keys / space / Enter (single/multiple) or by typing (text).
+#[derive(Debug, Clone)]
+pub struct UserInputPanel {
+    /// Kernel round-trip id — echoed back in `AgentCommand::Respond { id, .. }`.
+    pub request_id: u64,
+    pub header: String,
+    pub question: String,
+    pub mode: atomcode_capabilities::tools::request_user_input::UserInputMode,
+    /// Concrete options (single/multiple): label + optional model-provided
+    /// description (rendered as a faint second line). Empty for text mode.
+    /// Does NOT include the always-appended "Other" free-text option — that is
+    /// synthesized at index `options.len()`.
+    pub options: Vec<(String, Option<String>)>,
+    /// Highlighted row (single/multiple). Ranges over `0..options.len()`
+    /// (concrete options) and `options.len()` (the always-appended "Other"
+    /// free-text row). There is NO separate submit row. See
+    /// [`UserInputPanel::is_other_row`].
+    pub cursor: usize,
+    /// Per-row checked flags (multiple mode only). Length `options.len() + 1`:
+    /// one slot per concrete option PLUS a trailing slot for the "Other" row.
+    pub checked: Vec<bool>,
+    /// Free-form buffer (text mode only) — the standalone `text` mode's input.
+    pub text: String,
+    /// Free-text buffer for the always-appended "Other" row in single/multiple
+    /// mode. Distinct from `text` (which is the standalone text-mode input).
+    pub custom_text: String,
+    /// Whether the "Other" free-text row is offered (mirrors `UserInputRequest.custom`).
+    /// When false, the Other row does not exist — indices below account for its absence.
+    pub custom: bool,
+}
+
+impl UserInputPanel {
+    pub fn new(
+        request_id: u64,
+        r: &atomcode_capabilities::tools::request_user_input::UserInputRequest,
+    ) -> Self {
+        let options: Vec<(String, Option<String>)> = r
+            .options
+            .iter()
+            .map(|o| (o.label.clone(), o.description.clone()))
+            .collect();
+        // One checkbox slot per concrete option PLUS the trailing "Other" row —
+        // but only when custom answers are offered.
+        let checked = vec![false; options.len() + r.custom as usize];
+        Self {
+            request_id,
+            header: r.header.clone(),
+            question: r.question.clone(),
+            mode: r.mode.clone(),
+            options,
+            cursor: 0,
+            checked,
+            text: String::new(),
+            custom_text: String::new(),
+            custom: r.custom,
+        }
+    }
+    /// Index of the always-appended "Other" free-text row (`options.len()`).
+    pub fn other_index(&self) -> usize {
+        self.options.len()
+    }
+    /// Index of the Submit row (multiple mode only). After the concrete options,
+    /// plus the "Other" row when `custom` is on. `None` for single mode.
+    pub fn submit_index(&self) -> Option<usize> {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        if matches!(self.mode, UserInputMode::Multiple) {
+            Some(self.options.len() + self.custom as usize)
+        } else {
+            None
+        }
+    }
+    /// Last navigable cursor index.
+    /// - Multiple: the Submit row.
+    /// - Single/text: the "Other" row when `custom`, else the last concrete option.
+    pub(crate) fn last_row(&self) -> usize {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        match self.mode {
+            UserInputMode::Multiple => self.submit_index().unwrap(),
+            _ => {
+                if self.custom {
+                    self.other_index()
+                } else {
+                    self.options.len().saturating_sub(1)
+                }
+            }
+        }
+    }
+    /// Whether `cursor` is on the always-appended "Other" free-text row.
+    pub fn is_other_row(&self) -> bool {
+        self.custom && self.cursor == self.other_index()
+    }
+    /// Whether `cursor` is on the Submit row (multiple mode only).
+    pub fn is_submit_row(&self) -> bool {
+        self.submit_index().is_some_and(|i| self.cursor == i)
+    }
+    /// Back-compat alias for the "Other" row (formerly `✎ 自己输入…`).
+    pub fn is_custom_row(&self) -> bool {
+        self.is_other_row()
+    }
+    pub fn move_up(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+    pub fn move_down(&mut self) {
+        if self.cursor < self.last_row() {
+            self.cursor += 1;
+        }
+    }
+    /// Select/toggle the option under the cursor. Single mode is exclusive:
+    /// the cursor IS the radio selection, so this only clears the custom text
+    /// when landing on a concrete option. Multiple mode toggles the row's
+    /// checkbox (including the "Other" row).
+    pub fn select_current_option(&mut self) {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
+        match self.mode {
+            Single => {
+                // Single: the cursor row IS the selection (radio). Choosing a
+                // concrete option supersedes any typed custom text.
+                if self.cursor < self.options.len() {
+                    self.custom_text.clear();
+                }
+            }
+            Multiple => {
+                if let Some(c) = self.checked.get_mut(self.cursor) {
+                    *c = !*c;
+                }
+            }
+            Text => {}
+        }
+    }
+    /// Toggle the highlighted row (multiple-mode Space / number convenience).
+    /// In single mode this is a no-op beyond clearing custom text on a concrete
+    /// option (the cursor is the radio).
+    pub fn toggle(&mut self) {
+        self.select_current_option();
+    }
+    /// Toggle a specific row by index (multiple mode). Single mode moves the
+    /// cursor to it instead (the cursor is the radio) — handled by the caller.
+    pub fn toggle_index(&mut self, i: usize) {
+        if let Some(c) = self.checked.get_mut(i) {
+            *c = !*c;
+        }
+    }
+    /// Typed characters edit the "Other" custom-text buffer. In single mode
+    /// this supersedes any concrete-option radio selection (the cursor should
+    /// already be on the "Other" row). Inclusion of the custom answer is derived
+    /// from `custom_text.trim()` being non-empty — no separate checkbox state.
+    pub fn push_custom(&mut self, c: char) {
+        self.custom_text.push(c);
+    }
+    /// Backspace on the "Other" row.
+    pub fn pop_custom(&mut self) {
+        self.custom_text.pop();
+    }
+    /// The chosen concrete-option labels for MULTIPLE mode (all checked
+    /// concrete rows; the "Other" row is handled separately via `custom_text`).
+    /// For single mode this reads the cursor as the radio.
+    pub fn chosen(&self) -> Vec<String> {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
+        match self.mode {
+            Single => {
+                // Cursor-as-radio: a concrete option row → that label.
+                if self.cursor < self.options.len() {
+                    vec![self.options[self.cursor].0.clone()]
+                } else {
+                    vec![]
+                }
+            }
+            Multiple => self
+                .options
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| self.checked.get(*i).copied().unwrap_or(false))
+                .map(|(_, (l, _))| l.clone())
+                .collect(),
+            Text => vec![],
+        }
+    }
+    /// Build the `UserInputResponse` for the current panel state.
+    /// - single: the cursor row → its label, OR (cursor on "Other")
+    ///   `custom_text.trim()` when non-empty; `None` when nothing to submit.
+    /// - multiple: all checked concrete labels, PLUS `custom_text.trim()` when
+    ///   non-empty (inclusion is text-derived, NOT from `checked[other_index]`);
+    ///   `None` when nothing selected.
+    /// Text mode is handled separately by the caller.
+    pub fn build_response(
+        &self,
+    ) -> Option<atomcode_capabilities::tools::request_user_input::UserInputResponse> {
+        use atomcode_capabilities::tools::request_user_input::{
+            UserInputMode::*, UserInputResponse,
+        };
+        match self.mode {
+            Single => {
+                let selected = if self.cursor < self.options.len() {
+                    vec![self.options[self.cursor].0.clone()]
+                } else {
+                    let custom = self.custom_text.trim();
+                    if custom.is_empty() {
+                        return None; // cursor on "Other" with no text → no-op
+                    }
+                    vec![custom.to_string()]
+                };
+                Some(UserInputResponse {
+                    declined: false,
+                    selected,
+                    text: None,
+                })
+            }
+            Multiple => {
+                let mut selected = self.chosen();
+                // Inclusion of the custom answer is derived from the text itself,
+                // NOT from a separate checked flag — so Enter on the Other row
+                // (which is a no-op) can never desync the checkbox from the text.
+                let custom = self.custom_text.trim();
+                if !custom.is_empty() {
+                    selected.push(custom.to_string());
+                }
+                if selected.is_empty() {
+                    return None; // nothing chosen → Submit is a no-op
+                }
+                Some(UserInputResponse {
+                    declined: false,
+                    selected,
+                    text: None,
+                })
+            }
+            Text => Some(UserInputResponse {
+                declined: false,
+                selected: vec![],
+                text: Some(self.text.clone()),
+            }),
+        }
+    }
+
+    /// For **single** mode only: Enter confirms the cursor row. On a concrete
+    /// option → `{selected:[label]}`; on the "Other" row → `{selected:[custom]}`
+    /// when non-empty, else `None` (no-op). Multiple / text return `None`
+    /// (their Enter path is handled differently: multiple Enter on the Submit row
+    /// calls `build_response()` directly; Enter on option/Other rows toggles).
+    pub fn try_immediate_response(
+        &self,
+    ) -> Option<atomcode_capabilities::tools::request_user_input::UserInputResponse> {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        if !matches!(self.mode, UserInputMode::Single) {
+            return None;
+        }
+        self.build_response()
+    }
+}
+
+/// A batch of 1..=4 questions answered in one interaction. Wraps per-question
+/// `UserInputPanel`s; `request_id` lives here (the panels' own `request_id` is unused
+/// in a batch). `current` ranges `0..questions.len()` (question panels) plus
+/// `questions.len()` (the Submit stop that `Tab` cycles to).
+pub struct UserInputBatch {
+    pub request_id: u64,
+    pub questions: Vec<UserInputPanel>,
+    pub current: usize,
+}
+
+impl UserInputBatch {
+    pub fn new(
+        request_id: u64,
+        reqs: &[atomcode_capabilities::tools::request_user_input::UserInputRequest],
+    ) -> Self {
+        let questions = reqs
+            .iter()
+            .map(|r| UserInputPanel::new(request_id, r))
+            .collect();
+        Self {
+            request_id,
+            questions,
+            current: 0,
+        }
+    }
+
+    /// More than one question → render the navigator + Tab/Submit chrome.
+    pub fn is_multi(&self) -> bool {
+        self.questions.len() > 1
+    }
+
+    /// The Submit stop index (one past the last question).
+    pub fn submit_stop(&self) -> usize {
+        self.questions.len()
+    }
+
+    pub fn on_submit_stop(&self) -> bool {
+        self.current == self.submit_stop()
+    }
+
+    /// `Tab`: next question, wrapping through the Submit stop back to the first.
+    pub fn next_question(&mut self) {
+        self.current = if self.current >= self.submit_stop() {
+            0
+        } else {
+            self.current + 1
+        };
+    }
+
+    /// `Shift+Tab`: previous question, wrapping to the Submit stop.
+    pub fn prev_question(&mut self) {
+        self.current = if self.current == 0 {
+            self.submit_stop()
+        } else {
+            self.current - 1
+        };
+    }
+
+    /// Whether question `i` has real content (used for the ✓/○ navigator marker).
+    pub fn is_answered(&self, i: usize) -> bool {
+        self.questions.get(i).is_some_and(Self::panel_answered)
+    }
+
+    /// One response per question, in order. A question with no real content becomes
+    /// `declined` (partial-submit semantics).
+    pub fn build_batch_response(
+        &self,
+    ) -> Vec<atomcode_capabilities::tools::request_user_input::UserInputResponse> {
+        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
+        self.questions
+            .iter()
+            .map(|p| {
+                if Self::panel_answered(p) {
+                    p.build_response()
+                        .unwrap_or_else(UserInputResponse::declined)
+                } else {
+                    UserInputResponse::declined()
+                }
+            })
+            .collect()
+    }
+
+    /// A panel counts as answered when it builds a response with a non-empty selection
+    /// or non-blank text. (Text mode's `build_response` is always `Some`, possibly empty.)
+    fn panel_answered(p: &UserInputPanel) -> bool {
+        match p.build_response() {
+            Some(r) => {
+                !r.selected.is_empty()
+                    || r.text
+                        .as_deref()
+                        .map(|t| !t.trim().is_empty())
+                        .unwrap_or(false)
+            }
+            None => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod user_input_custom_tests {
+    use super::*;
+    use atomcode_capabilities::tools::request_user_input::{
+        UserInputMode, UserInputOption, UserInputRequest,
+    };
+
+    fn req(mode: UserInputMode, custom: bool) -> UserInputRequest {
+        UserInputRequest {
+            header: "H".into(),
+            question: "Q?".into(),
+            mode,
+            options: vec![
+                UserInputOption {
+                    label: "A".into(),
+                    description: None,
+                },
+                UserInputOption {
+                    label: "B".into(),
+                    description: None,
+                },
+            ],
+            custom,
+        }
+    }
+
+    #[test]
+    fn single_last_row_gates_on_custom() {
+        let with = UserInputPanel::new(1, &req(UserInputMode::Single, true));
+        assert_eq!(
+            with.last_row(),
+            2,
+            "single, custom → Other row is last (idx 2)"
+        );
+        let without = UserInputPanel::new(1, &req(UserInputMode::Single, false));
+        assert_eq!(
+            without.last_row(),
+            1,
+            "single, no custom → last option (idx 1)"
+        );
+    }
+
+    #[test]
+    fn multiple_submit_index_and_checked_gate_on_custom() {
+        let with = UserInputPanel::new(1, &req(UserInputMode::Multiple, true));
+        assert_eq!(with.submit_index(), Some(3), "custom → other@2, submit@3");
+        assert_eq!(
+            with.checked.len(),
+            3,
+            "custom → Other checkbox slot present"
+        );
+        let without = UserInputPanel::new(1, &req(UserInputMode::Multiple, false));
+        assert_eq!(
+            without.submit_index(),
+            Some(2),
+            "no custom → submit right after options@2"
+        );
+        assert_eq!(
+            without.checked.len(),
+            2,
+            "no custom → no Other checkbox slot"
+        );
+    }
+}
+
+#[cfg(test)]
+mod user_input_batch_tests {
+    use super::*;
+    use atomcode_capabilities::tools::request_user_input::{
+        UserInputMode, UserInputOption, UserInputRequest,
+    };
+
+    fn text_q(h: &str) -> UserInputRequest {
+        UserInputRequest {
+            header: h.into(),
+            question: "?".into(),
+            mode: UserInputMode::Text,
+            options: vec![],
+            custom: true,
+        }
+    }
+    fn single_q(h: &str) -> UserInputRequest {
+        UserInputRequest {
+            header: h.into(),
+            question: "?".into(),
+            mode: UserInputMode::Single,
+            options: vec![UserInputOption {
+                label: "x".into(),
+                description: None,
+            }],
+            custom: true,
+        }
+    }
+
+    #[test]
+    fn tab_wraps_through_submit_stop() {
+        let mut b = UserInputBatch::new(7, &[text_q("a"), text_q("b")]);
+        assert_eq!(b.current, 0);
+        assert_eq!(b.submit_stop(), 2);
+        b.next_question();
+        assert_eq!(b.current, 1);
+        b.next_question();
+        assert_eq!(b.current, 2); // submit stop
+        assert!(b.on_submit_stop());
+        b.next_question();
+        assert_eq!(b.current, 0); // wrap
+        b.prev_question();
+        assert_eq!(b.current, 2); // wrap back to submit stop
+    }
+
+    #[test]
+    fn build_batch_response_declines_untouched_questions() {
+        let mut b = UserInputBatch::new(1, &[single_q("a"), text_q("b")]);
+        // Answer q0 by selecting the concrete option under its cursor (cursor 0).
+        b.questions[0].select_current_option();
+        let resps = b.build_batch_response();
+        assert_eq!(resps.len(), 2);
+        assert!(!resps[0].declined, "answered question 0");
+        assert_eq!(resps[0].selected, vec!["x".to_string()]);
+        assert!(resps[1].declined, "untouched text question 1 → declined");
+    }
+
+    #[test]
+    fn is_answered_tracks_content() {
+        let mut b = UserInputBatch::new(1, &[text_q("a")]);
+        assert!(!b.is_answered(0), "empty text → not answered");
+        b.questions[0].text.push_str("hi");
+        assert!(b.is_answered(0));
+    }
+
+    #[test]
+    fn single_question_batch_is_not_multi() {
+        let b = UserInputBatch::new(1, &[text_q("only")]);
+        assert!(!b.is_multi());
+        assert_eq!(b.submit_stop(), 1);
+    }
+}
+
 /// How long the model may go silent before the spinner surfaces the "slow
 /// response · esc to cancel" hint. A mid-stream drop fails cleanly at the
 /// provider's idle watchdog (~120s), but that is silent dead-air; this reassures
@@ -79,7 +571,10 @@ pub const STREAM_STALL_HINT: std::time::Duration = std::time::Duration::from_sec
 /// local tool (a 30s build) emits no events but is not a network stall, so warning
 /// there would be a false positive. `None` elapsed (no activity stamped yet) never
 /// warns. Pure (no clock) so the threshold logic is unit-testable.
-pub fn stream_stalled_for(awaiting_model: bool, since_activity: Option<std::time::Duration>) -> bool {
+pub fn stream_stalled_for(
+    awaiting_model: bool,
+    since_activity: Option<std::time::Duration>,
+) -> bool {
     awaiting_model && since_activity.is_some_and(|d| d >= STREAM_STALL_HINT)
 }
 
@@ -142,7 +637,7 @@ pub const DONE_LABELS: &[&str] = &[
 /// Snapshot of the agent's context budget, cached from `AgentEvent::ContextStats`
 /// and surfaced by the `/context` command.
 ///
-/// Merged across two emission paths: the narrow TurnEvent-forwarded one
+/// Merged across runtime emission paths
 /// (system/sent/total_messages) and the rich one from `handle_send_message`
 /// (tool_defs / cold_zone / ctx_window / ctx_name). Each path leaves the
 /// fields it doesn't know at 0 / empty, so we merge by keeping non-zero
@@ -200,23 +695,47 @@ pub struct UiState {
     /// `explore#4 · grep unwrap`), set from marker-prefixed progress chunks and
     /// spliced into the spinner label in-place so a multi-minute fan-out isn't a
     /// silent `Pondering…`. `None` when no subtask activity is current; cleared
-    /// when the `task` tool finishes and at every turn end/cancel/error.
+    /// when the `task` tool finishes and at every authoritative turn terminal.
     pub subagent_activity: Option<String>,
     /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
     /// When false, `tick_spinner` and the spinner-label ellipsis fall
     /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
     /// Windows legacy conhost) don't show `□` tofu.
     pub unicode_symbols: bool,
+    /// Mirrors `TerminalCaps::colors` — frozen at construction.
+    pub colors: bool,
     pub total_tokens: usize,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub cached_tokens: usize,
+    /// Read-only command report shown in the footer directly below the input
+    /// box while a turn is streaming. `/usage` and `/cost` use this instead of
+    /// appending their multi-line report to conversation scrollback. Cleared
+    /// explicitly by Esc; the Esc press is consumed before turn cancellation.
+    pub footer_command_output: Option<String>,
+    /// Live `/usage` panel state backing [`footer_command_output`] while a turn
+    /// is streaming. The interactive modal can't install mid-turn (live token
+    /// redraws own the footer), so tab switching re-renders the active tab from
+    /// this into `footer_command_output`. `Some` only for streaming `/usage`;
+    /// `/cost` and idle `/usage` leave it `None`. Cleared wherever
+    /// `footer_command_output` is.
+    pub footer_usage: Option<crate::modals::usage::UsageModal>,
     /// Per-turn token tallies (reset at turn end). Feed the footer's billable
     /// token count + cache-hit annotation via [`turn_token_summary`]; kept
     /// separate from the session-cumulative `*_tokens` above.
     pub turn_prompt_tokens: usize,
     pub turn_completion_tokens: usize,
     pub turn_cached_tokens: usize,
+    /// Chars of model OUTPUT streamed this turn — visible text + reasoning +
+    /// tool-call arguments — accumulated live from the delta events (unlike
+    /// `turn_completion_tokens`, which the provider only reports once per round,
+    /// so it can't tick during a long single generation). Drives the spinner's
+    /// `↑ N tokens` activity indicator (via [`turn_output_token_estimate`]) so a
+    /// multi-minute turn visibly proves it's alive rather than looking hung.
+    /// Counting tool-call args is the point: a turn that spends minutes emitting
+    /// one huge tool call (e.g. a giant script) would otherwise show no motion.
+    /// Reset at turn start/end.
+    pub turn_output_chars: usize,
     /// Whether the CURRENT turn has rendered any visible assistant text (a
     /// non-empty post-think-strip `TextDelta`). Reset at turn start/end. Read on
     /// `TurnComplete` to detect a turn that finished with NO visible answer —
@@ -235,9 +754,19 @@ pub struct UiState {
     /// Cleared lazily: the first delta after [`UiState::response_finalized`]
     /// wipes it, so between turns it still holds the last reply for `/copy`.
     pub last_assistant_response: String,
-    /// Set on TurnComplete / TurnCancelled / Error to seal
+    /// Set on an authoritative turn terminal to seal
     /// `last_assistant_response`; the next turn's first delta clears it.
     pub response_finalized: bool,
+    /// The failure reason (provider `Error` / `RateLimited`) captured for the
+    /// CURRENT turn, FOLDED into the errored `✗ 已中断：<reason>` summary. The
+    /// standalone red error line is rendered mid-turn (phase `Streaming`, spinner
+    /// active) and can be clobbered by the physical Streaming→Idle redraw on a real
+    /// terminal; the summary renders cleanly at Idle, so folding the reason into it
+    /// guarantees the user always sees WHY the turn stopped. Set by the Error /
+    /// RateLimited handlers; `take()`n when the errored summary renders, and reset
+    /// to `None` when a CLEAN summary renders (`turn_summary_label`) so a reason
+    /// from an error path that produced no summary can never fold into a later turn.
+    pub last_turn_error: Option<String>,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
     /// While waiting on a tool approval, holds the `"Running {Tool}"`
@@ -252,10 +781,18 @@ pub struct UiState {
     /// tool approval is pending. Set in the `ApprovalNeeded` handler, cleared on
     /// resolve / turn-end / session reset.
     pub approval_panel: Option<ApprovalPanel>,
+    /// The active footer `request_user_input` panel. `None` when no interactive
+    /// question is pending. Set in the `Request` handler, cleared on resolve /
+    /// turn-end / session reset. Mirrors `approval_panel`.
+    pub user_input_panel: Option<UserInputPanel>,
+    /// A multi-question `request_user_input` batch is pending (mutually exclusive with
+    /// `user_input_panel`). Set in the `Request` handler when the payload carries a
+    /// `questions` array; cleared alongside `user_input_panel` on resolve.
+    pub user_input_batch: Option<UserInputBatch>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
     /// When the current turn started. Set by on_submit, cleared on
-    /// turn-complete / turn-cancelled / error. Used to surface the
+    /// turn-complete / turn-cancelled. Used to surface the
     /// total wall-clock duration in the TurnComplete event payload.
     pub turn_started_at: Option<std::time::Instant>,
     /// When the current phase began. Reset on every phase transition
@@ -263,7 +800,7 @@ pub struct UiState {
     /// on_tool_call_started) so the spinner shows time spent on the
     /// CURRENT operation — `Pondering… 12s`, `Running ReadFile… 4s`
     /// — instead of accumulating over the whole turn. Cleared on
-    /// turn-complete / turn-cancelled / error so the idle spinner
+    /// turn-complete / turn-cancelled so the idle spinner
     /// (rare) doesn't tick a stale duration.
     pub phase_started_at: Option<std::time::Instant>,
     /// When the last stream activity (any foreground agent event) was observed.
@@ -276,9 +813,9 @@ pub struct UiState {
     /// `AgentEvent::ContextStats` — `/context` renders this. `None`
     /// before the first turn completes.
     pub last_context: Option<ContextSnapshot>,
-    /// Temporary occupancy projected from a committed native compaction. The
-    /// bridge's legacy `/context` refresh still holds pre-compaction usage, so
-    /// its sent-token field is ignored until the next real TokenUsage arrives.
+    /// Temporary occupancy projected from a committed native compaction. A context
+    /// refresh can still hold pre-compaction usage, so its sent-token field is
+    /// ignored until the next real TokenUsage arrives.
     pub post_compaction_used_tokens: Option<usize>,
     /// Verbatim text of the message that is currently running. Set
     /// on every submit, cleared on turn-complete. When the user hits
@@ -287,6 +824,14 @@ pub struct UiState {
     /// can be edited + resent without re-typing. `None` between
     /// turns and after any successful completion.
     pub last_submitted_message: Option<String>,
+    /// Authoritative pasted `(images, markers)` of the last submitted turn,
+    /// captured at submit BEFORE typed-path attachment so the image↔marker
+    /// pairing stays exact (never re-derived from text, which can misorder).
+    /// Re-attached on `VisionPreprocessFailed` so the user can retry without
+    /// re-pasting. Overwritten each image-carrying submit; only read on
+    /// failure. Parallel vecs (aligned by index).
+    pub last_submitted_pasted_images: Vec<atomcode_core::conversation::message::ImagePart>,
+    pub last_submitted_pasted_markers: Vec<usize>,
     /// `/context` dispatched a `RefreshContextStats` command and is
     /// waiting for the resulting rich ContextStats event to render the
     /// report. `Some(show_prompt)` until the next rich emission lands;
@@ -353,7 +898,7 @@ pub struct UiState {
     /// `AgentEvent::SubAgentDispatchStart` so the UI can look up a
     /// child's display path from the `index` field on Started/Done/
     /// Failed events. Cleared on `on_sub_agent_dispatch_end`.
-    pub sub_agent_tasks: Vec<atomcode_core::agent::SubAgentTaskInfo>,
+    pub sub_agent_tasks: Vec<crate::event_loop::ui_event::SubAgentTaskInfo>,
     /// Number of failed sub-agents in the current dispatch — tracked
     /// separately from `sub_agent_done` so the aggregate summary can
     /// distinguish "6/7 ok · 1 fail" from "7/7 ok". Reset on each new
@@ -446,9 +991,9 @@ pub struct PendingSeparator {
     /// Whether the turn ran inside an active `/loop` (decides `⚡ loop round N`
     /// vs the normal summary when flushed mid-loop).
     pub was_loop_round: bool,
-    /// Whether the turn ended with `TurnStopReason::Error`. Lets the deferred
-    /// flush render the ✗ "stopped" summary instead of a celebratory ✓ under
-    /// the red Error line (preserves the pre-/goal-merge behaviour).
+    /// Whether the turn ended abnormally (error, cancellation, or a safety
+    /// limit). Lets the deferred flush render the ✗ "stopped" summary instead
+    /// of a celebratory ✓ for an incomplete turn.
     pub errored: bool,
     /// Cache-hit ratio over the turn's input, if the provider reported cached
     /// tokens. `None` ⇒ no annotation. Rendered as `· N% cached`.
@@ -490,6 +1035,11 @@ impl UiState {
     /// Production code calls this from `App::new` with the value the
     /// terminal-capability probe produced; tests stick with `new()`.
     pub fn with_unicode(unicode_symbols: bool) -> Self {
+        Self::with_caps(unicode_symbols, true)
+    }
+
+    /// Construct a `UiState` with explicit Unicode and color capabilities.
+    pub fn with_caps(unicode_symbols: bool, colors: bool) -> Self {
         Self {
             phase: UiPhase::Idle,
             agent_mode: AgentMode::default(),
@@ -500,20 +1050,27 @@ impl UiState {
             compaction_forced_streaming: false,
             subagent_activity: None,
             unicode_symbols,
+            colors,
             total_tokens: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
             cached_tokens: 0,
+            footer_command_output: None,
+            footer_usage: None,
             turn_prompt_tokens: 0,
             turn_completion_tokens: 0,
             turn_cached_tokens: 0,
+            turn_output_chars: 0,
             turn_rendered_visible_text: false,
             turn_saw_reasoning: false,
             last_assistant_response: String::new(),
             response_finalized: false,
+            last_turn_error: None,
             prior_phase: None,
             prior_spinner_label: None,
             approval_panel: None,
+            user_input_panel: None,
+            user_input_batch: None,
             thinking_idx: 0,
             turn_started_at: None,
             phase_started_at: None,
@@ -521,6 +1078,8 @@ impl UiState {
             last_context: None,
             post_compaction_used_tokens: None,
             last_submitted_message: None,
+            last_submitted_pasted_images: Vec::new(),
+            last_submitted_pasted_markers: Vec::new(),
             pending_context_render: None,
             pending_images: Vec::new(),
             pending_image_hashes: Vec::new(),
@@ -563,8 +1122,7 @@ impl UiState {
     }
 
     /// Merge one `AgentEvent::ContextStats` emission into the cached
-    /// snapshot. The agent side fires two emissions per turn: one narrow
-    /// (from `TurnRunner`) and one rich (from `handle_send_message`).
+    /// snapshot. The runtime may emit a narrow update followed by a rich update.
     /// Each leaves the fields it doesn't know at 0 / empty — we keep the
     /// most-recent non-zero value per field so either order works.
     pub fn on_context_stats(
@@ -585,7 +1143,7 @@ impl UiState {
         if is_rich {
             snap.system_tokens = system_tokens;
             // A rich emission with `sent_tokens == 0` means "no completed turn yet
-            // this engine session" (the v2 bridge's `last_usage` is None), NOT a
+            // this runtime generation" (`last_usage` is None), NOT a
             // genuine zero occupancy — `emit_context_stats` never reports a real 0.
             // Preserve a value restored from the persisted session on resume so
             // `/context`'s `RefreshContextStats` round-trip can't re-zero the gauge
@@ -710,6 +1268,15 @@ impl UiState {
             .or_else(|| self.turn_elapsed())
     }
 
+    /// Rough token estimate of this turn's streamed output, for the spinner's
+    /// `↑ N tokens` activity indicator. ~4 chars/token (the usual English
+    /// rule of thumb; only an at-a-glance liveness signal, not billing — the
+    /// authoritative per-turn count comes from `turn_completion_tokens` at
+    /// round end). Zero until the model starts emitting.
+    pub fn turn_output_token_estimate(&self) -> usize {
+        self.turn_output_chars / 4
+    }
+
     /// Stamp "the stream is alive" — called on submit and on every received
     /// foreground agent event. Resets the stall clock read by [`Self::stream_stalled`].
     pub fn note_stream_activity(&mut self) {
@@ -723,7 +1290,10 @@ impl UiState {
     pub fn stream_stalled(&self) -> bool {
         let awaiting_model = matches!(self.phase, UiPhase::Streaming)
             && THINKING_LABELS.contains(&self.spinner_label.as_str());
-        stream_stalled_for(awaiting_model, self.last_stream_activity.map(|t| t.elapsed()))
+        stream_stalled_for(
+            awaiting_model,
+            self.last_stream_activity.map(|t| t.elapsed()),
+        )
     }
 
     /// Whether a running compaction's summary has stalled past
@@ -731,7 +1301,10 @@ impl UiState {
     /// `compacting` instead of a THINKING_LABEL (the spinner shows
     /// "Compacting…", not a thinking label, during a compaction).
     pub fn compaction_stalled(&self) -> bool {
-        stream_stalled_for(self.compacting, self.last_stream_activity.map(|t| t.elapsed()))
+        stream_stalled_for(
+            self.compacting,
+            self.last_stream_activity.map(|t| t.elapsed()),
+        )
     }
 
     fn current_thinking(&self) -> &'static str {
@@ -774,12 +1347,20 @@ impl UiState {
         // blank-turn notice on TurnComplete).
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
+        self.turn_output_chars = 0;
         // Seed the stall clock so the first silent stretch is measured from submit,
         // not a stale stamp from the previous turn (which would flash the warning).
         self.last_stream_activity = Some(now);
         // Belt-and-suspenders: a fresh turn always starts with zero steers, even
         // if the previous turn ended abnormally and never fired on_turn_complete.
         self.steer_pending = 0;
+    }
+
+    /// The runtime rejected the turn before accepting it. Keep the UI idle and
+    /// discard the cancel-only restore stash; the committed text remains
+    /// available through input history.
+    pub(crate) fn on_submit_rejected(&mut self) {
+        self.last_submitted_message = None;
     }
 
     pub fn on_turn_complete(&mut self) {
@@ -795,6 +1376,7 @@ impl UiState {
         self.turn_prompt_tokens = 0;
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
+        self.turn_output_chars = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         // Turn finished normally — no need to offer resubmit of the
@@ -809,7 +1391,13 @@ impl UiState {
         // Safety clear: if a turn ends without resolving an approval (e.g. error
         // path or session switch), ensure the panel is not left stale.
         self.approval_panel = None;
+        self.user_input_panel = None;
+        self.user_input_batch = None;
         self.steer_pending = 0;
+        // The interactive `/usage` tab panel is streaming-only. Drop it (but keep
+        // the rendered text) so its tab keys can't bleed into idle or across into
+        // the next streaming turn; a fresh `/usage` re-arms it.
+        self.footer_usage = None;
     }
 
     pub fn on_turn_cancelled(&mut self) {
@@ -822,11 +1410,17 @@ impl UiState {
         self.turn_prompt_tokens = 0;
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
+        self.turn_output_chars = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
         self.approval_panel = None;
+        self.user_input_panel = None;
+        self.user_input_batch = None;
         self.steer_pending = 0;
+        // Streaming-only `/usage` tab panel — drop it on cancel too (mirrors
+        // on_turn_complete); the rendered text stays until Esc.
+        self.footer_usage = None;
         // The todo panel is per-session, not per-turn: it survives turn
         // termination (mirrors on_turn_complete). Clearing it here nuked the
         // plan, and a "继续" turn only sends incremental todowrite updates that
@@ -834,6 +1428,14 @@ impl UiState {
         // panel could never rebuild — it stayed gone while the model kept
         // executing. Only a session switch / new session / explicit clear drops
         // `active_todos` + `todo_titles`.
+    }
+
+    /// Drop presentation state that belongs to the outgoing session. Unlike a
+    /// normal turn terminal, a session replacement must not keep `/usage` or
+    /// `/cost` from the previous foreground session visible.
+    pub fn on_session_replaced(&mut self) {
+        self.footer_command_output = None;
+        self.footer_usage = None;
     }
 
     /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting
@@ -849,27 +1451,13 @@ impl UiState {
         self.steer_pending = self.steer_pending.saturating_sub(count);
     }
 
+    /// Record a diagnostic error observation without ending the turn locally.
+    ///
+    /// Kernel errors can precede the runtime-owned `TurnFinished` event (for
+    /// example when a safety limit trips). Moving to `Idle` here would let the
+    /// event loop submit type-ahead input into a turn that is still active.
     pub fn on_error(&mut self) {
-        self.phase = UiPhase::Idle;
-        self.spinner_label.clear();
-        self.compacting = false;
-        self.compaction_forced_streaming = false;
-        self.turn_started_at = None;
-        self.phase_started_at = None;
-        self.subagent_activity = None;
-        // Parity with on_turn_complete/on_turn_cancelled: clear the blank-turn
-        // flags so an errored turn can't leak a stale notice into a reused turn.
-        self.turn_rendered_visible_text = false;
-        self.turn_saw_reasoning = false;
-        self.approval_panel = None;
-        self.steer_pending = 0;
-        // The todo panel is per-session, not per-turn: it survives turn
-        // termination (mirrors on_turn_complete). Clearing it here nuked the
-        // plan, and a "继续" turn only sends incremental todowrite updates that
-        // fold against the existing panel (a no-op on an empty base), so the
-        // panel could never rebuild — it stayed gone while the model kept
-        // executing. Only a session switch / new session / explicit clear drops
-        // `active_todos` + `todo_titles`.
+        // The authoritative terminal owns all phase and per-turn cleanup.
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
@@ -910,7 +1498,7 @@ impl UiState {
 
     pub fn on_thinking(&mut self) {
         // A model round is starting. Restore Streaming if we'd fallen back to
-        // Idle: a `/goal` continuation runs SERVER-SIDE (the bridge injects the
+        // Idle: a `/goal` continuation runs inside CodingRuntime (its controller injects the
         // next round, it never flows through the local `on_submit` that normally
         // sets Streaming), so without this the TUI can sit in Idle while the
         // agent keeps looping — and Esc / Ctrl+C, which only reach the cancel
@@ -929,7 +1517,7 @@ impl UiState {
         // displayed time keeps growing across consecutive thinks/tools
         // and ends up showing "Noodling… 1301s" mid-turn.
         //
-        // EXCEPT during a parallel batch: the bridge emits PhaseChange(Thinking)
+        // EXCEPT during a parallel batch: the runtime projection emits PhaseChange(Thinking)
         // after every ToolResult, so in a batch these interleave with the tool
         // events and would restart the clock on each completion — the spinner's
         // elapsed-ms flicker 0→N→0. The batch anchors the clock once
@@ -947,7 +1535,7 @@ impl UiState {
     /// spinner label since `pool.execute_all` blocks the loop.
     pub fn on_sub_agent_dispatch_start(
         &mut self,
-        tasks: Vec<atomcode_core::agent::SubAgentTaskInfo>,
+        tasks: Vec<crate::event_loop::ui_event::SubAgentTaskInfo>,
     ) {
         self.sub_agent_total = tasks.len();
         self.sub_agent_done = 0;
@@ -983,7 +1571,10 @@ impl UiState {
     }
 
     fn refresh_sub_agent_label(&mut self) {
-        self.spinner_label = format!("Sub-agents {}/{}", self.sub_agent_done, self.sub_agent_total);
+        self.spinner_label = format!(
+            "Sub-agents {}/{}",
+            self.sub_agent_done, self.sub_agent_total
+        );
     }
 
     /// End the dispatch — clears descriptors so subsequent thinks/tools
@@ -1032,6 +1623,16 @@ impl UiState {
             // reflects that, not the cumulative wait-then-run time.
             self.phase_started_at = Some(std::time::Instant::now());
         }
+    }
+
+    /// Clear the interactive question panel and return to streaming — the same
+    /// shape as `on_approval_resolved` (the turn resumes once the tool receives
+    /// its answer). No spinner-label stash to restore: unlike approval, the
+    /// `Request` handler does not swap `spinner_label` when the panel opens.
+    pub fn on_user_input_resolved(&mut self) {
+        self.user_input_panel = None;
+        self.user_input_batch = None;
+        self.phase = UiPhase::Streaming;
     }
 
     pub fn on_suspend(&mut self) {
@@ -1098,8 +1699,7 @@ impl UiState {
         //   ASCII   → classic `|/-\` for legacy terminals whose font lacks
         //   the Braille block (notably Windows legacy conhost); those already
         //   run with unicode_symbols = false, so they take this path.
-        const UNICODE_FRAMES: &[&str] =
-            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        const UNICODE_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         const ASCII_FRAMES: &[&str] = &["|", "/", "-", "\\"];
         let frames = if self.unicode_symbols {
             UNICODE_FRAMES
@@ -1170,7 +1770,10 @@ mod tests {
         use std::time::Duration;
         // Awaiting model + silent at/over the threshold → warn (network may be down).
         assert!(stream_stalled_for(true, Some(STREAM_STALL_HINT)));
-        assert!(stream_stalled_for(true, Some(STREAM_STALL_HINT + Duration::from_secs(5))));
+        assert!(stream_stalled_for(
+            true,
+            Some(STREAM_STALL_HINT + Duration::from_secs(5))
+        ));
         // Awaiting model but a chunk arrived recently → no warn (stream is alive).
         assert!(!stream_stalled_for(true, Some(Duration::from_secs(1))));
         // No activity recorded yet (fresh turn) → no warn, so it can't flash on submit.
@@ -1215,13 +1818,16 @@ mod tests {
         // must not fabricate a snapshot (gauge stays empty until the next turn).
         let mut s = UiState::new();
         s.restore_context(0, 0);
-        assert!(s.last_context.is_none(), "must not seed a snapshot from 0/0");
+        assert!(
+            s.last_context.is_none(),
+            "must not seed a snapshot from 0/0"
+        );
     }
 
     #[test]
     fn refresh_with_zero_sent_does_not_clobber_restored_gauge() {
-        // `/context` after resume dispatches RefreshContextStats; the v2 bridge
-        // replies with sent_tokens=0 (last_usage None) but a real window. That
+        // `/context` after resume dispatches RefreshContextStats; the runtime can
+        // reply with sent_tokens=0 (last_usage None) but a real window. That
         // "unknown" 0 must not wipe the value restored from the persisted session.
         let mut s = UiState::new();
         s.restore_context(42_000, 200_000);
@@ -1307,9 +1913,15 @@ mod tests {
         let mut s = UiState::new();
         s.on_submit(); // phase=Streaming, spinner = a THINKING_LABEL
         s.last_stream_activity = Some(std::time::Instant::now() - STREAM_STALL_HINT * 2);
-        assert!(s.stream_stalled(), "silent model stream past threshold must warn");
+        assert!(
+            s.stream_stalled(),
+            "silent model stream past threshold must warn"
+        );
         s.on_tool_call_started("Bash"); // spinner = "Running Bash" — not a thinking label
-        assert!(!s.stream_stalled(), "a slow tool must NOT trip the network warning");
+        assert!(
+            !s.stream_stalled(),
+            "a slow tool must NOT trip the network warning"
+        );
     }
 
     #[test]
@@ -1425,6 +2037,57 @@ mod tests {
         assert_eq!(s.phase, UiPhase::Idle);
     }
 
+    #[test]
+    fn footer_report_survives_turn_terminal_but_not_session_replacement() {
+        let mut s = UiState::new();
+        s.footer_command_output = Some("current session usage".into());
+        s.on_turn_complete();
+        assert!(
+            s.footer_command_output.is_some(),
+            "normal turn completion keeps the report until Esc"
+        );
+
+        s.on_session_replaced();
+        assert!(
+            s.footer_command_output.is_none(),
+            "a new foreground session must not inherit the old report"
+        );
+    }
+
+    fn sample_usage_panel() -> crate::modals::usage::UsageModal {
+        crate::modals::usage::UsageModal::new(crate::modals::usage::UsageData {
+            window: None,
+            plan: None,
+            usage: None,
+            overview: None,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn turn_terminal_drops_live_usage_panel_but_keeps_the_text() {
+        // The interactive `/usage` panel is a streaming-only affordance. When the
+        // turn ends it must degrade to the static footer text (the report stays
+        // visible until Esc), so its tab keys can't leak into — or bleed across
+        // into the next streaming turn from — the idle phase.
+        for terminal in [UiState::on_turn_complete, UiState::on_turn_cancelled] {
+            let mut s = UiState::new();
+            s.footer_command_output = Some("usage report".into());
+            s.footer_usage = Some(sample_usage_panel());
+
+            terminal(&mut s);
+
+            assert!(
+                s.footer_usage.is_none(),
+                "turn end must drop the interactive panel"
+            );
+            assert!(
+                s.footer_command_output.is_some(),
+                "but the rendered report text stays until Esc"
+            );
+        }
+    }
+
     /// Regression for the cross-turn `[Image #N]` ambiguity: the marker
     /// counter must NOT reset when `pending_images` drains on submit —
     /// otherwise turn 1's first paste and turn 2's first paste would
@@ -1446,10 +2109,11 @@ mod tests {
         // Turn 1: simulate paste sites' increment-then-push pattern.
         s.session_image_count += 1;
         let n1 = s.session_image_count;
-        s.pending_images.push(atomcode_core::conversation::message::ImagePart {
-            media_type: "image/png".into(),
-            data: "AAAA".into(),
-        });
+        s.pending_images
+            .push(atomcode_core::conversation::message::ImagePart {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            });
         s.pending_image_hashes.push(0xdead_beef);
         // Submit drains pending_images / hashes (mirrors event_loop logic).
         let _ = std::mem::take(&mut s.pending_images);
@@ -1597,9 +2261,17 @@ mod tests {
             .insert("b1".into(), ActiveToolBatch { call_ids: vec![] });
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_tool_call_streaming("Bash(a)");
-        assert_eq!(s.phase_started_at, Some(anchor), "streaming restarted the batch clock");
+        assert_eq!(
+            s.phase_started_at,
+            Some(anchor),
+            "streaming restarted the batch clock"
+        );
         s.on_tool_call_started("Bash(b)");
-        assert_eq!(s.phase_started_at, Some(anchor), "started restarted the batch clock");
+        assert_eq!(
+            s.phase_started_at,
+            Some(anchor),
+            "started restarted the batch clock"
+        );
     }
 
     #[test]
@@ -1618,7 +2290,7 @@ mod tests {
 
     #[test]
     fn thinking_does_not_reset_phase_clock_during_batch() {
-        // The bridge emits PhaseChange(Thinking) after EVERY ToolResult, so in a
+        // The runtime projection emits PhaseChange(Thinking) after every ToolResult, so in a
         // parallel batch these interleave with the tool events. on_thinking must
         // NOT restart the phase clock then — otherwise the spinner ms still
         // flickers 0→N→0 even with the tool-event guards.
@@ -1630,7 +2302,11 @@ mod tests {
             .insert("b1".into(), ActiveToolBatch { call_ids: vec![] });
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_thinking();
-        assert_eq!(s.phase_started_at, Some(anchor), "thinking restarted the batch clock");
+        assert_eq!(
+            s.phase_started_at,
+            Some(anchor),
+            "thinking restarted the batch clock"
+        );
     }
 
     #[test]
@@ -1641,7 +2317,10 @@ mod tests {
         let before = s.phase_started_at.unwrap();
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_thinking();
-        assert!(s.phase_started_at.unwrap() > before, "think must reset the clock outside a batch");
+        assert!(
+            s.phase_started_at.unwrap() > before,
+            "think must reset the clock outside a batch"
+        );
     }
 
     #[test]
@@ -1663,11 +2342,11 @@ mod tests {
     }
 
     #[test]
-    fn error_returns_to_idle() {
+    fn error_is_diagnostic_until_the_authoritative_terminal() {
         let mut s = UiState::new();
         s.on_submit();
         s.on_error();
-        assert_eq!(s.phase, UiPhase::Idle);
+        assert_eq!(s.phase, UiPhase::Streaming);
     }
 
     #[test]
@@ -1675,8 +2354,8 @@ mod tests {
         assert_eq!(AgentMode::default(), AgentMode::Build);
     }
 
-    fn task_info(path: &str, dedup: &str) -> atomcode_core::agent::SubAgentTaskInfo {
-        atomcode_core::agent::SubAgentTaskInfo {
+    fn task_info(path: &str, dedup: &str) -> crate::event_loop::ui_event::SubAgentTaskInfo {
+        crate::event_loop::ui_event::SubAgentTaskInfo {
             path: path.to_string(),
             dedup_suffix: dedup.to_string(),
         }
@@ -1692,7 +2371,9 @@ mod tests {
         s.on_submit();
         s.on_tool_call_started("read_file");
         assert!(s.spinner_label.contains("read_file"));
-        let tasks = (0..6).map(|i| task_info(&format!("a{}.rs", i), "")).collect();
+        let tasks = (0..6)
+            .map(|i| task_info(&format!("a{}.rs", i), ""))
+            .collect();
         s.on_sub_agent_dispatch_start(tasks);
         assert_eq!(s.spinner_label, "Sub-agents 0/6");
     }
@@ -1856,7 +2537,7 @@ mod tests {
     #[test]
     fn active_todos_persist_across_cancel_and_error() {
         // The todo panel is PER-SESSION state (see reset_to_new_session /
-        // SessionSwitched, which drop it), NOT per-turn — it already survives
+        // native SessionChanged, which drop it), NOT per-turn — it already survives
         // turn COMPLETE (active_todos_persists_across_turn_end). Cancel and
         // error are just turn terminations too, so they must preserve it as
         // well. Regression: clearing on cancel/error nuked the plan, and since
@@ -1877,7 +2558,10 @@ mod tests {
 
         s.on_turn_cancelled();
         assert!(s.active_todos.is_some(), "panel must survive cancellation");
-        assert!(!s.todo_titles.is_empty(), "titles must survive cancellation");
+        assert!(
+            !s.todo_titles.is_empty(),
+            "titles must survive cancellation"
+        );
 
         s.on_error();
         assert!(s.active_todos.is_some(), "panel must survive error");
@@ -1891,11 +2575,24 @@ mod tests {
             tool: "bash".into(),
             detail: "rm -rf build/".into(),
             options: vec![
-                ApprovalOption { label: "Allow once".into(), kind: ApprovalKind::AllowOnce, accel: 'y' },
-                ApprovalOption { label: "Always allow bash".into(), kind: ApprovalKind::AlwaysAllow, accel: 'a' },
-                ApprovalOption { label: "Deny".into(), kind: ApprovalKind::Deny, accel: 'n' },
+                ApprovalOption {
+                    label: "Allow once".into(),
+                    kind: ApprovalKind::AllowOnce,
+                    accel: 'y',
+                },
+                ApprovalOption {
+                    label: "Always allow bash".into(),
+                    kind: ApprovalKind::AlwaysAllow,
+                    accel: 'a',
+                },
+                ApprovalOption {
+                    label: "Deny".into(),
+                    kind: ApprovalKind::Deny,
+                    accel: 'n',
+                },
             ],
             selected: 0,
+            cache_key: String::new(),
         };
         p.move_up();
         assert_eq!(p.selected, 2, "up from 0 wraps to last");
@@ -1909,15 +2606,158 @@ mod tests {
     }
 
     #[test]
+    fn user_input_panel_navigation_toggle_and_chosen() {
+        use crate::state::UserInputPanel;
+        use atomcode_capabilities::tools::request_user_input::{
+            UserInputMode, UserInputOption, UserInputRequest,
+        };
+
+        let single_req = UserInputRequest {
+            header: "Auth".into(),
+            question: "Which flow?".into(),
+            mode: UserInputMode::Single,
+            options: vec![
+                UserInputOption {
+                    label: "OAuth".into(),
+                    description: None,
+                },
+                UserInputOption {
+                    label: "API key".into(),
+                    description: None,
+                },
+                UserInputOption {
+                    label: "Device".into(),
+                    description: None,
+                },
+            ],
+            custom: true,
+        };
+        let mut p = UserInputPanel::new(7, &single_req);
+        assert_eq!(p.request_id, 7);
+        assert_eq!(p.cursor, 0);
+        // Single: cursor spans concrete options (0..3) and the always-appended
+        // "Other" row (3). No submit row. move_down clamps at the "Other" row.
+        for _ in 0..10 {
+            p.move_down();
+        }
+        assert_eq!(
+            p.cursor, 3,
+            "single move_down clamps at the Other row (options.len())"
+        );
+        assert!(p.is_other_row(), "single cursor clamps at the Other row");
+        // move_up clamps at 0.
+        for _ in 0..10 {
+            p.move_up();
+        }
+        assert_eq!(p.cursor, 0, "move_up clamps at 0");
+        // Single is cursor-as-radio: chosen() reads the cursor row's label.
+        p.move_down(); // cursor → "API key"
+        assert_eq!(p.chosen(), vec!["API key".to_string()]);
+        let resp = p
+            .build_response()
+            .expect("single with a cursor selection submits");
+        assert_eq!(resp.selected, vec!["API key".to_string()]);
+        assert_eq!(resp.text, None);
+        // Moving the cursor changes the radio selection.
+        p.move_up();
+        assert_eq!(
+            p.chosen(),
+            vec!["OAuth".to_string()],
+            "single radio follows the cursor"
+        );
+
+        // Single: cursor on the "Other" row + typed custom text submits it.
+        for _ in 0..10 {
+            p.move_down();
+        }
+        assert!(p.is_other_row());
+        p.push_custom('h');
+        p.push_custom('i');
+        let resp = p.build_response().expect("custom text submits");
+        assert_eq!(resp.selected, vec!["hi".to_string()]);
+        // "Other" row with empty custom text → no-op.
+        let mut other_empty = UserInputPanel::new(12, &single_req);
+        for _ in 0..10 {
+            other_empty.move_down();
+        }
+        assert!(other_empty.is_other_row());
+        assert!(
+            other_empty.build_response().is_none(),
+            "empty Other on single does not submit"
+        );
+
+        // Multiple: toggle flips the highlighted option; chosen() = all checked.
+        let mut m = UserInputPanel::new(
+            9,
+            &UserInputRequest {
+                mode: UserInputMode::Multiple,
+                ..single_req.clone()
+            },
+        );
+        m.toggle(); // check "OAuth"
+        m.move_down();
+        m.move_down();
+        m.toggle(); // check "Device"
+        assert_eq!(m.chosen(), vec!["OAuth".to_string(), "Device".to_string()]);
+        m.toggle(); // uncheck "Device"
+        assert_eq!(m.chosen(), vec!["OAuth".to_string()], "toggle flips off");
+        // Multiple: custom text is APPENDED whenever non-empty (text-derived,
+        // no separate checked flag needed).
+        m.push_custom('x');
+        let resp = m.build_response().expect("multiple always submits");
+        assert_eq!(resp.selected, vec!["OAuth".to_string(), "x".to_string()]);
+
+        // Text: chosen() is empty (answer rides `text`).
+        let mut t = UserInputPanel::new(
+            1,
+            &UserInputRequest {
+                mode: UserInputMode::Text,
+                options: vec![],
+                ..single_req.clone()
+            },
+        );
+        t.text.push_str("hello");
+        assert!(t.chosen().is_empty(), "text mode has no selected labels");
+        assert_eq!(t.text, "hello");
+        assert_eq!(t.build_response().unwrap().text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn on_user_input_resolved_clears_panel_and_resumes() {
+        use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputRequest};
+        let mut s = UiState::new();
+        s.user_input_panel = Some(crate::state::UserInputPanel::new(
+            3,
+            &UserInputRequest {
+                header: "H".into(),
+                question: "Q?".into(),
+                mode: UserInputMode::Text,
+                options: vec![],
+                custom: true,
+            },
+        ));
+        s.phase = UiPhase::UserInput;
+        s.on_user_input_resolved();
+        assert!(s.user_input_panel.is_none(), "panel cleared on resolve");
+        assert_eq!(s.phase, UiPhase::Streaming, "phase resumes to Streaming");
+    }
+
+    #[test]
     fn steer_pending_counts_unfolded_and_drains_on_fold() {
         let mut st = UiState::new();
         st.on_steer_sent();
         st.on_steer_sent();
-        assert_eq!(st.steer_pending, 2, "two steers dispatched, none folded yet");
+        assert_eq!(
+            st.steer_pending, 2,
+            "two steers dispatched, none folded yet"
+        );
         st.on_steered(1); // kernel confirms one fold
         assert_eq!(st.steer_pending, 1, "drains as folds are confirmed");
         st.on_steered(1);
-        assert_eq!(st.steer_pending, 0, "back to zero once all folded — a draining indicator");
+        assert_eq!(
+            st.steer_pending, 0,
+            "back to zero once all folded — a draining indicator"
+        );
         st.on_steered(3); // spurious / cross-client fold never underflows
         assert_eq!(st.steer_pending, 0, "saturating: never goes negative");
         // Every turn-end path clears it, parity with the other per-turn counters.
@@ -1929,9 +2769,25 @@ mod tests {
         assert_eq!(st.steer_pending, 0, "cleared on cancel");
         st.on_steer_sent();
         st.on_error();
-        assert_eq!(st.steer_pending, 0, "cleared on error");
+        assert_eq!(
+            st.steer_pending, 1,
+            "a diagnostic error must not clean up a still-active turn"
+        );
+        st.on_turn_complete();
+        assert_eq!(st.steer_pending, 0, "cleared by the terminal");
         st.on_steer_sent();
         st.on_submit();
         assert_eq!(st.steer_pending, 0, "a fresh turn starts at 0");
+    }
+
+    #[test]
+    fn rejected_submit_discards_cancel_restore_without_entering_streaming() {
+        let mut st = UiState::new();
+        st.last_submitted_message = Some("not accepted".to_string());
+
+        st.on_submit_rejected();
+
+        assert_eq!(st.phase, UiPhase::Idle);
+        assert!(st.last_submitted_message.is_none());
     }
 }

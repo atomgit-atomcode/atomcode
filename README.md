@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.0.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.0.1-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -194,10 +194,10 @@ brew install --cask atomcode
 
 Run AtomCode as your **normal user**, never with `sudo`. AtomCode keeps its
 config, sessions, and logs under `~/.atomcode`; running once as root leaves
-root-owned files there, so every later non-root start fails at engine init with:
+root-owned files there, so every later non-root start fails at runtime init with:
 
 ```
-engine v2 assemble failed: Permission denied (os error 13)
+coding runtime assemble failed: Permission denied (os error 13)
 ```
 
 (the message may say `prepare` instead of `assemble` — same cause.) If you hit
@@ -323,7 +323,6 @@ Then just type what you want:
 | `Enter` | Send message |
 | `Shift+Enter` | New line (requires Kitty keyboard protocol) |
 | `Ctrl+Enter` | New line (requires Kitty keyboard protocol) |
-| `Ctrl+J` | New line (requires Kitty keyboard protocol) |
 | `Alt+Enter` | New line (most terminals; see compatibility note below) |
 | `\` + `Enter` | New line (works on all terminals — type a `\` and press Enter; the `\` is consumed) |
 | `Esc` | Clear input / Cancel stream |
@@ -336,7 +335,7 @@ Then just type what you want:
 | `Ctrl+V` | Paste image from clipboard (Windows: use `/paste`, see below) |
 
 > **Terminal compatibility for newline chords:**
-> - `Shift+Enter`, `Ctrl+Enter`, and `Ctrl+J` all need a terminal that speaks the Kitty keyboard protocol — kitty, WezTerm, Alacritty, iTerm2 ≥3.5, Windows Terminal ≥1.21. Older terminals collapse them to plain `Enter` (which sends the message).
+> - `Shift+Enter` and `Ctrl+Enter` need a terminal that speaks the Kitty keyboard protocol — kitty, WezTerm, Alacritty, iTerm2 ≥3.5, Windows Terminal ≥1.21. Older terminals (and Windows, where atomcode doesn't enable the protocol) collapse them to plain `Enter` (which sends the message) — use `\` + `Enter`, which works everywhere.
 > - `Alt+Enter` works at the byte level on most terminals, but **Windows Terminal binds it to "toggle full screen" by default** — remove that binding under Settings → Actions to free it up.
 > - Xshell does not support the Kitty protocol; in its keymap settings, map a free chord to send `ESC, Enter` (`\x1b\r`) to get the same effect, or paste multi-line text via the clipboard (bracketed paste is enabled).
 
@@ -371,7 +370,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/clear` | Start a new conversation (clears context + screen) |
 | `/bg` | Background current session; subcommands: `/bg list`, `/bg <N>`, `/bg drop <N>`, `/bg help` |
 | `/background <task>` | Compatibility alias: start a one-shot task in a `/bg` slot |
-| `/cd` | Change working directory |
+| `/cd` | Change working directory and start a new session |
 | `/worktree` | Git worktree isolation (`create` / `list` / `done` / `cleanup`) |
 | `/webui` | Launch the browser webui (subcommands: `stop`, `lan`, `--host <addr>`) |
 | `/sync` | Attach to the live webui session (`/sync off` to detach) |
@@ -438,7 +437,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/upgrade` | Upgrade atomcode to latest (subcommand: `rollback`) |
 | `/setup` | First run: install the recommended skill and run it |
 | `/welcome` | Re-run the onboarding wizard |
-| `/language` | Switch display language |
+| `/language` | Switch display and default Git commit-message language |
 | `/issue` | Report a bug / request a feature (interactive wizard) |
 | `/guide <question>` | Ask atomcode-guide how to use AtomCode |
 | `/keys` | Show keyboard shortcuts |
@@ -517,42 +516,35 @@ Run `/help commands` to list all loaded custom commands.
 
 ## Architecture
 
-AtomCode is a Rust workspace with four crates:
+AtomCode is a layered Rust workspace:
 
 ```
 atomcode/
   crates/
-    atomcode-core/     # Headless library — no TUI dependency
-      agent/           # AgentLoop: autonomous tool-use loop
-      turn/            # TurnRunner, datalog, permission decider
-      config/          # Config loading, provider configs
-      conversation/    # Message types, windowed context
-      provider/        # LlmProvider trait + OpenAI/Claude/Ollama
-      tool/            # Tool trait + built-in tool implementations
-      session/         # Persistent sessions
-      skill.rs         # User-defined skills
-
-    atomcode-tuix/     # Terminal UI — retained-mode renderer (CC-style normal mode)
-      event_loop/      # App state machine, command dispatch
-      render/          # Cell-based renderer, diff, retained-mode frame loop
-      modals/          # Picker UIs (dir, model, session, provider, issue)
-
-    atomcode-cli/      # Binary entry point (TUI + headless -p mode)
-      main.rs          # CLI args, first-run wizard, launch
-      auth/            # AtomGit OAuth client
-
-    atomcode-daemon/   # HTTP/SSE API server over atomcode-core
+    atomcode-kernel/        # Neutral agent loop and runtime traits
+    atomcode-capabilities/  # Providers, tools, MCP, skills, sessions, memory
+    atomcode-coding/        # Coding specialization and CodingRuntime lifecycle
+    atomcode-review/        # Review specialization
+    atomcode-tuix/          # Terminal UI
+    atomcode-cli/           # TUI and headless entry point
+    atomcode-daemon/        # HTTP/SSE/WebSocket transport
+    atomcode-core/          # Transitional session/plugin/live compatibility code
 ```
+
+The coding path is `CLI/TUI/daemon → CodingRuntime → kernel`. The retired core
+agent protocol and `atomcode-bridge` are no longer part of the runtime path.
 
 ### Design Principles
 
 1. **Tech-stack agnostic** — never hardcodes language-specific logic. Detects project type dynamically from descriptor files (`package.json`, `Cargo.toml`, `pyproject.toml`, `pom.xml`, etc.).
 
-2. **Decoupled agent** — `AgentLoop` runs as an independent async task, communicating with the TUI via channels (`AgentCommand` / `AgentEvent`). The core library has zero TUI dependencies, which is also what makes the daemon possible.
+2. **Single runtime owner** — `CodingRuntime` owns the live coding agent, provider/session lifecycle, pending requests, snapshots, and controllers. Drivers handle input, presentation, and transport without rebuilding a second agent runtime.
 
 3. **Tool safety** — all destructive operations require explicit user approval. Tool failures become LLM observations, never panics.
 
 4. **Context-aware** — token-budget-aware conversation windowing, project file-tree injection, and per-turn system reminders keep the model focused without exceeding context limits.
+
+5. **Directed dependencies** — kernel stays neutral; capabilities and coding stay free of `atomcode-core`; legacy session data is handled at an explicit compatibility boundary rather than as a runtime fallback.
 
 ## Project Instruction File
 
