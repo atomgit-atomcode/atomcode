@@ -571,6 +571,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
 
       activeIdRef.current = sessionId;
+      providerPinnedRef.current = false;
       loadedForRef.current = null;
       optimisticFiredRef.current = false;
       // An existing session stays send-locked until `/chat/active` proves it
@@ -1061,8 +1062,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setUserInputReq(null);
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
-      if (e.provider) {
-        providerPinnedRef.current = false;
+      if (e.provider && !providerPinnedRef.current) {
         setProvider(e.provider);
       }
       // 同步当前审批模式，让新 tab 显示正确的模式 pill（含别的 tab 切成的 Auto/Plan）。
@@ -1080,10 +1080,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
       return;
     }
-    // 模型切换是进程级（全局），与正在查看哪个会话无关 → 不门控，始终更新下拉框。
+    // 模型切换是进程级（全局），与正在查看哪个会话无关。若当前未显式固定模型则跟随更新。
     if (e.type === 'provider') {
-      providerPinnedRef.current = false;
-      setProvider(e.provider);
+      if (!providerPinnedRef.current) {
+        setProvider(e.provider);
+      }
       return;
     }
     // 审批模式切换是进程级（另一 tab / 未来 TUI）→ 始终同步 pill。
@@ -1337,8 +1338,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   /** Switch the active provider and notify the backend when in sync mode. */
   function switchProvider(name: string) {
+    providerPinnedRef.current = true;
     if (!sync) {
-      providerPinnedRef.current = true;
       setProvider(name);
       return;
     }
