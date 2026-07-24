@@ -1476,10 +1476,14 @@ pub(crate) struct LiveSwitchSessionReq {
 /// legacy 收敛后将同一 lease 交给 CodingRuntime。无绑定 runtime 时明确
 /// 返回拒绝，不隐式创建另一条执行路径。
 pub(crate) async fn live_switch_session_endpoint(
+    State(state): State<AppState>,
     Json(req): Json<LiveSwitchSessionReq>,
 ) -> impl IntoResponse {
     match crate::native_live::resume_session(req.session_id).await {
-        Ok(_) => Json(serde_json::json!({ "ok": true })),
+        Ok(changed) => {
+            crate::update_project_state(&mut *state.project.write().await, &changed.working_dir);
+            Json(serde_json::json!({ "ok": true }))
+        }
         Err(error) => Json(serde_json::json!({
             "ok": false,
             "error": format!("session switch rejected: {error:?}"),
@@ -2557,5 +2561,47 @@ mod tests {
         assert!(snapshot.messages[0].synthetic);
         assert_eq!(snapshot.messages[0].text(), Some("after compact"));
         assert!(snapshot.cold_summaries.is_empty());
+    }
+
+    #[test]
+    fn prepare_catalog_session_resume_any_project_locates_session_in_another_bucket() {
+        use atomcode_capabilities::session::{SessionManager, SessionMeta};
+        use atomcode_kernel::message::SessionSnapshot;
+
+        let root = tempfile::tempdir().unwrap();
+        let proj1_dir = root.path().join("proj1");
+        let proj2_dir = root.path().join("proj2");
+        std::fs::create_dir_all(&proj1_dir).unwrap();
+        std::fs::create_dir_all(&proj2_dir).unwrap();
+
+        let bucket1 = SessionManager::project_hash(&proj1_dir);
+        let bucket2 = SessionManager::project_hash(&proj2_dir);
+
+        let mgr2 = SessionManager::with_root(root.path().join(&bucket2));
+        let lease2 = mgr2.acquire_lease("session-in-proj2").unwrap();
+        let mut meta2 = SessionMeta::new("session-in-proj2", proj2_dir.to_string_lossy(), 1000);
+        meta2.owner = atomcode_capabilities::session::StorageOwner::Native;
+        let snap2 = SessionSnapshot::new(vec![]);
+        let pres2 = atomcode_capabilities::session::PresentationFile::default();
+        mgr2.commit_native_import(&lease2, Some(&snap2), Some(&pres2), &meta2).unwrap();
+        drop(lease2);
+
+        // Searching explicitly in proj1 bucket fails
+        let res1 = crate::legacy_convert::prepare_catalog_session_resume_in_project_root(
+            root.path(),
+            &bucket1,
+            "session-in-proj2",
+        ).unwrap();
+        assert!(res1.is_none());
+
+        // Searching across any project finds it in proj2 bucket
+        let res2 = crate::legacy_convert::prepare_catalog_session_resume_any_project_in_root(
+            root.path(),
+            "session-in-proj2",
+        ).unwrap();
+        assert!(res2.is_some());
+        let prepared = res2.unwrap();
+        assert_eq!(prepared.project_bucket, bucket2);
+        assert_eq!(prepared.view.meta.working_dir, proj2_dir.to_string_lossy());
     }
 }

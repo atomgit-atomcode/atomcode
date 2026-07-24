@@ -21,6 +21,11 @@ pub mod util;
 /// runtime stays in `atomcode-core::proxy` (needs the HTTP stack) and re-exports these.
 pub mod proxy;
 
+/// TLS-version policy for the explicit process-wide env ceiling and the
+/// endpoint-scoped AtomGit fallback latch. Pure URL/env/atomic logic; HTTP
+/// clients remain in their owning leaf/provider crates.
+pub mod tls;
+
 /// The `LspServerConfig` config type (`Config.lsp.servers`). The LSP runtime
 /// (`LspServerRegistry`, client, manager) stays in `atomcode-core::lsp` and re-exports it.
 pub mod lsp_registry;

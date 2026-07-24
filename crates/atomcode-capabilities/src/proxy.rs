@@ -39,23 +39,60 @@ fn proxy_disabled() -> bool {
     mode_disables_proxy(env::var(MODE_ENV).ok().as_deref())
 }
 
-/// Apply the process proxy policy to an async reqwest client builder.
+/// The env override that caps outbound TLS at 1.2 (kept in sync with
+/// `atomcode_config::tls::MAX_ENV` — hardcoded here for the same layering reason
+/// `MODE_ENV` is: this module must build in config-less feature combos). Only read
+/// on the config-less path; the `provider` build defers to `atomcode_config::tls`.
+#[cfg(not(feature = "provider"))]
+const TLS_MAX_ENV: &str = "ATOMCODE_TLS_MAX";
+
+/// Whether the user explicitly requested a process-wide TLS 1.2 ceiling.
+/// Automatic AtomGit fallback is endpoint-aware and lives in the provider.
+fn force_tls12() -> bool {
+    #[cfg(feature = "provider")]
+    {
+        atomcode_config::tls::env_forces_tls12()
+    }
+    #[cfg(not(feature = "provider"))]
+    {
+        env::var(TLS_MAX_ENV)
+            .ok()
+            .map(|raw| {
+                let v = raw.trim();
+                v == "1.2" || v.eq_ignore_ascii_case("tlsv1.2") || v.eq_ignore_ascii_case("tls1.2")
+            })
+            .unwrap_or(false)
+    }
+}
+
+/// Apply the process proxy policy to an async reqwest client builder, then cap at
+/// TLS 1.2 when [`force_tls12`] is set.
 pub(crate) fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    if proxy_disabled() {
+    let builder = if proxy_disabled() {
         builder.no_proxy()
+    } else {
+        builder
+    };
+    if force_tls12() {
+        builder.max_tls_version(reqwest::tls::Version::TLS_1_2)
     } else {
         builder
     }
 }
 
 /// Apply the process proxy policy to a blocking reqwest client builder
-/// (the one-shot MCP OAuth login / refresh flow).
+/// (the one-shot MCP OAuth login / refresh flow), then cap TLS as above.
 #[cfg(feature = "mcp")]
 pub(crate) fn apply_blocking_proxy_policy(
     builder: reqwest::blocking::ClientBuilder,
 ) -> reqwest::blocking::ClientBuilder {
-    if proxy_disabled() {
+    let builder = if proxy_disabled() {
         builder.no_proxy()
+    } else {
+        builder
+    };
+    if force_tls12() {
+        builder.max_tls_version(reqwest::tls::Version::TLS_1_2)
     } else {
         builder
     }

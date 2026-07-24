@@ -59,7 +59,7 @@ impl ConfigStore {
 
     /// Read one internally-consistent config + revision snapshot.
     pub fn read(&self) -> Result<ConfigSnapshot> {
-        read_snapshot(&self.path)
+        read_snapshot_tolerant(&self.path)
     }
 
     /// Apply one delta to the latest disk snapshot while holding the process-shared lock.
@@ -134,7 +134,12 @@ impl ConfigStore {
         let disk = if tolerate_invalid_disk {
             read_snapshot_for_replace(&self.path)?
         } else {
-            match read_snapshot(&self.path) {
+            // Tolerant read: a single malformed `[providers.<name>]` must not
+            // block an unrelated write (e.g. `/model`). The invalid section is
+            // isolated into `quarantined_providers` and re-emitted verbatim by
+            // `persist_locked`, so the transaction succeeds without dropping the
+            // user's text. Genuine syntax errors / non-UTF-8 still fail here.
+            match read_snapshot_tolerant(&self.path) {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) if is_not_found(&error) => None,
                 Err(error) => return Err(error),
@@ -154,7 +159,10 @@ impl ConfigStore {
         ensure_parent(&self.path)?;
         let content = next.serialize_for_disk(disk)?;
         atomic_replace(&self.path, content.as_bytes())?;
-        let config = Config::parse_disk_content(&content, &self.path)?;
+        // Parse tolerantly: the content we just wrote may legitimately carry a
+        // preserved-but-invalid `[providers.<name>]` section (round-tripped from
+        // `quarantined_providers`), which a strict parse would reject.
+        let (config, _warnings) = Config::parse_disk_content_tolerant(&content, &self.path)?;
         Ok(ConfigSnapshot {
             config,
             revision: ConfigRevision::from_bytes(content.as_bytes()),
@@ -202,12 +210,12 @@ fn ensure_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_snapshot(path: &Path) -> Result<ConfigSnapshot> {
+fn read_snapshot_tolerant(path: &Path) -> Result<ConfigSnapshot> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read config: {}", path.display()))?;
     let content = std::str::from_utf8(&bytes)
         .with_context(|| format!("Config is not UTF-8: {}", path.display()))?;
-    let config = Config::parse_disk_content(content, path)?;
+    let (config, _warnings) = Config::parse_disk_content_tolerant(content, path)?;
     Ok(ConfigSnapshot {
         config,
         revision: ConfigRevision::from_bytes(&bytes),

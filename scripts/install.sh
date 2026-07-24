@@ -15,7 +15,7 @@
 set -eu
 
 # Fallback version used only when ATOMCODE_VERSION is unset and the API lookup fails.
-DEFAULT_VERSION="v5.0.1"
+DEFAULT_VERSION="v5.0.2"
 REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 REPO_LATEST_API="https://api.atomgit.com/api/v5/repos/atomgit_atomcode/atomcode/releases/latest"
 
@@ -194,7 +194,11 @@ case ":$PATH:" in
         fi
 
         if [ -n "$RC" ]; then
-            if [ -f "$RC" ] && grep -qF "$PREFIX" "$RC" 2>/dev/null; then
+            # Match the COMPLETE export line we manage (grep -x = whole line, -F =
+            # fixed string), not a bare substring of "$PREFIX". A `grep -qF "$PREFIX"`
+            # false-positives when the rc merely MENTIONS the prefix as a substring
+            # (e.g. an "AtomCodeBackup" path), silently skipping the real PATH add.
+            if [ -f "$RC" ] && grep -qxF "$LINE" "$RC" 2>/dev/null; then
                 # Already present, skip
                 :
             else

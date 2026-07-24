@@ -173,10 +173,11 @@ impl OpenAiCompatProvider {
         let connect_timeout = cfg.connect_timeout;
         let skip_tls_verify = cfg.skip_tls_verify;
         let user_agent = cfg.user_agent.clone();
-        let client = std::sync::Arc::new(SwappableClient::new(move || {
-            build_http_client(connect_timeout, skip_tls_verify, user_agent.clone())
-        })?);
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+        let initial_tls12 = atomcode_config::tls::should_cap_url(&url);
+        let client = std::sync::Arc::new(SwappableClient::new(initial_tls12, move |tls12| {
+            build_http_client(connect_timeout, skip_tls_verify, user_agent.clone(), tls12)
+        })?);
         Ok(Self {
             cfg,
             policy,
@@ -195,6 +196,50 @@ fn build_http_client(
     connect_timeout: std::time::Duration,
     skip_tls_verify: bool,
     user_agent: Option<String>,
+    force_tls12: bool,
+) -> Result<reqwest::Client, ProviderError> {
+    // First attempt: webpki base + OS native store + SSL_CERT_FILE (add_trusted_roots).
+    match build_http_client_inner(
+        connect_timeout,
+        skip_tls_verify,
+        user_agent.clone(),
+        force_tls12,
+        true,
+    ) {
+        Ok(client) => Ok(client),
+        Err(first) => {
+            // BACKSTOP (issue #514): even with the per-cert probe in `add_trusted_roots`,
+            // a poisoned SSL_CERT_FILE (or any other trust-root surprise) rejected by
+            // rustls at `.build()` aborts the ENTIRE client — leaving every provider dead
+            // on startup with an opaque "builder error". Rather than a total outage, retry
+            // ONCE with the INFALLIBLE webpki base only. Public-CA endpoints (the gateway,
+            // model APIs) still work; only a corporate MITM root would be lost, and a
+            // request-time TLS error is far better than a client that never builds.
+            tracing::warn!(
+                "http client build failed with the OS/SSL_CERT_FILE trust roots ({}); \
+                 retrying with the webpki base only — a custom/corporate root may be ignored (issue #514)",
+                first.message
+            );
+            build_http_client_inner(
+                connect_timeout,
+                skip_tls_verify,
+                user_agent,
+                force_tls12,
+                false,
+            )
+        }
+    }
+}
+
+/// Build a client with a single trust-root policy. `trust_os_roots=false` uses only
+/// the infallible webpki base (the backstop path); `true` layers the OS native store
+/// and `SSL_CERT_FILE` on top via [`add_trusted_roots`].
+fn build_http_client_inner(
+    connect_timeout: std::time::Duration,
+    skip_tls_verify: bool,
+    user_agent: Option<String>,
+    force_tls12: bool,
+    trust_os_roots: bool,
 ) -> Result<reqwest::Client, ProviderError> {
     let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
         .connect_timeout(connect_timeout)
@@ -206,18 +251,26 @@ fn build_http_client(
         // (parity with core's `build_http_client`). Driver injects the real
         // `atomcode/<version>`; bare fallback when unset.
         .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+    if force_tls12 {
+        builder = builder.max_tls_version(reqwest::tls::Version::TLS_1_2);
+    }
     // TLS trust (issue #514): webpki base roots are always present so `.build()`
     // never hard-fails on certs; layer the OS native store (corporate MITM CAs)
     // and SSL_CERT_FILE on top, additively and best-effort. This is the DEFAULT
     // v2 provider path. Mirrors `core::provider::add_trusted_roots` — kept
     // crate-local because capabilities does not depend on core.
-    builder = add_trusted_roots(builder);
+    if trust_os_roots {
+        builder = add_trusted_roots(builder);
+    }
     if skip_tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
     }
     builder.build().map_err(|e| ProviderError {
         retryable: false,
-        message: format!("http client build failed: {e}"),
+        // reqwest's builder-error `Display` is a bare "builder error" — the real
+        // reason (bad cert, invalid header, …) lives in its `source()` chain, so
+        // walk it (shared `retry::err_chain`) or the message is useless (issue #514).
+        message: format!("http client build failed: {}", retry::err_chain(&e)),
         ..Default::default()
     })
 }
@@ -238,17 +291,35 @@ fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuil
             native.certs.len()
         );
     }
+    // `reqwest::Certificate::from_der` does NOT validate under rustls — it just stores
+    // the bytes and defers validation to `rustls::RootCertStore::add` INSIDE `.build()`,
+    // which aborts the WHOLE client on the first cert rustls rejects (a legacy OS root
+    // without X509v3 extensions is enough). Pre-filter each cert through the same rustls
+    // parser so one bad OS root can't take every provider down. reqwest's own native
+    // loader is likewise tolerant; ours must be too. See issue #514.
+    let mut rejected = 0usize;
     for der in native.certs {
+        if rustls::RootCertStore::empty().add(der.clone()).is_err() {
+            rejected += 1;
+            continue;
+        }
         if let Ok(cert) = reqwest::Certificate::from_der(der.as_ref()) {
             builder = builder.add_root_certificate(cert);
         }
     }
+    if rejected > 0 {
+        tracing::warn!(
+            "skipped {rejected} OS root cert(s) rustls rejected; they would have aborted the whole client build (issue #514)"
+        );
+    }
 
     // 2) SSL_CERT_FILE override/extra (empty string = unset). Loaded explicitly
     //    for cross-platform certainty. reqwest's `Certificate` is validated only
-    //    at `.build()`, so a MALFORMED SSL_CERT_FILE surfaces there as a clear
-    //    `ProviderError` (never a panic, and only for this opt-in builder — every
-    //    other client build uses the webpki base and is unaffected). See #514.
+    //    at `.build()`; unlike the native loop above we do NOT pre-probe these
+    //    (no DER in hand from `from_pem_bundle`), so a MALFORMED SSL_CERT_FILE
+    //    still poisons `.build()` — but the `build_http_client` BACKSTOP catches
+    //    that and rebuilds on the webpki base (never a panic; the file is then
+    //    ignored with a warning rather than killing the client). See #514.
     let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|p| !p.is_empty()) else {
         return builder;
     };
@@ -282,14 +353,15 @@ fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuil
 pub(crate) struct SwappableClient {
     current: std::sync::RwLock<reqwest::Client>,
     #[allow(clippy::type_complexity)]
-    build: Box<dyn Fn() -> Result<reqwest::Client, ProviderError> + Send + Sync>,
+    build: Box<dyn Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync>,
 }
 
 impl SwappableClient {
     fn new(
-        build: impl Fn() -> Result<reqwest::Client, ProviderError> + Send + Sync + 'static,
+        force_tls12: bool,
+        build: impl Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync + 'static,
     ) -> Result<Self, ProviderError> {
-        let initial = build()?;
+        let initial = build(force_tls12)?;
         Ok(Self {
             current: std::sync::RwLock::new(initial),
             build: Box::new(build),
@@ -307,17 +379,12 @@ impl SwappableClient {
             .clone()
     }
 
-    /// Rebuild with a fresh (empty) pool and swap it in, returning the new client.
-    /// If the rebuild itself fails (e.g. transient proxy/env read), the OLD client is
-    /// kept and returned — a rebuild failure must never wedge the provider.
-    pub(crate) fn rebuild(&self) -> reqwest::Client {
-        match (self.build)() {
-            Ok(fresh) => {
-                *self.current.write().unwrap_or_else(|p| p.into_inner()) = fresh.clone();
-                fresh
-            }
-            Err(_) => self.get(),
-        }
+    /// Rebuild with a fresh (empty) pool and swap it in. On failure the old
+    /// client remains valid, but the caller receives the build error explicitly.
+    pub(crate) fn rebuild(&self, force_tls12: bool) -> Result<reqwest::Client, ProviderError> {
+        let fresh = (self.build)(force_tls12)?;
+        *self.current.write().unwrap_or_else(|p| p.into_inner()) = fresh.clone();
+        Ok(fresh)
     }
 }
 
@@ -469,7 +536,12 @@ impl LlmProvider for OpenAiCompatProvider {
                                 // of re-grabbing the dead socket. Only for the transient-transport
                                 // class — a logical/decode failure isn't cured by a new pool.
                                 if retry::chain_has_transient_io(&e) {
-                                    client.rebuild();
+                                    if let Err(rebuild_error) = client.rebuild(
+                                        atomcode_config::tls::should_cap_url(&url),
+                                    ) {
+                                        yield StreamEvent::Error(rebuild_error);
+                                        return;
+                                    }
                                 }
                                 if let Ok(fresh) =
                                     open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy).await
@@ -523,6 +595,7 @@ async fn open_stream(
     policy: &RetryPolicy,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
+    let mut tls12_probe = false;
     loop {
         // Take the CURRENT client each attempt: a transport-error retry below
         // rebuilds it, so the retried attempt gets a fresh (empty) pool.
@@ -551,8 +624,13 @@ async fn open_stream(
         if !session_id.is_empty() {
             req = req.header("x-atomcode-session-id", session_id);
         }
+        let was_capped = tls12_probe || atomcode_config::tls::should_cap_url(url);
         match req.send().await {
             Ok(resp) => {
+                if tls12_probe {
+                    atomcode_config::tls::latch_managed_tls12();
+                    tls12_probe = false;
+                }
                 let code = resp.status().as_u16();
                 if !resp.status().is_success() {
                     if retry::is_retryable_status(code) && attempt < policy.max_attempts {
@@ -585,6 +663,11 @@ async fn open_stream(
             }
             Err(e) => {
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
+                    // A managed-endpoint connect failure is eligible for one
+                    // TLS-1.2 probe. The latch is set only after that probe gets
+                    // an HTTP response; unrelated endpoints never auto-downgrade.
+                    let try_tls12 =
+                        atomcode_config::tls::should_try_fallback(url, was_capped, e.is_connect());
                     let wait = retry::compute_backoff(attempt, policy);
                     tokio::time::sleep(wait).await;
                     // Rebuild the client ONLY for the half-open-reuse class (a stale
@@ -594,9 +677,10 @@ async fn open_stream(
                     // pool, so rebuilding there would only churn a healthy pool (extra
                     // TLS handshakes) and re-read proxy env on every attempt. Safe on
                     // the OPEN path: no bytes consumed; a rebuild failure keeps the old
-                    // client. This is the automatic form of the `/login` remedy.
-                    if retry::chain_has_transient_io(&e) {
-                        client.rebuild();
+                    // client. Rebuild failures are returned explicitly.
+                    if try_tls12 || retry::chain_has_transient_io(&e) {
+                        client.rebuild(try_tls12 || was_capped)?;
+                        tls12_probe = try_tls12;
                     }
                     attempt += 1;
                     continue;
@@ -1360,7 +1444,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        let sc = SwappableClient::new(move || {
+        let sc = SwappableClient::new(false, move |_| {
             c.fetch_add(1, Ordering::SeqCst);
             Ok(reqwest::Client::new())
         })
@@ -1368,7 +1452,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "constructed once up front");
         let _ = sc.get();
         assert_eq!(calls.load(Ordering::SeqCst), 1, "get() must NOT rebuild");
-        sc.rebuild();
+        sc.rebuild(false).expect("rebuild");
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -1382,7 +1466,7 @@ mod tests {
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
         // First build succeeds; every rebuild after that fails.
-        let sc = SwappableClient::new(move || {
+        let sc = SwappableClient::new(false, move |_| {
             if c.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok(reqwest::Client::new())
             } else {
@@ -1395,7 +1479,8 @@ mod tests {
         })
         .expect("initial build");
         // A failing rebuild must not panic and must leave a usable client in place.
-        let _client = sc.rebuild();
+        let error = sc.rebuild(false).expect_err("rebuild must surface failure");
+        assert_eq!(error.message, "boom");
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -3004,15 +3089,16 @@ mod tests {
     fn build_http_client_builds_with_webpki_base_no_ssl_cert_file() {
         std::env::remove_var("SSL_CERT_FILE");
         // Plain build must succeed on the webpki base roots.
-        assert!(build_http_client(std::time::Duration::from_secs(5), false, None).is_ok());
+        assert!(build_http_client(std::time::Duration::from_secs(5), false, None, false).is_ok());
     }
 
     #[test]
     #[serial_test::serial(ssl_cert_file_env)]
-    fn build_http_client_reports_malformed_ssl_cert_file_as_error_not_panic() {
-        // A malformed SSL_CERT_FILE surfaces as a clear `ProviderError` at
-        // `.build()` — NEVER a panic, and only for this opt-in builder. The
-        // webpki base leaves every other client build unaffected. See #514.
+    fn build_http_client_recovers_from_malformed_ssl_cert_file_via_backstop() {
+        // A malformed SSL_CERT_FILE poisons the first `.build()` (rustls rejects the
+        // cert). BEFORE the #514 backstop this killed the whole client and left every
+        // provider dead on startup with an opaque "builder error". Now it must fall
+        // back to the infallible webpki base and STILL build — resilience over outage.
         let tmp = tempfile::tempdir().unwrap();
         let cert_path = tmp.path().join("roots.pem");
         std::fs::write(
@@ -3021,12 +3107,55 @@ mod tests {
         )
         .unwrap();
         std::env::set_var("SSL_CERT_FILE", &cert_path);
-        let built = build_http_client(std::time::Duration::from_secs(5), false, None);
+        let built = build_http_client(std::time::Duration::from_secs(5), false, None, false);
         std::env::remove_var("SSL_CERT_FILE");
         assert!(
-            built.is_err(),
-            "a malformed SSL_CERT_FILE must surface as Err, not panic"
+            built.is_ok(),
+            "a malformed SSL_CERT_FILE must fall back to the webpki base, not abort the client"
         );
+    }
+
+    #[test]
+    fn reqwest_aborts_whole_build_on_one_bad_root() {
+        // ROOT-CAUSE PROOF (issue #514): `reqwest::Certificate::from_der` stores bytes
+        // WITHOUT validating under rustls; validation is deferred to
+        // `rustls::RootCertStore::add` inside `.build()`, which propagates an error and
+        // aborts the ENTIRE client on the first cert it rejects. A single legacy OS root
+        // is therefore enough to take every provider down — which is exactly why
+        // `add_trusted_roots` must pre-filter each cert.
+        let junk = reqwest::Certificate::from_der(&[0x30, 0x03, 0x02, 0x01, 0x00])
+            .expect("from_der stores bytes without validating under rustls");
+        let built = reqwest::Client::builder()
+            .add_root_certificate(junk)
+            .build();
+        assert!(
+            built.is_err(),
+            "reqwest aborts the whole build on one bad user root — the failure we defend against"
+        );
+    }
+
+    #[test]
+    fn rustls_probe_rejects_garbage_der_and_accepts_a_real_root() {
+        use rustls::pki_types::CertificateDer;
+        // The same probe `add_trusted_roots` uses to skip poison certs.
+        let probe = |der: Vec<u8>| {
+            rustls::RootCertStore::empty()
+                .add(CertificateDer::from(der))
+                .is_ok()
+        };
+        assert!(
+            !probe(vec![0x30, 0x03, 0x02, 0x01, 0x00]),
+            "garbage DER must be rejected by the probe (kept out of reqwest's builder)"
+        );
+        // A genuine OS root — if the machine has any — must be accepted, so the probe
+        // does not throw away the real trust anchors we need.
+        let native = rustls_native_certs::load_native_certs();
+        if let Some(good) = native.certs.into_iter().next() {
+            assert!(
+                probe(good.as_ref().to_vec()),
+                "a real OS root must survive the probe"
+            );
+        }
     }
 
     #[test]
@@ -3034,6 +3163,6 @@ mod tests {
     fn build_http_client_skip_tls_verify_still_builds() {
         std::env::remove_var("SSL_CERT_FILE");
         // Root loading happens before the danger_accept path.
-        assert!(build_http_client(std::time::Duration::from_secs(5), true, None).is_ok());
+        assert!(build_http_client(std::time::Duration::from_secs(5), true, None, false).is_ok());
     }
 }

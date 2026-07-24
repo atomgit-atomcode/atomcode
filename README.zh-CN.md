@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.0.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.0.2-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -445,6 +445,69 @@ atomcode --prompt-file task.md
 > /plugin marketplace add https://atomgit.com/atomgit_atomcode/AtomCode-Channel
 > /plugin install weixin@atomcode-channel
 > ```
+
+### 自定义命令
+
+除了内置命令和插件命令，你还可以通过 `.md` 模板文件定义自己的斜杠命令，适用于频繁使用的提示词。
+
+**存放位置**（按优先级从低到高）：
+
+| 位置 | 作用域 |
+|-----|--------|
+| `$ATOMCODE_HOME/commands/`（默认为 `~/.atomcode/commands/`） | 全局 —— 所有项目生效 |
+| `<project>/.atomcode/commands/` | 项目级 —— 覆盖同名的全局命令 |
+| `plugins/<name>/commands/` | 插件贡献 —— 通过 `/plugin install` 安装 |
+
+**文件格式**：
+
+```markdown
+---
+name: explain
+description: 解释指定函数或模块的工作原理
+args: required
+---
+
+请详细解释以下代码的工作原理：
+
+$ARGUMENTS
+
+包括：函数签名与参数含义、核心业务逻辑、数据流与副作用。
+```
+
+- **`name`** —— 必填。命令名，输入 `/explain` 触发。
+- **`description`** —— 可选。Tab 补全时显示。
+- **`args`** —— 可选。控制参数期望与交互行为：
+
+  | 值 | 菜单 Enter 行为 | 空参提交 |
+  |-----|----------------|---------|
+  | `none`（默认） | 立即执行 | 允许（替换为空字符串） |
+  | `optional` | 补全到 `/name `，等待输入 | 允许 |
+  | `required` | 补全到 `/name `，等待输入 | 拒绝并提示错误 |
+
+  模板变量 `$ARGUMENTS` / `${ARGUMENTS}` 始终替换为用户在命令名后输入的内容（未输入则为空字符串）。
+
+- **模板正文** —— 输入命令后发送给 AI 的提示词。`$ARGUMENTS` 或 `${ARGUMENTS}` 会被替换为用户输入的命令参数。
+
+**示例：创建一个审查命令**
+
+```bash
+mkdir -p .atomcode/commands
+
+cat > .atomcode/commands/codereview.md << 'EOF'
+---
+name: codereview
+description: 对当前 git diff 进行代码审查
+args: optional
+---
+
+请对当前 git diff 中的所有改动进行代码审查。
+如有指定文件则只审查: $ARGUMENTS
+EOF
+```
+
+输入 `/help commands` 可查看所有已加载的自定义命令。
+
+> **优先级规则**：自定义命令名不能覆盖同名内置命令。如果内置已有 `/review`，项目级自定义的 `review.md` 不会出现在补全菜单中，也不会被 dispatch。
 
 ## 架构
 

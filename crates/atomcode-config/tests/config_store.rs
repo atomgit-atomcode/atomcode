@@ -153,6 +153,53 @@ fn failed_transaction_leaves_the_previous_snapshot_unchanged() {
 }
 
 #[test]
+fn tolerant_update_preserves_the_invalid_provider_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let content = r#"
+default_provider = "valid"
+
+[providers.valid]
+type = "openai"
+model = "working"
+
+[providers.invalid]
+model = "missing-type"
+"#;
+    std::fs::write(&path, content).unwrap();
+    let store = ConfigStore::new(&path);
+
+    let snapshot = store.read().expect("runtime reads should isolate bad providers");
+    assert_eq!(snapshot.config.default_provider, "valid");
+    assert!(snapshot.config.providers.contains_key("valid"));
+    assert!(!snapshot.config.providers.contains_key("invalid"));
+
+    // A malformed provider on disk must NOT block unrelated config writes
+    // (e.g. `/model`). The transaction succeeds…
+    let commit = store
+        .update(|config| {
+            config.default_provider = "valid".into();
+            Ok(())
+        })
+        .expect("a malformed provider must not block unrelated config writes");
+    assert_eq!(commit.snapshot.config.default_provider, "valid");
+    assert!(!commit.snapshot.config.providers.contains_key("invalid"));
+
+    // …while the malformed section is preserved verbatim on disk so the user
+    // can repair it in place later (never silently dropped).
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("[providers.invalid]") && on_disk.contains("missing-type"),
+        "the malformed provider section must survive the write:\n{on_disk}"
+    );
+
+    // And it still round-trips as quarantined (isolated) on the next read.
+    let reread = store.read().unwrap();
+    assert!(!reread.config.providers.contains_key("invalid"));
+    assert!(reread.config.quarantined_providers.contains_key("invalid"));
+}
+
+#[test]
 fn incremental_update_never_overwrites_a_corrupt_config() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");

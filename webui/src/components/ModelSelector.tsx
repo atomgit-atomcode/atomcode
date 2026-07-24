@@ -11,6 +11,24 @@ const EFFORT_OPTIONS: { val: string | null; key: MsgKey }[] = [
   { val: 'max', key: 'effort.max' },
 ];
 
+function areModelsEqual(a: ModelInfo[], b: ModelInfo[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const ma = a[i];
+    const mb = b[i];
+    if (
+      ma.provider !== mb.provider ||
+      ma.model !== mb.model ||
+      ma.is_default !== mb.is_default ||
+      ma.effort_applicable !== mb.effort_applicable ||
+      ma.reasoning_effort !== mb.reasoning_effort
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function ModelSelector({
   value,
   onChange,
@@ -29,11 +47,22 @@ export function ModelSelector({
   const [effortOverride, setEffortOverride] = useState<string | null | undefined>(undefined);
   const ref = useRef<HTMLDivElement>(null);
   const effortRef = useRef<HTMLDivElement>(null);
+
+  const modelsRef = useRef(models);
+  modelsRef.current = models;
+  const openRef = useRef(open);
+  openRef.current = open;
+  const effortOpenRef = useRef(effortOpen);
+  effortOpenRef.current = effortOpen;
+
   useEffect(() => {
     let active = true;
     const refresh = () => {
+      if (openRef.current || effortOpenRef.current) return;
       getModels().then((next) => {
-        if (active) {
+        if (!active) return;
+        if (openRef.current || effortOpenRef.current) return;
+        if (!areModelsEqual(modelsRef.current, next)) {
           setModels(next);
           const defaultModel = next.find((model) => model.is_default) ?? next[0];
           if (defaultModel) onDefaultChange?.(defaultModel.provider);

@@ -9,7 +9,7 @@ import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { PermissionCard } from './components/PermissionCard';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
-import { getProject, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
+import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
 import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
 
@@ -236,6 +236,7 @@ export function App() {
     try { sync = new URLSearchParams(location.search).get('sync') === '1'; } catch { /* ignore */ }
     createSession(targetCwd || undefined, undefined, sync)
       .then((data) => {
+        if (data.project_hash) setProjectHash(data.project_hash);
         setSessionId(data.id);
         setActiveSession({
           id: data.id,
@@ -246,10 +247,6 @@ export function App() {
           updated_at: data.created_at,
           message_count: 0,
         });
-        // Adopt the freshly-created session's bucket as the current project so
-        // the sidebar filters to it (handlePickCwd cleared it to fall back to
-        // cwd until this resolves).
-        if (data.project_hash) setProjectHash(data.project_hash);
         setSessionListVersion((v) => v + 1);
       })
       .catch((err) => {

@@ -1735,6 +1735,27 @@ async fn get_project_state(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+pub(crate) fn update_project_state(project: &mut ProjectState, new_path: &std::path::Path) {
+    let new_path = atomcode_capabilities::pathnorm::strip_verbatim_path(new_path);
+    let new_path = normalize_working_dir_case(new_path);
+    let old_dir = project.working_dir.clone();
+    if old_dir != new_path {
+        project.previous_dir = Some(old_dir);
+        project.working_dir = new_path.clone();
+        project.name = new_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string());
+
+        let new_key = atomcode_capabilities::pathnorm::path_case_key(&new_path);
+        project
+            .recent_dirs
+            .retain(|d| atomcode_capabilities::pathnorm::path_case_key(d) != new_key);
+        project.recent_dirs.insert(0, new_path);
+        project.recent_dirs.truncate(5);
+    }
+}
+
 /// POST /cd - Change working directory (like /cd command)
 async fn change_dir(
     State(state): State<AppState>,
@@ -1862,22 +1883,7 @@ async fn change_dir(
         }
 
         // Update state
-        let old_dir = project.working_dir.clone();
-        project.previous_dir = Some(old_dir);
-        project.working_dir = new_path.clone();
-        project.name = new_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "project".to_string());
-
-        // Update recent dirs (max 5, deduplicated case-insensitively on
-        // case-insensitive filesystems so two cases of one dir don't both linger).
-        let new_key = atomcode_capabilities::pathnorm::path_case_key(&new_path);
-        project
-            .recent_dirs
-            .retain(|d| atomcode_capabilities::pathnorm::path_case_key(d) != new_key);
-        project.recent_dirs.insert(0, new_path.clone());
-        project.recent_dirs.truncate(5);
+        update_project_state(&mut project, &new_path);
 
         // Persist to config only when explicitly requested. The live in-memory
         // state above is always updated (so a webui switch survives refresh);
@@ -2101,7 +2107,11 @@ async fn create_session(
 ) -> impl IntoResponse {
     // Determine working directory
     let working_dir = match req.working_dir {
-        Some(dir) => dir,
+        Some(dir) => {
+            let mut proj = state.project.write().await;
+            update_project_state(&mut proj, &dir);
+            dir
+        }
         None => {
             // Use current project's working directory
             let project = state.project.read().await;

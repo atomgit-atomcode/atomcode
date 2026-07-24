@@ -10,6 +10,7 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 anyhow = "1"
+url = "2"
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 # `real_home_dir` (config_dir resolution): home dir + sudo-aware passwd lookup.
 dirs = "6"

@@ -55,12 +55,17 @@ fn format_version(v: (u64, u64, u64)) -> String {
 /// `atomcode-core` proxy dependency.
 fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     atomcode_config::proxy::ensure_runtime_initialized();
-    if std::env::var(atomcode_config::proxy::MODE_ENV)
+    let builder = if std::env::var(atomcode_config::proxy::MODE_ENV)
         .ok()
         .as_deref()
         == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
     {
         builder.no_proxy()
+    } else {
+        builder
+    };
+    if atomcode_config::tls::env_forces_tls12() {
+        builder.max_tls_version(reqwest::tls::Version::TLS_1_2)
     } else {
         builder
     }
@@ -113,8 +118,8 @@ mod tests {
     #[test]
     fn newer_major_version_returns_some() {
         assert_eq!(
-            parse_and_compare("v4.15.3", &manifest_body("v5.0.1")),
-            Some("v5.0.1".to_string())
+            parse_and_compare("v4.15.3", &manifest_body("v5.0.2")),
+            Some("v5.0.2".to_string())
         );
     }
 

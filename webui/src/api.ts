@@ -624,6 +624,18 @@ export async function changeDir(path: string, setDefault = false): Promise<CdRes
   return resp.json();
 }
 
+/** Delete a historical project and its sessions catalog. */
+export async function deleteProject(hash: string): Promise<void> {
+  const resp = await fetch(`/projects/${hash}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) {
+    throw new Error(`deleteProject failed: ${resp.status}`);
+  }
+}
+
+
 // --- Session detail (messages endpoint exists) ---
 
 export async function getSession(
@@ -633,6 +645,9 @@ export async function getSession(
   const resp = await fetch(`/projects/${projectHash}/sessions/${sessionId}`, {
     headers: authHeaders(),
   });
+  if (!resp.ok) {
+    throw new Error(`getSession failed with status ${resp.status}`);
+  }
   return resp.json();
 }
 

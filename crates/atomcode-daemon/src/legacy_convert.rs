@@ -980,7 +980,46 @@ pub fn prepare_catalog_session_resume_in_project(
     )
 }
 
-fn prepare_catalog_session_resume_in_project_root(
+/// Resolve one catalog location across any project bucket in the catalog,
+/// converge it to native ownership under an exclusive lease, and return that same guard.
+pub fn prepare_catalog_session_resume_any_project(
+    id: &str,
+) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
+    prepare_catalog_session_resume_any_project_in_root(
+        &SessionManager::sessions_root(),
+        id,
+    )
+}
+
+pub(crate) fn prepare_catalog_session_resume_any_project_in_root(
+    sessions_root: &std::path::Path,
+    id: &str,
+) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
+    let scan = SessionManager::scan_catalog(sessions_root);
+    report_catalog_diagnostics(&scan.diagnostics);
+    let Some(entry) = scan
+        .entries
+        .iter()
+        .find(|entry| entry.id == id)
+    else {
+        reject_matching_catalog_diagnostic(&scan.diagnostics, id)?;
+        return Ok(None);
+    };
+    let manager = SessionManager::with_root(sessions_root.join(&entry.project_bucket));
+    let lease = manager.acquire_lease(id)?;
+    let outcome = converge_session(&manager, &lease)?;
+    Ok(Some(PreparedCatalogSessionResume {
+        project_bucket: entry.project_bucket.clone(),
+        view: CatalogSessionView {
+            snapshot: outcome.snapshot,
+            meta: outcome.meta,
+            presentation: outcome.presentation,
+        },
+        lease,
+    }))
+}
+
+pub(crate) fn prepare_catalog_session_resume_in_project_root(
     sessions_root: &std::path::Path,
     project_bucket: &str,
     id: &str,
@@ -1168,6 +1207,17 @@ fn rename_catalog_session_in_project_root(
 pub fn delete_catalog_session_in_project(project_bucket: &str, id: &str) -> anyhow::Result<()> {
     delete_catalog_session_in_root(&SessionManager::sessions_root(), project_bucket, id)
 }
+
+/// Delete a project's catalog directory under sessions root
+pub fn delete_catalog_project_in_project(project_bucket: &str) -> anyhow::Result<()> {
+    validate_project_bucket(project_bucket)?;
+    let bucket_dir = SessionManager::sessions_root().join(project_bucket);
+    if bucket_dir.exists() {
+        std::fs::remove_dir_all(bucket_dir)?;
+    }
+    Ok(())
+}
+
 
 /// Append UI-only text without ever inserting it into the runtime snapshot. Native
 /// sessions use the stable turn-anchored presentation sidecar; legacy sessions keep

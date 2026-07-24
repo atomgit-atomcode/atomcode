@@ -466,6 +466,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  No previous sessions found. Start a conversation first.\n".into(),
         Msg::CmdUnknownCommand { name } =>
             format!("Unknown command: /{name}").into(),
+        Msg::CmdCustomArgRequired { name } =>
+            format!("/{name} requires an argument. Usage: /{name} <your-input>").into(),
         Msg::CmdLoginFailed { error } =>
             format!("login failed: {error}").into(),
         Msg::CmdLogoutDone =>

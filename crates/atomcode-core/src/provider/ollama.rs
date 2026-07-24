@@ -24,7 +24,11 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     pub fn new(config: &ProviderConfig) -> Result<Self> {
         Ok(Self {
-            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify)?,
+            client: super::build_http_client(
+                config.user_agent.as_deref(),
+                config.skip_tls_verify,
+                false,
+            )?,
             model: config.model.clone(),
             base_url: config
                 .base_url

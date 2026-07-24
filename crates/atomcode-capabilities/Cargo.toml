@@ -47,6 +47,13 @@ tokio-util = { version = "0.7", optional = true }
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false, optional = true }
 # OS native root store loader for corporate MITM-proxy CAs. Best-effort. #514.
 rustls-native-certs = { version = "0.8", optional = true }
+# rustls (parser only, no crypto provider) to PRE-VALIDATE each OS root before we
+# hand it to reqwest. reqwest feeds added roots to `rustls::RootCertStore::add` at
+# `.build()` and aborts the WHOLE client on the first cert rustls rejects, so we
+# mirror reqwest's own tolerant native loader and drop the bad ones. Already in the
+# tree via reqwest's `rustls-tls`; `default-features = false` + `std` avoids pulling
+# a second crypto provider. See issue #514.
+rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
 # RFC 7231 HTTP-date parsing for `Retry-After` headers that use the date form (e.g. some
 # Anthropic 429s) instead of delta-seconds. Already in the tree via reqwest. provider-only.
 httpdate = { version = "1", optional = true }
@@ -126,7 +133,7 @@ tar = { version = "0.4", optional = true }
 default = ["provider", "tools"]
 # Real LlmProvider adapters (OpenAI-compatible: GLM / DeepSeek / …). `dirs` resolves the
 # wire-dump output dir (config_dir()/wire-dump) for the byte-level ATOMCODE_WIRE_DUMP.
-provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:getrandom", "dep:tracing"]
+provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:rustls", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:atomcode-config", "dep:getrandom", "dep:tracing"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
 tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "tokio/fs", "tokio/process", "tokio/io-util"]
