@@ -591,8 +591,7 @@ pub(crate) async fn run_chat_turn_v2(
     } = runtime;
     // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
     // （非视觉模型的 provider adapter 会因原图而报 400 错误）
-    let user_images = if user_text.contains("[图片内容（由") || user_text.contains("[图片识别失败]")
-    {
+    let user_images = if text_carries_vl_caption(&user_text) {
         Vec::new()
     } else {
         user_images
@@ -1313,6 +1312,15 @@ pub(crate) async fn preprocess_image_caption(
     }
 }
 
+/// Whether `text` is a VL-preprocessed caption produced by [`preprocess_image_caption`]
+/// (image described, or recognition failed) rather than the user's own words. The two
+/// markers are the canonical signal the daemon uses to decide the raw image must NOT
+/// reach a text-only model. Centralized so the runtime-strip and the webui-echo split
+/// agree on one definition instead of open-coding the marker strings at each site.
+fn text_carries_vl_caption(text: &str) -> bool {
+    text.contains("[图片内容（由") || text.contains("[图片识别失败]")
+}
+
 /// 对 live 输入做视觉预处理：主模型不支持视觉时，用 VL 模型把图片转文字拼进 caption
 /// （原图始终保留在 MultiPart 里用于缩略图渲染）。与 `/chat` 路径共享
 /// [`preprocess_image_caption`]；任何 config/provider 加载失败都降级为原文，不阻断发送。
@@ -1431,31 +1439,57 @@ pub(crate) async fn live_message(
             data: image.data,
         })
         .collect();
-    let text = preprocess_live_caption(
+    let runtime_text = preprocess_live_caption(
         &req.message,
         &original_images,
         Some(&provider_name),
         Some(&join.binding.session_id),
     )
     .await;
-    let images = if text != req.message {
-        Vec::new()
-    } else {
-        original_images
-            .into_iter()
-            .map(|image| atomcode_kernel::message::ImageContent {
-                media_type: image.media_type,
-                data: image.data,
-            })
-            .collect()
-    };
-    match crate::native_live::submit_confirmed(atomcode_coding::UserInput { text, images }).await {
+    let echo_images: Vec<atomcode_kernel::message::ImageContent> = original_images
+        .into_iter()
+        .map(|image| atomcode_kernel::message::ImageContent {
+            media_type: image.media_type,
+            data: image.data,
+        })
+        .collect();
+    let (runtime_input, echo_input) = split_live_inputs(req.message, echo_images, runtime_text);
+    match crate::native_live::submit_confirmed_with_echo(runtime_input, echo_input).await {
         Ok(_) => Json(serde_json::json!({ "accepted": true })),
         Err(error) => Json(serde_json::json!({
             "accepted": false,
             "error": format!("live submit rejected: {error:?}"),
         })),
     }
+}
+
+/// Split a submitted live message into the input fed to the model (`runtime`) vs the
+/// input echoed to the live view (`echo`). When VL preprocessing rewrote the text
+/// (`runtime_text` differs from the user's `message`, i.e. a caption was produced for
+/// a text-only model), the raw image bytes are dropped from the RUNTIME input — the
+/// adapter would 400 on them — but the ECHO always keeps the user's ORIGINAL text +
+/// images so the webui / synchronized TUI display shows what the user typed instead
+/// of the machine caption overwriting it.
+fn split_live_inputs(
+    message: String,
+    original_images: Vec<atomcode_kernel::message::ImageContent>,
+    runtime_text: String,
+) -> (atomcode_coding::UserInput, atomcode_coding::UserInput) {
+    let runtime_images = if text_carries_vl_caption(&runtime_text) {
+        Vec::new()
+    } else {
+        original_images.clone()
+    };
+    (
+        atomcode_coding::UserInput {
+            text: runtime_text,
+            images: runtime_images,
+        },
+        atomcode_coding::UserInput {
+            text: message,
+            images: original_images,
+        },
+    )
 }
 
 /// POST /live/stop — cancel the turn shared by the TUI and synchronized webui tabs.
@@ -1925,6 +1959,60 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 mod tests {
     use super::*;
     use atomcode_core::conversation::message::Message;
+
+    fn img(tag: &str) -> atomcode_kernel::message::ImageContent {
+        atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: tag.into(),
+        }
+    }
+
+    #[test]
+    fn split_live_inputs_echoes_original_when_vl_preprocessed() {
+        // A text-only model preprocessed the image into a caption. The RUNTIME gets
+        // the caption with NO image bytes (the adapter would 400 on them); the ECHO —
+        // what the webui / synced TUI displays — keeps the user's ORIGINAL text +
+        // image so the caption never overwrites the user's message. (The reported bug.)
+        let (runtime, echo) = split_live_inputs(
+            "look at this".into(),
+            vec![img("orig-bytes")],
+            "look at this\n\n[图片内容（由 vl 识别）]\na chart".into(),
+        );
+        assert_eq!(runtime.text, "look at this\n\n[图片内容（由 vl 识别）]\na chart");
+        assert!(runtime.images.is_empty(), "raw image must not reach a text-only model");
+        assert_eq!(echo.text, "look at this", "display must show the user's original text");
+        assert_eq!(echo.images, vec![img("orig-bytes")], "display must keep the image");
+    }
+
+    #[test]
+    fn split_live_inputs_keeps_image_for_vision_model_when_not_preprocessed() {
+        // A vision model needs no caption: runtime_text == message, so the raw image
+        // flows to BOTH the model and the echo unchanged.
+        let (runtime, echo) =
+            split_live_inputs("hi".into(), vec![img("orig-bytes")], "hi".into());
+        assert_eq!(runtime.text, "hi");
+        assert_eq!(runtime.images, vec![img("orig-bytes")]);
+        assert_eq!(echo.text, "hi");
+        assert_eq!(echo.images, vec![img("orig-bytes")]);
+    }
+
+    #[test]
+    fn split_live_inputs_keys_off_the_vl_marker_not_text_inequality() {
+        // The image-drop decision keys off the VL caption MARKER (the daemon's
+        // canonical signal), NOT a brittle `runtime_text != message`. A rewrite that
+        // changed the text WITHOUT a marker (not something the preprocessor produces,
+        // but the guard must be marker-based) keeps the image for the model.
+        let (runtime, _) = split_live_inputs(
+            "hi".into(),
+            vec![img("orig-bytes")],
+            "hi (edited, no marker)".into(),
+        );
+        assert_eq!(
+            runtime.images,
+            vec![img("orig-bytes")],
+            "no VL marker ⇒ not a caption ⇒ image is NOT dropped"
+        );
+    }
 
     /// Trust round-trip at the daemon layer: trust_project → is_project_trusted → partition_by_trust
     /// clears blocked list.  Uses ATOMCODE_MCP_TRUST_STORE as the test seam so we never touch the

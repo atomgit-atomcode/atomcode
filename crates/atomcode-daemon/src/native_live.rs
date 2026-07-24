@@ -133,6 +133,19 @@ pub async fn submit_confirmed(
     hub().submit_confirmed(input).await
 }
 
+/// Submit `runtime_input` to the model while echoing `echo_input` to the live view
+/// (see [`crate::live_hub::LiveViewHub::submit_confirmed_with_echo`]). Used by the
+/// webui image path so the VL caption feeds the model but the user's original
+/// message + image is what displays.
+pub async fn submit_confirmed_with_echo(
+    runtime_input: UserInput,
+    echo_input: UserInput,
+) -> Result<atomcode_coding::SubmitReceipt, HubError> {
+    hub()
+        .submit_confirmed_with_echo(runtime_input, echo_input)
+        .await
+}
+
 pub fn accept_local_input(input: UserInput) -> Result<(), HubError> {
     hub().accept_local_input(input)
 }

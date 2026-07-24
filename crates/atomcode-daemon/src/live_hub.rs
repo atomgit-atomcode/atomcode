@@ -310,9 +310,26 @@ impl LiveViewHub {
     }
 
     pub async fn submit_confirmed(&self, input: UserInput) -> Result<SubmitReceipt, HubError> {
+        let echo = input.clone();
+        self.submit_confirmed_with_echo(input, echo).await
+    }
+
+    /// Like [`Self::submit_confirmed`], but the view echo — what every subscribed
+    /// tab (and a synchronized TUI) DISPLAYS, and what late joiners replay — is
+    /// `echo_input`, DISTINCT from the `runtime_input` fed to the model.
+    ///
+    /// The webui image path needs this: it submits the VL-PREPROCESSED caption as
+    /// `runtime_input` (a text-only model 400s on the raw image bytes) while
+    /// echoing the user's ORIGINAL text + image, so the live view shows what the
+    /// user actually typed instead of the machine-generated caption overwriting it.
+    pub async fn submit_confirmed_with_echo(
+        &self,
+        runtime_input: UserInput,
+        echo_input: UserInput,
+    ) -> Result<SubmitReceipt, HubError> {
         let (binding, handle) = self.bound_handle()?;
         let receipt = handle
-            .submit(input.clone())
+            .submit(runtime_input)
             .await
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
         let receipt_generation = match receipt {
@@ -335,7 +352,7 @@ impl LiveViewHub {
             state.pending_requests.clear();
         }
         state.turn_active = true;
-        self.publish_view_locked(&mut state, LiveViewEvent::InputAccepted(input), true);
+        self.publish_view_locked(&mut state, LiveViewEvent::InputAccepted(echo_input), true);
         Ok(receipt)
     }
 
