@@ -1169,6 +1169,17 @@ pub fn delete_catalog_session_in_project(project_bucket: &str, id: &str) -> anyh
     delete_catalog_session_in_root(&SessionManager::sessions_root(), project_bucket, id)
 }
 
+/// Delete a project's catalog directory under sessions root
+pub fn delete_catalog_project_in_project(project_bucket: &str) -> anyhow::Result<()> {
+    validate_project_bucket(project_bucket)?;
+    let bucket_dir = SessionManager::sessions_root().join(project_bucket);
+    if bucket_dir.exists() {
+        std::fs::remove_dir_all(bucket_dir)?;
+    }
+    Ok(())
+}
+
+
 /// Append UI-only text without ever inserting it into the runtime snapshot. Native
 /// sessions use the stable turn-anchored presentation sidecar; legacy sessions keep
 /// their historical JSON representation until S4b performs cutover.

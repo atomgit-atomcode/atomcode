@@ -9,7 +9,7 @@ import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { PermissionCard } from './components/PermissionCard';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
-import { getProject, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
+import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
 import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
 
@@ -140,14 +140,29 @@ export function App() {
     setSidebarOpen((o) => !o);
   }
 
-  // Seed cwd from /project on mount（恢复会话时以会话目录为准，故只在仍为空时填充）
+  // Seed cwd from /project on mount（若设置了默认目录且与当前目录不一致，且未恢复特定URL会话，自动切换）
   useEffect(() => {
     let cancelled = false;
-    getProject()
-      .then((p) => {
+    Promise.all([getProject(), getConfig()])
+      .then(([p, cfg]) => {
         if (cancelled) return;
-        if (p.working_dir) setCwd((c) => c || p.working_dir);
-        if (p.project_hash) setProjectHash((h) => h || p.project_hash!);
+        const normDefault = cfg.default_workdir ? cfg.default_workdir.replace(/\/+$/, '') : '';
+        const normCurrent = p.working_dir ? p.working_dir.replace(/\/+$/, '') : '';
+        if (normDefault && normDefault !== normCurrent && !urlSessionRef.current) {
+          changeDir(cfg.default_workdir!)
+            .then((res) => {
+              if (!cancelled && res.current_dir) {
+                handlePickCwd(res.current_dir);
+              }
+            })
+            .catch(() => {
+              if (p.working_dir) setCwd((c) => c || p.working_dir);
+              if (p.project_hash) setProjectHash((h) => h || p.project_hash!);
+            });
+        } else {
+          if (p.working_dir) setCwd((c) => c || p.working_dir);
+          if (p.project_hash) setProjectHash((h) => h || p.project_hash!);
+        }
       })
       .catch(() => {
         // Ignore; cwd stays empty
@@ -236,6 +251,7 @@ export function App() {
     try { sync = new URLSearchParams(location.search).get('sync') === '1'; } catch { /* ignore */ }
     createSession(targetCwd || undefined, undefined, sync)
       .then((data) => {
+        if (data.project_hash) setProjectHash(data.project_hash);
         setSessionId(data.id);
         setActiveSession({
           id: data.id,
@@ -246,10 +262,6 @@ export function App() {
           updated_at: data.created_at,
           message_count: 0,
         });
-        // Adopt the freshly-created session's bucket as the current project so
-        // the sidebar filters to it (handlePickCwd cleared it to fall back to
-        // cwd until this resolves).
-        if (data.project_hash) setProjectHash(data.project_hash);
         setSessionListVersion((v) => v + 1);
       })
       .catch((err) => {

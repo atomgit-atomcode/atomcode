@@ -1,7 +1,7 @@
 // Task 15b — Working directory picker modal
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { listDir, getProjects, changeDir, mkdir, ProjectInfo } from '../api';
+import { listDir, getProjects, changeDir, deleteProject, mkdir, ProjectInfo } from '../api';
 import { useT } from '../settings';
 
 interface CwdPickerProps {
@@ -100,6 +100,16 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
   function handleProjectClick(workingDir: string) {
     setBrowsePath(workingDir);
     setInputPath(workingDir);
+  }
+
+  async function handleDeleteProject(hash: string, e: MouseEvent) {
+    e.stopPropagation();
+    try {
+      await deleteProject(hash);
+      setProjects((prev) => prev.filter((p) => p.hash !== hash));
+    } catch {
+      setProjects((prev) => prev.filter((p) => p.hash !== hash));
+    }
   }
 
   async function handleCreateFolder() {
@@ -237,14 +247,22 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
               {projects.slice(0, 6).map((p) => {
                 const isCurrent = p.working_dir === browsePath;
                 return (
-                  <button
+                  <div
                     key={p.hash}
                     class={'list-row' + (isCurrent ? ' active' : '')}
                     onClick={() => handleProjectClick(p.working_dir)}
                   >
-                    <span class="mono">{p.working_dir}</span>
+                    <span class="mono" style="flex:1;min-width:0">{p.working_dir}</span>
                     {isCurrent && <span class="badge">● {t('cwd.current')}</span>}
-                  </button>
+                    <button
+                      type="button"
+                      title="移除此项目"
+                      style="background:none;border:none;cursor:pointer;padding:2px 4px;opacity:0.6;font-size:12px;margin-left:auto;color:inherit;"
+                      onClick={(e) => handleDeleteProject(p.hash, e)}
+                    >
+                      ✕
+                    </button>
+                  </div>
                 );
               })}
             </div>

@@ -639,8 +639,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     if (loadedForRef.current === sessionId) return;
 
     const projectHash = activeSession?.project_hash;
-    if (!projectHash) {
-      // 还没拿到 project_hash：先给「继续会话」提示，等其到位再由本 effect 重跑加载。
+    if (!projectHash || (activeSession && activeSession.id !== sessionId)) {
+      // 还没拿到对齐的 project_hash / activeSession：先给「继续会话」提示，等其到位再由本 effect 重跑加载。
       setHistoryHint(t('chat.continueSession', { id: sessionId.slice(0, 8) }));
       setLoading(false);
       return;
@@ -663,7 +663,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         ) return;
 
         let nextHint: string | null = null;
-        if (sessionResult.status === 'fulfilled') {
+        if (sessionResult.status === 'fulfilled' && sessionResult.value && Array.isArray(sessionResult.value.messages)) {
           // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
           const loaded = sessionMessagesToDisplay(sessionResult.value.messages);
           const currentCached = messageCacheRef.current.get(loadId);
