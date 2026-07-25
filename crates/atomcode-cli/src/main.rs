@@ -1824,12 +1824,18 @@ fn spawn_deferred_tui_runtime(
 ) -> atomcode_tuix::SpawnedRuntime {
     let session_id = session.id.as_str().to_string();
     let snapshot = session.to_conversation_snapshot();
+    // Base agent config for the VL preprocessor's one-off provider builds,
+    // derived from this runtime's config before `cfg` is moved into the spawn.
+    let vl_base = cfg.agent_config();
     let (native_control, mut events, runtime_state) =
         atomcode_daemon::spawn_native_runtime_for_session_deferred_with_preprocessor(
             cfg,
             session_id.clone(),
             snapshot,
-            Some(std::sync::Arc::new(crate::vision::VlImagePreprocessor)),
+            Some(std::sync::Arc::new(crate::vision::VlImagePreprocessor::new(
+                atomcode_daemon::coding_provider_factory(),
+                vl_base,
+            ))),
         );
     let control = atomcode_tuix::RuntimeControl::deferred(native_control, runtime_state);
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2146,7 +2152,10 @@ async fn spawn_native_cli_runtime(
         // Restore the TUI's VL image recognition (dropped when the legacy
         // bridge was retired): convert images to text for non-vision models
         // inside the async turn, so it never blocks the UI. See `vision`.
-        image_preprocessor: Some(std::sync::Arc::new(crate::vision::VlImagePreprocessor)),
+        image_preprocessor: Some(std::sync::Arc::new(crate::vision::VlImagePreprocessor::new(
+            atomcode_daemon::coding_provider_factory(),
+            agent.clone(),
+        ))),
     };
     let runtime = match imported_lease {
         Some(lease) => {
