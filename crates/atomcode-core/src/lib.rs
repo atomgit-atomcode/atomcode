@@ -24,8 +24,6 @@ mod fs_atomic;
 pub mod lsp;
 pub mod plugin;
 pub mod proxy;
-pub mod skill;
-pub mod skill_render;
 pub mod trace;
 
 /// User-Agent identifier for every outbound HTTP request the app makes.

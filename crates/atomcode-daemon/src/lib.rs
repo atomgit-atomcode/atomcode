@@ -4626,8 +4626,14 @@ pub struct SkillInfo {
 /// GET /skills - List user-invocable skills for the current project.
 async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
-    let mut registry = atomcode_core::skill::SkillRegistry::new();
+    // Standard home/project skill dirs, then installed-plugin skill dirs — same
+    // two layers `core::skill::reload` loaded (its plugin layer via
+    // `iter_installed_plugin_assets`; here via `gather_plugin_skill_dirs`).
+    let mut registry = atomcode_capabilities::skills::SkillRegistry::new();
     registry.reload(&working_dir);
+    for (dir, namespace) in crate::gather_plugin_skill_dirs() {
+        registry.load_dir(&dir, Some(&namespace));
+    }
     let skills: Vec<SkillInfo> = registry
         .user_invocable()
         .map(|s| SkillInfo {

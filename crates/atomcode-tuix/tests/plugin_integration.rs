@@ -81,10 +81,18 @@ fn add_install_reload_flow() {
     )
     .unwrap();
 
-    // Verify SkillRegistry sees `e2e:sk`.
+    // Verify SkillRegistry sees `e2e:sk`. Load standard dirs then installed-plugin
+    // skill dirs — the two layers the retired `core::skill::reload` combined.
     let working = tempfile::tempdir().unwrap();
-    let mut reg = atomcode_core::skill::SkillRegistry::new();
+    let mut reg = atomcode_capabilities::skills::SkillRegistry::new();
     reg.reload(working.path());
+    for assets in atomcode_capabilities::plugin::loader::iter_installed_plugin_assets() {
+        for sd in assets.skills_dirs() {
+            if sd.exists() {
+                reg.load_dir(&sd, Some(&assets.plugin));
+            }
+        }
+    }
     assert!(reg.get("e2e:sk").is_some(), "missing skill e2e:sk");
 
     // Verify CustomCommandRegistry sees `e2e:c`. The registry moved to
