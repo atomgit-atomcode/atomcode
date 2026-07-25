@@ -608,6 +608,12 @@ pub struct StatusLine {
     /// two are mutually exclusive). `None` ⇒ no question pending, panel omitted.
     /// Mirrors `approval` — the renderer owns glyph/width/terminal-safety.
     pub user_input: Option<UserInputPanelView>,
+    /// When the round-cap checkpoint is active (the agent reached its configured
+    /// max-rounds limit and is asking the user whether to continue), this carries
+    /// the panel view for the dedicated footer picker. Rendered in the same slot
+    /// as `approval` / `user_input` (all three are mutually exclusive; the priority
+    /// order is: approval > user_input > round_cap_panel). `None` ⇒ no checkpoint.
+    pub round_cap_panel: Option<UserInputPanelView>,
     /// When an autonomous `/goal` loop is active, this carries its live status
     /// for the DEDICATED footer goal row (its own full-width line above the
     /// status row). `None` ⇒ no goal running, row omitted. Previously this was
@@ -683,6 +689,40 @@ pub struct UserInputBatchMeta {
     pub answered: Vec<bool>,
     /// The cursor is on the Submit stop (render the submit screen, not a question).
     pub on_submit: bool,
+}
+
+/// Build a [`UserInputPanelView`] for the round-cap checkpoint panel (style B:
+/// Single picker, two options with descriptions, no free-text "Other" row).
+///
+/// `cap` is the configured round limit (displayed in both the question and the
+/// continue option description). `cursor` is the currently highlighted row
+/// (0 = "继续", 1 = "停止"). `stats` is a pre-formatted elapsed/token string
+/// (e.g. "2h0m0s · 305.00K tokens") — appended to the question when non-empty.
+pub fn round_cap_view(cap: u32, cursor: usize, stats: &str) -> UserInputPanelView {
+    use atomcode_capabilities::tools::request_user_input::UserInputMode;
+    let question = if stats.is_empty() {
+        format!("已运行 {cap} 轮，继续吗？")
+    } else {
+        format!("已运行 {cap} 轮（{stats}），继续吗？")
+    };
+    UserInputPanelView {
+        header: "轮次上限".to_string(),
+        question,
+        mode: UserInputMode::Single,
+        options: vec![
+            (
+                "继续".to_string(),
+                Some(format!("再跑 {cap} 轮后重新确认")),
+            ),
+            ("停止".to_string(), Some("结束本回合".to_string())),
+        ],
+        cursor,
+        checked: vec![],
+        text: String::new(),
+        custom_text: String::new(),
+        custom: false,
+        batch: None,
+    }
 }
 
 /// Progress of the active todo list, rendered as the multi-line footer todo

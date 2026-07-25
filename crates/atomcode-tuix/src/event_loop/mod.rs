@@ -18936,7 +18936,29 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         todo,
         approval,
         user_input,
+        round_cap_panel: state.round_cap_panel.as_ref().map(|p| {
+            crate::render::round_cap_view(p.cap, p.cursor, &round_cap_stats(state))
+        }),
     }
+}
+
+/// Format the live stats string for the round-cap checkpoint panel.
+/// Returns "Xh Ym Zs · N.NNK tokens" (time · tokens), or just one
+/// component if the other is absent/zero.  Tool count is omitted —
+/// no live in-turn tool accumulator exists (only the per-turn
+/// completion count in `PendingSeparator`).
+fn round_cap_stats(state: &crate::state::UiState) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(d) = state.turn_elapsed() {
+        parts.push(crate::render::fmt_dur(d));
+    }
+    if state.total_tokens > 0 {
+        parts.push(format!(
+            "{} tokens",
+            atomcode_config::i18n::fmt_tokens(state.total_tokens)
+        ));
+    }
+    parts.join(" · ")
 }
 
 fn build_input_status(state: &UiState, ctx: &LoopCtx, buf: &Buffer) -> crate::render::StatusLine {

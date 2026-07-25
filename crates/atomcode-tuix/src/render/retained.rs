@@ -3590,11 +3590,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .as_ref()
             .map(|t| self.build_todo_rows(t, rule_width))
             .unwrap_or_default();
-        // Modal panel cells: approval OR user_input (mutually exclusive; approval
-        // wins if both are set). Drawn in the shared `approval_active` slot below.
+        // Modal panel cells: approval OR user_input OR round_cap_panel (mutually
+        // exclusive; approval wins, then user_input, then round_cap_panel).
+        // Drawn in the shared `approval_active` slot below.
         let approval_cells: Vec<Vec<Cell>> = if let Some(p) = status_clone.approval.as_ref() {
             self.build_approval_rows(p, rule_width, w)
         } else if let Some(p) = status_clone.user_input.as_ref() {
+            self.build_user_input_panel_view(p, rule_width, w)
+        } else if let Some(p) = status_clone.round_cap_panel.as_ref() {
             self.build_user_input_panel_view(p, rule_width, w)
         } else {
             Vec::new()
@@ -4102,22 +4105,26 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     /// Returns `true` when a modal footer panel that REPLACES the input box is
-    /// active — either the tool-approval panel or the `request_user_input`
-    /// panel (mutually exclusive). Both hide the input box + status row and are
-    /// drawn in the same slot, so the layout treats them identically.
+    /// active — the tool-approval panel, the `request_user_input` panel, or the
+    /// round-cap checkpoint panel (all mutually exclusive). All hide the input
+    /// box + status row and are drawn in the same slot.
     #[inline]
     fn approval_active(&self) -> bool {
-        self.status.approval.is_some() || self.status.user_input.is_some()
+        self.status.approval.is_some()
+            || self.status.user_input.is_some()
+            || self.status.round_cap_panel.is_some()
     }
 
-    /// Rows the modal panel (approval OR user_input) occupies — 0 when neither
-    /// is active. Single source so both `paint_footer` and `current_footer_rows`
-    /// agree. The two panels are mutually exclusive; approval wins if both are
-    /// somehow set (shouldn't happen).
+    /// Rows the modal panel (approval OR user_input OR round_cap_panel) occupies
+    /// — 0 when none is active. Single source so both `paint_footer` and
+    /// `current_footer_rows` agree. Priority: approval > user_input >
+    /// round_cap_panel (all mutually exclusive in practice).
     fn modal_panel_rows(&self) -> usize {
         if let Some(p) = self.status.approval.as_ref() {
             self.approval_panel_row_count(p)
         } else if let Some(p) = self.status.user_input.as_ref() {
+            self.user_input_panel_view_row_count(p)
+        } else if let Some(p) = self.status.round_cap_panel.as_ref() {
             self.user_input_panel_view_row_count(p)
         } else {
             0
@@ -8173,6 +8180,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            round_cap_panel: None,
         }
     }
 
@@ -8417,6 +8425,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -8469,6 +8478,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, /* shell */ true);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -8540,6 +8550,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -8587,6 +8598,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
         let idx = row
@@ -8638,6 +8650,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -8689,6 +8702,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -8724,6 +8738,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -14111,6 +14126,22 @@ mod tests {
         assert_eq!(sub_rows.len(), 5);
     }
 
+    /// Round-cap checkpoint: `round_cap_view` produces a Single-mode
+    /// `UserInputPanelView` with the correct header, question, and two options.
+    #[test]
+    fn round_cap_view_renders_header_and_two_options() {
+        let view = crate::render::round_cap_view(200, 0, "2h0m0s · 305.00K tokens");
+        assert_eq!(view.header, "轮次上限");
+        assert!(
+            view.question.contains("已运行 200 轮"),
+            "question should contain '已运行 200 轮', got: {}",
+            view.question
+        );
+        assert_eq!(view.options.len(), 2);
+        assert_eq!(view.options[0].0, "继续");
+        assert_eq!(view.options[1].0, "停止");
+    }
+
     /// Step 1: option rows carry `1. ` / `2. ` / `3. ` numeric prefixes, the
     /// selected row (`selected=0`) spans the full terminal width with reverse
     /// highlight, and a hint row appears after the last option.
@@ -18061,6 +18092,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            round_cap_panel: None,
         };
         status.approval = Some(crate::render::ApprovalPanelView {
             tool: "Bash".into(),
