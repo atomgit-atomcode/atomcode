@@ -83,7 +83,6 @@ use atomcode_coding::CodingRuntimeEvent;
 use atomcode_config::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_capabilities::mcp::McpRegistry;
-use atomcode_core::provider;
 use atomcode_telemetry::detect_repo_origin;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
@@ -3628,17 +3627,11 @@ async fn process_chat_request(
         .providers
         .get(&provider_name)
         .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_name))?;
-    // Pre-flight: validate the selected provider config up front so a bad
-    // provider surfaces a clean error here rather than deep in the runtime. The
-    // runtime builds its own provider for the actual turn.
-    // `create_provider` may do blocking auth I/O (OAuth token refresh) — run it
-    // off the async runtime so a slow/unreachable auth host can't block a worker.
-    let active_provider = {
-        let cfg = provider_config.clone();
-        tokio::task::spawn_blocking(move || provider::create_provider(&cfg))
-            .await
-            .map_err(|e| anyhow::anyhow!("provider construction task panicked: {e}"))??
-    };
+    // The provider config's existence is validated above; the native runtime
+    // builds (and validates) its own kernel provider for the actual turn and
+    // surfaces a clean error there. No core-provider preflight is needed — the
+    // VL preprocessor builds its own session-bound provider (see
+    // `preprocess_image_caption`), so nothing here consumes `core::provider`.
     let _ = event_tx.send(ChatEvent::RuntimeInfo {
         provider: provider_name.clone(),
         model: provider_config.model.clone(),
@@ -3670,10 +3663,6 @@ async fn process_chat_request(
     active_chats
         .bind_session(&operation_id, &session_id)
         .await?;
-
-    // Bind the persisted conversation id to the one-off active provider used by the
-    // VL preprocessor, preserving the same gateway affinity as the main chat turn.
-    active_provider.set_session_id(&session_id);
 
     // Key used to route interactive permission decisions back to this turn's
     // decider. We use the *actual* session id (not req.session_id, which may be
