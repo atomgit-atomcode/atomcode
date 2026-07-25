@@ -12750,15 +12750,43 @@ fn deliver_round_cap(ctx: &mut LoopCtx, id: u64, cont: bool) {
         .ok();
 }
 
-/// Pure predicate: should a `request_user_input` tool call be auto-skipped
-/// without showing the interactive panel?
-///
-/// Only Bypass / 免审批 mode (`Mode::Auto`) skips the panel.  Build and Plan
-/// modes always show the panel (asking during coding/planning is intentional).
-/// Extracted as a pure function so the contract is unit-testable without a
-/// full `LoopCtx`.
+enum TuiUserInputPresentation {
+    Single(atomcode_capabilities::tools::request_user_input::UserInputRequest),
+    Batch(Vec<atomcode_capabilities::tools::request_user_input::UserInputRequest>),
+    Invalid,
+}
+
+/// Parse a native `request_user_input` payload into the presentation the
+/// interactive TUI owns. Deliberately has no `AgentMode` input: Auto / `-y`
+/// changes approval policy, not whether a human-facing TUI can ask questions.
+fn classify_tui_user_input(payload: serde_json::Value) -> TuiUserInputPresentation {
+    use atomcode_capabilities::tools::request_user_input::UserInputRequest;
+
+    if let Some(questions) = payload
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+    {
+        let requests = questions
+            .iter()
+            .filter_map(|question| serde_json::from_value::<UserInputRequest>(question.clone()).ok())
+            .collect::<Vec<_>>();
+        return if requests.is_empty() {
+            TuiUserInputPresentation::Invalid
+        } else {
+            TuiUserInputPresentation::Batch(requests)
+        };
+    }
+
+    serde_json::from_value(payload)
+        .map(TuiUserInputPresentation::Single)
+        .unwrap_or(TuiUserInputPresentation::Invalid)
+}
+
+/// Round-cap confirmation is an execution safety checkpoint rather than a
+/// model-authored user question. Preserve the existing unattended Auto-mode
+/// behavior: stop fail-closed instead of opening an interactive checkpoint.
 #[inline]
-pub(crate) fn user_input_should_auto_skip(mode: crate::state::AgentMode) -> bool {
+fn round_cap_should_auto_stop(mode: crate::state::AgentMode) -> bool {
     mode.is_auto()
 }
 
@@ -15176,56 +15204,25 @@ fn handle_runtime_event(
                 }
                 CodingRuntimeEvent::Request(request) => {
                     use atomcode_capabilities::tools::{
-                        request_user_input::{
-                            UserInputRequest, UserInputResponse, REQUEST_USER_INPUT_KIND,
-                        },
+                        request_user_input::{UserInputResponse, REQUEST_USER_INPUT_KIND},
                         ApprovalRequest, APPROVAL_KIND,
                     };
                     if request.kind == REQUEST_USER_INPUT_KIND {
-                        // Batch form: a non-empty `questions` array. Handled before the
-                        // single path so a multi-question request never hits the flat parse.
-                        if let Some(qs) = request
-                            .payload
-                            .get("questions")
-                            .and_then(serde_json::Value::as_array)
-                        {
-                            let reqs: Vec<UserInputRequest> = qs
-                                .iter()
-                                .filter_map(|q| {
-                                    serde_json::from_value::<UserInputRequest>(q.clone()).ok()
-                                })
-                                .collect();
-                            if reqs.is_empty() {
-                                deliver_user_input(ctx, request.id, UserInputResponse::declined());
-                                return;
+                        match classify_tui_user_input(request.payload) {
+                            TuiUserInputPresentation::Batch(requests) => {
+                                state.user_input_batch =
+                                    Some(crate::state::UserInputBatch::new(request.id, &requests));
+                                state.phase = UiPhase::UserInput;
+                                redraw_idle_plain(buf, state, ctx, renderer);
                             }
-                            if user_input_should_auto_skip(state.agent_mode) {
-                                deliver_user_input_batch(
-                                    ctx,
-                                    request.id,
-                                    vec![UserInputResponse::declined(); reqs.len()],
-                                );
-                                return;
-                            }
-                            state.user_input_batch =
-                                Some(crate::state::UserInputBatch::new(request.id, &reqs));
-                            state.phase = UiPhase::UserInput;
-                            redraw_idle_plain(buf, state, ctx, renderer);
-                            return;
-                        }
-                        if user_input_should_auto_skip(state.agent_mode) {
-                            deliver_user_input(ctx, request.id, UserInputResponse::declined());
-                            return;
-                        }
-                        match serde_json::from_value::<UserInputRequest>(request.payload) {
-                            Ok(input) => {
+                            TuiUserInputPresentation::Single(input) => {
                                 state.user_input_panel =
                                     Some(crate::state::UserInputPanel::new(request.id, &input));
                                 state.phase = UiPhase::UserInput;
                                 redraw_idle_plain(buf, state, ctx, renderer);
                             }
-                            Err(_) => {
-                                deliver_user_input(ctx, request.id, UserInputResponse::declined())
+                            TuiUserInputPresentation::Invalid => {
+                                deliver_user_input(ctx, request.id, UserInputResponse::declined());
                             }
                         }
                         return;
@@ -15245,7 +15242,7 @@ fn handle_runtime_event(
                             .map(|b| b as u32)
                             .unwrap_or(cap);
                         // 无值守/免审批模式：fail-closed 停止（等同旧 MaxRounds）。
-                        if user_input_should_auto_skip(state.agent_mode) {
+                        if round_cap_should_auto_stop(state.agent_mode) {
                             deliver_round_cap(ctx, request.id, false);
                             return;
                         }
@@ -20785,57 +20782,72 @@ mod format_shell_command_tests {
 }
 
 #[cfg(test)]
-mod user_input_bypass_tests {
-    use super::user_input_should_auto_skip;
+mod user_input_mode_tests {
+    use super::{
+        classify_tui_user_input, round_cap_should_auto_stop, TuiUserInputPresentation,
+    };
     use crate::state::AgentMode;
 
-    /// Bypass (Auto) mode → panel must be skipped.
     #[test]
-    fn bypass_mode_skips_panel() {
-        assert!(
-            user_input_should_auto_skip(AgentMode::Auto),
-            "Bypass/Auto mode must auto-skip the user_input panel"
-        );
+    fn flat_payload_is_presented_as_a_single_question() {
+        let payload = serde_json::json!({
+            "header": "Scope",
+            "question": "Which module?",
+            "mode": "single",
+            "options": [{ "label": "Core" }],
+            "custom": false
+        });
+
+        let TuiUserInputPresentation::Single(request) = classify_tui_user_input(payload) else {
+            panic!("flat payload must open the single-question panel");
+        };
+        assert_eq!(request.header, "Scope");
     }
 
-    /// Build mode → panel must be shown (no skip).
     #[test]
-    fn build_mode_shows_panel() {
-        assert!(
-            !user_input_should_auto_skip(AgentMode::Build),
-            "Build mode must NOT skip the user_input panel"
-        );
+    fn questions_array_is_presented_as_a_batch() {
+        let payload = serde_json::json!({
+            "questions": [
+                {
+                    "header": "Scope",
+                    "question": "Which module?",
+                    "mode": "single",
+                    "options": [{ "label": "Core" }],
+                    "custom": false
+                },
+                {
+                    "header": "Style",
+                    "question": "Preferred style?",
+                    "mode": "text"
+                }
+            ]
+        });
+
+        let TuiUserInputPresentation::Batch(requests) = classify_tui_user_input(payload) else {
+            panic!("questions array must open the batch panel");
+        };
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].header, "Style");
     }
 
-    /// Plan mode → panel must be shown (planning explicitly asks the user).
     #[test]
-    fn plan_mode_shows_panel() {
-        assert!(
-            !user_input_should_auto_skip(AgentMode::Plan),
-            "Plan mode must NOT skip the user_input panel"
-        );
+    fn invalid_payload_declines_instead_of_opening_an_empty_panel() {
+        assert!(matches!(
+            classify_tui_user_input(serde_json::json!({ "questions": [] })),
+            TuiUserInputPresentation::Invalid
+        ));
     }
 
-    /// AcceptEdits mode → panel must be shown (only file edits are auto-approved).
     #[test]
-    fn accept_edits_mode_shows_panel() {
-        assert!(
-            !user_input_should_auto_skip(AgentMode::AcceptEdits),
-            "AcceptEdits mode must NOT skip the user_input panel"
-        );
-    }
-
-    /// Confirm the shape of the auto-answer: `declined()` encodes `declined: true`.
-    /// The Bypass mode delivers this response — `format_result` turns it into a non-error
-    /// "No answer was provided…" message so the model proceeds with its own judgment
-    /// instead of treating the decline as an error to recover from.
-    #[test]
-    fn declined_response_shape() {
-        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
-        let r = UserInputResponse::declined();
-        assert!(r.declined, "declined() must set declined=true");
-        assert!(r.text.is_none(), "declined() must have no text");
-        assert!(r.selected.is_empty(), "declined() must have no selections");
+    fn auto_mode_still_stops_round_cap_fail_closed() {
+        assert!(round_cap_should_auto_stop(AgentMode::Auto));
+        for mode in [
+            AgentMode::Build,
+            AgentMode::Plan,
+            AgentMode::AcceptEdits,
+        ] {
+            assert!(!round_cap_should_auto_stop(mode));
+        }
     }
 }
 
