@@ -16740,11 +16740,23 @@ fn handle_coding_runtime_event(
             }
         }
         CodingRuntimeEvent::CompactionFinished { completion } => {
+            let compaction_was_announced = state.compacting;
             state.compacting = false;
             match completion {
                 CompactionCompletion::Completed(outcome) if outcome.committed => {
                     state.on_compaction_committed(outcome.estimated_tokens_after);
-                    if mirror_persisted {
+                    // Match OpenCode/Codex: cheap, automatic pruning of stale
+                    // tool output is invisible transcript maintenance. Keep the
+                    // context gauge authoritative, but do not append a body row
+                    // or flush while the foreground turn is preparing its next
+                    // model request. Slow drain/summarize compaction announces
+                    // itself before running and remains visible even when replacing
+                    // one message with one summary produces zero net removals.
+                    // Manual and overflow paths retain their existing feedback.
+                    let silent_tool_fold =
+                        matches!(&outcome.trigger, CompactTrigger::Auto { .. })
+                            && !compaction_was_announced;
+                    if mirror_persisted && !silent_tool_fold {
                         renderer.render(UiLine::CompactionMark(
                             atomcode_config::i18n::format_compaction_mark(
                                 outcome.removed_messages,
@@ -16989,6 +17001,81 @@ mod coding_runtime_event_tests {
 
         assert!(matches!(state.phase, UiPhase::Streaming));
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn automatic_tool_output_fold_is_silent_and_updates_context_gauge() {
+        let mut state = UiState::default();
+        state.phase = UiPhase::Streaming;
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            let mut folded = outcome(CompactTrigger::Auto { utilization: 0.7 }, true);
+            folded.removed_messages = 0;
+            folded.estimated_tokens_after = 22_800;
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(folded),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+
+        assert!(matches!(state.phase, UiPhase::Streaming));
+        assert_eq!(
+            state
+                .last_context
+                .as_ref()
+                .map(|snapshot| snapshot.sent_tokens),
+            Some(22_800),
+            "silent maintenance must still refresh the footer context gauge"
+        );
+        assert!(
+            output.is_empty(),
+            "automatic tool-output folding must not touch foreground transcript rendering"
+        );
+    }
+
+    #[test]
+    fn announced_automatic_summary_with_zero_net_removals_remains_visible() {
+        let mut state = UiState::default();
+        state.phase = UiPhase::Streaming;
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionStarted {
+                    trigger: CompactTrigger::Auto { utilization: 0.8 },
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+            let mut summarized = outcome(CompactTrigger::Auto { utilization: 0.8 }, true);
+            summarized.removed_messages = 0;
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(summarized),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+
+        assert!(!state.compacting);
+        assert!(matches!(state.phase, UiPhase::Streaming));
+        assert!(
+            !output.is_empty(),
+            "an announced automatic summary must render its completion marker"
+        );
     }
 
     #[test]
@@ -18901,6 +18988,50 @@ fn clipboard_image_hash(cache: &std::sync::Mutex<ClipboardCheckState>) -> Option
     state.image_hash
 }
 
+fn status_context_usage(state: &UiState, configured_window: usize) -> (usize, usize) {
+    match state.last_context.as_ref() {
+        Some(snap) => (
+            snap.sent_tokens,
+            if snap.ctx_window > 0 {
+                snap.ctx_window
+            } else {
+                configured_window
+            },
+        ),
+        None => (0, configured_window),
+    }
+}
+
+#[cfg(test)]
+mod status_context_usage_tests {
+    use super::status_context_usage;
+    use crate::state::{ContextSnapshot, UiState};
+
+    #[test]
+    fn configured_model_window_fills_narrow_usage_snapshot() {
+        let mut state = UiState::new();
+        state.last_context = Some(ContextSnapshot {
+            sent_tokens: 22_800,
+            ctx_window: 0,
+            ..ContextSnapshot::default()
+        });
+
+        assert_eq!(status_context_usage(&state, 128_000), (22_800, 128_000));
+    }
+
+    #[test]
+    fn authoritative_context_window_wins_over_config_fallback() {
+        let mut state = UiState::new();
+        state.last_context = Some(ContextSnapshot {
+            sent_tokens: 22_800,
+            ctx_window: 200_000,
+            ..ContextSnapshot::default()
+        });
+
+        assert_eq!(status_context_usage(&state, 128_000), (22_800, 200_000));
+    }
+}
+
 pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
     let cwd = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
     // Priority:
@@ -19081,10 +19212,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // last turn) instead of cumulative `total_tokens` because the user
     // cares about "how close to overflow am I", not "how many tokens
     // has this session burned in total". See render::StatusLine docs.
-    let (ctx_used, ctx_window) = match state.last_context.as_ref() {
-        Some(snap) => (snap.sent_tokens, snap.ctx_window),
-        None => (0, 0),
-    };
+    let (ctx_used, ctx_window) =
+        status_context_usage(state, ctx.config.default_context_window());
     // Session-name badge: surfaced only when the user has explicitly
     // renamed the conversation. Auto-named sessions (default /
     // session-* / first-message-derived) intentionally stay badge-less
