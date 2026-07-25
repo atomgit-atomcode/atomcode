@@ -280,6 +280,12 @@ async fn exec_native_compact(
     let config =
         atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())?;
     let resolved = crate::live_api::resolve_provider_name(&config, provider_name);
+    // Validate the provider up front for a clean error (the old core path did
+    // `providers.get(...).ok_or("Provider not found")`); without this a missing
+    // key surfaces as a murkier build/network failure deeper in.
+    if !config.providers.contains_key(&resolved) {
+        anyhow::bail!("Provider '{resolved}' not found");
+    }
 
     // Build the summarizing provider via the SAME native chain `/chat` uses
     // (chat_runtime_config → coding_config_from_runtime → coding_provider_factory().build),
