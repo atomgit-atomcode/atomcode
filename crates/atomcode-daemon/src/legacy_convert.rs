@@ -1620,16 +1620,6 @@ fn validate_tool_pairing(messages: &[KernelMessage]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn usage_to_core(
-    usage: &atomcode_kernel::stream::TokenUsage,
-) -> atomcode_core::stream::TokenUsage {
-    atomcode_core::stream::TokenUsage {
-        prompt_tokens: usage.prompt as usize,
-        completion_tokens: usage.completion as usize,
-        cached_tokens: usage.cached as usize,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

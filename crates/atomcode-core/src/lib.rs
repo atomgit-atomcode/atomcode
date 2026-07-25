@@ -26,7 +26,6 @@ pub mod plugin;
 pub mod proxy;
 pub mod skill;
 pub mod skill_render;
-pub mod stream;
 pub mod trace;
 
 /// User-Agent identifier for every outbound HTTP request the app makes.
