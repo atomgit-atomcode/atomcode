@@ -3232,33 +3232,47 @@ pub struct TransientHint {
     pub deadline: std::time::Instant,
 }
 
-/// Memoised result of the most recent clipboard probe. The hash is a
-/// content fingerprint of the clipboard image's raw RGBA bytes (or
-/// `None` when the clipboard holds no image). Letting `build_status`
-/// compare this against `UiState::pending_image_hashes` is what powers
-/// the "hide hint after I already pasted THIS image, but show it again
-/// if the user copies a different one" UX.
+/// Memoised result of the most recent clipboard probe plus the one-shot
+/// notification window. The hash is a content fingerprint of the clipboard
+/// image's raw RGBA bytes (or `None` when it holds no image). A newly observed
+/// hash opens a short hint window; leaving the same image in the clipboard does
+/// not rearm it.
 #[derive(Debug, Default)]
 pub struct ClipboardCheckState {
     pub image_hash: Option<u64>,
     pub last_checked: Option<std::time::Instant>,
+    /// Hash currently eligible for the one-shot footer hint.
+    pub hint_hash: Option<u64>,
+    /// The hint remains visible only for this short window even when the
+    /// clipboard keeps holding the same image indefinitely.
+    pub hint_deadline: Option<std::time::Instant>,
+    /// Desired hint state most recently observed by the renderer or idle
+    /// poller. A change produces exactly one redraw request.
+    pub published_hint_hash: Option<u64>,
 }
 
-/// Cheap content fingerprint for clipboard images. Hashes width, height,
-/// total byte length, plus the first and last 1KB of RGBA bytes — enough
-/// to distinguish typical screenshots while keeping the per-poll cost
-/// O(2KB) regardless of image dimensions (a 4K screenshot's 32MB raw
-/// buffer would be too slow to hash in full at 1.5s polling cadence).
+/// Cheap content fingerprint for clipboard images. Hashes width, height, total
+/// byte length, and evenly distributed byte windows. Sampling throughout the
+/// image distinguishes same-sized screenshots whose top/bottom chrome matches,
+/// while keeping each poll O(2KB) even for a 4K image.
 fn rgba_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
+    const SAMPLE_COUNT: usize = 16;
+    const SAMPLE_BYTES: usize = 128;
+
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     width.hash(&mut hasher);
     height.hash(&mut hasher);
     bytes.len().hash(&mut hasher);
-    let head_end = bytes.len().min(1024);
-    bytes[..head_end].hash(&mut hasher);
-    let tail_start = bytes.len().saturating_sub(1024);
-    bytes[tail_start..].hash(&mut hasher);
+    if bytes.len() <= SAMPLE_COUNT * SAMPLE_BYTES {
+        bytes.hash(&mut hasher);
+    } else {
+        let max_start = bytes.len() - SAMPLE_BYTES;
+        for sample in 0..SAMPLE_COUNT {
+            let start = max_start * sample / (SAMPLE_COUNT - 1);
+            bytes[start..start + SAMPLE_BYTES].hash(&mut hasher);
+        }
+    }
     hasher.finish()
 }
 
@@ -7210,7 +7224,17 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     && retry_pending_provider_projection(&mut ctx, &mut app.state, renderer);
                 let config_changed = idle_boundary && poll_external_config(&mut ctx);
                 let auth_changed = poll_external_auth(&mut ctx);
-                if idle_boundary && (projection_changed || config_changed || auth_changed) {
+                let clipboard_hint_changed = idle_boundary
+                    && clipboard_image_hint_changed(
+                        &ctx.clipboard_check,
+                        &app.state.pending_image_hashes,
+                    );
+                if idle_boundary
+                    && (projection_changed
+                        || config_changed
+                        || auth_changed
+                        || clipboard_hint_changed)
+                {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
             }
@@ -7567,7 +7591,17 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     && retry_pending_provider_projection(&mut ctx, &mut app.state, renderer);
                 let config_changed = idle_boundary && poll_external_config(&mut ctx);
                 let auth_changed = poll_external_auth(&mut ctx);
-                if idle_boundary && (projection_changed || config_changed || auth_changed) {
+                let clipboard_hint_changed = idle_boundary
+                    && clipboard_image_hint_changed(
+                        &ctx.clipboard_check,
+                        &app.state.pending_image_hashes,
+                    );
+                if idle_boundary
+                    && (projection_changed
+                        || config_changed
+                        || auth_changed
+                        || clipboard_hint_changed)
+                {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
             }
@@ -19261,21 +19295,195 @@ mod session_naming_tests {
 /// this on every redraw, so without caching every spinner tick (~12/s
 /// during streaming) would round-trip to the platform clipboard API.
 const CLIPBOARD_HINT_TTL_MS: u64 = 1500;
+const CLIPBOARD_HINT_DISPLAY_SECS: u64 = 6;
 
-fn clipboard_image_hash(cache: &std::sync::Mutex<ClipboardCheckState>) -> Option<u64> {
+fn observe_clipboard_image(
+    state: &mut ClipboardCheckState,
+    image_hash: Option<u64>,
+    now: std::time::Instant,
+) {
+    if state.image_hash == image_hash {
+        return;
+    }
+    state.image_hash = image_hash;
+    state.hint_hash = image_hash;
+    state.hint_deadline =
+        image_hash.map(|_| now + std::time::Duration::from_secs(CLIPBOARD_HINT_DISPLAY_SECS));
+}
+
+fn apply_clipboard_observation(
+    state: &mut ClipboardCheckState,
+    observation: Result<Option<u64>, ()>,
+    now: std::time::Instant,
+) {
+    if let Ok(image_hash) = observation {
+        observe_clipboard_image(state, image_hash, now);
+    }
+}
+
+fn active_clipboard_hint(
+    state: &mut ClipboardCheckState,
+    pending_image_hashes: &[u64],
+    now: std::time::Instant,
+) -> Option<u64> {
+    let hash = state.hint_hash?;
+    if pending_image_hashes.contains(&hash)
+        || state.hint_deadline.is_none_or(|deadline| now >= deadline)
+    {
+        state.hint_hash = None;
+        state.hint_deadline = None;
+        return None;
+    }
+    Some(hash)
+}
+
+fn publish_clipboard_hint(state: &mut ClipboardCheckState, hint_hash: Option<u64>) -> bool {
+    let changed = state.published_hint_hash != hint_hash;
+    state.published_hint_hash = hint_hash;
+    changed
+}
+
+fn clipboard_image_hint_state(
+    cache: &std::sync::Mutex<ClipboardCheckState>,
+    pending_image_hashes: &[u64],
+    probe_clipboard: bool,
+) -> (Option<u64>, bool) {
     let mut state = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
     let stale = state
         .last_checked
         .map(|t| t.elapsed() >= std::time::Duration::from_millis(CLIPBOARD_HINT_TTL_MS))
         .unwrap_or(true);
-    if stale {
-        state.image_hash = arboard::Clipboard::new()
-            .and_then(|mut c| c.get_image())
-            .ok()
-            .map(|img| rgba_fingerprint(img.width, img.height, img.bytes.as_ref()));
-        state.last_checked = Some(std::time::Instant::now());
+    if probe_clipboard && stale {
+        let observation = match arboard::Clipboard::new() {
+            Ok(mut clipboard) => match clipboard.get_image() {
+                Ok(img) => Ok(Some(rgba_fingerprint(
+                    img.width,
+                    img.height,
+                    img.bytes.as_ref(),
+                ))),
+                Err(arboard::Error::ContentNotAvailable) => Ok(None),
+                Err(_) => Err(()),
+            },
+            Err(_) => Err(()),
+        };
+        apply_clipboard_observation(&mut state, observation, now);
+        state.last_checked = Some(now);
     }
-    state.image_hash
+    let hint_hash = active_clipboard_hint(&mut state, pending_image_hashes, now);
+    let changed = publish_clipboard_hint(&mut state, hint_hash);
+    (hint_hash, changed)
+}
+
+fn clipboard_image_hint_hash(
+    cache: &std::sync::Mutex<ClipboardCheckState>,
+    pending_image_hashes: &[u64],
+) -> Option<u64> {
+    clipboard_image_hint_state(cache, pending_image_hashes, true).0
+}
+
+fn clipboard_image_hint_changed(
+    cache: &std::sync::Mutex<ClipboardCheckState>,
+    pending_image_hashes: &[u64],
+) -> bool {
+    // The idle tick exists to repaint an expired/consumed hint, not to copy
+    // potentially tens of MB of RGBA clipboard data in the background.
+    clipboard_image_hint_state(cache, pending_image_hashes, false).1
+}
+
+#[cfg(test)]
+mod clipboard_hint_tests {
+    use super::{
+        active_clipboard_hint, apply_clipboard_observation, observe_clipboard_image,
+        publish_clipboard_hint, rgba_fingerprint, ClipboardCheckState,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn image_hint_is_one_shot_until_clipboard_content_changes() {
+        let now = Instant::now();
+        let mut state = ClipboardCheckState::default();
+
+        observe_clipboard_image(&mut state, Some(7), now);
+        assert_eq!(active_clipboard_hint(&mut state, &[], now), Some(7));
+        assert_eq!(
+            active_clipboard_hint(&mut state, &[], now + Duration::from_secs(7)),
+            None
+        );
+
+        // The same image staying in the clipboard must not restart the hint.
+        observe_clipboard_image(&mut state, Some(7), now + Duration::from_secs(8));
+        assert_eq!(
+            active_clipboard_hint(&mut state, &[], now + Duration::from_secs(8)),
+            None
+        );
+
+        // A different image is a new clipboard event and gets its own window.
+        observe_clipboard_image(&mut state, Some(8), now + Duration::from_secs(9));
+        assert_eq!(
+            active_clipboard_hint(&mut state, &[], now + Duration::from_secs(9)),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn attaching_or_clearing_the_image_consumes_and_rearms_the_hint() {
+        let now = Instant::now();
+        let mut state = ClipboardCheckState::default();
+
+        observe_clipboard_image(&mut state, Some(7), now);
+        assert_eq!(active_clipboard_hint(&mut state, &[7], now), None);
+
+        observe_clipboard_image(&mut state, None, now + Duration::from_secs(1));
+        observe_clipboard_image(&mut state, Some(7), now + Duration::from_secs(2));
+        assert_eq!(
+            active_clipboard_hint(&mut state, &[], now + Duration::from_secs(2)),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn transient_probe_failure_preserves_the_consumed_image_state() {
+        let now = Instant::now();
+        let mut state = ClipboardCheckState::default();
+
+        apply_clipboard_observation(&mut state, Ok(Some(7)), now);
+        assert_eq!(
+            active_clipboard_hint(&mut state, &[], now + Duration::from_secs(7)),
+            None
+        );
+        apply_clipboard_observation(&mut state, Err(()), now + Duration::from_secs(8));
+        apply_clipboard_observation(&mut state, Ok(Some(7)), now + Duration::from_secs(9));
+
+        assert_eq!(
+            active_clipboard_hint(&mut state, &[], now + Duration::from_secs(9)),
+            None,
+            "a temporary ClipboardOccupied-style failure must not rearm the same image"
+        );
+    }
+
+    #[test]
+    fn fingerprint_samples_changes_between_matching_head_and_tail() {
+        let mut first = vec![0u8; 16 * 1024];
+        let mut second = first.clone();
+        first[7 * 1024..9 * 1024].fill(1);
+        second[7 * 1024..9 * 1024].fill(2);
+
+        assert_ne!(
+            rgba_fingerprint(64, 64, &first),
+            rgba_fingerprint(64, 64, &second)
+        );
+    }
+
+    #[test]
+    fn published_hint_transitions_request_one_show_and_one_hide_redraw() {
+        let mut state = ClipboardCheckState::default();
+
+        assert!(publish_clipboard_hint(&mut state, Some(7)));
+        assert!(!publish_clipboard_hint(&mut state, Some(7)));
+        assert!(publish_clipboard_hint(&mut state, None));
+        assert!(!publish_clipboard_hint(&mut state, None));
+    }
 }
 
 fn status_context_usage(state: &UiState, configured_window: usize) -> (usize, usize) {
@@ -19388,8 +19596,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         usage_monitor::build_usage_hint(&ctx.usage_slot, &ctx.config.default_provider)
     {
         Some(usage)
-    } else if let Some(h) = clipboard_image_hash(&ctx.clipboard_check)
-        .filter(|h| !state.pending_image_hashes.contains(h))
+    } else if let Some(h) =
+        clipboard_image_hint_hash(&ctx.clipboard_check, &state.pending_image_hashes)
     {
         // Transient cue — beats the upgrade banner because the action
         // window is "now" (the image is in the clipboard right now).
