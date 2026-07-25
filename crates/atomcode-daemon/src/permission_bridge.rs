@@ -4,7 +4,7 @@
 //! `/chat/permission` 收到前端决定后，经 `PermissionResponders` 按
 //! session_id 路由到对应的 `response_tx`，唤醒 decider。
 
-use atomcode_core::tool::PermissionDecision;
+use atomcode_capabilities::tools::PermissionDecision;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc::UnboundedSender;
@@ -43,7 +43,7 @@ impl PermissionResponders {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::tool::PermissionDecision;
+    use atomcode_capabilities::tools::PermissionDecision;
 
     #[tokio::test]
     async fn routes_decision_to_registered_session() {
@@ -51,8 +51,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         reg.register("sess-1".into(), tx);
 
-        assert!(reg.deliver("sess-1", PermissionDecision::Allow));
-        assert!(matches!(rx.recv().await, Some(PermissionDecision::Allow)));
+        assert!(reg.deliver("sess-1", PermissionDecision::AllowOnce));
+        assert!(matches!(rx.recv().await, Some(PermissionDecision::AllowOnce)));
     }
 
     #[test]

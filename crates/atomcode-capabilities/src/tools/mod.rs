@@ -75,8 +75,8 @@ pub use crate::atomgit::{
     AtomgitClient, AtomgitConfig, LiveTokenProvider, StaticTokenProvider, TokenProvider,
 };
 pub use approval::{
-    request_approval_decision, ApprovalMiddleware, ApprovalRequest, ApprovalResponse,
-    InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
+    parse_permission_decision, request_approval_decision, ApprovalMiddleware, ApprovalRequest,
+    ApprovalResponse, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
 pub use ast_grep::AstGrepTool;
 #[cfg(feature = "atomgit")]

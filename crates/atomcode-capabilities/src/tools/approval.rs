@@ -100,6 +100,17 @@ impl PermissionDecision {
     }
 }
 
+/// Parse the wire string used by the daemon's permission endpoints
+/// (`/chat/permission`, `/live/permission`) into a decision. Mirrors the
+/// retired `core::tool::parse_permission_decision` wire mapping.
+pub fn parse_permission_decision(s: &str) -> PermissionDecision {
+    match s {
+        "allow" => PermissionDecision::AllowOnce,
+        "always_allow" => PermissionDecision::AllowAlways,
+        _ => PermissionDecision::Deny,
+    }
+}
+
 /// Session-scoped grant cache. The middleware consults it before round-tripping and
 /// records `AllowAlways` grants into it. Pluggable so a specialization can back it
 /// with anything (in-memory, persisted, per-project policy, …).
@@ -266,6 +277,20 @@ mod tests {
     use atomcode_kernel::tool::ToolCall;
     use std::time::Duration;
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn parse_permission_decision_maps_daemon_wire() {
+        assert_eq!(
+            parse_permission_decision("allow"),
+            PermissionDecision::AllowOnce
+        );
+        assert_eq!(
+            parse_permission_decision("always_allow"),
+            PermissionDecision::AllowAlways
+        );
+        assert_eq!(parse_permission_decision("deny"), PermissionDecision::Deny);
+        assert_eq!(parse_permission_decision("garbage"), PermissionDecision::Deny);
+    }
 
     fn risky_call() -> ToolCall {
         ToolCall {

@@ -3604,7 +3604,7 @@ async fn process_chat_request(
         // Interactive approval: route /chat/permission decisions to the native runtime
         // request waiting for this turn.
         let perm_rx = if registered_permission_responder {
-            let (tx, rx) = mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
+            let (tx, rx) = mpsc::unbounded_channel::<atomcode_capabilities::tools::PermissionDecision>();
             pending_permissions.register(perm_session_key.clone(), tx);
             Some(rx)
         } else {
@@ -3753,7 +3753,7 @@ async fn chat_permission(
     State(state): State<AppState>,
     Json(req): Json<PermissionDecisionRequest>,
 ) -> impl IntoResponse {
-    use atomcode_core::tool::{parse_permission_decision, PermissionDecision};
+    use atomcode_capabilities::tools::{parse_permission_decision, PermissionDecision};
     if req.decision == "allow_persist" {
         if let Some(full) = req.tool_name.as_deref() {
             let reg = state.mcp_registry.read().await.clone();
@@ -3769,7 +3769,7 @@ async fn chat_permission(
         }
         let ok = state
             .pending_permissions
-            .deliver(&req.session_id, PermissionDecision::Allow);
+            .deliver(&req.session_id, PermissionDecision::AllowOnce);
         return Json(serde_json::json!({ "success": ok }));
     }
     let decision = parse_permission_decision(&req.decision);

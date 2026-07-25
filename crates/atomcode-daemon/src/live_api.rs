@@ -15,7 +15,7 @@ use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_config::config::Config;
 use atomcode_kernel::message::{ImageContent, Message as KernelMessage, SessionSnapshot};
 use atomcode_capabilities::mcp::McpRegistry;
-use atomcode_core::tool::PermissionDecision;
+use atomcode_capabilities::tools::PermissionDecision;
 use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -32,7 +32,7 @@ pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecisi
         // (for example bash or a sensitive path), so missing responders must
         // fail closed.
         ApprovalMode::AcceptEdits | ApprovalMode::Plan => PermissionDecision::Deny,
-        ApprovalMode::Build | ApprovalMode::Auto => PermissionDecision::Allow,
+        ApprovalMode::Build | ApprovalMode::Auto => PermissionDecision::AllowOnce,
     }
 }
 
@@ -440,7 +440,7 @@ pub(crate) async fn run_chat_turn_v2(
                     },
                 };
                 let response = match decision {
-                    PermissionDecision::Allow => ApprovalResponse::allow(),
+                    PermissionDecision::AllowOnce => ApprovalResponse::allow(),
                     PermissionDecision::AllowAlways => ApprovalResponse::allow_always(),
                     _ => ApprovalResponse::deny(),
                 };
@@ -1663,14 +1663,14 @@ pub(crate) struct LivePermissionReq {
 /// request. The hub correlates the response with the pending native request.
 ///
 /// Decision mapping mirrors /chat/permission:
-///   "allow"        → PermissionDecision::Allow
+///   "allow"        → PermissionDecision::AllowOnce
 ///   "always_allow" → PermissionDecision::AllowAlways (persisted for the session)
 ///   anything else  → PermissionDecision::Deny
 pub(crate) async fn live_permission(
     State(state): State<AppState>,
     Json(req): Json<LivePermissionReq>,
 ) -> impl IntoResponse {
-    use atomcode_core::tool::{parse_permission_decision, PermissionDecision};
+    use atomcode_capabilities::tools::{parse_permission_decision, PermissionDecision};
     let decision = if req.decision == "allow_persist" {
         if let Some(full) = req.tool_name.as_deref() {
             let reg = state.mcp_registry.read().await.clone();
@@ -1684,12 +1684,12 @@ pub(crate) async fn live_permission(
                 reg.mark_tool_auto_approved(full);
             }
         }
-        PermissionDecision::Allow
+        PermissionDecision::AllowOnce
     } else {
         parse_permission_decision(&req.decision)
     };
     let response = match decision {
-        PermissionDecision::Allow => atomcode_capabilities::tools::ApprovalResponse::allow(),
+        PermissionDecision::AllowOnce => atomcode_capabilities::tools::ApprovalResponse::allow(),
         PermissionDecision::AllowAlways => {
             atomcode_capabilities::tools::ApprovalResponse::allow_always()
         }
@@ -1987,11 +1987,11 @@ mod tests {
         ));
         assert!(matches!(
             fallback_approval_decision(ApprovalMode::Build),
-            PermissionDecision::Allow
+            PermissionDecision::AllowOnce
         ));
         assert!(matches!(
             fallback_approval_decision(ApprovalMode::Auto),
-            PermissionDecision::Allow
+            PermissionDecision::AllowOnce
         ));
     }
 
