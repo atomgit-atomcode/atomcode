@@ -1332,6 +1332,7 @@ pub fn assemble(
     if cfg.max_rounds != 0 {
         builder = builder.max_rounds(cfg.max_rounds);
     }
+    builder = builder.round_cap_checkpoint(cfg.round_cap_checkpoint);
     // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
     // answered (interactive — a present human must not be auto-denied). The kernel defaults
     // to unbounded when `.request_timeout` is never set, so None = park.

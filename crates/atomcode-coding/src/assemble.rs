@@ -112,6 +112,7 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
     if cfg.max_rounds != 0 {
         builder = builder.max_rounds(cfg.max_rounds);
     }
+    builder = builder.round_cap_checkpoint(cfg.round_cap_checkpoint);
     // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
     // answered (interactive). Kernel defaults to unbounded when unset, so None = park.
     if let Some(d) = cfg.request_timeout {

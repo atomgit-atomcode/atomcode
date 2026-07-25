@@ -49,6 +49,9 @@ pub struct CodingAgentConfig {
     /// It is deliberately generous, produces an explicit incomplete terminal, and may be
     /// overridden with `ATOMCODE_TURN_MAX_ROUNDS`.
     pub max_rounds: u32,
+    /// When true, the kernel turns the `max_rounds` cap into an interactive
+    /// checkpoint (see AgentBuilder). Default false; only the TUI driver sets it.
+    pub round_cap_checkpoint: bool,
     /// Exact no-progress loop policy. `None` disables it for explicitly intentional
     /// identical repetition. Defaults to 3/4 and is configurable through
     /// `ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD` / `ATOMCODE_TOOL_LOOP_STOP_THRESHOLD`;
@@ -156,6 +159,7 @@ pub struct CodingRuntimeConfig {
     pub user_agent: Option<String>,
     pub skip_tls_verify: bool,
     pub loop_max_rounds: u32,
+    pub turn_max_rounds: u32,
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
 }
 
@@ -220,6 +224,10 @@ impl CodingRuntimeConfig {
                 config.loop_config.max_rounds,
                 std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
             ),
+            turn_max_rounds: resolve_turn_max_rounds(
+                config.coding.max_rounds,
+                std::env::var("ATOMCODE_TURN_MAX_ROUNDS").ok().as_deref(),
+            ),
             subagent_config: Some(Arc::new(config.clone())),
         }
     }
@@ -248,6 +256,7 @@ impl CodingRuntimeConfig {
         config.user_agent = self.user_agent.clone();
         config.skip_tls_verify = self.skip_tls_verify;
         config.loop_max_rounds = self.loop_max_rounds;
+        config.max_rounds = self.turn_max_rounds;
         config.subagent_config = self.subagent_config.clone();
         if self.interactive {
             config.request_timeout = None;
@@ -444,6 +453,16 @@ pub fn resolve_loop_max_rounds(configured: u32, env: Option<&str>) -> u32 {
         .unwrap_or(configured)
 }
 
+/// Resolve the per-turn round cap.
+///
+/// Env `ATOMCODE_TURN_MAX_ROUNDS` (if a valid u32) takes priority over the
+/// TOML `[coding] max_rounds` value. `0` is preserved (means unbounded).
+/// Non-parseable env values fall back to the TOML-configured value.
+/// Same shape as `resolve_loop_max_rounds`.
+pub fn resolve_turn_max_rounds(configured: u32, env: Option<&str>) -> u32 {
+    env.and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(configured)
+}
+
 impl CodingAgentConfig {
     /// Construct with the required fields and sane defaults for the rest.
     pub fn new(
@@ -465,6 +484,7 @@ impl CodingAgentConfig {
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
+            round_cap_checkpoint: false,
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
             goal_max_duration_secs: default_goal_max_duration_secs(),
@@ -518,6 +538,14 @@ mod tests {
             runtime.agent_config().preferred_language,
             Some(Locale::ZhCn)
         );
+    }
+
+    #[test]
+    fn turn_max_rounds_env_overrides_toml() {
+        assert_eq!(resolve_turn_max_rounds(200, Some("500")), 500);
+        assert_eq!(resolve_turn_max_rounds(200, Some("0")), 0); // 0 关闭保留
+        assert_eq!(resolve_turn_max_rounds(300, Some("bad")), 300); // 非法回退 TOML
+        assert_eq!(resolve_turn_max_rounds(300, None), 300);
     }
 
     #[test]

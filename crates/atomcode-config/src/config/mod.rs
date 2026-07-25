@@ -49,6 +49,20 @@ pub fn platform_rules() -> &'static str {
     }
 }
 
+/// `[coding]` table. Turn-level knobs for the main coding agent. `max_rounds` is
+/// the per-turn round cap (the interactive checkpoint threshold); `0` = unbounded.
+/// Env `ATOMCODE_TURN_MAX_ROUNDS` overrides this.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodingConfig {
+    pub max_rounds: u32,
+}
+impl Default for CodingConfig {
+    fn default() -> Self {
+        Self { max_rounds: 200 }
+    }
+}
+
 /// /loop command configuration. Persisted as the `[loop_config]` table
 /// (NOT `[loop]` — `loop` is a Rust keyword and is rejected by toml_edit).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +175,9 @@ pub struct Config {
     /// TOML section is `[loop_config]` (bare `loop` is a Rust keyword).
     #[serde(default)]
     pub loop_config: LoopConfig,
+    /// `[coding]` turn-level policy. Missing from older configs → max_rounds=200.
+    #[serde(default)]
+    pub coding: CodingConfig,
     /// Provider key (matches a key in `Config.providers`) of a vision-language
     /// model used to preprocess images before forwarding to a non-vision main
     /// provider. When `None` or empty, image preprocessing is disabled — pasted
@@ -408,6 +425,7 @@ impl Default for Config {
             auto_commit: false,
             subagent: Default::default(),
             loop_config: Default::default(),
+            coding: CodingConfig::default(),
             vision_preprocessor_provider: None,
             language: None,
             ui: UiConfig::default(),
@@ -1699,6 +1717,7 @@ model = "missing-type"
             auto_commit: false,
             subagent: Default::default(),
             loop_config: Default::default(),
+            coding: CodingConfig::default(),
             vision_preprocessor_provider: None,
             language: None,
             ui: Default::default(),
