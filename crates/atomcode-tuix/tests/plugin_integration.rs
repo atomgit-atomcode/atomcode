@@ -73,11 +73,11 @@ fn add_install_reload_flow() {
         .unwrap();
 
     let url = format!("file://{}", repo.display());
-    atomcode_core::plugin::marketplace::add_marketplace(&url).unwrap();
-    atomcode_core::plugin::installer::install(
+    atomcode_capabilities::plugin::marketplace::add_marketplace(&url).unwrap();
+    atomcode_capabilities::plugin::installer::install(
         "e2e",
         "e2e",
-        atomcode_core::plugin::InstallScope::User,
+        atomcode_capabilities::plugin::InstallScope::User,
     )
     .unwrap();
 
