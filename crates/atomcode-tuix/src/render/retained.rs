@@ -4572,22 +4572,49 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             total
         };
-        // Visible window starts no earlier than `scrolled_off` —
-        // anything before that index already lives in native
-        // scrollback and must not be re-painted into the viewport,
-        // otherwise the next overflow LF promotes it a second time
-        // (see `scrolled_off` doc).
-        let start = display_total
-            .saturating_sub(body_height)
-            .max(self.scrolled_off);
-        if start >= display_total {
+        // Anything before `scrolled_off` already lives in native
+        // scrollback and must not be re-painted into the viewport.
+        if self.scrolled_off >= display_total {
             return;
         }
         let body_width = self.screen.width() as usize;
-        // Clone the slice before drawing — `screen.draw_row` takes
-        // &mut self.screen and the iteration would otherwise double-
-        // borrow.
-        let rows: Vec<Vec<Cell>> = self.body_lines[start..display_total].to_vec();
+        // Permanent transcript rows are top-anchored at `scrolled_off`:
+        // the terminal row at the top of the viewport MUST correspond
+        // to `body_lines[scrolled_off]`, because the next bottom-row LF
+        // promotes that physical row and advances `scrolled_off` by one.
+        //
+        // A live spinner is transient and bypasses the permanent body's
+        // eager overflow-LF path. When the permanent body already fills
+        // `body_height`, appending the spinner (and optional spacer) can
+        // therefore make the retained tail longer than the viewport. Do
+        // not tail-anchor that overfull model: doing so shifts the physical
+        // top past `scrolled_off`, so the next permanent push records the
+        // wrong row as promoted and can duplicate or lose transcript rows.
+        //
+        // Instead, overlay the transient strip in the final visible slots.
+        // Any covered permanent tail rows remain in `body_lines` and are
+        // restored by the next paint after the spinner is cleared.
+        let transient_rows = if self.live_spinner_active {
+            1 + usize::from(self.live_spinner_spacer_active)
+        } else {
+            0
+        }
+        .min(display_total.saturating_sub(self.scrolled_off))
+        .min(body_height);
+        let permanent_end = display_total.saturating_sub(transient_rows);
+        let permanent_slots = body_height.saturating_sub(transient_rows);
+        let permanent_end_visible = self
+            .scrolled_off
+            .saturating_add(permanent_slots)
+            .min(permanent_end);
+
+        // Clone before drawing — `screen.draw_row` takes &mut self.screen
+        // and direct iteration would otherwise double-borrow.
+        let mut rows: Vec<Vec<Cell>> =
+            self.body_lines[self.scrolled_off..permanent_end_visible].to_vec();
+        if transient_rows > 0 {
+            rows.extend_from_slice(&self.body_lines[display_total - transient_rows..display_total]);
+        }
         for (i, row) in rows.iter().enumerate() {
             let clipped = clip_cells_to_width(row, body_width);
             self.screen.draw_row(i, 0, &clipped);
@@ -15321,6 +15348,177 @@ mod tests {
             count_probe(&vterm),
             vterm.scrollback_texts().join("\n")
         );
+    }
+
+    /// Regression for a live-spinner/streaming interleave at the exact
+    /// overflow boundary. The transient spinner and its spacer used to
+    /// append past `cap` without advancing `scrolled_off`. That made the
+    /// painted viewport start one or two rows after the logical scroll
+    /// boundary; the next permanent push then LF-promoted the wrong
+    /// physical top row while advancing `scrolled_off` as if it had
+    /// promoted the logical top row. Repeating the interleave could put
+    /// the same permanent row into native scrollback more than once.
+    #[test]
+    fn retained_full_body_spinner_stream_does_not_duplicate_scrollback() {
+        let w: u16 = 80;
+        let h: u16 = 12;
+        for (case, trailing_blank) in [("spinner-only", true), ("spinner-spacer", false)] {
+            let (mut r, buf) = new_capturing(w, h);
+            let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+
+            r.render(UiLine::InputPrompt {
+                buf: String::new(),
+                cursor_byte: 0,
+                menu: None,
+                status: status_basic(),
+                attachments: Vec::new(),
+            });
+            r.flush_deferred();
+            drain_into_vterm(&buf, &mut vterm);
+            let cap = (h as usize).saturating_sub(r.current_footer_rows());
+
+            // Establish a non-zero logical scrollback boundary, matching
+            // the real trace (`len=565, scrolled_off=524, cap=41`). A
+            // trailing blank makes the spinner a one-row transient strip;
+            // a trailing marker forces the two-row spacer+spinner shape.
+            let seed_rows = cap + 20;
+            let seed_markers = seed_rows - usize::from(trailing_blank);
+            for i in 0..seed_markers {
+                r.render(UiLine::AssistantText(format!("{case}-PINNED-{i:03}\n")));
+            }
+            if trailing_blank {
+                r.render(UiLine::AssistantText("\n".into()));
+            }
+            r.flush_deferred();
+            drain_into_vterm(&buf, &mut vterm);
+            assert!(r.scrolled_off > 0, "{case}: setup must overflow");
+
+            // Match the trace signature: while the transcript remains
+            // pinned at the overflow boundary, repeatedly paint a live
+            // spinner, clear it to verify the covered tail is restored,
+            // then recreate it before the next permanent streamed line.
+            for i in 0..(cap + 6) {
+                let expected_top: String = r.body_lines[r.scrolled_off]
+                    .iter()
+                    .map(|cell| cell.ch)
+                    .collect();
+                r.render(UiLine::Spinner {
+                    frame: "⠋".into(),
+                    label: format!("{case} Pondering {i}"),
+                });
+                r.flush_deferred();
+                drain_into_vterm(&buf, &mut vterm);
+
+                assert_eq!(
+                    r.live_spinner_spacer_active, !trailing_blank,
+                    "{case}: wrong transient strip shape"
+                );
+                assert_eq!(
+                    vterm.row_text(0).trim_end(),
+                    expected_top.trim_end(),
+                    "{case}: spinner paint moved the physical top away from scrolled_off"
+                );
+                assert!(
+                    vterm
+                        .row_text(cap - 1)
+                        .contains(&format!("{case} Pondering {i}")),
+                    "{case}: spinner must occupy the final body slot\n{}",
+                    vterm.dump()
+                );
+                if !trailing_blank {
+                    assert!(
+                        vterm.row_text(cap - 2).trim().is_empty(),
+                        "{case}: spacer must occupy the slot above the spinner\n{}",
+                        vterm.dump()
+                    );
+                }
+                assert!(
+                    vterm.row_text(cap).contains('─'),
+                    "{case}: transient strip overwrote the footer boundary\n{}",
+                    vterm.dump()
+                );
+
+                r.render(UiLine::InputPrompt {
+                    buf: String::new(),
+                    cursor_byte: 0,
+                    menu: None,
+                    status: status_basic(),
+                    attachments: Vec::new(),
+                });
+                r.flush_deferred();
+                drain_into_vterm(&buf, &mut vterm);
+                for (screen_row, body_row) in
+                    r.body_lines[r.scrolled_off..].iter().take(cap).enumerate()
+                {
+                    let expected: String = body_row.iter().map(|cell| cell.ch).collect();
+                    assert_eq!(
+                        vterm.row_text(screen_row).trim_end(),
+                        expected.trim_end(),
+                        "{case}: clearing spinner did not restore permanent row {screen_row}"
+                    );
+                }
+
+                r.render(UiLine::Spinner {
+                    frame: "⠙".into(),
+                    label: format!("{case} Pondering {i}"),
+                });
+                r.flush_deferred();
+                drain_into_vterm(&buf, &mut vterm);
+                let suffix = if trailing_blank { "\n\n" } else { "\n" };
+                r.render(UiLine::AssistantText(format!(
+                    "{case}-STREAM-{i:03}{suffix}"
+                )));
+                r.flush_deferred();
+                drain_into_vterm(&buf, &mut vterm);
+            }
+
+            let scrollback = vterm.scrollback_texts();
+            let adjacent_duplicates: Vec<_> = scrollback
+                .windows(2)
+                .filter(|rows| !rows[0].trim().is_empty() && rows[0] == rows[1])
+                .map(|rows| rows[0].clone())
+                .collect();
+            assert!(
+                adjacent_duplicates.is_empty(),
+                "{case}: full-body spinner/stream interleave duplicated adjacent \
+                 native scrollback rows: {adjacent_duplicates:?}\nscrollback:\n{}",
+                scrollback.join("\n")
+            );
+
+            let all_terminal_rows = scrollback
+                .iter()
+                .cloned()
+                .chain((0..h as usize).map(|row| vterm.row_text(row)))
+                .collect::<Vec<_>>();
+            for i in 0..seed_markers {
+                let marker = format!("{case}-PINNED-{i:03}");
+                let count = all_terminal_rows
+                    .iter()
+                    .filter(|row| row.contains(&marker))
+                    .count();
+                assert_eq!(
+                    count,
+                    1,
+                    "{case}: {marker} must occur exactly once across terminal \
+                     history and viewport (found {count})\nterminal rows:\n{}",
+                    all_terminal_rows.join("\n"),
+                );
+            }
+            for i in 0..(cap + 6) {
+                let marker = format!("{case}-STREAM-{i:03}");
+                let count = all_terminal_rows
+                    .iter()
+                    .filter(|row| row.contains(&marker))
+                    .count();
+                assert_eq!(
+                    count,
+                    1,
+                    "{case}: {marker} must occur exactly once across terminal \
+                     history and viewport (found {count})\nterminal rows:\n{}",
+                    all_terminal_rows.join("\n"),
+                );
+            }
+        }
     }
 
     /// Regression for the user-reported "30x duplicate bullet in
