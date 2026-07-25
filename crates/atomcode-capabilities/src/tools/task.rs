@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use atomcode_kernel::agent::{Agent, AutoRespond, Outcome, ToolLoopPolicy};
-use atomcode_kernel::event::StopReason;
+use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
 use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
@@ -15,8 +15,9 @@ use atomcode_kernel::tool::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const DEFAULT_MAX_CONCURRENT: usize = 3;
 /// Sentinel prefix on a `ctx.progress` line that marks it as EPHEMERAL live activity
@@ -512,6 +513,14 @@ parallel workers NON-OVERLAPPING scopes."
             let desc = t.description;
             let sem = sem.clone();
             let progress = ctx.progress.clone();
+            // Advertise the selected model while this child is still queued.
+            // Marker-prefixed means retained UIs update the fixed panel without
+            // committing an extra transcript row. The later ↻ event is the sole
+            // start-time boundary.
+            progress.emit(format!(
+                "{SUBAGENT_ACTIVITY_MARKER}{}",
+                subtask_progress_line(&format!("\u{25cb} queued \u{b7} {label}"), &model, &desc,)
+            ));
 
             set.spawn(async move {
                 let _permit = sem.acquire_owned().await.expect("semaphore not closed");
@@ -522,12 +531,19 @@ parallel workers NON-OVERLAPPING scopes."
                     &model,
                     &desc,
                 ));
+                let progress_hook = Arc::new(SubtaskProgressHook::new(
+                    progress.clone(),
+                    label.clone(),
+                    desc.contains(|ch: char| ('\u{4e00}'..='\u{9fff}').contains(&ch)),
+                    hook_cancel,
+                ));
                 let mut builder = Agent::builder()
                     .provider(provider)
                     .tools(tools)
                     .persona(persona)
                     .working_dir(wd.clone())
-                    .cancel_token(child_cancel);
+                    .cancel_token(child_cancel)
+                    .hook(progress_hook.clone());
                 if let Some(policy) = tool_loop_policy {
                     builder = builder.tool_loop_policy(policy);
                 }
@@ -540,15 +556,7 @@ parallel workers NON-OVERLAPPING scopes."
                 for mw in child_middlewares(is_worker, &scope, &wd) {
                     builder = builder.middleware(mw);
                 }
-                let child = builder
-                    // Funnel the child's live activity (thinking / current tool) up to the
-                    // parent progress sink so the TUI spinner shows what this subtask is doing.
-                    .hook(Arc::new(SubtaskProgressHook {
-                        progress: progress.clone(),
-                        label: label.clone(),
-                        cancel: hook_cancel,
-                    }))
-                    .build();
+                let child = builder.build();
                 // DETACH: inner spawn lets the child run independent of this future;
                 // cancel propagates only via the child_token.
                 //
@@ -557,9 +565,12 @@ parallel workers NON-OVERLAPPING scopes."
                 // below cannot fire from a panic. Defensive parity with parallel_edit.rs.
                 // `&mut handle` so a timeout doesn't drop (detach) the handle — we may need to
                 // re-await it below to recover the child's partial work.
-                let mut handle = tokio::spawn(async move {
-                    child.run_to_completion(prompt, AutoRespond::AllowAll).await
-                });
+                let mut handle = tokio::spawn(run_child_to_completion(
+                    child,
+                    prompt,
+                    AutoRespond::AllowAll,
+                    progress_hook,
+                ));
                 let timed_out_msg = || {
                     format!(
                         "subagent exceeded the {}s time limit",
@@ -732,18 +743,214 @@ fn first_line_capped(s: &str, max: usize) -> String {
     }
 }
 
-/// Child-agent lifecycle hook that funnels a subtask's live activity up to the PARENT's
-/// progress sink as marker-prefixed (ephemeral) lines: `thinking…` before each model round,
-/// then the tool it's about to run. The TUI shows the latest such line in-place on the
-/// spinner so a multi-minute fan-out isn't silent between the ↻ start and ✓ done lines.
+/// Child-agent observer that funnels live model and tool activity to the parent's
+/// marker-prefixed ephemeral progress stream. The TUI projects the latest state
+/// into its fixed Subtasks footer without adding transcript rows.
 struct SubtaskProgressHook {
     progress: ProgressSink,
     /// The subtask label, e.g. `explore#1` — so the footer shows WHICH child is acting.
     label: String,
+    localized_zh: bool,
     /// The child's cancel token. A timed-out child is cancelled then DETACHED (it may keep
     /// running if it ignores cooperative cancel); gate emits on this so a zombie can't
     /// resurrect stale activity onto the spinner after the parent already moved on.
     cancel: tokio_util::sync::CancellationToken,
+    live: Mutex<SubtaskLiveState>,
+}
+
+#[derive(Default)]
+struct SubtaskLiveState {
+    activity: String,
+    total_tokens: u64,
+    round_chars: usize,
+    text_tail: String,
+    active_tools: BTreeMap<String, String>,
+    last_emit: Option<std::time::Instant>,
+}
+
+impl SubtaskProgressHook {
+    fn new(
+        progress: ProgressSink,
+        label: String,
+        localized_zh: bool,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            progress,
+            label,
+            localized_zh,
+            cancel,
+            live: Mutex::new(SubtaskLiveState::default()),
+        }
+    }
+
+    fn thinking_label(&self) -> &'static str {
+        if self.localized_zh {
+            "正在分析任务"
+        } else {
+            "analyzing task"
+        }
+    }
+
+    fn running_tool_label(&self, tool: &str) -> String {
+        if self.localized_zh {
+            format!("正在执行 {tool}")
+        } else {
+            format!("running {tool}")
+        }
+    }
+
+    fn preparing_tool_label(&self, tool: &str) -> String {
+        if self.localized_zh {
+            format!("准备执行 {tool}")
+        } else {
+            format!("preparing {tool}")
+        }
+    }
+
+    fn finished_tool_label(&self, tool: &str) -> String {
+        if self.localized_zh {
+            format!("已完成 {tool}，正在分析结果")
+        } else {
+            format!("finished {tool}; analyzing results")
+        }
+    }
+
+    fn tool_started(&self, call: &ToolCall) {
+        let summary = summarize_tool_call(call);
+        let activity = {
+            let Ok(mut live) = self.live.lock() else {
+                return;
+            };
+            live.active_tools.insert(call.id.clone(), summary.clone());
+            if live.active_tools.len() == 1 {
+                self.running_tool_label(&summary)
+            } else if self.localized_zh {
+                format!("正在并行执行 {} 个工具：{summary}", live.active_tools.len())
+            } else {
+                format!(
+                    "running {} tools in parallel: {summary}",
+                    live.active_tools.len()
+                )
+            }
+        };
+        self.publish(Some(activity), true);
+    }
+
+    fn tool_finished(&self, result: &ToolResult) {
+        let activity = {
+            let Ok(mut live) = self.live.lock() else {
+                return;
+            };
+            let Some(summary) = live.active_tools.remove(&result.call_id) else {
+                return;
+            };
+            if live.active_tools.is_empty() {
+                self.finished_tool_label(&summary)
+            } else if self.localized_zh {
+                format!(
+                    "已完成 {summary}；仍有 {} 个工具运行",
+                    live.active_tools.len()
+                )
+            } else {
+                format!(
+                    "finished {summary}; {} tool(s) still running",
+                    live.active_tools.len()
+                )
+            }
+        };
+        self.publish(Some(activity), true);
+    }
+
+    fn publish(&self, activity: Option<String>, force: bool) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let message = {
+            let Ok(mut live) = self.live.lock() else {
+                return;
+            };
+            if let Some(activity) = activity.filter(|activity| !activity.is_empty()) {
+                live.activity = first_line_capped(&activity.replace(" \u{b7} ", " "), 88);
+            }
+            if live.activity.is_empty() {
+                live.activity = self.thinking_label().to_string();
+            }
+            if !force
+                && live.last_emit.is_some_and(|last| {
+                    now.duration_since(last) < std::time::Duration::from_millis(350)
+                })
+            {
+                return;
+            }
+            live.last_emit = Some(now);
+            let estimated = (live.round_chars / 4) as u64;
+            format!(
+                "{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} {} \u{b7} tokens={}",
+                self.label,
+                live.activity,
+                live.total_tokens.saturating_add(estimated)
+            )
+        };
+        self.progress.emit(message);
+    }
+
+    fn observe_delta(&self, delta: &str, semantic: bool) {
+        if self.cancel.is_cancelled() || delta.is_empty() {
+            return;
+        }
+        let activity = {
+            let Ok(mut live) = self.live.lock() else {
+                return;
+            };
+            live.round_chars = live.round_chars.saturating_add(delta.chars().count());
+            if semantic {
+                live.text_tail.push_str(delta);
+                if live.text_tail.len() > 512 {
+                    let keep_from = live
+                        .text_tail
+                        .char_indices()
+                        .rev()
+                        .take_while(|(idx, _)| live.text_tail.len().saturating_sub(*idx) <= 512)
+                        .last()
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(0);
+                    live.text_tail.drain(..keep_from);
+                }
+                readable_progress_tail(&live.text_tail)
+            } else {
+                None
+            }
+        };
+        self.publish(activity, false);
+    }
+
+    fn finish_round(&self, response: &Message) {
+        let activity = {
+            let Ok(mut live) = self.live.lock() else {
+                return;
+            };
+            let estimated = (live.round_chars / 4) as u64;
+            let reported = response
+                .meta
+                .as_ref()
+                .map(|meta| meta.tokens.completion as u64)
+                .unwrap_or(0);
+            live.total_tokens = live.total_tokens.saturating_add(reported.max(estimated));
+            live.round_chars = 0;
+            let semantic = readable_progress_tail(&response.text)
+                .or_else(|| readable_progress_tail(&live.text_tail));
+            live.text_tail.clear();
+            semantic.or_else(|| {
+                response
+                    .tool_calls
+                    .first()
+                    .map(|call| self.preparing_tool_label(&summarize_tool_call(call)))
+            })
+        };
+        self.publish(activity, true);
+    }
 }
 
 #[async_trait]
@@ -752,26 +959,92 @@ impl LifecycleHooks for SubtaskProgressHook {
         if self.cancel.is_cancelled() {
             return;
         }
-        // No trailing ellipsis: the TUI spinner appends its own `…`, so emitting one
-        // here would double it (`thinking……`).
-        self.progress.emit(format!(
-            "{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} thinking",
-            self.label
-        ));
+        self.publish(None, true);
+    }
+
+    async fn on_text_delta(&self, delta: &mut String) {
+        self.observe_delta(delta, true);
+    }
+
+    async fn on_reasoning_delta(&self, delta: &mut String) {
+        self.observe_delta(delta, false);
     }
 
     async fn on_model_response(&self, response: &mut Message) {
         if self.cancel.is_cancelled() {
             return;
         }
-        if let Some(call) = response.tool_calls.first() {
-            self.progress.emit(format!(
-                "{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} {}",
-                self.label,
-                summarize_tool_call(call)
-            ));
+        self.finish_round(response);
+    }
+}
+
+fn readable_progress_tail(text: &str) -> Option<String> {
+    let line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let clean = line
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect::<String>();
+    (!clean.is_empty()).then(|| first_line_capped(&clean, 88))
+}
+
+/// One-shot child driver with the same aggregation/failure semantics as
+/// `Agent::run_to_completion`, plus truthful execution-boundary progress. Tool
+/// middleware `before` is a classification seam and may run for a whole batch
+/// before any tool starts, so it cannot own user-facing "running" state.
+async fn run_child_to_completion(
+    child: Agent,
+    input: String,
+    policy: AutoRespond,
+    progress: Arc<SubtaskProgressHook>,
+) -> Outcome {
+    let mut handle = child.spawn();
+    let _ = handle.commands.send(AgentCommand::SendMessage {
+        text: input,
+        images: vec![],
+    });
+    let mut outcome = Outcome::default();
+    while let Some(event) = handle.events.recv().await {
+        match event {
+            AgentEvent::TextDelta(text) => outcome.text.push_str(&text),
+            AgentEvent::ToolStarted { call } => progress.tool_started(&call),
+            AgentEvent::ToolResult { result } => {
+                progress.tool_finished(&result);
+                outcome.tool_results.push(result);
+            }
+            AgentEvent::Request {
+                id,
+                kind: _,
+                payload: _,
+            } => {
+                let value = match policy {
+                    AutoRespond::AllowAll => serde_json::json!({ "decision": "allow" }),
+                    AutoRespond::DenyAll => serde_json::json!({ "decision": "deny" }),
+                };
+                let _ = handle.commands.send(AgentCommand::Respond { id, value });
+            }
+            AgentEvent::Error {
+                message,
+                http_status,
+                code,
+            } => {
+                outcome.error = Some(message);
+                outcome.http_status = http_status;
+                outcome.error_code = code;
+            }
+            AgentEvent::TurnComplete { reason } => {
+                outcome.stop = reason;
+                let _ = handle.commands.send(AgentCommand::Shutdown);
+                break;
+            }
+            _ => {}
         }
     }
+    let _ = handle.task.await;
+    outcome
 }
 
 /// Decide the final outcome of a child that unwound within the grace window AFTER its
@@ -984,11 +1257,7 @@ mod tests {
             ProgressSink::new(Arc::new(move |m: String| c.lock().unwrap().push(m)))
         };
         let cancel = CancellationToken::new();
-        let hook = SubtaskProgressHook {
-            progress: sink,
-            label: "explore#1".into(),
-            cancel: cancel.clone(),
-        };
+        let hook = SubtaskProgressHook::new(sink, "explore#1".into(), false, cancel.clone());
         let ctx = TurnCtx {
             session_id: None,
             turn_id: 1,
@@ -1018,14 +1287,13 @@ mod tests {
                 "marker-prefixed: {:?}",
                 c[0]
             );
-            // The spinner appends its OWN ellipsis — the thinking line must carry none.
+            assert!(c[0].contains("analyzing task"), "thinking line: {:?}", c[0]);
+            assert!(c[0].contains("tokens=0"), "token line: {:?}", c[0]);
             assert!(
-                !c[0].contains('\u{2026}'),
-                "no ellipsis on thinking line: {:?}",
-                c[0]
+                c[1].contains("preparing read_file a.rs"),
+                "tool line: {:?}",
+                c[1]
             );
-            assert!(c[0].ends_with("thinking"), "thinking line: {:?}", c[0]);
-            assert!(c[1].contains("read_file a.rs"), "tool line: {:?}", c[1]);
         }
 
         // A detached/zombie child cancelled on timeout must emit nothing further.
@@ -1037,6 +1305,100 @@ mod tests {
             2,
             "cancelled hook must stay silent"
         );
+    }
+
+    #[tokio::test]
+    async fn subtask_hook_reports_semantic_progress_and_monotonic_tokens() {
+        use atomcode_kernel::message::MessageMeta;
+        use atomcode_kernel::stream::TokenUsage;
+        use std::sync::Mutex;
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            ProgressSink::new(Arc::new(move |message| {
+                captured.lock().unwrap().push(message)
+            }))
+        };
+        let hook =
+            SubtaskProgressHook::new(sink, "explore#1".into(), true, CancellationToken::new());
+        let mut response =
+            Message::assistant("已定位命令注册入口，正在核对补全与权限机制", Vec::new());
+        response.meta = Some(MessageMeta {
+            tokens: TokenUsage {
+                prompt: 800,
+                completion: 128,
+                cached: 700,
+            },
+            ..MessageMeta::default()
+        });
+
+        hook.on_model_response(&mut response).await;
+        hook.observe_delta("abcdefghijabcdefghijabcdefghijabcdefghij", true);
+        let mut second = Message::assistant("继续核对补全脚本", Vec::new());
+        second.meta = Some(MessageMeta {
+            tokens: TokenUsage {
+                completion: 5,
+                ..TokenUsage::default()
+            },
+            ..MessageMeta::default()
+        });
+        hook.on_model_response(&mut second).await;
+
+        let captured = captured.lock().unwrap();
+        assert!(captured.iter().any(|line| {
+            line.contains("已定位命令注册入口，正在核对补全与权限机制")
+                && line.contains("tokens=128")
+        }));
+        let latest = captured.last().expect("second-round progress");
+        assert!(latest.contains("继续核对补全脚本"));
+        assert!(latest.contains("tokens=138"), "{latest}");
+    }
+
+    #[test]
+    fn subtask_hook_tracks_parallel_tools_by_call_id() {
+        use std::sync::Mutex;
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            ProgressSink::new(Arc::new(move |message| {
+                captured.lock().unwrap().push(message)
+            }))
+        };
+        let hook =
+            SubtaskProgressHook::new(sink, "explore#1".into(), true, CancellationToken::new());
+        let read = ToolCall {
+            id: "read-1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"a.rs"}"#.into(),
+        };
+        let grep = ToolCall {
+            id: "grep-1".into(),
+            name: "grep".into(),
+            arguments: r#"{"pattern":"TODO"}"#.into(),
+        };
+
+        hook.tool_started(&read);
+        hook.tool_started(&grep);
+        hook.tool_finished(&ToolResult {
+            call_id: read.id.clone(),
+            content: String::new(),
+            is_error: false,
+            images: Vec::new(),
+        });
+        hook.tool_finished(&ToolResult {
+            call_id: grep.id.clone(),
+            content: String::new(),
+            is_error: false,
+            images: Vec::new(),
+        });
+
+        let captured = captured.lock().unwrap();
+        assert!(captured[1].contains("正在并行执行 2 个工具"));
+        assert!(captured[2].contains("已完成 read_file a.rs"));
+        assert!(captured[2].contains("仍有 1 个工具运行"));
+        assert!(captured[3].contains("已完成 grep TODO"));
     }
 
     #[test]

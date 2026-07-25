@@ -770,6 +770,8 @@ pub struct SubtaskItem {
     pub description: String,
     pub model: String,
     pub activity: String,
+    pub started_at: Option<std::time::Instant>,
+    pub output_tokens: u64,
     pub status: SubtaskStatus,
 }
 

@@ -214,7 +214,40 @@ fn format_loop_row(
 /// list fits within the budget it renders every item; otherwise it folds (see
 /// `todo_panel_rows`). No blank padding — a short list shows short.
 const MAX_TODO_PANEL_ROWS: usize = 7;
-const MAX_SUBTASK_PANEL_ROWS: usize = 6;
+const MAX_SUBTASK_PANEL_ROWS: usize = 8;
+
+fn format_subtask_progress(activity: &str, elapsed: &str, tokens: u64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let tokens = crate::i18n::fmt_tokens(tokens as usize);
+    let metadata = [
+        format!(" \u{b7} {elapsed} \u{b7} \u{2191} {tokens} tokens"),
+        format!(" \u{b7} {elapsed} \u{b7} \u{2191}{tokens}"),
+        format!(" {elapsed} \u{2191}{tokens}"),
+        format!("\u{2191}{tokens}"),
+    ]
+    .into_iter()
+    .find(|candidate| crate::width::display_width(candidate) <= width);
+
+    let Some(metadata) = metadata else {
+        return crate::width::truncate_to_width(&format!("\u{2191}{tokens}"), width);
+    };
+    let activity_width = width.saturating_sub(crate::width::display_width(&metadata));
+    let activity = crate::width::truncate_with_ellipsis(&scrub_controls(activity), activity_width);
+    crate::width::truncate_to_width(&format!("{activity}{metadata}"), width)
+}
+
+fn clamp_cell_row(row: &mut Vec<Cell>, width: usize) {
+    if row.len() <= width {
+        return;
+    }
+    row.truncate(width);
+    // Never leave the leading half of a wide glyph at the right edge.
+    if row.last().is_some_and(|cell| cell.width > 1) {
+        row.pop();
+    }
+}
 
 /// One logical row of the collapsed todo panel. Pure structure — glyphs,
 /// i18n words, styling and width-fitting are applied in `build_todo_rows`.
@@ -2501,13 +2534,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return 0;
         }
         let fixed = if cap >= 2 { 2 } else { 1 }; // optional spacer + header
-        fixed + subtasks.items.len().min(cap.saturating_sub(fixed))
+        let budget = cap.saturating_sub(fixed);
+        if subtasks.items.len().saturating_mul(2) <= budget {
+            fixed + subtasks.items.len() * 2
+        } else {
+            fixed + budget.saturating_sub(1) / 2 * 2 + usize::from(budget > 0)
+        }
     }
 
-    /// Build the fixed Task fan-out panel. It is intentionally compact: one
-    /// header and one row per visible child, with a common model promoted into
-    /// the header. Child activity replaces in place through StatusLine updates;
-    /// none of these rows enter body_log or native scrollback.
+    /// Build the fixed Task fan-out panel. Each visible child owns an identity
+    /// row (including its model) and an in-place progress row. None of these
+    /// rows enter body_log or native scrollback.
     fn build_subtask_rows(
         &self,
         subtasks: &crate::render::SubtaskProgress,
@@ -2524,13 +2561,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             rows.push(Vec::new());
         }
 
-        let common_model = subtasks
-            .items
-            .iter()
-            .map(|item| item.model.as_str())
-            .filter(|model| !model.is_empty())
-            .reduce(|left, right| if left == right { left } else { "" })
-            .filter(|model| !model.is_empty());
         let bold = CellStyle {
             bold: true,
             ..CellStyle::default()
@@ -2549,9 +2579,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             &format!("{}/{} completed", subtasks.completed, subtasks.total),
             &detail,
         );
-        if let Some(model) = common_model {
-            push_str_cells(&mut header, &format!(" \u{b7} {model}"), &detail);
-        }
         rows.push(header);
 
         let mut ordered = subtasks.items.iter().collect::<Vec<_>>();
@@ -2562,11 +2589,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             SubtaskStatus::Completed => 3,
         });
         let budget = cap.saturating_sub(rows.len());
-        let has_hidden = ordered.len() > budget;
+        let has_hidden = ordered.len().saturating_mul(2) > budget;
         let visible_items = if has_hidden {
-            budget.saturating_sub(1)
+            budget.saturating_sub(1) / 2
         } else {
-            budget
+            ordered.len()
         };
         for item in ordered.iter().take(visible_items).copied() {
             let (glyph, glyph_style, body_style) = match item.status {
@@ -2575,7 +2602,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     ("\u{25cb}", style.clone(), style)
                 }
                 SubtaskStatus::Running => (
-                    "\u{25d0}",
+                    "\u{25cf}",
                     self.style_for(Role::Brand),
                     CellStyle {
                         bold: true,
@@ -2610,11 +2637,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             } else {
                 format!("{} \u{b7} {}", item.label, item.description)
             };
-            if !item.activity.is_empty() && item.status != SubtaskStatus::Completed {
-                suffix.push_str(&format!(" \u{b7} {}", item.activity));
-            }
-            if common_model.is_none() && !item.model.is_empty() {
-                suffix.push_str(&format!(" \u{b7} {}", item.model));
+            if !item.model.is_empty() {
+                let label_len = item.label.len();
+                let remainder = suffix.split_off(label_len);
+                suffix.push_str(&format!(" \u{b7} {}{}", item.model, remainder));
             }
             let glyph_width = crate::width::display_width(glyph);
             let fitted = crate::width::truncate_with_ellipsis(
@@ -2627,15 +2653,46 @@ impl<W: Write + Send> RetainedRenderer<W> {
             push_str_cells(&mut row, " ", &CellStyle::default());
             push_str_cells(&mut row, &fitted, &body_style);
             rows.push(row);
+
+            let elapsed = item
+                .started_at
+                .map(|started_at| started_at.elapsed().as_secs())
+                .unwrap_or(0);
+            let elapsed = if elapsed >= 60 {
+                format!("{}m{}s", elapsed / 60, elapsed % 60)
+            } else {
+                format!("{elapsed}s")
+            };
+            let activity = if item.activity.is_empty() {
+                match item.status {
+                    SubtaskStatus::Pending => "waiting",
+                    SubtaskStatus::Running => "analyzing task",
+                    SubtaskStatus::Completed => "completed",
+                    SubtaskStatus::Failed => "failed",
+                }
+            } else {
+                item.activity.as_str()
+            };
+            let content_width = rule_width.saturating_sub(6);
+            let fitted =
+                format_subtask_progress(activity, &elapsed, item.output_tokens, content_width);
+            let mut progress_row = Vec::new();
+            push_str_cells(&mut progress_row, "    ", &CellStyle::default());
+            push_str_cells(
+                &mut progress_row,
+                if self.caps.unicode_symbols {
+                    "\u{2514} "
+                } else {
+                    "- "
+                },
+                &self.style_for(Role::Muted),
+            );
+            push_str_cells(&mut progress_row, &fitted, &self.style_for(Role::Secondary));
+            rows.push(progress_row);
         }
         if has_hidden && budget > 0 {
             let hidden = &ordered[visible_items..];
-            let count = |status| {
-                hidden
-                    .iter()
-                    .filter(|item| item.status == status)
-                    .count()
-            };
+            let count = |status| hidden.iter().filter(|item| item.status == status).count();
             let mut parts = Vec::new();
             for (status, label) in [
                 (SubtaskStatus::Failed, "failed"),
@@ -2664,6 +2721,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 &self.style_for(Role::Muted),
             );
             rows.push(row);
+        }
+        for row in &mut rows {
+            clamp_cell_row(row, rule_width);
         }
         rows
     }
@@ -14492,6 +14552,8 @@ mod tests {
                     description: "inspect atomcode".into(),
                     model: "deepseek-v4-flash".into(),
                     activity: "completed".into(),
+                    started_at: Some(std::time::Instant::now()),
+                    output_tokens: 900,
                     status: SubtaskStatus::Completed,
                 },
                 SubtaskItem {
@@ -14499,6 +14561,8 @@ mod tests {
                     description: "inspect codex".into(),
                     model: "deepseek-v4-flash".into(),
                     activity: "reading files".into(),
+                    started_at: Some(std::time::Instant::now()),
+                    output_tokens: 420,
                     status: SubtaskStatus::Running,
                 },
                 SubtaskItem {
@@ -14506,6 +14570,8 @@ mod tests {
                     description: "inspect opencode".into(),
                     model: "deepseek-v4-flash".into(),
                     activity: "thinking".into(),
+                    started_at: Some(std::time::Instant::now()),
+                    output_tokens: 210,
                     status: SubtaskStatus::Running,
                 },
             ],
@@ -14522,13 +14588,72 @@ mod tests {
         let grid = vterm.dump();
         assert!(grid.contains("Subtasks 1/3 completed"));
         assert!(grid.contains("explore#2"));
+        assert!(grid.contains("\u{25cf} explore#2"));
+        assert!(grid.contains("explore#2 · deepseek-v4-flash · inspect codex"));
         assert!(grid.contains("reading files"));
+        assert!(grid.contains("↑ 420 tokens"));
         assert!(!grid.contains("standing todo"));
         assert_eq!(
             r.current_footer_rows(),
             r.last_painted_footer_rows,
             "subtask footer height math must mirror the painted rows"
         );
+    }
+
+    #[test]
+    fn subtask_progress_metadata_never_exceeds_narrow_width() {
+        for width in 0..32 {
+            let rendered = super::format_subtask_progress(
+                "已定位命令注册入口，正在核对补全与权限机制",
+                "18s",
+                12_345,
+                width,
+            );
+            assert!(
+                crate::width::display_width(&rendered) <= width,
+                "width={width}, rendered={rendered:?}"
+            );
+        }
+        let full = super::format_subtask_progress("正在分析", "18s", 384, 80);
+        assert!(full.contains("18s"));
+        assert!(full.contains("\u{2191} 384 tokens"));
+    }
+
+    #[test]
+    fn every_subtask_panel_row_is_clamped_to_rule_width() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (r, _buf) = new_capturing(100, 24);
+        let progress = SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 0,
+            total: 5,
+            items: (1..=5)
+                .map(|n| SubtaskItem {
+                    label: format!("explore#{n}"),
+                    description: "验证一个非常长的 CLI 命令注册与补全机制".into(),
+                    model: "deepseek-v4-flash".into(),
+                    activity: "已定位命令注册入口，正在核对补全与权限机制".into(),
+                    started_at: Some(std::time::Instant::now()),
+                    output_tokens: 12_345,
+                    status: SubtaskStatus::Running,
+                })
+                .collect(),
+        };
+
+        for width in 0..40 {
+            let rows = r.build_subtask_rows(&progress, width);
+            assert!(
+                rows.iter().all(|row| row.len() <= width),
+                "width={width}, row widths={:?}",
+                rows.iter().map(Vec::len).collect::<Vec<_>>()
+            );
+            assert!(
+                rows.iter()
+                    .all(|row| !row.last().is_some_and(|cell| cell.width > 1)),
+                "width={width}: wide glyph split at right edge"
+            );
+        }
     }
 
     #[test]
@@ -14543,6 +14668,8 @@ mod tests {
             description: format!("inspect {label}"),
             model: "deepseek-v4-flash".into(),
             activity: String::new(),
+            started_at: Some(std::time::Instant::now()),
+            output_tokens: 0,
             status: state,
         };
         status.subtasks = Some(SubtaskProgress {
@@ -14573,7 +14700,7 @@ mod tests {
         let grid = vterm.dump();
         assert!(grid.contains("failed#1"));
         assert!(grid.contains("running#1"));
-        assert!(grid.contains("1 pending · 4 completed"));
+        assert!(grid.contains("2 pending · 4 completed"));
         assert!(!grid.contains("more running"));
     }
 
@@ -14599,6 +14726,8 @@ mod tests {
                     description: format!("inspect area {n}"),
                     model: "deepseek-v4-flash".into(),
                     activity: "thinking".into(),
+                    started_at: Some(std::time::Instant::now()),
+                    output_tokens: 0,
                     status: SubtaskStatus::Running,
                 })
                 .collect(),
@@ -14641,6 +14770,8 @@ mod tests {
                 description: "inspect".into(),
                 model: "deepseek-v4-flash".into(),
                 activity: "thinking".into(),
+                started_at: Some(std::time::Instant::now()),
+                output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
         });
@@ -14673,6 +14804,8 @@ mod tests {
                 description: "inspect atomcode".into(),
                 model: "deepseek-v4-flash".into(),
                 activity: "thinking".into(),
+                started_at: Some(std::time::Instant::now()),
+                output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
         });
@@ -14710,6 +14843,8 @@ mod tests {
                 description: "edit scoped files".into(),
                 model: "deepseek-v4-flash".into(),
                 activity: "waiting".into(),
+                started_at: Some(std::time::Instant::now()),
+                output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
         });

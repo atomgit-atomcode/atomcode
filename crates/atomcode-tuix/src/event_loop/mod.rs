@@ -14839,8 +14839,7 @@ fn subtask_progress_from_args(
     call_id: &str,
     arguments: &str,
 ) -> Option<crate::render::SubtaskProgress> {
-    let repaired =
-        atomcode_capabilities::tools::repair::repair_tool_args("task", arguments);
+    let repaired = atomcode_capabilities::tools::repair::repair_tool_args("task", arguments);
     let value: serde_json::Value = serde_json::from_str(&repaired).ok()?;
     let tasks = value.get("tasks")?.as_array()?;
     if tasks.is_empty() {
@@ -14864,6 +14863,8 @@ fn subtask_progress_from_args(
                 description,
                 model: String::new(),
                 activity: String::new(),
+                started_at: None,
+                output_tokens: 0,
                 status: crate::render::SubtaskStatus::Pending,
             }
         })
@@ -14894,8 +14895,22 @@ fn update_subtask_progress(progress: &mut crate::render::SubtaskProgress, chunk:
         .strip_prefix(atomcode_capabilities::tools::task::SUBAGENT_ACTIVITY_MARKER)
         .unwrap_or(chunk);
     let parts = chunk.split(" \u{b7} ").collect::<Vec<_>>();
-    let (label, model, activity, status) = if let Some(label) =
-        parts.first().and_then(|part| part.strip_prefix("\u{21bb} "))
+    let started = parts
+        .first()
+        .is_some_and(|part| part.starts_with("\u{21bb} "));
+    let (label, model, activity, status) = if parts
+        .first()
+        .is_some_and(|part| *part == "\u{25cb} queued")
+    {
+        (
+            parts.get(1).copied().unwrap_or_default(),
+            parts.get(2).copied(),
+            Some("waiting"),
+            SubtaskStatus::Pending,
+        )
+    } else if let Some(label) = parts
+        .first()
+        .and_then(|part| part.strip_prefix("\u{21bb} "))
     {
         (
             label,
@@ -14933,11 +14948,21 @@ fn update_subtask_progress(progress: &mut crate::render::SubtaskProgress, chunk:
         return;
     };
     item.status = status;
+    if started && item.started_at.is_none() {
+        item.started_at = Some(std::time::Instant::now());
+    }
     if let Some(model) = model.filter(|model| !model.is_empty()) {
         item.model = model.to_string();
     }
     if let Some(activity) = activity.filter(|activity| !activity.is_empty()) {
         item.activity = activity.to_string();
+    }
+    if let Some(tokens) = parts
+        .iter()
+        .find_map(|part| part.strip_prefix("tokens="))
+        .and_then(|tokens| tokens.parse::<u64>().ok())
+    {
+        item.output_tokens = item.output_tokens.max(tokens);
     }
     progress.completed = progress
         .items
@@ -15018,6 +15043,16 @@ mod subtask_progress_projection_tests {
             {"subagent_type":"explore","description":"inspect codex"}
         ]}"#;
         let mut progress = subtask_progress_from_args("call-7", args).unwrap();
+        assert!(progress.items[0].started_at.is_none());
+        assert!(progress.items[1].started_at.is_none());
+
+        update_subtask_progress(
+            &mut progress,
+            "\u{1e}\u{25cb} queued \u{b7} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
+        );
+        assert_eq!(progress.items[0].status, SubtaskStatus::Pending);
+        assert_eq!(progress.items[0].model, "deepseek-v4-flash");
+        assert!(progress.items[0].started_at.is_none());
 
         update_subtask_progress(
             &mut progress,
@@ -15025,13 +15060,19 @@ mod subtask_progress_projection_tests {
         );
         assert_eq!(progress.items[0].status, SubtaskStatus::Running);
         assert_eq!(progress.items[0].model, "deepseek-v4-flash");
+        assert!(progress.items[0].started_at.is_some());
         assert_eq!(progress.items[1].status, SubtaskStatus::Pending);
+        assert!(progress.items[1].started_at.is_none());
 
         update_subtask_progress(
             &mut progress,
-            "\u{1e}explore#1 \u{b7} reading files",
+            "\u{1e}explore#1 \u{b7} 已读取 commands.rs，正在分析内容 \u{b7} tokens=384",
         );
-        assert_eq!(progress.items[0].activity, "reading files");
+        assert_eq!(
+            progress.items[0].activity,
+            "已读取 commands.rs，正在分析内容"
+        );
+        assert_eq!(progress.items[0].output_tokens, 384);
 
         update_subtask_progress(
             &mut progress,
