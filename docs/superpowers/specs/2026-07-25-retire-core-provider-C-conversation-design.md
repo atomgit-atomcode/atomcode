@@ -41,6 +41,10 @@ native SessionSnapshot(kernel) → snapshot_to_core → Conversation(core 缓冲
 - daemon `Cargo.toml` 视情去掉 `atomcode-core` 依赖（若 legacy_convert 完全消除；否则保留 importer 所需最小面）。
 - 更新过期 doc 注释。
 
+> **⚠️ C3 执行发现（2026-07-25）：物理删除被更深的 core::tool/ctx 纠缠阻塞。** C1+C2 后三模块**外部代码消费者已全零**（provider 仅余注释）。但它们物理上删不掉，因为 core 内部 `conversation↔provider↔ctx↔tool` 互相引用，且 **`core::tool` 仍有 9 个外部消费者**（daemon 的 `PermissionDecision`/`parse_permission_decision`、config 的 `real_home_dir`），`core::tool/mod.rs` 又内部用 `crate::ctx::file_store::FileStore`。故删 conversation/provider/ctx 需**先退役 core::tool + ctx::file_store**（外部消费者迁到 capabilities——capabilities 已有 `real_home_dir`/`strip_verbatim_prefix` 的 port）——这是一个**独立的后续子项目 D**，不属 C。
+>
+> **C 的实际完成度**：会话迁移**功能上已完成**——tuix/cli/daemon 传输全部脱离 core::conversation，含测试零引用（KEY CHECK grep 空）。legacy importer 用 frozen 本地 DTO 读旧盘，不依赖 core::conversation。剩余仅为 core 内部纠缠 + 物理删除，待子项目 D（退役 core::tool）解锁。
+
 ## 3. 关键设计决策
 
 - **C 顺序**：C1（trivial，摘 provider 消费者）→ C2（传输重构，最大）→ C3（删除）。C1 独立可先落地；C2 是主体；C3 是收口。
