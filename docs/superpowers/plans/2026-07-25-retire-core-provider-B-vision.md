@@ -48,6 +48,16 @@ mod tests {
         events: Vec<StreamEvent>,
         init_err: bool,
     }
+    // ProviderError has public fields and NO `new` — construct via struct literal.
+    fn perr(msg: &str) -> ProviderError {
+        ProviderError {
+            retryable: false,
+            message: msg.into(),
+            http_status: None,
+            code: None,
+            retry_after_secs: None,
+        }
+    }
     #[async_trait::async_trait]
     impl LlmProvider for ScriptedProvider {
         fn model_name(&self) -> &str { "fake-vl" }
@@ -58,7 +68,7 @@ mod tests {
             _options: &ChatOptions,
         ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, ProviderError> {
             if self.init_err {
-                return Err(ProviderError::new("init boom"));
+                return Err(perr("init boom"));
             }
             let evs = self.events.clone();
             Ok(Box::pin(stream::iter(evs)))
@@ -82,7 +92,7 @@ mod tests {
             events: vec![
                 StreamEvent::TextDelta("你好".into()),
                 StreamEvent::TextDelta("世界".into()),
-                StreamEvent::Done { stop_reason: None, usage: None },
+                StreamEvent::Done { truncated: false },
             ],
             init_err: false,
         });
@@ -99,7 +109,7 @@ mod tests {
     #[tokio::test]
     async fn run_vl_caption_stream_error_is_failed() {
         let p = Arc::new(ScriptedProvider {
-            events: vec![StreamEvent::Error(ProviderError::new("mid boom"))],
+            events: vec![StreamEvent::Error(perr("mid boom"))],
             init_err: false,
         });
         let out = run_vl_caption(p, "qwen-vl".into(), "看图", &[img()]).await;
@@ -109,7 +119,7 @@ mod tests {
     #[tokio::test]
     async fn run_vl_caption_empty_is_failed() {
         let p = Arc::new(ScriptedProvider {
-            events: vec![StreamEvent::Done { stop_reason: None, usage: None }],
+            events: vec![StreamEvent::Done { truncated: false }],
             init_err: false,
         });
         let out = run_vl_caption(p, "qwen-vl".into(), "看图", &[img()]).await;
@@ -117,7 +127,7 @@ mod tests {
     }
 }
 ```
-> 注：`StreamEvent::Done { .. }` 与 `ProviderError::new` 的**确切字段/构造**以 `crates/atomcode-kernel/src/stream.rs` 定义为准——实现时先看该文件（`Done` 可能字段名不同；若 `ProviderError::new` 签名不同，用其真实构造）。测试替身只实现 trait 的两个必需方法，其余走默认。
+> 已核实（stream.rs）：`StreamEvent::Done { truncated: bool }`；`ProviderError` 是公有字段 struct 无 `new`（`{retryable,message,http_status,code,retry_after_secs}`）且**无 `Display`**——格式化用 `e.message`（见实现）。测试替身只实现 trait 的两个必需方法，其余走默认。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -190,7 +200,7 @@ pub async fn run_vl_caption(
         Ok(s) => s,
         Err(e) => {
             return PreprocessOutcome::Failed {
-                reason: format!("VL '{vl_model}' stream init failed: {e:#}"),
+                reason: format!("VL '{vl_model}' stream init failed: {}", e.message),
             };
         }
     };
@@ -211,7 +221,7 @@ pub async fn run_vl_caption(
             Some(StreamEvent::Done { .. }) => break,
             Some(StreamEvent::Error(e)) => {
                 return PreprocessOutcome::Failed {
-                    reason: format!("VL '{vl_model}' call error: {e}"),
+                    reason: format!("VL '{vl_model}' call error: {}", e.message),
                 };
             }
             // One-shot OCR call: reasoning / usage / tool-call variants are not
