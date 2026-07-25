@@ -463,6 +463,7 @@ impl LlmProvider for OpenAiCompatProvider {
         // the initial open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = match open_stream(
             &client,
             &url,
@@ -471,6 +472,7 @@ impl LlmProvider for OpenAiCompatProvider {
             &api_key,
             &session_id,
             &policy,
+            rate_limit_retry_owner,
         )
         .await
         {
@@ -548,7 +550,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                     }
                                 }
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy).await
+                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
@@ -597,6 +599,7 @@ async fn open_stream(
     api_key: &str,
     session_id: &str,
     policy: &RetryPolicy,
+    rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     let mut tls12_probe = false;
@@ -637,7 +640,9 @@ async fn open_stream(
                 }
                 let code = resp.status().as_u16();
                 if !resp.status().is_success() {
-                    if retry::is_retryable_status(code) && attempt < policy.max_attempts {
+                    if retry::should_retry_open_status(code, rate_limit_retry_owner)
+                        && attempt < policy.max_attempts
+                    {
                         let wait = retry::parse_retry_after(resp.headers())
                             .unwrap_or_else(|| retry::compute_backoff(attempt, policy));
                         tokio::time::sleep(wait).await;
@@ -1403,6 +1408,39 @@ struct PromptTokensDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn open_429_request_count(
+        owner: atomcode_kernel::provider::RateLimitRetryOwner,
+    ) -> usize {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let mut cfg = OpenAiCompatConfig::new("test", format!("{}/v1", server.uri()), "test-model");
+        cfg.retry = RetryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        };
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+        let mut options = ChatOptions::default();
+        options.rate_limit_retry_owner = owner;
+        let result = provider.chat_stream(&[], &[], &options).await;
+        assert!(matches!(result, Err(e) if e.http_status == Some(429)));
+        server.received_requests().await.unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn per_call_owner_controls_real_429_open_retries() {
+        use atomcode_kernel::provider::RateLimitRetryOwner::{Kernel, Provider};
+
+        assert_eq!(open_429_request_count(Provider).await, 2);
+        assert_eq!(open_429_request_count(Kernel).await, 1);
+    }
 
     // Classification lock for every supported vision naming rule plus a
     // representative text-only negative.
@@ -1806,6 +1844,7 @@ mod tests {
             max_tokens: None,
             temperature: Some(0.5),
             tool_choice: ToolChoice::Required,
+            rate_limit_retry_owner: Default::default(),
         };
         let tools = vec![ToolDef {
             name: "read".into(),

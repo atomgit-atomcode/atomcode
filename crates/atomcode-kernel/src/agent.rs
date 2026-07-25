@@ -357,6 +357,35 @@ fn rate_limit_server_message(e: &crate::stream::ProviderError) -> Option<String>
     (!detail.is_empty()).then(|| detail.to_string())
 }
 
+/// Distinguish account/billing exhaustion from transient RPM/TPM throttling.
+/// Keep this allow-list narrow: unknown 429s remain retryable.
+fn is_terminal_rate_limit(e: &crate::stream::ProviderError) -> bool {
+    let code = e.code.as_deref().unwrap_or_default().to_ascii_lowercase();
+    if matches!(
+        code.as_str(),
+        "insufficient_quota"
+            | "billing_hard_limit_reached"
+            | "payment_required"
+            | "insufficient_balance"
+            | "1113"
+    ) {
+        return true;
+    }
+    let message = e.message.to_ascii_lowercase();
+    [
+        "insufficient quota",
+        "insufficient balance",
+        "billing hard limit",
+        "payment required",
+        "credit balance",
+        "余额不足",
+        "无可用资源包",
+        "请充值",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 /// Build the user-facing message shown when the empty-response retry budget is
 /// exhausted. Honest about cause: a content-free 200 from some OpenAI-compatible
 /// gateways is a LIKELY symptom of an over-/near-window request, so when the
@@ -1831,8 +1860,10 @@ impl RunningAgent {
             // pre_request projection, pre chat_stream): telemetry/datalog/cache-RCA
             // sees the exact bytes about to hit the provider. It gets `&` — it
             // cannot mutate the wire (mutation is pre_request's job above).
+            let mut request_options = self.chat_options.clone();
+            request_options.rate_limit_retry_owner = crate::provider::RateLimitRetryOwner::Kernel;
             self.hooks
-                .on_request(&messages, &defs, &self.chat_options, &turn_ctx)
+                .on_request(&messages, &defs, &request_options, &turn_ctx)
                 .await;
             // A failed OPEN cleanly fails the turn — no bogus assistant message,
             // no empty-success illusion. The session-level `chat_options` (the
@@ -1853,13 +1884,12 @@ impl RunningAgent {
                     self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                     return;
                 }
-                opened = self.provider.chat_stream(&messages, &defs, &self.chat_options) => opened,
+                opened = self.provider.chat_stream(&messages, &defs, &request_options) => opened,
             };
             let mut stream = match opened {
                 Ok(s) => {
                     overflow_attempt = 0; // a successful open resets the per-round counter
                     provider_retry = 0; // ditto for the transient-failure budget
-                    rate_limit_waits = 0; // window reopened — reset the livelock fuse
                     s
                 }
                 // HARD OVERFLOW recovery (OFF the normal path): the prompt exceeded the
@@ -1895,13 +1925,18 @@ impl RunningAgent {
                     let hint = crate::hook::RateLimitHint {
                         http_status: e.http_status,
                         retry_after_secs: effective_retry_after(&e),
+                        terminal: is_terminal_rate_limit(&e),
+                        attempt: rate_limit_waits.saturating_add(1),
                     };
                     let server_message = rate_limit_server_message(&e);
-                    let decision = self
-                        .hooks
-                        .on_rate_limit(&hint)
-                        .await
-                        .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
+                    let decision = if hint.terminal {
+                        crate::hook::RateLimitDecision::from_hint(&hint)
+                    } else {
+                        self.hooks
+                            .on_rate_limit(&hint)
+                            .await
+                            .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint))
+                    };
                     match decision {
                         crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
                             rate_limit_waits += 1;
@@ -2225,12 +2260,71 @@ impl RunningAgent {
                         let hint = crate::hook::RateLimitHint {
                             http_status: e.http_status,
                             retry_after_secs: effective_retry_after(&e),
+                            terminal: is_terminal_rate_limit(&e),
+                            attempt: rate_limit_waits.saturating_add(1),
                         };
                         let server_message = rate_limit_server_message(&e);
-                        let decision =
-                            self.hooks.on_rate_limit(&hint).await.unwrap_or_else(|| {
-                                crate::hook::RateLimitDecision::from_hint(&hint)
+                        let decision = if hint.terminal {
+                            crate::hook::RateLimitDecision::from_hint(&hint)
+                        } else {
+                            self.hooks
+                                .on_rate_limit(&hint)
+                                .await
+                                .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint))
+                        };
+                        // Once any model content has reached the driver, replaying the
+                        // request can duplicate text/reasoning/tool calls that cannot be
+                        // retracted from the live UI. Keep the clean RateLimited terminal,
+                        // but do not auto-retry this partially-consumed stream. A 429 before
+                        // the first content event remains safe to retry below.
+                        if saw_stream_content {
+                            // Persist exactly what the driver has already rendered;
+                            // otherwise snapshot/resume would lose visible output.
+                            let partial_reasoning = strip_reasoning_filler(&reasoning);
+                            if !assistant_text.is_empty()
+                                || !partial_reasoning.is_empty()
+                                || !pending_calls.is_empty()
+                            {
+                                let mut partial = crate::message::Message::assistant(
+                                    assistant_text.clone(),
+                                    pending_calls.clone(),
+                                );
+                                if suppress_internal_stream {
+                                    partial.internal_origin = Some("verify_cadence".to_string());
+                                    partial.text.clear();
+                                    partial.reasoning = None;
+                                    partial.reasoning_blocks.clear();
+                                } else {
+                                    partial.reasoning = if partial_reasoning.is_empty() {
+                                        None
+                                    } else {
+                                        Some(partial_reasoning)
+                                    };
+                                    partial.reasoning_blocks = reasoning_blocks.clone();
+                                }
+                                convo.push(partial);
+                            }
+                            let (reset_at_display, reset_label, secs_until_reset) = match decision {
+                                crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
+                                    (String::new(), String::new(), Some(secs))
+                                }
+                                crate::hook::RateLimitDecision::Pause {
+                                    reset_at_display,
+                                    reset_label,
+                                    secs_until_reset,
+                                } => (reset_at_display, reset_label, secs_until_reset),
+                            };
+                            self.rt.emit(AgentEvent::RateLimited {
+                                reset_at_display,
+                                reset_label,
+                                secs_until_reset,
+                                auto_resuming: false,
+                                server_message,
                             });
+                            self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
+                                .await;
+                            return;
+                        }
                         match decision {
                             crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
                                 rate_limit_waits += 1;
@@ -2262,44 +2356,6 @@ impl RunningAgent {
                                         return;
                                     }
                                     _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
-                                }
-                                // I-1: Commit any accumulated partial content (text, reasoning,
-                                // tool calls) to the conversation BEFORE re-issuing the round.
-                                // Without this the re-issued round presents the same bare user
-                                // prompt to the model, which then re-generates from scratch and
-                                // emits duplicate TextDelta events (the partial stream already
-                                // in the UI is irrecoverable — gateways usually reject at the
-                                // header layer so true mid-stream 429s are rare). With the
-                                // partial message committed, a well-behaved model continues from
-                                // the committed text rather than restarting. Known residual
-                                // limitation: already-emitted TextDelta events cannot be
-                                // recalled from the UI — if the model re-generates identical
-                                // content the user will see it twice. Full rollback would
-                                // require a streaming-rewind mechanism beyond this scope.
-                                let partial_reasoning = strip_reasoning_filler(&reasoning);
-                                if !assistant_text.is_empty()
-                                    || !partial_reasoning.is_empty()
-                                    || !pending_calls.is_empty()
-                                {
-                                    let mut partial = crate::message::Message::assistant(
-                                        assistant_text.clone(),
-                                        pending_calls.clone(),
-                                    );
-                                    if suppress_internal_stream {
-                                        partial.internal_origin =
-                                            Some("verify_cadence".to_string());
-                                        partial.text.clear();
-                                        partial.reasoning = None;
-                                        partial.reasoning_blocks.clear();
-                                    } else {
-                                        partial.reasoning = if partial_reasoning.is_empty() {
-                                            None
-                                        } else {
-                                            Some(partial_reasoning)
-                                        };
-                                        partial.reasoning_blocks = reasoning_blocks.clone();
-                                    }
-                                    convo.push(partial);
                                 }
                                 provider_retry = 0; // 429 must not consume the generic transient-retry budget
                                 retry_this_round = true;
@@ -2355,6 +2411,11 @@ impl RunningAgent {
                 round -= 1;
                 continue;
             }
+            // The stream reached a natural end rather than another 429, so this
+            // rate-limit incident has recovered. Do not reset merely because HTTP
+            // OPEN returned 200: some gateways report throttling as the first SSE
+            // error event, and resetting there would disable the five-wait fuse.
+            rate_limit_waits = 0;
             // The stream reached its natural end this round (no timeout, no 429
             // retry) — refill the reconnect budget so a LATER round's stall gets a
             // fresh MAX_STREAM_RETRIES.
@@ -3615,7 +3676,7 @@ impl AgentBuilder {
 
 #[cfg(test)]
 mod effective_retry_after_tests {
-    use super::effective_retry_after;
+    use super::{effective_retry_after, is_terminal_rate_limit};
     use crate::stream::ProviderError;
 
     fn err(message: &str, retry_after_secs: Option<u64>) -> ProviderError {
@@ -3660,6 +3721,23 @@ mod effective_retry_after_tests {
             effective_retry_after(&err("429 Too Many Requests", None)),
             None
         );
+    }
+
+    #[test]
+    fn billing_and_balance_429s_are_terminal_but_rpm_is_not() {
+        for (code, message) in [
+            (Some("insufficient_quota"), "quota unavailable"),
+            (None, "账户余额不足，请充值"),
+            (Some("billing_hard_limit_reached"), "limit"),
+        ] {
+            let mut e = err(message, None);
+            e.code = code.map(str::to_string);
+            assert!(is_terminal_rate_limit(&e), "{e:?}");
+        }
+
+        let mut rpm = err("requests per minute exceeded; retry later", None);
+        rpm.code = Some("rate_limit_exceeded".into());
+        assert!(!is_terminal_rate_limit(&rpm));
     }
 }
 

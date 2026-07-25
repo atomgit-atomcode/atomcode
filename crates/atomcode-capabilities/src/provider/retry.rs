@@ -5,12 +5,13 @@
 //! [`StreamEvent::Error`](atomcode_kernel::stream::StreamEvent) and NEVER retried —
 //! partial deltas may already have reached the consumer.
 //!
-//! Faithful port of `atomcode-core`'s neutral retry helpers. The locale-specific
-//! 429 quota-vs-transient classifier (`is_non_retryable_rate_limit`) is intentionally
-//! NOT ported here (it leans product/L3); a quota-exhausted 429 currently consumes a
-//! few retries before failing — tracked as a follow-up.
+//! HTTP 429 ownership is selected per call: direct consumers retain the bounded
+//! provider OPEN retry, while kernel turns surface the first 429 so their
+//! lifecycle can provide cancellable waits, countdowns, and a fuse.
 
 use std::time::Duration;
+
+use atomcode_kernel::provider::RateLimitRetryOwner;
 
 /// How long an idle keep-alive connection may sit in the pool before we drop
 /// it. reqwest's default is 90s; gateway load balancers commonly close idle
@@ -60,6 +61,13 @@ impl Default for RetryPolicy {
 /// (Anthropic-style; some OpenAI-compatible gateways pass it through).
 pub(crate) fn is_retryable_status(code: u16) -> bool {
     matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+/// Whether a transient status should be retried inside the provider's OPEN loop.
+/// HTTP 429 follows the per-call owner; all other transient statuses remain
+/// provider-owned fast retries.
+pub(crate) fn should_retry_open_status(code: u16, owner: RateLimitRetryOwner) -> bool {
+    is_retryable_status(code) && (code != 429 || owner == RateLimitRetryOwner::Provider)
 }
 
 /// Transient transport errors worth retrying.
@@ -221,6 +229,22 @@ mod tests {
         }
         for c in [400, 401, 403, 404, 422] {
             assert!(!is_retryable_status(c), "{c} should be fatal");
+        }
+    }
+
+    #[test]
+    fn open_retry_ownership_excludes_429_only() {
+        assert!(
+            is_retryable_status(429),
+            "kernel must still receive a retryable 429"
+        );
+        assert!(should_retry_open_status(429, RateLimitRetryOwner::Provider));
+        assert!(!should_retry_open_status(429, RateLimitRetryOwner::Kernel));
+        for code in [408, 425, 500, 502, 503, 504, 529] {
+            assert!(
+                should_retry_open_status(code, RateLimitRetryOwner::Kernel),
+                "{code} should keep provider fast retry"
+            );
         }
     }
 

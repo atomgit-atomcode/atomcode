@@ -9,7 +9,7 @@
 
 use atomcode_kernel::agent::{Agent, AgentHandle};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
-use atomcode_kernel::provider::{ChatOptions, ReasoningEffort, ToolChoice};
+use atomcode_kernel::provider::{ChatOptions, RateLimitRetryOwner, ReasoningEffort, ToolChoice};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::{EchoTool, RecordingProvider};
 use atomcode_kernel::tool::ToolRegistry;
@@ -62,6 +62,7 @@ async fn configured_chat_options_reach_the_provider() {
         max_tokens: Some(1000),
         tool_choice: ToolChoice::Required,
         temperature: Some(0.2),
+        rate_limit_retry_owner: RateLimitRetryOwner::Provider,
     };
 
     let mut handle = agent_handle(provider, Some(configured.clone()));
@@ -74,11 +75,11 @@ async fn configured_chat_options_reach_the_provider() {
         !calls.is_empty(),
         "the turn must have made at least one chat_stream call"
     );
-    // The provider received EXACTLY the configured options on its FIRST call.
-    assert_eq!(
-        calls[0].2, configured,
-        "the provider's first call must receive exactly the configured ChatOptions"
-    );
+    // Request knobs are unchanged; the runtime-only 429 owner is overridden by
+    // the turn loop because it owns cancellation, countdowns, and terminal state.
+    let mut expected = configured;
+    expected.rate_limit_retry_owner = RateLimitRetryOwner::Kernel;
+    assert_eq!(calls[0].2, expected);
     // Spot-check each field for a clearer failure message if the whole-struct eq fails.
     assert_eq!(calls[0].2.reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(calls[0].2.max_tokens, Some(1000));
@@ -107,9 +108,10 @@ async fn default_agent_sends_neutral_options() {
         !calls.is_empty(),
         "the turn must have made at least one chat_stream call"
     );
+    let mut expected = ChatOptions::default();
+    expected.rate_limit_retry_owner = RateLimitRetryOwner::Kernel;
     assert_eq!(
-        calls[0].2,
-        ChatOptions::default(),
-        "an agent built without chat_options must send a NEUTRAL ChatOptions::default()"
+        calls[0].2, expected,
+        "an agent built without chat_options must keep neutral model knobs"
     );
 }

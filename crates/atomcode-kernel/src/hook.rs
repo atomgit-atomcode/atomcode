@@ -97,6 +97,12 @@ impl Continuation {
 pub struct RateLimitHint {
     pub http_status: Option<u16>,
     pub retry_after_secs: Option<u64>,
+    /// True when the provider explicitly reports a non-transient account or
+    /// billing condition. Such a 429 must never enter an automatic retry loop.
+    pub terminal: bool,
+    /// One-based consecutive 429 incident attempt for this turn. The kernel owns
+    /// this counter so provider-local retries cannot multiply the fallback wait.
+    pub attempt: u32,
 }
 
 /// The host's verdict on a 429. `WaitAndRetry` => kernel sleeps (cancellably)
@@ -119,9 +125,34 @@ impl RateLimitDecision {
     /// or usage data unavailable): wait only if the kernel's own hint says the
     /// reset is imminent, otherwise pause with whatever little we know.
     pub fn from_hint(hint: &RateLimitHint) -> Self {
+        let jitter = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.subsec_nanos() as f64) / 1_000_000_000.0)
+            .unwrap_or(0.5);
+        Self::from_hint_with_jitter(hint, jitter)
+    }
+
+    /// Deterministic variant used by tests and hosts that inject their own
+    /// randomness. `jitter` is clamped to `0..=1`; fallback delays vary ±25%.
+    pub fn from_hint_with_jitter(hint: &RateLimitHint, jitter: f64) -> Self {
+        if hint.terminal {
+            return RateLimitDecision::Pause {
+                reset_at_display: String::new(),
+                reset_label: String::new(),
+                secs_until_reset: hint.retry_after_secs,
+            };
+        }
         match hint.retry_after_secs {
             Some(s) if s <= RATE_LIMIT_AUTO_WAIT_SECS => {
                 RateLimitDecision::WaitAndRetry { secs: s }
+            }
+            None => {
+                let shift = hint.attempt.saturating_sub(1).min(4);
+                let base = 3u64 << shift;
+                let factor = 0.75 + 0.5 * jitter.clamp(0.0, 1.0);
+                RateLimitDecision::WaitAndRetry {
+                    secs: ((base as f64) * factor).round().max(1.0) as u64,
+                }
             }
             _ => RateLimitDecision::Pause {
                 reset_at_display: String::new(),
@@ -468,22 +499,80 @@ mod tests {
         let d = RateLimitDecision::from_hint(&RateLimitHint {
             http_status: Some(429),
             retry_after_secs: Some(45),
+            terminal: false,
+            attempt: 1,
         });
         assert_eq!(d, RateLimitDecision::WaitAndRetry { secs: 45 });
     }
 
     #[test]
-    fn from_hint_pauses_when_reset_far_or_unknown() {
+    fn from_hint_pauses_when_reset_far_but_retries_unknown() {
         let far = RateLimitDecision::from_hint(&RateLimitHint {
             http_status: Some(429),
             retry_after_secs: Some(600),
+            terminal: false,
+            attempt: 1,
         });
         assert!(matches!(far, RateLimitDecision::Pause { .. }));
         let unknown = RateLimitDecision::from_hint(&RateLimitHint {
             http_status: Some(429),
             retry_after_secs: None,
+            terminal: false,
+            attempt: 1,
         });
-        assert!(matches!(unknown, RateLimitDecision::Pause { .. }));
+        assert!(matches!(
+            unknown,
+            RateLimitDecision::WaitAndRetry { secs: 2..=4 }
+        ));
+    }
+
+    #[test]
+    fn missing_retry_after_uses_bounded_incident_backoff() {
+        for (attempt, secs) in [(1, 3), (2, 6), (3, 12), (4, 24), (5, 48), (6, 48)] {
+            assert_eq!(
+                RateLimitDecision::from_hint_with_jitter(
+                    &RateLimitHint {
+                        http_status: Some(429),
+                        retry_after_secs: None,
+                        terminal: false,
+                        attempt,
+                    },
+                    0.5
+                ),
+                RateLimitDecision::WaitAndRetry { secs },
+            );
+        }
+    }
+
+    #[test]
+    fn missing_retry_after_jitter_stays_within_quarter_window() {
+        let hint = RateLimitHint {
+            http_status: Some(429),
+            retry_after_secs: None,
+            terminal: false,
+            attempt: 3,
+        };
+        assert_eq!(
+            RateLimitDecision::from_hint_with_jitter(&hint, 0.0),
+            RateLimitDecision::WaitAndRetry { secs: 9 }
+        );
+        assert_eq!(
+            RateLimitDecision::from_hint_with_jitter(&hint, 1.0),
+            RateLimitDecision::WaitAndRetry { secs: 15 }
+        );
+    }
+
+    #[test]
+    fn terminal_rate_limit_never_retries() {
+        assert!(matches!(
+            RateLimitDecision::from_hint(&RateLimitHint {
+                http_status: Some(429),
+                retry_after_secs: None,
+                terminal: true,
+                attempt: 1,
+            }),
+            RateLimitDecision::Pause { .. }
+        ));
     }
 
     #[tokio::test]
@@ -494,6 +583,8 @@ mod tests {
         let hint = RateLimitHint {
             http_status: Some(429),
             retry_after_secs: Some(10),
+            terminal: false,
+            attempt: 1,
         };
         assert!(Bare.on_rate_limit(&hint).await.is_none());
     }
