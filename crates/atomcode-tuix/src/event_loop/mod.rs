@@ -4775,11 +4775,10 @@ impl Buffer {
             crate::width::wrap_with_spans(&self.text, max_cols, self.cursor);
         if cur_row == 0 {
             // Already on first visual line → snap to byte 0.
-            if self.cursor > 0 {
-                self.cursor = 0;
-                return true;
-            }
-            return false;
+            // `self.cursor > 0` is guaranteed here: the early return
+            // above handles cursor == 0.
+            self.cursor = 0;
+            return true;
         }
         // Previous visual line: spans[cur_row - 1]
         let (prev_start, prev_end) = spans[cur_row - 1];
