@@ -3,7 +3,7 @@ use atomcode_config::proxy::{self, ProxyMode};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{build_status, save_and_reload, Buffer, LoopCtx};
+use crate::event_loop::{build_status, save_proxy_and_reload, Buffer, LoopCtx};
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
@@ -46,25 +46,21 @@ impl Modal for ProxyPicker {
                 Ok(ModalAction::Continue)
             }
             KeyCode::Enter => {
-                let mut desired = ctx.config.clone();
+                let mut desired = ctx.config.network.proxy.clone();
                 match self.selected {
                     0 => {
-                        desired.network.proxy.mode = ProxyMode::FollowSystem;
+                        desired.mode = ProxyMode::FollowSystem;
                     }
                     1 => {
                         let pinned = proxy::ProxyConfig::capture_from_env();
-                        desired.network.proxy.mode = ProxyMode::DefaultProxy;
-                        desired.network.proxy.http = pinned.http;
-                        desired.network.proxy.https = pinned.https;
-                        desired.network.proxy.all = pinned.all;
-                        desired.network.proxy.no_proxy = pinned.no_proxy;
+                        desired = pinned;
                     }
                     _ => {
-                        desired.network.proxy.mode = ProxyMode::NoProxy;
+                        desired.mode = ProxyMode::NoProxy;
                     }
                 }
-                let success = format!("  Proxy mode: {}\n", desired.network.proxy.summary());
-                if save_and_reload(ctx, desired, renderer, success, false) {
+                let success = format!("  Proxy mode: {}\n", desired.summary());
+                if save_proxy_and_reload(ctx, desired, renderer, success) {
                     Ok(ModalAction::Close)
                 } else {
                     Ok(ModalAction::Continue)

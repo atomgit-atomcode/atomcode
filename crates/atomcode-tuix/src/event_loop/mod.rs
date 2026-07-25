@@ -8069,6 +8069,22 @@ fn commit_desired_config(
     })
 }
 
+fn commit_proxy_config(
+    store: &ConfigStore,
+    proxy: &atomcode_config::proxy::ProxyConfig,
+) -> Result<DesiredConfigCommit, anyhow::Error> {
+    let mut previous = None;
+    let commit = store.update(|persisted| {
+        previous = Some(persisted.clone());
+        persisted.network.proxy = proxy.clone();
+        Ok(())
+    })?;
+    Ok(DesiredConfigCommit {
+        commit,
+        previous: previous.expect("successful ConfigStore update observed the previous snapshot"),
+    })
+}
+
 fn commit_language_without_reload(
     store: &ConfigStore,
     observed_revision: Option<&ConfigRevision>,
@@ -8265,6 +8281,91 @@ mod external_config_tests {
     #[test]
     fn config_save_without_an_observed_revision_fails_closed() {
         assert!(observed_revision_for_write(None).is_err());
+    }
+
+    #[test]
+    fn proxy_commit_creates_first_config_without_an_observed_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        let proxy = atomcode_config::proxy::ProxyConfig {
+            mode: atomcode_config::proxy::ProxyMode::DefaultProxy,
+            https: Some("http://proxy.example:8080".into()),
+            ..Default::default()
+        };
+
+        let committed = commit_proxy_config(&store, &proxy).unwrap();
+
+        assert_eq!(committed.commit.snapshot.config.network.proxy, proxy);
+        assert_eq!(store.read().unwrap().config.network.proxy, proxy);
+    }
+
+    #[test]
+    fn proxy_commit_preserves_a_concurrent_provider_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        store.replace(&config("initial-model", false)).unwrap();
+        store
+            .update(|persisted| {
+                persisted.providers.get_mut("main").unwrap().model = "external-model".into();
+                Ok(())
+            })
+            .unwrap();
+        let proxy = atomcode_config::proxy::ProxyConfig {
+            mode: atomcode_config::proxy::ProxyMode::NoProxy,
+            ..Default::default()
+        };
+
+        commit_proxy_config(&store, &proxy).unwrap();
+
+        let persisted = store.read().unwrap().config;
+        assert_eq!(persisted.providers["main"].model, "external-model");
+        assert_eq!(persisted.network.proxy, proxy);
+    }
+
+    #[test]
+    fn proxy_runtime_config_keeps_a_pinned_provider_selection() {
+        let current = config("pinned-model", false);
+        let mut persisted = config("global-model", false);
+        let global = persisted.providers.remove("main").unwrap();
+        persisted.providers.insert("global".into(), global);
+        persisted.default_provider = "global".into();
+        persisted.network.proxy.mode = atomcode_config::proxy::ProxyMode::NoProxy;
+
+        let desired = desired_config_from_snapshot_parts(
+            &current,
+            crate::ProviderSelectionMode::Pinned,
+            persisted,
+            false,
+        );
+
+        assert_eq!(desired.default_provider, "main");
+        assert_eq!(desired.providers["main"].model, "pinned-model");
+        assert_eq!(
+            desired.network.proxy.mode,
+            atomcode_config::proxy::ProxyMode::NoProxy
+        );
+    }
+
+    #[test]
+    fn proxy_runtime_config_retains_an_ephemeral_provider_missing_from_disk() {
+        let current = config("oauth-model", true);
+        let mut persisted = Config::default();
+        persisted.network.proxy.mode = atomcode_config::proxy::ProxyMode::DefaultProxy;
+
+        let desired = desired_config_from_snapshot_parts(
+            &current,
+            crate::ProviderSelectionMode::FollowGlobalDefault,
+            persisted,
+            false,
+        );
+
+        assert_eq!(desired.default_provider, "main");
+        assert!(desired.providers["main"].ephemeral);
+        assert_eq!(desired.providers["main"].model, "oauth-model");
+        assert_eq!(
+            desired.network.proxy.mode,
+            atomcode_config::proxy::ProxyMode::DefaultProxy
+        );
     }
 
     #[test]
@@ -8729,17 +8830,17 @@ fn select_committed_provider(
 /// `manual_reload` is set for an explicit `/reload` (vs a background external
 /// config poll): only then does a pinned session adopt on-disk edits to its
 /// active provider (see `merge_persisted_config_preserving_active`).
-fn desired_config_from_snapshot(
-    ctx: &LoopCtx,
+fn desired_config_from_snapshot_parts(
+    current: &Config,
+    selection_mode: crate::ProviderSelectionMode,
     mut persisted: Config,
     manual_reload: bool,
 ) -> Config {
-    let active_is_ephemeral = ctx
-        .config
+    let active_is_ephemeral = current
         .providers
-        .get(&ctx.config.default_provider)
+        .get(&current.default_provider)
         .is_some_and(|provider| provider.ephemeral);
-    for (name, provider) in &ctx.config.providers {
+    for (name, provider) in &current.providers {
         if provider.ephemeral {
             persisted
                 .providers
@@ -8747,11 +8848,24 @@ fn desired_config_from_snapshot(
                 .or_insert_with(|| provider.clone());
         }
     }
-    if ctx.provider_selection_mode == crate::ProviderSelectionMode::Pinned || active_is_ephemeral {
-        merge_persisted_config_preserving_active(&ctx.config, persisted, manual_reload)
+    if selection_mode == crate::ProviderSelectionMode::Pinned || active_is_ephemeral {
+        merge_persisted_config_preserving_active(current, persisted, manual_reload)
     } else {
         persisted
     }
+}
+
+fn desired_config_from_snapshot(
+    ctx: &LoopCtx,
+    persisted: Config,
+    manual_reload: bool,
+) -> Config {
+    desired_config_from_snapshot_parts(
+        &ctx.config,
+        ctx.provider_selection_mode,
+        persisted,
+        manual_reload,
+    )
 }
 
 fn reconcile_persisted_config(
@@ -11611,50 +11725,16 @@ pub(crate) fn save_and_reload(
         &desired,
         persist_runtime_provider_as_default,
     ) {
-        Ok(DesiredConfigCommit { commit, previous }) => {
-            let rollback_persisted_config = Some(previous);
-            let rollback_runtime_config = Some(previous_runtime_config);
-            let origin_generation = ctx.runtime.current_generation();
-            atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
-            if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
-                let rollback = rollback_pending_provider_reload(
-                    ctx,
-                    PendingProviderReload {
-                        origin_generation,
-                        desired_config: desired,
-                        persisted_revision: Some(commit.snapshot.revision),
-                        rollback_persisted_config,
-                        rollback_runtime_config,
-                        previous_model_name: Some(previous_model_name),
-                        announce: None,
-                        manual_reload_announce: false,
-                        selection_mode_after_success: None,
-                    },
-                );
-                let suffix = rollback
-                    .error
-                    .map(|error| format!("; config rollback failed: {error}"))
-                    .unwrap_or_default();
-                renderer.render(UiLine::Error(format!(
-                    "provider reload could not be started: {error}{suffix}"
-                )));
-                renderer.flush();
-                return false;
-            }
-            ctx.observed_config_revision = Some(commit.snapshot.revision.clone());
-            ctx.pending_provider_reload = Some(PendingProviderReload {
-                origin_generation,
-                desired_config: desired,
-                persisted_revision: Some(commit.snapshot.revision),
-                rollback_persisted_config,
-                rollback_runtime_config,
-                previous_model_name: Some(previous_model_name),
-                announce: Some(success_message),
-                manual_reload_announce: false,
-                selection_mode_after_success: None,
-            });
-            true
-        }
+        Ok(DesiredConfigCommit { commit, previous }) => stage_committed_config_reload(
+            ctx,
+            desired,
+            commit,
+            previous,
+            previous_runtime_config,
+            previous_model_name,
+            renderer,
+            success_message,
+        ),
         Err(e) => {
             renderer.render(UiLine::Error(
                 crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
@@ -11666,6 +11746,116 @@ pub(crate) fn save_and_reload(
             false
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_committed_config_reload(
+    ctx: &mut LoopCtx,
+    desired: Config,
+    commit: ConfigCommit,
+    previous_persisted_config: Config,
+    previous_runtime_config: Config,
+    previous_model_name: String,
+    renderer: &mut dyn Renderer,
+    success_message: String,
+) -> bool {
+    let rollback_persisted_config = Some(previous_persisted_config);
+    let rollback_runtime_config = Some(previous_runtime_config);
+    let origin_generation = ctx.runtime.current_generation();
+    atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+    if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+        let rollback = rollback_pending_provider_reload(
+            ctx,
+            PendingProviderReload {
+                origin_generation,
+                desired_config: desired,
+                persisted_revision: Some(commit.snapshot.revision),
+                rollback_persisted_config,
+                rollback_runtime_config,
+                previous_model_name: Some(previous_model_name),
+                announce: None,
+                manual_reload_announce: false,
+                selection_mode_after_success: None,
+            },
+        );
+        let suffix = rollback
+            .error
+            .map(|error| format!("; config rollback failed: {error}"))
+            .unwrap_or_default();
+        renderer.render(UiLine::Error(format!(
+            "provider reload could not be started: {error}{suffix}"
+        )));
+        renderer.flush();
+        return false;
+    }
+    ctx.observed_config_revision = Some(commit.snapshot.revision.clone());
+    ctx.pending_provider_reload = Some(PendingProviderReload {
+        origin_generation,
+        desired_config: desired,
+        persisted_revision: Some(commit.snapshot.revision),
+        rollback_persisted_config,
+        rollback_runtime_config,
+        previous_model_name: Some(previous_model_name),
+        announce: Some(success_message),
+        manual_reload_announce: false,
+        selection_mode_after_success: None,
+    });
+    true
+}
+
+pub(crate) fn save_proxy_and_reload(
+    ctx: &mut LoopCtx,
+    proxy: atomcode_config::proxy::ProxyConfig,
+    renderer: &mut dyn Renderer,
+    success_message: String,
+) -> bool {
+    if provider_transition_pending(ctx) {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+        ));
+        renderer.flush();
+        return false;
+    }
+    let previous_runtime_config = ctx.config.clone();
+    let previous_model_name = ctx.model_name.clone();
+    let DesiredConfigCommit { commit, previous } =
+        match commit_proxy_config(&ctx.config_store, &proxy) {
+            Ok(committed) => committed,
+            Err(error) => {
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
+                        error: &error.to_string(),
+                    })
+                    .into_owned(),
+                ));
+                renderer.flush();
+                return false;
+            }
+        };
+    let desired = desired_config_from_snapshot(ctx, commit.snapshot.config.clone(), false);
+
+    // First-run `/proxy` commonly runs before any provider exists. There is no
+    // HTTP client to rebuild yet; `/login` creates its client after this method
+    // applies the process proxy environment.
+    if desired.providers.is_empty() {
+        atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+        ctx.config = desired;
+        ctx.observed_config_revision = Some(commit.snapshot.revision);
+        renderer.render(UiLine::CommandOutput(success_message));
+        renderer.flush();
+        return true;
+    }
+
+    stage_committed_config_reload(
+        ctx,
+        desired,
+        commit,
+        previous,
+        previous_runtime_config,
+        previous_model_name,
+        renderer,
+        success_message,
+    )
 }
 
 pub(crate) fn save_language_and_reload(
