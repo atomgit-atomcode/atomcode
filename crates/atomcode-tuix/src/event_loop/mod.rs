@@ -13546,12 +13546,27 @@ fn handle_round_cap_key(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     code: KeyCode,
-    _modifiers: crossterm::event::KeyModifiers,
+    modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    use crossterm::event::KeyModifiers;
     let Some(panel) = app.state.round_cap_panel.as_ref() else {
         return Ok(());
     };
     let id = panel.id;
+    // Ctrl+C: fail-closed stop (answer the pending checkpoint Request so the
+    // kernel round-trip isn't left hanging) and then cancel the running turn —
+    // exactly like the sibling handlers (`handle_user_input_key`,
+    // `handle_approval_key`) treat Ctrl+C. Checked BEFORE the Char('k')/('j')
+    // arms so Ctrl+C never toggles the cursor. This needs the extra
+    // cancel action, so it's an explicit arm rather than going through the
+    // pure `round_cap_key_decision` in the `_` fallthrough.
+    if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+        app.state.on_round_cap_resolved();
+        deliver_round_cap(ctx, id, false);
+        cancel_active_turn(ctx);
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(p) = app.state.round_cap_panel.as_mut() {
@@ -19008,10 +19023,15 @@ fn round_cap_stats(state: &crate::state::UiState) -> String {
     if let Some(d) = state.turn_elapsed() {
         parts.push(crate::render::fmt_dur(d));
     }
-    if state.total_tokens > 0 {
+    // Per-turn token total (matches the per-turn `turn_elapsed()` above) —
+    // `total_tokens` is session-cumulative and would misreport the tokens spent
+    // in THIS turn, which is what the checkpoint is asking about.
+    let turn_tokens =
+        state.turn_prompt_tokens + state.turn_completion_tokens + state.turn_cached_tokens;
+    if turn_tokens > 0 {
         parts.push(format!(
             "{} tokens",
-            atomcode_config::i18n::fmt_tokens(state.total_tokens)
+            atomcode_config::i18n::fmt_tokens(turn_tokens)
         ));
     }
     parts.join(" · ")

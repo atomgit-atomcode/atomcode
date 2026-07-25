@@ -317,6 +317,8 @@ pub(crate) fn chat_runtime_config(
             .and_then(|s| s.trim().parse::<u32>().ok())
             .unwrap_or(config.coding.max_rounds),
         subagent_config: Some(Arc::new(config.clone())),
+        // Daemon path has no TUI checkpoint picker; keep the hard round-cap.
+        round_cap_checkpoint: false,
     }
 }
 

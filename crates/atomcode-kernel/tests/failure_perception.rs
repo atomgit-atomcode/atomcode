@@ -513,6 +513,63 @@ async fn round_cap_checkpoint_null_response_stops_fail_closed() {
 }
 
 #[tokio::test]
+async fn round_cap_checkpoint_cancel_stops_as_cancelled() {
+    // Cancelling AT the checkpoint (rather than answering stop) must terminate
+    // the turn as Cancelled, not MaxRounds: `Cancel` resolves the pending
+    // Request to Null so `continue` reads false, but the in-scope cancel token
+    // is set, so `run_turn` funnels through the cancel path. Also asserts no
+    // hang (the Cancel must actually terminate the turn).
+    let provider = scripted_tool_rounds(5);
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(echo_tools())
+        .max_rounds(2)
+        .round_cap_checkpoint(true)
+        .build()
+        .spawn();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
+
+    let mut saw_cancelled_event = false;
+    let mut stop = None;
+    let outcome = tokio::time::timeout(OUTER_GUARD, async {
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Request { kind, .. }
+                    if kind == atomcode_kernel::ROUND_CAP_CHECKPOINT_KIND =>
+                {
+                    // Cancel instead of Respond: the user aborted at the prompt.
+                    handle.commands.send(AgentCommand::Cancel).unwrap();
+                }
+                AgentEvent::Cancelled => {
+                    saw_cancelled_event = true;
+                }
+                AgentEvent::TurnComplete { reason } => {
+                    stop = Some(reason);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    outcome.expect("round_cap_checkpoint_cancel_stops_as_cancelled must not hang");
+    assert!(
+        matches!(stop, Some(StopReason::Cancelled)),
+        "cancel at checkpoint must end the turn as Cancelled; got {stop:?}"
+    );
+    assert!(
+        saw_cancelled_event,
+        "cancel path must emit AgentEvent::Cancelled"
+    );
+}
+
+#[tokio::test]
 async fn round_cap_checkpoint_off_keeps_hard_error() {
     // Default (round_cap_checkpoint = false): hitting the cap still emits a red
     // Error AND finishes MaxRounds AND never emits the checkpoint Request.

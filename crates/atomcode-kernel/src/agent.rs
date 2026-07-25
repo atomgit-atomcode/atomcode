@@ -1688,7 +1688,17 @@ impl RunningAgent {
                             let base = self.max_rounds.unwrap_or(cap);
                             round_cap = Some(cap.saturating_add(base));
                             // fall through: this round (== cap+1 <= new cap) proceeds.
+                        } else if cancel.is_cancelled() {
+                            // The `false` came from a Cancel that resolved the
+                            // pending Request to Null (not an explicit "stop").
+                            // Terminate through the canonical cancel funnel so the
+                            // turn ends as Cancelled — matching every other
+                            // mid-turn cancel arm — not MaxRounds.
+                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            return;
                         } else {
+                            // Explicit stop (Esc / picker) OR fail-closed default
+                            // (no requester / timeout): the round cap is the reason.
                             self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx).await;
                             return;
                         }

@@ -161,6 +161,12 @@ pub struct CodingRuntimeConfig {
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
+    /// When true, a `max_rounds` hit becomes an interactive continue/stop
+    /// checkpoint (the kernel sends a `ROUND_CAP_CHECKPOINT_KIND` Request)
+    /// instead of a hard error. Only the TUI implements the picker, so this
+    /// must stay `false` for headless / ACP / daemon runtimes (there is no
+    /// requester to answer the Request → the kernel fail-closes to a stop).
+    pub round_cap_checkpoint: bool,
 }
 
 impl CodingRuntimeConfig {
@@ -229,6 +235,9 @@ impl CodingRuntimeConfig {
                 std::env::var("ATOMCODE_TURN_MAX_ROUNDS").ok().as_deref(),
             ),
             subagent_config: Some(Arc::new(config.clone())),
+            // Default off; only the interactive TUI opts in (see the CLI's
+            // TUI spawn sites and `event_loop::reload_runtime_provider_from`).
+            round_cap_checkpoint: false,
         }
     }
 
@@ -262,6 +271,7 @@ impl CodingRuntimeConfig {
             config.request_timeout = None;
         }
         config.keep_interrupted_context = self.keep_interrupted_context;
+        config.round_cap_checkpoint = self.round_cap_checkpoint;
         config
     }
 }

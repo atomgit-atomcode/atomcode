@@ -1578,6 +1578,9 @@ async fn run() -> Result<i32> {
         resume_session_id,
         provider_bootstrap,
         !is_headless,
+        // TUI-only: the interactive checkpoint replaces the hard round-cap
+        // error. Headless (`-p`) keeps the fail-closed hard error (no picker).
+        !is_headless,
     )
     .await?;
     // TUI replay remains a presentation projection during S4; runtime resume above
@@ -1631,18 +1634,21 @@ async fn run() -> Result<i32> {
             move |config: &atomcode_config::config::Config,
                   working_dir: &std::path::Path,
                   session: &atomcode_tuix::session::Session| {
-                spawn_deferred_tui_runtime(
-                    runtime_config_from(
-                        config,
-                        working_dir,
-                        None,
-                        Some(tel.clone()),
-                        skip_perms,
-                        // In-TUI re-spawns (/session, /bg, /resume) are always interactive.
-                        true,
-                    ),
-                    session,
-                )
+                let mut runtime_cfg = runtime_config_from(
+                    config,
+                    working_dir,
+                    None,
+                    Some(tel.clone()),
+                    skip_perms,
+                    // In-TUI re-spawns (/session, /bg, /resume) are always interactive.
+                    true,
+                );
+                // TUI-only: a `max_rounds` hit becomes the interactive
+                // continue/stop checkpoint (the render arm lives in the TUI
+                // event loop). `spawn_deferred_tui_runtime` is only ever the
+                // in-TUI respawn factory, so this is never a headless path.
+                runtime_cfg.round_cap_checkpoint = true;
+                spawn_deferred_tui_runtime(runtime_cfg, session)
             },
         )
     };
@@ -2094,12 +2100,18 @@ async fn spawn_native_cli_runtime(
     resume_session_id: Option<String>,
     bootstrap: atomcode_coding::ProviderBootstrap,
     fork_on_session_in_use: bool,
+    // TUI-only opt-in: turn a `max_rounds` hit into the interactive
+    // continue/stop checkpoint. The checkpoint render arm lives in the TUI
+    // event loop, so headless (`-p`) callers pass `false` — otherwise the
+    // kernel would emit a checkpoint Request with no requester and fail-closed.
+    round_cap_checkpoint: bool,
 ) -> anyhow::Result<(
     atomcode_coding::CodingRuntime,
     atomcode_coding::CodingAgentConfig,
     Option<ContinuedCliSession>,
 )> {
-    let agent = cfg.agent_config();
+    let mut agent = cfg.agent_config();
+    agent.round_cap_checkpoint = round_cap_checkpoint;
     let (session, imported_lease, continued_session) = match resume_session_id {
         Some(id) => {
             let manager =
@@ -3557,6 +3569,42 @@ mod tests {
         assert_eq!(ov.provider_name, "direct");
         assert_eq!(ov.api_key, "sk-direct");
         assert_eq!(ov.reasoning_history.as_deref(), Some("exclude"));
+    }
+
+    #[test]
+    fn round_cap_checkpoint_default_off_and_propagates_to_agent_config() {
+        // Guard against C1 regression: the interactive checkpoint is TUI-only,
+        // opted in at the TUI spawn sites by flipping `round_cap_checkpoint` on
+        // the runtime config. A direct test of the async CLI factory
+        // (`spawn_native_cli_runtime`/`spawn_deferred_tui_runtime`) isn't
+        // feasible here — both need a live runtime + provider bootstrap — so we
+        // pin the propagation seam those sites rely on: the field defaults off
+        // and `agent_config()` copies it through to the kernel-facing config.
+        let toml_str = r#"
+            default_provider = "p"
+            [providers.p]
+            type = "openai"
+            model = "m"
+            api_key = "k"
+            base_url = "https://example.test/v1"
+        "#;
+        let config: atomcode_config::config::Config = toml::from_str(toml_str).unwrap();
+        let wd = PathBuf::from("/tmp/x");
+
+        // Default (headless / ACP / daemon behavior): checkpoint stays off.
+        let mut cfg = runtime_config_from(&config, &wd, None, None, false, true);
+        assert!(!cfg.round_cap_checkpoint, "defaults off");
+        assert!(
+            !cfg.agent_config().round_cap_checkpoint,
+            "off config yields off agent"
+        );
+
+        // TUI opt-in: the flag flows through agent_config() to the kernel.
+        cfg.round_cap_checkpoint = true;
+        assert!(
+            cfg.agent_config().round_cap_checkpoint,
+            "TUI opt-in reaches the agent config"
+        );
     }
 
     #[test]
