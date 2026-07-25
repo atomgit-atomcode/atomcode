@@ -16,7 +16,6 @@ use atomcode_config::config::Config;
 use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_capabilities::mcp::McpRegistry;
-use atomcode_core::provider;
 use atomcode_core::tool::PermissionDecision;
 use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -1118,12 +1117,53 @@ pub(crate) struct LiveMessageReq {
 /// already contains either the VL description or an explicit failure marker.
 pub(crate) async fn preprocess_image_caption(
     config: &Config,
-    active: &dyn atomcode_core::provider::LlmProvider,
+    active_model: &str,
+    working_dir: &std::path::Path,
+    telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    session_id: Option<&str>,
     message: &str,
     images: &[ImagePart],
 ) -> String {
-    use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
-    match maybe_preprocess(config, active, message, images).await {
+    use atomcode_coding::vision::{run_vl_caption, should_skip, PreprocessOutcome};
+    // Short-circuit: no images, or the main model already accepts images.
+    if should_skip(active_model, !images.is_empty()) {
+        return message.to_string();
+    }
+    // Resolve the configured VL provider. Nothing configured ⇒ pass through.
+    let Some(vl_name) = config.vision_preprocessor_provider.clone() else {
+        return message.to_string();
+    };
+    let Some(vl_pc) = config.providers.get(&vl_name).cloned() else {
+        return message.to_string();
+    };
+    let vl_model = vl_pc.model.clone();
+    // Build the one-off VL provider via the daemon's native chain (the SAME
+    // chain `/chat` and `/compact` use), yielding a kernel-native provider —
+    // no core provider. `build` may block on auth I/O (gateway token) → run it
+    // off the async runtime. `session_id` is bound at build so the VL call
+    // rides the same upstream account/replica as the main turn.
+    let coding_cfg = crate::kernel_runtime::coding_config_from_runtime(&chat_runtime_config(
+        config,
+        &vl_name,
+        working_dir,
+        telemetry,
+    ));
+    let factory = crate::runtime_host::coding_provider_factory();
+    let sid = session_id.filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let provider =
+        match tokio::task::spawn_blocking(move || factory.build(&coding_cfg, sid.as_deref())).await
+        {
+            Ok(Ok(p)) => p,
+            _ => return fold_vl_failure(message),
+        };
+    let kimgs: Vec<atomcode_kernel::message::ImageContent> = images
+        .iter()
+        .map(|i| atomcode_kernel::message::ImageContent {
+            media_type: i.media_type.clone(),
+            data: i.data.clone(),
+        })
+        .collect();
+    match run_vl_caption(provider, vl_model, message, &kimgs).await {
         PreprocessOutcome::Skipped => message.to_string(),
         PreprocessOutcome::Replaced { text, vl_model } => {
             if message.trim().is_empty() {
@@ -1132,13 +1172,18 @@ pub(crate) async fn preprocess_image_caption(
                 format!("{message}\n\n[图片内容（由 {vl_model} 识别）]\n{text}")
             }
         }
-        PreprocessOutcome::Failed { .. } => {
-            if message.trim().is_empty() {
-                "[图片识别失败]".to_string()
-            } else {
-                format!("{message}\n\n[图片识别失败]")
-            }
-        }
+        PreprocessOutcome::Failed { .. } => fold_vl_failure(message),
+    }
+}
+
+/// Fold the `[图片识别失败]` marker into a caption (VL build/stream failure). The
+/// marker string is byte-identical to the CLI `apply_outcome` failure path so
+/// `text_carries_vl_caption` + tuix `split_live_inputs` pair images correctly.
+fn fold_vl_failure(message: &str) -> String {
+    if message.trim().is_empty() {
+        "[图片识别失败]".to_string()
+    } else {
+        format!("{message}\n\n[图片识别失败]")
     }
 }
 
@@ -1161,6 +1206,8 @@ async fn preprocess_live_caption(
     images: &[ImagePart],
     provider_name: Option<&str>,
     session_id: Option<&str>,
+    working_dir: &std::path::Path,
+    telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
 ) -> String {
     if images.is_empty() {
         return message.to_string();
@@ -1169,21 +1216,23 @@ async fn preprocess_live_caption(
         Ok(c) => c,
         Err(_) => return message.to_string(),
     };
-    let name = provider_name
-        .map(str::to_string)
-        .unwrap_or_else(|| config.default_provider.clone());
-    let active = match config.providers.get(&name).map(provider::create_provider) {
-        Some(Ok(p)) => p,
-        _ => return message.to_string(),
+    // The main model name is what decides vision-capability (`should_skip`); the
+    // one-off VL request rides `session_id` onto the same upstream account.
+    let name = resolve_provider_name(&config, provider_name);
+    let active_model = match config.providers.get(&name) {
+        Some(pc) => pc.model.clone(),
+        None => return message.to_string(),
     };
-    // Bind the conversation's session id onto this (throwaway) active provider so
-    // `maybe_preprocess` forwards it onto the one-off VL request as
-    // `x-atomcode-session-id` — otherwise the webui/live vision call is the
-    // session-less second request of the turn. Empty ⇒ header omitted.
-    if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
-        active.set_session_id(sid);
-    }
-    preprocess_image_caption(&config, &*active, message, images).await
+    preprocess_image_caption(
+        &config,
+        &active_model,
+        working_dir,
+        telemetry,
+        session_id,
+        message,
+        images,
+    )
+    .await
 }
 
 pub(crate) async fn live_message(
@@ -1274,6 +1323,8 @@ pub(crate) async fn live_message(
         &original_images,
         Some(&provider_name),
         Some(&join.binding.session_id),
+        &join.binding.working_dir,
+        state.telemetry.clone(),
     )
     .await;
     // VL preprocessing produced a caption ⇒ the runtime strips the image from the
@@ -2126,10 +2177,28 @@ mod tests {
     }
 
     // 回归：无图时视觉预处理是直通的——caption 原样返回，不触碰 config/网络。
-    // （有图的 VL 路径依赖真实 config/provider，覆盖在 vision_preprocessor 的单测里。）
+    // （有图的 VL 流式路径覆盖在 atomcode_coding::vision::run_vl_caption 的单测里。）
     #[tokio::test]
     async fn preprocess_live_caption_is_passthrough_without_images() {
-        let out = preprocess_live_caption("看下这个图片", &[], None, None).await;
+        // Disabled telemetry + throwaway dir: empty images short-circuit BEFORE
+        // any provider build, so neither is exercised — just needed to type-check.
+        let telemetry = atomcode_telemetry::Telemetry::init(
+            atomcode_telemetry::config::ResolvedConfig {
+                state: atomcode_telemetry::config::TelemetryState::Disabled("test"),
+                endpoint: String::new(),
+                atomcode_dir: std::env::temp_dir(),
+            },
+            "test".into(),
+        );
+        let out = preprocess_live_caption(
+            "看下这个图片",
+            &[],
+            None,
+            None,
+            &std::env::temp_dir(),
+            telemetry,
+        )
+        .await;
         assert_eq!(out, "看下这个图片");
     }
 

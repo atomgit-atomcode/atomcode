@@ -3701,9 +3701,16 @@ async fn process_chat_request(
                 data: i.data.clone(),
             })
             .collect();
-        let runtime_text =
-            live_api::preprocess_image_caption(&config, &*active_provider, &req.message, &images)
-                .await;
+        let runtime_text = live_api::preprocess_image_caption(
+            &config,
+            &provider_config.model,
+            &working_dir,
+            telemetry.clone(),
+            Some(&session_id),
+            &req.message,
+            &images,
+        )
+        .await;
 
         let mut conv = conversation.lock().await;
         if images.is_empty() {
