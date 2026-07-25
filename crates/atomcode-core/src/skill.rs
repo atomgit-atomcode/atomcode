@@ -498,7 +498,7 @@ impl SkillRegistry {
         let mut warnings: Vec<String> = Vec::new();
 
         // System home directory (for Claude Code compat paths)
-        let system_home = crate::tool::real_home_dir();
+        let system_home = crate::process_utils::real_home_dir();
 
         // AtomCode config dir (respects ATOMCODE_HOME env var; defaults to
         // ~/.atomcode). This is the SAME root used by config.toml, history,

@@ -486,7 +486,7 @@ fn is_home_or_root(path: &Path) -> bool {
     if path == Path::new("/") {
         return true;
     }
-    if let Some(home) = crate::tool::real_home_dir() {
+    if let Some(home) = crate::process_utils::real_home_dir() {
         if path == home.as_path() {
             return true;
         }

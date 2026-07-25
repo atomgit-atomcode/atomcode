@@ -264,11 +264,11 @@ fn expand_github_repo(repo: &str) -> Result<String> {
 /// home dir; relative paths are interpreted from the current working dir.
 fn expand_local_path(path: &str) -> Result<PathBuf> {
     let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        crate::tool::real_home_dir()
+        crate::process_utils::real_home_dir()
             .ok_or_else(|| anyhow!("no home dir to expand `~`"))?
             .join(rest)
     } else if path == "~" {
-        crate::tool::real_home_dir().ok_or_else(|| anyhow!("no home dir to expand `~`"))?
+        crate::process_utils::real_home_dir().ok_or_else(|| anyhow!("no home dir to expand `~`"))?
     } else {
         PathBuf::from(path)
     };

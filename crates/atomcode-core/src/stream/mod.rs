@@ -1,4 +1,9 @@
-use crate::tool::ToolCall;
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
 
 /// Default threshold for `RunawayDetector` — number of consecutive
 /// identical chars that count as a runaway. Picked to leave normal
