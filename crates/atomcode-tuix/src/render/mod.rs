@@ -698,7 +698,7 @@ pub struct UserInputBatchMeta {
 /// continue option description). `cursor` is the currently highlighted row
 /// (0 = "继续", 1 = "停止"). `stats` is a pre-formatted elapsed/token string
 /// (e.g. "2h0m0s · 305.00K tokens") — appended to the question when non-empty.
-pub fn round_cap_view(cap: u32, cursor: usize, stats: &str) -> UserInputPanelView {
+pub fn round_cap_view(cap: u32, base: u32, cursor: usize, stats: &str) -> UserInputPanelView {
     use atomcode_capabilities::tools::request_user_input::UserInputMode;
     let question = if stats.is_empty() {
         format!("已运行 {cap} 轮，继续吗？")
@@ -710,10 +710,9 @@ pub fn round_cap_view(cap: u32, cursor: usize, stats: &str) -> UserInputPanelVie
         question,
         mode: UserInputMode::Single,
         options: vec![
-            (
-                "继续".to_string(),
-                Some(format!("再跑 {cap} 轮后重新确认")),
-            ),
+            // `base` (the re-arm step), not `cap`: after a continuation `cap` has
+            // grown but only `base` more rounds are granted before the next prompt.
+            ("继续".to_string(), Some(format!("再跑 {base} 轮后重新确认"))),
             ("停止".to_string(), Some("结束本回合".to_string())),
         ],
         cursor,

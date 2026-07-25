@@ -567,11 +567,19 @@ mod user_input_batch_tests {
 pub struct RoundCapPanel {
     pub id: u64,
     pub cap: u32,
+    /// Re-arm increment (rounds granted per "continue"); may differ from `cap`
+    /// after the first continuation, when `cap` has grown but the step stays.
+    pub base: u32,
     pub cursor: usize, // 0=继续 1=停止
 }
 impl RoundCapPanel {
-    pub fn new(id: u64, cap: u32) -> Self {
-        Self { id, cap, cursor: 0 }
+    pub fn new(id: u64, cap: u32, base: u32) -> Self {
+        Self {
+            id,
+            cap,
+            base,
+            cursor: 0,
+        }
     }
     /// true = 继续
     pub fn chosen_continue(&self) -> bool {
@@ -2864,7 +2872,7 @@ mod tests {
 
     #[test]
     fn round_cap_panel_toggle_and_choice() {
-        let mut p = crate::state::RoundCapPanel::new(7, 200);
+        let mut p = crate::state::RoundCapPanel::new(7, 200, 200);
         assert!(p.chosen_continue());
         p.move_down();
         assert!(!p.chosen_continue());
@@ -2875,7 +2883,7 @@ mod tests {
     #[test]
     fn on_round_cap_resolved_clears_panel_and_resumes_streaming() {
         let mut s = UiState::new();
-        s.round_cap_panel = Some(crate::state::RoundCapPanel::new(9, 200));
+        s.round_cap_panel = Some(crate::state::RoundCapPanel::new(9, 200, 200));
         s.phase = UiPhase::RoundCap;
         // Verify user_input_panel is untouched — resolving round-cap must
         // not clobber a concurrent (or future) user-input panel.

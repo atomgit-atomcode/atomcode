@@ -12736,6 +12736,12 @@ fn deliver_user_input_null(ctx: &mut LoopCtx, id: u64) {
 /// `Respond` command (no daemon live-binding path needed — checkpoints are only
 /// emitted by the local kernel, not by the daemon bridge).
 fn deliver_round_cap(ctx: &mut LoopCtx, id: u64, cont: bool) {
+    // Clear the in-flight request id like the deliver_user_input siblings, so a
+    // later error during the resumed turn can't mistake the resolved checkpoint
+    // for a still-pending request.
+    if ctx.pending_runtime_request_id == Some(id) {
+        ctx.pending_runtime_request_id = None;
+    }
     ctx.runtime
         .dispatch(atomcode_coding::DriverCommand::Respond {
             id,
@@ -13553,16 +13559,16 @@ fn handle_round_cap_key(
         return Ok(());
     };
     let id = panel.id;
-    // Ctrl+C: fail-closed stop (answer the pending checkpoint Request so the
-    // kernel round-trip isn't left hanging) and then cancel the running turn —
-    // exactly like the sibling handlers (`handle_user_input_key`,
-    // `handle_approval_key`) treat Ctrl+C. Checked BEFORE the Char('k')/('j')
-    // arms so Ctrl+C never toggles the cursor. This needs the extra
-    // cancel action, so it's an explicit arm rather than going through the
-    // pure `round_cap_key_decision` in the `_` fallthrough.
+    // Ctrl+C = cancel the turn. Do NOT also `deliver_round_cap(false)`: that
+    // Respond would resolve the kernel's checkpoint Request and end the turn as
+    // MaxRounds *before* the Cancel is dequeued (a race in the kernel's
+    // `tokio::select!` between Respond and Cancel). Sending ONLY the Cancel is
+    // unambiguous: the kernel's cancel handler sets the turn token THEN flushes
+    // the pending Request to Null, so `run_turn` observes `cancel.is_cancelled()`
+    // and ends the turn as Cancelled (not MaxRounds) with no hang. Checked BEFORE
+    // the Char('k')/('j') arms so Ctrl+C never toggles the cursor.
     if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
         app.state.on_round_cap_resolved();
-        deliver_round_cap(ctx, id, false);
         cancel_active_turn(ctx);
         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
         return Ok(());
@@ -15230,13 +15236,21 @@ fn handle_runtime_event(
                             .get("cap")
                             .and_then(serde_json::Value::as_u64)
                             .unwrap_or(0) as u32;
+                        // Re-arm increment (rounds granted per "continue"); falls back
+                        // to `cap` if the kernel didn't send it (older payloads).
+                        let base = request
+                            .payload
+                            .get("base")
+                            .and_then(serde_json::Value::as_u64)
+                            .map(|b| b as u32)
+                            .unwrap_or(cap);
                         // 无值守/免审批模式：fail-closed 停止（等同旧 MaxRounds）。
                         if user_input_should_auto_skip(state.agent_mode) {
                             deliver_round_cap(ctx, request.id, false);
                             return;
                         }
                         state.round_cap_panel =
-                            Some(crate::state::RoundCapPanel::new(request.id, cap));
+                            Some(crate::state::RoundCapPanel::new(request.id, cap, base));
                         state.phase = UiPhase::RoundCap;
                         redraw_idle_plain(buf, state, ctx, renderer);
                         return;
@@ -19007,9 +19021,10 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         todo,
         approval,
         user_input,
-        round_cap_panel: state.round_cap_panel.as_ref().map(|p| {
-            crate::render::round_cap_view(p.cap, p.cursor, &round_cap_stats(state))
-        }),
+        round_cap_panel: state
+            .round_cap_panel
+            .as_ref()
+            .map(|p| crate::render::round_cap_view(p.cap, p.base, p.cursor, &round_cap_stats(state))),
     }
 }
 
@@ -20851,7 +20866,7 @@ mod round_cap_key_tests {
     /// This mirrors the decision made inside `handle_round_cap_key` on Enter.
     #[test]
     fn round_cap_enter_on_continue_chosen_continue_is_true() {
-        let panel = RoundCapPanel::new(9, 200);
+        let panel = RoundCapPanel::new(9, 200, 200);
         assert_eq!(panel.cursor, 0, "new panel defaults to cursor=0 (continue)");
         assert!(
             panel.chosen_continue(),
@@ -20862,7 +20877,7 @@ mod round_cap_key_tests {
     /// Enter on cursor=1 (stop) → `chosen_continue()` returns false.
     #[test]
     fn round_cap_enter_on_stop_chosen_continue_is_false() {
-        let mut panel = RoundCapPanel::new(9, 200);
+        let mut panel = RoundCapPanel::new(9, 200, 200);
         panel.move_down(); // cursor → 1 (stop)
         assert!(!panel.chosen_continue(), "cursor=1 must map to chosen_continue()=false");
     }
@@ -20916,7 +20931,7 @@ mod round_cap_key_tests {
     #[test]
     fn round_cap_resolved_clears_panel_and_resumes() {
         let mut state = UiState::new();
-        state.round_cap_panel = Some(RoundCapPanel::new(9, 200));
+        state.round_cap_panel = Some(RoundCapPanel::new(9, 200, 200));
         state.phase = UiPhase::RoundCap;
         state.on_round_cap_resolved();
         assert!(state.round_cap_panel.is_none(), "panel cleared");
@@ -20926,7 +20941,7 @@ mod round_cap_key_tests {
     /// Navigation: Up always clamps to cursor=0 (continue).
     #[test]
     fn round_cap_move_up_clamps_to_continue() {
-        let mut p = RoundCapPanel::new(7, 100);
+        let mut p = RoundCapPanel::new(7, 100, 100);
         p.move_down(); // cursor → 1
         p.move_up();   // cursor → 0
         assert!(p.chosen_continue(), "move_up brings cursor back to 'continue'");
@@ -20937,7 +20952,7 @@ mod round_cap_key_tests {
     /// Navigation: Down always clamps to cursor=1 (stop).
     #[test]
     fn round_cap_move_down_clamps_to_stop() {
-        let mut p = RoundCapPanel::new(7, 100);
+        let mut p = RoundCapPanel::new(7, 100, 100);
         p.move_down(); // cursor → 1
         assert!(!p.chosen_continue(), "move_down sets cursor to 'stop'");
         p.move_down(); // clamped: cursor stays 1

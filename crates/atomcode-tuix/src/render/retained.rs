@@ -14130,15 +14130,22 @@ mod tests {
     /// `UserInputPanelView` with the correct header, question, and two options.
     #[test]
     fn round_cap_view_renders_header_and_two_options() {
-        let view = crate::render::round_cap_view(200, 0, "2h0m0s · 305.00K tokens");
+        // cap=400 (after one continuation) but base=200 (the re-arm step): the
+        // question shows the grown cap, the "continue" description must show base.
+        let view = crate::render::round_cap_view(400, 200, 0, "2h0m0s · 305.00K tokens");
         assert_eq!(view.header, "轮次上限");
         assert!(
-            view.question.contains("已运行 200 轮"),
-            "question should contain '已运行 200 轮', got: {}",
+            view.question.contains("已运行 400 轮"),
+            "question should contain '已运行 400 轮', got: {}",
             view.question
         );
         assert_eq!(view.options.len(), 2);
         assert_eq!(view.options[0].0, "继续");
+        assert_eq!(
+            view.options[0].1.as_deref(),
+            Some("再跑 200 轮后重新确认"),
+            "continue description must use base (200), not cap (400)"
+        );
         assert_eq!(view.options[1].0, "停止");
     }
 

@@ -311,11 +311,12 @@ pub(crate) fn chat_runtime_config(
             config.loop_config.max_rounds,
             std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
         ),
-        // Turn-level round cap. Mirror the env-override logic from CodingRuntimeConfig::from_config.
-        turn_max_rounds: std::env::var("ATOMCODE_TURN_MAX_ROUNDS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .unwrap_or(config.coding.max_rounds),
+        // Turn-level round cap. Reuse the canonical resolver (env > TOML) instead
+        // of re-implementing the parse — same pattern as loop_max_rounds above.
+        turn_max_rounds: atomcode_coding::resolve_turn_max_rounds(
+            config.coding.max_rounds,
+            std::env::var("ATOMCODE_TURN_MAX_ROUNDS").ok().as_deref(),
+        ),
         subagent_config: Some(Arc::new(config.clone())),
         // Daemon path has no TUI checkpoint picker; keep the hard round-cap.
         round_cap_checkpoint: false,

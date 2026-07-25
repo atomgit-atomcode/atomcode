@@ -1676,7 +1676,14 @@ impl RunningAgent {
                             .rt
                             .request(
                                 crate::event::ROUND_CAP_CHECKPOINT_KIND,
-                                serde_json::json!({ "round": round - 1, "cap": cap }),
+                                serde_json::json!({
+                                    "round": round - 1,
+                                    "cap": cap,
+                                    // Re-arm increment, so the driver can say "N more
+                                    // rounds" accurately after a continuation (cap grows
+                                    // but the granted step stays this base).
+                                    "base": self.max_rounds.unwrap_or(cap),
+                                }),
                             )
                             .await;
                         let cont = resp
