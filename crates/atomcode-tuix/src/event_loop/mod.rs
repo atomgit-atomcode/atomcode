@@ -13525,6 +13525,18 @@ pub(crate) fn user_input_response_for(
     }
 }
 
+/// The `{continue}` bool a key delivers at the round-cap checkpoint, or `None`
+/// if the key is not a resolving key. Enter honors the cursor position;
+/// Esc is always fail-closed (stop). Pure so it is unit-testable without a
+/// `LoopCtx`.
+fn round_cap_key_decision(code: KeyCode, cursor: usize) -> Option<bool> {
+    match code {
+        KeyCode::Enter => Some(cursor == 0),
+        KeyCode::Esc => Some(false),
+        _ => None,
+    }
+}
+
 /// Key handling while `UiPhase::RoundCap`. Two options: ↑/k toggle to
 /// "continue", ↓/j toggle to "stop"; Enter confirms the cursor selection;
 /// Esc is fail-closed (stop). Resolving keys clear the panel via
@@ -13553,24 +13565,20 @@ fn handle_round_cap_key(
             }
             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
         }
-        KeyCode::Enter => {
-            let cont = app
+        _ => {
+            // Read cursor before resolving/clearing the panel.
+            let cursor = app
                 .state
                 .round_cap_panel
                 .as_ref()
-                .map(|p| p.chosen_continue())
-                .unwrap_or(false);
-            app.state.on_round_cap_resolved();
-            deliver_round_cap(ctx, id, cont);
-            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                .map(|p| p.cursor)
+                .unwrap_or(0);
+            if let Some(cont) = round_cap_key_decision(code, cursor) {
+                app.state.on_round_cap_resolved();
+                deliver_round_cap(ctx, id, cont);
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            }
         }
-        KeyCode::Esc => {
-            // Fail-closed: stop the run even if the cursor was on "continue".
-            app.state.on_round_cap_resolved();
-            deliver_round_cap(ctx, id, false);
-            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
-        }
-        _ => {}
     }
     Ok(())
 }
@@ -20816,6 +20824,7 @@ mod user_input_bypass_tests {
 //   • Key-routing stub replacement → verified by `cargo build` (compile check)
 #[cfg(test)]
 mod round_cap_key_tests {
+    use super::round_cap_key_decision;
     use crate::state::{RoundCapPanel, UiPhase, UiState};
 
     /// Enter on cursor=0 (continue) → `chosen_continue()` returns true.
@@ -20838,19 +20847,48 @@ mod round_cap_key_tests {
         assert!(!panel.chosen_continue(), "cursor=1 must map to chosen_continue()=false");
     }
 
-    /// Esc is fail-closed: regardless of cursor, the handler delivers false.
-    /// Validated indirectly: `chosen_continue()` on cursor=0 returns true, but
-    /// the Esc arm in `handle_round_cap_key` unconditionally passes `false` to
-    /// `deliver_round_cap`. This test pins the cursor-independence contract.
+    /// Enter honors the cursor: cursor=0 (continue) → Some(true),
+    /// cursor=1 (stop) → Some(false).
     #[test]
-    fn round_cap_esc_is_fail_closed_regardless_of_cursor() {
-        // Cursor=0 (continue selected) — Esc must still deliver false.
-        let panel = RoundCapPanel::new(9, 200);
-        assert!(panel.chosen_continue(), "cursor=0 means 'continue'");
-        // The handler's Esc arm delivers `false` unconditionally (not `chosen_continue()`).
-        // Pin the contract: even when `chosen_continue()` is true, Esc → false.
-        let esc_delivers: bool = false; // see handle_round_cap_key Esc arm
-        assert!(!esc_delivers, "Esc must deliver false (stop), fail-closed");
+    fn round_cap_key_decision_enter_honors_cursor() {
+        use crossterm::event::KeyCode;
+        assert_eq!(
+            round_cap_key_decision(KeyCode::Enter, 0),
+            Some(true),
+            "Enter on cursor=0 must deliver true (continue)"
+        );
+        assert_eq!(
+            round_cap_key_decision(KeyCode::Enter, 1),
+            Some(false),
+            "Enter on cursor=1 must deliver false (stop)"
+        );
+    }
+
+    /// Esc is fail-closed: regardless of cursor position, always delivers false.
+    #[test]
+    fn round_cap_key_decision_esc_always_stops() {
+        use crossterm::event::KeyCode;
+        assert_eq!(
+            round_cap_key_decision(KeyCode::Esc, 0),
+            Some(false),
+            "Esc on cursor=0 (continue) must still deliver false (fail-closed)"
+        );
+        assert_eq!(
+            round_cap_key_decision(KeyCode::Esc, 1),
+            Some(false),
+            "Esc on cursor=1 (stop) must deliver false"
+        );
+    }
+
+    /// Non-resolving keys return None — they do not trigger a deliver.
+    #[test]
+    fn round_cap_key_decision_non_resolving_returns_none() {
+        use crossterm::event::KeyCode;
+        assert_eq!(
+            round_cap_key_decision(KeyCode::Up, 0),
+            None,
+            "Up is a navigation key, not a resolving key"
+        );
     }
 
     /// `on_round_cap_resolved` clears the panel and sets phase→Streaming.
