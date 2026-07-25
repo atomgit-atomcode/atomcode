@@ -27,6 +27,16 @@ pub fn should_skip(active_model: &str, has_images: bool) -> bool {
     !has_images || atomcode_capabilities::provider::model_suggests_vision(active_model)
 }
 
+/// Display name for a VL model: strip a `vendor/` prefix (e.g.
+/// `Qwen/Qwen3-VL-8B-Instruct` → `Qwen3-VL-8B-Instruct`) for the recognised
+/// marker / toast. Verbatim from the retired `core::vision_preprocessor`.
+pub fn vl_model_display(model: &str) -> &str {
+    match model.rsplit_once('/') {
+        Some((_, tail)) if !tail.is_empty() => tail,
+        _ => model,
+    }
+}
+
 /// Run the one-off VL caption call against an already-built provider. Owns the
 /// prompt, the local one-shot kernel message (deliberately NOT linked to the
 /// main conversation — VL only ever sees this image + caption), and the 30s
@@ -155,6 +165,14 @@ mod tests {
             media_type: "image/png".into(),
             data: "AAAA".into(),
         }
+    }
+
+    #[test]
+    fn vl_model_display_strips_vendor_prefix() {
+        assert_eq!(vl_model_display("Qwen/Qwen3-VL-8B-Instruct"), "Qwen3-VL-8B-Instruct");
+        assert_eq!(vl_model_display("qwen-vl-max"), "qwen-vl-max");
+        assert_eq!(vl_model_display("a/b/c"), "c");
+        assert_eq!(vl_model_display("trailing/"), "trailing/"); // empty tail → whole
     }
 
     #[test]

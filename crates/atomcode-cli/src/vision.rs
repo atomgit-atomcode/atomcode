@@ -9,7 +9,7 @@
 // Restores the TUI's VL image recognition that was dropped when the legacy
 // `atomcode-bridge` (which did this in its turn handler) was retired.
 
-use atomcode_coding::vision::{run_vl_caption, should_skip, PreprocessOutcome};
+use atomcode_coding::vision::{run_vl_caption, should_skip, vl_model_display, PreprocessOutcome};
 use atomcode_coding::{
     derive_tier_config, CodingAgentConfig, CodingProviderFactory, ImageContent, ImagePreprocessor,
     UserInput, VisionNotice,
@@ -51,15 +51,27 @@ impl ImagePreprocessor for VlImagePreprocessor {
             Ok(c) => c,
             Err(_) => return (UserInput { text, images }, None),
         };
-        // Resolve the configured VL provider entry. Nothing configured to
-        // caption with ⇒ pass through unchanged (Skipped).
-        let Some(vl_name) = config.vision_preprocessor_provider.clone() else {
+        // Nothing configured (None or empty) ⇒ pass through unchanged (Skipped).
+        let Some(vl_name) = config
+            .vision_preprocessor_provider
+            .clone()
+            .filter(|s| !s.is_empty())
+        else {
             return (UserInput { text, images }, None);
         };
+        // Configured but absent from `config.providers` ⇒ Failed (mirror the
+        // retired core `maybe_preprocess`): fold the failure marker + clear the
+        // images so raw bytes never reach a text-only model.
         let Some(vl_pc) = config.providers.get(&vl_name).cloned() else {
-            return (UserInput { text, images }, None);
+            return apply_outcome(
+                text,
+                images,
+                PreprocessOutcome::Failed {
+                    reason: format!("VL provider '{vl_name}' not found in config"),
+                },
+            );
         };
-        let vl_model = vl_pc.model.clone();
+        let vl_model = vl_model_display(&vl_pc.model).to_string();
         // Assemble the VL agent config from the base + the VL provider entry
         // (the same primitive subagent tier-routing uses), then build the
         // provider. `build` may block on auth I/O (token read + refresh over the

@@ -1094,19 +1094,26 @@ pub(crate) async fn preprocess_image_caption(
     message: &str,
     images: &[ImageContent],
 ) -> String {
-    use atomcode_coding::vision::{run_vl_caption, should_skip, PreprocessOutcome};
+    use atomcode_coding::vision::{run_vl_caption, should_skip, vl_model_display, PreprocessOutcome};
     // Short-circuit: no images, or the main model already accepts images.
     if should_skip(active_model, !images.is_empty()) {
         return message.to_string();
     }
-    // Resolve the configured VL provider. Nothing configured ⇒ pass through.
-    let Some(vl_name) = config.vision_preprocessor_provider.clone() else {
+    // Nothing configured (None or empty) ⇒ pass through unchanged (Skipped).
+    let Some(vl_name) = config
+        .vision_preprocessor_provider
+        .clone()
+        .filter(|s| !s.is_empty())
+    else {
         return message.to_string();
     };
+    // Configured but absent from `config.providers` ⇒ Failed (mirror the retired
+    // core `maybe_preprocess`): fold the failure marker so the caller strips the
+    // images — otherwise raw image bytes reach a text-only model (HTTP 400).
     let Some(vl_pc) = config.providers.get(&vl_name).cloned() else {
-        return message.to_string();
+        return fold_vl_failure(message);
     };
-    let vl_model = vl_pc.model.clone();
+    let vl_model = vl_model_display(&vl_pc.model).to_string();
     // Build the one-off VL provider via the daemon's native chain (the SAME
     // chain `/chat` and `/compact` use), yielding a kernel-native provider —
     // no core provider. `build` may block on auth I/O (gateway token) → run it

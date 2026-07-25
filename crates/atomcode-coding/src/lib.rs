@@ -81,7 +81,7 @@ pub use provider_factory::{
     CodingProviderFactory, DefaultCodingProviderFactory, ProviderAuthenticator, ProviderBuildError,
 };
 pub use rate_limit::{RateLimitWindow, RateLimitWindowSource};
-pub use vision::{run_vl_caption, should_skip, PreprocessOutcome};
+pub use vision::{run_vl_caption, should_skip, vl_model_display, PreprocessOutcome};
 pub use runtime::{
     CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
     CodingRuntimeStart, DeferredRuntimeState, DriverCommand, ImagePreprocessor, LocalContextInput,
