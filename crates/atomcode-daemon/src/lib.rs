@@ -39,6 +39,11 @@ mod login_state;
 mod login_state_tests;
 pub mod native_live;
 mod runtime_host;
+/// File-sink diagnostic trace (`ctrace!` macro), enabled via `ATOMCODE_TUIX_LOG`.
+/// Moved here from the retired `atomcode-core` (daemon is its only consumer;
+/// `atomcode_tuix::trace` keeps its own copy targeting the same append file).
+#[macro_use]
+pub mod trace;
 pub use kernel_runtime::{
     spawn_native_runtime_for_session_deferred,
     spawn_native_runtime_for_session_deferred_with_preprocessor, start_native_runtime,

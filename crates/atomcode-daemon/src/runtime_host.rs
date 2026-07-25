@@ -79,5 +79,5 @@ pub fn coding_plan_rate_limit_source() -> Arc<dyn RateLimitWindowSource> {
 }
 
 pub fn coding_provider_factory() -> Arc<dyn atomcode_coding::CodingProviderFactory> {
-    atomcode_coding::atomgit_provider_factory(atomcode_core::ATOMCODE_USER_AGENT)
+    atomcode_coding::atomgit_provider_factory(atomcode_auth::ATOMCODE_USER_AGENT)
 }

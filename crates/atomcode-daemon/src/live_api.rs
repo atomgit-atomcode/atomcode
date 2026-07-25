@@ -1054,7 +1054,7 @@ pub(crate) async fn live_stream(
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|w| {
         let json = serde_json::to_string(&w).unwrap_or_else(|error| {
-            atomcode_core::ctrace!(
+            crate::ctrace!(
                 "LIVE",
                 "live_stream: serde_json serialization failed: {error}"
             );

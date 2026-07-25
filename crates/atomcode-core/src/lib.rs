@@ -7,32 +7,9 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
-// `auth` (OAuth login + secure chmod-600 token file) fully lives in the leaf `atomcode-auth`
-// crate now; re-export it so core's own `crate::auth::…` uses and external
-// `atomcode_core::auth` consumers keep working during the transition.
-pub use atomcode_auth as auth;
-pub mod process_utils;
-// `config` fully lives in the leaf `atomcode-config` crate now; core code (and its
-// tests) use `atomcode_config::config` directly, so the transitional re-export shim
-// is gone.
-// `i18n` fully lives in the leaf `atomcode-config` crate now (it only needs
-// `locale::Locale`); re-export it so core's own `crate::i18n::…` uses and any
-// external `atomcode_core::i18n` consumers keep working during the transition.
-pub use atomcode_config::i18n;
-// `locale` fully lives in `atomcode-config` now (re-export shim removed).
+// What remains of `atomcode-core`: the reqwest-applying proxy runtime policy
+// (can't live in the leaf `atomcode-config`, which stays reqwest-free) and the
+// `ctrace!` file-sink macro. Everything else (auth, config/i18n, conversation,
+// provider, tool, skill, plugin, lsp, …) was retired into leaf/L1 crates. The
+// `ATOMCODE_USER_AGENT` constant now lives in `atomcode-auth`.
 pub mod proxy;
-pub mod trace;
-
-/// User-Agent identifier for every outbound HTTP request the app makes.
-///
-/// Lowercase `atomcode/<version>` is deliberate. The LLM gateway at
-/// `api-ai.gitcode.com` has a UA filter that silently hijacks any
-/// request whose UA starts with capital-A `AtomCode` and replies
-/// with a 200 + single SSE chunk containing the literal string
-/// "参数错误", no `[DONE]` frame — which surfaces in the TUI as a
-/// 4-token assistant reply rather than an error. The other
-/// atomgit.com / gitcode.com endpoints (CodingPlan, user REST,
-/// self-update) accept either case, so normalising to lowercase
-/// avoids the LLM-path hijack without breaking the rest. Revisit
-/// once the gateway filter is removed upstream.
-pub const ATOMCODE_USER_AGENT: &str = concat!("atomcode/", env!("CARGO_PKG_VERSION"));
