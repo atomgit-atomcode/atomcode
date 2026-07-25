@@ -1,10 +1,7 @@
-use atomcode_core::conversation::message::{
-    ImagePart, Message as CoreMessage, MessageContent, Role as CoreRole,
+use atomcode_kernel::message::{
+    ImageContent, Message as KernelMessage, Role as KernelRole, LEGACY_COLD_SUMMARY_ORIGIN,
+    LEGACY_COLD_SUMMARY_PREFIX,
 };
-use atomcode_core::conversation::{
-    ConversationSnapshot, LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
-};
-use atomcode_kernel::message::{ImageContent, Message as KernelMessage, Role as KernelRole};
 use serde::{Deserialize, Serialize};
 
 use atomcode_capabilities::session::manager::{NativeImportCommitOutcome, META_VERSION};
@@ -72,8 +69,9 @@ pub const LEGACY_SCHEMA: &str = "core-session-json";
 
 // ---------------------------------------------------------------------------
 // Frozen DTOs — self-contained read model for the retired core session JSON.
-// Every serde attribute mirrors core::conversation::message exactly so that
-// existing <id>.json files round-trip without deserialization loss.
+// Every serde attribute mirrors the retired core conversation message shape
+// exactly so that existing <id>.json files round-trip without deserialization
+// loss.
 // ---------------------------------------------------------------------------
 
 /// Verbatim copy of core `ToolCall` serde shape.
@@ -258,15 +256,6 @@ pub struct ImportOutcome {
     pub presentation: PresentationFile,
 }
 
-fn role_to_core(role: &KernelRole) -> CoreRole {
-    match role {
-        KernelRole::System => CoreRole::System,
-        KernelRole::User => CoreRole::User,
-        KernelRole::Assistant => CoreRole::Assistant,
-        KernelRole::Tool => CoreRole::Tool,
-    }
-}
-
 fn legacy_image_to_kernel(image: &LegacyImagePart) -> ImageContent {
     ImageContent {
         media_type: image.media_type.clone(),
@@ -341,60 +330,6 @@ fn legacy_message_to_kernel(message: &LegacyMessage) -> KernelMessage {
     converted.synthetic = message.synthetic;
     converted.internal_origin = message.internal_origin.clone();
     converted
-}
-
-pub(crate) fn message_to_core(message: &KernelMessage) -> CoreMessage {
-    let content = if message.role == KernelRole::Tool {
-        MessageContent::ToolResult(atomcode_core::tool::ToolResult {
-            call_id: message.tool_call_id.clone().unwrap_or_default(),
-            output: message.text.clone(),
-            success: !message.is_error,
-        })
-    } else if !message.tool_calls.is_empty() {
-        MessageContent::AssistantWithToolCalls {
-            text: (!message.text.is_empty()).then(|| message.text.clone()),
-            tool_calls: message
-                .tool_calls
-                .iter()
-                .map(|call| atomcode_core::tool::ToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                })
-                .collect(),
-            reasoning_content: message.reasoning.clone(),
-            thinking_blocks: message
-                .reasoning_blocks
-                .iter()
-                .map(
-                    |block| atomcode_core::conversation::message::ThinkingBlock {
-                        text: block.text.clone(),
-                        signature: block.opaque.clone().unwrap_or_default(),
-                    },
-                )
-                .collect(),
-        }
-    } else if !message.images.is_empty() {
-        MessageContent::MultiPart {
-            text: (!message.text.is_empty()).then(|| message.text.clone()),
-            images: message
-                .images
-                .iter()
-                .map(|image| ImagePart {
-                    media_type: image.media_type.clone(),
-                    data: image.data.clone(),
-                })
-                .collect(),
-        }
-    } else {
-        MessageContent::Text(message.text.clone())
-    };
-    CoreMessage {
-        role: role_to_core(&message.role),
-        content,
-        synthetic: message.synthetic,
-        internal_origin: message.internal_origin.clone(),
-    }
 }
 
 struct NormalizedLegacyTurns {
@@ -1685,26 +1620,6 @@ fn validate_tool_pairing(messages: &[KernelMessage]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn snapshot_to_core(
-    snapshot: &atomcode_kernel::message::SessionSnapshot,
-) -> ConversationSnapshot {
-    let mut messages = Vec::with_capacity(snapshot.messages.len());
-    let mut cold_summaries = Vec::new();
-    for message in &snapshot.messages {
-        if message.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN) {
-            if let Some(summary) = message.text.strip_prefix(LEGACY_COLD_SUMMARY_PREFIX) {
-                cold_summaries.push(summary.to_string());
-                continue;
-            }
-        }
-        messages.push(message_to_core(message));
-    }
-    ConversationSnapshot {
-        messages,
-        cold_summaries,
-    }
-}
-
 pub fn usage_to_core(
     usage: &atomcode_kernel::stream::TokenUsage,
 ) -> atomcode_core::stream::TokenUsage {
@@ -1743,8 +1658,7 @@ mod tests {
         assert_eq!(out.snapshot.messages.len(), 9);
         // cold-summary synthetic messages carry the legacy origin marker
         assert!(out.snapshot.messages.iter().any(|m| {
-            m.internal_origin.as_deref()
-                == Some(atomcode_core::conversation::LEGACY_COLD_SUMMARY_ORIGIN)
+            m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
         }));
         // meta: naming flags and seconds → milliseconds timestamp conversion
         assert_eq!(out.meta.user_renamed, true);
@@ -3646,32 +3560,4 @@ mod tests {
         assert_eq!(presentation.entries[0].text, "local note");
     }
 
-    #[test]
-    fn kernel_round_trip_characterizes_legacy_ref_summary_loss() {
-        let session = full_legacy_session();
-        // Build kernel snapshot via frozen-DTO path, then round-trip through
-        // snapshot_to_core to characterise ToolResultRef → ToolResult lossy
-        // collapse (the ref's full output is not preserved in the core snapshot).
-        let mut msgs = Vec::new();
-        for s in &session.cold_summaries {
-            let mut m = KernelMessage::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}{s}"));
-            m.synthetic = true;
-            m.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
-            msgs.push(m);
-        }
-        msgs.extend(session.messages.iter().map(legacy_message_to_kernel));
-        let kernel = atomcode_kernel::message::SessionSnapshot::new(msgs);
-        let round_trip = snapshot_to_core(&kernel);
-
-        assert_eq!(round_trip.cold_summaries, session.cold_summaries);
-        assert_eq!(round_trip.messages.len(), session.messages.len());
-        match &round_trip.messages[5].content {
-            MessageContent::ToolResult(result) => {
-                assert_eq!(result.call_id, "call-ref");
-                assert_eq!(result.output, "cached failure summary");
-                assert!(!result.success);
-            }
-            other => panic!("legacy ref currently returns as inline summary, got {other:?}"),
-        }
-    }
 }

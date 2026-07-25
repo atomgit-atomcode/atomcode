@@ -36,8 +36,6 @@ use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCom
 use atomcode_coding::CodingRuntimeHandle;
 use atomcode_config::config::Config;
 use atomcode_config::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};
-#[cfg(test)]
-use atomcode_daemon::legacy_convert::snapshot_to_core;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::{mpsc, watch};
 use ui_event::{UiAgentPhase as AgentPhase, UiEvent as AgentEvent};
@@ -16321,26 +16319,6 @@ mod coding_runtime_event_tests {
             Some("sig"),
             "opaque (signature) must round-trip"
         );
-    }
-
-    #[test]
-    fn kernel_projection_restores_legacy_cold_summaries() {
-        use atomcode_kernel::message::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
-        let mut summary = atomcode_kernel::message::Message::user(format!(
-            "{LEGACY_COLD_SUMMARY_PREFIX}older context"
-        ));
-        summary.synthetic = true;
-        summary.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.into());
-        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
-            summary,
-            atomcode_kernel::message::Message::user("recent"),
-        ]);
-
-        let projected = snapshot_to_core(&snapshot);
-
-        assert_eq!(projected.cold_summaries, vec!["older context"]);
-        assert_eq!(projected.messages.len(), 1);
-        assert_eq!(projected.messages[0].text(), Some("recent"));
     }
 
     #[test]
