@@ -5,20 +5,10 @@ use atomcode_kernel::message::{
     LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX, Message, Role, SessionSnapshot,
 };
 
-/// Extract legacy cold-summary strings from a kernel message set. Mirrors
-/// `legacy_convert.rs::snapshot_to_core` (the cold-summary split at
-/// legacy_convert.rs:1780-1786): a synthetic message tagged with
-/// `LEGACY_COLD_SUMMARY_ORIGIN` carries one summary, stored as its `text` behind
-/// the `LEGACY_COLD_SUMMARY_PREFIX`. Both constants now live in
-/// `atomcode_kernel::message` (relocated from core by Task 5).
-pub fn cold_summaries_from_messages(messages: &[Message]) -> Vec<String> {
-    messages
-        .iter()
-        .filter(|m| m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN))
-        .filter_map(|m| m.text.strip_prefix(LEGACY_COLD_SUMMARY_PREFIX))
-        .map(|summary| summary.to_string())
-        .collect()
-}
+/// Extract legacy cold-summary strings from a kernel message set. Now a
+/// re-export of the shared kernel definition (relocated there so the daemon
+/// transport shares it) — see [`atomcode_kernel::message::cold_summaries_from_messages`].
+pub use atomcode_kernel::message::cold_summaries_from_messages;
 
 /// Build a kernel text message with an explicit role (kernel has role-specific
 /// constructors but no generic `new(role, text)`).
