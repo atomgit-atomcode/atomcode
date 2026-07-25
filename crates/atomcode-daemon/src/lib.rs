@@ -5819,7 +5819,7 @@ mod tests {
         let project = tmp.path().join(project_bucket);
         std::fs::create_dir_all(&project).unwrap();
         let mut legacy: serde_json::Value = serde_json::from_slice(include_bytes!(
-            "../../atomcode-core/tests/fixtures/session/legacy_full.json"
+            "../tests/fixtures/session/legacy_full.json"
         ))
         .unwrap();
         let session_id = legacy["id"].as_str().unwrap().to_string();

@@ -89,9 +89,9 @@ impl Continuation {
     }
 }
 
-/// What the kernel knows about a 429 at the moment it fires. The kernel cannot
-/// see CodingPlan usage windows (that lives in `atomcode-core`, off-limits here)
-/// so this carries only its own best-effort signal: the status and any
+/// What the kernel knows about a 429 at the moment it fires. CodingPlan usage is
+/// product-layer state outside the neutral kernel, so this carries only the
+/// kernel's best-effort signal: the status and any
 /// `Retry-After`-style seconds parsed from the error text.
 #[derive(Debug, Clone)]
 pub struct RateLimitHint {

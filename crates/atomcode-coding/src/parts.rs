@@ -235,8 +235,8 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
 }
 
 /// Like [`prepare`], plus `plugin_cc_hooks` — CC hooks contributed INLINE by installed
-/// plugins, which the DRIVER resolves (the plugin loader lives in `atomcode-core`, which
-/// neither this crate nor L1 may depend on) and threads in here. They are merged with the
+/// plugins, which the DRIVER resolves through `atomcode-capabilities::plugin` and
+/// threads in here. They are merged with the
 /// user/project `hooks.json` into the one [`CCExternalHooks`] runner. Drivers without a
 /// plugin system (or with none installed) pass an empty vec and get the same result as
 /// [`prepare`].

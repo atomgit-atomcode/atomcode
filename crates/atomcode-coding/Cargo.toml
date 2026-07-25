@@ -11,8 +11,7 @@ atomgit = ["atomcode-capabilities/atomgit"]
 
 [dependencies]
 atomcode-kernel = { path = "../atomcode-kernel" }
-# Config system (leaf crate, extracted from core). Consumed directly instead of via
-# the transitional atomcode_core::config re-export shim.
+# Config system leaf consumed directly by the coding assembly.
 atomcode-config = { path = "../atomcode-config" }
 # The FULL capability set: L2 is the opinionated assembly — a coding agent ships
 # with web/skills/mcp/session/memory wired (the leaner features exist for other

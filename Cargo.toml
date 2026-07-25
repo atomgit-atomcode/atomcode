@@ -6,12 +6,11 @@ resolver = "2"
 # a no-toml-edit operation.
 members = ["crates/*"]
 # `atomcode-codingplan-crypto` is intentionally absent from default-members:
-# the stub is wired into atomcode-core via an optional dep behind the
-# `codingplan-crypto` feature, so a default `cargo build` from the
-# workspace root has no reason to compile it. The official build picks
-# it up explicitly via `--features atomcode-core/codingplan-crypto`.
+# the stub is wired into atomcode-auth via an optional dep behind the
+# final binary's `codingplan-crypto` feature, so a default `cargo build`
+# from the workspace root has no reason to compile it. The official build
+# picks it up explicitly via `--features atomcode/codingplan-crypto`.
 default-members = [
-    "crates/atomcode-core",
     "crates/atomcode-cli",
     "crates/atomcode-daemon",
     "crates/atomcode-telemetry",

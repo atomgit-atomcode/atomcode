@@ -10,7 +10,7 @@
 #                        else ~/.local/bin). On HarmonyOS as non-root, default is ~/.local/bin.
 # IMPORTANT: when changing install paths, the PATH-rc edit format, or filenames here,
 # also update scripts/uninstall.sh AND
-# crates/atomcode-core/src/uninstall/paths.rs. The CI parity test guards
+# crates/atomcode-cli/src/uninstall/paths.rs. The CI parity test guards
 # the manifest, but binary path / rc-edit format are not checked.
 set -eu
 

@@ -2,10 +2,7 @@ use atomcode_capabilities::session::{DisplayAnchor, SessionManager};
 use atomcode_daemon::legacy_convert::{converge_session, ImportDiagnostic, ImportStatus};
 
 fn legacy_fixture() -> serde_json::Value {
-    serde_json::from_str(include_str!(
-        "../../atomcode-core/tests/fixtures/session/legacy_full.json"
-    ))
-    .unwrap()
+    serde_json::from_str(include_str!("fixtures/session/legacy_full.json")).unwrap()
 }
 
 fn write_legacy(legacy: &serde_json::Value) -> (tempfile::TempDir, SessionManager, String) {

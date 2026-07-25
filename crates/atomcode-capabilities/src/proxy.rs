@@ -1,21 +1,14 @@
 //! Proxy policy for L1 outbound HTTP clients.
 //!
-//! `atomcode-capabilities` must not depend on `atomcode-core` (L1 layering is
-//! compile-enforced — see Cargo.toml), so it cannot call core's proxy module.
-//! Instead it honors the process-global `ATOMCODE_PROXY_MODE` env var that the
-//! CLI / daemon publish at startup via
-//! `atomcode_core::proxy::apply_process_proxy_config` (which runs before any v2
-//! client is built). This mirrors the identical self-contained helper in
-//! `atomcode-telemetry` (`sender/http.rs`), which sits below core for the same
-//! layering reason.
+//! It honors the process-global `ATOMCODE_PROXY_MODE` env var published from
+//! `atomcode-config` policy by the CLI/daemon before clients are built. This
+//! mirrors the self-contained helper in `atomcode-telemetry` (`sender/http.rs`).
 //!
 //! We call `.no_proxy()` ONLY when the mode is explicitly `no_proxy`. The app's
 //! default is `follow_system` (respect the environment proxy — corporate-proxy
 //! users would otherwise time out), so an **unset** env var (standalone embedder,
 //! or `cargo test`, where `apply_process_proxy_config` never runs) falls back to
-//! honoring the ambient proxy rather than bypassing it — matching core's
-//! `apply_async_proxy_policy`, which lazily installs the same follow_system
-//! default via `ensure_runtime_initialized()` on an unset var. For
+//! honoring the ambient proxy rather than bypassing it. For
 //! `follow_system` / `default_proxy` the builder is returned untouched and
 //! reqwest's default env-based proxy detection picks up the published vars.
 

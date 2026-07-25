@@ -216,10 +216,8 @@ const TRUNCATION_RESUME_NUDGE: &str =
      where you left off, writing the remaining content INCREMENTALLY to a file (append the \
      next section with edit_file) rather than re-emitting it all in one response.";
 
-// "·" here mirrors atomcode-core's `provider::REASONING_PLACEHOLDER`. kernel is a
-// standalone crate with no dependency on atomcode-core (deliberate: core is the
-// retiring v1 stack), so the value is duplicated rather than imported. If that
-// placeholder ever changes, update this literal too.
+// Provider adapters can emit these placeholder strings when no usable reasoning
+// was captured. Keep the neutral kernel cleanup list aligned with adapter output.
 const REASONING_FILLER_MARKERS: &[&str] = &[
     "·",
     "(no reasoning detected)",
@@ -228,10 +226,8 @@ const REASONING_FILLER_MARKERS: &[&str] = &[
     "no reasoning recorded",
 ];
 
-// KEEP IN SYNC WITH crates/atomcode-core/src/turn/runner.rs `strip_reasoning_filler`
-// (and its `strip_dsml_parameter_fragments` / `strip_leading_parameter_tail` helpers).
-// These are intentionally duplicated because kernel takes no dependency on core;
-// any bugfix here must be applied to the core copy as well.
+// Keep the DSML cleanup helpers below together: they form the kernel's single
+// normalization path for provider reasoning filler.
 fn strip_reasoning_filler(reasoning: &str) -> String {
     let (mut cleaned, mut changed) = strip_dsml_parameter_fragments(reasoning);
     for marker in REASONING_FILLER_MARKERS {
@@ -564,9 +560,8 @@ fn tool_call_dedup_key(call: &ToolCall) -> (String, String) {
     (call.name.clone(), canonicalize_tool_args(&call.arguments))
 }
 
-// KEEP IN SYNC WITH atomcode-core/src/turn/tool_args.rs. The kernel deliberately
-// has no dependency on the retiring core stack, but both execution paths must
-// agree on tool-call identity while the migration is in progress.
+// Canonicalization is owned by the kernel tool loop so every assembled agent uses
+// the same tool-call identity rules.
 fn canonicalize_tool_args(arguments: &str) -> String {
     match serde_json::from_str(arguments) {
         Ok(value) => serde_json::to_string(&sort_json_object_keys(value))

@@ -322,7 +322,6 @@ dependencies = [
  "atomcode-coding",
  "atomcode-codingplan",
  "atomcode-config",
- "atomcode-core",
  "atomcode-daemon",
  "atomcode-kernel",
  "atomcode-telemetry",
@@ -519,21 +518,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atomcode-core"
-version = "5.0.2"
-dependencies = [
- "atomcode-auth",
- "atomcode-config",
- "atomcode-kernel",
- "atomcode-telemetry",
- "ctor",
- "reqwest",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "atomcode-daemon"
 version = "5.0.2"
 dependencies = [
@@ -544,7 +528,6 @@ dependencies = [
  "atomcode-coding",
  "atomcode-codingplan",
  "atomcode-config",
- "atomcode-core",
  "atomcode-kernel",
  "atomcode-telemetry",
  "axum",
@@ -628,7 +611,6 @@ dependencies = [
  "atomcode-coding",
  "atomcode-codingplan",
  "atomcode-config",
- "atomcode-core",
  "atomcode-daemon",
  "atomcode-kernel",
  "atomcode-telemetry",

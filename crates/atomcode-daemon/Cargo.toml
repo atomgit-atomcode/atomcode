@@ -13,10 +13,8 @@ name = "atomcode-daemon"
 path = "src/main.rs"
 
 [dependencies]
-atomcode-core = { path = "../atomcode-core" }
 atomcode-codingplan = { path = "../atomcode-codingplan" }
-# Config system (leaf crate, extracted from core) — used directly, not via the
-# transitional atomcode_core::config re-export shim.
+# Config system used directly by the daemon.
 atomcode-config = { path = "../atomcode-config" }
 atomcode-auth = { path = "../atomcode-auth" }
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["plugin", "mcp"] }

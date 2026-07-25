@@ -1629,7 +1629,7 @@ mod tests {
     /// ToolResult, ToolResultRef, MultiPart (with image), cold_summaries, display_messages,
     /// turn_stats, user_renamed:true, seconds-level created_at/updated_at.
     const LEGACY_JSON: &str = include_str!(
-        "../../atomcode-core/tests/fixtures/session/legacy_full.json"
+        "../tests/fixtures/session/legacy_full.json"
     );
 
     fn full_legacy_session() -> LegacySession {
@@ -1868,7 +1868,7 @@ mod tests {
     #[test]
     fn minimal_legacy_fixture_uses_additive_defaults() {
         let session: LegacySession = serde_json::from_str(include_str!(
-            "../../atomcode-core/tests/fixtures/session/legacy_minimal.json"
+            "../tests/fixtures/session/legacy_minimal.json"
         ))
         .expect("minimal legacy session fixture must parse");
         let converted = convert_legacy_session(&session).expect("fixture must convert");
@@ -1907,7 +1907,7 @@ mod tests {
         let id = session.id.as_str();
         std::fs::write(
             manager.legacy_path(id).unwrap(),
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json"),
+            include_bytes!("../tests/fixtures/session/legacy_full.json"),
         )
         .unwrap();
         let lease = manager.acquire_lease(id).unwrap();
@@ -1966,7 +1966,7 @@ mod tests {
             .unwrap();
         std::fs::write(
             manager.legacy_path(id).unwrap(),
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json"),
+            include_bytes!("../tests/fixtures/session/legacy_full.json"),
         )
         .unwrap();
         let lease = manager.acquire_lease(id).unwrap();
@@ -1996,7 +1996,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let expected = convert_legacy_session(&legacy).unwrap().presentation;
         let orphan = PresentationFile {
@@ -2027,7 +2027,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let native_snapshot =
             atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
@@ -2074,7 +2074,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let (converted, diagnostic) = convert_legacy_session_with_diagnostic(&legacy).unwrap();
         let mut stale_snapshot =
@@ -2137,7 +2137,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let (converted, diagnostic) = convert_legacy_session_with_diagnostic(&legacy).unwrap();
         let mut snapshot =
@@ -2185,7 +2185,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let native_snapshot =
             atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
@@ -2208,7 +2208,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let unconfirmed = SessionMeta::new(&legacy.id, "/native", 1);
         manager.write_meta(&unconfirmed).unwrap();
@@ -2232,7 +2232,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
@@ -2264,7 +2264,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
@@ -2297,7 +2297,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
@@ -2336,7 +2336,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let mut converted = convert_legacy_session(&legacy).unwrap();
         rebase_converted_turn_ids(&mut converted, 5).unwrap();
@@ -2445,7 +2445,7 @@ mod tests {
     #[test]
     fn importer_v2_metadata_only_sidecars_upgrade_without_changing_presentation() {
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2487,7 +2487,7 @@ mod tests {
     #[test]
     fn importer_v3_is_reaudited_without_changing_presentation() {
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2531,7 +2531,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let id = legacy.id.as_str();
@@ -2591,7 +2591,7 @@ mod tests {
     #[test]
     fn importer_v2_with_imported_anchor_is_unresolved_and_non_destructive() {
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2623,7 +2623,7 @@ mod tests {
     #[test]
     fn metadata_only_sidecar_repair_requires_a_strict_stats_prefix() {
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2665,7 +2665,7 @@ mod tests {
     #[test]
     fn importer_v1_requires_coordinate_domain_evidence() {
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2693,7 +2693,7 @@ mod tests {
     #[test]
     fn importer_v1_exact_native_prefix_without_native_suffix_is_unresolved() {
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2720,7 +2720,7 @@ mod tests {
     #[test]
     fn metadata_only_sidecar_repair_is_non_destructive_when_presentation_origin_is_ambiguous() {
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2755,7 +2755,7 @@ mod tests {
     #[test]
     fn metadata_only_sidecar_repair_rejects_tail_using_an_imported_turn() {
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let imported_turn_id = converted.meta.turn_stats.last().unwrap().turn_id;
@@ -2792,7 +2792,7 @@ mod tests {
     #[test]
     fn metadata_only_sidecar_repair_does_not_delete_matching_native_sidecars() {
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let native_message_count = converted.snapshot.messages.len();
@@ -2878,7 +2878,7 @@ mod tests {
         let path = manager.legacy_path(id).unwrap();
         std::fs::write(
             &path,
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json"),
+            include_bytes!("../tests/fixtures/session/legacy_full.json"),
         )
         .unwrap();
         let lease = manager.acquire_lease(id).unwrap();
@@ -2907,7 +2907,7 @@ mod tests {
         manager.write_meta(&meta).unwrap();
         std::fs::write(
             manager.legacy_path(id).unwrap(),
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json"),
+            include_bytes!("../tests/fixtures/session/legacy_full.json"),
         )
         .unwrap();
         let lease = manager.acquire_lease(id).unwrap();
@@ -3389,7 +3389,7 @@ mod tests {
         let id = session.id.as_str();
         std::fs::write(
             project.join(format!("{id}.json")),
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json"),
+            include_bytes!("../tests/fixtures/session/legacy_full.json"),
         )
         .unwrap();
         let entry = CatalogEntry {
@@ -3425,7 +3425,7 @@ mod tests {
         let session = full_legacy_session();
         let id = session.id.as_str();
         let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+            include_bytes!("../tests/fixtures/session/legacy_full.json");
         std::fs::write(project.join(format!("{id}.json")), legacy_bytes).unwrap();
         let entry = CatalogEntry {
             id: id.into(),
