@@ -66,6 +66,8 @@ fn phase_status_glyph(phase: UiPhase) -> Option<&'static str> {
         // Waiting on the user to answer an interactive question — same
         // "needs-you" red as approval.
         UiPhase::UserInput => Some("🔴"),
+        // Round-cap checkpoint awaiting user decision — same "needs-you" red.
+        UiPhase::RoundCap => Some("🔴"),
         UiPhase::Suspended => None,
     }
 }

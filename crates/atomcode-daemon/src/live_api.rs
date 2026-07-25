@@ -311,6 +311,11 @@ pub(crate) fn chat_runtime_config(
             config.loop_config.max_rounds,
             std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
         ),
+        // Turn-level round cap. Mirror the env-override logic from CodingRuntimeConfig::from_config.
+        turn_max_rounds: std::env::var("ATOMCODE_TURN_MAX_ROUNDS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(config.coding.max_rounds),
         subagent_config: Some(Arc::new(config.clone())),
     }
 }

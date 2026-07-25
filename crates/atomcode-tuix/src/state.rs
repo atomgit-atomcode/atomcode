@@ -11,6 +11,11 @@ pub enum UiPhase {
     Streaming,
     Approval,
     UserInput,
+    /// Kernel-initiated round-cap checkpoint: the TUI shows a 2-option panel
+    /// ("继续 / 停止") and waits for the user to decide before the agent resumes
+    /// or stops.  Distinct from `UserInput` (model-initiated) so key handlers
+    /// and renderers can specialise without touching user-input paths.
+    RoundCap,
     Suspended,
 }
 
@@ -556,6 +561,30 @@ mod user_input_batch_tests {
     }
 }
 
+/// Round-cap checkpoint panel state (kernel-initiated; distinct from UserInputPanel
+/// which is model-initiated). Two fixed options: 0 = 继续, 1 = 停止.
+#[derive(Debug, Clone)]
+pub struct RoundCapPanel {
+    pub id: u64,
+    pub cap: u32,
+    pub cursor: usize, // 0=继续 1=停止
+}
+impl RoundCapPanel {
+    pub fn new(id: u64, cap: u32) -> Self {
+        Self { id, cap, cursor: 0 }
+    }
+    /// true = 继续
+    pub fn chosen_continue(&self) -> bool {
+        self.cursor == 0
+    }
+    pub fn move_up(&mut self) {
+        self.cursor = 0;
+    }
+    pub fn move_down(&mut self) {
+        self.cursor = 1;
+    }
+}
+
 /// How long the model may go silent before the spinner surfaces the "slow
 /// response · esc to cancel" hint. A mid-stream drop fails cleanly at the
 /// provider's idle watchdog (~120s), but that is silent dead-air; this reassures
@@ -799,6 +828,10 @@ pub struct UiState {
     /// `user_input_panel`). Set in the `Request` handler when the payload carries a
     /// `questions` array; cleared alongside `user_input_panel` on resolve.
     pub user_input_batch: Option<UserInputBatch>,
+    /// The active round-cap checkpoint panel. `None` when no checkpoint is pending.
+    /// Set in the `Request` handler when `kind == ROUND_CAP_CHECKPOINT_KIND`;
+    /// cleared alongside phase reset on resolve / turn-end / session reset.
+    pub round_cap_panel: Option<RoundCapPanel>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
     /// When the current turn started. Set by on_submit, cleared on
@@ -1076,6 +1109,7 @@ impl UiState {
             approval_panel: None,
             user_input_panel: None,
             user_input_batch: None,
+            round_cap_panel: None,
             thinking_idx: 0,
             turn_started_at: None,
             phase_started_at: None,
@@ -1399,6 +1433,7 @@ impl UiState {
         self.user_input_panel = None;
         self.user_input_batch = None;
         self.pending_steers.clear();
+        self.round_cap_panel = None;
         // The interactive `/usage` tab panel is streaming-only. Drop it (but keep
         // the rendered text) so its tab keys can't bleed into idle or across into
         // the next streaming turn; a fresh `/usage` re-arms it.
@@ -1423,6 +1458,7 @@ impl UiState {
         self.user_input_panel = None;
         self.user_input_batch = None;
         self.pending_steers.clear();
+        self.round_cap_panel = None;
         // Streaming-only `/usage` tab panel — drop it on cancel too (mirrors
         // on_turn_complete); the rendered text stays until Esc.
         self.footer_usage = None;
@@ -1641,6 +1677,7 @@ impl UiState {
     pub fn on_user_input_resolved(&mut self) {
         self.user_input_panel = None;
         self.user_input_batch = None;
+        self.round_cap_panel = None;
         self.phase = UiPhase::Streaming;
     }
 
@@ -2815,5 +2852,15 @@ mod tests {
 
         assert_eq!(st.phase, UiPhase::Idle);
         assert!(st.last_submitted_message.is_none());
+    }
+
+    #[test]
+    fn round_cap_panel_toggle_and_choice() {
+        let mut p = crate::state::RoundCapPanel::new(7, 200);
+        assert!(p.chosen_continue());
+        p.move_down();
+        assert!(!p.chosen_continue());
+        p.move_up();
+        assert!(p.chosen_continue());
     }
 }

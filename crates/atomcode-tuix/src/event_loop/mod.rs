@@ -96,8 +96,10 @@ fn reload_runtime_provider_from(
     if source.language == ctx.config.language {
         config.preferred_language = Some(crate::i18n::current_locale());
     }
+    let mut agent_cfg = config.agent_config();
+    agent_cfg.round_cap_checkpoint = true; // TUI implements the checkpoint panel (Task 3+)
     ctx.runtime.reload_provider(
-        config.agent_config(),
+        agent_cfg,
         ctx.foreground_runtime_id,
         ctx.runtime_event_tx.clone(),
     )
@@ -9577,6 +9579,9 @@ fn handle_input(
                 UiPhase::Streaming => handle_streaming_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Approval => handle_approval_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::UserInput => handle_user_input_key(app, ctx, renderer, code, modifiers)?,
+                // RoundCap key handling is wired in Task 5; for now fall through to streaming
+                // behaviour so Ctrl+C / Esc still cancel the turn.
+                UiPhase::RoundCap => handle_streaming_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Suspended => {}
             }
         }
@@ -12728,6 +12733,19 @@ fn deliver_user_input_null(ctx: &mut LoopCtx, id: u64) {
     }
 }
 
+/// Answer a round-cap checkpoint with `{"continue": bool}` and clear panel state.
+/// Mirrors `deliver_user_input` dispatch shape: goes through the native runtime
+/// `Respond` command (no daemon live-binding path needed — checkpoints are only
+/// emitted by the local kernel, not by the daemon bridge).
+fn deliver_round_cap(ctx: &mut LoopCtx, id: u64, cont: bool) {
+    ctx.runtime
+        .dispatch(atomcode_coding::DriverCommand::Respond {
+            id,
+            value: serde_json::json!({ "continue": cont }),
+        })
+        .ok();
+}
+
 /// Pure predicate: should a `request_user_input` tool call be auto-skipped
 /// without showing the interactive panel?
 ///
@@ -15135,6 +15153,23 @@ fn handle_runtime_event(
                         }
                         return;
                     }
+                    if request.kind == atomcode_kernel::ROUND_CAP_CHECKPOINT_KIND {
+                        let cap = request
+                            .payload
+                            .get("cap")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0) as u32;
+                        // 无值守/免审批模式：fail-closed 停止（等同旧 MaxRounds）。
+                        if user_input_should_auto_skip(state.agent_mode) {
+                            deliver_round_cap(ctx, request.id, false);
+                            return;
+                        }
+                        state.round_cap_panel =
+                            Some(crate::state::RoundCapPanel::new(request.id, cap));
+                        state.phase = UiPhase::RoundCap;
+                        redraw_idle_plain(buf, state, ctx, renderer);
+                        return;
+                    }
                     if request.kind != APPROVAL_KIND {
                         deliver_user_input_null(ctx, request.id);
                         return;
@@ -15250,7 +15285,10 @@ fn handle_runtime_event(
                     ctx.pending_runtime_request_id = None;
                     if matches!(
                         state.phase,
-                        UiPhase::Streaming | UiPhase::Approval | UiPhase::UserInput
+                        UiPhase::Streaming
+                            | UiPhase::Approval
+                            | UiPhase::UserInput
+                            | UiPhase::RoundCap
                     ) {
                         handle_agent_event(
                             AgentEvent::Error {

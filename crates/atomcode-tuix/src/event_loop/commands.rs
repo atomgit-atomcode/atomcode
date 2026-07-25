@@ -51,6 +51,7 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
         crate::state::UiPhase::Streaming
             | crate::state::UiPhase::Approval
             | crate::state::UiPhase::UserInput
+            | crate::state::UiPhase::RoundCap
     ) {
         bg_runtime::RuntimeState::Running
     } else {
@@ -186,6 +187,7 @@ fn foreground_turn_replay_events(state: &UiState) -> Vec<bg_runtime::RuntimeEven
         crate::state::UiPhase::Streaming
             | crate::state::UiPhase::Approval
             | crate::state::UiPhase::UserInput
+            | crate::state::UiPhase::RoundCap
     ) {
         return Vec::new();
     }
