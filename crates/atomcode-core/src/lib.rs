@@ -20,7 +20,6 @@ pub mod process_utils;
 // external `atomcode_core::i18n` consumers keep working during the transition.
 pub use atomcode_config::i18n;
 // `locale` fully lives in `atomcode-config` now (re-export shim removed).
-pub mod lsp;
 pub mod proxy;
 pub mod trace;
 
