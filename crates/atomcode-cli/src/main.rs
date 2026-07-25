@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 
 mod telemetry_cmd;
 mod vision;
@@ -286,7 +287,6 @@ fn scan_config_language() -> Option<atomcode_tuix::i18n::Locale> {
 /// respects the current locale (set by scan_argv_for_lang above).
 fn build_i18n_command() -> clap::Command {
     use atomcode_tuix::i18n::{t, Msg};
-    use clap::CommandFactory;
 
     let cmd = Cli::command();
 
@@ -384,6 +384,7 @@ fn should_try_sync_upgrade() -> bool {
                 | "uninstall"
                 | "mcp"
                 | "telemetry"
+                | "completion"
                 | "--version"
                 | "-V"
                 | "--help"
@@ -623,7 +624,7 @@ struct Cli {
     lang: Option<String>,
 
     /// Path to config file
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
     config: Option<PathBuf>,
 
     /// FIRST-RUN ONLY: seed the user's config from this file when they don't yet
@@ -634,11 +635,11 @@ struct Cli {
     /// binary): point this at that file via the launcher. Env: `ATOMCODE_SEED_CONFIG`.
     /// No-op when the user already has a config, so it's safe to always pass.
     /// Env `ATOMCODE_SEED_CONFIG` is honored as a fallback when the flag is absent.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     seed_config: Option<PathBuf>,
 
     /// Working directory (defaults to current directory)
-    #[arg(long, short = 'C')]
+    #[arg(long, short = 'C', value_hint = clap::ValueHint::DirPath)]
     dir: Option<PathBuf>,
 
     /// Prompt to run in headless (non-interactive) mode. If omitted, launches the TUI.
@@ -647,7 +648,12 @@ struct Cli {
 
     /// Read the prompt from a file (alternative to -p). Useful for long prompts
     /// that would exceed ARG_MAX or whose trailing newlines matter.
-    #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "prompt",
+        value_hint = clap::ValueHint::FilePath
+    )]
     prompt_file: Option<std::path::PathBuf>,
 
     /// Show tool calls, token usage, and turn summary on stderr (headless mode only).
@@ -765,6 +771,8 @@ enum Commands {
     /// Manage hooks (list, test, enable/disable)
     #[command(subcommand)]
     Hooks(HookCommands),
+    /// Generate a shell completion script on stdout.
+    Completion(CompletionCommand),
     /// Internal: askpass helper invoked by sudo/ssh via SUDO_ASKPASS / SSH_ASKPASS.
     /// Not intended for direct user invocation.
     #[command(name = "__askpass", hide = true)]
@@ -780,6 +788,108 @@ enum Commands {
     /// the ACP client's `session/new` request.
     #[command(hide = true)]
     Acp,
+}
+
+#[derive(clap::Args)]
+struct CompletionCommand {
+    /// Shell to generate completions for.
+    #[arg(value_enum, default_value_t = Shell::Bash)]
+    shell: Shell,
+}
+
+/// Parse and serve `atomcode completion [SHELL]` before normal startup.
+///
+/// `Cli::try_parse` is intentionally used instead of hand-parsing argv so
+/// global options and clap validation retain their canonical semantics. We
+/// only surface a parse error early when argv contains the completion
+/// subcommand token; every other invocation falls through to the existing
+/// localized parse path.
+fn try_print_shell_completion() -> bool {
+    if !is_completion_invocation(std::env::args_os().skip(1)) {
+        return false;
+    }
+
+    match Cli::try_parse() {
+        Ok(Cli {
+            command: Some(Commands::Completion(command)),
+            ..
+        }) => {
+            print_shell_completion(command.shell, &mut std::io::stdout());
+            true
+        }
+        Ok(_) => false,
+        Err(error) => error.exit(),
+    }
+}
+
+fn is_completion_invocation(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else {
+            return false;
+        };
+        match arg {
+            // `--` ends root option parsing; anything after it is input, not
+            // AtomCode's completion subcommand.
+            "--" => return false,
+            // Root flags that do not consume a value.
+            "-c"
+            | "--continue"
+            | "-v"
+            | "--verbose"
+            | "--dev"
+            | "--no-telemetry"
+            | "-y"
+            | "--dangerously-skip-permissions" => {}
+            // Root options that consume the following argv item.
+            "--provider" | "--model" | "--lang" | "--config" | "--seed-config" | "-C" | "--dir"
+            | "-p" | "--prompt" | "--prompt-file" => {
+                if args.next().is_none() {
+                    return false;
+                }
+            }
+            // Long options may carry their value after `=`.
+            value
+                if [
+                    "--provider=",
+                    "--model=",
+                    "--lang=",
+                    "--config=",
+                    "--seed-config=",
+                    "--dir=",
+                    "--prompt=",
+                    "--prompt-file=",
+                ]
+                .iter()
+                .any(|prefix| value.starts_with(prefix)) => {}
+            // The first root positional token is the subcommand.
+            value if !value.starts_with('-') => return value == "completion",
+            // Unknown/combined options belong to the canonical parser.
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn completion_command() -> clap::Command {
+    let source = Cli::command();
+    let visible_subcommands = source
+        .get_subcommands()
+        .filter(|command| !command.is_hide_set())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    clap::Command::new("atomcode")
+        .version(VERSION)
+        .about("AI coding assistant in your terminal")
+        .args(source.get_arguments().cloned())
+        .groups(source.get_groups().cloned())
+        .subcommands(visible_subcommands)
+}
+
+fn print_shell_completion(shell: Shell, out: &mut dyn Write) {
+    let mut command = completion_command();
+    clap_complete::generate(shell, &mut command, "atomcode", out);
 }
 
 /// Subcommands for hooks management
@@ -857,7 +967,7 @@ enum McpCli {
         #[arg(long)]
         global: bool,
         /// Directory for project `.mcp.json` (defaults to current directory)
-        #[arg(short = 'C', long)]
+        #[arg(short = 'C', long, value_hint = clap::ValueHint::DirPath)]
         dir: Option<PathBuf>,
     },
     /// Add GitHub's remote MCP server using OAuth.
@@ -869,7 +979,7 @@ enum McpCli {
         #[arg(long)]
         global: bool,
         /// Directory for project `.mcp.json` (defaults to current directory)
-        #[arg(short = 'C', long)]
+        #[arg(short = 'C', long, value_hint = clap::ValueHint::DirPath)]
         dir: Option<PathBuf>,
     },
     /// Complete OAuth login for a remote MCP server.
@@ -929,6 +1039,14 @@ const UPGRADED_FROM_ENV: &str = "ATOMCODE_UPGRADED_FROM";
 const INTERNAL_PREPARE_UPGRADE_ENV: &str = "ATOMCODE_INTERNAL_PREPARE_UPGRADE";
 
 fn main() {
+    // Completion generation must be a pure, fast CLI operation: no helper
+    // thread, Tokio runtime, log file, config read, telemetry, or updater.
+    // Shells may invoke completion helpers frequently, so even best-effort
+    // startup work here would turn Tab into network/filesystem activity.
+    if try_print_shell_completion() {
+        return;
+    }
+
     // Run the entire program on a thread with a large, explicit stack.
     // Rust gives the *main* OS thread the platform-default stack — on
     // Windows that's only ~1 MB (vs 8 MB on Linux/macOS). The TUI event
@@ -2666,6 +2784,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         Commands::Acp => {
             unreachable!("Acp is handled inline in run() before handle_command")
         }
+        Commands::Completion(_) => {
+            unreachable!("completion is handled before runtime startup")
+        }
         Commands::Hooks(subcmd) => handle_hooks(subcmd).await,
         Commands::Askpass { .. } => {
             unreachable!("__askpass is handled early in run() before handle_command")
@@ -3453,10 +3574,82 @@ mod tests {
     use super::{
         apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
-        headless_completion_notify_reason, merge_startup_notices, resolve_working_dir,
-        runtime_config_from, should_fork_busy_continue, truncate_log_line, DEFAULT_LOG_DIRECTIVES,
+        headless_completion_notify_reason, is_completion_invocation, merge_startup_notices,
+        print_shell_completion, resolve_working_dir, runtime_config_from,
+        should_fork_busy_continue, truncate_log_line, Cli, Commands, DEFAULT_LOG_DIRECTIVES,
     };
+    use clap::Parser;
+    use clap_complete::Shell;
     use std::path::PathBuf;
+
+    #[test]
+    fn completion_subcommand_defaults_to_bash_and_accepts_all_supported_shells() {
+        let default = Cli::try_parse_from(["atomcode", "completion"]).unwrap();
+        assert!(matches!(
+            default.command,
+            Some(Commands::Completion(command)) if command.shell == Shell::Bash
+        ));
+
+        for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+            let parsed = Cli::try_parse_from(["atomcode", "completion", shell]).unwrap();
+            assert!(matches!(parsed.command, Some(Commands::Completion(_))));
+        }
+    }
+
+    #[test]
+    fn completion_scripts_cover_all_supported_shells() {
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let mut output = Vec::new();
+            print_shell_completion(shell, &mut output);
+            let script = String::from_utf8(output).unwrap();
+            assert!(!script.is_empty(), "{shell:?} script should not be empty");
+            assert!(
+                script.contains("atomcode"),
+                "{shell:?} script should target atomcode"
+            );
+            assert!(
+                script.contains("completion"),
+                "{shell:?} script should include the completion command"
+            );
+            assert!(
+                !script.contains("__askpass"),
+                "{shell:?} script should not expose the internal askpass helper"
+            );
+            assert!(
+                !script.contains("codingplan"),
+                "{shell:?} script should not expose deprecated hidden aliases"
+            );
+            assert!(
+                !script.contains("acp"),
+                "{shell:?} script should not expose internal protocol commands"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_early_exit_only_matches_the_root_subcommand() {
+        let invocation =
+            |args: &[&str]| is_completion_invocation(args.iter().map(std::ffi::OsString::from));
+
+        assert!(invocation(&["completion", "zsh"]));
+        assert!(invocation(&["--no-telemetry", "completion", "fish"]));
+        assert!(invocation(&[
+            "--config",
+            "/tmp/config.toml",
+            "completion",
+            "bash"
+        ]));
+        assert!(!invocation(&["--provider", "completion"]));
+        assert!(!invocation(&["-p", "completion"]));
+        assert!(!invocation(&["mcp", "add", "completion", "server"]));
+        assert!(!invocation(&["--", "completion"]));
+    }
 
     #[test]
     fn log_path_is_logs_subdir_of_config_dir() {

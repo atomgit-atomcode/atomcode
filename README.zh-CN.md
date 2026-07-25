@@ -184,6 +184,28 @@ npm install -g @atomgit.com/atomcode
 brew install --cask atomcode
 ```
 
+### Shell 补全
+
+AtomCode 可为 Bash、Zsh、Fish、PowerShell 和 Elvish 生成补全脚本。例如：
+
+```bash
+# Bash（当前会话）
+source <(atomcode completion bash)
+
+# Zsh（持久生效）
+mkdir -p ~/.zfunc
+atomcode completion zsh > ~/.zfunc/_atomcode
+# 同时在 ~/.zshrc 的 `compinit` 之前加入：fpath=(~/.zfunc $fpath)
+
+# Fish（持久生效）
+mkdir -p ~/.config/fish/completions
+atomcode completion fish > ~/.config/fish/completions/atomcode.fish
+```
+
+PowerShell 可运行 `atomcode completion powershell | Out-String |
+Invoke-Expression`。完整 Shell 列表见 `atomcode completion --help`。该能力只作用于
+外部命令行，不会改变 TUI 内 `Tab` 的模式切换行为。
+
 ### 依赖
 
 - Rust 1.88+（用于构建；更旧的 Cargo 无法解析当前 lock 文件）

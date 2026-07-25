@@ -45,6 +45,7 @@ atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify
 atomcode-auth = { path = "../atomcode-auth" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }
 url = "2"

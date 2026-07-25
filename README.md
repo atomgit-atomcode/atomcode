@@ -185,6 +185,30 @@ npm install -g @atomgit.com/atomcode
 brew install --cask atomcode
 ```
 
+### Shell Completion
+
+AtomCode can generate completion scripts for Bash, Zsh, Fish, PowerShell, and
+Elvish. For example:
+
+```bash
+# Bash (current session)
+source <(atomcode completion bash)
+
+# Zsh (persistent)
+mkdir -p ~/.zfunc
+atomcode completion zsh > ~/.zfunc/_atomcode
+# Also add `fpath=(~/.zfunc $fpath)` before `compinit` in ~/.zshrc.
+
+# Fish (persistent)
+mkdir -p ~/.config/fish/completions
+atomcode completion fish > ~/.config/fish/completions/atomcode.fish
+```
+
+For PowerShell, run `atomcode completion powershell | Out-String |
+Invoke-Expression`. Run `atomcode completion --help` for the complete shell
+list. This affects command-line completion only and does not change the TUI's
+`Tab` mode switching.
+
 ### Requirements
 
 - Rust 1.88+ (for building; older Cargo versions cannot parse the current lockfile)
