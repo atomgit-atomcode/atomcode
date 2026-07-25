@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { parseOpenFileSelection } from './filePosition';
 import * as path from 'path';
 import * as fs from 'fs';
 import { classifyAuthDisplayState } from '../auth/status';
@@ -709,10 +710,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               viewColumn: vscode.ViewColumn.Active,
               preserveFocus: false,
             };
-            if (msg.startLine) {
-              const start = msg.startLine - 1;
-              const end = msg.endLine ? msg.endLine - 1 : start;
-              opts.selection = new vscode.Range(start, 0, end, 0);
+            const selection = parseOpenFileSelection(msg);
+            if (selection) {
+              opts.selection = new vscode.Range(
+                selection.startLine - 1,
+                selection.startColumn - 1,
+                selection.endLine - 1,
+                selection.endColumn - 1,
+              );
             }
             // Try to reveal in existing editor if already open
             const existingEditor = vscode.window.visibleTextEditors.find(

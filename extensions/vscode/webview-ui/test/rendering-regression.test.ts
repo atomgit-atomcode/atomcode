@@ -12,6 +12,10 @@ import { renderCodeBlockHtml } from '../src/components/codeBlockRendering';
 import { parseDiff } from '../src/components/DiffView';
 import { markdownToHtml } from '../src/components/Markdown';
 import { prepareMarkdownForRender, repairStreamingMarkdown } from '../src/components/streamingMarkdown';
+import {
+  openFileMessageFromVscodeUri,
+  parseVscodeFileUri,
+} from '../src/components/vscodeFileLinks';
 import { formatToolDuration } from '../src/utils/format';
 import { shouldShowIdleNotice } from '../src/utils/streamStatus';
 
@@ -984,6 +988,64 @@ function testMarkdownRawHtmlIsEscapedInsteadOfDroppedBySanitizer() {
   assert.doesNotMatch(html, /<script>/);
 }
 
+function testVscodeFileUriParsingSupportsWindowsPosixAndPositions() {
+  assert.deepEqual(
+    parseVscodeFileUri('vscode://file/C:/Program%20Files/app/main.ts:42:8'),
+    { path: 'C:/Program Files/app/main.ts', line: 42, column: 8 },
+  );
+  assert.deepEqual(
+    parseVscodeFileUri('vscode://file/home/user/src/main.rs:7'),
+    { path: '/home/user/src/main.rs', line: 7, column: undefined },
+  );
+}
+
+function testVscodeFileUriParsingRejectsNonFileAndInvalidPositions() {
+  assert.equal(parseVscodeFileUri('vscode://command/workbench.action.closeWindow'), null);
+  assert.equal(parseVscodeFileUri('vscode://file/C:/work/main.ts:0'), null);
+  assert.equal(parseVscodeFileUri('vscode://file/C:/bad%ZZ/main.ts:4'), null);
+}
+
+function testVscodeFileUriBuildsTheOpenFileHostMessage() {
+  assert.deepEqual(
+    openFileMessageFromVscodeUri('vscode://file/C:/work/main.ts:42:8'),
+    {
+      type: 'openFile',
+      path: 'C:/work/main.ts',
+      startLine: 42,
+      startColumn: 8,
+    },
+  );
+  assert.equal(
+    openFileMessageFromVscodeUri('vscode://command/workbench.action.closeWindow'),
+    null,
+  );
+}
+
+function testMarkdownLinksBareAndExplicitVscodeFileUris() {
+  const bare = markdownToHtml('位置：vscode://file/C:/work/src/main.ts:42。');
+  assert.match(bare, /data-vscode-file-uri="vscode:\/\/file\/C:\/work\/src\/main\.ts:42"/);
+  assert.match(bare, /<\/a>。/);
+
+  const explicit = markdownToHtml('[打开文件](vscode://file/C:/work/src/main.ts:42:8)');
+  assert.match(explicit, /href="#"/);
+  assert.match(explicit, /data-vscode-file-uri="vscode:\/\/file\/C:\/work\/src\/main\.ts:42:8"/);
+
+  const ordinary = markdownToHtml('[site](https://example.com "Example")');
+  assert.match(ordinary, /href="https:\/\/example\.com"/);
+  assert.match(ordinary, /title="Example"/);
+}
+
+function testMarkdownDoesNotLinkVscodeUrisInCodeOrOtherProtocols() {
+  const inlineCode = markdownToHtml('`vscode://file/C:/work/main.ts:42`');
+  assert.doesNotMatch(inlineCode, /data-vscode-file-uri/);
+
+  const fencedCode = markdownToHtml('```\nvscode://file/C:/work/main.ts:42\n```');
+  assert.doesNotMatch(fencedCode, /data-vscode-file-uri/);
+
+  const command = markdownToHtml('vscode://command/workbench.action.closeWindow');
+  assert.doesNotMatch(command, /<a /);
+}
+
 function testMarkdownTableDoesNotSwallowFollowingPlainText() {
   const markdown = [
     '| 示例（Pandoc） | 示例（Slidev） |',
@@ -1116,6 +1178,11 @@ testStreamingMarkdownRepairsUnclosedCodeFence();
 testStreamingMarkdownLeavesClosedCodeFenceUnchanged();
 testFinalMarkdownProtectsFenceInsideInlineCodeSpan();
 testMarkdownRawHtmlIsEscapedInsteadOfDroppedBySanitizer();
+testVscodeFileUriParsingSupportsWindowsPosixAndPositions();
+testVscodeFileUriParsingRejectsNonFileAndInvalidPositions();
+testVscodeFileUriBuildsTheOpenFileHostMessage();
+testMarkdownLinksBareAndExplicitVscodeFileUris();
+testMarkdownDoesNotLinkVscodeUrisInCodeOrOtherProtocols();
 testMarkdownTableDoesNotSwallowFollowingPlainText();
 testMarkdownTableWithSingleDashDelimiterDoesNotSwallowFollowingPlainText();
 testMarkdownTableDoesNotSwallowFollowingFencedCode();
