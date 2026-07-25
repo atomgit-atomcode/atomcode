@@ -29,6 +29,7 @@ pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NA
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::session::{Session, SessionId};
 use anyhow::Result;
@@ -4118,6 +4119,12 @@ fn rgba_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
 pub struct Buffer {
     pub text: String,
     pub cursor: usize,
+    /// Display width of the input area (in terminal columns), used by
+    /// [`cursor_visual_up`] / [`cursor_visual_down`] to navigate by
+    /// **visual** (soft-wrapped) lines rather than logical `\n` lines.
+    /// Set from the event loop on resize. 0 = disabled (falls back to
+    /// logical-line navigation).
+    pub input_width: usize,
     history_idx: Option<usize>,
     /// One-shot: suppress the slash-command menu for text placed into the
     /// buffer programmatically (a cancelled message restored on Esc). Without
@@ -4161,6 +4168,7 @@ impl Buffer {
         Self {
             text: String::new(),
             cursor: 0,
+            input_width: 80,
             history_idx: None,
             menu_suppressed: false,
             stash: String::new(),
@@ -4709,7 +4717,7 @@ impl Buffer {
             }
             return false;
         }
-        let target_col = crate::width::display_width(&self.text[cur_line_start..self.cursor]);
+        let target_col = crate::width::display_width_with_tabs(&self.text[cur_line_start..self.cursor]);
         let prev_line_end = cur_line_start - 1;
         let prev_line_start = self.text[..prev_line_end]
             .rfind('\n')
@@ -4737,7 +4745,7 @@ impl Buffer {
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        let target_col = crate::width::display_width(&self.text[cur_line_start..self.cursor]);
+        let target_col = crate::width::display_width_with_tabs(&self.text[cur_line_start..self.cursor]);
         let next_line_start = self.cursor + rel_end + 1;
         let next_line_end = self.text[next_line_start..]
             .find('\n')
@@ -4747,19 +4755,81 @@ impl Buffer {
             + byte_offset_at_col(&self.text[next_line_start..next_line_end], target_col);
         true
     }
+
+    /// Move the cursor UP by one **visual** (soft-wrapped) line, as opposed
+    /// to by logical `\n` delimiters. Uses [`wrap_with_spans`] to determine
+    /// the visual line layout at `self.input_width` columns.
+    ///
+    /// When `input_width` is 0 (unset) or the text fits on a single visual
+    /// line, delegates to the original [`cursor_line_up`] logic so existing
+    /// callers (history navigation fallback) keep working unchanged.
+    ///
+    /// Returns `false` only when the cursor is already at byte 0 — the
+    /// caller falls through to `HistoryPrev`.
+    pub fn cursor_visual_up(&mut self) -> bool {
+        let max_cols = self.input_width;
+        if max_cols == 0 || self.cursor == 0 {
+            return self.cursor_line_up();
+        }
+        let (spans, cur_row, cur_col) =
+            crate::width::wrap_with_spans(&self.text, max_cols, self.cursor);
+        if cur_row == 0 {
+            // Already on first visual line → snap to byte 0.
+            if self.cursor > 0 {
+                self.cursor = 0;
+                return true;
+            }
+            return false;
+        }
+        // Previous visual line: spans[cur_row - 1]
+        let (prev_start, prev_end) = spans[cur_row - 1];
+        let prev_text = &self.text[prev_start..prev_end];
+        let prev_width = crate::width::display_width_with_tabs(prev_text);
+        let target_col = cur_col.min(prev_width);
+        self.cursor = prev_start + byte_offset_at_col(prev_text, target_col);
+        true
+    }
+
+    /// Mirror of [`cursor_visual_up`] for Down. Returns `false` only
+    /// when the cursor is already at `text.len()` — the caller falls
+    /// through to `HistoryNext`.
+    pub fn cursor_visual_down(&mut self) -> bool {
+        let max_cols = self.input_width;
+        if max_cols == 0 || self.cursor == self.text.len() {
+            return self.cursor_line_down();
+        }
+        let (spans, cur_row, cur_col) =
+            crate::width::wrap_with_spans(&self.text, max_cols, self.cursor);
+        // If the cursor is past the last span (shouldn't happen in practice),
+        // fall back to logical-line down.
+        if cur_row + 1 >= spans.len() {
+            return self.cursor_line_down();
+        }
+        // Next visual line: spans[cur_row + 1]
+        let (next_start, next_end) = spans[cur_row + 1];
+        let next_text = &self.text[next_start..next_end];
+        let next_width = crate::width::display_width_with_tabs(next_text);
+        let target_col = cur_col.min(next_width);
+        self.cursor = next_start + byte_offset_at_col(next_text, target_col);
+        true
+    }
 }
 
-/// Find the byte offset within `line` at the first character whose
-/// cumulative display width meets or exceeds `target_col`. If the line
-/// is shorter than `target_col` cells, returns `line.len()` — the
-/// caller clamps the cursor to the end of that shorter line.
+/// Find the byte offset within `line` at the first grapheme cluster whose
+/// cumulative display width meets or exceeds `target_col`. Iterates by
+/// grapheme cluster (not code points) and uses the same width model as
+/// [`wrap_with_spans`] — including `SOFT_TAB_WIDTH` for `\t` — so the
+/// cursor never lands mid-cluster or misaligns on tab-indented lines.
+///
+/// If the line is shorter than `target_col` cells, returns `line.len()` —
+/// the caller clamps the cursor to the end of that shorter line.
 fn byte_offset_at_col(line: &str, target_col: usize) -> usize {
     let mut acc = 0usize;
-    for (i, ch) in line.char_indices() {
+    for (i, g) in line.grapheme_indices(true) {
         if acc >= target_col {
             return i;
         }
-        acc += crate::width::cell_char_width(ch).unwrap_or(0);
+        acc += crate::width::cluster_display_width(g);
     }
     line.len()
 }
@@ -6660,6 +6730,144 @@ mod menu_tests {
         assert_eq!(buf.cursor, 6);
     }
 
+    // ── Visual-line navigation (soft-wrap aware Up/Down) ──
+
+    #[test]
+    fn cursor_visual_up_navigates_wrapped_single_paragraph() {
+        // A long single line that wraps to 3 visual rows at max_cols=10.
+        // "abcdefghijklmnopqrstuvwxyz" wraps as:
+        //   [0..10)  "abcdefghij"
+        //   [10..20) "klmnopqrst"
+        //   [20..26) "uvwxyz"
+        // Cursor at end (byte 26, col 6 on visual row 2): Up → row 1, col 6.
+        let mut buf = Buffer::new();
+        buf.input_width = 10;
+        buf.text = "abcdefghijklmnopqrstuvwxyz".into();
+        buf.cursor = buf.text.len(); // byte 26
+
+        assert!(buf.cursor_visual_up(), "Up from last visual row");
+        // Should land at byte 20 (start of "uvwxyz") + col 6 = byte 26
+        // Wait: cur_col = 6, target_col = 6, prev line "klmnopqrst" width=10
+        // byte_offset_at_col("klmnopqrst", 6) → byte 6 (since "klmnop" = 6 chars)
+        // prev_start = 10 → cursor = 10 + 6 = 16
+        assert_eq!(buf.cursor, 16, "should be at 'g' on row 1");
+
+        assert!(buf.cursor_visual_up(), "Up to first visual row");
+        assert_eq!(buf.cursor, 6, "should be at 'g' on row 0");
+
+        assert!(buf.cursor_visual_up(), "snap to byte 0");
+        assert_eq!(buf.cursor, 0);
+
+        assert!(!buf.cursor_visual_up(), "already at byte 0 → false");
+    }
+
+    #[test]
+    fn cursor_visual_down_navigates_wrapped_single_paragraph() {
+        let mut buf = Buffer::new();
+        buf.input_width = 10;
+        buf.text = "abcdefghijklmnopqrstuvwxyz".into();
+        buf.cursor = 0; // byte 0, visual row 0, col 0
+
+        assert!(buf.cursor_visual_down(), "Down to second visual row");
+        // cur_col = 0, next line "klmnopqrst" → byte_offset_at_col(_, 0) = 0
+        // next_start = 10 → cursor = 10
+        assert_eq!(buf.cursor, 10, "should be start of row 1");
+
+        assert!(buf.cursor_visual_down(), "Down to third visual row");
+        assert_eq!(buf.cursor, 20, "should be start of row 2");
+
+        assert!(buf.cursor_visual_down(), "snap to end");
+        assert_eq!(buf.cursor, buf.text.len());
+
+        assert!(!buf.cursor_visual_down(), "already at end → false");
+    }
+
+    #[test]
+    fn cursor_visual_up_down_preserves_column_alignment() {
+        // Multi-line text where the second line wraps because it exceeds
+        // input_width. Cursor at byte 22 (the \n after "klmnopqrstu"),
+        // which `wrap_with_spans` places on visual row 2 ("u"), col 1.
+        // Byte layout:
+        //   "abcdefghij\n"              → [0..11),  visual row 0
+        //   "klmnopqrst"                → [11..21), visual row 1
+        //   "u"                         → [21..22), visual row 2
+        //   "\nvwxyz"                   → [22..28), visual row 3
+        //   cursor = 22 → visual row 2, col 1 (after "u" at col 0)
+        let mut buf = Buffer::new();
+        buf.input_width = 10;
+        buf.text = "abcdefghij\nklmnopqrstu\nvwxyz".into();
+        buf.cursor = 22;
+        assert_eq!(&buf.text[..buf.cursor], "abcdefghij\nklmnopqrstu");
+
+        // Up: navigate from visual row 2 ("u") to row 1 ("klmnopqrst"),
+        // preserving col 1 → byte_offset_at_col("klmnopqrst", 1) = 'l' at byte 12.
+        assert!(buf.cursor_visual_up());
+        assert_eq!(buf.cursor, 12, "cursor at 'l' (col 1) on visual row 1");
+
+        // Down back: from visual row 1 back to row 2 ("u"), preserving col 1.
+        // byte_offset_at_col("u", 1) returns 1 (line.len()), so cursor = 21 + 1 = 22,
+        // which is the \n after "u" — the byte just past the "u" grapheme.
+        assert!(buf.cursor_visual_down());
+        assert_eq!(buf.cursor, 22, "cursor at '\\n' after 'u' on visual row 2");
+    }
+
+    #[test]
+    fn cursor_visual_up_down_input_width_zero_falls_back_to_logical() {
+        // With input_width=0, cursor_visual_up/down should behave like cursor_line_up/down
+        let mut buf = Buffer::new();
+        buf.input_width = 0; // disable visual navigation
+        buf.text = "line1\nline2\nline3".into();
+        buf.cursor = buf.text.len();
+
+        assert!(buf.cursor_visual_up(), "falls back to logical line up");
+        assert_eq!(&buf.text[..buf.cursor], "line1\nline2");
+    }
+
+    #[test]
+    fn cursor_visual_up_down_input_width_zero_fallback_preserves_tab_columns() {
+        // With input_width=0 the visual nav falls back to cursor_line_up/down.
+        // The fallback must still use display_width_with_tabs for the target
+        // column so that a tab-indented line doesn't get width 0 and snap
+        // the cursor to byte 0 of the target line instead of the real column.
+        let mut buf = Buffer::new();
+        buf.input_width = 0;
+        buf.text = "abcd\n\tb".into();
+        buf.cursor = 4;
+
+        assert!(buf.cursor_visual_down(), "fallback Down to tab-indented line");
+        // After cursor_line_down: cur_line="abcd", target_col=4,
+        // next_line="\tb", byte_offset_at_col("\tb", 4)
+        //   → acc+=4 (SOFT_TAB_WIDTH) → acc=4 >= 4 → return i=1
+        // cursor = 5 + 1 = 6
+        assert_eq!(buf.cursor, 6, "fallback down preserves column 4 on tab line");
+    }
+
+    #[test]
+    fn cursor_visual_navigation_preserves_tab_columns() {
+        // Tab-indented second line: "abcd" is 4 cols, "\tb" renders as
+        // 4 (SOFT_TAB_WIDTH) + 1 = 5 cols. Cursor at col 4 on line 0
+        // ("abcd") — Down must land at the corresponding column on the
+        // tab-indented visual row, not clamped to display_width("\tb")==1.
+        //
+        // wrap_with_spans("abcd\n\tb", 20) produces:
+        //   spans = [(0,4), (5,7)]
+        //   cursor at byte 4 → row 0, col 4
+        // cursor_visual_down:
+        //   next_text = "\tb" (bytes 5..7)
+        //   display_width_with_tabs("\tb") = 4 + 1 = 5
+        //   target_col = min(4, 5) = 4
+        //   byte_offset_at_col("\tb", 4):
+        //     i=0, g="\t", width=4 → acc=4 >= 4 → return i=1
+        //   cursor = 5 + 1 = 6 (start of "b")
+        let mut buf = Buffer::new();
+        buf.input_width = 20;
+        buf.text = "abcd\n\tb".into();
+        buf.cursor = 4;
+
+        assert!(buf.cursor_visual_down(), "Down to tab-indented line");
+        assert_eq!(buf.cursor, 6, "cursor at byte 6 ('b') — visual column 4 on tab-indented row");
+    }
+
     #[test]
     fn history_next_back_to_stash_restores_cursor_to_end() {
         let mut buf = Buffer::new();
@@ -8252,6 +8460,15 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             atomcode_daemon::live_set_mode(crate::state::AgentMode::Auto);
         },
     );
+
+    // Sync the initial input width from the live terminal geometry so visual
+    // line navigation wraps at the same width as the renderer from turn one.
+    // (Without this, Buffer defaults to 80 cols and wraps differently from
+    // any terminal that isn't exactly 82 columns wide.)
+    if let Ok((cols, _)) = crossterm::terminal::size() {
+        let reserve: usize = if ctx.caps.jediterm { 3 } else { 2 };
+        app.buf.input_width = (cols as usize).saturating_sub(reserve);
+    }
 
     crate::tuix_trace!(
         "SES",
@@ -11267,6 +11484,12 @@ fn handle_input(
             // `on_resize` already fully wipes+reflows the terminal and drops the
             // stale modal overlay itself (so #1158 duplication stays fixed).
             renderer.on_resize(cols, rows);
+            // Sync the input area display width so Buffer's visual line
+            // navigation uses the new geometry. Account for the "> "
+            // prompt prefix (2 cols normally, 3 on JediTerm for the
+            // right-edge reserve that its paint layer requires).
+            let reserve: usize = if ctx.caps.jediterm { 3 } else { 2 };
+            app.buf.input_width = (cols as usize).saturating_sub(reserve);
             // A resize invalidates any open modal's cached overlay
             // geometry (it was built for the old size). Rebuild it now so
             // the window re-centres at the new dimensions instead of
@@ -12616,18 +12839,18 @@ fn handle_idle_key(
     }
 
     // Multi-line cursor nav (idle path). Mirror of the streaming-mode
-    // handler: in a buffer with embedded newlines, plain Up/Down walks
-    // through the lines first; only when the cursor is already on the
-    // first/last line does it surface as HistoryPrev/Next. Gated to
-    // "no modifiers" so Shift+Up (body scroll) and other compound keys
-    // still classify normally.
+    // handler: plain Up/Down walks through visual (soft-wrapped) lines
+    // first; only when the cursor is at the very first/last position
+    // does it surface as HistoryPrev/Next. Gated to "no modifiers" so
+    // Shift+Up (body scroll) and other compound keys still classify
+    // normally.
     if modifiers.is_empty() {
         match code {
-            KeyCode::Up if app.buf.cursor_line_up() => {
+            KeyCode::Up if app.buf.cursor_visual_up() => {
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
-            KeyCode::Down if app.buf.cursor_line_down() => {
+            KeyCode::Down if app.buf.cursor_visual_down() => {
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
@@ -14854,17 +15077,14 @@ fn handle_streaming_key(
         }
     }
 
-    // Multi-line cursor nav: in a buffer with embedded newlines, plain
-    // Up/Down should walk through the lines first; only when the
-    // cursor is already on the first/last line does it surface as
-    // HistoryPrev/Next. Matches the convention from fish / Cursor /
-    // Claude Code — losing a multi-line draft to "I was just trying
-    // to fix line 2" is far worse than the historical single-line
-    // shortcut.  Gated to "no modifiers" so Shift+Up (selection in
-    // some terminals) and other compound keys still classify normally.
+    // Multi-line cursor nav: plain Up/Down walks through visual
+    // (soft-wrapped) lines first; only when the cursor is at the very
+    // first/last position does it surface as HistoryPrev/Next. Gated to
+    // "no modifiers" so Shift+Up (selection in some terminals) and
+    // other compound keys still classify normally.
     if modifiers.is_empty() {
         match code {
-            KeyCode::Up if app.buf.cursor_line_up() => {
+            KeyCode::Up if app.buf.cursor_visual_up() => {
                 draw_spinner_now(
                     &mut app.state,
                     &app.buf,
@@ -14875,7 +15095,7 @@ fn handle_streaming_key(
                 );
                 return Ok(());
             }
-            KeyCode::Down if app.buf.cursor_line_down() => {
+            KeyCode::Down if app.buf.cursor_visual_down() => {
                 draw_spinner_now(
                     &mut app.state,
                     &app.buf,
