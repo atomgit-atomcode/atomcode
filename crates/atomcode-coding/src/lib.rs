@@ -48,6 +48,7 @@ pub mod provider_factory;
 pub mod runtime;
 pub mod session_title;
 pub mod telemetry;
+pub mod vision;
 
 mod assemble;
 mod init_prompt;
@@ -80,6 +81,7 @@ pub use provider_factory::{
     CodingProviderFactory, DefaultCodingProviderFactory, ProviderAuthenticator, ProviderBuildError,
 };
 pub use rate_limit::{RateLimitWindow, RateLimitWindowSource};
+pub use vision::{run_vl_caption, should_skip, PreprocessOutcome};
 pub use runtime::{
     CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
     CodingRuntimeStart, DeferredRuntimeState, DriverCommand, ImagePreprocessor, LocalContextInput,
