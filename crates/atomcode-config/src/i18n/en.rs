@@ -169,10 +169,20 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ⚠ {}\n", hint).into(),
         Msg::StatusInstructionFilesHeader =>
             "  Instruction files:\n".into(),
-        Msg::StatusInstructionPresent { path, label } =>
-            format!("    ✓ {} ({})\n", path, label).into(),
-        Msg::StatusInstructionMissing { label } =>
-            format!("    × {} — not found\n", label).into(),
+        Msg::StatusInstructionScopeGlobal => "User global".into(),
+        Msg::StatusInstructionScopeProject => "Project shared".into(),
+        Msg::StatusInstructionScopeUser => "User project override".into(),
+        Msg::StatusInstructionPresent { path, label, scope } =>
+            format!("    ✓ {scope} ({label}): {path}\n").into(),
+        Msg::StatusInstructionMissing { path, label, scope } =>
+            format!("    × {scope} ({label}): {path} — not found\n").into(),
+        Msg::StatusMemoryFilesHeader => "  Memory files:\n".into(),
+        Msg::StatusMemoryScopeGlobal => "User global".into(),
+        Msg::StatusMemoryScopeProject => "Project memory".into(),
+        Msg::StatusMemoryPresent { path, scope } =>
+            format!("    ✓ {scope}: {path}\n").into(),
+        Msg::StatusMemoryMissing { path, scope } =>
+            format!("    × {scope}: {path} — not found\n").into(),
 
         // ── Help ──
         Msg::HelpAvailableCommands =>

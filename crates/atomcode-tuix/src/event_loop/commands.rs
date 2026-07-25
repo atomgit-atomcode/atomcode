@@ -450,19 +450,55 @@ pub(super) fn active_session_project_bucket(working_dir: &std::path::Path) -> St
 /// by `/status`, factored out so `/init` can also display it after
 /// writing `.atomcode.md` (so users see the new file appear under
 /// PROJECT immediately, rather than trusting the success message).
-fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
-    use atomcode_config::config::instructions::LayeredInstructions;
+fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
+    use atomcode_config::config::instructions::{InstructionLevel, LayeredInstructions};
     let instructions = LayeredInstructions::load(working_dir);
     let mut out = t(Msg::StatusInstructionFilesHeader).into_owned();
-    for (level, path) in instructions.status_lines() {
-        match path {
-            Some(p) => out.push_str(&t(Msg::StatusInstructionPresent {
-                path: &p.display().to_string(),
-                label: level.label(),
-            })),
-            None => out.push_str(&t(Msg::StatusInstructionMissing {
-                label: level.label(),
-            })),
+    for line in instructions.status_lines(working_dir) {
+        let scope = t(match line.level {
+            InstructionLevel::Global => Msg::StatusInstructionScopeGlobal,
+            InstructionLevel::Project => Msg::StatusInstructionScopeProject,
+            InstructionLevel::User => Msg::StatusInstructionScopeUser,
+        });
+        let path = line.path.display().to_string();
+        if line.found {
+            out.push_str(&t(Msg::StatusInstructionPresent {
+                path: &path,
+                label: line.level.label(),
+                scope: &scope,
+            }));
+        } else {
+            out.push_str(&t(Msg::StatusInstructionMissing {
+                path: &path,
+                label: line.level.label(),
+                scope: &scope,
+            }));
+        }
+    }
+    out.push('\n');
+    out.push_str(&t(Msg::StatusMemoryFilesHeader));
+    for (scope_msg, store) in [
+        (
+            Msg::StatusMemoryScopeGlobal,
+            MemoryStore::global(),
+        ),
+        (
+            Msg::StatusMemoryScopeProject,
+            MemoryStore::project(working_dir),
+        ),
+    ] {
+        let scope = t(scope_msg);
+        let path = store.path().display().to_string();
+        if store.path().is_file() {
+            out.push_str(&t(Msg::StatusMemoryPresent {
+                path: &path,
+                scope: &scope,
+            }));
+        } else {
+            out.push_str(&t(Msg::StatusMemoryMissing {
+                path: &path,
+                scope: &scope,
+            }));
         }
     }
     out
@@ -4890,7 +4926,7 @@ pub(super) fn build_status_text(ctx: &LoopCtx, proxy: Option<&str>) -> String {
         &body,
         &render_codingplan_status_for_status_cmd(),
         proxy,
-        &render_instruction_status_block(&ctx.working_dir),
+        &render_context_file_status_block(&ctx.working_dir),
     )
 }
 
@@ -7023,6 +7059,33 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_file_status_shows_instruction_and_memory_paths() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("AGENTS.md"), "project instructions").unwrap();
+        let project_memory = MemoryStore::project(project.path());
+        std::fs::create_dir_all(project_memory.path().parent().unwrap()).unwrap();
+        std::fs::write(project_memory.path(), "- remembered fact\n").unwrap();
+        let status = render_context_file_status_block(project.path());
+        assert!(status.contains(
+            &project
+                .path()
+                .join("AGENTS.md")
+                .display()
+                .to_string()
+        ));
+        assert!(status.contains(&project_memory.path().display().to_string()));
+        assert!(status.contains("(PROJECT)") || status.contains("（PROJECT）"));
+        assert!(
+            status.contains("Instruction files") || status.contains("指令文件"),
+            "instruction section should be visible: {status}"
+        );
+        assert!(
+            status.contains("Memory files") || status.contains("记忆文件"),
+            "memory section should be visible: {status}"
+        );
+    }
 
     #[test]
     fn streaming_usage_snapshot_composes_plan_and_window_lines() {

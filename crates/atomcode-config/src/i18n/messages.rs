@@ -242,12 +242,29 @@ pub enum Msg<'a> {
         hint: &'a str,
     },
     StatusInstructionFilesHeader,
+    StatusInstructionScopeGlobal,
+    StatusInstructionScopeProject,
+    StatusInstructionScopeUser,
     StatusInstructionPresent {
         path: &'a str,
         label: &'a str,
+        scope: &'a str,
     },
     StatusInstructionMissing {
+        path: &'a str,
         label: &'a str,
+        scope: &'a str,
+    },
+    StatusMemoryFilesHeader,
+    StatusMemoryScopeGlobal,
+    StatusMemoryScopeProject,
+    StatusMemoryPresent {
+        path: &'a str,
+        scope: &'a str,
+    },
+    StatusMemoryMissing {
+        path: &'a str,
+        scope: &'a str,
     },
 
     // ── Help / commands ──

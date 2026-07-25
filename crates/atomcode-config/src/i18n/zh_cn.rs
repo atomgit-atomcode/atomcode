@@ -161,10 +161,20 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ⚠ {}\n", hint).into(),
         Msg::StatusInstructionFilesHeader =>
             "  指令文件：\n".into(),
-        Msg::StatusInstructionPresent { path, label } =>
-            format!("    ✓ {} ({})\n", path, label).into(),
-        Msg::StatusInstructionMissing { label } =>
-            format!("    × {} — 未找到\n", label).into(),
+        Msg::StatusInstructionScopeGlobal => "用户全局".into(),
+        Msg::StatusInstructionScopeProject => "项目共享".into(),
+        Msg::StatusInstructionScopeUser => "用户项目覆盖".into(),
+        Msg::StatusInstructionPresent { path, label, scope } =>
+            format!("    ✓ {scope}（{label}）：{path}\n").into(),
+        Msg::StatusInstructionMissing { path, label, scope } =>
+            format!("    × {scope}（{label}）：{path} — 未找到\n").into(),
+        Msg::StatusMemoryFilesHeader => "  记忆文件：\n".into(),
+        Msg::StatusMemoryScopeGlobal => "用户全局".into(),
+        Msg::StatusMemoryScopeProject => "项目记忆".into(),
+        Msg::StatusMemoryPresent { path, scope } =>
+            format!("    ✓ {scope}：{path}\n").into(),
+        Msg::StatusMemoryMissing { path, scope } =>
+            format!("    × {scope}：{path} — 未找到\n").into(),
 
         // ── 帮助 ──
         Msg::HelpAvailableCommands =>

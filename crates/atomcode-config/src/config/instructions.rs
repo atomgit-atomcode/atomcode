@@ -21,7 +21,7 @@ pub struct InstructionFile {
     pub level: InstructionLevel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstructionLevel {
     Global,
     Project,
@@ -134,26 +134,53 @@ impl LayeredInstructions {
         parts.join("\n\n")
     }
 
-    /// Return status for all three levels (loaded path or None).
-    pub fn status_lines(&self) -> Vec<(InstructionLevel, Option<&Path>)> {
+    /// Return status for all three levels with either the loaded path or the
+    /// preferred path to create when that level is missing.
+    pub fn status_lines(&self, project_root: &Path) -> Vec<InstructionStatusLine> {
         vec![
-            (
+            InstructionStatusLine::new(
                 InstructionLevel::Global,
-                self.global.as_ref().map(|f| f.path.as_path()),
+                self.global.as_ref(),
+                crate::config::Config::config_dir().join("ATOMCODE.md"),
             ),
-            (
+            InstructionStatusLine::new(
                 InstructionLevel::Project,
-                self.project.as_ref().map(|f| f.path.as_path()),
+                self.project.as_ref(),
+                project_root.join(".atomcode.md"),
             ),
-            (
+            InstructionStatusLine::new(
                 InstructionLevel::User,
-                self.user.as_ref().map(|f| f.path.as_path()),
+                self.user.as_ref(),
+                project_root.join(".atomcode.user.md"),
             ),
         ]
     }
 
     pub fn has_any(&self) -> bool {
         self.global.is_some() || self.project.is_some() || self.user.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstructionStatusLine {
+    pub level: InstructionLevel,
+    pub path: PathBuf,
+    pub found: bool,
+}
+
+impl InstructionStatusLine {
+    fn new(
+        level: InstructionLevel,
+        loaded: Option<&InstructionFile>,
+        missing_path: PathBuf,
+    ) -> Self {
+        Self {
+            level,
+            path: loaded
+                .map(|instruction| instruction.path.clone())
+                .unwrap_or(missing_path),
+            found: loaded.is_some(),
+        }
     }
 }
 
@@ -351,14 +378,17 @@ mod tests {
                 level: InstructionLevel::User,
             }),
         };
-        let lines = instructions.status_lines();
+        let lines = instructions.status_lines(tmp.path());
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0].0, InstructionLevel::Global);
-        assert!(lines[0].1.is_some());
-        assert_eq!(lines[1].0, InstructionLevel::Project);
-        assert!(lines[1].1.is_none());
-        assert_eq!(lines[2].0, InstructionLevel::User);
-        assert!(lines[2].1.is_some());
+        assert_eq!(lines[0].level, InstructionLevel::Global);
+        assert!(lines[0].found);
+        assert!(lines[0].path.ends_with("g.md"));
+        assert_eq!(lines[1].level, InstructionLevel::Project);
+        assert!(!lines[1].found);
+        assert_eq!(lines[1].path, tmp.path().join(".atomcode.md"));
+        assert_eq!(lines[2].level, InstructionLevel::User);
+        assert!(lines[2].found);
+        assert!(lines[2].path.ends_with("u.md"));
     }
 
     #[test]

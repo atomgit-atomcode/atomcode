@@ -479,20 +479,56 @@ fn exec_diff(working_dir: &std::path::Path) -> anyhow::Result<CommandResult> {
     Ok(CommandResult::Diff { stat })
 }
 
-fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
-    use atomcode_config::config::instructions::LayeredInstructions;
+fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
+    use atomcode_config::config::instructions::{InstructionLevel, LayeredInstructions};
     use atomcode_config::i18n::{t, Msg};
     let instructions = LayeredInstructions::load(working_dir);
     let mut out = t(Msg::StatusInstructionFilesHeader).into_owned();
-    for (level, path) in instructions.status_lines() {
-        match path {
-            Some(p) => out.push_str(&t(Msg::StatusInstructionPresent {
-                path: &p.display().to_string(),
-                label: level.label(),
-            })),
-            None => out.push_str(&t(Msg::StatusInstructionMissing {
-                label: level.label(),
-            })),
+    for line in instructions.status_lines(working_dir) {
+        let scope = t(match line.level {
+            InstructionLevel::Global => Msg::StatusInstructionScopeGlobal,
+            InstructionLevel::Project => Msg::StatusInstructionScopeProject,
+            InstructionLevel::User => Msg::StatusInstructionScopeUser,
+        });
+        let path = line.path.display().to_string();
+        if line.found {
+            out.push_str(&t(Msg::StatusInstructionPresent {
+                path: &path,
+                label: line.level.label(),
+                scope: &scope,
+            }));
+        } else {
+            out.push_str(&t(Msg::StatusInstructionMissing {
+                path: &path,
+                label: line.level.label(),
+                scope: &scope,
+            }));
+        }
+    }
+    out.push('\n');
+    out.push_str(&t(Msg::StatusMemoryFilesHeader));
+    for (scope_msg, store) in [
+        (
+            Msg::StatusMemoryScopeGlobal,
+            atomcode_config::config::memory::MemoryStore::global(),
+        ),
+        (
+            Msg::StatusMemoryScopeProject,
+            atomcode_config::config::memory::MemoryStore::project(working_dir),
+        ),
+    ] {
+        let scope = t(scope_msg);
+        let path = store.path().display().to_string();
+        if store.path().is_file() {
+            out.push_str(&t(Msg::StatusMemoryPresent {
+                path: &path,
+                scope: &scope,
+            }));
+        } else {
+            out.push_str(&t(Msg::StatusMemoryMissing {
+                path: &path,
+                scope: &scope,
+            }));
         }
     }
     out
@@ -654,7 +690,7 @@ fn exec_status(
         &body,
         &render_codingplan_status_for_status_cmd(),
         &proxy_line,
-        &render_instruction_status_block(working_dir),
+        &render_context_file_status_block(working_dir),
     );
 
     Ok(CommandResult::Status {
@@ -807,6 +843,25 @@ mod tests {
     use atomcode_capabilities::session::PresentationFile;
     use atomcode_capabilities::session::{StorageOwner, TurnStat};
     use atomcode_config::config::memory::MemoryStore;
+
+    #[test]
+    fn context_file_status_shows_instruction_and_memory_paths() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("AGENTS.md"), "project instructions").unwrap();
+        let project_memory = MemoryStore::project(project.path());
+        std::fs::create_dir_all(project_memory.path().parent().unwrap()).unwrap();
+        std::fs::write(project_memory.path(), "- remembered fact\n").unwrap();
+        let status = render_context_file_status_block(project.path());
+        assert!(status.contains(
+            &project
+                .path()
+                .join("AGENTS.md")
+                .display()
+                .to_string()
+        ));
+        assert!(status.contains(&project_memory.path().display().to_string()));
+        assert!(status.contains("(PROJECT)") || status.contains("（PROJECT）"));
+    }
 
     #[test]
     fn snapshot_used_tokens_reads_latest_assistant_meta() {
