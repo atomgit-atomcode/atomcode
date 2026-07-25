@@ -15,8 +15,6 @@ pub mod process_utils;
 // `config` fully lives in the leaf `atomcode-config` crate now; core code (and its
 // tests) use `atomcode_config::config` directly, so the transitional re-export shim
 // is gone.
-pub mod conversation;
-pub mod ctx;
 pub mod graph;
 // `i18n` fully lives in the leaf `atomcode-config` crate now (it only needs
 // `locale::Locale`); re-export it so core's own `crate::i18n::…` uses and any
@@ -26,13 +24,11 @@ pub use atomcode_config::i18n;
 mod fs_atomic;
 pub mod lsp;
 pub mod plugin;
-pub mod provider;
 pub mod proxy;
 pub mod semantic;
 pub mod skill;
 pub mod skill_render;
 pub mod stream;
-pub mod tool;
 pub mod trace;
 pub mod turn;
 
