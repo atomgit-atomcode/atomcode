@@ -1181,11 +1181,36 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let safe_name = scrub_controls(name);
         let safe_detail = scrub_controls(detail);
 
+        // Task/CodeReview are long-running sub-agent fan-outs. Their live row
+        // carries spinner activity (`· thinking…`, elapsed, token count), so
+        // treat the whole transient strip as an activity indicator rather than
+        // a static tool call. Once committed, the normal tool renderer rebuilds
+        // the row in the ordinary ToolName/Secondary palette.
+        let is_subagent_fanout = matches!(
+            safe_name.to_ascii_lowercase().as_str(),
+            "task" | "codereview" | "code_review"
+        );
         let prefix = format!("{} ", icon);
-        let prefix_style = self.tool_bullet_style();
-        let name_style = self.style_bold(Role::ToolName);
-        let detail_style = self.style_for(Role::Secondary);
-        let meta_style = self.style_bold(Role::ToolName);
+        let prefix_style = if is_subagent_fanout {
+            self.style_for(Role::Brand)
+        } else {
+            self.tool_bullet_style()
+        };
+        let name_style = if is_subagent_fanout {
+            self.style_bold(Role::Brand)
+        } else {
+            self.style_bold(Role::ToolName)
+        };
+        let detail_style = if is_subagent_fanout {
+            self.style_for(Role::Brand)
+        } else {
+            self.style_for(Role::Secondary)
+        };
+        let meta_style = if is_subagent_fanout {
+            self.style_bold(Role::Brand)
+        } else {
+            self.style_bold(Role::ToolName)
+        };
 
         let is_bash = safe_name.eq_ignore_ascii_case("bash");
         let mut new_rows = if safe_detail.is_empty() {
@@ -9787,6 +9812,44 @@ mod tests {
             after_first,
             "body_lines grew across spinner ticks — render_inflight_tool \
              must remove previous inflight rows before re-rendering"
+        );
+    }
+
+    #[test]
+    fn retained_inflight_subagent_fanout_uses_brand_activity_style() {
+        let (mut r, _buf) = new_capturing(100, 24);
+        r.render_inflight_tool(
+            "⠋",
+            "Task",
+            "3 subtasks",
+            " · thinking… (57s · ↑ 715 tokens)",
+        );
+
+        let row = r
+            .body_lines
+            .iter()
+            .find(|row| row.iter().map(|cell| cell.ch).collect::<String>().contains("Task"))
+            .expect("live Task row");
+        let brand = r.style_for(Role::Brand).fg;
+        assert!(brand.is_some(), "capturing terminal should enable brand color");
+        assert!(
+            row.iter()
+                .filter(|cell| !cell.ch.is_whitespace())
+                .all(|cell| cell.style.fg == brand),
+            "live Task activity, including detail and spinner metadata, must use brand color"
+        );
+
+        r.render_inflight_tool("⠙", "Read", "src/lib.rs", " (2s)");
+        let ordinary = r
+            .body_lines
+            .iter()
+            .find(|row| row.iter().map(|cell| cell.ch).collect::<String>().contains("Read"))
+            .expect("ordinary live tool row");
+        assert!(
+            ordinary
+                .iter()
+                .any(|cell| !cell.ch.is_whitespace() && cell.style.fg != brand),
+            "ordinary live tools must retain their existing tool palette"
         );
     }
 
