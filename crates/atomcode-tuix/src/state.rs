@@ -1681,6 +1681,14 @@ impl UiState {
         self.phase = UiPhase::Streaming;
     }
 
+    /// Clear the round-cap checkpoint panel and resume streaming.
+    /// Does NOT touch `user_input_panel` / `user_input_batch` — this is
+    /// semantically a round-cap resolution only.
+    pub fn on_round_cap_resolved(&mut self) {
+        self.round_cap_panel = None;
+        self.phase = UiPhase::Streaming;
+    }
+
     pub fn on_suspend(&mut self) {
         self.prior_phase = Some(self.phase);
         self.phase = UiPhase::Suspended;
@@ -2862,5 +2870,25 @@ mod tests {
         assert!(!p.chosen_continue());
         p.move_up();
         assert!(p.chosen_continue());
+    }
+
+    #[test]
+    fn on_round_cap_resolved_clears_panel_and_resumes_streaming() {
+        let mut s = UiState::new();
+        s.round_cap_panel = Some(crate::state::RoundCapPanel::new(9, 200));
+        s.phase = UiPhase::RoundCap;
+        // Verify user_input_panel is untouched — resolving round-cap must
+        // not clobber a concurrent (or future) user-input panel.
+        s.on_round_cap_resolved();
+        assert!(s.round_cap_panel.is_none(), "panel cleared on resolve");
+        assert_eq!(s.phase, UiPhase::Streaming, "phase resumes to Streaming");
+        assert!(
+            s.user_input_panel.is_none(),
+            "user_input_panel was not set and must stay None"
+        );
+        assert!(
+            s.user_input_batch.is_none(),
+            "user_input_batch must not be touched"
+        );
     }
 }
