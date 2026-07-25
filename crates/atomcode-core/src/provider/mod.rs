@@ -788,8 +788,9 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
 /// `ModelArts.81001` `message[3].content[0] has invalid field(s):
 /// text, type` failure pattern that surfaced in production.
 ///
-/// Also used by `vision_preprocessor::maybe_preprocess` to decide
-/// whether the active main provider needs preprocessing (vision-capable
+/// Also mirrored by `atomcode_coding::vision::should_skip` (the kernel-native
+/// VL preprocessing that replaced the retired `core::vision_preprocessor`) to
+/// decide whether the active main provider needs preprocessing (vision-capable
 /// → skip) and by `coding_plan::setup` to auto-pick a VL preprocessor
 /// from the AtomGit model list.
 ///

@@ -35,7 +35,6 @@ pub mod stream;
 pub mod tool;
 pub mod trace;
 pub mod turn;
-pub mod vision_preprocessor;
 
 /// User-Agent identifier for every outbound HTTP request the app makes.
 ///

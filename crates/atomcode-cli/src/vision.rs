@@ -88,7 +88,7 @@ impl ImagePreprocessor for VlImagePreprocessor {
     }
 }
 
-/// Map a `maybe_preprocess` outcome to `(UserInput, notice)`. Pure (no I/O) so
+/// Map a `run_vl_caption` outcome to `(UserInput, notice)`. Pure (no I/O) so
 /// the wrapping/`char_count` logic is unit-testable without a live VL provider.
 ///
 /// `Skipped` (vision model) passes through with images kept; `Replaced`/`Failed`
