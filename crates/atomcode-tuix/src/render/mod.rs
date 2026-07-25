@@ -598,6 +598,9 @@ pub struct StatusLine {
     /// conversations that never used todowrite). Carries raw fields; the
     /// renderer owns glyph/width/terminal-safety (mirrors GoalStatus).
     pub todo: Option<TodoProgress>,
+    /// Active `task` fan-out, rendered as a fixed panel above the input. While
+    /// present it takes the expanded top-panel slot and TodoWrite collapses.
+    pub subtasks: Option<SubtaskProgress>,
     /// When the approval panel is active (user must confirm/deny a tool call),
     /// this carries its current state for the dedicated footer approval panel
     /// (rendered above the todo panel). `None` ⇒ no approval pending, panel
@@ -746,6 +749,37 @@ pub struct TodoProgress {
     /// todo panel. `current`/`completed`/`in_progress`/`total` are retained as
     /// pre-computed conveniences for the header + hide-when-all-done filter.
     pub items: Vec<(atomcode_capabilities::tools::todo::TodoStatus, String)>,
+}
+
+/// Fixed footer projection for one in-flight `task` fan-out. This is a TUI
+/// presentation type: the kernel continues to expose generic tool-progress
+/// strings, while the event loop folds the known Task contract into these
+/// stable child rows.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SubtaskProgress {
+    /// Parent tool call whose terminal event owns removal of this panel.
+    pub call_id: String,
+    pub completed: usize,
+    pub total: usize,
+    pub items: Vec<SubtaskItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtaskItem {
+    pub label: String,
+    pub description: String,
+    pub model: String,
+    pub activity: String,
+    pub status: SubtaskStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubtaskStatus {
+    #[default]
+    Pending,
+    Running,
+    Completed,
+    Failed,
 }
 
 /// Live status of an active autonomous `/goal` loop, rendered on the dedicated

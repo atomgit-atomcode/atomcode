@@ -14801,6 +14801,233 @@ fn ephemeral_tool_activity<'a>(tool_display: Option<&str>, chunk: &'a str) -> Op
     supported.then_some(activity)
 }
 
+fn subtask_progress_from_args(
+    call_id: &str,
+    arguments: &str,
+) -> Option<crate::render::SubtaskProgress> {
+    let repaired =
+        atomcode_capabilities::tools::repair::repair_tool_args("task", arguments);
+    let value: serde_json::Value = serde_json::from_str(&repaired).ok()?;
+    let tasks = value.get("tasks")?.as_array()?;
+    if tasks.is_empty() {
+        return None;
+    }
+    let items = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| {
+            let kind = task
+                .get("subagent_type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("explore");
+            let description = task
+                .get("description")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            crate::render::SubtaskItem {
+                label: format!("{kind}#{}", index + 1),
+                description,
+                model: String::new(),
+                activity: String::new(),
+                status: crate::render::SubtaskStatus::Pending,
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(crate::render::SubtaskProgress {
+        call_id: call_id.to_string(),
+        completed: 0,
+        total: items.len(),
+        items,
+    })
+}
+
+fn should_defer_task_approval_row(
+    tool_name: &str,
+    call_id: &str,
+    arguments: &str,
+    is_plain_renderer: bool,
+) -> bool {
+    tool_name == "task"
+        && !is_plain_renderer
+        && subtask_progress_from_args(call_id, arguments).is_some()
+}
+
+fn update_subtask_progress(progress: &mut crate::render::SubtaskProgress, chunk: &str) {
+    use crate::render::SubtaskStatus;
+
+    let chunk = chunk
+        .strip_prefix(atomcode_capabilities::tools::task::SUBAGENT_ACTIVITY_MARKER)
+        .unwrap_or(chunk);
+    let parts = chunk.split(" \u{b7} ").collect::<Vec<_>>();
+    let (label, model, activity, status) = if let Some(label) =
+        parts.first().and_then(|part| part.strip_prefix("\u{21bb} "))
+    {
+        (
+            label,
+            parts.get(1).copied(),
+            Some("running"),
+            SubtaskStatus::Running,
+        )
+    } else if parts.first().is_some_and(|part| *part == "\u{2713} done") {
+        (
+            parts.get(1).copied().unwrap_or_default(),
+            parts.get(2).copied(),
+            Some("completed"),
+            SubtaskStatus::Completed,
+        )
+    } else if parts
+        .first()
+        .is_some_and(|part| part.starts_with("\u{2717} failed"))
+    {
+        (
+            parts.get(1).copied().unwrap_or_default(),
+            parts.get(2).copied(),
+            parts.first().copied(),
+            SubtaskStatus::Failed,
+        )
+    } else {
+        (
+            parts.first().copied().unwrap_or_default(),
+            None,
+            parts.get(1).copied(),
+            SubtaskStatus::Running,
+        )
+    };
+
+    let Some(item) = progress.items.iter_mut().find(|item| item.label == label) else {
+        return;
+    };
+    item.status = status;
+    if let Some(model) = model.filter(|model| !model.is_empty()) {
+        item.model = model.to_string();
+    }
+    if let Some(activity) = activity.filter(|activity| !activity.is_empty()) {
+        item.activity = activity.to_string();
+    }
+    progress.completed = progress
+        .items
+        .iter()
+        .filter(|item| item.status == SubtaskStatus::Completed)
+        .count();
+}
+
+fn completed_task_detail(
+    detail: &str,
+    output: &str,
+    duration: std::time::Duration,
+) -> String {
+    let terminal = if output.contains("state=\"failed\"") {
+        "finished"
+    } else {
+        "completed"
+    };
+    let elapsed = crate::render::fmt_dur(duration);
+    if detail.is_empty() {
+        format!("{terminal} \u{b7} {elapsed}")
+    } else {
+        format!("{detail} {terminal} \u{b7} {elapsed}")
+    }
+}
+
+#[cfg(test)]
+mod subtask_progress_projection_tests {
+    use super::{
+        completed_task_detail, should_defer_task_approval_row, subtask_progress_from_args,
+        update_subtask_progress,
+    };
+    use crate::render::SubtaskStatus;
+
+    #[test]
+    fn task_arguments_seed_stable_child_rows() {
+        let args = r#"{"tasks":[
+            {"subagent_type":"explore","description":"inspect atomcode"},
+            {"subagent_type":"worker","description":"fix codex","scope":["src/**"]}
+        ]}"#;
+        let progress = subtask_progress_from_args("call-7", args).expect("valid Task panel");
+
+        assert_eq!(progress.call_id, "call-7");
+        assert_eq!(progress.total, 2);
+        assert_eq!(progress.items[0].label, "explore#1");
+        assert_eq!(progress.items[0].description, "inspect atomcode");
+        assert_eq!(progress.items[1].label, "worker#2");
+        assert_eq!(progress.items[1].status, SubtaskStatus::Pending);
+    }
+
+    #[test]
+    fn task_projection_repairs_unescaped_newlines_like_the_tool() {
+        let args = "{\"tasks\":[{\"subagent_type\":\"explore\",\"description\":\"inspect\ncode\",\"prompt\":\"p\"}]}";
+        let progress = subtask_progress_from_args("call-7", args).expect("repairable Task panel");
+
+        assert_eq!(progress.items[0].description, "inspect\ncode");
+    }
+
+    #[test]
+    fn approval_defers_only_structured_retained_task_rows() {
+        let args = r#"{"tasks":[{"subagent_type":"worker","description":"edit","prompt":"p","scope":["src/**"]}]}"#;
+
+        assert!(should_defer_task_approval_row("task", "call-7", args, false));
+        assert!(!should_defer_task_approval_row("task", "call-7", args, true));
+        assert!(!should_defer_task_approval_row("bash", "call-7", args, false));
+        assert!(!should_defer_task_approval_row(
+            "task",
+            "call-7",
+            "{invalid",
+            false
+        ));
+    }
+
+    #[test]
+    fn task_progress_updates_one_child_in_place() {
+        let args = r#"{"tasks":[
+            {"subagent_type":"explore","description":"inspect atomcode"},
+            {"subagent_type":"explore","description":"inspect codex"}
+        ]}"#;
+        let mut progress = subtask_progress_from_args("call-7", args).unwrap();
+
+        update_subtask_progress(
+            &mut progress,
+            "\u{21bb} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
+        );
+        assert_eq!(progress.items[0].status, SubtaskStatus::Running);
+        assert_eq!(progress.items[0].model, "deepseek-v4-flash");
+        assert_eq!(progress.items[1].status, SubtaskStatus::Pending);
+
+        update_subtask_progress(
+            &mut progress,
+            "\u{1e}explore#1 \u{b7} reading files",
+        );
+        assert_eq!(progress.items[0].activity, "reading files");
+
+        update_subtask_progress(
+            &mut progress,
+            "\u{2713} done \u{b7} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
+        );
+        assert_eq!(progress.items[0].status, SubtaskStatus::Completed);
+        assert_eq!(progress.completed, 1);
+    }
+
+    #[test]
+    fn completed_task_keeps_one_compact_permanent_summary() {
+        assert_eq!(
+            completed_task_detail(
+                "3 subtasks",
+                r#"<task state="completed">ok</task>"#,
+                std::time::Duration::from_secs(42),
+            ),
+            "3 subtasks completed \u{b7} 42.0s"
+        );
+        assert_eq!(
+            completed_task_detail(
+                "3 subtasks",
+                r#"<task state="failed">no</task>"#,
+                std::time::Duration::from_secs(2),
+            ),
+            "3 subtasks finished \u{b7} 2.0s"
+        );
+    }
+}
+
 fn is_incomplete_review_result(name: &str, output: &str, success: bool) -> bool {
     !success && name == "code_review" && output.starts_with("Code review incomplete")
 }
@@ -16510,6 +16737,7 @@ fn commit_native_session_changed(
     state.on_turn_complete();
     state.on_session_replaced();
     state.active_todos = None;
+    state.active_subtasks = None;
     sync_todo_titles(state);
     state.approval_panel = None;
     commands::bind_telemetry_to_session(ctx, &session);
@@ -17297,6 +17525,20 @@ fn handle_agent_event(
                 sync_todo_titles(state); // titles follow the new plan (id = position)
             }
 
+            // Task fan-out owns a fixed footer panel while it runs. Seed the
+            // stable child rows from the call arguments before any batch /
+            // approval early return; live ToolProgress events update this
+            // projection in place and never enter transcript scrollback.
+            let task_panel = if name == "task" && !ctx.is_plain_renderer {
+                subtask_progress_from_args(&id, &arguments)
+            } else {
+                None
+            };
+            if let Some(progress) = task_panel.as_ref() {
+                state.active_subtasks = Some(progress.clone());
+                state.subagent_activity = None;
+            }
+
             // If this call is part of an active batch, the
             // ToolBatchStarted handler already rendered the group header
             // + child rows — skip the standalone ▸ ToolCallInFlight
@@ -17337,6 +17579,16 @@ fn handle_agent_event(
                 return;
             }
 
+            // A valid Task call is represented solely by the fixed Subtasks
+            // panel until its terminal event. Keep the call metadata so the
+            // result handler can append one compact permanent `Task(...)` row,
+            // but do not create an animated body tool row or generic spinner.
+            if task_panel.is_some() {
+                pending_tools.insert(id, (display.clone(), detail, false));
+                state.on_tool_call_started(&display);
+                return;
+            }
+
             // Emit the ▸ line immediately so users can see what command
             // is running, especially for long-running bash commands.
             renderer.render(UiLine::AssistantLineBreak);
@@ -17366,6 +17618,18 @@ fn handle_agent_event(
         }
         AgentEvent::ToolOutputChunk { call_id, chunk } => {
             let tool_display = pending_tools.get(&call_id).map(|(d, ..)| d.as_str());
+            if state
+                .active_subtasks
+                .as_ref()
+                .is_some_and(|progress| progress.call_id == call_id)
+            {
+                if let Some(progress) = state.active_subtasks.as_mut() {
+                    update_subtask_progress(progress, &chunk);
+                }
+                state.subagent_activity = None;
+                renderer.flush();
+                return;
+            }
             // Marker-prefixed child activity is EPHEMERAL: latest wins in the footer spinner,
             // never append it to scrollback. Scope the convention to known sub-agent tools so
             // an unrelated command that emits U+001E cannot hijack the UI.
@@ -17389,7 +17653,7 @@ fn handle_agent_event(
             name,
             output,
             success,
-            ..
+            duration,
         } => {
             // A result for this call arrived while an approval prompt is still up ⇒ the
             // approval was resolved WITHOUT the user answering (headless timeout fail-close,
@@ -17401,6 +17665,13 @@ fn handle_agent_event(
             // agent keeps working the rest of the turn.
             if name == "task" || name == "code_review" {
                 state.subagent_activity = None;
+                if state
+                    .active_subtasks
+                    .as_ref()
+                    .is_some_and(|progress| progress.call_id == call_id)
+                {
+                    state.active_subtasks = None;
+                }
             }
             // Title cache (id → content, for `todo update #N` row names) is maintained by
             // `sync_todo_titles` from `active_todos` at every panel mutation. This legacy parse
@@ -17493,9 +17764,12 @@ fn handle_agent_event(
             // Prefer the display-name we stored at ToolCallStarted time;
             // fall back to converting the raw name if we missed the Start
             // (e.g. protocol surfaced a Result without a matching Start).
-            let (display_name, detail, call_rendered) = pending_tools
+            let (display_name, mut detail, call_rendered) = pending_tools
                 .remove(&call_id)
                 .unwrap_or_else(|| (display_tool_name(&name), String::new(), false));
+            if name == "task" && output.contains("<task ") && !call_rendered {
+                detail = completed_task_detail(&detail, &output, duration);
+            }
 
             // Filter empty tool names (model occasionally emits malformed
             // tool calls with "" as the name; agent surfaces the error via
@@ -17530,7 +17804,9 @@ fn handle_agent_event(
 
             // Only emit the tool-call line here if ApprovalNeeded didn't
             // already render it — otherwise we'd print it twice.
-            if !call_rendered && !suppress_body_echo {
+            if !call_rendered
+                && (!suppress_body_echo || (name == "task" && output.contains("<task ")))
+            {
                 renderer.render(UiLine::ToolCall {
                     name: safe_name.clone(),
                     detail: detail.clone(),
@@ -17670,11 +17946,25 @@ fn handle_agent_event(
                 .get(&call.id)
                 .map(|(_, det, _)| det.clone())
                 .unwrap_or_else(|| format_tool_detail(&tool_name, &call.arguments));
+            let defer_task_row = should_defer_task_approval_row(
+                &tool_name,
+                &call.id,
+                &call.arguments,
+                ctx.is_plain_renderer,
+            );
 
             // Check if ToolCallStarted already rendered this tool call as a
             // dynamic ToolCallInFlight spinner. If so, we need to freeze it
             // to a static `▸` row before showing the approval prompt.
-            if let Some(entry) = pending_tools.get_mut(&call.id) {
+            if defer_task_row {
+                // The approval panel already names the Task being approved.
+                // Keep its transcript row deferred so ToolCallResult can append
+                // exactly one permanent `Task(... completed · duration)` row.
+                pending_tools.insert(
+                    call.id.clone(),
+                    (display.clone(), detail.clone(), false),
+                );
+            } else if let Some(entry) = pending_tools.get_mut(&call.id) {
                 let (disp, det, rendered) = entry;
                 if *rendered {
                     // ToolCallInFlight is animating — commit it to a static row
@@ -19344,6 +19634,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         goal,
         loop_status,
         todo,
+        subtasks: state.active_subtasks.clone(),
         approval,
         user_input,
         round_cap_panel: state

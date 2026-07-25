@@ -738,12 +738,12 @@ pub struct UiState {
     /// spinner). If so, completion restores Idle; an auto-compaction runs
     /// mid-turn and leaves the phase to the turn's own lifecycle.
     pub compaction_forced_streaming: bool,
-    /// Latest live activity of a running `task` subagent fan-out (e.g.
-    /// `explore#4 · grep unwrap`), set from marker-prefixed progress chunks and
-    /// spliced into the spinner label in-place so a multi-minute fan-out isn't a
-    /// silent `Pondering…`. `None` when no subtask activity is current; cleared
-    /// when the `task` tool finishes and at every authoritative turn terminal.
+    /// Legacy single-row projection retained for compatibility with older
+    /// progress producers. New Task fan-outs use `active_subtasks`.
     pub subagent_activity: Option<String>,
+    /// Structured, fixed-footer projection of the currently-running Task
+    /// fan-out. Owned by the TUI driver and keyed by the parent tool call id.
+    pub active_subtasks: Option<crate::render::SubtaskProgress>,
     /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
     /// When false, `tick_spinner` and the spinner-label ellipsis fall
     /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
@@ -1095,6 +1095,7 @@ impl UiState {
             compacting: false,
             compaction_forced_streaming: false,
             subagent_activity: None,
+            active_subtasks: None,
             unicode_symbols,
             colors,
             total_tokens: 0,
@@ -1435,6 +1436,7 @@ impl UiState {
         // Same discipline for the subagent fan-out activity: no turn-end path may
         // leave a stale `explore#4 · …` pinned onto the next turn's spinner.
         self.subagent_activity = None;
+        self.active_subtasks = None;
         // Safety clear: if a turn ends without resolving an approval (e.g. error
         // path or session switch), ensure the panel is not left stale.
         self.approval_panel = None;
@@ -1462,6 +1464,7 @@ impl UiState {
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
+        self.active_subtasks = None;
         self.approval_panel = None;
         self.user_input_panel = None;
         self.user_input_batch = None;
@@ -1485,6 +1488,8 @@ impl UiState {
     pub fn on_session_replaced(&mut self) {
         self.footer_command_output = None;
         self.footer_usage = None;
+        self.subagent_activity = None;
+        self.active_subtasks = None;
     }
 
     /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting
@@ -2157,6 +2162,26 @@ mod tests {
             assert!(
                 s.footer_command_output.is_some(),
                 "but the rendered report text stays until Esc"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_terminal_clears_transient_subtask_panel() {
+        for terminal in [UiState::on_turn_complete, UiState::on_turn_cancelled] {
+            let mut state = UiState::new();
+            state.active_subtasks = Some(crate::render::SubtaskProgress {
+                call_id: "call-task".into(),
+                completed: 0,
+                total: 1,
+                items: vec![],
+            });
+
+            terminal(&mut state);
+
+            assert!(
+                state.active_subtasks.is_none(),
+                "a Task panel must never survive its owning turn"
             );
         }
     }

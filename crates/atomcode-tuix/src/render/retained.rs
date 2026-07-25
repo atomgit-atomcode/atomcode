@@ -214,6 +214,7 @@ fn format_loop_row(
 /// list fits within the budget it renders every item; otherwise it folds (see
 /// `todo_panel_rows`). No blank padding — a short list shows short.
 const MAX_TODO_PANEL_ROWS: usize = 7;
+const MAX_SUBTASK_PANEL_ROWS: usize = 6;
 
 /// One logical row of the collapsed todo panel. Pure structure — glyphs,
 /// i18n words, styling and width-fitting are applied in `build_todo_rows`.
@@ -2462,6 +2463,211 @@ impl<W: Write + Send> RetainedRenderer<W> {
         .len()
     }
 
+    fn subtask_panel_cap(&self) -> usize {
+        let h = self.screen.height() as usize;
+        let hide_input_box = self.menu.as_ref().is_some_and(|menu| {
+            matches!(
+                menu.kind,
+                super::MenuKind::Plugin
+                    | super::MenuKind::Marketplace
+                    | super::MenuKind::PluginInfo
+                    | super::MenuKind::SessionList
+            )
+        });
+        let status_rows = usize::from(
+            !self.status.model.is_empty()
+                || !self.status.cwd.is_empty()
+                || self.status.hint.is_some(),
+        );
+        let goal_rows =
+            usize::from(self.status.goal.is_some() || self.status.loop_status.is_some());
+        let input_chrome = if hide_input_box {
+            1 // shared top rule
+        } else {
+            3 + status_rows // top rule + one input row + bottom rule + status
+        };
+        let reserved = 1 // keep at least one body row visible
+            + input_chrome
+            + self.input_attachments.len()
+            + self.max_menu_rows(h, 0)
+            + goal_rows
+            + self.build_command_output_rows().len();
+        MAX_SUBTASK_PANEL_ROWS.min(h.saturating_sub(reserved))
+    }
+
+    fn subtask_panel_row_count(&self, subtasks: &crate::render::SubtaskProgress) -> usize {
+        let cap = self.subtask_panel_cap();
+        if cap == 0 {
+            return 0;
+        }
+        let fixed = if cap >= 2 { 2 } else { 1 }; // optional spacer + header
+        fixed + subtasks.items.len().min(cap.saturating_sub(fixed))
+    }
+
+    /// Build the fixed Task fan-out panel. It is intentionally compact: one
+    /// header and one row per visible child, with a common model promoted into
+    /// the header. Child activity replaces in place through StatusLine updates;
+    /// none of these rows enter body_log or native scrollback.
+    fn build_subtask_rows(
+        &self,
+        subtasks: &crate::render::SubtaskProgress,
+        rule_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        use crate::render::SubtaskStatus;
+
+        let cap = self.subtask_panel_cap();
+        if cap == 0 {
+            return Vec::new();
+        }
+        let mut rows = Vec::new();
+        if cap >= 2 {
+            rows.push(Vec::new());
+        }
+
+        let common_model = subtasks
+            .items
+            .iter()
+            .map(|item| item.model.as_str())
+            .filter(|model| !model.is_empty())
+            .reduce(|left, right| if left == right { left } else { "" })
+            .filter(|model| !model.is_empty());
+        let bold = CellStyle {
+            bold: true,
+            ..CellStyle::default()
+        };
+        let detail = self.style_for(Role::Secondary);
+        let mut header = Vec::new();
+        let marker = if self.caps.unicode_symbols {
+            "\u{25cf}"
+        } else {
+            "*"
+        };
+        push_str_cells(&mut header, marker, &self.style_for(Role::Brand));
+        push_str_cells(&mut header, " Subtasks ", &bold);
+        push_str_cells(
+            &mut header,
+            &format!("{}/{} completed", subtasks.completed, subtasks.total),
+            &detail,
+        );
+        if let Some(model) = common_model {
+            push_str_cells(&mut header, &format!(" \u{b7} {model}"), &detail);
+        }
+        rows.push(header);
+
+        let mut ordered = subtasks.items.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|item| match item.status {
+            SubtaskStatus::Failed => 0,
+            SubtaskStatus::Running => 1,
+            SubtaskStatus::Pending => 2,
+            SubtaskStatus::Completed => 3,
+        });
+        let budget = cap.saturating_sub(rows.len());
+        let has_hidden = ordered.len() > budget;
+        let visible_items = if has_hidden {
+            budget.saturating_sub(1)
+        } else {
+            budget
+        };
+        for item in ordered.iter().take(visible_items).copied() {
+            let (glyph, glyph_style, body_style) = match item.status {
+                SubtaskStatus::Pending => {
+                    let style = self.style_for(Role::Secondary);
+                    ("\u{25cb}", style.clone(), style)
+                }
+                SubtaskStatus::Running => (
+                    "\u{25d0}",
+                    self.style_for(Role::Brand),
+                    CellStyle {
+                        bold: true,
+                        ..CellStyle::default()
+                    },
+                ),
+                SubtaskStatus::Completed => {
+                    let style = CellStyle {
+                        faint: true,
+                        ..self.style_for(Role::Muted)
+                    };
+                    ("\u{2713}", style.clone(), style)
+                }
+                SubtaskStatus::Failed => (
+                    "\u{2717}",
+                    self.style_for(Role::Error),
+                    CellStyle::default(),
+                ),
+            };
+            let glyph = if self.caps.unicode_symbols {
+                glyph
+            } else {
+                match item.status {
+                    SubtaskStatus::Pending => "[ ]",
+                    SubtaskStatus::Running => "[>]",
+                    SubtaskStatus::Completed => "[x]",
+                    SubtaskStatus::Failed => "[!]",
+                }
+            };
+            let mut suffix = if item.description.is_empty() {
+                item.label.clone()
+            } else {
+                format!("{} \u{b7} {}", item.label, item.description)
+            };
+            if !item.activity.is_empty() && item.status != SubtaskStatus::Completed {
+                suffix.push_str(&format!(" \u{b7} {}", item.activity));
+            }
+            if common_model.is_none() && !item.model.is_empty() {
+                suffix.push_str(&format!(" \u{b7} {}", item.model));
+            }
+            let glyph_width = crate::width::display_width(glyph);
+            let fitted = crate::width::truncate_with_ellipsis(
+                &scrub_controls(&suffix),
+                rule_width.saturating_sub(2 + glyph_width + 1),
+            );
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", &CellStyle::default());
+            push_str_cells(&mut row, glyph, &glyph_style);
+            push_str_cells(&mut row, " ", &CellStyle::default());
+            push_str_cells(&mut row, &fitted, &body_style);
+            rows.push(row);
+        }
+        if has_hidden && budget > 0 {
+            let hidden = &ordered[visible_items..];
+            let count = |status| {
+                hidden
+                    .iter()
+                    .filter(|item| item.status == status)
+                    .count()
+            };
+            let mut parts = Vec::new();
+            for (status, label) in [
+                (SubtaskStatus::Failed, "failed"),
+                (SubtaskStatus::Running, "running"),
+                (SubtaskStatus::Pending, "pending"),
+                (SubtaskStatus::Completed, "completed"),
+            ] {
+                let n = count(status);
+                if n > 0 {
+                    parts.push(format!("{n} {label}"));
+                }
+            }
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", &CellStyle::default());
+            push_str_cells(
+                &mut row,
+                &format!(
+                    "{} {}",
+                    if self.caps.unicode_symbols {
+                        "\u{2026}"
+                    } else {
+                        "..."
+                    },
+                    parts.join(" \u{b7} ")
+                ),
+                &self.style_for(Role::Muted),
+            );
+            rows.push(row);
+        }
+        rows
+    }
+
     /// Build the multi-line todo panel: a header row (`Tasks (N done, M open)`)
     /// followed by collapsed rows — `✔ N done` fold, then `☐ #k content` items
     /// (in-progress bold, pending muted), then a `+N more…` fold. Pinned at the top
@@ -3503,20 +3709,31 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             0
         };
-        // Dedicated todo row: one full-width line above the status row (and above
-        // the goal/loop row when present), shown while a todo list is active.
-        let todo_rows = self
-            .status
-            .todo
-            .as_ref()
-            .map(|t| self.todo_panel_row_count(t))
-            .unwrap_or(0);
+        // Modal input always wins the scarce interactive footer area. While a
+        // Task fan-out is active it owns the expanded top-panel slot and the
+        // standing TodoWrite panel collapses completely until Task finishes.
+        let approval_rows = self.modal_panel_rows();
+        let subtask_rows = if approval_rows == 0 {
+            self.status
+                .subtasks
+                .as_ref()
+                .map(|progress| self.subtask_panel_row_count(progress))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let todo_rows = if self.status.subtasks.is_none() {
+            self.status
+                .todo
+                .as_ref()
+                .map(|t| self.todo_panel_row_count(t))
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let pending_message_cells = self.build_pending_message_rows();
         let pending_message_rows = pending_message_cells.len();
-        let top_panel_rows = pending_message_rows + todo_rows;
-        // Modal panel (approval OR request_user_input): sits above the todo
-        // panel (top of footer block) and replaces the input box.
-        let approval_rows = self.modal_panel_rows();
+        let top_panel_rows = pending_message_rows + subtask_rows + todo_rows;
         // Cap the input-box height so a long paste / typed text can't grow the
         // footer past the screen (overflow). The full text stays in input_buf;
         // we render a scrolling window that keeps the cursor row visible. The
@@ -3618,8 +3835,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let todo_cells: Vec<Vec<Cell>> = status_clone
             .todo
             .as_ref()
+            .filter(|_| status_clone.subtasks.is_none())
             .map(|t| self.build_todo_rows(t, rule_width))
             .unwrap_or_default();
+        let subtask_cells: Vec<Vec<Cell>> = if approval_rows == 0 {
+            status_clone
+                .subtasks
+                .as_ref()
+                .map(|progress| self.build_subtask_rows(progress, rule_width))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         // Modal panel cells: approval OR user_input OR round_cap_panel (mutually
         // exclusive; approval wins, then user_input, then round_cap_panel).
         // Drawn in the shared `approval_active` slot below.
@@ -3947,6 +4174,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.screen.draw_row(pending_top + i, 0, &padded);
         }
         let todo_top = pending_top + pending_message_rows;
+        for (i, row) in subtask_cells.into_iter().enumerate() {
+            let mut padded = row;
+            Self::pad_row_to_width(&mut padded, w, CellStyle::default());
+            self.screen.draw_row(todo_top + i, 0, &padded);
+        }
+        let todo_top = todo_top + subtask_rows;
         for (i, tr) in todo_cells.into_iter().enumerate() {
             let mut padded = tr;
             Self::pad_row_to_width(&mut padded, w, CellStyle::default());
@@ -4239,15 +4472,27 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             0
         };
-        let todo_rows = self
-            .status
-            .todo
-            .as_ref()
-            .map(|t| self.todo_panel_row_count(t))
-            .unwrap_or(0);
-        let pending_message_rows = self.build_pending_message_rows().len();
-        let top_panel_rows = pending_message_rows + todo_rows;
         let approval_rows = self.modal_panel_rows();
+        let subtask_rows = if approval_rows == 0 {
+            self.status
+                .subtasks
+                .as_ref()
+                .map(|progress| self.subtask_panel_row_count(progress))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let todo_rows = if self.status.subtasks.is_none() {
+            self.status
+                .todo
+                .as_ref()
+                .map(|t| self.todo_panel_row_count(t))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let pending_message_rows = self.build_pending_message_rows().len();
+        let top_panel_rows = pending_message_rows + subtask_rows + todo_rows;
         let attachment_rows = self.input_attachments.len();
         let command_output_rows = self.build_command_output_rows().len();
         // Cap the input height (mirrors paint_footer) so a long paste / typed
@@ -4323,12 +4568,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
         );
         let goal_rows =
             usize::from(self.status.goal.is_some() || self.status.loop_status.is_some());
-        let todo_rows = self
-            .status
-            .todo
-            .as_ref()
-            .map(|todo| self.todo_panel_row_count(todo))
-            .unwrap_or(0);
+        let modal_rows = self.modal_panel_rows();
+        let subtask_rows = if modal_rows == 0 {
+            self.status
+                .subtasks
+                .as_ref()
+                .map(|progress| self.subtask_panel_row_count(progress))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let todo_rows = if self.status.subtasks.is_none() {
+            self.status
+                .todo
+                .as_ref()
+                .map(|todo| self.todo_panel_row_count(todo))
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let reserved_rows = 1 // input top rule
             + 1 // at least one input row
             + 1 // input bottom rule
@@ -4337,8 +4595,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             + self.max_menu_rows(h, 0)
             + status_rows
             + goal_rows
+            + subtask_rows
             + todo_rows
-            + self.modal_panel_rows()
+            + modal_rows
             + self.build_command_output_rows().len();
         let available_rows = h.saturating_sub(reserved_rows);
         // A title and at least one preview are the minimum useful panel. On an
@@ -6263,6 +6522,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.menu = menu;
                 self.status = status;
                 self.input_attachments = attachments;
+                // A Task fan-out has its own fixed footer liveness panel. Do
+                // not also paint the generic thinking/tool spinner into the
+                // transcript body: competing child updates made that row flash,
+                // and the duplicate activity added no information.
+                if self.status.subtasks.is_some() && self.inflight_tool.is_none() {
+                    self.clear_live_spinner();
+                    self.dirty = true;
+                    return;
+                }
                 // Spinner (frame + label) goes into body as a live
                 // paragraph header. Each tick replaces the previous
                 // wrapped rows via render_inflight_tool so long
@@ -8335,6 +8603,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            subtasks: None,
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
@@ -8692,6 +8961,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            subtasks: None,
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
@@ -8745,6 +9015,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            subtasks: None,
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
@@ -8817,6 +9088,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            subtasks: None,
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
@@ -8865,6 +9137,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            subtasks: None,
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
@@ -8917,6 +9190,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            subtasks: None,
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
@@ -8969,6 +9243,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            subtasks: None,
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
@@ -9005,6 +9280,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            subtasks: None,
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
@@ -14190,6 +14466,276 @@ mod tests {
     }
 
     #[test]
+    fn subtask_panel_renders_fixed_compact_rows_and_hides_todo_panel() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, buf) = new_capturing(100, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(100, 24);
+        let mut status = status_basic();
+        status.todo = Some(crate::render::TodoProgress {
+            current: Some("standing todo".into()),
+            completed: 0,
+            in_progress: 1,
+            total: 1,
+            items: vec![(
+                atomcode_capabilities::tools::todo::TodoStatus::InProgress,
+                "standing todo".into(),
+            )],
+        });
+        status.subtasks = Some(SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 1,
+            total: 3,
+            items: vec![
+                SubtaskItem {
+                    label: "explore#1".into(),
+                    description: "inspect atomcode".into(),
+                    model: "deepseek-v4-flash".into(),
+                    activity: "completed".into(),
+                    status: SubtaskStatus::Completed,
+                },
+                SubtaskItem {
+                    label: "explore#2".into(),
+                    description: "inspect codex".into(),
+                    model: "deepseek-v4-flash".into(),
+                    activity: "reading files".into(),
+                    status: SubtaskStatus::Running,
+                },
+                SubtaskItem {
+                    label: "explore#3".into(),
+                    description: "inspect opencode".into(),
+                    model: "deepseek-v4-flash".into(),
+                    activity: "thinking".into(),
+                    status: SubtaskStatus::Running,
+                },
+            ],
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: vec![],
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let grid = vterm.dump();
+        assert!(grid.contains("Subtasks 1/3 completed"));
+        assert!(grid.contains("explore#2"));
+        assert!(grid.contains("reading files"));
+        assert!(!grid.contains("standing todo"));
+        assert_eq!(
+            r.current_footer_rows(),
+            r.last_painted_footer_rows,
+            "subtask footer height math must mirror the painted rows"
+        );
+    }
+
+    #[test]
+    fn subtask_panel_prioritizes_live_rows_and_truthfully_aggregates_hidden_rows() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, buf) = new_capturing(100, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(100, 24);
+        let mut status = status_basic();
+        let item = |label: &str, state| SubtaskItem {
+            label: label.into(),
+            description: format!("inspect {label}"),
+            model: "deepseek-v4-flash".into(),
+            activity: String::new(),
+            status: state,
+        };
+        status.subtasks = Some(SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 4,
+            total: 8,
+            items: vec![
+                item("done#1", SubtaskStatus::Completed),
+                item("done#2", SubtaskStatus::Completed),
+                item("done#3", SubtaskStatus::Completed),
+                item("done#4", SubtaskStatus::Completed),
+                item("pending#1", SubtaskStatus::Pending),
+                item("pending#2", SubtaskStatus::Pending),
+                item("running#1", SubtaskStatus::Running),
+                item("failed#1", SubtaskStatus::Failed),
+            ],
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: vec![],
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let grid = vterm.dump();
+        assert!(grid.contains("failed#1"));
+        assert!(grid.contains("running#1"));
+        assert!(grid.contains("1 pending · 4 completed"));
+        assert!(!grid.contains("more running"));
+    }
+
+    #[test]
+    fn subtask_panel_respects_short_screen_footer_budget() {
+        use crate::render::{GoalStatus, SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, buf) = new_capturing(80, 8);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 8);
+        let mut status = status_basic();
+        status.goal = Some(GoalStatus {
+            condition: "finish the audit".into(),
+            round: 2,
+            elapsed_secs: 12,
+        });
+        status.subtasks = Some(SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 0,
+            total: 3,
+            items: (1..=3)
+                .map(|n| SubtaskItem {
+                    label: format!("explore#{n}"),
+                    description: format!("inspect area {n}"),
+                    model: "deepseek-v4-flash".into(),
+                    activity: "thinking".into(),
+                    status: SubtaskStatus::Running,
+                })
+                .collect(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: vec![],
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(
+            r.current_footer_rows() <= 8,
+            "footer must fit the physical screen"
+        );
+        assert_eq!(r.current_footer_rows(), r.last_painted_footer_rows);
+        assert!(vterm.dump().contains("Subtasks 0/3 completed"));
+    }
+
+    #[test]
+    fn subtask_panel_uses_zero_rows_when_no_footer_budget_remains() {
+        use crate::render::{GoalStatus, SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, _buf) = new_capturing(80, 5);
+        let mut status = status_basic();
+        status.goal = Some(GoalStatus {
+            condition: "finish".into(),
+            round: 1,
+            elapsed_secs: 1,
+        });
+        status.subtasks = Some(SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 0,
+            total: 1,
+            items: vec![SubtaskItem {
+                label: "explore#1".into(),
+                description: "inspect".into(),
+                model: "deepseek-v4-flash".into(),
+                activity: "thinking".into(),
+                status: SubtaskStatus::Running,
+            }],
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: vec![],
+        });
+        r.flush_deferred();
+
+        assert!(r.current_footer_rows() <= 5);
+        assert_eq!(r.current_footer_rows(), r.last_painted_footer_rows);
+    }
+
+    #[test]
+    fn subtask_panel_replaces_generic_body_spinner() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, buf) = new_capturing(100, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(100, 24);
+        let mut status = status_basic();
+        status.subtasks = Some(SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 0,
+            total: 1,
+            items: vec![SubtaskItem {
+                label: "explore#1".into(),
+                description: "inspect atomcode".into(),
+                model: "deepseek-v4-flash".into(),
+                activity: "thinking".into(),
+                status: SubtaskStatus::Running,
+            }],
+        });
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "\u{25d0}".into(),
+            label: "Thinking\u{2026} (2s)".into(),
+            status,
+            menu: None,
+            attachments: vec![],
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let grid = vterm.dump();
+        assert!(grid.contains("Subtasks 0/1 completed"));
+        assert!(!grid.contains("Thinking"));
+        assert!(!r.live_spinner_active);
+    }
+
+    #[test]
+    fn approval_panel_temporarily_hides_subtask_panel() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, buf) = new_capturing(100, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(100, 24);
+        let mut status = status_basic();
+        status.subtasks = Some(SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 0,
+            total: 1,
+            items: vec![SubtaskItem {
+                label: "worker#1".into(),
+                description: "edit scoped files".into(),
+                model: "deepseek-v4-flash".into(),
+                activity: "waiting".into(),
+                status: SubtaskStatus::Running,
+            }],
+        });
+        status.approval = Some(crate::render::ApprovalPanelView {
+            tool: "Task".into(),
+            detail: "worker scope".into(),
+            options: vec!["Allow".into(), "Deny".into()],
+            selected: 0,
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: vec![],
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let grid = vterm.dump();
+        assert!(grid.contains("Allow"));
+        assert!(!grid.contains("Subtasks"));
+        assert_eq!(r.current_footer_rows(), r.last_painted_footer_rows);
+    }
+
+    #[test]
     fn approval_panel_renders_selectable_options() {
         let (mut r, buf) = new_capturing(80, 24);
         r.caps.colors = true;
@@ -18709,6 +19255,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            subtasks: None,
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
