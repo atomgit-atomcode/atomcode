@@ -1,6 +1,5 @@
 //! `POST /command`: 无状态斜杠命令执行器（对已持久化会话/记忆施加一次性变更）。
 use axum::{extract::State, response::IntoResponse, Json};
-use futures::StreamExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,68 +9,6 @@ use atomcode_capabilities::session::{
     SessionMeta as NativeSessionMeta, SessionStoreError,
 };
 use atomcode_config::config::memory::MemoryStore;
-
-struct KernelSummaryProvider {
-    inner: Arc<dyn atomcode_core::provider::LlmProvider>,
-    context_window: u32,
-}
-
-#[async_trait::async_trait]
-impl atomcode_kernel::provider::LlmProvider for KernelSummaryProvider {
-    fn model_name(&self) -> &str {
-        self.inner.model_name()
-    }
-
-    fn context_window(&self) -> u32 {
-        self.context_window
-    }
-
-    async fn chat_stream(
-        &self,
-        messages: &[atomcode_kernel::message::Message],
-        _tools: &[atomcode_kernel::tool::ToolDef],
-        _options: &atomcode_kernel::provider::ChatOptions,
-    ) -> Result<
-        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
-        atomcode_kernel::stream::ProviderError,
-    > {
-        let messages: Vec<_> = messages
-            .iter()
-            .map(crate::legacy_convert::message_to_core)
-            .collect();
-        let stream = self.inner.chat_stream(&messages, None).map_err(|error| {
-            atomcode_kernel::stream::ProviderError {
-                message: error.to_string(),
-                ..Default::default()
-            }
-        })?;
-        Ok(stream
-            .filter_map(|event| async move {
-                use atomcode_core::stream::StreamEvent as Core;
-                use atomcode_kernel::stream::{ProviderError, StreamEvent as Kernel, TokenUsage};
-                match event {
-                    Ok(Core::Delta(text)) => Some(Kernel::TextDelta(text)),
-                    Ok(Core::Reasoning(text)) => Some(Kernel::Reasoning(text)),
-                    Ok(Core::Usage(usage)) => Some(Kernel::Usage(TokenUsage {
-                        prompt: usage.prompt_tokens as u32,
-                        completion: usage.completion_tokens as u32,
-                        cached: usage.cached_tokens as u32,
-                    })),
-                    Ok(Core::Done { truncated }) => Some(Kernel::Done { truncated }),
-                    Ok(Core::Error(message)) => Some(Kernel::Error(ProviderError {
-                        message: message.to_string(),
-                        ..Default::default()
-                    })),
-                    Err(error) => Some(Kernel::Error(ProviderError {
-                        message: error.to_string(),
-                        ..Default::default()
-                    })),
-                    _ => None,
-                }
-            })
-            .boxed())
-    }
-}
 
 #[derive(serde::Deserialize)]
 pub(crate) struct CommandReq {
@@ -337,29 +274,26 @@ async fn exec_native_compact(
     provider_name: Option<&str>,
     arg: &str,
     session: NativeCommandSession,
+    working_dir: &std::path::Path,
+    telemetry: Arc<atomcode_telemetry::Telemetry>,
 ) -> anyhow::Result<CommandResult> {
     let config =
         atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())?;
     let resolved = crate::live_api::resolve_provider_name(&config, provider_name);
-    let provider_config = config
-        .providers
-        .get(&resolved)
-        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved))?;
-    let context_window = provider_config.context_window as u32;
-    // Compaction only needs the summarizing provider — not the live tool
-    // registry. Build it directly (mirrors `build_turn_parts`' provider step):
-    // `create_provider` may do blocking auth I/O (OAuth refresh), so run it off
-    // the async runtime so a slow/unreachable auth host can't block a worker thread.
-    let cfg = provider_config.clone();
-    let inner: Arc<dyn atomcode_core::provider::LlmProvider> = Arc::from(
-        tokio::task::spawn_blocking(move || atomcode_core::provider::create_provider(&cfg))
-            .await
-            .map_err(|e| anyhow::anyhow!("provider construction task panicked: {e}"))??,
+
+    // Build the summarizing provider via the SAME native chain `/chat` uses
+    // (chat_runtime_config → coding_config_from_runtime → coding_provider_factory().build),
+    // yielding a kernel-native `LlmProvider` directly — no core provider, no adapter.
+    // `build` may do blocking auth I/O (gateway token), so run it off the async runtime.
+    let coding_cfg = crate::kernel_runtime::coding_config_from_runtime(
+        &crate::live_api::chat_runtime_config(&config, &resolved, working_dir, telemetry),
     );
-    let provider = Arc::new(KernelSummaryProvider {
-        inner,
-        context_window,
-    });
+    let factory = crate::runtime_host::coding_provider_factory();
+    let provider = tokio::task::spawn_blocking(move || factory.build(&coding_cfg, None))
+        .await
+        .map_err(|e| anyhow::anyhow!("provider build task panicked: {e}"))?
+        .map_err(|e| anyhow::anyhow!("provider construction failed: {e}"))?;
+
     let compacted = atomcode_coding::runtime::compact_snapshot(
         session.loaded.snapshot.messages.clone(),
         provider,
@@ -490,11 +424,12 @@ async fn exec_compact(
     session_id: Option<&str>,
     provider: Option<&str>,
     arg: &str,
+    telemetry: Arc<atomcode_telemetry::Telemetry>,
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for compact"))?;
     let native = load_native_command_session(working_dir, project_hash, sid)?
         .ok_or_else(|| anyhow::anyhow!("session {sid:?} not found"))?;
-    exec_native_compact(provider, arg, native).await
+    exec_native_compact(provider, arg, native, working_dir, telemetry).await
 }
 
 fn exec_whoami() -> anyhow::Result<CommandResult> {
@@ -795,7 +730,7 @@ fn todo_items_from_messages(messages: &[atomcode_kernel::message::Message]) -> V
 }
 
 pub(crate) async fn run_command(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<CommandReq>,
 ) -> impl IntoResponse {
     let working_dir = match req.working_dir.as_deref() {
@@ -832,6 +767,7 @@ pub(crate) async fn run_command(
                 req.session_id.as_deref(),
                 req.provider.as_deref(),
                 &req.arg,
+                state.telemetry.clone(),
             )
             .await
         }
