@@ -640,7 +640,6 @@ pub fn wrap_with_spans(
             spans.push((g_end, g_end));
             col = 0;
         } else {
-            let w = cluster_display_width(g);
             col += w;
         }
     }
