@@ -3481,6 +3481,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .as_ref()
             .map(|t| self.todo_panel_row_count(t))
             .unwrap_or(0);
+        let pending_message_cells = self.build_pending_message_rows();
+        let pending_message_rows = pending_message_cells.len();
+        let top_panel_rows = pending_message_rows + todo_rows;
         // Modal panel (approval OR request_user_input): sits above the todo
         // panel (top of footer block) and replaces the input box.
         let approval_rows = self.modal_panel_rows();
@@ -3495,7 +3498,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             h,
             attachment_rows,
             menu_rows,
-            status_rows + goal_rows + todo_rows + approval_rows + command_output_rows,
+            status_rows + goal_rows + top_panel_rows + approval_rows + command_output_rows,
         );
         let input_view_start = if lines.len() > max_input_rows {
             cursor_row_in_middle
@@ -3530,7 +3533,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             attachment_rows,
             menu_rows,
             goal_rows,
-            todo_rows,
+            top_panel_rows,
             approval_rows,
             status_rows,
             hide_input_box,
@@ -3902,17 +3905,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // body content still showing from earlier frames (see
         // `pad_row_to_width` for full rationale).
         //
-        // The todo panel sits at the very TOP of the footer block, above the
-        // input box. The approval panel is drawn BELOW the input box (a compact
-        // bottom-anchored action bar — see further down). Everything from the top
-        // rule onward shifts down by todo_rows only.
-        let todo_top = footer_top;
+        // Pending messages and todo progress sit at the TOP of the footer block,
+        // above the input box. Both are transient and never enter scrollback.
+        let pending_top = footer_top;
+        for (i, row) in pending_message_cells.into_iter().enumerate() {
+            let mut padded = row;
+            Self::pad_row_to_width(&mut padded, w, CellStyle::default());
+            self.screen.draw_row(pending_top + i, 0, &padded);
+        }
+        let todo_top = pending_top + pending_message_rows;
         for (i, tr) in todo_cells.into_iter().enumerate() {
             let mut padded = tr;
             Self::pad_row_to_width(&mut padded, w, CellStyle::default());
             self.screen.draw_row(todo_top + i, 0, &padded);
         }
-        let rules_top = footer_top + todo_rows;
+        let rules_top = footer_top + top_panel_rows;
 
         if hide_input_box {
             let mut border_rule = Vec::with_capacity(rule_width);
@@ -4201,6 +4208,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .as_ref()
             .map(|t| self.todo_panel_row_count(t))
             .unwrap_or(0);
+        let pending_message_rows = self.build_pending_message_rows().len();
+        let top_panel_rows = pending_message_rows + todo_rows;
         let approval_rows = self.modal_panel_rows();
         let attachment_rows = self.input_attachments.len();
         let command_output_rows = self.build_command_output_rows().len();
@@ -4210,7 +4219,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             h,
             attachment_rows,
             menu_rows,
-            status_rows + goal_rows + todo_rows + approval_rows + command_output_rows,
+            status_rows + goal_rows + top_panel_rows + approval_rows + command_output_rows,
         ));
         // 1 top rule + middle + 1 bot rule + attachments + menu + goal/loop + todo + approval + status.
         // (Spinner used to reserve a row here but now lives in body as
@@ -4230,7 +4239,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             attachment_rows,
             menu_rows,
             goal_rows,
-            todo_rows,
+            top_panel_rows,
             approval_rows,
             status_rows,
             hide_input_box,
@@ -4251,6 +4260,51 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // top rule + bot rule + chrome, plus one reserved body row.
         let reserved = 2 + attachment_rows + menu_rows + status_rows + 1;
         h.saturating_sub(reserved).min(MAX_INPUT_ROWS).max(1)
+    }
+
+    /// Build the transient Codex-style pending-message panel shown above the
+    /// composer. Messages are single-line previews; full payloads remain in
+    /// `UiState::pending_steers`. Bound the panel on short terminals without
+    /// falling back to an opaque numeric counter.
+    fn build_pending_message_rows(&self) -> Vec<Vec<Cell>> {
+        if self.status.pending_messages.is_empty() {
+            return Vec::new();
+        }
+        let width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+        if width == 0 {
+            return Vec::new();
+        }
+        let max_message_rows = (self.screen.height() as usize / 3).clamp(1, 6);
+        let mut rows = Vec::with_capacity(max_message_rows + 1);
+        let muted = self.style_for(Role::Muted);
+        let normal = CellStyle::default();
+
+        let title = crate::width::truncate_with_ellipsis(
+            &crate::i18n::t(crate::i18n::Msg::PendingMessagesTitle),
+            width.saturating_sub(2),
+        );
+        let mut header = Vec::new();
+        push_str_cells(&mut header, "• ", &muted);
+        push_str_cells(&mut header, &title, &muted);
+        rows.push(header);
+
+        for message in self.status.pending_messages.iter().take(max_message_rows) {
+            let preview = scrub_controls(message)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let preview = crate::width::truncate_with_ellipsis(&preview, width.saturating_sub(2));
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ↳ ", &muted);
+            push_str_cells(&mut row, &preview, &normal);
+            rows.push(row);
+        }
+        if self.status.pending_messages.len() > max_message_rows {
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ↳ …", &muted);
+            rows.push(row);
+        }
+        rows
     }
 
     /// Build a transient read-only command report directly below the input
@@ -8118,6 +8172,7 @@ mod tests {
             todo: None,
             approval: None,
             user_input: None,
+            pending_messages: Vec::new(),
         }
     }
 
@@ -8141,6 +8196,29 @@ mod tests {
 
         r.status.command_output = None;
         assert_eq!(r.current_footer_rows(), baseline_footer_rows);
+    }
+
+    #[test]
+    fn pending_messages_render_as_transient_footer_rows() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.status = status_basic();
+        let baseline_footer_rows = r.current_footer_rows();
+        r.status.pending_messages = vec![
+            "first pending message".into(),
+            "second\npending\tmessage".into(),
+        ];
+
+        let rows = r.build_pending_message_rows();
+        let text = |row: &Vec<Cell>| row.iter().map(|cell| cell.ch).collect::<String>();
+        assert_eq!(rows.len(), 3, "one title plus two message previews");
+        assert!(text(&rows[0]).contains("Messages to be submitted"));
+        assert!(text(&rows[1]).contains("first pending message"));
+        assert!(text(&rows[2]).contains("second pending message"));
+        assert_eq!(r.current_footer_rows(), baseline_footer_rows + 3);
+        assert!(
+            r.body_lines.is_empty() && r.body_log.is_empty(),
+            "pending messages must never enter transcript scrollback"
+        );
     }
 
     #[test]
@@ -8338,6 +8416,7 @@ mod tests {
             todo: None,
             approval: None,
             user_input: None,
+            pending_messages: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, false);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -8389,6 +8468,7 @@ mod tests {
             todo: None,
             approval: None,
             user_input: None,
+            pending_messages: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, /* shell */ true);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -8459,6 +8539,7 @@ mod tests {
             todo: None,
             approval: None,
             user_input: None,
+            pending_messages: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -8505,6 +8586,7 @@ mod tests {
             todo: None,
             approval: None,
             user_input: None,
+            pending_messages: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, false);
         let idx = row
@@ -8555,6 +8637,7 @@ mod tests {
             todo: None,
             approval: None,
             user_input: None,
+            pending_messages: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -8605,6 +8688,7 @@ mod tests {
             todo: None,
             approval: None,
             user_input: None,
+            pending_messages: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -8639,6 +8723,7 @@ mod tests {
             todo: None,
             approval: None,
             user_input: None,
+            pending_messages: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -14592,7 +14677,9 @@ mod tests {
                 DiffPanelTone::Highlight,
             )]),
         ];
-        let title = DiffPanelRow::new(vec![DiffPanelSpan::new("Diff", DiffPanelTone::Default).bold()]);
+        let title = DiffPanelRow::new(vec![
+            DiffPanelSpan::new("Diff", DiffPanelTone::Default).bold()
+        ]);
         let overlay = r.build_diff_panel_overlay(&title, &rows, "Esc close", 60, 20);
 
         // Borderless layout: [0]=top rule, [1]=title, [2..]=content rows.
@@ -17238,8 +17325,9 @@ mod tests {
             attachments: Vec::new(),
         });
         // Open a `/diff`-style panel (sets `modal_overlay` + `diff_overlay_active`).
-        let title =
-            DiffPanelRow::new(vec![DiffPanelSpan::new("Diff", DiffPanelTone::Default).bold()]);
+        let title = DiffPanelRow::new(vec![
+            DiffPanelSpan::new("Diff", DiffPanelTone::Default).bold()
+        ]);
         let panel_rows = vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
             "a.rs",
             DiffPanelTone::Default,
@@ -17254,7 +17342,10 @@ mod tests {
         r.flush_deferred();
         assert!(r.modal_overlay.is_some(), "panel should install an overlay");
         let logged = r.body_log.len();
-        assert!(logged > 0, "transcript must be logged before resize: {logged}");
+        assert!(
+            logged > 0,
+            "transcript must be logged before resize: {logged}"
+        );
         buf.lock().unwrap().clear();
 
         // Shrink the terminal while the panel is open.
@@ -17299,10 +17390,7 @@ mod tests {
             buf: String::new(),
             cursor_byte: 0,
             menu: Some(MenuPayload {
-                items: vec![
-                    ("glm-5".into(), "".into()),
-                    ("deepseek".into(), "".into()),
-                ],
+                items: vec![("glm-5".into(), "".into()), ("deepseek".into(), "".into())],
                 selected: 0,
                 kind: crate::render::MenuKind::SlashCommand,
             }),
@@ -17972,6 +18060,7 @@ mod tests {
             todo: None,
             approval: None,
             user_input: None,
+            pending_messages: Vec::new(),
         };
         status.approval = Some(crate::render::ApprovalPanelView {
             tool: "Bash".into(),

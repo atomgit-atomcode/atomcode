@@ -1144,7 +1144,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::EscAgainToUndo => "  (press Esc again to undo last turn)\n".into(),
         Msg::BashInputHint => "Enter to run as a bash command".into(),
         Msg::ShellModeHint => "! for shell mode".into(),
-        Msg::SteerFoldedHint => "will fold into current turn".into(),
+        Msg::PendingMessagesTitle =>
+            "Messages to be submitted after next tool call (press esc to interrupt and send immediately)".into(),
+        Msg::PendingMessagesNotSent { count } =>
+            format!("{count} pending message(s) were not sent because the runtime stopped").into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} Multi-line input: end the line with `\\` then press Enter.\n    \
             Works in every terminal. (Shift / Alt / Ctrl + Enter may also work\n    \

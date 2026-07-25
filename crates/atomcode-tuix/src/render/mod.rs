@@ -549,6 +549,9 @@ pub struct ModeBadge {
 pub struct StatusLine {
     pub model: String,
     pub cwd: String, // HOME replaced with "~"
+    /// Messages submitted during the active turn but not yet accepted at a
+    /// model/tool boundary. Rendered as a transient panel above the composer.
+    pub pending_messages: Vec<String>,
     /// Current recalled input-history position, shown on the input box's
     /// top rule only while Up/Down navigation is active.
     pub history: Option<HistoryPosition>,

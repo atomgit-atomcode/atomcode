@@ -1147,6 +1147,48 @@ fn type_ahead_queue_action(event: &bg_runtime::RuntimeEventPayload) -> TypeAhead
     }
 }
 
+/// Esc-with-pending is an explicit exception to the normal fail-closed
+/// type-ahead policy: presentation-only cancellation must not clear the replay
+/// copy, and the runtime-owned completed terminal releases exactly one entry.
+/// Runtime failure still clears everything.
+fn interrupt_queue_action(
+    event: &bg_runtime::RuntimeEventPayload,
+    base: TypeAheadQueueAction,
+    armed: bool,
+) -> (TypeAheadQueueAction, bool) {
+    if !armed {
+        return (base, false);
+    }
+    match event {
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => interrupt_queue_action(
+            &bg_runtime::RuntimeEventPayload::Native(envelope.event.clone()),
+            base,
+            true,
+        ),
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+            atomcode_coding::TurnCompletion::Completed { .. },
+        )) => (TypeAheadQueueAction::DrainOne, false),
+        bg_runtime::RuntimeEventPayload::Native(
+            CodingRuntimeEvent::TurnFinished(
+                atomcode_coding::TurnCompletion::SnapshotUnavailable { .. },
+            )
+            | CodingRuntimeEvent::RuntimeStopped(_),
+        ) => (TypeAheadQueueAction::Clear, false),
+        _ if matches!(base, TypeAheadQueueAction::Clear) => (TypeAheadQueueAction::None, true),
+        _ => (base, true),
+    }
+}
+
+/// A presentation-only terminal may clean up transient UI state before the
+/// runtime publishes its authoritative `TurnFinished`. While an Esc replay is
+/// armed, keep input routing in the busy phase so a manual submit cannot race
+/// ahead of the replay queue.
+fn hold_interrupt_wait_phase(state: &mut UiState, armed: bool) {
+    if armed && matches!(state.phase, UiPhase::Idle) {
+        state.phase = UiPhase::Streaming;
+    }
+}
+
 /// What a runtime event is allowed to do to a fixed-interval prompt loop.
 /// A normal runtime-owned terminal releases the next scheduled iteration;
 /// every authoritative failure tears the loop down. Presentation-only natural
@@ -1352,6 +1394,110 @@ mod submit_hold_tests {
         apply_type_ahead_queue_action(TypeAheadQueueAction::None, &mut queue, &mut authorized);
         assert_eq!(queue, VecDeque::from(["next"]));
         assert!(!authorized);
+    }
+
+    #[test]
+    fn interrupt_replay_waits_for_authoritative_terminal() {
+        let presentation_cancel = bg_runtime::RuntimeEventPayload::Ui(AgentEvent::TurnCancelled {
+            snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
+        });
+        assert_eq!(
+            interrupt_queue_action(
+                &presentation_cancel,
+                type_ahead_queue_action(&presentation_cancel),
+                true,
+            ),
+            (TypeAheadQueueAction::None, true),
+            "presentation cancellation cannot release or clear replay payloads"
+        );
+
+        let native_cancel = native_turn_finished(atomcode_kernel::event::StopReason::Cancelled);
+        assert_eq!(
+            interrupt_queue_action(
+                &native_cancel,
+                type_ahead_queue_action(&native_cancel),
+                true,
+            ),
+            (TypeAheadQueueAction::DrainOne, false),
+            "runtime-owned cancellation releases exactly one replayed message"
+        );
+    }
+
+    #[test]
+    fn interrupt_replay_fails_closed_when_snapshot_is_unavailable() {
+        let event = bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+            atomcode_coding::TurnCompletion::SnapshotUnavailable {
+                turn_id: 1,
+                reason: atomcode_kernel::event::StopReason::Cancelled,
+                error: atomcode_coding::RuntimeSnapshotError {
+                    message: "snapshot failed".into(),
+                },
+                stats: Default::default(),
+            },
+        ));
+        assert_eq!(
+            interrupt_queue_action(&event, type_ahead_queue_action(&event), true),
+            (TypeAheadQueueAction::Clear, false)
+        );
+    }
+
+    #[test]
+    fn presentation_terminal_keeps_interrupt_wait_busy() {
+        let mut state = UiState::new();
+        assert!(matches!(state.phase, UiPhase::Idle));
+        hold_interrupt_wait_phase(&mut state, true);
+        assert!(
+            matches!(state.phase, UiPhase::Streaming),
+            "manual input must keep using the streaming route until native terminal"
+        );
+
+        state.phase = UiPhase::Idle;
+        hold_interrupt_wait_phase(&mut state, false);
+        assert!(matches!(state.phase, UiPhase::Idle));
+    }
+
+    #[test]
+    fn interrupt_staging_preserves_fifo_and_existing_type_ahead() {
+        fn queued(text: &str, marker: usize) -> crate::state::QueuedMessage {
+            crate::state::QueuedMessage {
+                text: text.into(),
+                images: Vec::new(),
+                image_markers: vec![marker],
+            }
+        }
+        let mut pending = VecDeque::from([
+            crate::state::PendingSteer {
+                message: queued("pending-1", 1),
+                display_text: "pending-1".into(),
+            },
+            crate::state::PendingSteer {
+                message: queued("pending-2", 2),
+                display_text: "pending-2".into(),
+            },
+        ]);
+        let mut queue = VecDeque::from([queued("queued-3", 3)]);
+
+        assert!(stage_pending_steers(&mut pending, &mut queue));
+        assert!(pending.is_empty());
+        assert_eq!(
+            queue
+                .iter()
+                .map(|message| (message.text.as_str(), message.image_markers.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("pending-1", &[1][..]),
+                ("pending-2", &[2][..]),
+                ("queued-3", &[3][..]),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_cancel_never_authorizes_interrupt_staging() {
+        assert!(!should_stage_interrupt(false, true, true));
+        assert!(!should_stage_interrupt(true, false, true));
+        assert!(!should_stage_interrupt(true, true, false));
+        assert!(should_stage_interrupt(true, true, true));
     }
 
     #[test]
@@ -2975,7 +3121,8 @@ pub struct LoopCtx {
     /// without extra plumbing. Used by the slash-command palette to
     /// surface user-invocable skills, and by the dispatcher to expand
     /// `/skill_name [args]` into a SendMessage.
-    pub skill_registry: std::sync::Arc<std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
+    pub skill_registry:
+        std::sync::Arc<std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
     /// Snapshot of the terminal's rendering capabilities. Probed once at
     /// startup in `lib.rs`; threaded into `App::new` so `UiState` knows
     /// whether to use Unicode or ASCII fallbacks for the spinner glyph
@@ -4713,7 +4860,11 @@ mod menu_tests {
         );
     }
 
-    fn skill_fixture(name: &str, desc: &str, user_invocable: bool) -> atomcode_capabilities::skills::Skill {
+    fn skill_fixture(
+        name: &str,
+        desc: &str,
+        user_invocable: bool,
+    ) -> atomcode_capabilities::skills::Skill {
         atomcode_capabilities::skills::Skill {
             name: name.to_string(),
             description: desc.to_string(),
@@ -4890,7 +5041,8 @@ mod menu_tests {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
         let with_none = build_menu_items("/", 0, &reg, &custom, None, None).unwrap();
-        let empty_skills = std::sync::RwLock::new(atomcode_capabilities::skills::SkillRegistry::new());
+        let empty_skills =
+            std::sync::RwLock::new(atomcode_capabilities::skills::SkillRegistry::new());
         let with_empty =
             build_menu_items("/", 0, &reg, &custom, Some(&empty_skills), None).unwrap();
         assert_eq!(
@@ -5439,8 +5591,8 @@ mod menu_tests {
             source: PathBuf::from("x"),
             namespace: None,
         });
-        let items = build_menu_items("/myr", 0, &reg, &custom, None, None)
-            .expect("should find myreview");
+        let items =
+            build_menu_items("/myr", 0, &reg, &custom, None, None).expect("should find myreview");
         let name = &items[0].0;
         // Assert the contract directly: Required custom command must resolve
         // to ArgsRequirement::Required (which implies needs_args = true).
@@ -5462,8 +5614,8 @@ mod menu_tests {
             source: PathBuf::from("x"),
             namespace: None,
         });
-        let items = build_menu_items("/myr", 0, &reg, &custom, None, None)
-            .expect("should find myreview");
+        let items =
+            build_menu_items("/myr", 0, &reg, &custom, None, None).expect("should find myreview");
         let name = &items[0].0;
         // Assert the contract directly: Optional custom command must resolve
         // to ArgsRequirement::Optional (which implies needs_args = true).
@@ -5485,8 +5637,8 @@ mod menu_tests {
             source: PathBuf::from("x"),
             namespace: None,
         });
-        let items = build_menu_items("/myr", 0, &reg, &custom, None, None)
-            .expect("should find myreview");
+        let items =
+            build_menu_items("/myr", 0, &reg, &custom, None, None).expect("should find myreview");
         let name = &items[0].0;
         // Assert the contract directly: None custom command must resolve
         // to ArgsRequirement::None (which implies needs_args = false).
@@ -6423,6 +6575,9 @@ pub struct App {
     /// was deliberately held while the provider was starting/reconfiguring.
     /// Diagnostic events never arm this latch.
     queue_drain_authorized: bool,
+    /// Esc with pending steers cancels the active turn, then replays those
+    /// messages only after the runtime-owned turn terminal proves Submit is safe.
+    interrupt_drain_pending: bool,
     /// Streaming-state `<think>…</think>` stripper. Kept on App (not
     /// a local in the streaming arm) because it carries state across
     /// agent events — a tag straddling two chunks would break if the
@@ -6556,6 +6711,7 @@ impl App {
             active_modal: None,
             message_queue: VecDeque::new(),
             queue_drain_authorized: false,
+            interrupt_drain_pending: false,
             think: ThinkStripper::new(),
             pending_tools: std::collections::HashMap::new(),
             exit_pending: None,
@@ -7233,7 +7389,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let provider_reload_failed =
                         is_provider_reload_failure(&runtime_event.event);
-                    let queue_action = type_ahead_queue_action(&runtime_event.event);
+                    let base_queue_action = type_ahead_queue_action(&runtime_event.event);
+                    let interrupt_was_armed = app.interrupt_drain_pending;
+                    let (queue_action, interrupt_armed) = interrupt_queue_action(
+                        &runtime_event.event,
+                        base_queue_action,
+                        interrupt_was_armed,
+                    );
+                    app.interrupt_drain_pending = interrupt_armed;
                     let loop_action = fixed_interval_loop_action(&runtime_event.event);
                     if let Err(error) = publish_live_runtime_event(&ctx, &runtime_event.event) {
                         renderer.render(UiLine::Error(error));
@@ -7242,6 +7405,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     let pre_phase = app.state.phase;
                     apply_fixed_interval_loop_action(loop_action, &mut app.state, &mut ctx);
                     handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    hold_interrupt_wait_phase(&mut app.state, app.interrupt_drain_pending);
+                    if interrupt_was_armed
+                        && matches!(queue_action, TypeAheadQueueAction::Clear)
+                        && !app.message_queue.is_empty()
+                    {
+                        renderer.render(UiLine::Warning(
+                            crate::i18n::t(crate::i18n::Msg::PendingMessagesNotSent {
+                                count: app.message_queue.len(),
+                            })
+                            .into_owned(),
+                        ));
+                        renderer.flush();
+                    }
                     apply_type_ahead_queue_action(
                         queue_action,
                         &mut app.message_queue,
@@ -7595,7 +7771,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let provider_reload_failed =
                         is_provider_reload_failure(&runtime_event.event);
-                    let queue_action = type_ahead_queue_action(&runtime_event.event);
+                    let base_queue_action = type_ahead_queue_action(&runtime_event.event);
+                    let interrupt_was_armed = app.interrupt_drain_pending;
+                    let (queue_action, interrupt_armed) = interrupt_queue_action(
+                        &runtime_event.event,
+                        base_queue_action,
+                        interrupt_was_armed,
+                    );
+                    app.interrupt_drain_pending = interrupt_armed;
                     let loop_action = fixed_interval_loop_action(&runtime_event.event);
                     if let Err(error) = publish_live_runtime_event(&ctx, &runtime_event.event) {
                         renderer.render(UiLine::Error(error));
@@ -7604,6 +7787,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     let pre_phase = app.state.phase;
                     apply_fixed_interval_loop_action(loop_action, &mut app.state, &mut ctx);
                     handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    hold_interrupt_wait_phase(&mut app.state, app.interrupt_drain_pending);
+                    if interrupt_was_armed
+                        && matches!(queue_action, TypeAheadQueueAction::Clear)
+                        && !app.message_queue.is_empty()
+                    {
+                        renderer.render(UiLine::Warning(
+                            crate::i18n::t(crate::i18n::Msg::PendingMessagesNotSent {
+                                count: app.message_queue.len(),
+                            })
+                            .into_owned(),
+                        ));
+                        renderer.flush();
+                    }
                     apply_type_ahead_queue_action(
                         queue_action,
                         &mut app.message_queue,
@@ -8011,7 +8207,7 @@ mod external_config_tests {
 
         assert_eq!(merged.default_provider, "main"); // selection preserved
         assert_eq!(merged.providers["main"].context_window, 32_000); // edit applied
-        // And the change is detected, so the runtime is actually reconfigured.
+                                                                     // And the change is detected, so the runtime is actually reconfigured.
         assert!(active_provider_config_changed(&current, &merged));
     }
 
@@ -8138,7 +8334,8 @@ mod external_config_tests {
         );
         next_default.default_provider = "next".into();
 
-        let visible = merge_persisted_config_preserving_active(&opened, next_default.clone(), false);
+        let visible =
+            merge_persisted_config_preserving_active(&opened, next_default.clone(), false);
 
         assert_eq!(visible.default_provider, "main");
         assert_eq!(visible.providers["main"].model, "opened-model");
@@ -8574,7 +8771,8 @@ fn reconcile_persisted_config(
         &desired,
         ctx.runtime.ui_availability(),
         auth_available,
-    ) || (manual_reload_announce && active_provider_config_changed(&ctx.config, &desired));
+    ) || (manual_reload_announce
+        && active_provider_config_changed(&ctx.config, &desired));
 
     if !wants_reload {
         let (provider, model) = resolved_provider_and_model(&desired);
@@ -11720,6 +11918,41 @@ fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, 
     }
 }
 
+/// Preserve pending steers across the kernel's cancel-time steer-buffer clear.
+/// Returns true when Esc should use interrupt-and-send semantics instead of
+/// restoring the cancelled prompt into the editor.
+fn stage_pending_steers_for_interrupt(app: &mut App) -> bool {
+    if !stage_pending_steers(&mut app.state.pending_steers, &mut app.message_queue) {
+        return false;
+    }
+    app.queue_drain_authorized = false;
+    app.interrupt_drain_pending = true;
+    // The current turn is intentionally being abandoned in favor of the
+    // pending messages; do not restore its original prompt over the draft.
+    app.state.last_submitted_message = None;
+    true
+}
+
+fn stage_pending_steers(
+    pending_steers: &mut VecDeque<crate::state::PendingSteer>,
+    message_queue: &mut VecDeque<crate::state::QueuedMessage>,
+) -> bool {
+    if pending_steers.is_empty() {
+        return false;
+    }
+    let mut replay = pending_steers
+        .drain(..)
+        .map(|pending| pending.message)
+        .collect::<VecDeque<_>>();
+    replay.append(message_queue);
+    *message_queue = replay;
+    true
+}
+
+fn should_stage_interrupt(send_ok: bool, bare_esc: bool, has_pending: bool) -> bool {
+    send_ok && bare_esc && has_pending
+}
+
 /// Slash commands allowed to EXECUTE while a turn is running. Everything else is
 /// blocked with the "disabled while a turn is running" hint. Returns the
 /// `(command, args)` to run, or `None` to fall through to the block/queue.
@@ -11895,14 +12128,31 @@ fn handle_streaming_key(
     // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
     if code == KeyCode::Esc {
         let send_ok = cancel_active_turn(ctx);
+        let interrupt_and_send = should_stage_interrupt(
+            send_ok,
+            modifiers.is_empty(),
+            !app.state.pending_steers.is_empty(),
+        ) && stage_pending_steers_for_interrupt(app);
         clear_capturing_modal_on_cancel(app);
         crate::tuix_trace!(
             "KEY",
-            "streaming Esc -> Cancel send_ok={} spinner={:?}",
+            "streaming Esc -> Cancel send_ok={} interrupt_and_send={} spinner={:?}",
             send_ok,
+            interrupt_and_send,
             app.state.spinner_label
         );
-        restore_cancelled_message_to_buf(app, renderer, ctx);
+        if interrupt_and_send {
+            draw_spinner_now(
+                &mut app.state,
+                &app.buf,
+                ctx,
+                renderer,
+                app.message_queue.len(),
+                app.menu.selected,
+            );
+        } else {
+            restore_cancelled_message_to_buf(app, renderer, ctx);
+        }
         return Ok(());
     }
 
@@ -12277,16 +12527,25 @@ fn handle_streaming_key(
             });
             match midturn_submit_route(true) {
                 SubmitRoute::SteerNow => {
-                    // Steer into the running turn: the kernel folds this at the next
-                    // round boundary (see AgentEvent::Steered). No local queue. Count
-                    // it as PENDING now; the Steered event drains it once folded.
-                    if submit_foreground_runtime(ctx, runtime_user_input(expanded, q_images)) {
-                        app.state.on_steer_sent();
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  ↳ {}: {}\n",
-                            crate::i18n::t(crate::i18n::Msg::SteerFoldedHint),
-                            line
-                        )));
+                    // Steer into the running turn and retain an exact recovery copy.
+                    // The footer panel owns the acknowledgement; do not write a
+                    // permanent "will fold" line into conversation scrollback.
+                    let pending = crate::state::PendingSteer {
+                        message: crate::state::QueuedMessage {
+                            text: expanded,
+                            images: q_images,
+                            image_markers: q_markers,
+                        },
+                        display_text: line,
+                    };
+                    if submit_foreground_runtime(
+                        ctx,
+                        runtime_user_input(
+                            pending.message.text.clone(),
+                            pending.message.images.clone(),
+                        ),
+                    ) {
+                        app.state.on_steer_sent(pending);
                     } else {
                         renderer.render(UiLine::Error(
                             crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable).into_owned(),
@@ -14446,11 +14705,13 @@ fn project_kernel_event(
                 duration: started.elapsed(),
             })
         }
-        Kernel::Usage(meta) => Some(AgentEvent::TokenUsage(atomcode_kernel::stream::TokenUsage {
-            prompt: meta.tokens.prompt,
-            completion: meta.tokens.completion,
-            cached: meta.tokens.cached,
-        })),
+        Kernel::Usage(meta) => Some(AgentEvent::TokenUsage(
+            atomcode_kernel::stream::TokenUsage {
+                prompt: meta.tokens.prompt,
+                completion: meta.tokens.completion,
+                cached: meta.tokens.cached,
+            },
+        )),
         Kernel::Error { message, .. } => Some(AgentEvent::Error {
             error: message,
             snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
@@ -14894,13 +15155,9 @@ fn handle_runtime_event(
                             return;
                         }
                     };
-                    let snapshot = request
-                        .snapshot
-                        .as_deref()
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            atomcode_kernel::message::SessionSnapshot::new(Vec::new())
-                        });
+                    let snapshot = request.snapshot.as_deref().cloned().unwrap_or_else(|| {
+                        atomcode_kernel::message::SessionSnapshot::new(Vec::new())
+                    });
                     handle_agent_event(
                         AgentEvent::ApprovalNeeded {
                             tool_name: approval.tool.clone(),
@@ -18238,7 +18495,10 @@ mod session_naming_tests {
 
         apply_session_snapshot(
             &mut session,
-            snapshot(&["compressed context"], vec![user_msg(Role::User, "new task")]),
+            snapshot(
+                &["compressed context"],
+                vec![user_msg(Role::User, "new task")],
+            ),
         );
 
         assert_eq!(session.cold_summaries, vec!["compressed context"]);
@@ -18249,7 +18509,10 @@ mod session_naming_tests {
         let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
         session.messages = vec![user_msg(Role::User, "stale recent turn")];
 
-        apply_session_snapshot(&mut session, snapshot(&["all retained context"], Vec::new()));
+        apply_session_snapshot(
+            &mut session,
+            snapshot(&["all retained context"], Vec::new()),
+        );
 
         assert!(session.messages.is_empty());
         assert_eq!(session.cold_summaries, vec!["all retained context"]);
@@ -18612,6 +18875,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     crate::render::StatusLine {
         model,
         cwd,
+        pending_messages: state
+            .pending_steers
+            .iter()
+            .map(|pending| pending.display_text.clone())
+            .collect(),
         history: None,
         command_output: state.footer_command_output.clone(),
         ctx_used,
@@ -18794,11 +19062,6 @@ fn format_spinner_label(
     }
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
-    }
-    if state.steer_pending > 0 {
-        // Draining "waiting to fold" count — appears when you steer, gone once the
-        // kernel folds it into the turn (mirrors codex/opencode's pending indicator).
-        out.push_str(&format!(" · {} to fold", state.steer_pending));
     }
     // (The mid-stream "· esc to cancel" stall hint was removed by request — esc
     // still cancels, it's just no longer advertised in the spinner. The stall

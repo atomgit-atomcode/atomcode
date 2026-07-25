@@ -668,6 +668,16 @@ pub struct QueuedMessage {
     pub image_markers: Vec<usize>,
 }
 
+/// A message already sent to the kernel as an in-turn steer, retained by the
+/// TUI until `Steered` confirms delivery. The copy is also the recovery payload
+/// for Esc: cancellation clears the kernel steer buffer, so the TUI replays
+/// these messages as fresh turns after the authoritative cancel terminal.
+#[derive(Debug, Clone)]
+pub struct PendingSteer {
+    pub message: QueuedMessage,
+    pub display_text: String,
+}
+
 pub struct UiState {
     pub phase: UiPhase,
     pub agent_mode: AgentMode,
@@ -954,15 +964,10 @@ pub struct UiState {
     /// Any other event flushes this buffer with the usual `↻ goal round N`
     /// or `✓ done` label.
     pub pending_separator: Option<PendingSeparator>,
-    /// Mid-turn steers submitted but NOT YET folded into the turn by the kernel
-    /// — i.e. still waiting for the next model-request boundary. Incremented when
-    /// the TUI dispatches a steer (`on_steer_sent`), decremented when the kernel
-    /// confirms the fold (`AgentEvent::Steered { count }` → `on_steered`), and
-    /// cleared at turn end / new turn start. Surfaced in the footer as
-    /// `· N to fold` while non-zero, so it DRAINS to nothing once folded (it is a
-    /// pending indicator, not a cumulative tally). Mirrors codex's pending-steer
-    /// list / opencode's draining `N queued`.
-    pub steer_pending: usize,
+    /// Mid-turn messages waiting for the next model-request boundary. Keeping
+    /// the actual payload (not only a count) enables the Codex-style pending
+    /// panel and fail-safe Esc → cancel → submit-as-new-turn behavior.
+    pub pending_steers: std::collections::VecDeque<PendingSteer>,
     /// Whether the user has explicitly switched to Build mode via
     /// Tab/Shift+Tab or `/build`. When `false`, the status bar hides
     /// the `⏸ build` badge so the default startup state stays clean.
@@ -1105,7 +1110,7 @@ impl UiState {
             loop_round: 0,
             loop_started_at: None,
             pending_separator: None,
-            steer_pending: 0,
+            pending_steers: std::collections::VecDeque::new(),
             build_badge_visible: false,
         }
     }
@@ -1353,7 +1358,7 @@ impl UiState {
         self.last_stream_activity = Some(now);
         // Belt-and-suspenders: a fresh turn always starts with zero steers, even
         // if the previous turn ended abnormally and never fired on_turn_complete.
-        self.steer_pending = 0;
+        self.pending_steers.clear();
     }
 
     /// The runtime rejected the turn before accepting it. Keep the UI idle and
@@ -1393,7 +1398,7 @@ impl UiState {
         self.approval_panel = None;
         self.user_input_panel = None;
         self.user_input_batch = None;
-        self.steer_pending = 0;
+        self.pending_steers.clear();
         // The interactive `/usage` tab panel is streaming-only. Drop it (but keep
         // the rendered text) so its tab keys can't bleed into idle or across into
         // the next streaming turn; a fresh `/usage` re-arms it.
@@ -1417,7 +1422,7 @@ impl UiState {
         self.approval_panel = None;
         self.user_input_panel = None;
         self.user_input_batch = None;
-        self.steer_pending = 0;
+        self.pending_steers.clear();
         // Streaming-only `/usage` tab panel — drop it on cancel too (mirrors
         // on_turn_complete); the rendered text stays until Esc.
         self.footer_usage = None;
@@ -1440,15 +1445,19 @@ impl UiState {
 
     /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting
     /// to fold into the running turn at the next model-request boundary.
-    pub fn on_steer_sent(&mut self) {
-        self.steer_pending += 1;
+    pub fn on_steer_sent(&mut self, pending: PendingSteer) {
+        self.pending_steers.push_back(pending);
     }
 
     /// The kernel confirmed it folded `count` steered prompt(s) into the turn
     /// (`AgentEvent::Steered`). Drain the pending count; `saturating_sub` so a
     /// steer folded from another client (no local `on_steer_sent`) can't underflow.
     pub fn on_steered(&mut self, count: usize) {
-        self.steer_pending = self.steer_pending.saturating_sub(count);
+        for _ in 0..count {
+            if self.pending_steers.pop_front().is_none() {
+                break;
+            }
+        }
     }
 
     /// Record a diagnostic error observation without ending the turn locally.
@@ -2743,41 +2752,58 @@ mod tests {
     }
 
     #[test]
-    fn steer_pending_counts_unfolded_and_drains_on_fold() {
+    fn pending_steers_retain_payload_and_drain_on_fold() {
+        fn pending(text: &str) -> PendingSteer {
+            PendingSteer {
+                message: QueuedMessage {
+                    text: text.to_owned(),
+                    images: Vec::new(),
+                    image_markers: Vec::new(),
+                },
+                display_text: text.to_owned(),
+            }
+        }
+
         let mut st = UiState::new();
-        st.on_steer_sent();
-        st.on_steer_sent();
+        st.on_steer_sent(pending("one"));
+        st.on_steer_sent(pending("two"));
         assert_eq!(
-            st.steer_pending, 2,
-            "two steers dispatched, none folded yet"
+            st.pending_steers
+                .iter()
+                .map(|pending| pending.display_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"],
+            "payload and display order survive until kernel confirmation"
         );
         st.on_steered(1); // kernel confirms one fold
-        assert_eq!(st.steer_pending, 1, "drains as folds are confirmed");
-        st.on_steered(1);
         assert_eq!(
-            st.steer_pending, 0,
-            "back to zero once all folded — a draining indicator"
+            st.pending_steers.front().map(|p| p.display_text.as_str()),
+            Some("two"),
+            "drains from the front as folds are confirmed"
         );
+        st.on_steered(1);
+        assert!(st.pending_steers.is_empty());
         st.on_steered(3); // spurious / cross-client fold never underflows
-        assert_eq!(st.steer_pending, 0, "saturating: never goes negative");
+        assert!(st.pending_steers.is_empty());
         // Every turn-end path clears it, parity with the other per-turn counters.
-        st.on_steer_sent();
+        st.on_steer_sent(pending("complete"));
         st.on_turn_complete();
-        assert_eq!(st.steer_pending, 0, "cleared at turn end");
-        st.on_steer_sent();
+        assert!(st.pending_steers.is_empty(), "cleared at turn end");
+        st.on_steer_sent(pending("cancel"));
         st.on_turn_cancelled();
-        assert_eq!(st.steer_pending, 0, "cleared on cancel");
-        st.on_steer_sent();
+        assert!(st.pending_steers.is_empty(), "cleared on cancel");
+        st.on_steer_sent(pending("diagnostic"));
         st.on_error();
         assert_eq!(
-            st.steer_pending, 1,
+            st.pending_steers.len(),
+            1,
             "a diagnostic error must not clean up a still-active turn"
         );
         st.on_turn_complete();
-        assert_eq!(st.steer_pending, 0, "cleared by the terminal");
-        st.on_steer_sent();
+        assert!(st.pending_steers.is_empty(), "cleared by the terminal");
+        st.on_steer_sent(pending("fresh"));
         st.on_submit();
-        assert_eq!(st.steer_pending, 0, "a fresh turn starts at 0");
+        assert!(st.pending_steers.is_empty(), "a fresh turn starts empty");
     }
 
     #[test]

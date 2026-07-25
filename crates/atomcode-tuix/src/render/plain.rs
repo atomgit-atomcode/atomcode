@@ -60,6 +60,10 @@ pub struct PlainRenderer<W: Write + Send> {
     ///   with the assistant's reply.
     interactive_terminal: bool,
     last_prompt_written: bool,
+    /// Last pending-message snapshot surfaced in interactive plain mode.
+    /// Plain terminals cannot repaint a footer panel, so only newly appended
+    /// entries are written as a compact acknowledgement.
+    last_pending_messages: Vec<String>,
     /// True iff the last write was a transient (spinner) line that
     /// hasn't been wiped yet. The next non-transient render needs to
     /// emit `\r\x1b[K` first so it doesn't append to the spinner row.
@@ -112,6 +116,7 @@ impl<W: Write + Send> PlainRenderer<W> {
             caps,
             interactive_terminal,
             last_prompt_written: false,
+            last_pending_messages: Vec::new(),
             transient_active: false,
         }
     }
@@ -162,6 +167,43 @@ impl<W: Write + Send> PlainRenderer<W> {
             };
             let _ = writeln!(self.out, "  {} [Image #{}]", branch, n);
         }
+    }
+
+    fn render_pending_messages(&mut self, pending: &[String]) {
+        if pending == self.last_pending_messages {
+            return;
+        }
+        if !self.interactive_terminal {
+            self.last_pending_messages = pending.to_vec();
+            return;
+        }
+
+        let appended_from = if pending.starts_with(&self.last_pending_messages) {
+            self.last_pending_messages.len()
+        } else {
+            0
+        };
+        if appended_from < pending.len() {
+            self.drop_transient();
+            let _ = writeln!(
+                self.out,
+                "{}",
+                crate::i18n::t(crate::i18n::Msg::PendingMessagesTitle)
+            );
+            let branch = if self.caps.unicode_symbols {
+                "\u{21b3}"
+            } else {
+                "->"
+            };
+            for message in &pending[appended_from..] {
+                let preview = scrub_controls(message)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let _ = writeln!(self.out, "  {} {}", branch, self.dg(&preview));
+            }
+        }
+        self.last_pending_messages = pending.to_vec();
     }
 }
 
@@ -455,9 +497,11 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     self.transient_active = false;
                 }
             }
-            UiLine::StreamingBox { .. } => {
-                // No streaming-box rendering in plain mode — assistant
-                // text streams as plain text via AssistantText.
+            UiLine::StreamingBox { status, .. } => {
+                // No streaming-box repaint in plain mode — assistant text
+                // streams as plain text. Pending steers still need a static
+                // acknowledgement because this renderer has no footer panel.
+                self.render_pending_messages(&status.pending_messages);
             }
             UiLine::TurnSeparator { label } => {
                 self.drop_transient();
@@ -1041,6 +1085,57 @@ mod tests {
             "approval guidance must precede the chevron. got: {:?}",
             s
         );
+    }
+
+    #[test]
+    fn pending_messages_are_acknowledged_once_in_interactive_plain_mode() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let mut buf = Vec::new();
+        let mut r =
+            PlainRenderer::with_writer_caps_and_interactive(&mut buf, caps_jediterm_ish(), true);
+        let streaming = |pending_messages: Vec<String>| UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "*",
+            label: "Working".into(),
+            status: crate::render::StatusLine {
+                pending_messages,
+                ..Default::default()
+            },
+            menu: None,
+            attachments: Vec::new(),
+        };
+
+        r.render(streaming(vec!["first".into()]));
+        r.render(streaming(vec!["first".into()])); // spinner repaint: no duplicate
+        r.render(streaming(vec!["first".into(), "second\nmessage".into()]));
+        r.flush();
+
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output.matches("Messages to be submitted").count(), 2);
+        assert_eq!(output.matches("first").count(), 1);
+        assert_eq!(output.matches("second message").count(), 1);
+    }
+
+    #[test]
+    fn pending_messages_stay_silent_in_pipe_mode() {
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(&mut buf, caps_dumb(), false);
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "*",
+            label: "Working".into(),
+            status: crate::render::StatusLine {
+                pending_messages: vec!["secret input".into()],
+                ..Default::default()
+            },
+            menu: None,
+            attachments: Vec::new(),
+        });
+        r.flush();
+        assert!(buf.is_empty());
     }
 
     /// Pipe / CI mode: no human watching, so the approval panel text must NOT
