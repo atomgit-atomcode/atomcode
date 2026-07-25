@@ -4286,8 +4286,45 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if width == 0 {
             return Vec::new();
         }
+        // Reserve the non-pending footer chrome plus one body row. Cosmetic
+        // pending spacers are admitted only from the rows left over here, so
+        // they can never push the composer beyond the viewport on a short
+        // terminal.
+        let h = self.screen.height() as usize;
+        let status_rows = usize::from(
+            !self.status.model.is_empty()
+                || !self.status.cwd.is_empty()
+                || self.status.hint.is_some(),
+        );
+        let goal_rows =
+            usize::from(self.status.goal.is_some() || self.status.loop_status.is_some());
+        let todo_rows = self
+            .status
+            .todo
+            .as_ref()
+            .map(|todo| self.todo_panel_row_count(todo))
+            .unwrap_or(0);
+        let reserved_rows = 1 // input top rule
+            + 1 // at least one input row
+            + 1 // input bottom rule
+            + 1 // at least one body row
+            + self.input_attachments.len()
+            + self.max_menu_rows(h, 0)
+            + status_rows
+            + goal_rows
+            + todo_rows
+            + self.modal_panel_rows()
+            + self.build_command_output_rows().len();
+        let available_rows = h.saturating_sub(reserved_rows);
+        // A title and at least one preview are the minimum useful panel. On an
+        // extremely short terminal, prefer keeping the composer usable over
+        // painting a partial pending panel.
+        if available_rows < 2 {
+            return Vec::new();
+        }
+
         let max_message_rows = (self.screen.height() as usize / 3).clamp(1, 6);
-        let mut rows = Vec::with_capacity(max_message_rows + 1);
+        let mut content_rows = Vec::with_capacity(max_message_rows + 2);
         let muted = self.style_for(Role::Muted);
         let normal = CellStyle::default();
 
@@ -4298,7 +4335,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let mut header = Vec::new();
         push_str_cells(&mut header, "• ", &muted);
         push_str_cells(&mut header, &title, &muted);
-        rows.push(header);
+        content_rows.push(header);
 
         for message in self.status.pending_messages.iter().take(max_message_rows) {
             let preview = scrub_controls(message)
@@ -4309,12 +4346,33 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ↳ ", &muted);
             push_str_cells(&mut row, &preview, &normal);
-            rows.push(row);
+            content_rows.push(row);
         }
         if self.status.pending_messages.len() > max_message_rows {
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ↳ …", &muted);
-            rows.push(row);
+            content_rows.push(row);
+        }
+
+        // Todo already owns a leading spacer. When it follows pending messages,
+        // that row is the single separator between the panels; adding a pending
+        // trailing spacer as well would create the audited double-gap.
+        let desired_spacers = if self.status.todo.is_some() { 1 } else { 2 };
+        let spacer_rows = if available_rows >= 2 + desired_spacers {
+            desired_spacers
+        } else {
+            0
+        };
+        let content_budget = available_rows.saturating_sub(spacer_rows).max(2);
+        content_rows.truncate(content_budget);
+
+        let mut rows = Vec::with_capacity(content_rows.len() + spacer_rows);
+        if spacer_rows > 0 {
+            rows.push(Vec::new());
+        }
+        rows.extend(content_rows);
+        if spacer_rows == 2 {
+            rows.push(Vec::new());
         }
         rows
     }
@@ -8293,14 +8351,126 @@ mod tests {
 
         let rows = r.build_pending_message_rows();
         let text = |row: &Vec<Cell>| row.iter().map(|cell| cell.ch).collect::<String>();
-        assert_eq!(rows.len(), 3, "one title plus two message previews");
-        assert!(text(&rows[0]).contains("Messages to be submitted"));
-        assert!(text(&rows[1]).contains("first pending message"));
-        assert!(text(&rows[2]).contains("second pending message"));
-        assert_eq!(r.current_footer_rows(), baseline_footer_rows + 3);
+        assert_eq!(
+            rows.len(),
+            5,
+            "leading spacer, title, two message previews, trailing spacer"
+        );
+        assert!(text(&rows[0]).is_empty());
+        assert!(text(&rows[1]).contains("Messages to be submitted"));
+        assert!(text(&rows[2]).contains("first pending message"));
+        assert!(text(&rows[3]).contains("second pending message"));
+        assert!(text(&rows[4]).is_empty());
+        assert_eq!(r.current_footer_rows(), baseline_footer_rows + 5);
         assert!(
             r.body_lines.is_empty() && r.body_log.is_empty(),
             "pending messages must never enter transcript scrollback"
+        );
+    }
+
+    #[test]
+    fn pending_messages_have_one_blank_row_above_and_below_on_screen() {
+        let width = 80u16;
+        let height = 16u16;
+        let (mut r, buf) = new_capturing(width, height);
+        let mut vterm = crate::test_term::VirtualTerminal::new(width, height);
+        let mut status = status_basic();
+        status.pending_messages = vec!["你明白了吗？".into()];
+
+        r.render(UiLine::AssistantText("assistant tail\n".into()));
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Brewing".into(),
+            status,
+            menu: None,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let spinner_row = (0..height as usize)
+            .find(|row| vterm.row_text(*row).contains("Brewing"))
+            .unwrap_or_else(|| panic!("spinner missing:\n{}", vterm.dump()));
+        let pending_title_row = (0..height as usize)
+            .find(|row| vterm.row_text(*row).contains("Messages to be submitted"))
+            .unwrap_or_else(|| panic!("pending title missing:\n{}", vterm.dump()));
+        let pending_message_row = pending_title_row + 1;
+        assert!(
+            vterm.row_text(pending_message_row).contains('↳'),
+            "pending message missing:\n{}",
+            vterm.dump()
+        );
+        let input_rule_row = (pending_message_row + 1..height as usize)
+            .find(|row| vterm.row_text(*row).contains('─'))
+            .unwrap_or_else(|| panic!("input top rule missing:\n{}", vterm.dump()));
+
+        assert_eq!(
+            pending_title_row,
+            spinner_row + 2,
+            "pending panel must leave exactly one blank row below the spinner:\n{}",
+            vterm.dump()
+        );
+        assert_eq!(
+            input_rule_row,
+            pending_message_row + 2,
+            "pending panel must leave exactly one blank row above the input:\n{}",
+            vterm.dump()
+        );
+    }
+
+    #[test]
+    fn pending_messages_drop_cosmetic_spacing_to_fit_short_terminal() {
+        let (mut r, _buf) = new_capturing(80, 8);
+        r.status = status_basic();
+        r.status.pending_messages = (0..8).map(|i| format!("pending-{i}")).collect();
+
+        let rows = r.build_pending_message_rows();
+        assert!(
+            rows.iter().all(|row| !row.is_empty()),
+            "short terminal must drop cosmetic pending spacers first"
+        );
+        assert!(
+            r.current_footer_rows() < r.screen.height() as usize,
+            "footer must preserve at least one body row: footer={} height={}",
+            r.current_footer_rows(),
+            r.screen.height()
+        );
+    }
+
+    #[test]
+    fn pending_and_todo_panels_do_not_stack_blank_rows() {
+        use atomcode_capabilities::tools::todo::TodoStatus;
+
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.status = status_basic();
+        r.status.pending_messages = vec!["pending steer".into()];
+        r.status.todo = Some(crate::render::TodoProgress {
+            current: Some("active task".into()),
+            completed: 0,
+            in_progress: 1,
+            total: 1,
+            items: vec![(TodoStatus::InProgress, "active task".into())],
+        });
+
+        let pending = r.build_pending_message_rows();
+        let todo = r.build_todo_rows(r.status.todo.as_ref().unwrap(), 76);
+        let combined: Vec<&Vec<Cell>> = pending.iter().chain(todo.iter()).collect();
+
+        assert!(
+            !combined
+                .windows(2)
+                .any(|pair| pair[0].is_empty() && pair[1].is_empty()),
+            "pending and todo panels must never create consecutive spacer rows"
+        );
+        assert!(
+            pending.first().is_some_and(|row| row.is_empty()),
+            "the combined top panel should retain one leading breathing row"
+        );
+        assert!(
+            todo.first().is_some_and(|row| row.is_empty()),
+            "todo's leading spacer should be the sole separator after pending content"
         );
     }
 
