@@ -82,9 +82,21 @@ webui 各跑并确认无回归：`/chat` 与 `/live` 新会话贴图（VL captio
 
 C2 落地 + 真机绿后：确认 `core::conversation`/`core::provider`/`core::ctx` 外部消费者全零 → 删三模块本体 + lib.rs 声明 + orphan 测试；daemon Cargo.toml 视情去 `atomcode-core` 依赖。
 
-## 调查记录
+## 调查记录（Task 0 已完成 — 三处全绿，C2 大幅缩小）
 
-（Task 0 执行后回填。特别是 turn_tracker/cancel 是否冗余的决策——它决定 Task 1/3 规模。）
+**决策1：turn_tracker + cancel_current_turn 可直接 DROP（不重建）。**
+- core `cancel_current_turn`（conversation/mod.rs:247-269）做：收尾流式 buffer→assistant、清 partial tool-call、`backfill_cancelled_tool_results` 给孤儿 tool call 补 `(cancelled)` result、标记 turn Completed。
+- kernel `Conversation`（kernel message.rs:393-420）有**同名** `backfill_cancelled_tool_results()`；SessionSnapshot 用 `message.meta.turn_id` 做轮次；原生 runtime 自管轮界+取消并产出**权威** kernel 终结 snapshot（install_authoritative_terminal_snapshot 整体覆盖）。
+- daemon 的 cancel 路径（lib.rs:3825-3834）只在 `was_stopped && Cancelled` 触发，随即被 kernel 终结 snapshot 覆盖 → **冗余**。迁移后：daemon 只需 `handle.cancel()`（lib.rs:3840）让 kernel 产终结 snapshot，**不做 daemon 侧 turn 清理**。→ Task1 不建 turn_tracker/cancel；Task3 删这些点。
+
+**决策2：cold_summaries 有 kernel 助手，双向已就绪。**
+- daemon 读点：live_api.rs:380（塞进 startup snapshot）、:516（压缩完清空）。
+- 编码：kernel 把 cold summary 存成合成 message（`internal_origin=LEGACY_COLD_SUMMARY_ORIGIN`，text 带 `LEGACY_COLD_SUMMARY_PREFIX`）——见 legacy_convert `snapshot_to_kernel`:473-485 / `snapshot_to_core`:1775-1793（双向）。常量在 kernel message.rs:9-17（磁盘契约，不可改）。
+- 助手：`atomcode_tuix::session::cold_summaries_from_messages(&[Message]) -> Vec<String>`（tuix session.rs:14）——**从 kernel messages 抽 Vec<String>**。⚠️该助手在 tuix，daemon 不宜依赖 tuix → **C2 需把它提到共享层**（kernel 或 capabilities；逐字同 legacy_convert 的 strip 逻辑），或 daemon 内联同款 strip。→ 这是 C2 唯一"新增共享助手"点。
+
+**决策3：持久化复用 `SessionManager::save_snapshot(id: &str, snap: &SessionSnapshot) -> SessionResult<()>`**（capabilities manager.rs:748）。`persist_pre_runtime_terminal`（legacy_convert）内部已走它 → daemon 迁移后直接 `manager.save_snapshot(id, &kernel_snapshot)`，去掉 core ConversationSnapshot 中间态。
+
+**规模影响**：Task1（LiveBuffer）可能**不再需要独立类型**——daemon 可直接持 `Arc<Mutex<Vec<kernel::Message>>>`（+ 用 cold_summaries helper 抽取），无 turn_tracker/cancel 要镜像。C2 收敛为：①提 cold_summaries_from_messages 到共享层 ②两路径把 Conversation→kernel Vec 并删 snapshot 往返+cancel 记账 ③删 legacy_convert 往返。**Task 1 可能并入 Task 2/3**（执行者据编译边界定）。
 
 ## Self-Review 记录
 

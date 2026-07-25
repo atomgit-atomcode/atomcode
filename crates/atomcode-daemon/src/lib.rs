@@ -81,7 +81,6 @@ use atomcode_auth as auth;
 use atomcode_capabilities::session::SessionManager as NativeSessionManager;
 use atomcode_coding::CodingRuntimeEvent;
 use atomcode_config::config::Config;
-use atomcode_core::conversation::Conversation;
 use atomcode_capabilities::mcp::McpRegistry;
 use atomcode_telemetry::detect_repo_origin;
 use atomcode_telemetry::{
@@ -522,7 +521,6 @@ impl Drop for SseConnectionGuard {
 /// Combined app state for Axum
 #[derive(Clone)]
 pub struct AppState {
-    pub sessions: SessionStore,
     pub project: ProjectStateStore,
     /// Admitted background chat operations and their session/request aliases.
     active_chats: ActiveChatRegistry,
@@ -760,144 +758,6 @@ fn strip_vision_marker(raw: &str) -> (String, bool) {
     }
 }
 
-fn restore_submitted_user_images_before_save(
-    messages: &mut [atomcode_core::conversation::message::Message],
-    submitted_text: &str,
-    submitted_images: &[atomcode_core::conversation::message::ImagePart],
-) {
-    if submitted_images.is_empty() {
-        return;
-    }
-
-    let Some(idx) = messages.iter().rposition(|msg| {
-        matches!(msg.role, atomcode_core::conversation::message::Role::User) && !msg.synthetic
-    }) else {
-        return;
-    };
-
-    messages[idx].content = atomcode_core::conversation::message::MessageContent::MultiPart {
-        text: if submitted_text.is_empty() {
-            None
-        } else {
-            Some(submitted_text.to_string())
-        },
-        images: submitted_images.to_vec(),
-    };
-}
-
-impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
-    fn from(msg: &atomcode_core::conversation::message::Message) -> Self {
-        let role = match msg.role {
-            atomcode_core::conversation::message::Role::System => "system",
-            atomcode_core::conversation::message::Role::User => "user",
-            atomcode_core::conversation::message::Role::Assistant => "assistant",
-            atomcode_core::conversation::message::Role::Tool => "tool",
-        };
-
-        let (content, tool_calls, tool_result, artifacts) = match &msg.content {
-            atomcode_core::conversation::message::MessageContent::Text(s) => {
-                // No artifacts from plain text messages (code blocks not extracted)
-                (s.clone(), None, None, None)
-            }
-            atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
-                text,
-                tool_calls,
-                ..
-            } => {
-                let calls: Vec<ToolCallInfo> = tool_calls
-                    .iter()
-                    .map(|tc| ToolCallInfo {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        arguments: tc.arguments.clone(),
-                        display: format_tool_args(&tc.name, &tc.arguments),
-                    })
-                    .collect();
-
-                // Extract artifacts from tool calls (e.g., write_file for HTML)
-                let artifacts = extract_artifacts_from_tool_calls(tool_calls);
-                (
-                    text.clone().unwrap_or_default(),
-                    Some(calls),
-                    None,
-                    artifacts,
-                )
-            }
-            atomcode_core::conversation::message::MessageContent::ToolResult(r) => {
-                let lines = r.output.lines().count();
-                let first_line = r.output.lines().next().unwrap_or("");
-                let summary = if first_line.len() > 100 {
-                    format!("{}...", first_line.chars().take(97).collect::<String>())
-                } else {
-                    first_line.to_string()
-                };
-                (
-                    r.output.clone(),
-                    None,
-                    Some(ToolResultInfo {
-                        call_id: r.call_id.clone(),
-                        success: r.success,
-                        summary,
-                        line_count: lines,
-                    }),
-                    None,
-                )
-            }
-            atomcode_core::conversation::message::MessageContent::ToolResultRef(r) => {
-                (r.summary.clone(), None, None, None)
-            }
-            atomcode_core::conversation::message::MessageContent::MultiPart { text, .. } => {
-                // 图片走下面的 images 字段渲染缩略图；文本里若拼接了 VL 识别结果
-                // （[图片内容（由 … 识别）] / [图片识别失败]，仅用于喂给非视觉模型），
-                // 展示时剥离，只保留用户原始输入，避免历史里出现一大段识别文字。
-                let raw = text.clone().unwrap_or_default();
-                let (display, _) = strip_vision_marker(&raw);
-                (display, None, None, None)
-            }
-        };
-        let mut content = content;
-
-        // 提取 MultiPart 的图片，供 webui 历史渲染缩略图。
-        let mut images =
-            match &msg.content {
-                atomcode_core::conversation::message::MessageContent::MultiPart {
-                    images, ..
-                } if !images.is_empty() => Some(
-                    images
-                        .iter()
-                        .map(|i| ImageData {
-                            media_type: i.media_type.clone(),
-                            data: i.data.clone(),
-                            missing: false,
-                        })
-                        .collect(),
-                ),
-                _ => None,
-            };
-        if matches!(msg.role, atomcode_core::conversation::message::Role::User) {
-            let (display, had_vision_marker) = strip_vision_marker(&content);
-            if had_vision_marker {
-                content = display;
-                if images.is_none() {
-                    images = Some(vec![ImageData::missing_placeholder()]);
-                }
-            }
-        }
-
-        Self {
-            role: role.to_string(),
-            content,
-            synthetic: msg.synthetic,
-            internal_origin: msg.internal_origin.clone(),
-            tool_calls,
-            tool_result,
-            artifacts,
-            images,
-            created_at: None,
-        }
-    }
-}
-
 impl MessageInfo {
     fn from_kernel(msg: &atomcode_kernel::message::Message) -> Self {
         use atomcode_kernel::message::Role;
@@ -970,17 +830,6 @@ impl MessageInfo {
             created_at: None,
         }
     }
-}
-
-/// Extract artifacts from tool calls (e.g., write_file creating HTML files)
-fn extract_artifacts_from_tool_calls(
-    tool_calls: &[atomcode_core::tool::ToolCall],
-) -> Option<Vec<ArtifactInfo>> {
-    extract_artifacts_from_call_fields(
-        tool_calls
-            .iter()
-            .map(|call| (call.name.as_str(), call.arguments.as_str())),
-    )
 }
 
 fn extract_artifacts_from_call_fields<'a>(
@@ -2108,7 +1957,7 @@ fn merge_catalog_session_messages_for_display(
         .iter()
         .filter(|message| {
             message.internal_origin.as_deref()
-                != Some(atomcode_core::conversation::LEGACY_COLD_SUMMARY_ORIGIN)
+                != Some(atomcode_kernel::message::LEGACY_COLD_SUMMARY_ORIGIN)
         })
         .collect();
     let mut presentation = std::collections::BTreeMap::<usize, Vec<_>>::new();
@@ -3466,9 +3315,6 @@ impl ChatRuntimeProjector {
     }
 }
 
-/// Global chat sessions store (in-memory for now)
-type SessionStore = Arc<RwLock<std::collections::HashMap<String, Conversation>>>;
-
 /// POST /chat - Stream chat response with SSE
 async fn chat_stream(
     State(state): State<AppState>,
@@ -3642,7 +3488,7 @@ async fn process_chat_request(
         .working_dir
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    let (session_id, initial_snapshot) = if let Some(ref session_id_str) = req.session_id {
+    let (session_id, initial_messages) = if let Some(ref session_id_str) = req.session_id {
         let project_bucket = NativeSessionManager::project_hash(&working_dir);
         let session = crate::legacy_convert::load_catalog_session_view_in_project(
             &project_bucket,
@@ -3653,12 +3499,9 @@ async fn process_chat_request(
                 "session {session_id_str:?} not found in project bucket {project_bucket}"
             )
         })?;
-        (
-            session.meta.id,
-            crate::legacy_convert::snapshot_to_core(&session.snapshot),
-        )
+        (session.meta.id, session.snapshot.messages)
     } else {
-        (uuid::Uuid::new_v4().to_string(), Default::default())
+        (uuid::Uuid::new_v4().to_string(), Vec::new())
     };
     active_chats
         .bind_session(&operation_id, &session_id)
@@ -3671,21 +3514,20 @@ async fn process_chat_request(
     // `permission_request` SSE event use this same key.
     let perm_session_key = session_id.clone();
 
-    // The core conversation is retained only as the current live transport adapter;
-    // persisted history was loaded from the native/kernel session view above.
-    let conversation = Arc::new(tokio::sync::Mutex::new(Conversation::from_snapshot(
-        initial_snapshot,
-    )));
+    // The kernel-native buffer is the live transport (cold summaries inline as
+    // synthetic messages); persisted history was loaded from the native session view
+    // above. The native runtime owns turn boundaries — no daemon-side turn tracker.
+    let conversation = Arc::new(tokio::sync::Mutex::new(initial_messages));
     // Keep the original images in the persisted/display conversation, but preprocess the
     // runtime caption first when the active model is text-only. `run_chat_turn_v2` detects
     // the marker and omits the already-described image bytes from the kernel input.
     {
-        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
+        use atomcode_kernel::message::{ImageContent, Message};
 
-        let images: Vec<ImagePart> = req
+        let images: Vec<ImageContent> = req
             .images
             .iter()
-            .map(|i| ImagePart {
+            .map(|i| ImageContent {
                 media_type: i.media_type.clone(),
                 data: i.data.clone(),
             })
@@ -3703,23 +3545,9 @@ async fn process_chat_request(
 
         let mut conv = conversation.lock().await;
         if images.is_empty() {
-            conv.add_user_message(&runtime_text);
+            conv.push(Message::user(runtime_text));
         } else {
-            let idx = conv.messages.len();
-            conv.messages.push(Message {
-                role: Role::User,
-                content: MessageContent::MultiPart {
-                    text: if runtime_text.is_empty() {
-                        None
-                    } else {
-                        Some(runtime_text)
-                    },
-                    images,
-                },
-                synthetic: false,
-                internal_origin: None,
-            });
-            conv.turn_tracker.on_user_message(idx);
+            conv.push(Message::user_with_images(runtime_text, images));
         }
     }
     // Interactive approval bridged over HTTP: interactive local clients (WebUI,
@@ -3742,10 +3570,12 @@ async fn process_chat_request(
         // conversation should still be resumable via /resume.
         {
             let conv = conversation.lock().await;
+            let snapshot =
+                atomcode_kernel::message::SessionSnapshot::new(conv.clone());
             if let Err(e) = crate::legacy_convert::persist_pre_runtime_terminal(
                 &working_dir,
                 &session_id,
-                &conv.snapshot(),
+                &snapshot,
             ) {
                 eprintln!("Warning: Failed to save native session after early stop: {e}");
             }
@@ -3818,36 +3648,12 @@ async fn process_chat_request(
         });
     }
 
-    // Save session after conversation completes.
-    // If the session was stopped mid-turn, clean up the partial conversation
-    // and save it so the user can /resume from this point — same behaviour as
-    // the TUI (persist_current_session on TurnCancelled).
-    let was_stopped = active_chats.was_stopped(&operation_id).await;
-
-    {
-        let mut conv = conversation.lock().await;
-        if was_stopped
-            && (projector.terminal_reason == Some(atomcode_kernel::event::StopReason::Cancelled)
-                || !projector.terminal_seen)
-        {
-            conv.cancel_current_turn();
-        }
-        let submitted_images: Vec<atomcode_core::conversation::message::ImagePart> = req
-            .images
-            .iter()
-            .map(|i| atomcode_core::conversation::message::ImagePart {
-                media_type: i.media_type.clone(),
-                data: i.data.clone(),
-            })
-            .collect();
-        restore_submitted_user_images_before_save(
-            &mut conv.messages,
-            &req.message,
-            &submitted_images,
-        );
-    }
-    // The native SnapshotHook owns terminal persistence. The core projection above
-    // exists only to shape the HTTP response and must never be written back.
+    // The native runtime owns turn boundaries, mid-turn cancel cleanup
+    // (`backfill_cancelled_tool_results`), and terminal persistence via its
+    // SnapshotHook + the authoritative terminal snapshot written back into the
+    // kernel buffer. The daemon buffer is a display/transport projection only and is
+    // never written back here, so no post-turn cancel bookkeeping or image restore is
+    // needed — the kernel terminal snapshot is authoritative.
 
     // Turn finished (the forwarding loop above exits when runtime_event_rx closes).
     // Drop the permission
@@ -5067,7 +4873,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     *DAEMON_PROJECT.lock().unwrap() = Some(project_store.clone());
 
     let state = AppState {
-        sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
         project: project_store,
         active_chats: ActiveChatRegistry::default(),
         mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
@@ -5440,7 +5245,6 @@ mod tests {
         let working_dir = home._dir.path().to_path_buf();
         let (shutdown_tx, _) = watch::channel(false);
         AppState {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             project: Arc::new(RwLock::new(ProjectState {
                 working_dir: working_dir.clone(),
                 previous_dir: None,
@@ -6282,14 +6086,13 @@ mod tests {
 
     #[test]
     fn message_info_user_text_with_vl_marker_renders_missing_image_placeholder() {
-        use atomcode_core::conversation::message::{Message, Role};
+        use atomcode_kernel::message::Message;
 
-        let msg = Message::new(
-            Role::User,
+        let msg = Message::user(
             "识别图片内容\n\n[图片内容（由 AtomGit-Qwen-Qwen3-VL-8B-Instruct 识别）]\n这是一张图片",
         );
 
-        let info = MessageInfo::from(&msg);
+        let info = MessageInfo::from_kernel(&msg);
 
         assert_eq!(info.content, "识别图片内容");
         assert!(matches!(
@@ -6300,10 +6103,10 @@ mod tests {
 
     #[test]
     fn message_info_preserves_synthetic_user_flag() {
-        use atomcode_core::conversation::message::Message;
+        use atomcode_kernel::message::Message;
 
         let msg = Message::synthetic_user("internal reminder");
-        let info = MessageInfo::from(&msg);
+        let info = MessageInfo::from_kernel(&msg);
 
         assert_eq!(info.role, "user");
         assert!(
@@ -6314,41 +6117,13 @@ mod tests {
 
     #[test]
     fn message_info_preserves_internal_origin() {
-        use atomcode_core::conversation::message::{Message, Role};
+        use atomcode_kernel::message::Message;
 
-        let mut msg = Message::new(Role::Assistant, "hidden");
+        let mut msg = Message::assistant("hidden", Vec::new());
         msg.internal_origin = Some("verify_cadence".to_string());
-        let info = MessageInfo::from(&msg);
+        let info = MessageInfo::from_kernel(&msg);
 
         assert_eq!(info.internal_origin.as_deref(), Some("verify_cadence"));
-    }
-
-    #[test]
-    fn restore_submitted_user_images_before_save_repairs_text_only_snapshot() {
-        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
-
-        let mut messages = vec![
-            Message::new(Role::System, "session context"),
-            Message::new(
-                Role::User,
-                "分析图片内容\n\n[图片内容（由 vl-provider 识别）]\n图片描述",
-            ),
-            Message::new(Role::Assistant, "done"),
-        ];
-        let images = vec![ImagePart {
-            media_type: "image/png".into(),
-            data: "aW1hZ2U=".into(),
-        }];
-
-        restore_submitted_user_images_before_save(&mut messages, "分析图片内容", &images);
-
-        assert!(matches!(
-            &messages[1].content,
-            MessageContent::MultiPart { text, images }
-                if text.as_deref() == Some("分析图片内容")
-                    && images.len() == 1
-                    && images[0].data == "aW1hZ2U="
-        ));
     }
 
     #[test]

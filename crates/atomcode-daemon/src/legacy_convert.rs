@@ -258,22 +258,6 @@ pub struct ImportOutcome {
     pub presentation: PresentationFile,
 }
 
-pub fn image_to_kernel(image: &ImagePart) -> ImageContent {
-    ImageContent {
-        media_type: image.media_type.clone(),
-        data: image.data.clone(),
-    }
-}
-
-fn role_to_kernel(role: &CoreRole) -> KernelRole {
-    match role {
-        CoreRole::System => KernelRole::System,
-        CoreRole::User => KernelRole::User,
-        CoreRole::Assistant => KernelRole::Assistant,
-        CoreRole::Tool => KernelRole::Tool,
-    }
-}
-
 fn role_to_core(role: &KernelRole) -> CoreRole {
     match role {
         KernelRole::System => CoreRole::System,
@@ -281,63 +265,6 @@ fn role_to_core(role: &KernelRole) -> CoreRole {
         KernelRole::Assistant => CoreRole::Assistant,
         KernelRole::Tool => CoreRole::Tool,
     }
-}
-
-pub fn message_to_kernel(message: &CoreMessage) -> KernelMessage {
-    let mut converted = match &message.content {
-        MessageContent::Text(text) => {
-            let mut converted = KernelMessage::user(text.clone());
-            converted.role = role_to_kernel(&message.role);
-            converted
-        }
-        MessageContent::AssistantWithToolCalls {
-            text,
-            tool_calls,
-            reasoning_content,
-            thinking_blocks,
-        } => {
-            let mut converted = KernelMessage::assistant(
-                text.clone().unwrap_or_default(),
-                tool_calls
-                    .iter()
-                    .map(|call| atomcode_kernel::tool::ToolCall {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                    })
-                    .collect(),
-            );
-            converted.reasoning = reasoning_content.clone();
-            converted.reasoning_blocks = thinking_blocks
-                .iter()
-                .map(|block| atomcode_kernel::message::ReasoningBlock {
-                    text: block.text.clone(),
-                    opaque: Some(block.signature.clone()),
-                    // Legacy files did not persist provider identity. The signature
-                    // is lossless, but attributing it to Anthropic would be a guess.
-                    provider: None,
-                })
-                .collect();
-            converted
-        }
-        MessageContent::ToolResult(result) => KernelMessage::tool_result(
-            result.call_id.clone(),
-            result.output.clone(),
-            !result.success,
-        ),
-        MessageContent::ToolResultRef(result) => KernelMessage::tool_result(
-            result.call_id.clone(),
-            result.summary.clone(),
-            !result.success,
-        ),
-        MessageContent::MultiPart { text, images } => KernelMessage::user_with_images(
-            text.clone().unwrap_or_default(),
-            images.iter().map(image_to_kernel).collect(),
-        ),
-    };
-    converted.synthetic = message.synthetic;
-    converted.internal_origin = message.internal_origin.clone();
-    converted
 }
 
 fn legacy_image_to_kernel(image: &LegacyImagePart) -> ImageContent {
@@ -468,20 +395,6 @@ pub(crate) fn message_to_core(message: &KernelMessage) -> CoreMessage {
         synthetic: message.synthetic,
         internal_origin: message.internal_origin.clone(),
     }
-}
-
-pub fn snapshot_to_kernel(
-    snapshot: &ConversationSnapshot,
-) -> atomcode_kernel::message::SessionSnapshot {
-    let mut messages = Vec::with_capacity(snapshot.messages.len() + snapshot.cold_summaries.len());
-    for summary in &snapshot.cold_summaries {
-        let mut message = KernelMessage::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}{summary}"));
-        message.synthetic = true;
-        message.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
-        messages.push(message);
-    }
-    messages.extend(snapshot.messages.iter().map(message_to_kernel));
-    atomcode_kernel::message::SessionSnapshot::new(messages)
 }
 
 struct NormalizedLegacyTurns {
@@ -1398,7 +1311,7 @@ pub fn append_catalog_presentation_in_project(
 pub fn persist_pre_runtime_terminal(
     working_dir: &std::path::Path,
     id: &str,
-    snapshot: &ConversationSnapshot,
+    snapshot: &atomcode_kernel::message::SessionSnapshot,
 ) -> anyhow::Result<()> {
     let manager = SessionManager::for_project(working_dir);
     let lease = manager.acquire_lease(id)?;
@@ -1409,7 +1322,7 @@ pub fn persist_pre_runtime_terminal(
     ]
     .iter()
     .any(|path| path.exists());
-    let mut native_snapshot = snapshot_to_kernel(snapshot);
+    let mut native_snapshot = snapshot.clone();
     if has_existing {
         let outcome = converge_session(&manager, &lease)?;
         native_snapshot.turn_counter = native_snapshot
