@@ -10,6 +10,7 @@ pub mod checkpoint;
 pub mod clock;
 pub mod conformance;
 pub mod event;
+pub use event::ROUND_CAP_CHECKPOINT_KIND;
 pub mod hook;
 pub mod message;
 pub mod middleware;

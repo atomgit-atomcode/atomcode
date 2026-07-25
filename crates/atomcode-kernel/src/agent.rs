@@ -805,6 +805,8 @@ pub struct Agent {
     /// history (backfilled to stay API-valid) instead of rolling back. Default
     /// `false` = CANCEL = UNDO. See `AgentBuilder::keep_interrupted_context`.
     keep_interrupted_context: bool,
+    /// See `AgentBuilder::round_cap_checkpoint`.
+    round_cap_checkpoint: bool,
 }
 
 impl Agent {
@@ -873,6 +875,7 @@ impl Agent {
             request_counter: AtomicU64::new(request_seed),
             clock: self.clock,
             keep_interrupted_context: self.keep_interrupted_context,
+            round_cap_checkpoint: self.round_cap_checkpoint,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle {
@@ -988,6 +991,8 @@ struct RunningAgent {
     clock: Arc<dyn Clock>,
     /// See `Agent::keep_interrupted_context`.
     keep_interrupted_context: bool,
+    /// See `AgentBuilder::round_cap_checkpoint`.
+    round_cap_checkpoint: bool,
 }
 
 impl RunningAgent {
@@ -1639,6 +1644,9 @@ impl RunningAgent {
         let mut last_round_sig: Option<String> = None;
         let mut repeat_rounds: u32 = 0;
         let mut repeat_nudged = false;
+        // Re-armable round cap: on each checkpoint "continue" this grows by the base
+        // `max_rounds`, giving a CONSTANT interval between confirmations.
+        let mut round_cap = self.max_rounds;
         loop {
             round += 1;
             // Mint this request's id AND build this round's TurnCtx UP FRONT — before
@@ -1659,17 +1667,41 @@ impl RunningAgent {
                 context_window: ctx_window,
                 used_tokens,
             };
-            // Hard cap (safety fuse): stop before exceeding max_rounds.
-            if let Some(max) = self.max_rounds {
-                if round > max {
-                    self.rt.emit(AgentEvent::Error {
-                        message: format!("max rounds ({max}) reached"),
-                        http_status: None,
-                        code: None,
-                    });
-                    self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
-                        .await;
-                    return;
+            // Hard cap (safety fuse). With `round_cap_checkpoint`, this becomes an
+            // interactive checkpoint instead of a hard error.
+            if let Some(cap) = round_cap {
+                if round > cap {
+                    if self.round_cap_checkpoint {
+                        let resp = self
+                            .rt
+                            .request(
+                                crate::event::ROUND_CAP_CHECKPOINT_KIND,
+                                serde_json::json!({ "round": round - 1, "cap": cap }),
+                            )
+                            .await;
+                        let cont = resp
+                            .get("continue")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        if cont {
+                            // Re-arm by the configured base (guaranteed Some here).
+                            let base = self.max_rounds.unwrap_or(cap);
+                            round_cap = Some(cap.saturating_add(base));
+                            // fall through: this round (== cap+1 <= new cap) proceeds.
+                        } else {
+                            self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx).await;
+                            return;
+                        }
+                    } else {
+                        self.rt.emit(AgentEvent::Error {
+                            message: format!("max rounds ({cap}) reached"),
+                            http_status: None,
+                            code: None,
+                        });
+                        self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                            .await;
+                        return;
+                    }
                 }
             }
             let start = self.clock.now_millis();
@@ -3214,6 +3246,12 @@ pub struct AgentBuilder {
     clock: Arc<dyn Clock>,
     /// See `Agent::keep_interrupted_context`. Default `false`.
     keep_interrupted_context: bool,
+    /// When true, the `max_rounds` fuse becomes an interactive CHECKPOINT: instead
+    /// of `emit(Error)+MaxRounds`, it round-trips the driver (kind
+    /// `ROUND_CAP_CHECKPOINT_KIND`) and only stops on a non-continue answer. Default
+    /// `false` → today's hard-stop (so a driver that doesn't implement the kind can
+    /// never park). Only a driver that renders the checkpoint sets this true.
+    round_cap_checkpoint: bool,
 }
 
 impl Default for AgentBuilder {
@@ -3267,6 +3305,7 @@ impl Default for AgentBuilder {
             clock: Arc::new(SystemClock::new()),
             // NEUTRAL default: preserve OFF → CANCEL = UNDO (current behavior).
             keep_interrupted_context: false,
+            round_cap_checkpoint: false,
         }
     }
 }
@@ -3309,6 +3348,11 @@ impl AgentBuilder {
     /// Hard cap on LLM rounds per turn (safety fuse; None = unlimited).
     pub fn max_rounds(mut self, n: u32) -> Self {
         self.max_rounds = Some(n);
+        self
+    }
+    /// See `AgentBuilder.round_cap_checkpoint`. Default false.
+    pub fn round_cap_checkpoint(mut self, on: bool) -> Self {
+        self.round_cap_checkpoint = on;
         self
     }
     /// Enable conservative exact tool-loop detection for this live session.
@@ -3541,6 +3585,7 @@ impl AgentBuilder {
             session_id: self.session_id,
             clock: self.clock,
             keep_interrupted_context: self.keep_interrupted_context,
+            round_cap_checkpoint: self.round_cap_checkpoint,
         }
     }
 }

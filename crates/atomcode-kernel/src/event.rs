@@ -2,6 +2,13 @@ use crate::message::{ImageContent, MessageMeta, SessionSnapshot};
 use crate::tool::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 
+/// Driver round-trip `kind` for the round-cap checkpoint (kernel-initiated:
+/// the fuse pauses the turn and asks the driver "continue past the cap?").
+/// The driver answers `{"continue": bool}`; any non-object / missing / Null
+/// response degrades to `false` (stop). Distinct from `request_user_input`
+/// (model-initiated, in atomcode-capabilities).
+pub const ROUND_CAP_CHECKPOINT_KIND: &str = "round_cap_checkpoint";
+
 pub type RequestId = u64;
 
 /// WHY a turn ended (FAILURE PERCEPTION). Carried by the terminal
