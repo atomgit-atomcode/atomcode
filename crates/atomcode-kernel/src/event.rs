@@ -11,6 +11,16 @@ pub const ROUND_CAP_CHECKPOINT_KIND: &str = "round_cap_checkpoint";
 
 pub type RequestId = u64;
 
+/// A user input that was authoritatively folded into an already-running turn.
+/// Kept separate from persisted [`crate::message::Message`]: this is a transient
+/// acknowledgement payload for drivers correlating their local pending UI.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteeredInput {
+    pub text: String,
+    #[serde(default)]
+    pub images: Vec<ImageContent>,
+}
+
 /// WHY a turn ended (FAILURE PERCEPTION). Carried by the terminal
 /// `AgentEvent::TurnComplete { reason }` and aggregated into `Outcome::stop`, so a
 /// driver (TUI / SWE-bench grader / CI) can ALWAYS tell a clean stop from a
@@ -226,6 +236,10 @@ pub enum AgentEvent {
     /// type-ahead indicator from "queued" to "folded into current turn".
     Steered {
         count: usize,
+        /// Exact inputs folded at this boundary. Additive for wire
+        /// compatibility: older events deserialize with an empty list.
+        #[serde(default)]
+        inputs: Vec<SteeredInput>,
     },
     /// A compaction is ABOUT TO RUN — emitted before the strategy plans/summarizes
     /// (a manual `/compact` may make a slow one-shot LLM summary call here). Lets a
@@ -302,6 +316,38 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn steered_serde_defaults_missing_inputs_and_roundtrips_payload() {
+        let old: AgentEvent = serde_json::from_str(r#"{"Steered":{"count":1}}"#).unwrap();
+        assert!(matches!(
+            old,
+            AgentEvent::Steered {
+                count: 1,
+                inputs
+            } if inputs.is_empty()
+        ));
+
+        let event = AgentEvent::Steered {
+            count: 1,
+            inputs: vec![SteeredInput {
+                text: "follow up".into(),
+                images: Vec::new(),
+            }],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let roundtrip: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            roundtrip,
+            AgentEvent::Steered {
+                count: 1,
+                inputs
+            } if inputs == vec![SteeredInput {
+                text: "follow up".into(),
+                images: Vec::new(),
+            }]
+        ));
     }
 
     #[test]

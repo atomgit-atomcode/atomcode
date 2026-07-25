@@ -12701,16 +12701,6 @@ fn handle_streaming_key(
                     q_markers.push(n);
                 }
             }
-            if ctx.live_binding.is_none() {
-                // Same as the idle submit path: echo the EXACT text queued for
-                // the agent (`expanded`) — the full pasted body, no
-                // `[Pasted #N …]` placeholder — while history keeps the folded
-                // `line` for compact Up-arrow recall.
-                renderer.render(UiLine::UserWithAttachments {
-                    text: expanded.clone(),
-                    attachments: q_markers.clone(),
-                });
-            }
             ctx.history.push(crate::input::history::HistoryEntry {
                 text: line.clone(),
                 images: q_refs,
@@ -12746,6 +12736,16 @@ fn handle_streaming_key(
                     }
                 }
                 _ => {
+                    if ctx.live_binding.is_none() {
+                        // A real type-ahead queue owns its acknowledgement in
+                        // transcript history immediately. SteerNow deliberately
+                        // skips this path: its footer remains authoritative until
+                        // the kernel confirms the fold with AgentEvent::Steered.
+                        renderer.render(UiLine::UserWithAttachments {
+                            text: expanded.clone(),
+                            attachments: q_markers.clone(),
+                        });
+                    }
                     app.message_queue.push_back(crate::state::QueuedMessage {
                         text: expanded,
                         images: q_images,
@@ -15043,7 +15043,7 @@ fn project_kernel_event(
             auto_resuming,
             server_message,
         }),
-        Kernel::Steered { count } => Some(AgentEvent::Steered { count }),
+        Kernel::Steered { count, inputs } => Some(AgentEvent::Steered { count, inputs }),
         Kernel::Cancelled
         | Kernel::Request { .. }
         | Kernel::Snapshot { .. }
@@ -18628,8 +18628,17 @@ fn handle_agent_event(
             renderer.render(UiLine::Muted(line));
             renderer.flush();
         }
-        AgentEvent::Steered { count } => {
-            state.on_steered(count);
+        AgentEvent::Steered { count: _, inputs } => {
+            let confirmed = state.on_steered(&inputs);
+            if ctx.live_binding.is_none() {
+                for pending in confirmed {
+                    renderer.render(UiLine::UserWithAttachments {
+                        text: pending.message.text,
+                        attachments: pending.message.image_markers,
+                    });
+                }
+                renderer.flush();
+            }
         }
     }
 }

@@ -1493,15 +1493,26 @@ impl UiState {
         self.pending_steers.push_back(pending);
     }
 
-    /// The kernel confirmed it folded `count` steered prompt(s) into the turn
-    /// (`AgentEvent::Steered`). Drain the pending count; `saturating_sub` so a
-    /// steer folded from another client (no local `on_steer_sent`) can't underflow.
-    pub fn on_steered(&mut self, count: usize) {
-        for _ in 0..count {
-            if self.pending_steers.pop_front().is_none() {
-                break;
+    /// The kernel confirmed one or more steered prompts. Return locally-owned
+    /// payloads whose content matches the authoritative folded inputs.
+    pub fn on_steered(
+        &mut self,
+        inputs: &[atomcode_kernel::event::SteeredInput],
+    ) -> Vec<PendingSteer> {
+        let mut confirmed = Vec::new();
+        for input in inputs {
+            let matches_front = self.pending_steers.front().is_some_and(|pending| {
+                pending.message.text == input.text && pending.message.images == input.images
+            });
+            if matches_front {
+                confirmed.push(
+                    self.pending_steers
+                        .pop_front()
+                        .expect("front was checked above"),
+                );
             }
         }
+        confirmed
     }
 
     /// Record a diagnostic error observation without ending the turn locally.
@@ -2828,15 +2839,53 @@ mod tests {
             vec!["one", "two"],
             "payload and display order survive until kernel confirmation"
         );
-        st.on_steered(1); // kernel confirms one fold
+        let confirmed = st.on_steered(&[atomcode_kernel::event::SteeredInput {
+            text: "one".into(),
+            images: Vec::new(),
+        }]); // kernel confirms one fold
+        assert_eq!(
+            confirmed
+                .iter()
+                .map(|pending| pending.message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one"],
+            "only confirmed local payloads are returned for transcript projection"
+        );
         assert_eq!(
             st.pending_steers.front().map(|p| p.display_text.as_str()),
             Some("two"),
             "drains from the front as folds are confirmed"
         );
-        st.on_steered(1);
+        assert!(
+            st.on_steered(&[atomcode_kernel::event::SteeredInput {
+                text: "remote".into(),
+                images: Vec::new(),
+            }])
+            .is_empty(),
+            "a different client's fold cannot consume the local queue front"
+        );
+        assert_eq!(
+            st.pending_steers.front().map(|p| p.display_text.as_str()),
+            Some("two")
+        );
+        assert_eq!(
+            st.on_steered(&[atomcode_kernel::event::SteeredInput {
+                text: "two".into(),
+                images: Vec::new(),
+            }])[0]
+                .message
+                .text,
+            "two"
+        );
         assert!(st.pending_steers.is_empty());
-        st.on_steered(3); // spurious / cross-client fold never underflows
+        assert!(
+            st.on_steered(&[atomcode_kernel::event::SteeredInput {
+                text: "remote".into(),
+                images: Vec::new(),
+            }])
+            .is_empty(),
+            "spurious / cross-client fold cannot fabricate a local echo"
+        );
         assert!(st.pending_steers.is_empty());
         // Every turn-end path clears it, parity with the other per-turn counters.
         st.on_steer_sent(pending("complete"));

@@ -706,6 +706,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// spacer inserted by `push_or_update_live_spinner`. It is removed with
     /// the spinner and never enters terminal scrollback.
     live_spinner_spacer_active: bool,
+    /// True after a painted full-viewport spinner frame temporarily replaced
+    /// one older middle row with the newest permanent tail. A following
+    /// permanent push must restore the continuous body before emitting LF.
+    live_spinner_tail_compacted: bool,
     /// Set by `emit_body_line_inner` when an overflow LF scrolled the whole
     /// viewport (footer included) up one row; consumed (cleared) by
     /// `take_pending_scroll_flush` so the render worker repaints the footer
@@ -914,6 +918,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             welcome_line_count: 0,
             live_spinner_active: false,
             live_spinner_spacer_active: false,
+            live_spinner_tail_compacted: false,
             pending_scroll_flush: false,
             in_sync_batch: false,
             inflight_tool: None,
@@ -4603,15 +4608,38 @@ impl<W: Write + Send> RetainedRenderer<W> {
         .min(body_height);
         let permanent_end = display_total.saturating_sub(transient_rows);
         let permanent_slots = body_height.saturating_sub(transient_rows);
-        let permanent_end_visible = self
-            .scrolled_off
-            .saturating_add(permanent_slots)
-            .min(permanent_end);
+        let permanent_visible = permanent_end.saturating_sub(self.scrolled_off);
+        self.live_spinner_tail_compacted =
+            transient_rows > 0 && permanent_visible > permanent_slots;
 
         // Clone before drawing — `screen.draw_row` takes &mut self.screen
         // and direct iteration would otherwise double-borrow.
-        let mut rows: Vec<Vec<Cell>> =
-            self.body_lines[self.scrolled_off..permanent_end_visible].to_vec();
+        //
+        // Keep the logical top row fixed while a transient strip is active,
+        // but also retain the newest permanent tail. At a full viewport the
+        // tail commonly ends in `User, blank`; keeping only the permanent
+        // prefix would hide that blank and make the spinner touch the user
+        // message. The middle omission is transient and is restored as soon
+        // as the spinner clears; preserving row 0 keeps the next overflow LF
+        // aligned with `scrolled_off`.
+        let mut rows: Vec<Vec<Cell>> = if permanent_visible <= permanent_slots {
+            self.body_lines[self.scrolled_off..permanent_end].to_vec()
+        } else if permanent_slots == 0 {
+            Vec::new()
+        } else {
+            // Preserve only the two newest permanent rows (normally
+            // `latest user message, blank`) and keep the rest as a
+            // continuous prefix. This confines the transient omission to
+            // the bottom few rows, so clearing the spinner restores only a
+            // tiny cell diff instead of repainting the whole viewport.
+            let tail_slots = permanent_slots.saturating_sub(1).min(2);
+            let prefix_slots = permanent_slots.saturating_sub(tail_slots);
+            let prefix_end = self.scrolled_off.saturating_add(prefix_slots);
+            let tail_start = permanent_end.saturating_sub(tail_slots);
+            let mut visible = self.body_lines[self.scrolled_off..prefix_end].to_vec();
+            visible.extend_from_slice(&self.body_lines[tail_start..permanent_end]);
+            visible
+        };
         if transient_rows > 0 {
             rows.extend_from_slice(&self.body_lines[display_total - transient_rows..display_total]);
         }
@@ -4865,6 +4893,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.live_spinner_active = false;
         let remove = 1 + usize::from(self.live_spinner_spacer_active);
         self.live_spinner_spacer_active = false;
+        self.live_spinner_tail_compacted = false;
         // (Cursor visibility is no longer coupled to the spinner — the
         // input box stays editable during streaming, so the caret is
         // always shown at the input position. See `paint_footer`.)
@@ -4893,6 +4922,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let _ = self.out.write_all(seq.as_bytes());
         }
         true
+    }
+
+    /// Clear a live spinner before appending permanent transcript rows.
+    ///
+    /// A painted full-viewport spinner may temporarily preserve the newest
+    /// permanent tail by omitting an older middle row. Before any eager body
+    /// emit can issue LF, restore the continuous permanent projection so the
+    /// physical rows promoted to native scrollback stay aligned with
+    /// `body_lines[scrolled_off..]`.
+    fn clear_live_spinner_before_permanent_body(&mut self) -> bool {
+        let restore_compacted_tail = self.live_spinner_tail_compacted;
+        let cleared = self.clear_live_spinner();
+        if cleared && restore_compacted_tail {
+            self.paint_frame();
+            self.flush_frame();
+        }
+        cleared
     }
 
     /// Lift the live in-flight tool-call strip off the body tail — the multi-line mirror of
@@ -4990,7 +5036,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // events fall back to no-op rather than CUP-rewriting some
         // unrelated row that took the group child's screen position.
         self.live_group = None;
-        if self.clear_live_spinner() {
+        if self.clear_live_spinner_before_permanent_body() {
             // `clear_live_spinner` already popped the spinner row from
             // `body_lines`. In append-only mode the next emit naturally
             // lands in the freed slot (footer_top shifted up by 1, the
@@ -5096,6 +5142,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
             self.body_lines.push(row_cells);
             self.live_spinner_active = true;
+            self.live_spinner_tail_compacted = false;
             self.dirty = true;
         }
         // (Cursor visibility is driven by `paint_footer` reading
@@ -6002,6 +6049,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.inflight_hint = None;
         self.live_spinner_active = false;
         self.live_spinner_spacer_active = false;
+        self.live_spinner_tail_compacted = false;
         self.last_mark_was_assistant = false;
         self.skip_body_scroll_count = 0;
         // Take the log out so `render()` can borrow `self` mutably; the
@@ -6299,7 +6347,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // ToolCall arm) so we can add one blank row of breathing room
                 // between assistant text and this tool.
                 let prev_was_assistant = self.last_mark_was_assistant;
-                self.clear_live_spinner();
+                self.clear_live_spinner_before_permanent_body();
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
@@ -6361,7 +6409,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // ToolCall arm) so we can add one blank row of breathing room
                 // between assistant text and this tool batch.
                 let prev_was_assistant = self.last_mark_was_assistant;
-                self.clear_live_spinner();
+                self.clear_live_spinner_before_permanent_body();
                 // Mark the batch header as a ToolCall anchor — Alt+↑/↓
                 // (message-jump) walks `message_marks`; without this
                 // the whole "● Running N calls in parallel" header +
@@ -6530,7 +6578,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // We need the entry-time value to decide whether to insert a
                 // leading blank row for breathing room.
                 let prev_was_assistant = self.last_mark_was_assistant;
-                self.clear_live_spinner();
+                self.clear_live_spinner_before_permanent_body();
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
@@ -12572,6 +12620,140 @@ mod tests {
             "expected exactly 1 blank row between user message and \
             spinner, got {} blank row(s):\n{}",
             spin_row.saturating_sub(user_row).saturating_sub(1),
+            vterm.dump()
+        );
+    }
+
+    #[test]
+    fn retained_full_viewport_keeps_user_spinner_blank_and_logical_top() {
+        let width = 80u16;
+        let height = 12u16;
+        let (mut r, buf) = new_capturing(width, height);
+        let mut vterm = crate::test_term::VirtualTerminal::new(width, height);
+        let status = status_basic();
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let body_capacity = (height as usize).saturating_sub(r.current_footer_rows());
+
+        for i in 0..body_capacity.saturating_sub(2) {
+            r.render(UiLine::AssistantText(format!("older-{i:02}\n")));
+        }
+        r.render(UiLine::User("latest-user".into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert_eq!(
+            r.body_lines.len().saturating_sub(r.scrolled_off),
+            body_capacity,
+            "setup must exactly fill the permanent body viewport"
+        );
+        let expected_top: String = r.body_lines[r.scrolled_off]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect();
+
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Noodling".into(),
+            status,
+            menu: None,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let user_row = (0..body_capacity)
+            .find(|row| vterm.row_text(*row).contains("latest-user"))
+            .unwrap_or_else(|| panic!("user echo missing:\n{}", vterm.dump()));
+        let spinner_row = (0..body_capacity)
+            .find(|row| vterm.row_text(*row).contains("Noodling"))
+            .unwrap_or_else(|| panic!("spinner missing:\n{}", vterm.dump()));
+
+        assert_eq!(
+            spinner_row - user_row,
+            2,
+            "full viewport must retain exactly one blank row between user and spinner:\n{}",
+            vterm.dump()
+        );
+        assert_eq!(
+            vterm.row_text(0).trim_end(),
+            expected_top.trim_end(),
+            "transient tail preservation must not move the logical scrollback top"
+        );
+    }
+
+    #[test]
+    fn retained_full_viewport_spinner_to_tool_restores_continuous_body() {
+        let width = 80u16;
+        let height = 12u16;
+        let (mut r, buf) = new_capturing(width, height);
+        let mut vterm = crate::test_term::VirtualTerminal::new(width, height);
+        let status = status_basic();
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let body_capacity = (height as usize).saturating_sub(r.current_footer_rows());
+
+        for i in 0..body_capacity.saturating_sub(2) {
+            r.render(UiLine::AssistantText(format!("tool-seed-{i:02}\n")));
+        }
+        r.render(UiLine::User("tool-request".into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Noodling".into(),
+            status,
+            menu: None,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            r.live_spinner_tail_compacted,
+            "setup must paint the full-viewport compacted spinner layout"
+        );
+
+        r.render(UiLine::ToolCall {
+            name: "Read".into(),
+            detail: "src/lib.rs".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(!r.live_spinner_tail_compacted);
+        let expected_top: String = r.body_lines[r.scrolled_off]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect();
+        assert_eq!(
+            vterm.row_text(0).trim_end(),
+            expected_top.trim_end(),
+            "spinner-to-tool transition left physical rows out of sync with scrolled_off:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("Read") && row.contains("src/lib.rs")),
+            "tool row missing after spinner transition:\n{}",
             vterm.dump()
         );
     }

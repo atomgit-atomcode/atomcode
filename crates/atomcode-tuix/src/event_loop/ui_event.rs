@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use atomcode_kernel::event::ToolBatchCall;
 use atomcode_kernel::message::ImageContent;
+use atomcode_kernel::message::SessionSnapshot;
 use atomcode_kernel::stream::TokenUsage;
 use atomcode_kernel::tool::ToolCall;
-use atomcode_kernel::event::ToolBatchCall;
-use atomcode_kernel::message::SessionSnapshot;
 
 /// TUI-only presentation events. Runtime and live-session inputs are projected
 /// into this type at the driver boundary; it is not an engine protocol.
@@ -169,6 +169,7 @@ pub enum UiEvent {
     },
     Steered {
         count: usize,
+        inputs: Vec<atomcode_kernel::event::SteeredInput>,
     },
 }
 

@@ -1400,7 +1400,10 @@ impl RunningAgent {
                     // boundary to fold the prompt into the CURRENT turn's next request
                     // (rather than running it as a separate turn afterward).
                     Some(AgentCommand::SendMessage { text, images }) => {
-                        steer.lock().unwrap_or_else(|e| e.into_inner()).push_back(SteerInput { text, images });
+                        steer.lock().unwrap_or_else(|e| e.into_inner()).push_back(SteerInput {
+                            text,
+                            images,
+                        });
                     }
                     // A Compact mid-turn is QUEUED, not executed: compacting inside a
                     // running turn would reopen the within-turn cache break (and
@@ -1735,10 +1738,18 @@ impl RunningAgent {
                 repeat_rounds = 0;
                 repeat_nudged = false;
                 let n = steered.len();
-                for s in steered {
-                    convo.push(Message::user_with_images(s.text, s.images));
+                let mut inputs = Vec::with_capacity(n);
+                for input in steered {
+                    convo.push(Message::user_with_images(
+                        input.text.clone(),
+                        input.images.clone(),
+                    ));
+                    inputs.push(crate::event::SteeredInput {
+                        text: input.text,
+                        images: input.images,
+                    });
                 }
-                self.rt.emit(AgentEvent::Steered { count: n });
+                self.rt.emit(AgentEvent::Steered { count: n, inputs });
             }
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
@@ -4316,7 +4327,7 @@ mod steer_buffer_tests {
     }
 
     /// Injecting one steer during round 1 must emit exactly one
-    /// `AgentEvent::Steered { count: 1 }` before the turn completes.
+    /// `AgentEvent::Steered { count: 1, .. }` before the turn completes.
     #[tokio::test]
     async fn steer_emits_a_steered_event_with_count() {
         let deferred_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentCommand>>>> =
@@ -4358,16 +4369,23 @@ mod steer_buffer_tests {
                 images: vec![],
             })
             .unwrap();
-        let mut steered_total = 0usize;
+        let mut steered_inputs = Vec::new();
         while let Some(ev) = handle.events.recv().await {
             match ev {
-                AgentEvent::Steered { count } => steered_total += count,
+                AgentEvent::Steered { count, inputs } => {
+                    assert_eq!(count, inputs.len());
+                    steered_inputs.extend(inputs);
+                }
                 AgentEvent::TurnComplete { .. } => break,
                 _ => {}
             }
         }
         assert_eq!(
-            steered_total, 1,
+            steered_inputs,
+            vec![crate::event::SteeredInput {
+                text: "STEER-COUNT".into(),
+                images: Vec::new(),
+            }],
             "one folded prompt → Steered {{ count: 1 }}"
         );
     }
