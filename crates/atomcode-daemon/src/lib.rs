@@ -2506,7 +2506,7 @@ async fn get_models() -> impl IntoResponse {
             provider_type: p.provider_type.clone(),
             is_default: name == &config.default_provider,
             effort_applicable:
-                atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(&p.model),
+                atomcode_capabilities::provider::reason_effort_applicable(&p.model),
             reasoning_effort: p.reasoning_effort.clone(),
         })
         .collect();
