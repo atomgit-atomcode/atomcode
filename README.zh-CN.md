@@ -544,8 +544,7 @@ atomcode/
     atomcode-review/        # 代码评审专业化
     atomcode-tuix/          # 终端 UI
     atomcode-cli/           # TUI 与 headless 入口
-    atomcode-daemon/        # HTTP/SSE/WebSocket 传输层
-    atomcode-core/          # 过渡期 session/plugin/live 兼容代码
+    atomcode-daemon/        # HTTP/SSE/WebSocket 传输层及历史 session importer
 ```
 
 coding 主调用链是 `CLI/TUI/daemon → CodingRuntime → kernel`。已经退役的 core agent
@@ -624,11 +623,11 @@ cargo run -p atomcode-daemon
 cargo test
 
 # 运行指定 crate 的测试
-cargo test -p atomcode-core
+cargo test -p atomcode-capabilities
 cargo test -p atomcode-tuix
 
 # 运行指定的用例
-cargo test -p atomcode-core test_name
+cargo test -p atomcode-capabilities test_name
 ```
 
 ### 常用命令
@@ -697,8 +696,8 @@ cargo install --path crates/atomcode-cli
 
 ### 从哪里上手
 
-- **新增工具** —— 在 `crates/atomcode-core/src/tool/` 下实现 `Tool` trait
-- **新增模型提供方** —— 在 `crates/atomcode-core/src/provider/` 下实现 `LlmProvider`
+- **新增工具** —— 在 `crates/atomcode-capabilities/src/tools/` 下实现 `Tool` trait
+- **新增模型提供方** —— 在 `crates/atomcode-capabilities/src/provider/` 下实现 `LlmProvider`
 - **改进 UI** —— 渲染相关代码在 `crates/atomcode-tuix/src/render/`
 - **修 Bug** —— 到 [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) 上挑一个
 

@@ -551,8 +551,7 @@ atomcode/
     atomcode-review/        # Review specialization
     atomcode-tuix/          # Terminal UI
     atomcode-cli/           # TUI and headless entry point
-    atomcode-daemon/        # HTTP/SSE/WebSocket transport
-    atomcode-core/          # Transitional session/plugin/live compatibility code
+    atomcode-daemon/        # HTTP/SSE/WebSocket transport + legacy session importer
 ```
 
 The coding path is `CLI/TUI/daemon → CodingRuntime → kernel`. The retired core
@@ -631,11 +630,11 @@ cargo run -p atomcode-daemon
 cargo test
 
 # Run tests for a specific crate
-cargo test -p atomcode-core
+cargo test -p atomcode-capabilities
 cargo test -p atomcode-tuix
 
 # Run a specific test
-cargo test -p atomcode-core test_name
+cargo test -p atomcode-capabilities test_name
 ```
 
 ### Useful Commands
@@ -704,8 +703,8 @@ Contributions are welcome! AtomCode is in active development.
 
 ### Where to Start
 
-- **Add a new tool** — implement the `Tool` trait in `crates/atomcode-core/src/tool/`
-- **Add a new provider** — implement `LlmProvider` in `crates/atomcode-core/src/provider/`
+- **Add a new tool** — implement the `Tool` trait in `crates/atomcode-capabilities/src/tools/`
+- **Add a new provider** — implement `LlmProvider` in `crates/atomcode-capabilities/src/provider/`
 - **Improve the UI** — rendering lives in `crates/atomcode-tuix/src/render/`
 - **Fix bugs** — check [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) for open bugs
 

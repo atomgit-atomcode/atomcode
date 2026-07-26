@@ -57,7 +57,9 @@ mod skill_first;
 pub mod subagent_tiers;
 mod todo;
 
-pub use assemble::{build_coding_agent, build_coding_agent_with};
+pub use assemble::{
+    build_coding_agent, build_coding_agent_with, try_build_coding_agent_with,
+};
 /// The image type carried by [`UserInput`] / [`ImagePreprocessor`], re-exported
 /// so driver crates can implement the hook without naming `atomcode_kernel`.
 pub use atomcode_kernel::message::ImageContent;

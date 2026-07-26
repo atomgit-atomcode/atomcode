@@ -38,6 +38,8 @@ pub mod ast_grep;
 /// AtomGit REST tools (repo / pr / issue). Opt-in `atomgit` feature.
 #[cfg(feature = "atomgit")]
 pub mod atomgit;
+#[cfg(feature = "atomgit")]
+pub mod atomgit_bash_gate;
 pub mod bash;
 pub mod bash_workspace_gate;
 pub mod cd;
@@ -83,6 +85,8 @@ pub use ast_grep::AstGrepTool;
 pub use atomgit::{
     atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, AtomgitPrTool, AtomgitRepoTool,
 };
+#[cfg(feature = "atomgit")]
+pub use atomgit_bash_gate::AtomgitBashGate;
 pub use bash::{normalize_command_for_grant, run_shell, BashTool, ShellExit, ShellOutcome};
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;

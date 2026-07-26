@@ -130,7 +130,7 @@ atomcode -p "explain this code" --provider local --model qwen2.5:14b</code></pre
       </div>
 
       <h2>atomcode-daemon</h2>
-      <p><code>atomcode-daemon</code> is a standalone binary that re-uses <code>atomcode-core</code>. It exposes an HTTP + Server-Sent Events API for web frontends, IDE plugins, and editor extensions. The official AtomCode VS Code extension and the AtomCode Air desktop app both connect through it.</p>
+      <p><code>atomcode-daemon</code> is a standalone transport adapter over <code>CodingRuntime</code>. It exposes an HTTP + Server-Sent Events API for web frontends, IDE plugins, and editor extensions. The official AtomCode VS Code extension and the AtomCode Air desktop app both connect through it.</p>
 
       <h3>Launching</h3>
       <pre><code># Recommended: launch via the CLI subcommand — it invokes the sibling atomcode-daemon binary
@@ -240,7 +240,7 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
       </table>
 
       <h3>SSE streaming chat</h3>
-      <p>The SSE stream returned by <code>POST /chat</code> includes events for AI text deltas, reasoning deltas, tool-call batches (start / end), token stats, errors, and more. The full event schema is the <code>TurnEvent</code> definition in <code>crates/atomcode-core/src/turn/event.rs</code>.</p>
+      <p>The SSE stream returned by <code>POST /chat</code> includes events for AI text deltas, reasoning deltas, tool-call batches (start / end), token stats, errors, and more. The daemon wire schema is defined by <code>LiveWireEvent</code> in <code>crates/atomcode-daemon/src/live_api.rs</code>.</p>
       <p>Frontends can consume the stream with the native <code>EventSource</code> or any SSE client library.</p>
 
       <h3>CORS</h3>

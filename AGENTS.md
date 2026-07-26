@@ -10,7 +10,7 @@
 - `crates/atomcode-capabilities/`；
 - `crates/atomcode-coding/` 的 runtime、provider、session、controller；
 - CLI、TUI、daemon、ACP、clix 的 runtime、session、command/event 接入；
-- `atomcode-core` 中仍被接入层使用的 conversation、plugin、live、MCP 等模块；
+- daemon 中保留的历史 core JSON 单向 importer 与兼容 DTO；
 - 公共协议、持久化格式、审批、安全边界或跨 crate 依赖方向。
 
 本文件描述的是约束，不是永远正确的现状快照。若约束中的事实与当前代码冲突，以当前代码为准；先说明差异，再修正文档或实现，不得按旧路径盲目补代码。
@@ -37,12 +37,12 @@ CLI / TUI / daemon / background / ACP / clix code
 - core legacy `AgentClient/AgentCommand/AgentEvent`、v1 engine 和 `atomcode-bridge` 已退役。不得重新引入 bridge、双 endpoint、v1/v2 选择开关或 core driver fallback。
 - `atomcode-kernel`、`atomcode-capabilities`、`atomcode-coding` 的生产依赖必须保持 core-free；尤其禁止 capabilities 反向依赖 core、L2 或前端。
 - native `SessionManager/SessionMeta/SessionSnapshot/PresentationFile` 是唯一 session 持久化模型；core session 模块与持久化 API 已退役。历史 core JSON 只允许由 daemon 私有 DTO 单向导入，禁止恢复 legacy writer、core 磁盘投影或双向持久化转换。
-- `atomcode-core` 当前仍承载 conversation、plugin、live transport 和部分旧能力实现。它们不是旧 engine driver 协议，但属于待按职责收口的接入层/兼容层负担。
-- daemon/TUI 中的 core ↔ kernel 数据转换只允许服务仍在运行的 live/provider/UI 投影；持久化读取必须先得到严格 native 聚合。不得借转换层恢复旧 engine 命令、第二 runtime owner、core session 磁盘模型或静默 fallback。
+- `atomcode-core` crate 已从 workspace 删除；生产代码不得重新依赖或重建同名兼容层。历史 core JSON 只由 daemon 私有 DTO 单向导入。
+- daemon/TUI 的 live/provider/UI 投影必须直接使用 kernel/coding 中立类型；持久化读取必须先得到严格 native 聚合。不得借转换层恢复旧 engine 命令、第二 runtime owner、core session 磁盘模型或静默 fallback。
 
 ## 架构方向
 
-- 目标是单一状态所有权、清晰依赖方向和可验证兼容性，不是为了 LOC 或 crate 数量强行“清零 core”。
+- 目标是单一状态所有权、清晰依赖方向和可验证兼容性；已经删除的 core 不得以 facade、兼容 crate 或复制状态所有者的方式回流。
 - driver 负责输入、展示、传输和明确的本地操作；coding runtime 负责业务生命周期；kernel 只负责中立 agent 循环；capabilities 提供可复用能力实现。
 - 不需要运行中 conversation/provider/session 的本地查询或副作用，应留在 driver/local service。需要操作运行中状态的行为必须通过 runtime 定义清楚的命令、事件和终态。
 - 新能力优先放入职责正确的现有层。不得把业务语义下沉到 kernel，也不得为了去 core 新建一个无边界的“杂物 crate”。
@@ -66,26 +66,19 @@ CLI / TUI / daemon / background / ACP / clix code
 
 当任务涉及 turn completion 或 compaction 时，先复核现有 `LifecycleHooks::turn_complete`、kernel 终止路径和 `atomcode-capabilities` compaction 实现。没有证明现有 seam 缺失前，不得新增重叠 hook、第二压缩状态机或猜测式回合末补丁。
 
-## Core 收口策略
+## 历史兼容面维护
 
-后续可以继续减少 core，但必须按垂直职责切片，不做大爆炸搬迁。
+`atomcode-core` 已完成退役。后续兼容工作只允许围绕仍保留的单向 importer 和明确的
+wire DTO 展开：
 
-一个收口切片只有同时满足以下条件才有实际价值：
+1. 明确当前数据或状态的唯一 owner；
+2. 找全持久化格式和兼容入口；
+3. 历史格式只能作为边界清晰、可测试的单向 importer；
+4. importer 消费者归零后删除对应 DTO、转换和测试；
+5. 禁止恢复 legacy writer、双向转换、运行时 fallback 或新的 core facade。
 
-1. 明确当前能力、数据或状态的唯一 owner；
-2. 找全生产消费者、持久化格式和兼容入口；
-3. 所有目标消费者切到新 owner；
-4. 历史格式需要保留时，降为边界清晰、可测试的单向 importer；
-5. 删除旧实现、旧依赖、重复转换或 fallback，而不只是复制代码。
-
-当前优先方向是：
-
-1. 单独收口 core live transport：先定义 owner、kernel-neutral 事件 DTO、审批和多视图回放边界，不与已完成的 session 持久化迁移混做；
-2. 按职责收口 plugin、MCP host 等接入层服务；
-3. 在消费者归零后删除 core 中重复的 provider/tool/MCP/LSP/graph/semantic 等实现；
-4. 只有 core 自然失去职责和消费者后，才从 workspace 移除 crate。
-
-收口进度以“减少一个状态所有者、一个数据模型、一条转换链、一项直接依赖或一条 fallback”为度量。不得以移动文件、增加 facade、创建新 crate 或净删除行数冒充架构进度。
+兼容收口以“减少一个 importer、数据模型、转换链或 fallback”为度量。不得以移动文件、
+增加 facade、创建新 crate 或净删除行数冒充架构进度。
 
 ## 兼容面迁移与退役判定
 

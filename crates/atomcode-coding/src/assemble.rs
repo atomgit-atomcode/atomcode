@@ -51,13 +51,45 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
     provider_cfg.supports_vision = model_suggests_vision(&cfg.model);
     let provider = OpenAiCompatProvider::new(provider_cfg)
         .map_err(|e| format!("provider init failed: {}", e.message))?;
-    Ok(build_coding_agent_with(&cfg, Arc::new(provider)))
+    try_build_coding_agent_with(&cfg, Arc::new(provider))
 }
 
 /// The SAME coding policy as [`build_coding_agent`] but with a CALLER-SUPPLIED provider
 /// (a mock for tests, or any custom [`LlmProvider`]). Use this when you construct the
 /// provider yourself; otherwise prefer [`build_coding_agent`].
+///
+/// This compatibility entry point keeps its historical infallible signature. If optional
+/// AtomGit client setup fails, the agent remains usable without those tools and receives an
+/// explicit persona warning. New callers that need startup failure propagation should use
+/// [`try_build_coding_agent_with`].
 pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmProvider>) -> Agent {
+    match mount_coding_tools(model_suggests_vision(&cfg.model)) {
+        Ok(tools) => build_coding_agent_from_tools(cfg, provider, tools, None),
+        Err(_error) => build_coding_agent_from_tools(
+            cfg,
+            provider,
+            mount_base_coding_tools(model_suggests_vision(&cfg.model)),
+            Some("AtomGit tools are unavailable because capability setup failed.".to_string()),
+        ),
+    }
+}
+
+/// Fallible variant of [`build_coding_agent_with`] for production callers that require
+/// every feature-enabled capability to be present before accepting work.
+pub fn try_build_coding_agent_with(
+    cfg: &CodingAgentConfig,
+    provider: Arc<dyn LlmProvider>,
+) -> Result<Agent, String> {
+    let tools = mount_coding_tools(model_suggests_vision(&cfg.model))?;
+    Ok(build_coding_agent_from_tools(cfg, provider, tools, None))
+}
+
+fn build_coding_agent_from_tools(
+    cfg: &CodingAgentConfig,
+    provider: Arc<dyn LlmProvider>,
+    tools: MountedTools,
+    startup_warning: Option<String>,
+) -> Agent {
     let summary_provider = provider.clone(); // tier-2 overflow summary uses the same provider
                                              // Single source of truth for the todo switch (`ATOMCODE_TODO` env overrides the
                                              // default-on config). Used for BOTH the persona usage-guidance section AND the
@@ -65,15 +97,21 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
                                              // when the tool + hook aren't mounted (and vice-versa). The `todowrite` TOOL
                                              // itself is registered on the same env gate in `atomcode-capabilities`.
     let todo_enabled = crate::persona::todo_switch_enabled();
+    let mut persona = coding_persona_with_language(
+        &cfg.model,
+        cfg.preferred_language,
+        todo_enabled,
+        crate::persona::request_user_input_switch_enabled(),
+    );
+    if let Some(warning) = startup_warning {
+        persona.push_str("\n\n<system-reminder>");
+        persona.push_str(&warning);
+        persona.push_str("</system-reminder>");
+    }
     let mut builder = Agent::builder()
         .provider(provider)
-        .tools(mount_coding_tools(model_suggests_vision(&cfg.model)))
-        .persona(coding_persona_with_language(
-            &cfg.model,
-            cfg.preferred_language,
-            todo_enabled,
-            crate::persona::request_user_input_switch_enabled(),
-        ))
+        .tools(tools)
+        .persona(persona)
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
         // BEFORE approval so its `Allow` short-circuits the prompt.
@@ -133,6 +171,9 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
     #[cfg(feature = "atomgit")]
     {
         builder = builder.middleware(Arc::new(
+            atomcode_capabilities::tools::AtomgitBashGate::new(),
+        ));
+        builder = builder.middleware(Arc::new(
             atomcode_capabilities::tools::GitPushLabelMiddleware::new(cfg.working_dir.clone()),
         ));
     }
@@ -141,21 +182,30 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
 
 /// Register the neutral coding tools + codeintel into a fresh registry and mount the
 /// union (everything visible to the model).
-fn mount_coding_tools(vision: bool) -> MountedTools {
+fn mount_coding_tools(vision: bool) -> Result<MountedTools, String> {
+    let (mut registry, mut names) = base_coding_tools(vision);
+    #[cfg(feature = "atomgit")]
+    register_atomgit_capabilities(&mut registry, &mut names)?;
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    Ok(registry.mount(&refs))
+}
+
+fn mount_base_coding_tools(vision: bool) -> MountedTools {
+    let (registry, names) = base_coding_tools(vision);
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    registry.mount(&refs)
+}
+
+fn base_coding_tools(vision: bool) -> (ToolRegistry, Vec<String>) {
     let mut registry = ToolRegistry::new();
     register_coding_tools_with_vision(&mut registry, vision);
     register_codeintel_tools(&mut registry);
-    #[cfg_attr(not(feature = "atomgit"), allow(unused_mut))]
-    let mut names: Vec<String> = coding_tool_names()
+    let names: Vec<String> = coding_tool_names()
         .iter()
         .chain(codeintel_tool_names().iter())
         .map(|name| (*name).to_string())
         .collect();
-    #[cfg(feature = "atomgit")]
-    register_atomgit_capabilities(&mut registry, &mut names)
-        .expect("the static AtomGit REST client configuration must be valid");
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    registry.mount(&refs)
+    (registry, names)
 }
 
 /// Register the shipped AtomGit REST capabilities into a coding tool catalog.

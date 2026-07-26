@@ -1262,6 +1262,14 @@ pub fn assemble(
         .middleware(Arc::new(SensitivePathGate::with_store(
             parts.sensitive_path_grants.clone(),
         )));
+    #[cfg(feature = "atomgit")]
+    {
+        // Typed AtomGit tools are the only supported API path: they keep credentials
+        // outside model-visible arguments and retain action-aware approval semantics.
+        builder = builder.middleware(Arc::new(
+            atomcode_capabilities::tools::AtomgitBashGate::new(),
+        ));
+    }
     // CC external hooks (PreToolUse gate). Runs AFTER the hard PlanMode/SensitivePath gates
     // (which must stay un-bypassable by a hook `allow`) but BEFORE every auto-approve
     // convenience gate — OpenFileWorkspaceGate and especially WriteApprovalGate, which

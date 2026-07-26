@@ -346,9 +346,11 @@ fn legacy_message_to_kernel(message: &LegacyMessage) -> KernelMessage {
                 .collect();
             converted
         }
-        LegacyContent::ToolResult(result) => {
-            KernelMessage::tool_result(result.call_id.clone(), result.output.clone(), !result.success)
-        }
+        LegacyContent::ToolResult(result) => KernelMessage::tool_result(
+            result.call_id.clone(),
+            result.output.clone(),
+            !result.success,
+        ),
         LegacyContent::ToolResultRef(result) => KernelMessage::tool_result(
             result.call_id.clone(),
             result.summary.clone(),
@@ -787,8 +789,7 @@ fn converge_session_with_retries(
                 && snapshot.messages.is_empty()
                 && presentation.entries.is_empty()
                 && meta.import_info.as_ref().is_some_and(|info| {
-                    info.kind == ImportKind::MetadataOnly
-                        && info.source_sha256 == sha256_hex(bytes)
+                    info.kind == ImportKind::MetadataOnly && info.source_sha256 == sha256_hex(bytes)
                 });
             if recoverable_empty_import {
                 let legacy: LegacySession = serde_json::from_slice(bytes)
@@ -799,8 +800,7 @@ fn converge_session_with_retries(
                         legacy.id
                     )
                 }
-                let (converted, diagnostic) =
-                    convert_legacy_session_with_diagnostic(&legacy)?;
+                let (converted, diagnostic) = convert_legacy_session_with_diagnostic(&legacy)?;
                 if !converted.snapshot.messages.is_empty() {
                     let mut recovered_meta = converted.meta;
                     recovered_meta.auto_name_from_messages(&converted.snapshot.messages);
@@ -810,8 +810,8 @@ fn converge_session_with_retries(
                         recovered_meta.ai_named = meta.ai_named;
                     }
                     recovered_meta.updated_at = recovered_meta.updated_at.max(meta.updated_at);
-                    recovered_meta.message_count =
-                        u32::try_from(converted.snapshot.messages.len()).map_err(|_| {
+                    recovered_meta.message_count = u32::try_from(converted.snapshot.messages.len())
+                        .map_err(|_| {
                             anyhow::anyhow!("native snapshot message count exceeds u32")
                         })?;
                     recovered_meta.owner = StorageOwner::Native;
@@ -1127,10 +1127,7 @@ pub fn prepare_catalog_session_resume_in_project(
 pub fn prepare_catalog_session_resume_any_project(
     id: &str,
 ) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
-    prepare_catalog_session_resume_any_project_in_root(
-        &SessionManager::sessions_root(),
-        id,
-    )
+    prepare_catalog_session_resume_any_project_in_root(&SessionManager::sessions_root(), id)
 }
 
 pub(crate) fn prepare_catalog_session_resume_any_project_in_root(
@@ -1139,11 +1136,7 @@ pub(crate) fn prepare_catalog_session_resume_any_project_in_root(
 ) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
     let scan = SessionManager::scan_catalog(sessions_root);
     report_catalog_diagnostics(&scan.diagnostics);
-    let Some(entry) = scan
-        .entries
-        .iter()
-        .find(|entry| entry.id == id)
-    else {
+    let Some(entry) = scan.entries.iter().find(|entry| entry.id == id) else {
         reject_matching_catalog_diagnostic(&scan.diagnostics, id)?;
         return Ok(None);
     };
@@ -1360,7 +1353,6 @@ pub fn delete_catalog_project_in_project(project_bucket: &str) -> anyhow::Result
     Ok(())
 }
 
-
 /// Append UI-only text without ever inserting it into the runtime snapshot. Native
 /// sessions use the stable turn-anchored presentation sidecar; legacy sessions keep
 /// their historical JSON representation until S4b performs cutover.
@@ -1462,6 +1454,23 @@ fn delete_catalog_session_in_root(
     validate_project_bucket(project_bucket)?;
     let manager = SessionManager::with_root(sessions_root.join(project_bucket));
     let lease = manager.acquire_lease(id)?;
+    let targets = [
+        manager.snapshot_path(id)?,
+        manager.meta_path(id)?,
+        manager.jsonl_path(id)?,
+        manager.presentation_path(id)?,
+        manager.legacy_path(id)?,
+    ];
+    let mut found = false;
+    for path in &targets {
+        found |= path.try_exists()?;
+    }
+    if !found {
+        return Err(SessionStoreError::NotFound {
+            path: manager.meta_path(id)?,
+        }
+        .into());
+    }
     manager.delete(&lease)?;
     Ok(())
 }
@@ -1764,13 +1773,10 @@ mod tests {
     /// Covers: AssistantWithToolCalls (tool_calls + reasoning_content + thinking_blocks),
     /// ToolResult, ToolResultRef, MultiPart (with image), cold_summaries, display_messages,
     /// turn_stats, user_renamed:true, seconds-level created_at/updated_at.
-    const LEGACY_JSON: &str = include_str!(
-        "../tests/fixtures/session/legacy_full.json"
-    );
+    const LEGACY_JSON: &str = include_str!("../tests/fixtures/session/legacy_full.json");
 
     fn full_legacy_session() -> LegacySession {
-        serde_json::from_str(LEGACY_JSON)
-            .expect("full legacy session fixture must parse")
+        serde_json::from_str(LEGACY_JSON).expect("full legacy session fixture must parse")
     }
 
     /// Characterization (baseline) test: locks the current importer output so that
@@ -1783,9 +1789,11 @@ mod tests {
         // kernel snapshot: 2 cold-summary synthetics + 7 real messages = 9
         assert_eq!(out.snapshot.messages.len(), 9);
         // cold-summary synthetic messages carry the legacy origin marker
-        assert!(out.snapshot.messages.iter().any(|m| {
-            m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
-        }));
+        assert!(out
+            .snapshot
+            .messages
+            .iter()
+            .any(|m| { m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN) }));
         // meta: naming flags and seconds → milliseconds timestamp conversion
         assert_eq!(out.meta.user_renamed, true);
         assert_eq!(out.meta.created_at, session.created_at as i64 * 1000);
@@ -2247,8 +2255,7 @@ mod tests {
     fn full_legacy_import_replaces_an_orphan_presentation_from_an_incomplete_native_state() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let expected = convert_legacy_session(&legacy).unwrap().presentation;
         let orphan = PresentationFile {
@@ -2278,8 +2285,7 @@ mod tests {
     fn metadata_only_import_preserves_an_existing_native_presentation() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let native_snapshot =
             atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
@@ -2325,8 +2331,7 @@ mod tests {
     fn metadata_only_import_recomputes_after_full_state_cas_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let (converted, diagnostic) = convert_legacy_session_with_diagnostic(&legacy).unwrap();
         let mut stale_snapshot =
@@ -2388,8 +2393,7 @@ mod tests {
     fn metadata_only_import_preserves_native_stats_after_legacy_zero_id_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let (converted, diagnostic) = convert_legacy_session_with_diagnostic(&legacy).unwrap();
         let mut snapshot =
@@ -2436,8 +2440,7 @@ mod tests {
     fn snapshot_and_legacy_without_meta_is_ambiguous_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let native_snapshot =
             atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
@@ -2459,8 +2462,7 @@ mod tests {
     fn full_legacy_import_preserves_unconfirmed_user_rename() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let unconfirmed = SessionMeta::new(&legacy.id, "/native", 1);
         manager.write_meta(&unconfirmed).unwrap();
@@ -2483,8 +2485,7 @@ mod tests {
     fn pre_intent_full_import_residue_without_meta_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
@@ -2515,8 +2516,7 @@ mod tests {
     fn legacy_import_intent_recovers_interrupted_full_import() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
@@ -2548,8 +2548,7 @@ mod tests {
     fn legacy_import_intent_replaces_corrupt_interrupted_sidecars() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
@@ -2587,8 +2586,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let mut converted = convert_legacy_session(&legacy).unwrap();
         rebase_converted_turn_ids(&mut converted, 5).unwrap();
@@ -2696,8 +2694,7 @@ mod tests {
 
     #[test]
     fn importer_v2_metadata_only_sidecars_upgrade_without_changing_presentation() {
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2738,8 +2735,7 @@ mod tests {
 
     #[test]
     fn importer_v3_is_reaudited_without_changing_presentation() {
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2782,8 +2778,7 @@ mod tests {
     fn importer_v3_disk_upgrade_changes_only_metadata_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let id = legacy.id.as_str();
@@ -2842,8 +2837,7 @@ mod tests {
 
     #[test]
     fn importer_v2_with_imported_anchor_is_unresolved_and_non_destructive() {
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2874,8 +2868,7 @@ mod tests {
 
     #[test]
     fn metadata_only_sidecar_repair_requires_a_strict_stats_prefix() {
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2916,8 +2909,7 @@ mod tests {
 
     #[test]
     fn importer_v1_requires_coordinate_domain_evidence() {
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2944,8 +2936,7 @@ mod tests {
 
     #[test]
     fn importer_v1_exact_native_prefix_without_native_suffix_is_unresolved() {
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2971,8 +2962,7 @@ mod tests {
 
     #[test]
     fn metadata_only_sidecar_repair_is_non_destructive_when_presentation_origin_is_ambiguous() {
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -3006,8 +2996,7 @@ mod tests {
 
     #[test]
     fn metadata_only_sidecar_repair_rejects_tail_using_an_imported_turn() {
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let imported_turn_id = converted.meta.turn_stats.last().unwrap().turn_id;
@@ -3043,8 +3032,7 @@ mod tests {
 
     #[test]
     fn metadata_only_sidecar_repair_does_not_delete_matching_native_sidecars() {
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let native_message_count = converted.snapshot.messages.len();
@@ -3681,8 +3669,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let session = full_legacy_session();
         let id = session.id.as_str();
-        let legacy_bytes =
-            include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         std::fs::write(project.join(format!("{id}.json")), legacy_bytes).unwrap();
         let entry = CatalogEntry {
             id: id.into(),
@@ -3711,7 +3698,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_uses_active_lease_and_cleans_every_session_artifact_idempotently() {
+    fn delete_uses_active_lease_cleans_every_artifact_and_reports_missing() {
         let dir = tempfile::tempdir().unwrap();
         let bucket = "0123456789abcdef";
         let id = "delete-all";
@@ -3734,7 +3721,6 @@ mod tests {
         drop(active);
 
         delete_catalog_session_in_root(dir.path(), bucket, id).unwrap();
-        delete_catalog_session_in_root(dir.path(), bucket, id).unwrap();
         for path in [
             manager.snapshot_path(id).unwrap(),
             manager.meta_path(id).unwrap(),
@@ -3744,6 +3730,11 @@ mod tests {
         ] {
             assert!(!path.exists(), "{} was not deleted", path.display());
         }
+        let missing = delete_catalog_session_in_root(dir.path(), bucket, id).unwrap_err();
+        assert!(matches!(
+            missing.downcast_ref::<SessionStoreError>(),
+            Some(SessionStoreError::NotFound { .. })
+        ));
     }
 
     #[test]
@@ -3807,5 +3798,4 @@ mod tests {
         );
         assert_eq!(presentation.entries[0].text, "local note");
     }
-
 }

@@ -130,7 +130,7 @@ atomcode -p "解释这段代码" --provider local --model qwen2.5:14b</code></pr
       </div>
 
       <h2>atomcode-daemon</h2>
-      <p><code>atomcode-daemon</code> 是独立的二进制,直接复用 <code>atomcode-core</code>。它对外暴露 HTTP + Server-Sent Events 接口,可以被 Web 前端、IDE 插件、编辑器扩展消费。AtomCode 官方的 VS Code 扩展和 AtomCode Air 桌面端都是通过它连过来的。</p>
+      <p><code>atomcode-daemon</code> 是构建在 <code>CodingRuntime</code> 之上的独立传输适配器。它对外暴露 HTTP + Server-Sent Events 接口,可以被 Web 前端、IDE 插件、编辑器扩展消费。AtomCode 官方的 VS Code 扩展和 AtomCode Air 桌面端都是通过它连过来的。</p>
 
       <h3>启动</h3>
       <pre><code># 推荐:通过 CLI 子命令启动,自动调用同目录下的 atomcode-daemon 二进制
@@ -240,7 +240,7 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
       </table>
 
       <h3>SSE 流式聊天</h3>
-      <p><code>POST /chat</code> 返回的 SSE 流事件包含:AI 增量文本、推理 (reasoning) 增量、工具调用批次 (开始 / 结束)、token 统计、错误等。具体事件 schema 见 <code>crates/atomcode-core/src/turn/event.rs</code> 的 <code>TurnEvent</code> 定义。</p>
+      <p><code>POST /chat</code> 返回的 SSE 流事件包含:AI 增量文本、推理 (reasoning) 增量、工具调用批次 (开始 / 结束)、token 统计、错误等。daemon wire schema 见 <code>crates/atomcode-daemon/src/live_api.rs</code> 中的 <code>LiveWireEvent</code>。</p>
       <p>前端可以用原生 <code>EventSource</code> 消费,也可以借助任何 SSE 客户端库。</p>
 
       <h3>CORS</h3>

@@ -10,10 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 atomcode-review = { path = "../atomcode-review" }
-atomcode-coding = { path = "../atomcode-coding" }
+atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
 # Direct dep for the D-layer pieces the driver owns: MemoryStore (slash commands),
 # the typed approval wire contract, SessionManager (session listing).
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "session", "memory", "mcp"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "session", "memory", "mcp", "atomgit"] }
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-config = { path = "../atomcode-config" }
 # Standalone telemetry sink (clix is core-decoupled, so it resolves + inits its own,

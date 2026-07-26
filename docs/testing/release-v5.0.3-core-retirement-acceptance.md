@@ -220,9 +220,9 @@ git diff --check
 ### 5.1 基础启动与普通对话
 
 - [ ] 无历史配置首次启动可进入 TUI，不 panic
-- [ ] 已登录用户启动后可以直接发送消息
-- [ ] 外部 provider 能完成一次流式文本响应
-- [ ] AtomGit provider 能完成一次流式文本响应
+- [x] 已登录用户启动后可以直接发送消息
+- [x] 外部 provider 能完成一次流式文本响应
+- [x] AtomGit provider 能完成一次流式文本响应
 - [ ] tool call 的开始、参数、结果和完成状态展示正常
 - [ ] provider 错误有明确提示，当前 turn 只有一个终态
 - [ ] Ctrl+C 中断当前 turn 后可以继续发送下一条消息
