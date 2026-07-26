@@ -176,6 +176,9 @@ pub struct CodingParts {
     /// The same session snapshot writer used by `SnapshotHook`, exposed through
     /// the kernel's manual-compaction checkpoint seam.
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
+    /// Concrete handle retained so provider-only reassembly can update the
+    /// per-turn cost attribution without rebuilding session-owned hooks.
+    snapshot_hook: Option<Arc<SnapshotHook>>,
     snapshot_persistence_status: Option<SnapshotPersistenceStatus>,
     pub session: Option<SessionBinding>,
     /// Runtime-owned resume for sessionless drivers during an in-process reassembly.
@@ -572,6 +575,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     //    keep it last: any earlier hook's continuation outranks the cadence nudge.
     let mut hooks: Vec<Arc<dyn LifecycleHooks>> = Vec::new();
     let mut compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>> = None;
+    let mut snapshot_hook_handle = None;
     let mut snapshot_persistence_status = None;
     // Env / project-instructions / git context — unconditional (v1 parity: always present).
     hooks.push(Arc::new(SessionContextHook::new(&cfg.working_dir)));
@@ -594,6 +598,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         );
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
         compaction_checkpoint = Some(snapshot_hook.clone());
+        snapshot_hook_handle = Some(snapshot_hook.clone());
         hooks.push(snapshot_hook);
         hooks.push(Arc::new(TranscriptHook::new(b.manager.clone(), &b.id)));
     }
@@ -703,6 +708,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         approval: Arc::new(ApprovalMiddleware::in_memory()),
         hooks,
         compaction_checkpoint,
+        snapshot_hook: snapshot_hook_handle,
         snapshot_persistence_status,
         session,
         runtime_resume: None,
@@ -1453,7 +1459,14 @@ pub fn assemble(
             atomcode_capabilities::tools::GitPushLabelMiddleware::new(cfg.working_dir.clone()),
         ));
     }
-    Ok(builder.build())
+    let agent = builder.build();
+    // Commit model attribution only after every fallible assembly step has
+    // succeeded. ReassembleProvider stops the old agent before entering here,
+    // so no accepted turn can observe a half-switched attribution.
+    if let Some(snapshot_hook) = &parts.snapshot_hook {
+        snapshot_hook.set_model_attribution(&cfg.provider_name, &cfg.model, cfg.pricing);
+    }
+    Ok(agent)
 }
 
 const ATOMCODE_PERSONA_PREFIX: &str =
@@ -2542,6 +2555,48 @@ mod tests {
             Some("swapped-model"),
             "primary TelemetryHook must report the model active at assemble, not the prepare-time one"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn snapshot_cost_attribution_tracks_model_swapped_at_assemble() {
+        use atomcode_kernel::agent::AutoRespond;
+
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut cfg = CodingAgentConfig::new("k", "http://localhost", "model-a", project.path());
+        cfg.provider_name = "provider-a".into();
+
+        let mut opts = io_free_opts();
+        opts.session = SessionMode::Fresh;
+        let mut parts = prepare(&cfg, opts).await.unwrap();
+        let binding = parts.session.as_ref().unwrap();
+        let manager = binding.manager.clone();
+        let session_id = binding.id.clone();
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+        let first = assemble(&mut parts, &cfg, provider.clone()).unwrap();
+        parts.publish_staged_session().unwrap();
+        let _ = first
+            .run_to_completion("first", AutoRespond::AllowAll)
+            .await;
+
+        cfg.provider_name = "provider-b".into();
+        cfg.model = "model-b".into();
+        let second = assemble(&mut parts, &cfg, provider).unwrap();
+        let _ = second
+            .run_to_completion("second", AutoRespond::AllowAll)
+            .await;
+
+        let report = atomcode_capabilities::session::aggregate_session_cost(
+            &manager.read_meta(&session_id).unwrap(),
+        );
+        assert_eq!(report.models.len(), 2);
+        assert_eq!(report.models[0].provider_id, "provider-a");
+        assert_eq!(report.models[0].model_id, "model-a");
+        assert_eq!(report.models[1].provider_id, "provider-b");
+        assert_eq!(report.models[1].model_id, "model-b");
     }
 
     /// Helper: run `prepare` with `opts.web = web_enabled` (all other optional capabilities

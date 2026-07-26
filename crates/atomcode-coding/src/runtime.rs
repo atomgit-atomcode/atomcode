@@ -5971,6 +5971,60 @@ mod tests {
         fail: bool,
     }
 
+    struct UsageProvider {
+        model: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for UsageProvider {
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[atomcode_kernel::tool::ToolDef],
+            _options: &atomcode_kernel::provider::ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            use atomcode_kernel::stream::{StreamEvent, TokenUsage};
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta("answer".into()),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 100,
+                    completion: 10,
+                    cached: 0,
+                }),
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+
+    #[derive(Default)]
+    struct UsageProviderFactory {
+        fail_model: std::sync::Mutex<Option<String>>,
+    }
+
+    impl CodingProviderFactory for UsageProviderFactory {
+        fn build(
+            &self,
+            config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            if self.fail_model.lock().unwrap().as_deref() == Some(config.model.as_str()) {
+                return Err(crate::ProviderBuildError::Adapter(
+                    "expected usage-provider reload failure".into(),
+                ));
+            }
+            Ok(Arc::new(UsageProvider {
+                model: config.model.clone(),
+            }))
+        }
+    }
+
     struct RecoverableAuthFactory {
         fail: std::sync::atomic::AtomicBool,
     }
@@ -6445,6 +6499,17 @@ mod tests {
             }),
             plugin_hooks: Arc::new(crate::StaticPluginHookSource::default()),
             image_preprocessor: None,
+        }
+    }
+
+    async fn wait_for_turn_finished(runtime: &mut CodingRuntime) {
+        loop {
+            if matches!(
+                runtime.events.recv().await.unwrap().event,
+                CodingRuntimeEvent::TurnFinished(_)
+            ) {
+                break;
+            }
         }
     }
 
@@ -9787,6 +9852,78 @@ mod tests {
             }
         ));
         assert!(first.sequence < second.sequence && second.sequence < third.sequence);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn provider_reassemble_updates_cost_attribution_and_failed_reload_keeps_current_model() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+
+        let factory = Arc::new(UsageProviderFactory::default());
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.agent.provider_name = "provider-a".into();
+        start.agent.model = "model-a".into();
+        start.prepare.session = crate::SessionMode::Fresh;
+        start.provider_factory = factory.clone();
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+        runtime
+            .handle
+            .submit(UserInput::from("model a turn"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+
+        let mut model_b =
+            CodingAgentConfig::new("key", "https://example.test/v1", "model-b", project.path());
+        model_b.provider_name = "provider-b".into();
+        runtime
+            .handle
+            .reassemble_provider(model_b.clone())
+            .await
+            .unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("model b turn"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+
+        *factory.fail_model.lock().unwrap() = Some("model-fail".into());
+        let mut failed = model_b;
+        failed.provider_name = "provider-fail".into();
+        failed.model = "model-fail".into();
+        assert!(matches!(
+            runtime.handle.reassemble_provider(failed).await,
+            Err(RuntimeError::ReconfigureFailed(message))
+                if message.contains("expected usage-provider reload failure")
+        ));
+        runtime
+            .handle
+            .submit(UserInput::from("model b after failed reload"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+
+        let manager =
+            atomcode_capabilities::session::SessionManager::for_project(project.path());
+        let sessions = manager.list();
+        assert_eq!(sessions.len(), 1);
+        let report = atomcode_capabilities::session::aggregate_session_cost(
+            &manager.read_meta(&sessions[0].id).unwrap(),
+        );
+        assert_eq!(report.models.len(), 2);
+        assert_eq!(report.models[0].provider_id, "provider-a");
+        assert_eq!(report.models[0].model_id, "model-a");
+        assert_eq!(report.models[0].tokens.total(), 110);
+        assert_eq!(report.models[1].provider_id, "provider-b");
+        assert_eq!(report.models[1].model_id, "model-b");
+        assert_eq!(report.models[1].tokens.total(), 220);
+
         runtime.handle.shutdown().await.unwrap();
     }
 

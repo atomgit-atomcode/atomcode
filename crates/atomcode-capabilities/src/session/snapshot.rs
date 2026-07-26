@@ -83,7 +83,7 @@ pub struct SnapshotHook {
     lease: Option<SessionLease>,
     accum: Mutex<TurnAccum>,
     persistence_status: SnapshotPersistenceStatus,
-    attribution: Option<ModelAttribution>,
+    attribution: Mutex<Option<ModelAttribution>>,
 }
 
 #[derive(Clone)]
@@ -106,7 +106,7 @@ impl SnapshotHook {
             lease: None,
             accum: Mutex::new(TurnAccum::default()),
             persistence_status: SnapshotPersistenceStatus::default(),
-            attribution: None,
+            attribution: Mutex::new(None),
         }
     }
 
@@ -121,12 +121,31 @@ impl SnapshotHook {
         model_id: impl Into<String>,
         pricing: Option<ModelPricing>,
     ) -> Self {
-        self.attribution = Some(ModelAttribution {
+        self.attribution = Mutex::new(Some(ModelAttribution {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            pricing,
+        }));
+        self
+    }
+
+    /// Atomically replace the attribution used by subsequent turns. The coding
+    /// runtime calls this only after a replacement agent has assembled
+    /// successfully and the previous generation has stopped.
+    pub fn set_model_attribution(
+        &self,
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        pricing: Option<ModelPricing>,
+    ) {
+        *self
+            .attribution
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(ModelAttribution {
             provider_id: provider_id.into(),
             model_id: model_id.into(),
             pricing,
         });
-        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, TurnAccum> {
@@ -290,8 +309,12 @@ impl LifecycleHooks for SnapshotHook {
                 a.tokens,
             )
         };
-        let model_usage = self
+        let attribution = self
             .attribution
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let model_usage = attribution
             .as_ref()
             .filter(|_| tokens.total() > 0)
             .map(|attribution| {
@@ -690,6 +713,49 @@ mod tests {
         assert_eq!(stat["model_usage"][0]["model_id"], "model-a");
         assert_eq!(stat["model_usage"][0]["tokens"]["input"], 300);
         assert_eq!(stat["model_usage"][0]["tokens"]["output"], 30);
+    }
+
+    #[tokio::test]
+    async fn model_attribution_can_switch_between_completed_turns() {
+        let (base, mgr, _d) = hook("s1a-model-switch");
+        let h = base.with_model_attribution("provider-a", "model-a", None);
+
+        h.user_prompt_submit(&mut "first".to_string())
+            .await
+            .unwrap();
+        h.on_model_response(&mut resp(0, 1)).await;
+        h.turn_complete(
+            &convo_with(1),
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: 1,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
+
+        h.set_model_attribution("provider-b", "model-b", None);
+        h.user_prompt_submit(&mut "second".to_string())
+            .await
+            .unwrap();
+        h.on_model_response(&mut resp(0, 2)).await;
+        h.turn_complete(
+            &convo_with(2),
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: 2,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
+
+        let report =
+            crate::session::aggregate_session_cost(&mgr.read_meta("s1a-model-switch").unwrap());
+        assert_eq!(report.models.len(), 2);
+        assert_eq!(report.models[0].provider_id, "provider-a");
+        assert_eq!(report.models[0].model_id, "model-a");
+        assert_eq!(report.models[1].provider_id, "provider-b");
+        assert_eq!(report.models[1].model_id, "model-b");
     }
 
     #[tokio::test]
