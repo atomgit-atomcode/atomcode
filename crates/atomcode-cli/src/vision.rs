@@ -78,7 +78,7 @@ impl ImagePreprocessor for VlImagePreprocessor {
         // network); run it off the async owner task so a slow auth host can't
         // stall the runtime loop. `session_id` is bound at build so the one-off
         // VL call rides the same upstream account/replica as the main turn.
-        let vl_cfg = derive_tier_config(&self.base, &vl_pc);
+        let vl_cfg = derive_tier_config(&self.base, &vl_name, &vl_pc);
         let factory = self.factory.clone();
         let sid = session_id.filter(|s| !s.is_empty());
         let built =
