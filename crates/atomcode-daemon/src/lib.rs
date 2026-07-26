@@ -460,6 +460,15 @@ impl ActiveChatRegistry {
             .is_some_and(|operation| operation.stopped)
     }
 
+    async fn session_id(&self, operation_id: &str) -> Option<String> {
+        self.inner
+            .read()
+            .await
+            .operations
+            .get(operation_id)
+            .and_then(|operation| operation.session_id.clone())
+    }
+
     /// Remove only the exact operation that finished. A late cleanup from an
     /// older generation can never erase a replacement operation's aliases.
     async fn complete(&self, operation_id: &str) -> bool {
@@ -3473,6 +3482,8 @@ async fn chat_stream(
     let cleanup_op = operation_id.clone();
     let cleanup_chats = active_chats.clone();
     let inner_event_tx = tx.clone();
+    let terminal_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let inner_terminal_sent = terminal_sent.clone();
 
     tokio::spawn(async move {
         let inner = tokio::spawn(async move {
@@ -3487,12 +3498,21 @@ async fn chat_stream(
                     telemetry,
                     pending_permissions,
                     interactive_permission,
+                    inner_terminal_sent,
                 )
                 .await
             })
             .await
         });
-        finalize_chat_task(inner, &tx, &cleanup_chats, &cleanup_op, &chat_session_id).await;
+        finalize_chat_task(
+            inner,
+            &tx,
+            &cleanup_chats,
+            &cleanup_op,
+            &chat_session_id,
+            &terminal_sent,
+        )
+        .await;
     });
 
     // Track active SSE connections for idle timeout using a Drop guard
@@ -3531,7 +3551,8 @@ async fn finalize_chat_task(
     event_tx: &mpsc::UnboundedSender<ChatEvent>,
     cleanup_chats: &ActiveChatRegistry,
     cleanup_operation_id: &str,
-    done_session_id: &str,
+    requested_session_id: &str,
+    terminal_sent: &std::sync::atomic::AtomicBool,
 ) {
     match inner.await {
         Ok(Ok(())) => {}
@@ -3540,17 +3561,29 @@ async fn finalize_chat_task(
                 message: e.to_string(),
             });
         }
-        Err(panic_err) => {
+        Err(join_error) => {
+            tracing::error!(
+                operation_id = cleanup_operation_id,
+                error = %join_error,
+                cancelled = join_error.is_cancelled(),
+                "chat task failed"
+            );
             let _ = event_tx.send(ChatEvent::Error {
-                message: format!("chat task panicked: {panic_err}"),
+                message: "chat task failed".into(),
             });
-            let _ = event_tx.send(ChatEvent::Done {
-                tokens: 0,
-                tool_calls: 0,
-                session_id: done_session_id.to_string(),
-                stop_reason: Some("internal_error".into()),
-                message: Some("chat task panicked".into()),
-            });
+            if !terminal_sent.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let session_id = cleanup_chats
+                    .session_id(cleanup_operation_id)
+                    .await
+                    .unwrap_or_else(|| requested_session_id.to_string());
+                let _ = event_tx.send(ChatEvent::Done {
+                    tokens: 0,
+                    tool_calls: 0,
+                    session_id,
+                    stop_reason: Some("internal_error".into()),
+                    message: Some("chat task failed".into()),
+                });
+            }
         }
     }
     cleanup_chats.complete(cleanup_operation_id).await;
@@ -3569,6 +3602,7 @@ async fn process_chat_request(
     telemetry: Arc<Telemetry>,
     pending_permissions: permission_bridge::PermissionResponders,
     interactive_permission: bool,
+    terminal_sent: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let approval_mode = effective_chat_approval_mode(req.approval_mode);
     // Load config
@@ -3743,6 +3777,9 @@ async fn process_chat_request(
     let mut projector = ChatRuntimeProjector::default();
     while let Some(event) = runtime_event_rx.recv().await {
         for chat_event in projector.project_runtime(event, &perm_session_key) {
+            if matches!(chat_event, ChatEvent::Done { .. }) {
+                terminal_sent.store(true, std::sync::atomic::Ordering::Release);
+            }
             let _ = event_tx.send(chat_event);
         }
     }
@@ -5564,22 +5601,40 @@ mod tests {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
         let cleanup_chats = active_chats.clone();
         let cleanup_op = admission.operation_id.clone();
+        active_chats
+            .bind_session(&cleanup_op, "canonical-session")
+            .await
+            .unwrap();
+        let terminal_sent = std::sync::atomic::AtomicBool::new(false);
 
         let inner = tokio::spawn(async move {
-            panic!("simulated chat task panic");
+            panic!("simulated secret panic payload");
             #[allow(unreachable_code)]
             anyhow::Ok(())
         });
-        finalize_chat_task(inner, &event_tx, &cleanup_chats, &cleanup_op, "session-1").await;
+        finalize_chat_task(
+            inner,
+            &event_tx,
+            &cleanup_chats,
+            &cleanup_op,
+            "session-1",
+            &terminal_sent,
+        )
+        .await;
 
         let events: Vec<_> = (0..10).filter_map(|_| event_rx.try_recv().ok()).collect();
         assert!(
-            events.iter().any(|e| matches!(e, ChatEvent::Error { .. })),
-            "panic must produce an Error event"
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Error { message } if message == "chat task failed")),
+            "panic must produce a redacted Error event"
         );
         assert!(
-            events.iter().any(|e| matches!(e, ChatEvent::Done { .. })),
-            "panic must produce a Done event to close the SSE stream"
+            events.iter().any(|event| matches!(
+                event,
+                ChatEvent::Done { session_id, .. } if session_id == "canonical-session"
+            )),
+            "panic must produce a Done event with the canonical session id"
         );
 
         assert!(
@@ -5606,6 +5661,7 @@ mod tests {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
         let cleanup_chats = active_chats.clone();
         let cleanup_op = admission.operation_id.clone();
+        let terminal_sent = std::sync::atomic::AtomicBool::new(false);
 
         let session_id = uuid::Uuid::new_v4();
         let ctx = CurrentContext {
@@ -5624,7 +5680,15 @@ mod tests {
             })
             .await
         });
-        finalize_chat_task(inner, &event_tx, &cleanup_chats, &cleanup_op, "session-1").await;
+        finalize_chat_task(
+            inner,
+            &event_tx,
+            &cleanup_chats,
+            &cleanup_op,
+            "session-1",
+            &terminal_sent,
+        )
+        .await;
 
         let events: Vec<_> = (0..10).filter_map(|_| event_rx.try_recv().ok()).collect();
         assert!(
@@ -5640,6 +5704,44 @@ mod tests {
                 .any(|s| s == "session-1"),
             "cleanup must run after successful task"
         );
+    }
+
+    #[tokio::test]
+    async fn chat_panic_after_terminal_does_not_emit_a_second_done() {
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats.admit(Some("session-1"), None).await.unwrap();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let terminal_sent = std::sync::atomic::AtomicBool::new(true);
+
+        let inner = tokio::spawn(async move {
+            panic!("panic after terminal");
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        });
+        finalize_chat_task(
+            inner,
+            &event_tx,
+            &active_chats,
+            &admission.operation_id,
+            "session-1",
+            &terminal_sent,
+        )
+        .await;
+
+        let events: Vec<_> = (0..10).filter_map(|_| event_rx.try_recv().ok()).collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Error { .. })),
+            "the supervisor must still report the panic"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Done { .. })),
+            "the supervisor must not emit a second terminal"
+        );
+        assert!(active_chats.active_session_ids().await.is_empty());
     }
 
     #[tokio::test]
@@ -5713,6 +5815,7 @@ mod tests {
             chat_test_telemetry(&home),
             permission_bridge::PermissionResponders::new(),
             false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -6276,6 +6379,7 @@ mod tests {
             telemetry,
             permission_bridge::PermissionResponders::new(),
             false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .expect("chat request succeeds");

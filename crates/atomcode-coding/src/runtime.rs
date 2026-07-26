@@ -4576,10 +4576,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     });
                                                     let outcome = match inner.await {
                                                         Ok(outcome) => outcome,
-                                                        Err(e) => EvalOutcome {
+                                                        Err(_) => EvalOutcome {
                                                             generation,
                                                             controller_id,
-                                                            result: GoalResult::Error(format!("evaluator panicked: {e}")),
+                                                            result: GoalResult::Error(
+                                                                "evaluator task failed".into(),
+                                                            ),
                                                             usage: None,
                                                         },
                                                     };
@@ -7771,30 +7773,20 @@ mod tests {
             Some(AgentCommand::SendMessage { .. })
         ));
 
-        for attempt in 1..=MAX_EVAL_FAILURES {
-            kernel_events
-                .send(AgentEvent::TurnComplete {
-                    reason: StopReason::Stopped,
-                })
-                .unwrap();
-            assert!(matches!(
-                kernel_commands.recv().await,
-                Some(AgentCommand::Snapshot)
-            ));
-            kernel_events
-                .send(AgentEvent::Snapshot {
-                    snapshot: SessionSnapshot::new(vec![Message::assistant("not evaluated", vec![])]),
-                })
-                .unwrap();
-            if attempt < MAX_EVAL_FAILURES {
-                assert!(matches!(
-                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
-                        .await
-                        .expect("evaluator panic retry was not dispatched"),
-                    Some(AgentCommand::SendSyntheticMessage { .. })
-                ));
-            }
-        }
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("not evaluated", vec![])]),
+            })
+            .unwrap();
 
         let mut saw_inactive_goal = false;
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
