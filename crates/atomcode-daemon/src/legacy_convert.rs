@@ -178,7 +178,8 @@ struct LegacyDisplayMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LegacyTurnStat {
     after_message: usize,
-    turn_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_count: Option<usize>,
     tool_call_count: usize,
     duration_ms: u64,
     total_tokens: usize,
@@ -204,6 +205,13 @@ pub enum ImportDiagnostic {
     RepairedLegacyTurnBoundaries {
         dropped_turn_stats: usize,
     },
+    DefaultedLegacyTurnCounts {
+        repaired_turn_stats: usize,
+    },
+    RepairedLegacyTurnStats {
+        dropped_turn_stats: usize,
+        defaulted_turn_counts: usize,
+    },
     RepairedMetadataOnlySidecars {
         repaired_turn_stats: usize,
         removed_presentation_entries: usize,
@@ -218,6 +226,30 @@ fn report_import_diagnostic(session_id: &str, diagnostic: Option<ImportDiagnosti
                 session_id,
                 dropped_turn_stats,
                 "repaired malformed legacy turn boundaries during import"
+            );
+        }
+        Some(ImportDiagnostic::DefaultedLegacyTurnCounts {
+            repaired_turn_stats,
+        }) => {
+            tracing::warn!(
+                session_id,
+                repaired_turn_stats,
+                "defaulted missing legacy turn_count fields during import"
+            );
+        }
+        Some(ImportDiagnostic::RepairedLegacyTurnStats {
+            dropped_turn_stats,
+            defaulted_turn_counts,
+        }) => {
+            tracing::warn!(
+                session_id,
+                dropped_turn_stats,
+                "repaired malformed legacy turn boundaries during import"
+            );
+            tracing::warn!(
+                session_id,
+                repaired_turn_stats = defaulted_turn_counts,
+                "defaulted missing legacy turn_count fields during import"
             );
         }
         Some(ImportDiagnostic::RepairedMetadataOnlySidecars {
@@ -336,6 +368,7 @@ struct NormalizedLegacyTurns {
     boundaries: Vec<LegacyTurnBoundary>,
     turn_stats: Vec<TurnStat>,
     dropped_turn_stats: usize,
+    defaulted_turn_counts: usize,
 }
 
 fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedLegacyTurns> {
@@ -343,6 +376,7 @@ fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedL
     let mut turn_stats = Vec::with_capacity(session.turn_stats.len());
     let mut previous_after = 0usize;
     let mut dropped_turn_stats = 0usize;
+    let mut defaulted_turn_counts = 0usize;
 
     for stat in &session.turn_stats {
         if stat.after_message > session.messages.len()
@@ -351,6 +385,9 @@ fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedL
         {
             dropped_turn_stats += 1;
             continue;
+        }
+        if stat.turn_count.is_none() {
+            defaulted_turn_counts += 1;
         }
 
         let turn_id = u64::try_from(turn_stats.len())?
@@ -364,7 +401,7 @@ fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedL
             after_message: stat.after_message,
             position_valid: true,
             turn_id,
-            round_count: checked_u32(stat.turn_count, "turn_count")?,
+            round_count: checked_u32(stat.turn_count.unwrap_or_default(), "turn_count")?,
             tool_call_count: checked_u32(stat.tool_call_count, "tool_call_count")?,
             duration_ms: stat.duration_ms,
             total_tokens: checked_u32(stat.total_tokens, "total_tokens")?,
@@ -382,6 +419,7 @@ fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedL
         boundaries,
         turn_stats,
         dropped_turn_stats,
+        defaulted_turn_counts,
     })
 }
 
@@ -499,11 +537,23 @@ fn convert_legacy_session_with_diagnostic(
     };
     meta.auto_name_from_messages(&snapshot.messages);
 
-    let diagnostic = (normalized_turns.dropped_turn_stats > 0).then_some(
-        ImportDiagnostic::RepairedLegacyTurnBoundaries {
-            dropped_turn_stats: normalized_turns.dropped_turn_stats,
-        },
-    );
+    let diagnostic =
+        if normalized_turns.dropped_turn_stats > 0 && normalized_turns.defaulted_turn_counts > 0 {
+            Some(ImportDiagnostic::RepairedLegacyTurnStats {
+                dropped_turn_stats: normalized_turns.dropped_turn_stats,
+                defaulted_turn_counts: normalized_turns.defaulted_turn_counts,
+            })
+        } else if normalized_turns.dropped_turn_stats > 0 {
+            Some(ImportDiagnostic::RepairedLegacyTurnBoundaries {
+                dropped_turn_stats: normalized_turns.dropped_turn_stats,
+            })
+        } else if normalized_turns.defaulted_turn_counts > 0 {
+            Some(ImportDiagnostic::DefaultedLegacyTurnCounts {
+                repaired_turn_stats: normalized_turns.defaulted_turn_counts,
+            })
+        } else {
+            None
+        };
 
     Ok((
         ConvertedLegacySession {
@@ -1833,6 +1883,31 @@ mod tests {
             manager.acquire_lease(&legacy.id),
             Err(atomcode_capabilities::session::SessionStoreError::SessionInUse { .. })
         ));
+    }
+
+    #[test]
+    fn prepared_resume_accepts_missing_legacy_turn_count() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = "4444444444444444";
+        let mut legacy = full_legacy_session();
+        legacy.turn_stats[1].turn_count = None;
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        std::fs::create_dir_all(manager.root()).unwrap();
+        std::fs::write(
+            manager.legacy_path(&legacy.id).unwrap(),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let prepared =
+            prepare_catalog_session_resume_in_project_root(root.path(), bucket, &legacy.id)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(prepared.view.meta.owner, StorageOwner::Native);
+        assert!(!prepared.view.snapshot.messages.is_empty());
+        assert_eq!(prepared.view.meta.turn_stats.len(), 2);
+        assert_eq!(prepared.view.meta.turn_stats[1].round_count, 0);
     }
 
     #[test]

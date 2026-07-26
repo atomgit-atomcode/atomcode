@@ -104,6 +104,56 @@ fn out_of_range_legacy_turn_boundary_is_repaired_during_cutover() {
 }
 
 #[test]
+fn missing_legacy_turn_count_is_defaulted_during_cutover() {
+    let mut legacy = legacy_fixture();
+    legacy["turn_stats"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("turn_count");
+
+    let (_dir, manager, id) = write_legacy(&legacy);
+    let lease = manager.acquire_lease(&id).unwrap();
+
+    let outcome = converge_session(&manager, &lease).unwrap();
+
+    assert_eq!(outcome.status, ImportStatus::ImportedFull);
+    assert_eq!(
+        outcome.diagnostic,
+        Some(ImportDiagnostic::DefaultedLegacyTurnCounts {
+            repaired_turn_stats: 1,
+        })
+    );
+    assert_eq!(outcome.meta.turn_stats.len(), 2);
+    assert_eq!(outcome.meta.turn_stats[1].round_count, 0);
+    assert_eq!(manager.load_native_session(&id).unwrap().meta, outcome.meta);
+}
+
+#[test]
+fn boundary_and_missing_turn_count_repairs_are_both_reported() {
+    let mut legacy = legacy_fixture();
+    legacy["turn_stats"][0]["after_message"] = 0.into();
+    legacy["turn_stats"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("turn_count");
+
+    let (_dir, manager, id) = write_legacy(&legacy);
+    let lease = manager.acquire_lease(&id).unwrap();
+
+    let outcome = converge_session(&manager, &lease).unwrap();
+
+    assert_eq!(
+        outcome.diagnostic,
+        Some(ImportDiagnostic::RepairedLegacyTurnStats {
+            dropped_turn_stats: 1,
+            defaulted_turn_counts: 1,
+        })
+    );
+    assert_eq!(outcome.meta.turn_stats.len(), 1);
+    assert_eq!(outcome.meta.turn_stats[0].round_count, 0);
+}
+
+#[test]
 fn invalid_presentation_position_without_boundary_repair_remains_an_error() {
     let mut legacy = legacy_fixture();
     legacy["display_messages"][1]["after_message"] = 8.into();
