@@ -9,7 +9,7 @@
 // palette. Esc cancels at any point.
 
 use anyhow::Result;
-use atomcode_config::config::provider::ProviderConfig;
+use atomcode_config::config::provider::{ProviderConfig, ProviderPricing};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
@@ -71,6 +71,8 @@ pub enum WizardStep {
     ApiKey,
     Model,
     ContextWindow,
+    /// Optional USD per million tokens: input,output,cached-input.
+    Pricing,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -84,6 +86,8 @@ pub struct DraftProvider {
     /// the provider-type default ([`default_context_window_for`]) on Add or
     /// keep the existing value on Edit.
     pub context_window: Option<usize>,
+    pub pricing: Option<ProviderPricing>,
+    pub clear_pricing: bool,
 }
 
 impl DraftProvider {
@@ -104,6 +108,11 @@ impl DraftProvider {
         }
         if let Some(cw) = self.context_window {
             base.context_window = cw;
+        }
+        if self.clear_pricing {
+            base.pricing = None;
+        } else if let Some(pricing) = self.pricing {
+            base.pricing = Some(pricing);
         }
     }
 
@@ -138,6 +147,7 @@ impl DraftProvider {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            pricing: self.pricing,
         }
     }
 }
@@ -831,6 +841,19 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
             current: p.context_window,
         })
         .into_owned(),
+        (WizardStep::Pricing, None) => t(Msg::ProviderStepPricing).into_owned(),
+        (WizardStep::Pricing, Some(p)) => match p.pricing {
+            Some(pricing) => {
+                let current = format!(
+                    "{},{},{}",
+                    pricing.input_per_million,
+                    pricing.output_per_million,
+                    pricing.cached_input_per_million
+                );
+                t(Msg::ProviderStepPricingWithHint { current: &current }).into_owned()
+            }
+            None => t(Msg::ProviderStepPricing).into_owned(),
+        },
     }
 }
 
@@ -863,6 +886,7 @@ fn show_add_step_prompt(
             })
             .into_owned()
         }
+        WizardStep::Pricing => t(Msg::ProviderStepPricing).into_owned(),
         other => step_prompt_text(other, None),
     };
     if matches!(step, WizardStep::Template) || total == 0 {
@@ -984,6 +1008,7 @@ fn import_plan(draft: &DraftProvider) -> Vec<WizardStep> {
     // Always offer the context window (blank keeps the provider-type default),
     // then confirm the Name last.
     plan.push(WizardStep::ContextWindow);
+    plan.push(WizardStep::Pricing);
     plan.push(WizardStep::Name);
     plan
 }
@@ -1008,6 +1033,19 @@ fn parse_context_window(s: &str) -> Option<usize> {
     }
     let n = cleaned.parse::<usize>().ok()?.checked_mul(mult)?;
     (n > 0).then_some(n)
+}
+
+fn parse_pricing(s: &str) -> Option<ProviderPricing> {
+    let values: Vec<_> = s.split(',').map(str::trim).collect();
+    if values.len() != 3 {
+        return None;
+    }
+    ProviderPricing {
+        input_per_million: values[0].parse().ok()?,
+        output_per_million: values[1].parse().ok()?,
+        cached_input_per_million: values[2].parse().ok()?,
+    }
+    .validated()
 }
 
 /// Seed the Name step's default if it isn't set yet.
@@ -1077,6 +1115,19 @@ fn store_step(
                 }
             }
         }
+        WizardStep::Pricing => {
+            if ans.eq_ignore_ascii_case("clear") || ans == "清除" {
+                draft.pricing = None;
+                draft.clear_pricing = true;
+            } else if !ans.is_empty() {
+                let Some(pricing) = parse_pricing(ans) else {
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderPricingInvalid));
+                    return StepOutcome::Retry;
+                };
+                draft.pricing = Some(pricing);
+                draft.clear_pricing = false;
+            }
+        }
         // Template / Base URL / Type are pre-plan steps, never planned.
         WizardStep::Template | WizardStep::BaseUrl | WizardStep::ProviderType => {}
     }
@@ -1136,6 +1187,20 @@ fn advance_edit(
                         return Some(WizardStep::ContextWindow);
                     }
                 }
+            }
+            Some(WizardStep::Pricing)
+        }
+        WizardStep::Pricing => {
+            if ans.eq_ignore_ascii_case("clear") || ans == "清除" {
+                draft.pricing = None;
+                draft.clear_pricing = true;
+            } else if !ans.is_empty() {
+                let Some(pricing) = parse_pricing(ans) else {
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderPricingInvalid));
+                    return Some(WizardStep::Pricing);
+                };
+                draft.pricing = Some(pricing);
+                draft.clear_pricing = false;
             }
             None
         }
@@ -1586,6 +1651,7 @@ chunks = query({
             vec![
                 WizardStep::ApiKey,
                 WizardStep::ContextWindow,
+                WizardStep::Pricing,
                 WizardStep::Name
             ]
         );
@@ -1709,6 +1775,7 @@ chunks = query({
                 WizardStep::ApiKey,
                 WizardStep::Model,
                 WizardStep::ContextWindow,
+                WizardStep::Pricing,
                 WizardStep::Name
             ]
         );
@@ -1723,13 +1790,18 @@ chunks = query({
                 WizardStep::ApiKey,
                 WizardStep::Model,
                 WizardStep::ContextWindow,
+                WizardStep::Pricing,
                 WizardStep::Name
             ]
         );
         // everything filled → still offer the context window, then confirm Name.
         assert_eq!(
             import_plan(&draft_filled("openai", "sk-1", "gpt-4o")),
-            vec![WizardStep::ContextWindow, WizardStep::Name]
+            vec![
+                WizardStep::ContextWindow,
+                WizardStep::Pricing,
+                WizardStep::Name
+            ]
         );
         // model already filled → skip it, keep context window before Name.
         assert_eq!(
@@ -1737,6 +1809,7 @@ chunks = query({
             vec![
                 WizardStep::ApiKey,
                 WizardStep::ContextWindow,
+                WizardStep::Pricing,
                 WizardStep::Name
             ]
         );
@@ -1756,6 +1829,18 @@ chunks = query({
         assert_eq!(parse_context_window("banana"), None);
         assert_eq!(parse_context_window(""), None);
         assert_eq!(parse_context_window("12x"), None);
+    }
+
+    #[test]
+    fn parse_pricing_requires_three_finite_non_negative_values() {
+        let pricing = parse_pricing("2.5, 10, 0.25").unwrap();
+        assert_eq!(pricing.input_per_million, 2.5);
+        assert_eq!(pricing.output_per_million, 10.0);
+        assert_eq!(pricing.cached_input_per_million, 0.25);
+        assert!(parse_pricing("0,0,0").is_some());
+        assert!(parse_pricing("-1,2,3").is_none());
+        assert!(parse_pricing("1,2").is_none());
+        assert!(parse_pricing("NaN,2,3").is_none());
     }
 
     #[test]
@@ -1827,17 +1912,22 @@ chunks = query({
             advance_edit(&mut d, WizardStep::Model, "gpt-4o", &mut sink),
             Some(WizardStep::ContextWindow)
         );
-        // Valid entry → ends, value captured.
+        // Valid entry advances to optional pricing, value captured.
         assert_eq!(
             advance_edit(&mut d, WizardStep::ContextWindow, "32000", &mut sink),
-            None
+            Some(WizardStep::Pricing)
         );
         assert_eq!(d.context_window, Some(32_000));
-        // Blank → ends, stays None so apply_onto keeps the existing value.
+        assert_eq!(
+            advance_edit(&mut d, WizardStep::Pricing, "1,2,0.5", &mut sink),
+            None
+        );
+        assert_eq!(d.pricing.unwrap().output_per_million, 2.0);
+        // Blank context still advances, stays None so apply_onto keeps it.
         let mut d2 = DraftProvider::default();
         assert_eq!(
             advance_edit(&mut d2, WizardStep::ContextWindow, "", &mut sink),
-            None
+            Some(WizardStep::Pricing)
         );
         assert_eq!(d2.context_window, None);
         // Invalid → re-prompt the same step.
@@ -1896,6 +1986,7 @@ chunks = query({
             vec![
                 WizardStep::ApiKey,
                 WizardStep::ContextWindow,
+                WizardStep::Pricing,
                 WizardStep::Name
             ]
         );

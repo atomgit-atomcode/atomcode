@@ -1855,14 +1855,7 @@ fn execute_slash_command_impl(
             }
         }
         "cost" => {
-            // Local session token cost (any model, incl. self-integrated) — as
-            // opposed to `/usage`, which queries the CodingPlan gateway only.
-            let text = build_cost_text(
-                &ctx.model_name,
-                state.prompt_tokens,
-                state.completion_tokens,
-                state.cached_tokens,
-            );
+            let text = build_session_cost_text(ctx, state);
             if matches!(state.phase, crate::state::UiPhase::Streaming) {
                 // `/cost` is a static report — drop any live `/usage` panel so
                 // tab keys don't steer a report that's no longer on screen.
@@ -5037,27 +5030,177 @@ fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Mod
 /// `/cost` 的用量报告文本：本会话累计 token × 模型价目表。与 `/usage`（只查
 /// CodingPlan 网关）不同，这是本地统计，任何模型（含自接入）都能出数。TUI arm
 /// 与手机远程执行共用。
-pub(crate) fn build_cost_text(
-    model: &str,
-    prompt: usize,
-    completion: usize,
-    cached: usize,
+pub(crate) fn build_cost_report_text(
+    mut report: atomcode_capabilities::session::SessionCostReport,
+    current_provider: &str,
+    current_model: &str,
+    current_pricing: Option<atomcode_capabilities::session::ModelPricing>,
 ) -> String {
-    // Reuse the tested cache-% helper (clamps a degenerate cached>prompt to 100%).
-    let (_billable, cache_pct) = crate::state::turn_token_summary(prompt, completion, cached);
-    let cache_rate = cache_pct.unwrap_or(0) as usize;
-    let total = prompt + completion;
-    let cost = crate::pricing::calculate_cost(model, prompt, completion, cached);
-    let cost_str = crate::pricing::format_cost(cost);
-    t(Msg::CostReport {
-        prompt,
-        completion,
-        cached,
-        cache_rate,
-        total,
-        cost: &cost_str,
-    })
-    .into_owned()
+    if !report
+        .models
+        .iter()
+        .any(|item| item.provider_id == current_provider && item.model_id == current_model)
+    {
+        report.models.push(atomcode_capabilities::session::ModelCostSummary {
+            provider_id: current_provider.to_string(),
+            model_id: current_model.to_string(),
+            tokens: Default::default(),
+            estimated_cost_usd: current_pricing.map(|_| 0.0),
+            explicitly_free: current_pricing.is_some_and(|pricing| pricing.is_free()),
+        });
+    }
+
+    let mut sections = Vec::new();
+    for item in report.models {
+        let prompt = item.tokens.input.saturating_add(item.tokens.cached_input) as usize;
+        let completion = item.tokens.output as usize;
+        let cached = item.tokens.cached_input as usize;
+        let cache_rate = if prompt == 0 {
+            0
+        } else {
+            cached.saturating_mul(100) / prompt
+        };
+        let cost = if item.explicitly_free {
+            t(Msg::CostFree).into_owned()
+        } else {
+            item.estimated_cost_usd
+                .map(crate::pricing::format_cost)
+                .unwrap_or_else(|| t(Msg::CostUnknown).into_owned())
+        };
+        let body = t(Msg::CostReport {
+            prompt,
+            completion,
+            cached,
+            cache_rate,
+            total: prompt.saturating_add(completion),
+            cost: &cost,
+        });
+        sections.push(format!(
+            "{} / {}\n{}",
+            item.provider_id, item.model_id, body
+        ));
+    }
+    if report.unattributed_tokens > 0 {
+        sections.push(
+            t(Msg::CostUnattributed {
+                tokens: report.unattributed_tokens,
+            })
+            .into_owned(),
+        );
+    }
+    sections.join("\n\n")
+}
+
+fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
+    let provider = ctx.config.default_provider.as_str();
+    let pricing = ctx
+        .config
+        .providers
+        .get(provider)
+        .and_then(|config| config.pricing)
+        .and_then(|pricing| pricing.validated())
+        .map(|pricing| atomcode_capabilities::session::ModelPricing {
+            input_per_million: pricing.input_per_million,
+            output_per_million: pricing.output_per_million,
+            cached_input_per_million: pricing.cached_input_per_million,
+        });
+    let manager = session_manager_for_cost(
+        ctx.current_session_project_bucket.as_deref(),
+        &ctx.current_session.working_dir,
+    );
+    let mut report = match manager.read_meta(&ctx.current_session.id) {
+        Ok(meta) => atomcode_capabilities::session::aggregate_session_cost(&meta),
+        Err(_) => {
+            // Never relabel older in-memory totals as the current model when
+            // native metadata is unavailable. Only the active turn below has
+            // a trustworthy current-generation identity.
+            let session_total = state
+                .prompt_tokens
+                .saturating_add(state.completion_tokens) as u64;
+            let live_total = state
+                .turn_prompt_tokens
+                .saturating_add(state.turn_completion_tokens) as u64;
+            let unattributed_tokens = session_total.saturating_sub(live_total);
+            atomcode_capabilities::session::SessionCostReport {
+                models: Vec::new(),
+                unattributed_tokens,
+                total_tokens: unattributed_tokens,
+                estimated_cost_usd: None,
+            }
+        }
+    };
+    let live_tokens = atomcode_capabilities::session::TokenBreakdown {
+        input: state
+            .turn_prompt_tokens
+            .saturating_sub(state.turn_cached_tokens) as u64,
+        output: state.turn_completion_tokens as u64,
+        cached_input: state.turn_cached_tokens as u64,
+    };
+    if live_tokens.total() > 0 {
+        if let Some(model) = report
+            .models
+            .iter_mut()
+            .find(|item| item.provider_id == provider && item.model_id == ctx.model_name)
+        {
+            model.tokens.input = model.tokens.input.saturating_add(live_tokens.input);
+            model.tokens.output = model.tokens.output.saturating_add(live_tokens.output);
+            model.tokens.cached_input = model
+                .tokens
+                .cached_input
+                .saturating_add(live_tokens.cached_input);
+            match (model.estimated_cost_usd.as_mut(), pricing) {
+                (Some(cost), Some(price)) => *cost += price.estimate(live_tokens),
+                _ => model.estimated_cost_usd = None,
+            }
+            model.explicitly_free &= pricing.is_some_and(|price| price.is_free());
+        } else {
+            report
+                .models
+                .push(atomcode_capabilities::session::ModelCostSummary {
+                    provider_id: provider.to_string(),
+                    model_id: ctx.model_name.clone(),
+                    tokens: live_tokens,
+                    estimated_cost_usd: pricing.map(|price| price.estimate(live_tokens)),
+                    explicitly_free: pricing.is_some_and(|price| price.is_free()),
+                });
+        }
+        report.total_tokens = report.total_tokens.saturating_add(live_tokens.total());
+        report.estimated_cost_usd = None;
+    }
+    build_cost_report_text(report, provider, &ctx.model_name, pricing)
+}
+
+fn session_manager_for_cost(
+    project_bucket: Option<&str>,
+    working_dir: &std::path::Path,
+) -> atomcode_capabilities::session::SessionManager {
+    project_bucket
+        .filter(|bucket| {
+            bucket.len() == 16 && bucket.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map(|bucket| {
+            atomcode_capabilities::session::SessionManager::with_root(
+                atomcode_capabilities::session::SessionManager::sessions_root().join(bucket),
+            )
+        })
+        .unwrap_or_else(|| {
+            atomcode_capabilities::session::SessionManager::for_project(working_dir)
+        })
+}
+
+#[cfg(test)]
+mod cost_session_location_tests {
+    use super::session_manager_for_cost;
+
+    #[test]
+    fn authoritative_catalog_bucket_wins_over_working_dir_hash() {
+        let bucket = "0123456789abcdef";
+        let manager = session_manager_for_cost(Some(bucket), std::path::Path::new("/different"));
+        assert_eq!(
+            manager.root(),
+            atomcode_capabilities::session::SessionManager::sessions_root().join(bucket)
+        );
+    }
 }
 
 /// 手机端可远程触发的**只读信息类**命令白名单。返回 None = 不允许远程执行
@@ -5070,12 +5213,7 @@ pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> O
         .as_str()
     {
         "status" => Some(build_status_text(ctx, None)),
-        "cost" => Some(build_cost_text(
-            &ctx.model_name,
-            state.prompt_tokens,
-            state.completion_tokens,
-            state.cached_tokens,
-        )),
+        "cost" => Some(build_session_cost_text(ctx, state)),
         "whoami" => Some(build_whoami_text()),
         "diff" => Some(build_diff_stat_text(ctx).unwrap_or_else(|e| e)),
         _ => None,
@@ -8114,18 +8252,38 @@ mod todo_command_tests {
     }
 
     #[test]
-    fn build_cost_text_reports_tokens_cost_and_nonzero_for_self_integrated() {
-        use crate::event_loop::commands::build_cost_text;
-        // Distinct values so substring asserts don't cross-match.
-        let out = build_cost_text("my-self-hosted-llm-v9", 1234, 567, 89);
-        assert!(out.contains("1234"), "prompt tokens shown");
-        assert!(out.contains("567"), "completion tokens shown");
-        assert!(out.contains("89"), "cached tokens shown");
-        assert!(out.contains('$'), "a cost figure is rendered");
-        assert!(
-            !out.contains("$0.0000"),
-            "self-integrated/unknown model must not price to $0"
+    fn cost_report_keeps_models_separate_and_marks_unknown_price() {
+        use crate::event_loop::commands::build_cost_report_text;
+        use atomcode_capabilities::session::{
+            ModelCostSummary, SessionCostReport, TokenBreakdown,
+        };
+        let out = build_cost_report_text(
+            SessionCostReport {
+                models: vec![ModelCostSummary {
+                    provider_id: "provider-a".into(),
+                    model_id: "model-a".into(),
+                    tokens: TokenBreakdown {
+                        input: 1234,
+                        output: 567,
+                        cached_input: 89,
+                    },
+                    estimated_cost_usd: None,
+                    explicitly_free: false,
+                }],
+                unattributed_tokens: 0,
+                total_tokens: 1890,
+                estimated_cost_usd: None,
+            },
+            "provider-b",
+            "model-b",
+            None,
         );
+        assert!(out.contains("provider-a / model-a"));
+        assert!(out.contains("provider-b / model-b"));
+        assert!(out.contains("1323"));
+        assert!(out.contains("567"));
+        assert!(out.contains("89"));
+        assert!(out.contains("unknown"));
     }
 }
 

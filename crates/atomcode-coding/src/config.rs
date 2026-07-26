@@ -52,6 +52,9 @@ pub struct CodingAgentConfig {
     /// When true, the kernel turns the `max_rounds` cap into an interactive
     /// checkpoint (see AgentBuilder). Default false; only the TUI driver sets it.
     pub round_cap_checkpoint: bool,
+    /// Immutable price snapshot for this runtime generation. `None` means the
+    /// configured model's price is unknown.
+    pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
     /// Exact no-progress loop policy. `None` disables it for explicitly intentional
     /// identical repetition. Defaults to 3/4 and is configurable through
     /// `ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD` / `ATOMCODE_TOOL_LOOP_STOP_THRESHOLD`;
@@ -167,6 +170,7 @@ pub struct CodingRuntimeConfig {
     /// must stay `false` for headless / ACP / daemon runtimes (there is no
     /// requester to answer the Request → the kernel fail-closes to a stop).
     pub round_cap_checkpoint: bool,
+    pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
 }
 
 impl CodingRuntimeConfig {
@@ -238,6 +242,16 @@ impl CodingRuntimeConfig {
             // Default off; only the interactive TUI opts in (see the CLI's
             // TUI spawn sites and `event_loop::reload_runtime_provider_from`).
             round_cap_checkpoint: false,
+            pricing: provider.and_then(|provider| {
+                provider
+                    .pricing
+                    .and_then(|pricing| pricing.validated())
+                    .map(|pricing| atomcode_capabilities::session::ModelPricing {
+                        input_per_million: pricing.input_per_million,
+                        output_per_million: pricing.output_per_million,
+                        cached_input_per_million: pricing.cached_input_per_million,
+                    })
+            }),
         }
     }
 
@@ -272,6 +286,7 @@ impl CodingRuntimeConfig {
         }
         config.keep_interrupted_context = self.keep_interrupted_context;
         config.round_cap_checkpoint = self.round_cap_checkpoint;
+        config.pricing = self.pricing;
         config
     }
 }
@@ -281,6 +296,14 @@ pub fn apply_provider_config(
     provider: &atomcode_config::config::provider::ProviderConfig,
 ) {
     config.model = provider.model.clone();
+    config.pricing = provider
+        .pricing
+        .and_then(|pricing| pricing.validated())
+        .map(|pricing| atomcode_capabilities::session::ModelPricing {
+            input_per_million: pricing.input_per_million,
+            output_per_million: pricing.output_per_million,
+            cached_input_per_million: pricing.cached_input_per_million,
+        });
     if let Some(base_url) = &provider.base_url {
         config.base_url = base_url.clone();
     }
@@ -325,6 +348,7 @@ struct TierInner {
     /// otherwise forces the strong-tier subtasks to run serially). Survives `reset` (a `/model`
     /// swap changes the tier model, not the conversation identity).
     session_id: Option<String>,
+    usage_recorder: Option<atomcode_capabilities::session::DetachedUsageRecorder>,
 }
 
 pub struct TierProvider {
@@ -338,6 +362,7 @@ impl TierProvider {
                 thunk,
                 cache: None,
                 session_id: None,
+                usage_recorder: None,
             }),
         })
     }
@@ -351,7 +376,14 @@ impl TierProvider {
         if let Some(cached) = &g.cache {
             return cached.clone();
         }
-        let built = (g.thunk)();
+        let mut built = (g.thunk)();
+        if let Some(recorder) = g.usage_recorder.clone() {
+            if let Some(provider) = built.take() {
+                built = Some(Arc::new(
+                    atomcode_capabilities::session::UsageRecordingProvider::new(provider, recorder),
+                ));
+            }
+        }
         // Bind the parent session id onto the freshly-built provider so subtask children carry
         // the main conversation's `x-atomcode-session-id` (one gateway window ⇒ concurrent OK).
         if let (Some(sid), Some(p)) = (&g.session_id, &built) {
@@ -359,6 +391,17 @@ impl TierProvider {
         }
         g.cache = Some(built.clone());
         built
+    }
+
+    pub fn set_usage_recorder(
+        &self,
+        recorder: atomcode_capabilities::session::DetachedUsageRecorder,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        g.usage_recorder = Some(recorder);
+        // A model/provider reload may change attribution. Rebuild lazily so a
+        // cached provider can never keep writing under the previous identity.
+        g.cache = None;
     }
 
     /// Record the parent conversation's session id, to be bound onto the tier provider when
@@ -470,7 +513,8 @@ pub fn resolve_loop_max_rounds(configured: u32, env: Option<&str>) -> u32 {
 /// Non-parseable env values fall back to the TOML-configured value.
 /// Same shape as `resolve_loop_max_rounds`.
 pub fn resolve_turn_max_rounds(configured: u32, env: Option<&str>) -> u32 {
-    env.and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(configured)
+    env.and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(configured)
 }
 
 impl CodingAgentConfig {
@@ -495,6 +539,7 @@ impl CodingAgentConfig {
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
             round_cap_checkpoint: false,
+            pricing: None,
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
             goal_max_duration_secs: default_goal_max_duration_secs(),

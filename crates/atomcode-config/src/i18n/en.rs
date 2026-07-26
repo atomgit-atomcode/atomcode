@@ -298,6 +298,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Context window? [{current}] tokens (blank to keep; e.g. 128000 / 256000 / 512000 / 1000000, or 128k / 1m)").into(),
         Msg::ProviderContextWindowInvalid =>
             "Context window must be a positive number of tokens, e.g. 128000 or 128k.".into(),
+        Msg::ProviderStepPricing =>
+            "Pricing USD per 1M tokens? input,output,cached-input (blank = unknown/keep; `clear` removes; e.g. 2.5,10,0.25; free = 0,0,0)".into(),
+        Msg::ProviderStepPricingWithHint { current } =>
+            format!("Pricing USD per 1M tokens? [{current}] (blank to keep; `clear` removes)").into(),
+        Msg::ProviderPricingInvalid =>
+            "Pricing must be three finite non-negative numbers: input,output,cached-input.".into(),
         Msg::ProviderNameEmpty => "Name cannot be empty.".into(),
         Msg::ProviderBaseUrlEmpty => "Base URL cannot be empty.".into(),
         Msg::ProviderUnknownType =>
@@ -568,6 +574,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
                 "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n  Estimated cost:    {}\n",
                 prompt, completion, cached, cache_rate, total, cost
             ).into(),
+        Msg::CostFree => "free".into(),
+        Msg::CostUnknown => "unknown".into(),
+        Msg::CostUnattributed { tokens } =>
+            format!("Unattributed legacy usage\n  Total tokens:      {}\n  Estimated cost:    unknown", tokens).into(),
 
         // ── /think ──
         Msg::ThinkStatus { status, budget, provider } =>

@@ -8169,6 +8169,7 @@ mod external_config_tests {
                 skip_tls_verify: false,
                 ephemeral,
                 capable_model: None,
+                pricing: None,
             },
         );
         config

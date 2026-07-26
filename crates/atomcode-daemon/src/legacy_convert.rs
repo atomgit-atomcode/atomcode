@@ -410,6 +410,7 @@ fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedL
             errored: stat.errored,
             used_tokens: checked_u32(stat.used_tokens, "used_tokens")?,
             ctx_window: checked_u32(stat.ctx_window, "ctx_window")?,
+            model_usage: Vec::new(),
         });
         previous_after = stat.after_message;
     }
@@ -536,6 +537,8 @@ fn convert_legacy_session_with_diagnostic(
         turn_count: checked_u32(normalized_turns.turn_stats.len(), "turn_stats")?,
         message_count: checked_u32(session.messages.len(), "messages")?,
         turn_stats: normalized_turns.turn_stats,
+        detached_model_usage: Vec::new(),
+        detached_unattributed_tokens: 0,
     };
     meta.auto_name_from_messages(&snapshot.messages);
 
@@ -2617,6 +2620,7 @@ mod tests {
             errored: false,
             used_tokens: 1,
             ctx_window: 128,
+            model_usage: Vec::new(),
         });
         let native_presentation = PresentationEntry {
             anchor: DisplayAnchor::AfterTurn {
@@ -2892,6 +2896,7 @@ mod tests {
                 errored: false,
                 used_tokens: 1,
                 ctx_window: 128,
+                model_usage: Vec::new(),
             },
         );
         let original_meta = meta.clone();
@@ -3769,6 +3774,7 @@ mod tests {
             errored: false,
             used_tokens: 1,
             ctx_window: 10,
+            model_usage: Vec::new(),
         });
         let lease = manager.acquire_lease(id).unwrap();
         manager

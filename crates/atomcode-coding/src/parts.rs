@@ -587,8 +587,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     hooks.push(Arc::new(SkillCatalogHook::new(skill_catalog)));
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
-        let snapshot_hook =
-            Arc::new(SnapshotHook::new(b.manager.clone(), &b.id, &wd).with_lease(b.lease.clone()));
+        let snapshot_hook = Arc::new(
+            SnapshotHook::new(b.manager.clone(), &b.id, &wd)
+                .with_lease(b.lease.clone())
+                .with_model_attribution(&cfg.provider_name, &cfg.model, cfg.pricing),
+        );
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
         compaction_checkpoint = Some(snapshot_hook.clone());
         hooks.push(snapshot_hook);
@@ -756,6 +759,12 @@ impl CodingParts {
         self.snapshot_persistence_status
             .as_ref()
             .and_then(SnapshotPersistenceStatus::take_uncertain_commit)
+    }
+
+    pub(crate) fn take_cost_persistence_warning(&self) -> Option<String> {
+        self.snapshot_persistence_status
+            .as_ref()
+            .and_then(SnapshotPersistenceStatus::take_cost_warning)
     }
 
     pub(crate) fn snapshot_persistence_status(&self) -> Option<SnapshotPersistenceStatus> {
@@ -1129,16 +1138,35 @@ pub fn assemble(
     // on_model_response), so without this their token spend is invisible. The host loop's
     // PRIMARY provider stays bare below: the TelemetryHook already meters it, and wrapping
     // it too would double-count. `None` ⇒ telemetry off ⇒ the bare provider (zero overhead).
+    let out_of_loop_provider: Arc<dyn LlmProvider> = match &parts.session {
+        Some(session) => {
+            let mut recorder = atomcode_capabilities::session::DetachedUsageRecorder::new(
+                session.manager.clone(),
+                &session.id,
+                &cfg.provider_name,
+                &cfg.model,
+                cfg.pricing,
+            );
+            if let Some(status) = parts.snapshot_persistence_status() {
+                recorder = recorder.with_persistence_status(status);
+            }
+            Arc::new(atomcode_capabilities::session::UsageRecordingProvider::new(
+                provider.clone(),
+                recorder,
+            ))
+        }
+        None => provider.clone(),
+    };
     let metered_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
         Some(tel) => Arc::new(crate::telemetry::MeteredProvider::new(
-            provider.clone(),
+            out_of_loop_provider.clone(),
             tel.clone(),
             cfg.provider_type.as_str(),
             &cfg.base_url,
             &cfg.model,
             parts.session.as_ref().map(|b| b.id.as_str()),
         )),
-        None => provider.clone(),
+        None => out_of_loop_provider.clone(),
     };
 
     // Fill the `code_review` tool's provider slot (the tool was built in `prepare` before
@@ -1153,7 +1181,7 @@ pub fn assemble(
         let review_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
             Some(tel) => Arc::new(
                 crate::telemetry::MeteredProvider::new(
-                    provider.clone(),
+                    out_of_loop_provider.clone(),
                     tel.clone(),
                     cfg.provider_type.as_str(),
                     &cfg.base_url,
@@ -1162,7 +1190,7 @@ pub fn assemble(
                 )
                 .with_surface("code_review"),
             ),
-            None => provider.clone(),
+            None => out_of_loop_provider.clone(),
         };
         if let Ok(mut g) = slot.write() {
             *g = Some(review_provider);
@@ -1173,7 +1201,7 @@ pub fn assemble(
         let sub_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
             Some(tel) => Arc::new(
                 crate::telemetry::MeteredProvider::new(
-                    provider.clone(),
+                    out_of_loop_provider.clone(),
                     tel.clone(),
                     cfg.provider_type.as_str(),
                     &cfg.base_url,
@@ -1182,7 +1210,7 @@ pub fn assemble(
                 )
                 .with_surface("subagent"),
             ),
-            None => provider.clone(),
+            None => out_of_loop_provider.clone(),
         };
         if let Ok(mut g) = slot.write() {
             *g = Some(sub_provider);
@@ -1369,6 +1397,42 @@ pub fn assemble(
         }
         if let Some(cell) = &cfg.subagent_capable_provider {
             cell.set_session_id(&b.id);
+        }
+        if let Some(registry) = cfg.subagent_config.as_deref() {
+            if let Some((fast_key, capable_key)) =
+                crate::subagent_tiers::resolve_tier_keys(registry, &cfg.model)
+            {
+                let install_recorder = |cell: &Arc<crate::config::TierProvider>, key: &str| {
+                    if let Some(provider) = registry.providers.get(key) {
+                        let pricing = provider
+                            .pricing
+                            .and_then(|pricing| pricing.validated())
+                            .map(|pricing| atomcode_capabilities::session::ModelPricing {
+                                input_per_million: pricing.input_per_million,
+                                output_per_million: pricing.output_per_million,
+                                cached_input_per_million: pricing.cached_input_per_million,
+                            });
+                        let mut recorder =
+                            atomcode_capabilities::session::DetachedUsageRecorder::new(
+                                b.manager.clone(),
+                                &b.id,
+                                key,
+                                &provider.model,
+                                pricing,
+                            );
+                        if let Some(status) = parts.snapshot_persistence_status() {
+                            recorder = recorder.with_persistence_status(status);
+                        }
+                        cell.set_usage_recorder(recorder);
+                    }
+                };
+                if let Some(cell) = &cfg.subagent_fast_provider {
+                    install_recorder(cell, &fast_key);
+                }
+                if let Some(cell) = &cfg.subagent_capable_provider {
+                    install_recorder(cell, &capable_key);
+                }
+            }
         }
         if let Some(snap) = &b.resume {
             builder = builder.resume(snap.clone());

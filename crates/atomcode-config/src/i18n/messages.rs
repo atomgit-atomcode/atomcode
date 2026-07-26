@@ -338,6 +338,11 @@ pub enum Msg<'a> {
         current: usize,
     },
     ProviderContextWindowInvalid,
+    ProviderStepPricing,
+    ProviderStepPricingWithHint {
+        current: &'a str,
+    },
+    ProviderPricingInvalid,
     ProviderNameEmpty,
     ProviderBaseUrlEmpty,
     ProviderUnknownType,
@@ -675,6 +680,11 @@ pub enum Msg<'a> {
         cache_rate: usize,
         total: usize,
         cost: &'a str,
+    },
+    CostFree,
+    CostUnknown,
+    CostUnattributed {
+        tokens: u64,
     },
 
     // ── /usage command ──

@@ -320,6 +320,16 @@ pub(crate) fn chat_runtime_config(
         subagent_config: Some(Arc::new(config.clone())),
         // Daemon path has no TUI checkpoint picker; keep the hard round-cap.
         round_cap_checkpoint: false,
+        pricing: p.and_then(|provider| {
+            provider
+                .pricing
+                .and_then(|pricing| pricing.validated())
+                .map(|pricing| atomcode_capabilities::session::ModelPricing {
+                    input_per_million: pricing.input_per_million,
+                    output_per_million: pricing.output_per_million,
+                    cached_input_per_million: pricing.cached_input_per_million,
+                })
+        }),
     }
 }
 

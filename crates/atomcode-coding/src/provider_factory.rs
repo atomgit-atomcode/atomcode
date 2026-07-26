@@ -172,10 +172,20 @@ pub fn default_max_tokens(context_window: u32) -> u32 {
 
 pub fn derive_tier_config(
     base: &CodingAgentConfig,
+    provider_name: &str,
     provider: &atomcode_config::config::provider::ProviderConfig,
 ) -> CodingAgentConfig {
     let mut tier = base.clone();
     tier.model = provider.model.clone();
+    tier.provider_name = provider_name.to_string();
+    tier.pricing = provider
+        .pricing
+        .and_then(|pricing| pricing.validated())
+        .map(|pricing| atomcode_capabilities::session::ModelPricing {
+            input_per_million: pricing.input_per_million,
+            output_per_million: pricing.output_per_million,
+            cached_input_per_million: pricing.cached_input_per_million,
+        });
     if let Some(base_url) = &provider.base_url {
         tier.base_url = base_url.clone();
     }
@@ -201,12 +211,13 @@ pub fn tier_provider_builder(
     factory: Arc<dyn CodingProviderFactory>,
     base: &CodingAgentConfig,
     host_model: &str,
+    provider_name: &str,
     provider: &atomcode_config::config::provider::ProviderConfig,
 ) -> Option<SubagentProvider> {
     if provider.model == host_model {
         return None;
     }
-    let tier = derive_tier_config(base, provider);
+    let tier = derive_tier_config(base, provider_name, provider);
     Some(Arc::new(move || factory.build(&tier, None).ok()))
 }
 
@@ -226,7 +237,9 @@ pub fn resolve_subagent_tier_thunks(
         config
             .providers
             .get(key)
-            .and_then(|provider| tier_provider_builder(factory.clone(), base, host_model, provider))
+            .and_then(|provider| {
+                tier_provider_builder(factory.clone(), base, host_model, key, provider)
+            })
             .unwrap_or_else(none)
     };
     (thunk_for(&fast_key), thunk_for(&capable_key))

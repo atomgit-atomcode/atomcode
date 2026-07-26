@@ -1,4 +1,6 @@
-use atomcode_config::config::provider::{default_context_window_for, ProviderConfig};
+use atomcode_config::config::provider::{
+    default_context_window_for, ProviderConfig, ProviderPricing,
+};
 use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 
@@ -31,6 +33,7 @@ pub(crate) struct CreateProviderRequest {
     pub reasoning_effort: Option<String>,
     pub thinking_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
+    pub pricing: Option<ProviderPricing>,
     #[serde(default)]
     pub skip_tls_verify: bool,
     #[serde(default)]
@@ -65,6 +68,9 @@ pub(crate) struct PatchProviderRequest {
     pub reasoning_history: Option<Option<String>>,
     pub reasoning_effort: Option<Option<String>>,
     pub skip_tls_verify: Option<bool>,
+    pub pricing: Option<Option<ProviderPricing>>,
+    #[serde(default)]
+    pub clear_pricing: bool,
 }
 
 /// PATCH /providers/:name/thinking - Update thinking settings.
@@ -123,6 +129,13 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
                 .into_response();
         }
     }
+    if req.pricing.is_some_and(|pricing| pricing.validated().is_none()) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "pricing values must be finite and non-negative",
+        )
+        .into_response();
+    }
 
     let context_window = req
         .context_window
@@ -146,6 +159,7 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
         skip_tls_verify: req.skip_tls_verify,
         ephemeral: false,
         capable_model: None,
+        pricing: req.pricing,
     };
 
     let mut is_new = false;
@@ -189,6 +203,18 @@ pub(crate) async fn patch_provider(
     {
         return json_error(StatusCode::BAD_REQUEST, "Provider type cannot be empty")
             .into_response();
+    }
+    if req
+        .pricing
+        .as_ref()
+        .and_then(|pricing| *pricing)
+        .is_some_and(|pricing| pricing.validated().is_none())
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "pricing values must be finite and non-negative",
+        )
+        .into_response();
     }
     if req
         .model
@@ -276,6 +302,11 @@ pub(crate) async fn patch_provider(
         }
         if let Some(value) = req.skip_tls_verify {
             existing.skip_tls_verify = value;
+        }
+        if req.clear_pricing {
+            existing.pricing = None;
+        } else if let Some(value) = req.pricing {
+            existing.pricing = value;
         }
         if final_name != name {
             let provider = config.providers.remove(&name).expect("validated above");

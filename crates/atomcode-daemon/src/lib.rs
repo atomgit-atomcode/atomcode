@@ -140,6 +140,7 @@ pub(crate) struct ProviderInfo {
     pub reasoning_effort: Option<String>,
     pub skip_tls_verify: bool,
     pub ephemeral: bool,
+    pub pricing: Option<atomcode_config::config::provider::ProviderPricing>,
 }
 
 /// Login attempts stay addressable while a blocking poll is in flight. Per-record
@@ -5710,6 +5711,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            pricing: None,
         }
     }
 

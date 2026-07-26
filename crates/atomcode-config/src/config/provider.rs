@@ -1,5 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+/// Optional local estimate in USD per million tokens. Absence means pricing is
+/// unknown; an explicitly configured all-zero value means the model is free.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ProviderPricing {
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    #[serde(default)]
+    pub cached_input_per_million: f64,
+}
+
+impl ProviderPricing {
+    pub fn validated(self) -> Option<Self> {
+        [
+            self.input_per_million,
+            self.output_per_million,
+            self.cached_input_per_million,
+        ]
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
+        .then_some(self)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     #[serde(rename = "type")]
@@ -77,6 +100,9 @@ pub struct ProviderConfig {
     /// tier; fewer than 2 (or a non-participating host) ⇒ the subagent uses the current model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capable_model: Option<i64>,
+    /// Optional price snapshot used for local `/cost` estimates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ProviderPricing>,
 }
 
 impl ProviderConfig {
@@ -224,6 +250,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pricing_is_optional_and_explicit_zero_means_free() {
+        let unknown: ProviderConfig = toml::from_str(
+            r#"
+type = "openai"
+model = "custom"
+base_url = "https://example.test/v1"
+"#,
+        )
+        .unwrap();
+        assert_eq!(unknown.pricing, None);
+
+        let free: ProviderConfig = toml::from_str(
+            r#"
+type = "openai"
+model = "custom"
+base_url = "https://example.test/v1"
+[pricing]
+input_per_million = 0
+output_per_million = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            free.pricing,
+            Some(ProviderPricing {
+                input_per_million: 0.0,
+                output_per_million: 0.0,
+                cached_input_per_million: 0.0,
+            })
+        );
+        assert!(
+            ProviderPricing {
+                input_per_million: -1.0,
+                output_per_million: 0.0,
+                cached_input_per_million: 0.0,
+            }
+            .validated()
+            .is_none()
+        );
+    }
+
+    #[test]
     fn accepts_images_false_for_text_only_model() {
         // Regression for the user's GLM-5.1 case: heuristic rejects
         // text-only models so the TUI's Ctrl+V handler refuses image
@@ -324,6 +392,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            pricing: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -352,6 +421,7 @@ mod tests {
             skip_tls_verify: true,
             ephemeral: false,
             capable_model: None,
+            pricing: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -377,6 +447,7 @@ mod tests {
         assert!(s.contains("capable_model = 1"), "set rank must serialize");
         let none_cfg = ProviderConfig {
             capable_model: None,
+            pricing: None,
             ..cfg
         };
         let s2 = toml::to_string(&none_cfg).expect("serialize");
@@ -427,6 +498,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            pricing: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-from-env-var".to_string()));
@@ -454,6 +526,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            pricing: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-custom-123".to_string()));
@@ -481,6 +554,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            pricing: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-openai-std".to_string()));

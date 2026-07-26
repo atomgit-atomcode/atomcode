@@ -1748,6 +1748,7 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
+                pricing: None,
             },
         );
         cfg.save(&tmp).unwrap();
@@ -1961,6 +1962,7 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
+                pricing: None,
             },
         );
         cfg.save(tmp.path()).unwrap();
@@ -2040,6 +2042,7 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
+                pricing: None,
             },
         );
         Config {
@@ -2102,6 +2105,7 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
+                pricing: None,
             },
         );
         assert!(cfg.can_handle_attached_images());

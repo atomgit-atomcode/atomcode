@@ -370,6 +370,16 @@ pub struct SessionMeta {
     /// then they live here, where wall-clock `duration_ms` belongs anyway.)
     #[serde(default)]
     pub turn_stats: Vec<TurnStat>,
+    /// Provider usage without a live turn position: calls outside the primary
+    /// loop (subagents, review, LLM compaction) plus usage archived when
+    /// undo/compaction removes the corresponding turn divider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detached_model_usage: Vec<ModelUsageStat>,
+    /// Legacy usage moved out of turn stats when undo/compaction removes the
+    /// corresponding presentation turn. It remains billable but cannot be
+    /// attributed to a provider/model written by older metadata.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub detached_unattributed_tokens: u64,
 }
 
 impl SessionMeta {
@@ -392,6 +402,52 @@ impl SessionMeta {
             turn_count: 0,
             message_count: 0,
             turn_stats: Vec::new(),
+            detached_model_usage: Vec::new(),
+            detached_unattributed_tokens: 0,
+        }
+    }
+
+    /// Remove turn stats selected by `predicate` while preserving their usage
+    /// in the position-independent cost ledger.
+    pub fn archive_turn_stats_where(
+        &mut self,
+        mut predicate: impl FnMut(&TurnStat) -> bool,
+    ) -> Vec<TurnStat> {
+        let mut retained = Vec::with_capacity(self.turn_stats.len());
+        let mut archived = Vec::new();
+        for turn in std::mem::take(&mut self.turn_stats) {
+            if !predicate(&turn) {
+                retained.push(turn);
+                continue;
+            }
+            if turn.model_usage.is_empty() {
+                self.detached_unattributed_tokens = self
+                    .detached_unattributed_tokens
+                    .saturating_add(u64::from(turn.total_tokens));
+            } else {
+                for usage in &turn.model_usage {
+                    merge_model_usage(&mut self.detached_model_usage, usage.clone());
+                }
+            }
+            archived.push(turn);
+        }
+        self.turn_stats = retained;
+        archived
+    }
+
+    /// Reverse only the cost-ledger contribution made by
+    /// [`archive_turn_stats_where`]. Concurrent detached usage remains intact.
+    pub fn remove_archived_turn_usage(&mut self, archived: &[TurnStat]) {
+        for turn in archived {
+            if turn.model_usage.is_empty() {
+                self.detached_unattributed_tokens = self
+                    .detached_unattributed_tokens
+                    .saturating_sub(u64::from(turn.total_tokens));
+            } else {
+                for usage in &turn.model_usage {
+                    subtract_model_usage(&mut self.detached_model_usage, usage);
+                }
+            }
         }
     }
 
@@ -535,10 +591,263 @@ pub struct TurnStat {
     /// Model context-window size paired with `used_tokens`.
     #[serde(default)]
     pub ctx_window: u32,
+    /// Per-model usage produced during this turn. Empty for metadata written
+    /// before model attribution was introduced; readers must keep that legacy
+    /// total under "unattributed" rather than assigning it to the active model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_usage: Vec<ModelUsageStat>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct TokenBreakdown {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub cached_input: u64,
+}
+
+impl TokenBreakdown {
+    pub fn total(self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cached_input)
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cached_input = self.cached_input.saturating_add(other.cached_input);
+    }
+
+    fn sub_assign(&mut self, other: Self) {
+        self.input = self.input.saturating_sub(other.input);
+        self.output = self.output.saturating_sub(other.output);
+        self.cached_input = self.cached_input.saturating_sub(other.cached_input);
+    }
+}
+
+/// Price snapshot in USD per million tokens. `None` on [`ModelUsageStat`]
+/// means unknown pricing; an all-zero snapshot means explicitly free.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ModelPricing {
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    #[serde(default)]
+    pub cached_input_per_million: f64,
+}
+
+impl ModelPricing {
+    pub fn estimate(self, tokens: TokenBreakdown) -> f64 {
+        (tokens.input as f64 * self.input_per_million
+            + tokens.output as f64 * self.output_per_million
+            + tokens.cached_input as f64 * self.cached_input_per_million)
+            / 1_000_000.0
+    }
+
+    pub fn is_free(self) -> bool {
+        self.input_per_million == 0.0
+            && self.output_per_million == 0.0
+            && self.cached_input_per_million == 0.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelUsageStat {
+    pub provider_id: String,
+    pub model_id: String,
+    pub tokens: TokenBreakdown,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
+}
+
+/// Session-scoped writer for model calls that run outside the primary agent
+/// lifecycle hooks. It uses the metadata lock for cross-task/process safety and
+/// deliberately does not mutate turn/message counters.
+#[derive(Clone)]
+pub struct DetachedUsageRecorder {
+    manager: Arc<SessionManager>,
+    session_id: String,
+    provider_id: String,
+    model_id: String,
+    pricing: Option<ModelPricing>,
+    persistence_status: Option<super::snapshot::SnapshotPersistenceStatus>,
+}
+
+impl DetachedUsageRecorder {
+    pub fn new(
+        manager: Arc<SessionManager>,
+        session_id: impl Into<String>,
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        pricing: Option<ModelPricing>,
+    ) -> Self {
+        Self {
+            manager,
+            session_id: session_id.into(),
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            pricing,
+            persistence_status: None,
+        }
+    }
+
+    pub fn with_persistence_status(
+        mut self,
+        status: super::snapshot::SnapshotPersistenceStatus,
+    ) -> Self {
+        self.persistence_status = Some(status);
+        self
+    }
+
+    pub fn record(&self, tokens: TokenBreakdown) -> SessionResult<()> {
+        if tokens.total() == 0 {
+            return Ok(());
+        }
+        let result = self.manager.update_meta(&self.session_id, |meta| {
+            merge_model_usage(
+                &mut meta.detached_model_usage,
+                ModelUsageStat {
+                    provider_id: self.provider_id.clone(),
+                    model_id: self.model_id.clone(),
+                    tokens,
+                    pricing: self.pricing,
+                },
+            );
+        });
+        if let Err(error) = &result {
+            if let Some(status) = &self.persistence_status {
+                status.report_cost_warning(format!(
+                    "model usage could not be persisted; /cost may be incomplete: {error}"
+                ));
+            }
+        }
+        result
+    }
+}
+
+fn merge_model_usage(records: &mut Vec<ModelUsageStat>, usage: ModelUsageStat) {
+    if let Some(existing) = records.iter_mut().find(|existing| {
+        existing.provider_id == usage.provider_id
+            && existing.model_id == usage.model_id
+            && existing.pricing == usage.pricing
+    }) {
+        existing.tokens.add_assign(usage.tokens);
+    } else {
+        records.push(usage);
+    }
+}
+
+fn subtract_model_usage(records: &mut Vec<ModelUsageStat>, usage: &ModelUsageStat) {
+    if let Some(existing) = records.iter_mut().find(|existing| {
+        existing.provider_id == usage.provider_id
+            && existing.model_id == usage.model_id
+            && existing.pricing == usage.pricing
+    }) {
+        existing.tokens.sub_assign(usage.tokens);
+    }
+    records.retain(|record| record.tokens.total() > 0);
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelCostSummary {
+    pub provider_id: String,
+    pub model_id: String,
+    pub tokens: TokenBreakdown,
+    /// `None` when any grouped record had unknown pricing.
+    pub estimated_cost_usd: Option<f64>,
+    pub explicitly_free: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionCostReport {
+    pub models: Vec<ModelCostSummary>,
+    pub unattributed_tokens: u64,
+    pub total_tokens: u64,
+    /// Sum of model estimates only when every attributed group has known
+    /// pricing and there is no unattributed legacy usage.
+    pub estimated_cost_usd: Option<f64>,
+}
+
+pub fn aggregate_session_cost(meta: &SessionMeta) -> SessionCostReport {
+    use std::collections::BTreeMap;
+
+    let mut grouped: BTreeMap<(String, String), (TokenBreakdown, Option<f64>, bool)> =
+        BTreeMap::new();
+    let mut unattributed_tokens = meta.detached_unattributed_tokens;
+
+    let mut add_usage = |usage: &ModelUsageStat| {
+        let entry = grouped
+            .entry((usage.provider_id.clone(), usage.model_id.clone()))
+            .or_insert((TokenBreakdown::default(), Some(0.0), true));
+        entry.0.add_assign(usage.tokens);
+        match (entry.1.as_mut(), usage.pricing) {
+            (Some(cost), Some(pricing)) => *cost += pricing.estimate(usage.tokens),
+            _ => entry.1 = None,
+        }
+        entry.2 &= usage.pricing.is_some_and(ModelPricing::is_free);
+    };
+
+    for turn in &meta.turn_stats {
+        if turn.model_usage.is_empty() {
+            unattributed_tokens = unattributed_tokens.saturating_add(u64::from(turn.total_tokens));
+            continue;
+        }
+        for usage in &turn.model_usage {
+            add_usage(usage);
+        }
+    }
+    for usage in &meta.detached_model_usage {
+        add_usage(usage);
+    }
+
+    let models: Vec<_> = grouped
+        .into_iter()
+        .map(
+            |((provider_id, model_id), (tokens, estimated_cost_usd, explicitly_free))| {
+                ModelCostSummary {
+                    provider_id,
+                    model_id,
+                    tokens,
+                    estimated_cost_usd,
+                    explicitly_free,
+                }
+            },
+        )
+        .collect();
+    let attributed_total = models.iter().fold(0_u64, |total, model| {
+        total.saturating_add(model.tokens.total())
+    });
+    let total_tokens = attributed_total.saturating_add(unattributed_tokens);
+    let estimated_cost_usd = if unattributed_tokens == 0
+        && models
+            .iter()
+            .all(|model| model.estimated_cost_usd.is_some())
+    {
+        Some(
+            models
+                .iter()
+                .filter_map(|model| model.estimated_cost_usd)
+                .sum(),
+        )
+    } else {
+        None
+    };
+    SessionCostReport {
+        models,
+        unattributed_tokens,
+        total_tokens,
+        estimated_cost_usd,
+    }
 }
 
 /// The per-project session store at `$ATOMCODE_HOME/sessions/<project_hash>/`.
@@ -3506,6 +3815,7 @@ mod tests {
             errored: false,
             used_tokens: 1,
             ctx_window: 10,
+            model_usage: Vec::new(),
         };
         meta.turn_stats = vec![stat(0, 1), stat(1, 2), stat(2, 3)];
         mgr.write_meta(&meta).unwrap();
@@ -5359,6 +5669,7 @@ mod tests {
                 errored: false,
                 used_tokens: 1,
                 ctx_window: 10,
+                model_usage: Vec::new(),
             },
             TurnStat {
                 after_message: 99,
@@ -5371,6 +5682,7 @@ mod tests {
                 errored: false,
                 used_tokens: 1,
                 ctx_window: 10,
+                model_usage: Vec::new(),
             },
         ];
         mgr.write_meta(&meta).unwrap();
@@ -5480,5 +5792,198 @@ mod tests {
             leftovers.is_empty(),
             "no .tmp must survive a successful write"
         );
+    }
+
+    #[test]
+    fn session_cost_groups_by_provider_and_model_without_relabeling_legacy_usage() {
+        let mut meta = SessionMeta::new("cost", "/project", 1);
+        let stat = |turn_id, usage: Vec<ModelUsageStat>, legacy_total| TurnStat {
+            after_message: turn_id as usize * 2,
+            position_valid: true,
+            turn_id,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: legacy_total,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+            model_usage: usage,
+        };
+        let paid = Some(ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 3.0,
+            cached_input_per_million: 0.1,
+        });
+        meta.turn_stats.push(stat(
+            1,
+            vec![ModelUsageStat {
+                provider_id: "provider-a".into(),
+                model_id: "same-name".into(),
+                tokens: TokenBreakdown {
+                    input: 100,
+                    output: 20,
+                    cached_input: 50,
+                },
+                pricing: paid,
+            }],
+            170,
+        ));
+        meta.turn_stats.push(stat(
+            2,
+            vec![ModelUsageStat {
+                provider_id: "provider-b".into(),
+                model_id: "same-name".into(),
+                tokens: TokenBreakdown {
+                    input: 10,
+                    output: 0,
+                    cached_input: 0,
+                },
+                pricing: None,
+            }],
+            10,
+        ));
+        meta.turn_stats.push(stat(3, Vec::new(), 40));
+
+        let report = aggregate_session_cost(&meta);
+        assert_eq!(report.models.len(), 2);
+        assert_eq!(report.models[0].provider_id, "provider-a");
+        assert_eq!(report.models[0].tokens.total(), 170);
+        assert!(report.models[0].estimated_cost_usd.is_some());
+        assert_eq!(report.models[1].provider_id, "provider-b");
+        assert_eq!(report.models[1].tokens.total(), 10);
+        assert_eq!(report.models[1].estimated_cost_usd, None);
+        assert_eq!(report.unattributed_tokens, 40);
+        assert_eq!(report.total_tokens, 220);
+        assert_eq!(report.estimated_cost_usd, None);
+    }
+
+    #[test]
+    fn explicit_zero_pricing_is_distinct_from_unknown_pricing() {
+        let free = ModelPricing {
+            input_per_million: 0.0,
+            output_per_million: 0.0,
+            cached_input_per_million: 0.0,
+        };
+        let mut meta = SessionMeta::new("free", "/project", 1);
+        meta.turn_stats.push(TurnStat {
+            after_message: 2,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 12,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+            model_usage: vec![ModelUsageStat {
+                provider_id: "local".into(),
+                model_id: "free-model".into(),
+                tokens: TokenBreakdown {
+                    input: 10,
+                    output: 2,
+                    cached_input: 0,
+                },
+                pricing: Some(free),
+            }],
+        });
+
+        let report = aggregate_session_cost(&meta);
+        assert_eq!(report.models[0].estimated_cost_usd, Some(0.0));
+        assert!(report.models[0].explicitly_free);
+        assert_eq!(report.estimated_cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn detached_model_usage_is_aggregated_without_changing_turn_count() {
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.detached_model_usage.push(ModelUsageStat {
+            provider_id: "fast".into(),
+            model_id: "fast-model".into(),
+            tokens: TokenBreakdown {
+                input: 10,
+                output: 2,
+                cached_input: 3,
+            },
+            pricing: None,
+        });
+
+        let report = aggregate_session_cost(&meta);
+        assert_eq!(meta.turn_count, 0);
+        assert_eq!(report.total_tokens, 15);
+        assert_eq!(report.models.len(), 1);
+        assert_eq!(report.models[0].provider_id, "fast");
+        assert_eq!(report.models[0].tokens.total(), 15);
+    }
+
+    #[test]
+    fn archiving_turn_stats_preserves_attributed_and_legacy_cost() {
+        let mut meta = SessionMeta::new("archive", "/p", 1);
+        meta.turn_stats.push(TurnStat {
+            after_message: 2,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 12,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+            model_usage: vec![ModelUsageStat {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                tokens: TokenBreakdown {
+                    input: 10,
+                    output: 2,
+                    cached_input: 0,
+                },
+                pricing: None,
+            }],
+        });
+        meta.turn_stats.push(TurnStat {
+            after_message: 4,
+            position_valid: true,
+            turn_id: 2,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 7,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+            model_usage: Vec::new(),
+        });
+
+        let archived = meta.archive_turn_stats_where(|_| true);
+
+        assert_eq!(archived.len(), 2);
+        assert!(meta.turn_stats.is_empty());
+        assert_eq!(meta.detached_unattributed_tokens, 7);
+        let report = aggregate_session_cost(&meta);
+        assert_eq!(report.models[0].tokens.total(), 12);
+        assert_eq!(report.unattributed_tokens, 7);
+        assert_eq!(report.total_tokens, 19);
+
+        merge_model_usage(
+            &mut meta.detached_model_usage,
+            ModelUsageStat {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                tokens: TokenBreakdown {
+                    input: 1,
+                    output: 0,
+                    cached_input: 0,
+                },
+                pricing: None,
+            },
+        );
+        meta.detached_unattributed_tokens += 3;
+        meta.remove_archived_turn_usage(&archived);
+        let concurrent_only = aggregate_session_cost(&meta);
+        assert_eq!(concurrent_only.models[0].tokens.total(), 1);
+        assert_eq!(concurrent_only.unattributed_tokens, 3);
+        assert_eq!(concurrent_only.total_tokens, 4);
     }
 }

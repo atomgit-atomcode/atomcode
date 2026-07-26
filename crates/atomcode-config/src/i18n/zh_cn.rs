@@ -287,6 +287,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("上下文窗口？[{current}] tokens（留空保持不变；如 128000 / 256000 / 512000 / 1000000，或 128k / 1m）").into(),
         Msg::ProviderContextWindowInvalid =>
             "上下文窗口必须是正整数 tokens，例如 128000 或 128k。".into(),
+        Msg::ProviderStepPricing =>
+            "每百万 token 价格（美元）？输入,输出,缓存输入（留空=未知/保持；输入 clear 可清除；如 2.5,10,0.25；免费填 0,0,0）".into(),
+        Msg::ProviderStepPricingWithHint { current } =>
+            format!("每百万 token 价格（美元）？[{current}]（留空保持；输入 clear 可清除）").into(),
+        Msg::ProviderPricingInvalid =>
+            "价格必须是三个有限且非负的数字：输入,输出,缓存输入。".into(),
         Msg::ProviderNameEmpty => "名称不能为空。".into(),
         Msg::ProviderBaseUrlEmpty => "Base URL 不能为空。".into(),
         Msg::ProviderUnknownType =>
@@ -552,6 +558,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
                 "  提示 Token：       {}\n  补全 Token：       {}\n  缓存 Token：       {}（{}% 命中率）\n  Token 总计：       {}\n  预估费用：         {}\n",
                 prompt, completion, cached, cache_rate, total, cost
             ).into(),
+        Msg::CostFree => "免费".into(),
+        Msg::CostUnknown => "未知".into(),
+        Msg::CostUnattributed { tokens } =>
+            format!("历史未归属用量\n  Token 总计：       {}\n  预估费用：         未知", tokens).into(),
 
         // ── /think ──
         Msg::ThinkStatus { status, budget, provider } =>

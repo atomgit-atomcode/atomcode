@@ -6,9 +6,22 @@ use std::sync::Arc;
 use crate::AppState;
 use atomcode_capabilities::session::{
     LoadedSession, SessionLease as NativeSessionLease, SessionManager as NativeSessionManager,
-    SessionMeta as NativeSessionMeta, SessionStoreError,
+    SessionStoreError,
 };
 use atomcode_config::config::memory::MemoryStore;
+#[cfg(test)]
+use atomcode_capabilities::session::SessionMeta as NativeSessionMeta;
+
+#[derive(serde::Serialize)]
+pub(crate) struct CostModelResult {
+    provider: String,
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    estimated_cost_usd: Option<f64>,
+    free: bool,
+}
 
 #[derive(serde::Deserialize)]
 pub(crate) struct CommandReq {
@@ -79,6 +92,9 @@ pub(crate) enum CommandResult {
     Cost {
         total_tokens: usize,
         turn_count: usize,
+        models: Vec<CostModelResult>,
+        unattributed_tokens: u64,
+        estimated_cost_usd: Option<f64>,
     },
     Todo {
         items: Vec<TodoItemJson>,
@@ -233,20 +249,19 @@ fn commit_native_compaction(
                 new_end,
             } = mutation
             {
-                meta.turn_stats.retain_mut(|stat| {
-                    if !stat.position_valid {
-                        return true;
-                    }
-                    if stat.after_message > old_start && stat.after_message < old_end {
-                        false
-                    } else {
-                        if stat.after_message >= old_end {
-                            stat.after_message =
-                                new_end + stat.after_message.saturating_sub(old_end);
-                        }
-                        true
-                    }
+                let _ = meta.archive_turn_stats_where(|stat| {
+                    stat.position_valid
+                        && stat.after_message > old_start
+                        && stat.after_message < old_end
                 });
+                for stat in &mut meta.turn_stats {
+                    if !stat.position_valid {
+                        continue;
+                    }
+                    if stat.after_message >= old_end {
+                        stat.after_message = new_end + stat.after_message.saturating_sub(old_end);
+                    }
+                }
             }
             let surviving_turn_ids: std::collections::BTreeSet<_> = meta
                 .turn_stats
@@ -711,22 +726,26 @@ fn exec_cost(
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for cost"))?;
     let session = load_command_session_view(working_dir, project_hash, sid)?;
-    let (total_tokens, turn_count) = session_cost(&session.meta);
+    let report = atomcode_capabilities::session::aggregate_session_cost(&session.meta);
     Ok(CommandResult::Cost {
-        total_tokens,
-        turn_count,
+        total_tokens: report.total_tokens as usize,
+        turn_count: session.meta.turn_stats.len(),
+        models: report
+            .models
+            .into_iter()
+            .map(|model| CostModelResult {
+                provider: model.provider_id,
+                model: model.model_id,
+                input_tokens: model.tokens.input,
+                output_tokens: model.tokens.output,
+                cached_tokens: model.tokens.cached_input,
+                estimated_cost_usd: model.estimated_cost_usd,
+                free: model.explicitly_free,
+            })
+            .collect(),
+        unattributed_tokens: report.unattributed_tokens,
+        estimated_cost_usd: report.estimated_cost_usd,
     })
-}
-
-fn session_cost(meta: &NativeSessionMeta) -> (usize, usize) {
-    // TurnStat.total_tokens stores the per-turn token count (reset to 0 at turn start,
-    // accumulated during the turn, saved at TurnComplete). Summing gives session total.
-    let total_tokens = meta
-        .turn_stats
-        .iter()
-        .map(|t| t.total_tokens as usize)
-        .sum();
-    (total_tokens, meta.turn_stats.len())
 }
 
 fn exec_todo(
@@ -914,6 +933,7 @@ mod tests {
                 errored: false,
                 used_tokens: 1,
                 ctx_window: 10,
+                model_usage: Vec::new(),
             },
             TurnStat {
                 after_message: 2,
@@ -926,6 +946,7 @@ mod tests {
                 errored: false,
                 used_tokens: 1,
                 ctx_window: 10,
+                model_usage: Vec::new(),
             },
             TurnStat {
                 after_message: 4,
@@ -938,6 +959,7 @@ mod tests {
                 errored: false,
                 used_tokens: 1,
                 ctx_window: 10,
+                model_usage: Vec::new(),
             },
         ];
         manager.write_meta(&meta).unwrap();
@@ -1036,6 +1058,7 @@ mod tests {
             errored: false,
             used_tokens: 1,
             ctx_window: 10,
+            model_usage: Vec::new(),
         };
         let mut meta = NativeSessionMeta::new(id, "/p", 1);
         meta.owner = StorageOwner::Native;
@@ -1105,6 +1128,7 @@ mod tests {
         assert_eq!(meta.turn_count, 2);
         assert_eq!(meta.turn_stats[0].after_message, 1);
         assert_eq!(meta.turn_stats[1].after_message, 3);
+        assert_eq!(meta.detached_unattributed_tokens, 1);
         assert_eq!(meta.name, "renamed after load");
         assert!(meta.user_renamed);
         let presentation = manager.read_presentation(id).unwrap();
@@ -1165,6 +1189,7 @@ mod tests {
             errored: false,
             used_tokens: 0,
             ctx_window: 0,
+            model_usage: Vec::new(),
         });
         meta.turn_stats.push(TurnStat {
             after_message: 4,
@@ -1177,8 +1202,11 @@ mod tests {
             errored: false,
             used_tokens: 0,
             ctx_window: 0,
+            model_usage: Vec::new(),
         });
-        assert_eq!(session_cost(&meta), (350, 2));
+        let report = atomcode_capabilities::session::aggregate_session_cost(&meta);
+        assert_eq!(report.total_tokens, 350);
+        assert_eq!(report.unattributed_tokens, 350);
     }
 
     #[test]

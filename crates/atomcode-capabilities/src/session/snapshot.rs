@@ -18,8 +18,8 @@ use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
 
 use super::{
-    now_ms, PresentationFile, SessionLease, SessionManager, SessionMeta, SessionStoreError,
-    TurnStat,
+    now_ms, ModelPricing, ModelUsageStat, PresentationFile, SessionLease, SessionManager,
+    SessionMeta, SessionStoreError, TokenBreakdown, TurnStat,
 };
 
 /// Per-turn accumulation (reset each turn): duration, round/tool counts, and the final
@@ -32,6 +32,7 @@ struct TurnAccum {
     total_tokens: u32,
     used_tokens: u32,
     ctx_window: u32,
+    tokens: TokenBreakdown,
 }
 
 /// One-shot signal from the persistence hook to its owning runtime. A normal
@@ -40,6 +41,7 @@ struct TurnAccum {
 #[derive(Clone, Default)]
 pub struct SnapshotPersistenceStatus {
     uncertain_commit: Arc<Mutex<Option<String>>>,
+    cost_warning: Arc<Mutex<Option<String>>>,
 }
 
 impl SnapshotPersistenceStatus {
@@ -57,6 +59,20 @@ impl SnapshotPersistenceStatus {
             .unwrap_or_else(|error| error.into_inner())
             .take()
     }
+
+    pub fn report_cost_warning(&self, message: impl Into<String>) {
+        *self
+            .cost_warning
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(message.into());
+    }
+
+    pub fn take_cost_warning(&self) -> Option<String> {
+        self.cost_warning
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
 }
 
 /// Saves `<id>.snapshot` (the compacted working set) + updates `<id>.meta` each turn.
@@ -67,6 +83,14 @@ pub struct SnapshotHook {
     lease: Option<SessionLease>,
     accum: Mutex<TurnAccum>,
     persistence_status: SnapshotPersistenceStatus,
+    attribution: Option<ModelAttribution>,
+}
+
+#[derive(Clone)]
+struct ModelAttribution {
+    provider_id: String,
+    model_id: String,
+    pricing: Option<ModelPricing>,
 }
 
 impl SnapshotHook {
@@ -82,11 +106,26 @@ impl SnapshotHook {
             lease: None,
             accum: Mutex::new(TurnAccum::default()),
             persistence_status: SnapshotPersistenceStatus::default(),
+            attribution: None,
         }
     }
 
     pub fn with_lease(mut self, lease: SessionLease) -> Self {
         self.lease = Some(lease);
+        self
+    }
+
+    pub fn with_model_attribution(
+        mut self,
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        pricing: Option<ModelPricing>,
+    ) -> Self {
+        self.attribution = Some(ModelAttribution {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            pricing,
+        });
         self
     }
 
@@ -132,19 +171,17 @@ fn reindex_compacted_sidecars(
             .count();
         let old_end = before.messages.len().saturating_sub(suffix);
         let new_end = after.messages.len().saturating_sub(suffix);
-        meta.turn_stats.retain_mut(|stat| {
-            if !stat.position_valid {
-                return true;
-            }
-            if stat.after_message > prefix && stat.after_message < old_end {
-                false
-            } else {
-                if stat.after_message >= old_end {
-                    stat.after_message = new_end + stat.after_message.saturating_sub(old_end);
-                }
-                true
-            }
+        let _ = meta.archive_turn_stats_where(|stat| {
+            stat.position_valid && stat.after_message > prefix && stat.after_message < old_end
         });
+        for stat in &mut meta.turn_stats {
+            if !stat.position_valid {
+                continue;
+            }
+            if stat.after_message >= old_end {
+                stat.after_message = new_end + stat.after_message.saturating_sub(old_end);
+            }
+        }
     }
     let surviving_turn_ids: std::collections::BTreeSet<_> = meta
         .turn_stats
@@ -204,6 +241,20 @@ impl LifecycleHooks for SnapshotHook {
             a.total_tokens = meta.tokens.prompt.saturating_add(meta.tokens.completion);
             a.used_tokens = meta.used_tokens;
             a.ctx_window = meta.ctx_window;
+            // Provider prompt usage includes cached input for the adapters we
+            // support. Store mutually-exclusive buckets so aggregation and
+            // pricing never charge cached tokens twice.
+            a.tokens.input = a.tokens.input.saturating_add(u64::from(
+                meta.tokens.prompt.saturating_sub(meta.tokens.cached),
+            ));
+            a.tokens.output = a
+                .tokens
+                .output
+                .saturating_add(u64::from(meta.tokens.completion));
+            a.tokens.cached_input = a
+                .tokens
+                .cached_input
+                .saturating_add(u64::from(meta.tokens.cached));
         }
     }
 
@@ -219,7 +270,15 @@ impl LifecycleHooks for SnapshotHook {
         snap.turn_counter = snap.turn_counter.max(ctx.turn_id);
         snap.request_counter = snap.request_counter.max(ctx.request_id);
         let now = now_ms();
-        let (duration_ms, round_count, tool_call_count, total_tokens, used_tokens, ctx_window) = {
+        let (
+            duration_ms,
+            round_count,
+            tool_call_count,
+            total_tokens,
+            used_tokens,
+            ctx_window,
+            tokens,
+        ) = {
             let a = self.lock();
             (
                 (now - a.started_ms).max(0) as u64,
@@ -228,8 +287,22 @@ impl LifecycleHooks for SnapshotHook {
                 a.total_tokens,
                 a.used_tokens,
                 a.ctx_window,
+                a.tokens,
             )
         };
+        let model_usage = self
+            .attribution
+            .as_ref()
+            .filter(|_| tokens.total() > 0)
+            .map(|attribution| {
+                vec![ModelUsageStat {
+                    provider_id: attribution.provider_id.clone(),
+                    model_id: attribution.model_id.clone(),
+                    tokens,
+                    pricing: attribution.pricing,
+                }]
+            })
+            .unwrap_or_default();
 
         let msg_count = convo.messages.len();
         let update_meta = |meta: &mut SessionMeta| {
@@ -237,8 +310,12 @@ impl LifecycleHooks for SnapshotHook {
             meta.updated_at = now;
             meta.turn_count = meta.turn_count.saturating_add(1);
             meta.message_count = msg_count as u32;
-            meta.turn_stats
-                .retain(|s| s.turn_id != 0 || s.after_message <= msg_count);
+            // Only legacy position-only stats can be judged by message count.
+            // Native stats have stable turn ids and are reindexed exclusively by
+            // the explicit compaction/undo seams.
+            let _ = meta.archive_turn_stats_where(|stat| {
+                stat.turn_id == 0 && stat.position_valid && stat.after_message > msg_count
+            });
             meta.turn_stats.push(TurnStat {
                 after_message: msg_count,
                 position_valid: true,
@@ -250,6 +327,7 @@ impl LifecycleHooks for SnapshotHook {
                 errored: *reason != StopReason::Stopped,
                 used_tokens,
                 ctx_window,
+                model_usage,
             });
         };
         let result = if let Some(lease) = &self.lease {
@@ -334,6 +412,7 @@ mod tests {
             errored: false,
             used_tokens: 1,
             ctx_window: 10,
+            model_usage: Vec::new(),
         };
         let mut meta = SessionMeta::new(id, "/p", 1);
         meta.owner = StorageOwner::Native;
@@ -375,6 +454,7 @@ mod tests {
         assert_eq!(meta.turn_stats.len(), 2);
         assert_eq!(meta.turn_stats[0].after_message, 1);
         assert_eq!(meta.turn_stats[1].after_message, 3);
+        assert_eq!(meta.detached_unattributed_tokens, 1);
         let presentation = manager.read_presentation(id).unwrap();
         assert_eq!(presentation.entries.len(), 1);
         assert_eq!(presentation.entries[0].text, "keep");
@@ -418,6 +498,7 @@ mod tests {
             errored: false,
             used_tokens: 1,
             ctx_window: 10,
+            model_usage: Vec::new(),
         };
         let mut meta = SessionMeta::new(id, "/p", 1);
         meta.owner = StorageOwner::Native;
@@ -578,7 +659,16 @@ mod tests {
 
     #[tokio::test]
     async fn records_round_count_and_distinct_token_semantics() {
-        let (h, mgr, _d) = hook("s1a-stats");
+        let (base, mgr, _d) = hook("s1a-stats");
+        let h = base.with_model_attribution(
+            "provider-a",
+            "model-a",
+            Some(ModelPricing {
+                input_per_million: 1.0,
+                output_per_million: 2.0,
+                cached_input_per_million: 0.1,
+            }),
+        );
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp_with_usage(1, 100, 10, 800, 1_000))
             .await;
@@ -596,6 +686,10 @@ mod tests {
         assert_eq!(stat["total_tokens"], 220);
         assert_eq!(stat["used_tokens"], 900);
         assert_eq!(stat["ctx_window"], 1_000);
+        assert_eq!(stat["model_usage"][0]["provider_id"], "provider-a");
+        assert_eq!(stat["model_usage"][0]["model_id"], "model-a");
+        assert_eq!(stat["model_usage"][0]["tokens"]["input"], 300);
+        assert_eq!(stat["model_usage"][0]["tokens"]["output"], 30);
     }
 
     #[tokio::test]
@@ -682,7 +776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prunes_unconverted_legacy_stats_when_snapshot_shrinks() {
+    async fn snapshot_shrink_reindexes_and_keeps_unconverted_usage_stats() {
         let (h, mgr, _d) = hook("s1");
         // Turn 1: a 5-message snapshot → stat at after_message=5.
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
@@ -695,12 +789,8 @@ mod tests {
         h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
             .await;
         let meta = mgr.read_meta("s1").unwrap();
-        assert!(
-            meta.turn_stats.iter().all(|s| s.after_message <= 2),
-            "stale stats (after_message > new len) must be pruned: {:?}",
-            meta.turn_stats
-        );
         assert_eq!(meta.turn_stats.len(), 1, "only the in-range stat remains");
+        assert_eq!(meta.detached_unattributed_tokens, 6);
     }
 
     #[tokio::test]
@@ -734,6 +824,7 @@ mod tests {
         assert_eq!(stats.len(), 2);
         assert_eq!(stats[0].turn_id, 1);
         assert_eq!(stats[0].after_message, 5);
+        assert!(stats[0].position_valid);
         assert_eq!(stats[1].turn_id, 2);
     }
 

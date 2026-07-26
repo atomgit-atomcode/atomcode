@@ -29,8 +29,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::controllers::{
     evaluate_goal, goal_continuation_message, summarize_for_goal, EvalOutcome, GoalProgress,
-    GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest,
-    MAX_UNPRODUCTIVE,
+    GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool,
+    WakeupRequest, MAX_UNPRODUCTIVE,
 };
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
 #[cfg(test)]
@@ -4164,6 +4164,17 @@ fn spawn_runtime_owner_with_optional_agent(
                             })
                         })
                         .flatten();
+                        if matches!(
+                            &event,
+                            AgentEvent::Compacted { .. } | AgentEvent::CompactionFailed { .. }
+                        ) {
+                            if let Some(warning) = resources.as_ref().and_then(|runtime| {
+                                runtime.parts.take_cost_persistence_warning()
+                            }) {
+                                let _ = runtime_event_tx
+                                    .send(CodingRuntimeEvent::ControllerWarning(warning));
+                            }
+                        }
                         let event = handle_compaction_event(
                             event,
                             &mut compactions,
@@ -4268,6 +4279,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                 ));
                             }
                             AgentEvent::TurnComplete { reason } => {
+                                if let Some(warning) =
+                                    resources.as_ref().and_then(|runtime| {
+                                        runtime.parts.take_cost_persistence_warning()
+                                    })
+                                {
+                                    let _ = runtime_event_tx
+                                        .send(CodingRuntimeEvent::ControllerWarning(warning));
+                                }
                                 turn_stats.duration = turn_started_at
                                     .take()
                                     .map(|started| started.elapsed())
@@ -5206,6 +5225,7 @@ struct NativeUndoSidecars {
     message_count: u32,
     turn_count: u32,
     turn_stats: Vec<TurnStat>,
+    archived_turn_stats: Vec<TurnStat>,
     removed_presentation: Vec<(usize, PresentationEntry)>,
 }
 
@@ -5300,10 +5320,11 @@ fn persist_runtime_undo(
                     message_count: meta.message_count,
                     turn_count: meta.turn_count,
                     turn_stats: meta.turn_stats.clone(),
+                    archived_turn_stats: Vec::new(),
                     removed_presentation: Vec::new(),
                 };
-                meta.turn_stats.retain(|stat| {
-                    !stat.position_valid || stat.after_message <= snapshot.messages.len()
+                sidecars.archived_turn_stats = meta.archive_turn_stats_where(|stat| {
+                    stat.position_valid && stat.after_message > snapshot.messages.len()
                 });
                 let surviving_turn_ids: BTreeSet<_> = meta
                     .turn_stats
@@ -5363,6 +5384,7 @@ fn restore_runtime_undo(
         message_count,
         turn_count,
         turn_stats,
+        archived_turn_stats,
         removed_presentation,
     } = sidecars;
     let mut snapshot_conflict = false;
@@ -5381,6 +5403,7 @@ fn restore_runtime_undo(
                 }
                 meta.message_count = message_count;
                 meta.turn_count = turn_count;
+                meta.remove_archived_turn_usage(&archived_turn_stats);
                 meta.turn_stats = turn_stats;
                 for (original_index, entry) in removed_presentation {
                     presentation
@@ -6240,6 +6263,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: Some(rank),
+            pricing: None,
         }
     }
 
@@ -10478,6 +10502,7 @@ mod tests {
                 errored: false,
                 used_tokens: 10,
                 ctx_window: 1_000,
+                model_usage: Vec::new(),
             },
             TurnStat {
                 after_message: 4,
@@ -10490,6 +10515,7 @@ mod tests {
                 errored: false,
                 used_tokens: 20,
                 ctx_window: 1_000,
+                model_usage: Vec::new(),
             },
         ];
         let at_start = PresentationEntry {
@@ -10561,10 +10587,10 @@ mod tests {
             .unwrap()
             .expect("native undo must retain a sidecar rollback receipt");
         assert_eq!(manager.load_snapshot(id).unwrap(), truncated);
-        assert_eq!(
-            manager.read_meta(id).unwrap().turn_stats,
-            original_stats[..1]
-        );
+        let persisted_meta = manager.read_meta(id).unwrap();
+        assert_eq!(persisted_meta.turn_stats, vec![original_stats[0].clone()]);
+        assert_eq!(persisted_meta.turn_count, 1);
+        assert_eq!(persisted_meta.detached_unattributed_tokens, 40);
         assert_eq!(
             manager.read_presentation(id).unwrap().entries,
             vec![at_start.clone(), first_turn.clone()]
@@ -10581,6 +10607,8 @@ mod tests {
             .update_meta(id, |meta| {
                 meta.ai_named = true;
                 meta.import_info = Some(concurrent_import.clone());
+                meta.detached_unattributed_tokens =
+                    meta.detached_unattributed_tokens.saturating_add(3);
                 meta.updated_at = 1;
             })
             .unwrap();
@@ -10612,6 +10640,10 @@ mod tests {
         assert_eq!(restored_meta.message_count, 4);
         assert_eq!(restored_meta.turn_count, 2);
         assert_eq!(restored_meta.turn_stats, original_stats);
+        assert_eq!(
+            restored_meta.detached_unattributed_tokens, 3,
+            "rollback must remove only its archive delta and preserve concurrent usage"
+        );
         assert!(restored_meta.updated_at >= rollback_started_at);
         assert_eq!(
             manager.read_presentation(id).unwrap().entries,
