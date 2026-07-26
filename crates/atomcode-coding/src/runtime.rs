@@ -21,7 +21,7 @@ use atomcode_kernel::checkpoint::CompactionCheckpointError;
 use atomcode_kernel::event::{AgentCommand, AgentEvent, RequestId, StopReason};
 pub use atomcode_kernel::message::CompactTrigger;
 use atomcode_kernel::message::{
-    CompactionStrategy, CompactionView, Conversation, ImageContent, Message, MessageMeta, Role,
+    CompactionStrategy, CompactionView, Conversation, ImageContent, Message, MessageMeta,
     SessionSnapshot,
 };
 use atomcode_kernel::provider::LlmProvider;
@@ -4428,25 +4428,6 @@ fn spawn_runtime_owner_with_optional_agent(
                                 if terminal_reason.is_some() {
                                     conversation_revision = conversation_revision.wrapping_add(1);
                                 }
-                                if terminal_reason.is_some() {
-                                    if let (Some(turn_id), Some(runtime)) =
-                                        (active_turn, resources.as_ref())
-                                    {
-                                        if let Some((requested, actual)) = provider_model_mismatch(
-                                            &runtime.config.model,
-                                            turn_id,
-                                            &snapshot,
-                                        ) {
-                                            let _ = runtime_event_tx.send(
-                                                CodingRuntimeEvent::Agent(AgentEvent::Warning(
-                                                    format!(
-                                                        "Model routing mismatch: selected \"{requested}\", but the provider reported \"{actual}\"."
-                                                    ),
-                                                )),
-                                            );
-                                        }
-                                    }
-                                }
                                 if let Some(runtime) = resources.as_mut() {
                                     if runtime.parts.session.is_none() {
                                         runtime.parts.set_runtime_resume(snapshot.clone());
@@ -5877,28 +5858,6 @@ fn cancel_controllers_and_finish_held(
     had_controller
 }
 
-/// Return a selected/actual model pair only when the provider reported a different
-/// model for an assistant response produced by this exact turn. Scoping by turn id
-/// avoids comparing a failed request against an older successful response.
-fn provider_model_mismatch(
-    requested: &str,
-    turn_id: u64,
-    snapshot: &SessionSnapshot,
-) -> Option<(String, String)> {
-    let actual = snapshot.messages.iter().rev().find_map(|message| {
-        if message.role != Role::Assistant {
-            return None;
-        }
-        let meta = message.meta.as_ref()?;
-        if meta.turn_id != turn_id {
-            return None;
-        }
-        meta.provider_model.as_deref()
-    })?;
-    (!requested.trim().eq_ignore_ascii_case(actual.trim()))
-        .then(|| (requested.to_string(), actual.to_string()))
-}
-
 #[doc(hidden)]
 pub fn noop_agent_handle() -> AgentHandle {
     let (commands, mut command_rx) = mpsc::unbounded_channel();
@@ -5944,30 +5903,6 @@ impl Error for RuntimeUnavailable {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn provider_model_mismatch_uses_latest_assistant_report() {
-        let mut older = Message::assistant("older", vec![]);
-        older.meta = Some(MessageMeta {
-            provider_model: Some("model-a".into()),
-            turn_id: 41,
-            ..Default::default()
-        });
-        let mut latest = Message::assistant("latest", vec![]);
-        latest.meta = Some(MessageMeta {
-            provider_model: Some("model-b".into()),
-            turn_id: 42,
-            ..Default::default()
-        });
-        let snapshot = SessionSnapshot::new(vec![older, latest]);
-
-        assert_eq!(provider_model_mismatch("MODEL-B", 42, &snapshot), None);
-        assert_eq!(
-            provider_model_mismatch("model-c", 42, &snapshot),
-            Some(("model-c".into(), "model-b".into()))
-        );
-        assert_eq!(provider_model_mismatch("model-c", 43, &snapshot), None);
-    }
 
     struct TestProviderFactory {
         fail: bool,
@@ -8714,67 +8649,6 @@ mod tests {
             })) if snapshot.as_ref() == &expected
         ));
         assert_eq!(handle.status().phase, RuntimePhase::Ready);
-        handle.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn completed_turn_warns_when_provider_reports_a_different_model() {
-        let (
-            handle,
-            mut kernel_commands,
-            kernel_events,
-            mut runtime_events,
-            _wakeup_tx,
-            _loop_active,
-            _adapter,
-        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
-
-        assert!(matches!(
-            handle.submit(UserInput::from("hello")).await.unwrap(),
-            SubmitReceipt::Started { turn_id: 1, .. }
-        ));
-        assert!(matches!(
-            kernel_commands.recv().await,
-            Some(AgentCommand::SendMessage { .. })
-        ));
-        kernel_events
-            .send(AgentEvent::TurnComplete {
-                reason: StopReason::Stopped,
-            })
-            .unwrap();
-        assert!(matches!(
-            kernel_commands.recv().await,
-            Some(AgentCommand::Snapshot)
-        ));
-        let mut response = Message::assistant("answer", vec![]);
-        response.meta = Some(MessageMeta {
-            turn_id: 1,
-            provider_model: Some("actual-model".into()),
-            ..Default::default()
-        });
-        kernel_events
-            .send(AgentEvent::Snapshot {
-                snapshot: SessionSnapshot::new(vec![response]),
-            })
-            .unwrap();
-
-        let warning = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                match runtime_events.recv().await {
-                    Some(CodingRuntimeEvent::Agent(AgentEvent::Warning(message))) => break message,
-                    Some(CodingRuntimeEvent::TurnFinished(_)) => {
-                        panic!("model mismatch warning must precede the turn terminal")
-                    }
-                    Some(_) => {}
-                    None => panic!("runtime events closed before mismatch warning"),
-                }
-            }
-        })
-        .await
-        .expect("model mismatch warning was not emitted");
-        assert!(warning.contains("selected \"test\""));
-        assert!(warning.contains("reported \"actual-model\""));
-
         handle.shutdown().await.unwrap();
     }
 
