@@ -3469,31 +3469,30 @@ async fn chat_stream(
         ..CurrentContext::current()
     };
 
-    // Spawn the chat processing task
-    tokio::spawn(async move {
-        CurrentContext::scope(ctx_for_task, || async move {
-            let cleanup_operation_id = operation_id.clone();
-            if let Err(e) = process_chat_request(
-                req,
-                tx.clone(),
-                cancel_token,
-                operation_id,
-                active_chats.clone(),
-                mcp_cache,
-                telemetry,
-                pending_permissions,
-                interactive_permission,
-            )
-            .await
-            {
-                let _ = tx.send(ChatEvent::Error {
-                    message: e.to_string(),
-                });
-            }
+    let chat_session_id = session_uuid.map(|u| u.to_string()).unwrap_or_default();
+    let cleanup_op = operation_id.clone();
+    let cleanup_chats = active_chats.clone();
+    let inner_event_tx = tx.clone();
 
-            active_chats.complete(&cleanup_operation_id).await;
-        })
-        .await;
+    tokio::spawn(async move {
+        let inner = tokio::spawn(async move {
+            CurrentContext::scope(ctx_for_task, || async move {
+                process_chat_request(
+                    req,
+                    inner_event_tx,
+                    cancel_token,
+                    operation_id,
+                    active_chats,
+                    mcp_cache,
+                    telemetry,
+                    pending_permissions,
+                    interactive_permission,
+                )
+                .await
+            })
+            .await
+        });
+        finalize_chat_task(inner, &tx, &cleanup_chats, &cleanup_op, &chat_session_id).await;
     });
 
     // Track active SSE connections for idle timeout using a Drop guard
@@ -3523,6 +3522,38 @@ async fn chat_stream(
                 .text("ping"),
         )
         .into_response()
+}
+
+/// Await the inner chat task, translating its outcome into SSE events and
+/// always calling `active_chats.complete()` afterwards — even on panic.
+async fn finalize_chat_task(
+    inner: tokio::task::JoinHandle<anyhow::Result<()>>,
+    event_tx: &mpsc::UnboundedSender<ChatEvent>,
+    cleanup_chats: &ActiveChatRegistry,
+    cleanup_operation_id: &str,
+    done_session_id: &str,
+) {
+    match inner.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let _ = event_tx.send(ChatEvent::Error {
+                message: e.to_string(),
+            });
+        }
+        Err(panic_err) => {
+            let _ = event_tx.send(ChatEvent::Error {
+                message: format!("chat task panicked: {panic_err}"),
+            });
+            let _ = event_tx.send(ChatEvent::Done {
+                tokens: 0,
+                tool_calls: 0,
+                session_id: done_session_id.to_string(),
+                stop_reason: Some("internal_error".into()),
+                message: Some("chat task panicked".into()),
+            });
+        }
+    }
+    cleanup_chats.complete(cleanup_operation_id).await;
 }
 
 /// Process a chat request and stream events
@@ -5523,6 +5554,92 @@ mod tests {
             "cleanup for an older operation must compare identity before removal"
         );
         registry.complete(&replacement.operation_id).await;
+    }
+
+    #[tokio::test]
+    async fn chat_panic_cleanup_removes_operation_and_allows_resubmit() {
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats.admit(Some("session-1"), None).await.unwrap();
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let cleanup_chats = active_chats.clone();
+        let cleanup_op = admission.operation_id.clone();
+
+        let inner = tokio::spawn(async move {
+            panic!("simulated chat task panic");
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        });
+        finalize_chat_task(inner, &event_tx, &cleanup_chats, &cleanup_op, "session-1").await;
+
+        let events: Vec<_> = (0..10).filter_map(|_| event_rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|e| matches!(e, ChatEvent::Error { .. })),
+            "panic must produce an Error event"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, ChatEvent::Done { .. })),
+            "panic must produce a Done event to close the SSE stream"
+        );
+
+        assert!(
+            !active_chats
+                .active_session_ids()
+                .await
+                .iter()
+                .any(|s| s == "session-1"),
+            "panic cleanup must remove the active-chat record"
+        );
+
+        let second = active_chats.admit(Some("session-1"), None).await;
+        assert!(
+            second.is_ok(),
+            "same session must be able to submit again after panic cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_panic_cleanup_preserves_task_local_context() {
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats.admit(Some("session-1"), None).await.unwrap();
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let cleanup_chats = active_chats.clone();
+        let cleanup_op = admission.operation_id.clone();
+
+        let session_id = uuid::Uuid::new_v4();
+        let ctx = CurrentContext {
+            mode: Some(atomcode_telemetry::SessionMode::Headless),
+            repo_origin: None,
+            session_id: Some(session_id),
+            ..CurrentContext::current()
+        };
+
+        let inner = tokio::spawn(async move {
+            CurrentContext::scope(ctx, || async move {
+                let current = CurrentContext::current();
+                assert!(current.mode.is_some(), "mode must propagate across spawn");
+                assert_eq!(current.session_id, Some(session_id));
+                Ok(())
+            })
+            .await
+        });
+        finalize_chat_task(inner, &event_tx, &cleanup_chats, &cleanup_op, "session-1").await;
+
+        let events: Vec<_> = (0..10).filter_map(|_| event_rx.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|e| matches!(e, ChatEvent::Error { .. })),
+            "successful task with task-local context must not produce an Error"
+        );
+
+        assert!(
+            !active_chats
+                .active_session_ids()
+                .await
+                .iter()
+                .any(|s| s == "session-1"),
+            "cleanup must run after successful task"
+        );
     }
 
     #[tokio::test]
