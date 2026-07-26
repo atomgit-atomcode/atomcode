@@ -93,6 +93,29 @@ test('collection APIs reject server error payloads instead of returning non-arra
   }
 });
 
+test('deleteSession surfaces the daemon conflict reason', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({
+      success: false,
+      error: 'This session is active. Switch to or create another session, then try again.',
+      code: 'SESSION_IN_USE',
+      retryable: false,
+    }),
+    { status: 409, headers: { 'Content-Type': 'application/json' } },
+  )) as typeof fetch;
+
+  try {
+    const { deleteSession, DeleteSessionError } = await import('./api.ts');
+    const error = await deleteSession('0123456789abcdef', 's1').catch((cause) => cause);
+    assert.ok(error instanceof DeleteSessionError);
+    assert.equal(error.code, 'SESSION_IN_USE');
+    assert.match(error.message, /session is active/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('streamChat rejects a clean EOF without an authoritative terminal', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(

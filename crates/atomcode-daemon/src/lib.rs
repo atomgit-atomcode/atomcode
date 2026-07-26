@@ -83,7 +83,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use atomcode_auth as auth;
-use atomcode_capabilities::session::SessionManager as NativeSessionManager;
+use atomcode_capabilities::session::{SessionManager as NativeSessionManager, SessionStoreError};
 use atomcode_coding::CodingRuntimeEvent;
 use atomcode_config::config::Config;
 use atomcode_capabilities::mcp::McpRegistry;
@@ -2235,10 +2235,64 @@ async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse 
     }
 }
 
-/// Delete a session file
-fn delete_session_file(project_hash: &str, session_id: &str) -> std::io::Result<()> {
+/// Delete one inactive session aggregate.
+///
+/// Keep the typed storage error in the anyhow chain: the HTTP boundary must
+/// distinguish an active lease (`409`) from missing data (`404`) and an
+/// unexpected storage failure (`500`). Flattening everything into
+/// `io::Error::other` made that distinction impossible.
+fn delete_session_file(project_hash: &str, session_id: &str) -> anyhow::Result<()> {
     crate::legacy_convert::delete_catalog_session_in_project(project_hash, session_id)
-        .map_err(std::io::Error::other)
+}
+
+fn valid_project_bucket(project_bucket: &str) -> bool {
+    project_bucket.len() == 16
+        && project_bucket
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn delete_session_api_error(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> (StatusCode, Json<ApiError>) {
+    (
+        status,
+        Json(ApiError {
+            success: false,
+            error: message.to_string(),
+            code: Some(code.to_string()),
+            retryable: Some(false),
+        }),
+    )
+}
+
+fn classify_delete_session_error(error: &anyhow::Error) -> (StatusCode, Json<ApiError>) {
+    match error.downcast_ref::<SessionStoreError>() {
+        Some(SessionStoreError::SessionInUse { .. }) => delete_session_api_error(
+            StatusCode::CONFLICT,
+            "SESSION_IN_USE",
+            "This session is active. Switch to or create another session, then try again.",
+        ),
+        Some(SessionStoreError::NotFound { .. }) => delete_session_api_error(
+            StatusCode::NOT_FOUND,
+            "SESSION_NOT_FOUND",
+            "The session was not found.",
+        ),
+        Some(SessionStoreError::InvalidId { .. } | SessionStoreError::AmbiguousId { .. }) => {
+            delete_session_api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_SESSION",
+                "The session identifier is invalid.",
+            )
+        }
+        _ => delete_session_api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DELETE_FAILED",
+            "Failed to delete the session. Check the AtomCode logs for details.",
+        ),
+    }
 }
 
 /// DELETE /projects/:hash/sessions/:id - Delete a session
@@ -2250,6 +2304,15 @@ async fn delete_session(
     let session_uuid = uuid::Uuid::parse_str(&id).ok();
     let state_clone = state.clone();
     daemon_scope(&state, session_uuid, client_mode, || async move {
+        if !valid_project_bucket(&hash) {
+            tracing::warn!(project_bucket = %hash, "rejected invalid session delete request");
+            return delete_session_api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_SESSION",
+                "The project or session identifier is invalid.",
+            )
+            .into_response();
+        }
         match delete_session_file(&hash, &id) {
             Ok(()) => {
                 state_clone.telemetry.track(Event::UseCommand {
@@ -2262,8 +2325,16 @@ async fn delete_session(
                 (StatusCode::OK, Json(msg)).into_response()
             }
             Err(e) => {
-                let msg = format!("Failed to delete session: {}", e);
-                (StatusCode::NOT_FOUND, Json(msg)).into_response()
+                let response = classify_delete_session_error(&e);
+                if response.0 == StatusCode::INTERNAL_SERVER_ERROR {
+                    tracing::error!(
+                        project_bucket = %hash,
+                        session_id = %id,
+                        error = ?e,
+                        "failed to delete session"
+                    );
+                }
+                response.into_response()
             }
         }
     })
@@ -5211,6 +5282,44 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_session_errors_preserve_storage_semantics() {
+        assert!(valid_project_bucket("0123456789abcdef"));
+        assert!(!valid_project_bucket("../outside"));
+
+        let active = anyhow::Error::new(SessionStoreError::SessionInUse {
+            id: "active".to_string(),
+            path: PathBuf::from("active.lease"),
+        });
+        let (status, Json(body)) = classify_delete_session_error(&active);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code.as_deref(), Some("SESSION_IN_USE"));
+        assert!(!body.error.contains("active.lease"));
+
+        let missing = anyhow::Error::new(SessionStoreError::NotFound {
+            path: PathBuf::from("missing.meta"),
+        });
+        let (status, Json(body)) = classify_delete_session_error(&missing);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.code.as_deref(), Some("SESSION_NOT_FOUND"));
+        assert!(!body.error.contains("missing.meta"));
+
+        let invalid = anyhow::Error::new(SessionStoreError::InvalidId {
+            id: "../outside".to_string(),
+            reason: "path separators are forbidden",
+        });
+        let (status, Json(body)) = classify_delete_session_error(&invalid);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("INVALID_SESSION"));
+        assert!(!body.error.contains("../outside"));
+
+        let unexpected = anyhow::anyhow!("unexpected storage failure");
+        let (status, Json(body)) = classify_delete_session_error(&unexpected);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.code.as_deref(), Some("DELETE_FAILED"));
+        assert!(!body.error.contains("unexpected storage failure"));
+    }
 
     struct ScopedChatHome {
         _lock: std::sync::MutexGuard<'static, ()>,

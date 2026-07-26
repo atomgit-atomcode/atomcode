@@ -70,6 +70,10 @@ const zh = {
   'delete.title': '删除会话',
   'delete.confirm': '删除',
   'delete.body': '确定删除会话「{name}」吗？此操作不可撤销。',
+  'delete.inUse': '该会话正在运行。请先切换或新建会话，然后重试。',
+  'delete.notFound': '该会话不存在或已被删除。',
+  'delete.invalid': '项目或会话标识无效。',
+  'delete.failed': '删除会话失败，请查看 AtomCode 日志了解详情。',
 
   // Relative time
   'time.justNow': '刚刚',
@@ -396,6 +400,10 @@ const en: Record<MsgKey, string> = {
   'delete.title': 'Delete session',
   'delete.confirm': 'Delete',
   'delete.body': 'Delete session “{name}”? This cannot be undone.',
+  'delete.inUse': 'This session is active. Switch to or create another session, then try again.',
+  'delete.notFound': 'This session does not exist or has already been deleted.',
+  'delete.invalid': 'The project or session identifier is invalid.',
+  'delete.failed': 'Failed to delete the session. Check the AtomCode logs for details.',
 
   'time.justNow': 'just now',
   'time.minutesAgo': '{n} min ago',

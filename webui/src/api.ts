@@ -360,6 +360,16 @@ export async function renameSession(
   if (!resp.ok) throw new Error(`rename failed: ${resp.status}`);
 }
 
+export class DeleteSessionError extends Error {
+  readonly code?: string;
+
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = 'DeleteSessionError';
+    this.code = code;
+  }
+}
+
 export async function deleteSession(
   projectHash: string,
   sessionId: string,
@@ -368,7 +378,25 @@ export async function deleteSession(
     `/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}`,
     { method: 'DELETE', headers: authHeaders() },
   );
-  if (!resp.ok) throw new Error(`delete failed: ${resp.status}`);
+  if (!resp.ok) {
+    const payload: unknown = await resp.json().catch(() => undefined);
+    const errorValue =
+      payload && typeof payload === 'object' && 'error' in payload
+        ? (payload as { error: unknown }).error
+        : undefined;
+    const codeValue =
+      payload && typeof payload === 'object' && 'code' in payload
+        ? (payload as { code: unknown }).code
+        : undefined;
+    const detail =
+      typeof payload === 'string'
+        ? payload
+        : typeof errorValue === 'string'
+          ? errorValue
+          : undefined;
+    const code = typeof codeValue === 'string' ? codeValue : undefined;
+    throw new DeleteSessionError(detail || `delete failed: ${resp.status}`, code);
+  }
 }
 
 // --- Config types ---

@@ -1510,6 +1510,98 @@ impl SessionManager {
         })
     }
 
+    /// Replace a previously committed empty metadata-only import when every
+    /// native artifact still exactly matches the state inspected by the
+    /// compatibility importer. This is intentionally narrower than a general
+    /// native overwrite: only an empty aggregate with metadata-only provenance
+    /// may be replaced by a populated full import of the same legacy source.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_empty_metadata_only_import_if_unchanged(
+        &self,
+        lease: &SessionLease,
+        expected_meta: &SessionMeta,
+        expected_snapshot: &SessionSnapshot,
+        expected_presentation: &PresentationFile,
+        snapshot: &SessionSnapshot,
+        presentation: &PresentationFile,
+        meta: &SessionMeta,
+    ) -> SessionResult<NativeImportCommitOutcome> {
+        self.validate_lease(lease)?;
+        ensure_meta_id(lease.id(), expected_meta)?;
+        ensure_meta_id(lease.id(), meta)?;
+        let expected_import = expected_meta.import_info.as_ref();
+        let replacement_import = meta.import_info.as_ref();
+        let valid_recovery = expected_meta.owner == StorageOwner::Native
+            && expected_meta.message_count == 0
+            && expected_snapshot.messages.is_empty()
+            && expected_presentation.entries.is_empty()
+            && expected_import.is_some_and(|info| info.kind == ImportKind::MetadataOnly)
+            && meta.owner == StorageOwner::Native
+            && !snapshot.messages.is_empty()
+            && replacement_import.is_some_and(|info| {
+                info.kind == ImportKind::Full
+                    && expected_import.is_some_and(|expected| {
+                        expected.source_sha256 == info.source_sha256
+                            && expected.legacy_schema == info.legacy_schema
+                    })
+            });
+        if !valid_recovery {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session import recovery",
+                message: "recovery requires an empty metadata-only native aggregate and a \
+                          populated full import of the same legacy source"
+                    .into(),
+            });
+        }
+        validate_meta(expected_meta)?;
+        validate_snapshot(expected_snapshot)?;
+        expected_presentation.validate()?;
+        validate_meta(meta)?;
+        validate_snapshot(snapshot)?;
+        presentation.validate()?;
+        let snapshot_bytes = serialize_bounded(snapshot, "snapshot", MAX_SNAPSHOT_BYTES)?;
+        let presentation_bytes =
+            serialize_pretty_bounded(presentation, "presentation", MAX_PRESENTATION_BYTES)?;
+        let meta_bytes = serialize_pretty_bounded(meta, "session meta", MAX_META_BYTES)?;
+
+        self.with_meta_lock(lease.id(), || {
+            self.cleanup_import_staging(lease.id())?;
+            let Some(current_meta) = self.read_optional_meta_artifact(lease.id())? else {
+                return Err(SessionStoreError::NotFound {
+                    path: self.meta_path(lease.id())?,
+                });
+            };
+            let current_snapshot = self.read_optional_snapshot_artifact(lease.id())?;
+            let current_presentation = self.read_optional_presentation_artifact(lease.id())?;
+            if current_meta.0 != *expected_meta
+                || current_snapshot.as_ref().map(|(value, _)| value) != Some(expected_snapshot)
+                || current_presentation.as_ref().map(|(value, _)| value)
+                    != Some(expected_presentation)
+            {
+                return Ok(NativeImportCommitOutcome::Conflict {
+                    meta: current_meta.0,
+                    snapshot: current_snapshot.map(|(value, _)| value),
+                    presentation: current_presentation.map(|(value, _)| value),
+                });
+            }
+            self.publish_native_import_locked(
+                lease.id(),
+                Some(current_meta),
+                current_snapshot,
+                current_presentation,
+                None,
+                None,
+                Some(snapshot),
+                Some(&snapshot_bytes),
+                Some(presentation),
+                Some(&presentation_bytes),
+                meta,
+                &meta_bytes,
+            )?;
+            Ok(NativeImportCommitOutcome::Committed(meta.clone()))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn publish_native_import_locked(
         &self,
@@ -4057,6 +4149,58 @@ mod tests {
                 presentation: Some(concurrent_presentation),
             }
         );
+        assert_eq!(native_artifact_bytes(&mgr, "s1"), before);
+    }
+
+    #[test]
+    fn empty_metadata_only_recovery_cas_preserves_concurrent_native_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let expected_snapshot = SessionSnapshot::new(Vec::new());
+        let expected_presentation = PresentationFile::default();
+        let mut expected_meta = SessionMeta::new("s1", "/p", 1);
+        expected_meta.owner = StorageOwner::Native;
+        expected_meta.import_info = Some(ImportInfo {
+            legacy_schema: "legacy".into(),
+            source_sha256: "a".repeat(64),
+            importer_version: 1,
+            kind: ImportKind::MetadataOnly,
+        });
+        mgr.commit_native_import(
+            &lease,
+            Some(&expected_snapshot),
+            Some(&expected_presentation),
+            &expected_meta,
+        )
+        .unwrap();
+        let concurrent_snapshot = snap(&["concurrent"]);
+        mgr.save_snapshot("s1", &concurrent_snapshot).unwrap();
+        let before = native_artifact_bytes(&mgr, "s1");
+        let desired_snapshot = snap(&["legacy"]);
+        let mut desired_meta = expected_meta.clone();
+        desired_meta.message_count = 1;
+        desired_meta.import_info.as_mut().unwrap().kind = ImportKind::Full;
+
+        let outcome = mgr
+            .recover_empty_metadata_only_import_if_unchanged(
+                &lease,
+                &expected_meta,
+                &expected_snapshot,
+                &expected_presentation,
+                &desired_snapshot,
+                &expected_presentation,
+                &desired_meta,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            NativeImportCommitOutcome::Conflict {
+                snapshot: Some(snapshot),
+                ..
+            } if snapshot == concurrent_snapshot
+        ));
         assert_eq!(native_artifact_bytes(&mgr, "s1"), before);
     }
 

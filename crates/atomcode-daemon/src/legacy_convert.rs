@@ -732,6 +732,80 @@ fn converge_session_with_retries(
         let expected_meta = meta.clone();
         let expected_snapshot = snapshot.clone();
         let expected_presentation = presentation.clone();
+        if let Some(bytes) = legacy_bytes.as_deref() {
+            let recoverable_empty_import = meta.message_count == 0
+                && snapshot.messages.is_empty()
+                && presentation.entries.is_empty()
+                && meta.import_info.as_ref().is_some_and(|info| {
+                    info.kind == ImportKind::MetadataOnly
+                        && info.source_sha256 == sha256_hex(bytes)
+                });
+            if recoverable_empty_import {
+                let legacy: LegacySession = serde_json::from_slice(bytes)
+                    .map_err(|error| anyhow::anyhow!("invalid legacy session {id:?}: {error}"))?;
+                if legacy.id != id {
+                    anyhow::bail!(
+                        "legacy filename id {id:?} does not match stored id {:?}",
+                        legacy.id
+                    )
+                }
+                let (converted, diagnostic) =
+                    convert_legacy_session_with_diagnostic(&legacy)?;
+                if !converted.snapshot.messages.is_empty() {
+                    let mut recovered_meta = converted.meta;
+                    recovered_meta.auto_name_from_messages(&converted.snapshot.messages);
+                    if meta.user_renamed || meta.ai_named {
+                        recovered_meta.name = meta.name.clone();
+                        recovered_meta.user_renamed = meta.user_renamed;
+                        recovered_meta.ai_named = meta.ai_named;
+                    }
+                    recovered_meta.updated_at = recovered_meta.updated_at.max(meta.updated_at);
+                    recovered_meta.message_count =
+                        u32::try_from(converted.snapshot.messages.len()).map_err(|_| {
+                            anyhow::anyhow!("native snapshot message count exceeds u32")
+                        })?;
+                    recovered_meta.owner = StorageOwner::Native;
+                    recovered_meta.import_info = Some(ImportInfo {
+                        legacy_schema: LEGACY_SCHEMA.into(),
+                        source_sha256: sha256_hex(bytes),
+                        importer_version: IMPORTER_VERSION,
+                        kind: ImportKind::Full,
+                    });
+                    match manager.recover_empty_metadata_only_import_if_unchanged(
+                        lease,
+                        &expected_meta,
+                        &expected_snapshot,
+                        &expected_presentation,
+                        &converted.snapshot,
+                        &converted.presentation,
+                        &recovered_meta,
+                    )? {
+                        NativeImportCommitOutcome::Committed(meta) => {
+                            report_import_diagnostic(id, diagnostic);
+                            return Ok(ImportOutcome {
+                                status: ImportStatus::ImportedFull,
+                                diagnostic,
+                                snapshot: converted.snapshot,
+                                meta,
+                                presentation: converted.presentation,
+                            });
+                        }
+                        NativeImportCommitOutcome::Conflict { .. } => {
+                            if remaining_retries == 0 {
+                                anyhow::bail!(
+                                    "session {id:?} changed repeatedly during empty import recovery; retry"
+                                )
+                            }
+                            return converge_session_with_retries(
+                                manager,
+                                lease,
+                                remaining_retries - 1,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let mut diagnostic = match (legacy_bytes.as_deref(), meta.import_info.as_ref()) {
             (Some(bytes), Some(info)) if sha256_hex(bytes) != info.source_sha256 => {
                 Some(ImportDiagnostic::LegacyChangedAfterCutover)
@@ -834,7 +908,17 @@ fn converge_session_with_retries(
         )
     }
     let (converted, diagnostic) = convert_legacy_session_with_diagnostic(&legacy)?;
-    let preserve_native_snapshot = existing_snapshot.is_some() && !force_legacy;
+    let empty_unconfirmed_stub = existing_meta
+        .as_ref()
+        .is_some_and(|meta| meta.owner == StorageOwner::Unconfirmed && meta.message_count == 0)
+        && existing_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.messages.is_empty())
+        && existing_presentation
+            .as_ref()
+            .is_some_and(|presentation| presentation.entries.is_empty());
+    let preserve_native_snapshot =
+        existing_snapshot.is_some() && !force_legacy && !empty_unconfirmed_stub;
     if preserve_native_snapshot {
         let meta = existing_meta.ok_or_else(|| {
             anyhow::anyhow!("session {id:?} has a native snapshot without ownership metadata")
@@ -1991,6 +2075,97 @@ mod tests {
         );
         assert!(manager.read_presentation(id).unwrap().entries.is_empty());
         assert_eq!(manager.load_snapshot(id).unwrap(), imported.snapshot);
+    }
+
+    #[test]
+    fn empty_unconfirmed_native_stub_is_replaced_by_populated_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
+        let empty_snapshot = atomcode_kernel::message::SessionSnapshot::new(Vec::new());
+        let empty_presentation = PresentationFile::default();
+        manager.save_snapshot(&legacy.id, &empty_snapshot).unwrap();
+        manager
+            .write_presentation(&legacy.id, &empty_presentation)
+            .unwrap();
+        manager
+            .write_meta(&SessionMeta::new(&legacy.id, "/native", 7))
+            .unwrap();
+        std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
+        let lease = manager.acquire_lease(&legacy.id).unwrap();
+
+        let imported = converge_session(&manager, &lease).unwrap();
+
+        assert_eq!(imported.status, ImportStatus::ImportedFull);
+        assert!(!imported.snapshot.messages.is_empty());
+        assert_eq!(
+            manager.load_native_session(&legacy.id).unwrap().snapshot,
+            imported.snapshot
+        );
+    }
+
+    #[test]
+    fn empty_metadata_only_native_stub_recovers_from_matching_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
+        let empty_snapshot = atomcode_kernel::message::SessionSnapshot::new(Vec::new());
+        let empty_presentation = PresentationFile::default();
+        let mut poisoned_meta = SessionMeta::new(&legacy.id, "/native", 7);
+        poisoned_meta.owner = StorageOwner::Native;
+        poisoned_meta.import_info = Some(ImportInfo {
+            legacy_schema: LEGACY_SCHEMA.into(),
+            source_sha256: sha256_hex(legacy_bytes),
+            importer_version: IMPORTER_VERSION,
+            kind: ImportKind::MetadataOnly,
+        });
+        manager.save_snapshot(&legacy.id, &empty_snapshot).unwrap();
+        manager
+            .write_presentation(&legacy.id, &empty_presentation)
+            .unwrap();
+        manager.write_meta(&poisoned_meta).unwrap();
+        std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
+        let lease = manager.acquire_lease(&legacy.id).unwrap();
+
+        let recovered = converge_session(&manager, &lease).unwrap();
+
+        assert_eq!(recovered.status, ImportStatus::ImportedFull);
+        assert!(!recovered.snapshot.messages.is_empty());
+        assert_eq!(
+            recovered.meta.import_info.as_ref().map(|info| &info.kind),
+            Some(&ImportKind::Full)
+        );
+        assert_eq!(
+            manager.load_native_session(&legacy.id).unwrap().snapshot,
+            recovered.snapshot
+        );
+    }
+
+    #[test]
+    fn empty_native_session_without_matching_import_provenance_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
+        let empty_snapshot = atomcode_kernel::message::SessionSnapshot::new(Vec::new());
+        let empty_presentation = PresentationFile::default();
+        let mut native_meta = SessionMeta::new(&legacy.id, "/native", 7);
+        native_meta.owner = StorageOwner::Native;
+        manager.save_snapshot(&legacy.id, &empty_snapshot).unwrap();
+        manager
+            .write_presentation(&legacy.id, &empty_presentation)
+            .unwrap();
+        manager.write_meta(&native_meta).unwrap();
+        std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
+        let lease = manager.acquire_lease(&legacy.id).unwrap();
+
+        let loaded = converge_session(&manager, &lease).unwrap();
+
+        assert_eq!(loaded.status, ImportStatus::AlreadyNative);
+        assert!(loaded.snapshot.messages.is_empty());
+        assert_eq!(manager.read_meta(&legacy.id).unwrap(), native_meta);
     }
 
     #[test]

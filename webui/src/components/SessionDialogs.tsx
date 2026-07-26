@@ -1,7 +1,7 @@
 // Rename + delete dialogs for a session (triggered from the sidebar item menu).
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { renameSession, deleteSession, SessionMetaWithProject } from '../api';
+import { renameSession, deleteSession, DeleteSessionError, SessionMetaWithProject } from '../api';
 import { useT } from '../settings';
 
 interface RenameDialogProps {
@@ -88,16 +88,28 @@ interface DeleteDialogProps {
 export function DeleteDialog({ session, onClose, onDone }: DeleteDialogProps) {
   const t = useT();
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const name = session.name || session.id.slice(0, 8);
 
   async function confirm() {
     if (busy) return;
     setBusy(true);
+    setError(null);
     try {
       await deleteSession(session.project_hash, session.id);
       onDone();
       onClose();
-    } catch {
+    } catch (cause) {
+      const localized =
+        cause instanceof DeleteSessionError
+          ? ({
+              SESSION_IN_USE: t('delete.inUse'),
+              SESSION_NOT_FOUND: t('delete.notFound'),
+              INVALID_SESSION: t('delete.invalid'),
+              DELETE_FAILED: t('delete.failed'),
+            } as Record<string, string>)[cause.code ?? '']
+          : undefined;
+      setError(localized ?? (cause instanceof Error ? cause.message : String(cause)));
       setBusy(false);
     }
   }
@@ -119,6 +131,7 @@ export function DeleteDialog({ session, onClose, onDone }: DeleteDialogProps) {
         </div>
         <div class="modal-body">
           <p class="field-hint">{t('delete.body', { name })}</p>
+          {error && <div class="modal-error" role="alert">{error}</div>}
         </div>
         <div class="modal-footer">
           <button class="btn" onClick={onClose}>
