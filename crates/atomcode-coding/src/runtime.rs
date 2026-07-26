@@ -29,8 +29,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::controllers::{
     evaluate_goal, goal_continuation_message, summarize_for_goal, EvalOutcome, GoalProgress,
-    GoalResult, GoalState, LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest,
-    MAX_EVAL_FAILURES, MAX_UNPRODUCTIVE,
+    GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest,
+    MAX_UNPRODUCTIVE,
 };
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
 #[cfg(test)]
@@ -2377,8 +2377,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     match outcome.result {
                         GoalResult::Met(verdict) => {
                             if let Some(state) = goal.as_mut() {
-                                state.active = false;
-                                state.last_reason = Some(verdict);
+                                state.finish(GoalTerminal::Met, verdict);
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             finish_reason = Some(StopReason::Stopped);
@@ -2386,7 +2385,6 @@ fn spawn_runtime_owner_with_optional_agent(
                         GoalResult::NotMet(verdict) => {
                             if let Some(state) = goal.as_mut() {
                                 state.round = state.round.saturating_add(1);
-                                state.evaluator_failures = 0;
                                 state.last_reason = Some(verdict.clone());
                                 continuation = Some(goal_continuation_message(&verdict, &state.condition));
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
@@ -2394,16 +2392,13 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         GoalResult::Error(error) => {
                             if let Some(state) = goal.as_mut() {
-                                state.evaluator_failures = state.evaluator_failures.saturating_add(1);
-                                state.last_reason = Some(format!("evaluator failed: {error}"));
-                                if state.evaluator_failures >= MAX_EVAL_FAILURES {
-                                    state.active = false;
-                                    finish_reason = Some(StopReason::ProviderError);
-                                } else {
-                                    continuation = Some(goal_continuation_message(&format!("evaluator error: {error}"), &state.condition));
-                                }
+                                state.finish(
+                                    GoalTerminal::Failed,
+                                    format!("evaluator failed: {error}"),
+                                );
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
+                            finish_reason = Some(StopReason::ProviderError);
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal evaluator failed: {error}")));
                         }
                     }
@@ -2423,8 +2418,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             agent_available = false;
                             if let Some(mut state) = goal.take() {
                                 state.cancel.cancel();
-                                state.active = false;
-                                state.last_reason = Some("continuation dispatch failed".into());
+                                state.finish(
+                                    GoalTerminal::Failed,
+                                    "continuation dispatch failed",
+                                );
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
@@ -2731,8 +2728,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         } else if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
                             if let Some(mut state) = goal.take() {
                                 state.cancel.cancel();
-                                state.active = false;
-                                state.last_reason = Some("cancelled by user".into());
+                                state.finish(GoalTerminal::Cancelled, "cancelled by user");
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             if let Some(mut state) = loop_state.take() {
@@ -2764,8 +2760,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         } else {
                             if let Some(mut state) = goal.take() {
                                 state.cancel.cancel();
-                                state.active = false;
-                                state.last_reason = Some("cancelled by user".into());
+                                state.finish(GoalTerminal::Cancelled, "cancelled by user");
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             if let Some(mut state) = loop_state.take() {
@@ -3990,8 +3985,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         if let Some(mut current) = goal.take() {
                             current.cancel.cancel();
-                            current.active = false;
-                            current.last_reason = Some("cleared by user".into());
+                            current.finish(GoalTerminal::Cancelled, "cleared by user");
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(current.progress()));
                         }
                         if active_turn.is_some() { let _ = send_agent_command(&agent, AgentCommand::Cancel); }
@@ -4187,9 +4181,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             held_turn = None;
                             if let Some(mut state) = goal.take() {
                                 state.cancel.cancel();
-                                state.active = false;
-                                state.last_reason = Some(
-                                    "ended: compaction persistence became uncertain".into(),
+                                state.finish(
+                                    GoalTerminal::Failed,
+                                    "ended: compaction persistence became uncertain",
                                 );
                                 let _ = runtime_event_tx
                                     .send(CodingRuntimeEvent::GoalChanged(state.progress()));
@@ -4288,9 +4282,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                     pending_wakeup = None;
                                     if let Some(mut state) = goal.take() {
                                         state.cancel.cancel();
-                                        state.active = false;
-                                        state.last_reason = Some(
-                                            "ended: session persistence became uncertain".into(),
+                                        state.finish(
+                                            GoalTerminal::Failed,
+                                            "ended: session persistence became uncertain",
                                         );
                                         let _ = runtime_event_tx.send(
                                             CodingRuntimeEvent::GoalChanged(state.progress()),
@@ -4355,10 +4349,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                         pending_wakeup = None;
                                         if let Some(mut state) = goal.take() {
                                             state.cancel.cancel();
-                                            state.active = false;
-                                            state.last_reason = Some(
-                                                "ended: kernel snapshot command delivery failed"
-                                                    .into(),
+                                            state.finish(
+                                                GoalTerminal::Failed,
+                                                "ended: kernel snapshot command delivery failed",
                                             );
                                             let _ = runtime_event_tx.send(
                                                 CodingRuntimeEvent::GoalChanged(state.progress()),
@@ -4526,8 +4519,10 @@ fn spawn_runtime_owner_with_optional_agent(
                                             StopReason::Timeout | StopReason::ProviderError
                                         );
                                         if let Some(why) = stop_reason {
-                                            state.active = false;
-                                            state.last_reason = Some(format!("stopped: {why}"));
+                                            state.finish(
+                                                GoalTerminal::Stopped,
+                                                format!("stopped: {why}"),
+                                            );
                                             completion_reason = match why {
                                                 "round limit" => StopReason::MaxRounds,
                                                 "time limit" => StopReason::Timeout,
@@ -4546,7 +4541,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                             );
                                             let provider = resources.as_ref().and_then(|runtime| {
                                                 let session_id = runtime.parts.session.as_ref().map(|binding| binding.id.as_str());
-                                                runtime.provider_factory.build(&runtime.config, session_id).ok()
+                                                build_goal_evaluator_provider(
+                                                    &runtime.provider_factory,
+                                                    &runtime.config,
+                                                    session_id,
+                                                )
+                                                .ok()
                                             });
                                             held_turn = Some((turn_id, reason, snapshot.clone(), stats));
                                             let tx = goal_eval_tx.clone();
@@ -4583,8 +4583,10 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 }
                                                 agent_available = false;
                                                 state.cancel.cancel();
-                                                state.active = false;
-                                                state.last_reason = Some("continuation dispatch failed".into());
+                                                state.finish(
+                                                    GoalTerminal::Failed,
+                                                    "continuation dispatch failed",
+                                                );
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
                                                     "goal stopped: continuation dispatch failed".into(),
@@ -4610,15 +4612,19 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 );
                                                 continue;
                                             } else {
-                                                state.active = false;
-                                                state.last_reason = Some("stopped: too many failed rounds".into());
+                                                state.finish(
+                                                    GoalTerminal::Failed,
+                                                    "stopped: too many failed rounds",
+                                                );
                                                 completion_reason = StopReason::ProviderError;
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("goal stopped: too many failed rounds".into()));
                                             }
                                         } else {
-                                            state.active = false;
-                                            state.last_reason = Some(format!("ended: {reason:?}"));
+                                            state.finish(
+                                                GoalTerminal::Failed,
+                                                format!("ended: {reason:?}"),
+                                            );
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                         }
                                         goal = None;
@@ -4712,8 +4718,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = pending_wakeup.take();
                             if let Some(mut state) = goal.take() {
                                 state.cancel.cancel();
-                                state.active = false;
-                                state.last_reason = Some("ended: kernel event stream closed".into());
+                                state.finish(
+                                    GoalTerminal::Failed,
+                                    "ended: kernel event stream closed",
+                                );
                                 let _ = runtime_event_tx
                                     .send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
@@ -5113,6 +5121,44 @@ fn runtime_prepare_error(error: io::Error) -> RuntimeError {
         Some(id) => RuntimeError::SessionInUse { id },
         None => RuntimeError::ReconfigureFailed(error.to_string()),
     }
+}
+
+fn build_goal_evaluator_provider(
+    factory: &Arc<dyn CodingProviderFactory>,
+    host: &CodingAgentConfig,
+    session_id: Option<&str>,
+) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+    if let Some(registry) = host.subagent_config.as_deref() {
+        if let Some(key) = registry.evaluator_provider.as_deref() {
+            if let Some(provider) = registry.providers.get(key) {
+                let mut evaluator = host.clone();
+                evaluator.provider_name = key.to_owned();
+                evaluator.model = provider.model.clone();
+                evaluator.provider_type = provider.provider_type.clone();
+                evaluator.context_window = provider.context_window as u32;
+                evaluator.chat_options.max_tokens = provider.max_tokens.map(|value| value as u32);
+                evaluator.thinking_type = provider.thinking_type.clone();
+                evaluator.thinking_keep = provider.thinking_keep.clone();
+                evaluator.reasoning_history = provider.reasoning_history.clone();
+                evaluator.thinking_enabled = provider.thinking_enabled;
+                evaluator.user_agent = provider.user_agent.clone();
+                evaluator.skip_tls_verify = provider.skip_tls_verify;
+                evaluator.subagent_fast_provider = None;
+                evaluator.subagent_capable_provider = None;
+                evaluator.subagent_config = None;
+                // An evaluator is an independent provider boundary. Never let a
+                // missing target credential/endpoint inherit the host provider's
+                // values: that could send the host API key to another base URL.
+                evaluator.api_key = provider.resolved_api_key().unwrap_or_default();
+                evaluator.base_url = provider.base_url.clone().unwrap_or_default();
+                if let Ok(provider) = factory.build(&evaluator, session_id) {
+                    return Ok(provider);
+                }
+            }
+        }
+    }
+
+    factory.build(host, session_id)
 }
 
 fn assemble_runtime_resources(runtime: &mut RuntimeResources) -> Result<AgentHandle, String> {
@@ -5710,8 +5756,10 @@ fn fail_close_after_stopped_persistence(
     );
     if let Some(mut current) = goal.take() {
         current.cancel.cancel();
-        current.active = false;
-        current.last_reason = Some("ended: session persistence became uncertain".into());
+        current.finish(
+            GoalTerminal::Failed,
+            "ended: session persistence became uncertain",
+        );
         let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(current.progress()));
     }
     if let Some(mut current) = loop_state.take() {
@@ -5761,8 +5809,7 @@ fn cancel_controllers_and_finish_held(
     let had_controller = goal.is_some() || loop_state.is_some();
     if let Some(mut current) = goal.take() {
         current.cancel.cancel();
-        current.active = false;
-        current.last_reason = Some(detail.into());
+        current.finish(GoalTerminal::Failed, detail);
         let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(current.progress()));
     }
     if let Some(mut current) = loop_state.take() {
@@ -6074,6 +6121,7 @@ mod tests {
     #[derive(Default)]
     struct TierRecordingFactory {
         models: std::sync::Mutex<Vec<String>>,
+        provider_inputs: std::sync::Mutex<Vec<(String, String, String, Option<String>)>>,
         host_fast_cell: std::sync::Mutex<Option<Arc<crate::TierProvider>>>,
         fail_model: std::sync::Mutex<Option<String>>,
     }
@@ -6143,6 +6191,12 @@ mod tests {
             _session_id: Option<&str>,
         ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
             self.models.lock().unwrap().push(config.model.clone());
+            self.provider_inputs.lock().unwrap().push((
+                config.provider_name.clone(),
+                config.base_url.clone(),
+                config.api_key.clone(),
+                _session_id.map(str::to_owned),
+            ));
             if let Some(cell) = config.subagent_fast_provider.clone() {
                 *self.host_fast_cell.lock().unwrap() = Some(cell);
             }
@@ -6187,6 +6241,90 @@ mod tests {
             ephemeral: false,
             capable_model: Some(rank),
         }
+    }
+
+    #[test]
+    fn goal_evaluator_uses_configured_provider() {
+        let mut registry = atomcode_config::config::Config::default();
+        registry.evaluator_provider = Some("judge".into());
+        registry
+            .providers
+            .insert("judge".into(), tier_provider("judge-model", 0));
+
+        let factory = Arc::new(TierRecordingFactory::default());
+        let mut host = native_start(false).agent;
+        host.model = "host-model".into();
+        host.subagent_config = Some(Arc::new(registry));
+
+        build_goal_evaluator_provider(
+            &(factory.clone() as Arc<dyn CodingProviderFactory>),
+            &host,
+            Some("session-1"),
+        )
+        .unwrap();
+
+        assert_eq!(factory.models.lock().unwrap().as_slice(), ["judge-model"]);
+    }
+
+    #[test]
+    fn goal_evaluator_falls_back_to_host_when_configured_provider_fails() {
+        let mut registry = atomcode_config::config::Config::default();
+        registry.evaluator_provider = Some("judge".into());
+        registry
+            .providers
+            .insert("judge".into(), tier_provider("judge-model", 0));
+
+        let factory = Arc::new(TierRecordingFactory::default());
+        *factory.fail_model.lock().unwrap() = Some("judge-model".into());
+        let mut host = native_start(false).agent;
+        host.model = "host-model".into();
+        host.subagent_config = Some(Arc::new(registry));
+
+        build_goal_evaluator_provider(
+            &(factory.clone() as Arc<dyn CodingProviderFactory>),
+            &host,
+            Some("session-1"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            factory.models.lock().unwrap().as_slice(),
+            ["judge-model", "host-model"]
+        );
+    }
+
+    #[test]
+    fn goal_evaluator_never_inherits_host_endpoint_or_credentials() {
+        let mut registry = atomcode_config::config::Config::default();
+        registry.evaluator_provider = Some("judge".into());
+        let mut judge = tier_provider("judge-model", 0);
+        judge.base_url = Some("https://judge.example/v1".into());
+        judge.api_key = None;
+        registry.providers.insert("judge".into(), judge);
+
+        let factory = Arc::new(TierRecordingFactory::default());
+        let mut host = native_start(false).agent;
+        host.model = "host-model".into();
+        host.base_url = "https://host.example/v1".into();
+        host.api_key = "host-secret".into();
+        host.subagent_config = Some(Arc::new(registry));
+
+        build_goal_evaluator_provider(
+            &(factory.clone() as Arc<dyn CodingProviderFactory>),
+            &host,
+            Some("session-1"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            factory.provider_inputs.lock().unwrap().as_slice(),
+            [(
+                "judge".into(),
+                "https://judge.example/v1".into(),
+                String::new(),
+                Some("session-1".into())
+            )]
+        );
     }
 
     #[tokio::test]
@@ -6856,7 +6994,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_evaluator_exhaustion_reports_provider_error() {
+    async fn goal_evaluator_failure_stops_without_replaying_the_main_agent() {
         let (
             handle,
             mut kernel_commands,
@@ -6878,40 +7016,29 @@ mod tests {
             Some(AgentCommand::SendMessage { .. })
         ));
 
-        for attempt in 1..=MAX_EVAL_FAILURES {
-            kernel_events
-                .send(AgentEvent::TurnComplete {
-                    reason: StopReason::Stopped,
-                })
-                .unwrap();
-            assert!(matches!(
-                kernel_commands.recv().await,
-                Some(AgentCommand::Snapshot)
-            ));
-            kernel_events
-                .send(AgentEvent::Snapshot {
-                    snapshot: SessionSnapshot::new(vec![Message::assistant(
-                        "not evaluated",
-                        vec![],
-                    )]),
-                })
-                .unwrap();
-            if attempt < MAX_EVAL_FAILURES {
-                assert!(matches!(
-                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
-                        .await
-                        .expect("evaluator retry was not dispatched"),
-                    Some(AgentCommand::SendSyntheticMessage { .. })
-                ));
-            }
-        }
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("not evaluated", vec![])]),
+            })
+            .unwrap();
 
         let mut saw_inactive_goal = false;
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 match runtime_events.recv().await {
                     Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
-                        active: false, ..
+                        active: false,
+                        terminal: Some(GoalTerminal::Failed),
+                        ..
                     })) => saw_inactive_goal = true,
                     Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
                     Some(_) => {}
@@ -6920,10 +7047,10 @@ mod tests {
             }
         })
         .await
-        .expect("evaluator exhaustion lost the held terminal");
+        .expect("evaluator failure lost the held terminal");
         assert!(
             saw_inactive_goal,
-            "evaluator exhaustion must deactivate /goal"
+            "evaluator failure must deactivate /goal"
         );
         assert!(matches!(
             terminal,
@@ -6932,6 +7059,12 @@ mod tests {
                 ..
             }
         ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), kernel_commands.recv())
+                .await
+                .is_err(),
+            "an evaluator failure must not dispatch a synthetic main-agent retry"
+        );
 
         handle.shutdown().await.unwrap();
     }
@@ -8474,7 +8607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_continuation_send_failure_finishes_the_held_snapshot() {
+    async fn goal_evaluator_failure_finishes_the_held_snapshot_without_failing_runtime() {
         let (agent, mut kernel_commands, kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
         let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
@@ -8554,7 +8687,7 @@ mod tests {
             }
         })
         .await
-        .expect("continuation send failure lost the held turn terminal");
+        .expect("evaluator failure lost the held turn terminal");
 
         assert!(matches!(
             terminal,
@@ -8565,7 +8698,7 @@ mod tests {
                 ..
             } if snapshot.as_ref() == &expected
         ));
-        assert_eq!(handle.status().phase, RuntimePhase::Failed);
+        assert_eq!(handle.status().phase, RuntimePhase::Ready);
     }
 
     // An `ImagePreprocessor` that fails: clears images from the model request

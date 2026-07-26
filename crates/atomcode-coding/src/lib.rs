@@ -67,7 +67,7 @@ pub use config::{
     apply_provider_config, resolve_loop_max_rounds, resolve_turn_max_rounds, CodingAgentConfig,
     CodingRuntimeConfig, SubagentProvider, TierProvider,
 };
-pub use controllers::{GoalProgress, LoopProgress};
+pub use controllers::{GoalProgress, GoalTerminal, LoopProgress};
 pub use discipline::VerifyCadenceHook;
 pub use init_prompt::INIT_PROMPT;
 pub use parts::{

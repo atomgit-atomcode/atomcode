@@ -15973,6 +15973,7 @@ fn handle_runtime_event(
                     handle_agent_event(
                         AgentEvent::GoalUpdate {
                             active: progress.active,
+                            terminal: progress.terminal,
                             round: progress.round,
                             elapsed_secs: progress.elapsed_secs,
                             condition: progress.condition,
@@ -17469,6 +17470,25 @@ mod coding_runtime_event_tests {
     }
 }
 
+fn goal_terminal_is_met(terminal: Option<atomcode_coding::GoalTerminal>) -> bool {
+    terminal == Some(atomcode_coding::GoalTerminal::Met)
+}
+
+#[cfg(test)]
+mod goal_end_tests {
+    use super::goal_terminal_is_met;
+    use atomcode_coding::GoalTerminal;
+
+    #[test]
+    fn only_explicit_met_terminal_is_successful() {
+        assert!(goal_terminal_is_met(Some(GoalTerminal::Met)));
+        assert!(!goal_terminal_is_met(Some(GoalTerminal::Failed)));
+        assert!(!goal_terminal_is_met(Some(GoalTerminal::Stopped)));
+        assert!(!goal_terminal_is_met(Some(GoalTerminal::Cancelled)));
+        assert!(!goal_terminal_is_met(None));
+    }
+}
+
 fn handle_agent_event(
     ev: AgentEvent,
     state: &mut UiState,
@@ -18759,6 +18779,7 @@ fn handle_agent_event(
         }
         AgentEvent::GoalUpdate {
             active,
+            terminal,
             round,
             condition,
             last_reason,
@@ -18780,16 +18801,14 @@ fn handle_agent_event(
                 // form here.
                 if state.goal_condition.is_some() {
                     if let Some(reason) = last_reason.as_deref() {
-                        let banner = if reason.contains("cancelled") {
+                        let banner = if terminal == Some(atomcode_coding::GoalTerminal::Cancelled) {
                             // Cancel already gets its own UiLine via
                             // TurnCancelled — skip to avoid double banner.
                             None
-                        } else if reason.contains("evaluator unavailable")
-                            || reason.contains("cleared by user")
-                        {
-                            Some(format!("  ⚠ Goal stopped: {reason}\n"))
-                        } else {
+                        } else if goal_terminal_is_met(terminal) {
                             Some(format!("  ✓ Goal met: {reason}\n"))
+                        } else {
+                            Some(format!("  ⚠ Goal stopped: {reason}\n"))
                         };
                         if let Some(line) = banner {
                             renderer.render(UiLine::CommandOutput(line));
