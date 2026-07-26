@@ -146,25 +146,38 @@ fn mount_coding_tools(vision: bool) -> MountedTools {
     register_coding_tools_with_vision(&mut registry, vision);
     register_codeintel_tools(&mut registry);
     #[cfg_attr(not(feature = "atomgit"), allow(unused_mut))]
-    let mut names: Vec<&str> = coding_tool_names()
+    let mut names: Vec<String> = coding_tool_names()
         .iter()
         .chain(codeintel_tool_names().iter())
-        .copied()
+        .map(|name| (*name).to_string())
         .collect();
     #[cfg(feature = "atomgit")]
-    {
-        use atomcode_capabilities::tools::{
-            atomgit_tool_names, register_atomgit_tools, AtomgitClient, AtomgitConfig,
-            LiveTokenProvider,
-        };
-        if let Ok(client) = AtomgitClient::new(AtomgitConfig {
-            base_url: "https://api.atomgit.com/api/v5".to_string(),
-            user_agent: format!("atomcode/{}", env!("CARGO_PKG_VERSION")),
-            token: std::sync::Arc::new(LiveTokenProvider),
-        }) {
-            register_atomgit_tools(&mut registry, std::sync::Arc::new(client));
-            names.extend_from_slice(atomgit_tool_names());
-        }
-    }
-    registry.mount(&names)
+    register_atomgit_capabilities(&mut registry, &mut names)
+        .expect("the static AtomGit REST client configuration must be valid");
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    registry.mount(&refs)
+}
+
+/// Register the shipped AtomGit REST capabilities into a coding tool catalog.
+///
+/// Both the minimal builder above and the production `parts::prepare → assemble`
+/// path use this helper so a feature-enabled build cannot expose different tools
+/// depending on which assembly entry point the driver uses.
+#[cfg(feature = "atomgit")]
+pub(crate) fn register_atomgit_capabilities(
+    registry: &mut ToolRegistry,
+    names: &mut Vec<String>,
+) -> Result<(), String> {
+    use atomcode_capabilities::tools::{
+        atomgit_tool_names, register_atomgit_tools, AtomgitClient, AtomgitConfig, LiveTokenProvider,
+    };
+
+    let client = AtomgitClient::new(AtomgitConfig {
+        base_url: "https://api.atomgit.com/api/v5".to_string(),
+        user_agent: format!("atomcode/{}", env!("CARGO_PKG_VERSION")),
+        token: Arc::new(LiveTokenProvider),
+    })?;
+    register_atomgit_tools(registry, Arc::new(client));
+    names.extend(atomgit_tool_names().iter().map(|name| (*name).to_string()));
+    Ok(())
 }

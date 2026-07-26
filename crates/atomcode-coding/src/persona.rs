@@ -179,6 +179,8 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     if request_user_input_enabled {
         p.push_str(REQUEST_USER_INPUT_USAGE);
     }
+    #[cfg(feature = "atomgit")]
+    p.push_str(ATOMGIT_TOOL_USAGE);
     if memory_tool_enabled() {
         p.push_str(MEMORY_USAGE);
     }
@@ -248,6 +250,13 @@ Do NOT shell out for file work:\n\
 - Read a file → read_file (NOT `bash cat`).\n\
 Use bash ONLY for git, builds, package managers, running commands, and pipelines / \
 aggregation (wc, sort, uniq, awk, git log) the dedicated tools cannot do.";
+
+#[cfg(feature = "atomgit")]
+const ATOMGIT_TOOL_USAGE: &str = "\n\n## ATOMGIT TOOLS:\n\
+For AtomGit repository, pull-request, and issue operations, use the dedicated \
+`atomgit_repo`, `atomgit_pr`, and `atomgit_issue` tools. Do not read AtomGit auth files, \
+print access tokens, or construct raw AtomGit API requests with `bash`/`curl`. The dedicated \
+tools obtain the current OAuth credential internally and preserve the approval boundary.";
 
 /// Blunt, point-of-decision restatement of the EXECUTION guardrails, appended only for the
 /// model flagged by [`model_needs_firm_execution`] (DeepSeek only — GLM excluded). The soft rules in
@@ -1072,6 +1081,19 @@ mod tests {
                 "persona must preserve tool preference: {phrase}"
             );
         }
+    }
+
+    #[cfg(feature = "atomgit")]
+    #[test]
+    fn persona_prefers_atomgit_tools_without_exposing_credentials() {
+        let p = coding_persona("m", true, false);
+
+        for tool in ["`atomgit_repo`", "`atomgit_pr`", "`atomgit_issue`"] {
+            assert!(p.contains(tool), "persona must direct the model to {tool}");
+        }
+        assert!(p.contains("Do not read AtomGit auth files"));
+        assert!(p.contains("raw AtomGit API requests with `bash`/`curl`"));
+        assert!(p.contains("obtain the current OAuth credential internally"));
     }
 
     #[test]
