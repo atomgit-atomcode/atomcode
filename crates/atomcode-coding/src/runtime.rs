@@ -4571,7 +4571,18 @@ fn spawn_runtime_owner_with_optional_agent(
                                             let tx = goal_eval_tx.clone();
                                             if let Some(provider) = provider {
                                                 tokio::spawn(async move {
-                                                    let outcome = evaluate_goal(generation, controller_id, provider, condition, summary, cancel).await;
+                                                    let inner = tokio::spawn(async move {
+                                                        evaluate_goal(generation, controller_id, provider, condition, summary, cancel).await
+                                                    });
+                                                    let outcome = match inner.await {
+                                                        Ok(outcome) => outcome,
+                                                        Err(e) => EvalOutcome {
+                                                            generation,
+                                                            controller_id,
+                                                            result: GoalResult::Error(format!("evaluator panicked: {e}")),
+                                                            usage: None,
+                                                        },
+                                                    };
                                                     let _ = tx.send(outcome);
                                                 });
                                                 continue;
@@ -7634,6 +7645,120 @@ mod tests {
                 .await
                 .is_err(),
             "tool-loop detection must not dispatch a continuation"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    struct PanicProviderFactory;
+
+    impl CodingProviderFactory for PanicProviderFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            use atomcode_kernel::provider::ChatOptions;
+            use atomcode_kernel::stream::ProviderError;
+            use atomcode_kernel::tool::ToolDef;
+
+            struct PanicProvider;
+            #[async_trait::async_trait]
+            impl LlmProvider for PanicProvider {
+                fn model_name(&self) -> &str {
+                    "panic"
+                }
+                async fn chat_stream(
+                    &self,
+                    _messages: &[Message],
+                    _tools: &[ToolDef],
+                    _options: &ChatOptions,
+                ) -> Result<
+                    futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+                    ProviderError,
+                > {
+                    panic!("evaluator panic test")
+                }
+            }
+            Ok(Arc::new(PanicProvider))
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_evaluator_panic_produces_turn_finished_and_allows_shutdown() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(PanicProviderFactory)).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        for attempt in 1..=MAX_EVAL_FAILURES {
+            kernel_events
+                .send(AgentEvent::TurnComplete {
+                    reason: StopReason::Stopped,
+                })
+                .unwrap();
+            assert!(matches!(
+                kernel_commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            kernel_events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![Message::assistant("not evaluated", vec![])]),
+                })
+                .unwrap();
+            if attempt < MAX_EVAL_FAILURES {
+                assert!(matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                        .await
+                        .expect("evaluator panic retry was not dispatched"),
+                    Some(AgentCommand::SendSyntheticMessage { .. })
+                ));
+            }
+        }
+
+        let mut saw_inactive_goal = false;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                        active: false, ..
+                    })) => saw_inactive_goal = true,
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime events closed before evaluator terminal"),
+                }
+            }
+        })
+        .await
+        .expect("evaluator panic did not produce a TurnFinished terminal");
+        assert!(
+            saw_inactive_goal,
+            "evaluator panic must deactivate /goal"
+        );
+        assert!(
+            matches!(
+                terminal,
+                TurnCompletion::Completed {
+                    reason: StopReason::ProviderError,
+                    ..
+                }
+            ),
+            "evaluator panic must produce ProviderError terminal"
         );
 
         handle.shutdown().await.unwrap();
