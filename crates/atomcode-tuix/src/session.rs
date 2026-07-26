@@ -304,6 +304,7 @@ mod tests {
         let entry = CatalogEntry {
             id: "same-id".into(),
             name: "selected".into(),
+            fork_root_id: None,
             project_bucket: "0123456789abcdef".into(),
             working_dir: PathBuf::from("/project"),
             created_at_ms: 1,

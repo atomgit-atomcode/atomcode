@@ -1403,6 +1403,7 @@ fn list_sessions_in_root(
         .into_iter()
         .filter(|entry| entry.project_bucket == project_hash && entry.message_count > 0)
         .collect();
+    NativeSessionManager::collapse_fork_lineages(&mut entries);
     crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
     Ok(entries
         .iter()
@@ -1423,6 +1424,7 @@ fn list_all_sessions_in_root(
         .into_iter()
         .filter(|entry| entry.message_count > 0)
         .collect();
+    NativeSessionManager::collapse_fork_lineages(&mut entries);
     // Bound snapshot hydration to the same newest-50 surface the API returns.
     entries.truncate(50);
     crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);

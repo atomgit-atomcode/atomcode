@@ -34,8 +34,8 @@ pub mod transcript;
 pub use context::SessionContextHook;
 pub use manager::{
     CatalogDiagnostic, CatalogDiagnosticKind, CatalogEntry, CatalogLocation, CatalogPresence,
-    CatalogScan, ImportInfo, ImportKind, LoadedSession, SessionLease, SessionManager, SessionMeta,
-    SessionResult, SessionStoreError, StorageOwner, TurnStat,
+    CatalogScan, ForkInfo, ImportInfo, ImportKind, LoadedSession, SessionLease, SessionManager,
+    SessionMeta, SessionResult, SessionStoreError, StorageOwner, TurnStat,
 };
 pub use presentation::{
     anchor_from_legacy_position, DisplayAnchor, LegacyTurnBoundary, PresentationEntry,

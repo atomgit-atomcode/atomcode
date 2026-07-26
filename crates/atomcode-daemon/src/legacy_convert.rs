@@ -489,6 +489,7 @@ fn convert_legacy_session_with_diagnostic(
         ai_named: session.ai_named,
         owner: StorageOwner::Legacy,
         import_info: None,
+        fork_info: None,
         working_dir,
         created_at,
         updated_at,
@@ -929,6 +930,7 @@ fn catalog_for_project_in_root(
                 || working_dirs_equivalent(&entry.working_dir, working_dir)
         })
         .collect();
+    SessionManager::collapse_fork_lineages(&mut entries);
     repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
     Ok(entries)
 }
@@ -3036,6 +3038,7 @@ mod tests {
         let entry = CatalogEntry {
             id: id.into(),
             name: meta.name.clone(),
+            fork_root_id: None,
             project_bucket: bucket.into(),
             working_dir: "/project".into(),
             created_at_ms: meta.created_at,
@@ -3136,6 +3139,7 @@ mod tests {
         let entry = CatalogEntry {
             id: id.into(),
             name: meta.name.clone(),
+            fork_root_id: None,
             project_bucket: bucket.into(),
             working_dir: "/project".into(),
             created_at_ms: 1,
@@ -3176,6 +3180,7 @@ mod tests {
         let entry = CatalogEntry {
             id: id.into(),
             name: meta.name,
+            fork_root_id: None,
             project_bucket: bucket.into(),
             working_dir: "/project".into(),
             created_at_ms: 1,
@@ -3355,6 +3360,7 @@ mod tests {
         let entry = CatalogEntry {
             id: id.into(),
             name: meta.name.clone(),
+            fork_root_id: None,
             project_bucket: bucket.into(),
             working_dir: "/project".into(),
             created_at_ms: 1,
@@ -3395,6 +3401,7 @@ mod tests {
         let entry = CatalogEntry {
             id: id.into(),
             name: session.name.clone(),
+            fork_root_id: None,
             project_bucket: bucket.into(),
             working_dir: session.working_dir.clone(),
             created_at_ms: session.created_at as i64 * 1_000,
@@ -3430,6 +3437,7 @@ mod tests {
         let entry = CatalogEntry {
             id: id.into(),
             name: session.name.clone(),
+            fork_root_id: None,
             project_bucket: bucket.into(),
             working_dir: session.working_dir.clone(),
             created_at_ms: session.created_at as i64 * 1_000,

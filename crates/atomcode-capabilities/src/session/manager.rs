@@ -217,6 +217,8 @@ pub enum CatalogPresence {
 pub struct CatalogEntry {
     pub id: String,
     pub name: String,
+    /// Root identity for an automatic busy-continue fork.
+    pub fork_root_id: Option<String>,
     pub project_bucket: String,
     pub working_dir: PathBuf,
     pub created_at_ms: i64,
@@ -314,6 +316,17 @@ pub struct ImportInfo {
     pub kind: ImportKind,
 }
 
+/// Durable lineage for an automatic fork created because `--continue` found
+/// its source session leased by another runtime.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForkInfo {
+    pub root_id: String,
+    pub parent_id: String,
+    pub forked_at_ms: i64,
+    pub base_message_count: u32,
+    pub base_turn_count: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     /// `.meta` SCHEMA VERSION — the forward-compat seam (`.snapshot` has
@@ -340,6 +353,10 @@ pub struct SessionMeta {
     /// empty; it is deliberately independent from `owner`.
     #[serde(default)]
     pub import_info: Option<ImportInfo>,
+    /// Automatic busy-continue fork provenance. This is deliberately separate
+    /// from `import_info`, which only describes legacy-format cutover.
+    #[serde(default)]
+    pub fork_info: Option<ForkInfo>,
     pub working_dir: String,
     /// epoch MILLISECONDS, UTC.
     pub created_at: i64,
@@ -368,6 +385,7 @@ impl SessionMeta {
             ai_named: false,
             owner: StorageOwner::Unconfirmed,
             import_info: None,
+            fork_info: None,
             working_dir: working_dir.into(),
             created_at: now_ms,
             updated_at: now_ms,
@@ -1170,20 +1188,34 @@ impl SessionManager {
         now_ms: i64,
     ) -> SessionResult<(LoadedSession, SessionLease)> {
         let source = self.load_native_session(source_id)?;
+        self.reap_abandoned_forks(&source);
         let destination_lease = self.acquire_lease(destination_id)?;
         let source_name_was_placeholder =
             SessionMeta::name_needs_fallback(&source.meta.name, source_id);
+        let root_id = source
+            .meta
+            .fork_info
+            .as_ref()
+            .map(|fork| fork.root_id.clone())
+            .unwrap_or_else(|| source_id.to_string());
         let mut meta = source.meta.clone();
         meta.id = destination_id.to_string();
         meta.name = if source_name_was_placeholder {
             format!("session-{destination_id}")
         } else {
-            format!("{} (fork)", source.meta.name)
+            source.meta.name.clone()
         };
         meta.created_at = now_ms;
         meta.updated_at = now_ms;
         meta.owner = StorageOwner::Native;
         meta.import_info = None;
+        meta.fork_info = Some(ForkInfo {
+            root_id,
+            parent_id: source_id.to_string(),
+            forked_at_ms: now_ms,
+            base_message_count: source.meta.message_count,
+            base_turn_count: source.meta.turn_count,
+        });
         let forked = LoadedSession {
             meta,
             snapshot: source.snapshot,
@@ -1196,6 +1228,59 @@ impl SessionManager {
             &forked.meta,
         )?;
         Ok((forked, destination_lease))
+    }
+
+    /// Best-effort GC for automatic forks that were created but never used.
+    fn reap_abandoned_forks(&self, source: &LoadedSession) {
+        let root_id = source
+            .meta
+            .fork_info
+            .as_ref()
+            .map(|fork| fork.root_id.as_str())
+            .unwrap_or(source.meta.id.as_str());
+        for candidate in self.list() {
+            if candidate.id == source.meta.id || candidate.id == root_id {
+                continue;
+            }
+            let Some(lineage) = candidate.fork_info.as_ref() else {
+                continue;
+            };
+            if lineage.root_id != root_id
+                || candidate.message_count != lineage.base_message_count
+                || candidate.turn_count != lineage.base_turn_count
+                || candidate.updated_at != lineage.forked_at_ms
+            {
+                continue;
+            }
+            let Ok(lease) = self.acquire_lease(&candidate.id) else {
+                continue;
+            };
+            let Ok(loaded) = self.load_native_session(&candidate.id) else {
+                continue;
+            };
+            let Some(confirmed) = loaded.meta.fork_info.as_ref() else {
+                continue;
+            };
+            if confirmed != lineage
+                || loaded.meta.message_count != confirmed.base_message_count
+                || loaded.meta.turn_count != confirmed.base_turn_count
+                || loaded.meta.updated_at != confirmed.forked_at_ms
+                || !self.transcript_is_empty(&candidate.id)
+            {
+                continue;
+            }
+            let _ = self.delete(&lease);
+        }
+    }
+
+    fn transcript_is_empty(&self, id: &str) -> bool {
+        let Ok(path) = self.jsonl_path(id) else {
+            return false;
+        };
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata.file_type().is_file() && metadata.len() == 0,
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        }
     }
 
     /// Publish a prepared legacy import under the caller's active session lease.
@@ -1917,6 +2002,22 @@ impl SessionManager {
         scan_catalog_cached(sessions_root)
     }
 
+    /// Collapse automatic fork aggregates into one newest logical conversation
+    /// row per project. Exact-ID loading and the raw catalog remain unchanged.
+    pub fn collapse_fork_lineages(entries: &mut Vec<CatalogEntry>) {
+        entries.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then_with(|| a.project_bucket.cmp(&b.project_bucket))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let mut seen = BTreeSet::new();
+        entries.retain(|entry| {
+            let logical_id = entry.fork_root_id.as_deref().unwrap_or(&entry.id);
+            seen.insert((entry.project_bucket.clone(), logical_id.to_string()))
+        });
+    }
+
     pub fn scan_all() -> CatalogScan {
         Self::scan_catalog(&Self::sessions_root())
     }
@@ -2497,6 +2598,7 @@ fn catalog_entry(
     match (sources.native, sources.legacy) {
         (Some(native), legacy) => Some(CatalogEntry {
             id,
+            fork_root_id: native.fork_info.as_ref().map(|fork| fork.root_id.clone()),
             name: native.name,
             project_bucket,
             working_dir: PathBuf::from(native.working_dir),
@@ -2513,6 +2615,7 @@ fn catalog_entry(
         (None, Some(legacy)) => Some(CatalogEntry {
             id,
             name: legacy.name,
+            fork_root_id: None,
             project_bucket,
             working_dir: legacy.working_dir,
             created_at_ms: checked_legacy_millis(legacy.created_at).ok()?,
@@ -2710,6 +2813,28 @@ fn validate_meta(meta: &SessionMeta) -> SessionResult<()> {
             return Err(SessionStoreError::Corrupt {
                 kind: "session meta",
                 message: "source_sha256 must be 64 hexadecimal characters".into(),
+            });
+        }
+    }
+    if let Some(fork) = &meta.fork_info {
+        if meta.owner != StorageOwner::Native {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session meta",
+                message: "fork_info requires owner=native".into(),
+            });
+        }
+        validate_session_id(&fork.root_id)?;
+        validate_session_id(&fork.parent_id)?;
+        if fork.root_id == meta.id || fork.parent_id == meta.id {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session meta",
+                message: "fork lineage cannot reference the fork itself".into(),
+            });
+        }
+        if fork.forked_at_ms < 0 {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session meta",
+                message: "forked_at_ms must be non-negative".into(),
             });
         }
     }
@@ -3488,8 +3613,10 @@ mod tests {
         assert_eq!(rewritten["turn_stats"][0]["turn_id"], 0);
         assert_eq!(meta.owner, StorageOwner::Unconfirmed);
         assert!(meta.import_info.is_none());
+        assert!(meta.fork_info.is_none());
         assert_eq!(rewritten["owner"], "unconfirmed");
         assert!(rewritten["import_info"].is_null());
+        assert!(rewritten["fork_info"].is_null());
     }
 
     #[test]
@@ -3609,13 +3736,23 @@ mod tests {
         assert_eq!(forked.snapshot, snapshot);
         assert_eq!(forked.presentation, presentation);
         assert_eq!(forked.meta.id, "destination");
-        assert_eq!(forked.meta.name, "working session (fork)");
+        assert_eq!(forked.meta.name, "working session");
         assert_eq!(forked.meta.working_dir, "/project");
         assert_eq!(forked.meta.created_at, 20);
         assert_eq!(forked.meta.updated_at, 20);
         assert_eq!(forked.meta.turn_count, 2);
         assert_eq!(forked.meta.message_count, 2);
         assert_eq!(forked.meta.import_info, None);
+        assert_eq!(
+            forked.meta.fork_info,
+            Some(ForkInfo {
+                root_id: "source".into(),
+                parent_id: "source".into(),
+                forked_at_ms: 20,
+                base_message_count: 2,
+                base_turn_count: 2,
+            })
+        );
         assert_eq!(mgr.load_native_session("source").unwrap().meta, source_meta);
         assert!(matches!(
             mgr.acquire_lease("source"),
@@ -3678,6 +3815,99 @@ mod tests {
             mgr.load_native_session("destination").unwrap().snapshot,
             destination_snapshot
         );
+    }
+
+    #[test]
+    fn fork_native_session_reaps_only_unused_unleased_forks_in_the_same_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let source_lease = mgr.acquire_lease("source").unwrap();
+        let snapshot = snap(&["source"]);
+        let presentation = PresentationFile::default();
+        let mut source_meta = SessionMeta::new("source", "/project", 10);
+        source_meta.owner = StorageOwner::Native;
+        source_meta.message_count = 1;
+        mgr.commit_native_import(
+            &source_lease,
+            Some(&snapshot),
+            Some(&presentation),
+            &source_meta,
+        )
+        .unwrap();
+
+        for (id, transcript) in [("unused", false), ("used", true)] {
+            let lease = mgr.acquire_lease(id).unwrap();
+            let mut meta = SessionMeta::new(id, "/project", 15);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            meta.fork_info = Some(ForkInfo {
+                root_id: "source".into(),
+                parent_id: "source".into(),
+                forked_at_ms: 15,
+                base_message_count: 1,
+                base_turn_count: 0,
+            });
+            mgr.commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+                .unwrap();
+            if transcript {
+                std::fs::write(mgr.jsonl_path(id).unwrap(), b"{\"turn\":1}\n").unwrap();
+            }
+            drop(lease);
+        }
+
+        let (_forked, _lease) = mgr
+            .fork_native_session("source", "destination", 20)
+            .unwrap();
+
+        assert!(!mgr.meta_path("unused").unwrap().exists());
+        assert!(!mgr.snapshot_path("unused").unwrap().exists());
+        assert!(mgr.lease_path("unused").unwrap().exists());
+        assert!(mgr.meta_lock_path("unused").unwrap().exists());
+        assert!(mgr.meta_path("used").unwrap().exists());
+    }
+
+    #[test]
+    fn catalog_collapse_keeps_newest_fork_but_raw_catalog_keeps_every_aggregate() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        let mgr = SessionManager::with_root(&bucket);
+        for (id, updated_at, fork_root_id) in [
+            ("root", 10, None),
+            ("fork-a", 20, Some("root")),
+            ("fork-b", 30, Some("root")),
+        ] {
+            let mut meta = SessionMeta::new(id, "/project", updated_at);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            meta.fork_info = fork_root_id.map(|root_id| ForkInfo {
+                root_id: root_id.into(),
+                parent_id: "root".into(),
+                forked_at_ms: updated_at,
+                base_message_count: 1,
+                base_turn_count: 0,
+            });
+            let lease = mgr.acquire_lease(id).unwrap();
+            mgr.commit_native_import(
+                &lease,
+                Some(&snap(&[id])),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        }
+
+        let raw = SessionManager::scan_catalog(root.path());
+        assert_eq!(raw.entries.len(), 3);
+        let mut visible = raw.entries.clone();
+        SessionManager::collapse_fork_lineages(&mut visible);
+        assert_eq!(
+            visible
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fork-b"]
+        );
+        assert!(mgr.load_native_session("fork-a").is_ok());
     }
 
     #[test]
