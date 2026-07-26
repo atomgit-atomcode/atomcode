@@ -6621,8 +6621,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 }
             }
             UiLine::ClearTransient | UiLine::InputCommit => {
-                // No-op in retained mode.
-                return;
+                // Submission clears the composer before the permanent user
+                // echo is appended. Keeping the old (possibly wrapped)
+                // input cached here makes `current_footer_rows()` reserve too
+                // many rows during `push_user_message`; the overflow path then
+                // promotes the echo's first row into native scrollback, so the
+                // viewport appears to contain only its continuation until the
+                // user scrolls up. The event loop clears its Buffer immediately
+                // after this event, so mirror that state synchronously.
+                self.input_buf.clear();
+                self.input_cursor_byte = 0;
+                self.menu = None;
+                self.input_attachments.clear();
+                self.dirty = true;
             }
 
             // ── body: welcome / turn events ──
@@ -15702,6 +15713,58 @@ mod tests {
             saw_chevron && saw_bar,
             "expected a chevron row and a bar continuation row"
         );
+    }
+
+    /// Submitting a recalled prompt clears the composer before its permanent
+    /// user echo is laid out. Otherwise a wrapped history entry keeps the
+    /// footer artificially tall while the echo is appended, which promotes
+    /// the echo's first row into native scrollback. The current viewport then
+    /// shows only the continuation row until the user scrolls upward.
+    #[test]
+    fn retained_submit_clears_wrapped_composer_before_user_echo() {
+        let (mut r, _buf) = new_capturing(40, 12);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        let empty_footer_rows = r.current_footer_rows();
+        // Two text rows plus the standard blank separator appended by
+        // `push_user_message`.
+        let body_rows_before_echo = 12usize.saturating_sub(empty_footer_rows + 3);
+        for i in 0..body_rows_before_echo {
+            r.push_body_text(&format!("prior-{i}"), &CellStyle::default());
+        }
+
+        let recalled = "a recalled prompt long enough to wrap across several composer rows";
+        r.render(UiLine::InputPrompt {
+            buf: recalled.into(),
+            cursor_byte: recalled.len(),
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        assert!(
+            r.current_footer_rows() > empty_footer_rows,
+            "fixture must produce a taller wrapped composer"
+        );
+
+        let scrolled_before = r.scrolled_off;
+        r.render(UiLine::ClearTransient);
+        r.render(UiLine::User("first line\nsecond line".into()));
+
+        assert_eq!(
+            r.scrolled_off, scrolled_before,
+            "the first echo row must remain visible instead of being promoted to native scrollback"
+        );
+        let visible: Vec<String> = r.body_lines[r.scrolled_off..]
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect())
+            .collect();
+        assert!(visible.iter().any(|row| row.contains("first line")));
+        assert!(visible.iter().any(|row| row.contains("second line")));
     }
 
     /// Windows / no-unicode-font terminals: the continuation bar falls back to an
