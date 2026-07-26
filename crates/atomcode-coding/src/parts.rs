@@ -1410,14 +1410,7 @@ pub fn assemble(
             {
                 let install_recorder = |cell: &Arc<crate::config::TierProvider>, key: &str| {
                     if let Some(provider) = registry.providers.get(key) {
-                        let pricing = provider
-                            .pricing
-                            .and_then(|pricing| pricing.validated())
-                            .map(|pricing| atomcode_capabilities::session::ModelPricing {
-                                input_per_million: pricing.input_per_million,
-                                output_per_million: pricing.output_per_million,
-                                cached_input_per_million: pricing.cached_input_per_million,
-                            });
+                        let pricing = crate::resolve_provider_pricing(key, provider);
                         let mut recorder =
                             atomcode_capabilities::session::DetachedUsageRecorder::new(
                                 b.manager.clone(),

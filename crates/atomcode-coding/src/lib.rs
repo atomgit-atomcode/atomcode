@@ -64,8 +64,8 @@ pub use assemble::{
 /// so driver crates can implement the hook without naming `atomcode_kernel`.
 pub use atomcode_kernel::message::ImageContent;
 pub use config::{
-    apply_provider_config, resolve_loop_max_rounds, resolve_turn_max_rounds, CodingAgentConfig,
-    CodingRuntimeConfig, SubagentProvider, TierProvider,
+    apply_provider_config, resolve_loop_max_rounds, resolve_provider_pricing,
+    resolve_turn_max_rounds, CodingAgentConfig, CodingRuntimeConfig, SubagentProvider, TierProvider,
 };
 pub use controllers::{GoalProgress, GoalTerminal, LoopProgress};
 pub use discipline::VerifyCadenceHook;

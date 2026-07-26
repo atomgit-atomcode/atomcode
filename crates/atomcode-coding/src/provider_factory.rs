@@ -178,14 +178,7 @@ pub fn derive_tier_config(
     let mut tier = base.clone();
     tier.model = provider.model.clone();
     tier.provider_name = provider_name.to_string();
-    tier.pricing = provider
-        .pricing
-        .and_then(|pricing| pricing.validated())
-        .map(|pricing| atomcode_capabilities::session::ModelPricing {
-            input_per_million: pricing.input_per_million,
-            output_per_million: pricing.output_per_million,
-            cached_input_per_million: pricing.cached_input_per_million,
-        });
+    tier.pricing = crate::resolve_provider_pricing(provider_name, provider);
     if let Some(base_url) = &provider.base_url {
         tier.base_url = base_url.clone();
     }

@@ -574,10 +574,14 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
                 "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n  Estimated cost:    {}\n",
                 prompt, completion, cached, cache_rate, total, cost
             ).into(),
+        Msg::CostTokenReport { prompt, completion, cached, cache_rate, total } =>
+            format!(
+                "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n",
+                prompt, completion, cached, cache_rate, total
+            ).into(),
         Msg::CostFree => "free".into(),
-        Msg::CostUnknown => "unknown".into(),
         Msg::CostUnattributed { tokens } =>
-            format!("Unattributed legacy usage\n  Total tokens:      {}\n  Estimated cost:    unknown", tokens).into(),
+            format!("Unattributed legacy usage\n  Total tokens:      {}", tokens).into(),
 
         // ── /think ──
         Msg::ThinkStatus { status, budget, provider } =>

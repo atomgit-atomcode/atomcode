@@ -4967,6 +4967,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
 
     // Seed the offline verdict + note ONCE from config + env, before any tool/telemetry assembly.
     atomcode_config::config::offline::seed_offline_from_config(startup_config.as_ref());
+    if !atomcode_config::config::offline::is_offline_active() {
+        // Best-effort metadata; failure leaves `/cost` token-only and never
+        // prevents daemon/provider startup.
+        atomcode_capabilities::provider::ensure_models_dev_catalog().await;
+    }
 
     // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
     let resolved = resolve(

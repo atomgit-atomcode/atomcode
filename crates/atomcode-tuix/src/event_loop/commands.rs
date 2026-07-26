@@ -5060,21 +5060,22 @@ pub(crate) fn build_cost_report_text(
         } else {
             cached.saturating_mul(100) / prompt
         };
-        let cost = if item.explicitly_free {
-            t(Msg::CostFree).into_owned()
+        let total = prompt.saturating_add(completion);
+        let body = if item.explicitly_free {
+            let cost = t(Msg::CostFree);
+            t(Msg::CostReport {
+                prompt, completion, cached, cache_rate, total, cost: &cost,
+            })
+        } else if let Some(estimated) = item.estimated_cost_usd {
+            let cost = crate::pricing::format_cost(estimated);
+            t(Msg::CostReport {
+                prompt, completion, cached, cache_rate, total, cost: &cost,
+            })
         } else {
-            item.estimated_cost_usd
-                .map(crate::pricing::format_cost)
-                .unwrap_or_else(|| t(Msg::CostUnknown).into_owned())
+            t(Msg::CostTokenReport {
+                prompt, completion, cached, cache_rate, total,
+            })
         };
-        let body = t(Msg::CostReport {
-            prompt,
-            completion,
-            cached,
-            cache_rate,
-            total: prompt.saturating_add(completion),
-            cost: &cost,
-        });
         sections.push(format!(
             "{} / {}\n{}",
             item.provider_id, item.model_id, body
@@ -5097,13 +5098,7 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
         .config
         .providers
         .get(provider)
-        .and_then(|config| config.pricing)
-        .and_then(|pricing| pricing.validated())
-        .map(|pricing| atomcode_capabilities::session::ModelPricing {
-            input_per_million: pricing.input_per_million,
-            output_per_million: pricing.output_per_million,
-            cached_input_per_million: pricing.cached_input_per_million,
-        });
+        .and_then(|config| atomcode_coding::resolve_provider_pricing(provider, config));
     let manager = session_manager_for_cost(
         ctx.current_session_project_bucket.as_deref(),
         &ctx.current_session.working_dir,
@@ -8252,7 +8247,7 @@ mod todo_command_tests {
     }
 
     #[test]
-    fn cost_report_keeps_models_separate_and_marks_unknown_price() {
+    fn cost_report_keeps_models_separate_and_hides_unknown_price() {
         use crate::event_loop::commands::build_cost_report_text;
         use atomcode_capabilities::session::{
             ModelCostSummary, SessionCostReport, TokenBreakdown,
@@ -8283,7 +8278,8 @@ mod todo_command_tests {
         assert!(out.contains("1323"));
         assert!(out.contains("567"));
         assert!(out.contains("89"));
-        assert!(out.contains("unknown"));
+        assert!(!out.contains("Estimated cost"));
+        assert!(!out.contains("unknown"));
     }
 }
 

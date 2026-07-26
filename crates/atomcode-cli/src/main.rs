@@ -1510,6 +1510,9 @@ async fn run() -> Result<i32> {
                     cli.model.as_deref(),
                 );
                 let working_dir = resolve_working_dir(cli.dir.clone());
+                if !atomcode_config::config::offline::is_offline_active() {
+                    atomcode_capabilities::provider::ensure_models_dev_catalog().await;
+                }
                 let runtime_cfg = runtime_config_from(
                     &config,
                     &working_dir,
@@ -1671,6 +1674,9 @@ async fn run() -> Result<i32> {
     // config, so the `tool_registry`/`tool_context` assembled above are no longer
     // wired to an agent loop; they remain constructed (unchanged lifetime) pending
     // a follow-up cleanup.
+    if !atomcode_config::config::offline::is_offline_active() {
+        atomcode_capabilities::provider::ensure_models_dev_catalog().await;
+    }
     let runtime_cfg = runtime_config_from(
         &config,
         &working_dir,

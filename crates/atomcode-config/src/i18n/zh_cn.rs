@@ -558,10 +558,14 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
                 "  提示 Token：       {}\n  补全 Token：       {}\n  缓存 Token：       {}（{}% 命中率）\n  Token 总计：       {}\n  预估费用：         {}\n",
                 prompt, completion, cached, cache_rate, total, cost
             ).into(),
+        Msg::CostTokenReport { prompt, completion, cached, cache_rate, total } =>
+            format!(
+                "  提示 Token：       {}\n  补全 Token：       {}\n  缓存 Token：       {}（{}% 命中率）\n  Token 总计：       {}\n",
+                prompt, completion, cached, cache_rate, total
+            ).into(),
         Msg::CostFree => "免费".into(),
-        Msg::CostUnknown => "未知".into(),
         Msg::CostUnattributed { tokens } =>
-            format!("历史未归属用量\n  Token 总计：       {}\n  预估费用：         未知", tokens).into(),
+            format!("历史未归属用量\n  Token 总计：       {}", tokens).into(),
 
         // ── /think ──
         Msg::ThinkStatus { status, budget, provider } =>

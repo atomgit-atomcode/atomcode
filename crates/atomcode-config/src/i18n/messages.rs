@@ -681,8 +681,14 @@ pub enum Msg<'a> {
         total: usize,
         cost: &'a str,
     },
+    CostTokenReport {
+        prompt: usize,
+        completion: usize,
+        cached: usize,
+        cache_rate: usize,
+        total: usize,
+    },
     CostFree,
-    CostUnknown,
     CostUnattributed {
         tokens: u64,
     },
