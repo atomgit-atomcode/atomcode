@@ -14995,7 +14995,13 @@ fn should_defer_task_approval_row(
         && subtask_progress_from_args(call_id, arguments).is_some()
 }
 
-fn update_subtask_progress(progress: &mut crate::render::SubtaskProgress, chunk: &str) {
+/// Fold one Task progress event into the fixed panel. On the first transition
+/// of a known child to a terminal state, return the permanent line to commit to
+/// scrollback. Replayed terminal events are idempotent and return `None`.
+fn update_subtask_progress(
+    progress: &mut crate::render::SubtaskProgress,
+    chunk: &str,
+) -> Option<String> {
     use crate::render::SubtaskStatus;
 
     let chunk = chunk
@@ -15052,8 +15058,15 @@ fn update_subtask_progress(progress: &mut crate::render::SubtaskProgress, chunk:
     };
 
     let Some(item) = progress.items.iter_mut().find(|item| item.label == label) else {
-        return;
+        return None;
     };
+    let was_terminal = matches!(
+        item.status,
+        SubtaskStatus::Completed | SubtaskStatus::Failed
+    );
+    if was_terminal {
+        return None;
+    }
     item.status = status;
     if started && item.started_at.is_none() {
         item.started_at = Some(std::time::Instant::now());
@@ -15071,19 +15084,59 @@ fn update_subtask_progress(progress: &mut crate::render::SubtaskProgress, chunk:
     {
         item.output_tokens = item.output_tokens.max(tokens);
     }
+    let terminal_line =
+        if matches!(status, SubtaskStatus::Completed | SubtaskStatus::Failed) {
+            let elapsed = item
+                .started_at
+                .map(|started_at| started_at.elapsed())
+                .unwrap_or_default();
+            Some(format!(
+                "{chunk} \u{b7} {} \u{b7} \u{2191} {} tokens",
+                crate::render::fmt_dur(elapsed),
+                crate::i18n::fmt_tokens(item.output_tokens as usize)
+            ))
+        } else {
+            None
+        };
     progress.completed = progress
         .items
         .iter()
         .filter(|item| item.status == SubtaskStatus::Completed)
         .count();
+    terminal_line
+}
+
+/// Inspect only generated top-level `<task ...>` headers. Child output is
+/// arbitrary text inside the block and must not be allowed to spoof the
+/// aggregate state by merely mentioning `state="error"`.
+fn task_output_has_error_state(output: &str) -> bool {
+    let mut expect_header = true;
+    for line in output.lines() {
+        if expect_header {
+            let header = line.trim();
+            if header.starts_with("<task id=\"")
+                && header.contains("\" model=\"")
+                && (header.ends_with(" state=\"error\">")
+                    || header.ends_with(" state=\"failed\">"))
+            {
+                return true;
+            }
+            expect_header = false;
+        }
+        if line.trim() == "</task>" {
+            expect_header = true;
+        }
+    }
+    false
 }
 
 fn completed_task_detail(
     detail: &str,
     output: &str,
+    success: bool,
     duration: std::time::Duration,
 ) -> String {
-    let terminal = if output.contains("state=\"failed\"") {
+    let terminal = if !success || task_output_has_error_state(output) {
         "finished"
     } else {
         "completed"
@@ -15153,40 +15206,86 @@ mod subtask_progress_projection_tests {
         assert!(progress.items[0].started_at.is_none());
         assert!(progress.items[1].started_at.is_none());
 
-        update_subtask_progress(
+        assert!(update_subtask_progress(
             &mut progress,
             "\u{1e}\u{25cb} queued \u{b7} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
-        );
+        )
+        .is_none());
         assert_eq!(progress.items[0].status, SubtaskStatus::Pending);
         assert_eq!(progress.items[0].model, "deepseek-v4-flash");
         assert!(progress.items[0].started_at.is_none());
 
-        update_subtask_progress(
+        assert!(update_subtask_progress(
             &mut progress,
             "\u{21bb} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
-        );
+        )
+        .is_none());
         assert_eq!(progress.items[0].status, SubtaskStatus::Running);
         assert_eq!(progress.items[0].model, "deepseek-v4-flash");
         assert!(progress.items[0].started_at.is_some());
         assert_eq!(progress.items[1].status, SubtaskStatus::Pending);
         assert!(progress.items[1].started_at.is_none());
 
-        update_subtask_progress(
+        assert!(update_subtask_progress(
             &mut progress,
             "\u{1e}explore#1 \u{b7} 已读取 commands.rs，正在分析内容 \u{b7} tokens=384",
-        );
+        )
+        .is_none());
         assert_eq!(
             progress.items[0].activity,
             "已读取 commands.rs，正在分析内容"
         );
         assert_eq!(progress.items[0].output_tokens, 384);
 
-        update_subtask_progress(
+        progress.items[0].started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(33));
+        let terminal = update_subtask_progress(
             &mut progress,
             "\u{2713} done \u{b7} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
-        );
+        )
+        .expect("first terminal event must produce a permanent line");
         assert_eq!(progress.items[0].status, SubtaskStatus::Completed);
         assert_eq!(progress.completed, 1);
+        assert!(terminal.contains("33.0s"), "{terminal}");
+        assert!(terminal.contains("\u{2191} 384 tokens"), "{terminal}");
+        assert!(
+            update_subtask_progress(
+                &mut progress,
+                "\u{2713} done \u{b7} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
+            )
+            .is_none(),
+            "replayed terminal events must not duplicate scrollback"
+        );
+
+        assert!(update_subtask_progress(
+            &mut progress,
+            "\u{21bb} explore#2 \u{b7} deepseek-v4-flash \u{b7} inspect codex",
+        )
+        .is_none());
+        assert!(update_subtask_progress(
+            &mut progress,
+            "\u{1e}explore#2 \u{b7} checking completion \u{b7} tokens=725",
+        )
+        .is_none());
+        progress.items[1].started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+        let failed = update_subtask_progress(
+            &mut progress,
+            "\u{2717} failed (ProviderError) \u{b7} explore#2 \u{b7} deepseek-v4-flash \u{b7} inspect codex",
+        )
+        .expect("first failed event must produce a permanent line");
+        assert!(failed.contains("failed (ProviderError)"), "{failed}");
+        assert!(failed.contains("12.0s"), "{failed}");
+        assert!(failed.contains("\u{2191} 725 tokens"), "{failed}");
+        assert!(
+            update_subtask_progress(
+                &mut progress,
+                "\u{2717} failed (ProviderError) \u{b7} explore#2 \u{b7} deepseek-v4-flash \u{b7} inspect codex",
+            )
+            .is_none(),
+            "replayed failures must not duplicate scrollback"
+        );
+        assert_eq!(progress.completed, 1, "failed is finished but not completed");
     }
 
     #[test]
@@ -15194,7 +15293,10 @@ mod subtask_progress_projection_tests {
         assert_eq!(
             completed_task_detail(
                 "3 subtasks",
-                r#"<task state="completed">ok</task>"#,
+                r#"<task id="explore#1" model="mock" state="completed">
+<task_result>ok</task_result>
+</task>"#,
+                true,
                 std::time::Duration::from_secs(42),
             ),
             "3 subtasks completed \u{b7} 42.0s"
@@ -15202,10 +15304,37 @@ mod subtask_progress_projection_tests {
         assert_eq!(
             completed_task_detail(
                 "3 subtasks",
-                r#"<task state="failed">no</task>"#,
+                r#"<task id="explore#1" model="mock" state="error">
+<task_error>no</task_error>
+</task>"#,
+                true,
                 std::time::Duration::from_secs(2),
             ),
             "3 subtasks finished \u{b7} 2.0s"
+        );
+        assert_eq!(
+            completed_task_detail(
+                "3 subtasks",
+                r#"<task id="explore#1" model="mock" state="completed">
+<task_result>partial protocol result</task_result>
+</task>"#,
+                false,
+                std::time::Duration::from_secs(3),
+            ),
+            "3 subtasks finished \u{b7} 3.0s"
+        );
+        assert_eq!(
+            completed_task_detail(
+                "1 subtask",
+                r#"<task id="explore#1" model="mock" state="completed">
+<task_result>
+The parser should discuss state="error" without changing this successful result.
+</task_result>
+</task>"#,
+                true,
+                std::time::Duration::from_secs(4),
+            ),
+            "1 subtask completed \u{b7} 4.0s"
         );
     }
 }
@@ -17837,8 +17966,15 @@ fn handle_agent_event(
                 .as_ref()
                 .is_some_and(|progress| progress.call_id == call_id)
             {
-                if let Some(progress) = state.active_subtasks.as_mut() {
-                    update_subtask_progress(progress, &chunk);
+                let terminal_line = state
+                    .active_subtasks
+                    .as_mut()
+                    .and_then(|progress| update_subtask_progress(progress, &chunk));
+                if let Some(terminal_line) = terminal_line {
+                    // Running activity belongs to the fixed panel, but a terminal
+                    // child is historical information. Commit it once so completed
+                    // and failed children remain visible above the live panel.
+                    renderer.render(UiLine::CommandOutput(terminal_line));
                 }
                 state.subagent_activity = None;
                 renderer.flush();
@@ -17982,7 +18118,7 @@ fn handle_agent_event(
                 .remove(&call_id)
                 .unwrap_or_else(|| (display_tool_name(&name), String::new(), false));
             if name == "task" && output.contains("<task ") && !call_rendered {
-                detail = completed_task_detail(&detail, &output, duration);
+                detail = completed_task_detail(&detail, &output, success, duration);
             }
 
             // Filter empty tool names (model occasionally emits malformed

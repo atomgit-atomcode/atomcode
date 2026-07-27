@@ -247,15 +247,15 @@ max_rounds = 100
 # =============================================================================
 # 总开关是环境变量 ATOMCODE_SUBAGENT（默认开启）——用 `ATOMCODE_SUBAGENT=0` 关闭。
 # 下面的 `enabled` 字段是历史遗留、当前不生效；真正开关看上面的环境变量。
-# 生效旋钮：max_concurrent（并发数）、timeout_secs（单任务墙钟超时）和 max_rounds
-#（单任务模型轮次高水位）。后两者分别可由 ATOMCODE_SUBAGENT_TIMEOUT 和
-# ATOMCODE_SUBAGENT_MAX_ROUNDS 覆盖。
+# 生效旋钮：max_concurrent（并发数）和 max_rounds（单任务模型轮次高水位）。
+# timeout_secs 仅为兼容旧配置保留，不再限制 subagent 的总运行时间。
+# max_rounds 可由 ATOMCODE_SUBAGENT_MAX_ROUNDS 覆盖。
 [subagent]
 enabled = true          # 遗留字段，不生效（改这个不会关掉 subagent；用 ATOMCODE_SUBAGENT=0）
 initial_turns = 4       # 遗留字段，不生效
 max_turns = 12          # 遗留字段，不生效
 max_concurrent = 3      # 生效：并发子 agent 上限（下限 1）
-timeout_secs = 900      # 生效：单个子任务超时（秒，下限 30；ATOMCODE_SUBAGENT_TIMEOUT 覆盖）
+timeout_secs = 900      # 遗留字段：仍可解析，但不生效
 max_rounds = 200        # 生效：单个子任务模型轮次高水位（0=不设上限；继承上面的精确防护策略）
 
 # =============================================================================

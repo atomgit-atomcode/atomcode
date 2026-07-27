@@ -403,18 +403,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 })
             };
 
-            // `[subagent]` config knobs (max_concurrent / timeout_secs) with the
-            // `ATOMCODE_SUBAGENT_TIMEOUT` env overriding the timeout. `subagent_config` carries
-            // the full registry (also used for tier routing); its absence (CLI/test paths)
-            // falls back to the shipped defaults via `SubAgentConfig::default()`.
+            // `[subagent]` live knobs. `timeout_secs` remains parse-only compatibility:
+            // a productive child is never cancelled for total wall-clock age.
             let subagent_cfg = cfg
                 .subagent_config
                 .as_ref()
                 .map(|c| c.subagent.clone())
                 .unwrap_or_default();
-            let (max_concurrent, subtask_timeout, max_rounds) = subagent_runtime_knobs(
+            let (max_concurrent, max_rounds) = subagent_runtime_knobs(
                 &subagent_cfg,
-                std::env::var("ATOMCODE_SUBAGENT_TIMEOUT").ok().as_deref(),
                 std::env::var("ATOMCODE_SUBAGENT_MAX_ROUNDS")
                     .ok()
                     .as_deref(),
@@ -427,7 +424,6 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                     make_worker_tools,
                 )
                 .with_max_concurrent(max_concurrent)
-                .with_subtask_timeout(subtask_timeout)
                 .with_max_rounds(max_rounds)
                 .with_tool_loop_policy(cfg.tool_loop_policy),
             ));
@@ -1569,35 +1565,16 @@ pub fn subagent_enabled_from_env(var: Option<&str>) -> bool {
     }
 }
 
-/// Resolve the `task` subagent tool's runtime knobs from the `[subagent]` config section,
-/// with the `ATOMCODE_SUBAGENT_TIMEOUT` env var OVERRIDING the config `timeout_secs` base
-/// (mirroring how `ATOMCODE_SUBAGENT` / `ATOMCODE_TODO` env switches override their config).
-/// Returns `(max_concurrent, per_subtask_timeout, per_subtask_max_rounds)`. `0` rounds
-/// intentionally means unbounded and does not alter the separately inherited exact policy.
-///
-/// Footgun guards (a misconfigured section must not wedge the tool): at least 1 worker, and
-/// at least 30s per subtask. `timeout_env` unset / empty / non-numeric / `0` falls back to the
-/// config base. `SubAgentConfig::default()` yields `(3, 900s)` — the values the tool shipped
-/// with before it read config, so wiring config is not a silent behavior change.
+/// Resolve the live `task` subagent knobs. The legacy `timeout_secs` field is deliberately
+/// ignored: child liveness is owned by provider idle timeouts, the round cap, and cancellation.
 pub fn subagent_runtime_knobs(
     cfg: &atomcode_config::config::SubAgentConfig,
-    timeout_env: Option<&str>,
     max_rounds_env: Option<&str>,
-) -> (usize, std::time::Duration, u32) {
-    const MIN_TIMEOUT_SECS: u64 = 30;
-    let timeout_secs = timeout_env
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .unwrap_or(cfg.timeout_secs)
-        .max(MIN_TIMEOUT_SECS);
+) -> (usize, u32) {
     let max_rounds = max_rounds_env
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(cfg.max_rounds);
-    (
-        cfg.max_concurrent.max(1),
-        std::time::Duration::from_secs(timeout_secs),
-        max_rounds,
-    )
+    (cfg.max_concurrent.max(1), max_rounds)
 }
 
 #[cfg(test)]
@@ -1655,77 +1632,25 @@ mod tests {
     }
 
     #[test]
-    fn subagent_runtime_knobs_env_overrides_config_timeout() {
+    fn subagent_runtime_knobs_ignore_legacy_timeout_and_floor_concurrency() {
         use super::subagent_runtime_knobs;
         use atomcode_config::config::SubAgentConfig;
-        use std::time::Duration;
         let cfg = SubAgentConfig {
-            max_concurrent: 5,
-            timeout_secs: 600,
-            ..SubAgentConfig::default()
-        };
-        // env unset → the config `[subagent]` values drive both knobs.
-        let (mc, to, rounds) = subagent_runtime_knobs(&cfg, None, None);
-        assert_eq!(mc, 5);
-        assert_eq!(to, Duration::from_secs(600));
-        assert_eq!(rounds, 200);
-        // env set → overrides ONLY the timeout; max_concurrent still comes from config.
-        let (mc, to, rounds) = subagent_runtime_knobs(&cfg, Some("  1200 "), None);
-        assert_eq!(mc, 5, "env timeout override must not touch max_concurrent");
-        assert_eq!(to, Duration::from_secs(1200));
-        assert_eq!(rounds, 200, "env timeout must not touch max_rounds");
-        // env empty / non-numeric / 0 → fall back to the config timeout base.
-        assert_eq!(
-            subagent_runtime_knobs(&cfg, Some(""), None).1,
-            Duration::from_secs(600)
-        );
-        assert_eq!(
-            subagent_runtime_knobs(&cfg, Some("abc"), None).1,
-            Duration::from_secs(600)
-        );
-        assert_eq!(
-            subagent_runtime_knobs(&cfg, Some("0"), None).1,
-            Duration::from_secs(600)
-        );
-    }
-
-    #[test]
-    fn subagent_runtime_knobs_apply_footgun_floors() {
-        use super::subagent_runtime_knobs;
-        use atomcode_config::config::SubAgentConfig;
-        use std::time::Duration;
-        // A misconfigured config (0 workers / a tiny timeout) must be floored so it can't
-        // wedge the tool: at least 1 worker, at least 30s per subtask.
-        let tiny = SubAgentConfig {
             max_concurrent: 0,
             timeout_secs: 5,
             ..SubAgentConfig::default()
         };
-        let (mc, to, _) = subagent_runtime_knobs(&tiny, None, None);
-        assert_eq!(mc, 1, "max_concurrent floored to 1");
-        assert_eq!(to, Duration::from_secs(30), "config timeout floored to 30s");
-        // An env override below the floor is floored too.
-        assert_eq!(
-            subagent_runtime_knobs(&SubAgentConfig::default(), Some("5"), None).1,
-            Duration::from_secs(30)
-        );
+        let (mc, rounds) = subagent_runtime_knobs(&cfg, None);
+        assert_eq!(mc, 1, "max_concurrent is still floored to one");
+        assert_eq!(rounds, 200);
     }
 
     #[test]
-    fn subagent_runtime_knobs_default_config_preserves_shipped_defaults() {
+    fn subagent_runtime_knobs_default_config_preserves_live_defaults() {
         use super::subagent_runtime_knobs;
         use atomcode_config::config::SubAgentConfig;
-        use std::time::Duration;
-        // Wiring config must NOT silently change the shipped `task` defaults for opt-in users:
-        // default config still yields 3 concurrent workers and a 900s (15 min) per-subtask
-        // timeout — the same values the tool used before it read config.
-        let (mc, to, rounds) = subagent_runtime_knobs(&SubAgentConfig::default(), None, None);
+        let (mc, rounds) = subagent_runtime_knobs(&SubAgentConfig::default(), None);
         assert_eq!(mc, 3, "default max_concurrent unchanged");
-        assert_eq!(
-            to,
-            Duration::from_secs(900),
-            "default per-subtask timeout unchanged"
-        );
         assert_eq!(rounds, 200, "default child round high-water unchanged");
     }
 
@@ -1737,14 +1662,14 @@ mod tests {
             max_rounds: 350,
             ..SubAgentConfig::default()
         };
-        assert_eq!(subagent_runtime_knobs(&cfg, None, None).2, 350);
-        assert_eq!(subagent_runtime_knobs(&cfg, None, Some(" 500 ")).2, 500);
+        assert_eq!(subagent_runtime_knobs(&cfg, None).1, 350);
+        assert_eq!(subagent_runtime_knobs(&cfg, Some(" 500 ")).1, 500);
         assert_eq!(
-            subagent_runtime_knobs(&cfg, None, Some("0")).2,
+            subagent_runtime_knobs(&cfg, Some("0")).1,
             0,
             "zero is an intentional unbounded override"
         );
-        assert_eq!(subagent_runtime_knobs(&cfg, None, Some("bad")).2, 350);
+        assert_eq!(subagent_runtime_knobs(&cfg, Some("bad")).1, 350);
     }
 
     #[test]

@@ -214,7 +214,9 @@ fn format_loop_row(
 /// list fits within the budget it renders every item; otherwise it folds (see
 /// `todo_panel_rows`). No blank padding — a short list shows short.
 const MAX_TODO_PANEL_ROWS: usize = 7;
-const MAX_SUBTASK_PANEL_ROWS: usize = 8;
+/// Header + at most three live children + one folded terminal/pending summary.
+const MAX_SUBTASK_PANEL_ROWS: usize = 5;
+const MAX_VISIBLE_RUNNING_SUBTASKS: usize = 3;
 
 fn format_subtask_progress(activity: &str, elapsed: &str, tokens: u64, width: usize) -> String {
     if width == 0 {
@@ -2533,18 +2535,33 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if cap == 0 {
             return 0;
         }
-        let fixed = if cap >= 2 { 2 } else { 1 }; // optional spacer + header
-        let budget = cap.saturating_sub(fixed);
-        if subtasks.items.len().saturating_mul(2) <= budget {
-            fixed + subtasks.items.len() * 2
-        } else {
-            fixed + budget.saturating_sub(1) / 2 * 2 + usize::from(budget > 0)
-        }
+        let running = subtasks
+            .items
+            .iter()
+            .filter(|item| item.status == crate::render::SubtaskStatus::Running)
+            .count();
+        let failed = subtasks
+            .items
+            .iter()
+            .filter(|item| item.status == crate::render::SubtaskStatus::Failed)
+            .count();
+        let pending = subtasks
+            .items
+            .iter()
+            .filter(|item| item.status == crate::render::SubtaskStatus::Pending)
+            .count();
+        let needs_summary =
+            failed > 0 || pending > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
+        let summary_rows = usize::from(needs_summary && cap >= 2);
+        let visible_running = running
+            .min(MAX_VISIBLE_RUNNING_SUBTASKS)
+            .min(cap.saturating_sub(1 + summary_rows));
+        1 + visible_running + summary_rows
     }
 
-    /// Build the fixed Task fan-out panel. Each visible child owns an identity
-    /// row (including its model) and an in-place progress row. None of these
-    /// rows enter body_log or native scrollback.
+    /// Build the fixed Task fan-out panel. Only running children own detailed
+    /// rows; pending and terminal children fold into the header/summary so they
+    /// cannot displace current work. None of these rows enter scrollback.
     fn build_subtask_rows(
         &self,
         subtasks: &crate::render::SubtaskProgress,
@@ -2557,9 +2574,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return Vec::new();
         }
         let mut rows = Vec::new();
-        if cap >= 2 {
-            rows.push(Vec::new());
-        }
 
         let bold = CellStyle {
             bold: true,
@@ -2573,87 +2587,58 @@ impl<W: Write + Send> RetainedRenderer<W> {
             "*"
         };
         push_str_cells(&mut header, marker, &self.style_for(Role::Brand));
-        push_str_cells(&mut header, " Subtasks ", &bold);
+        push_str_cells(&mut header, " Subtasks", &bold);
+        let failed = subtasks
+            .items
+            .iter()
+            .filter(|item| item.status == SubtaskStatus::Failed)
+            .count();
+        let running = subtasks
+            .items
+            .iter()
+            .filter(|item| item.status == SubtaskStatus::Running)
+            .collect::<Vec<_>>();
+        let pending = subtasks
+            .items
+            .iter()
+            .filter(|item| item.status == SubtaskStatus::Pending)
+            .count();
+        let finished = subtasks.completed.saturating_add(failed);
         push_str_cells(
             &mut header,
-            &format!("{}/{} completed", subtasks.completed, subtasks.total),
+            &format!(
+                " \u{b7} {finished}/{} finished \u{b7} {} running \u{b7} {pending} pending",
+                subtasks.total,
+                running.len()
+            ),
             &detail,
         );
         rows.push(header);
 
-        let mut ordered = subtasks.items.iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|item| match item.status {
-            SubtaskStatus::Failed => 0,
-            SubtaskStatus::Running => 1,
-            SubtaskStatus::Pending => 2,
-            SubtaskStatus::Completed => 3,
-        });
-        let budget = cap.saturating_sub(rows.len());
-        let has_hidden = ordered.len().saturating_mul(2) > budget;
-        let visible_items = if has_hidden {
-            budget.saturating_sub(1) / 2
-        } else {
-            ordered.len()
-        };
-        for item in ordered.iter().take(visible_items).copied() {
-            let (glyph, glyph_style, body_style) = match item.status {
-                SubtaskStatus::Pending => {
-                    let style = self.style_for(Role::Secondary);
-                    ("\u{25cb}", style.clone(), style)
-                }
-                SubtaskStatus::Running => (
-                    "\u{25cf}",
-                    self.style_for(Role::Brand),
-                    CellStyle {
-                        bold: true,
-                        ..CellStyle::default()
-                    },
-                ),
-                SubtaskStatus::Completed => {
-                    let style = CellStyle {
-                        faint: true,
-                        ..self.style_for(Role::Muted)
-                    };
-                    ("\u{2713}", style.clone(), style)
-                }
-                SubtaskStatus::Failed => (
-                    "\u{2717}",
-                    self.style_for(Role::Error),
-                    CellStyle::default(),
-                ),
-            };
+        let needs_summary =
+            failed > 0 || pending > 0 || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
+        let summary_rows = usize::from(needs_summary && cap >= 2);
+        let visible_running = running
+            .len()
+            .min(MAX_VISIBLE_RUNNING_SUBTASKS)
+            .min(cap.saturating_sub(rows.len() + summary_rows));
+        for item in running.iter().take(visible_running).copied() {
+            let glyph = "\u{25cf}";
             let glyph = if self.caps.unicode_symbols {
                 glyph
             } else {
-                match item.status {
-                    SubtaskStatus::Pending => "[ ]",
-                    SubtaskStatus::Running => "[>]",
-                    SubtaskStatus::Completed => "[x]",
-                    SubtaskStatus::Failed => "[!]",
-                }
+                "[>]"
             };
-            let mut suffix = if item.description.is_empty() {
+            let mut identity = if item.description.is_empty() {
                 item.label.clone()
             } else {
                 format!("{} \u{b7} {}", item.label, item.description)
             };
             if !item.model.is_empty() {
                 let label_len = item.label.len();
-                let remainder = suffix.split_off(label_len);
-                suffix.push_str(&format!(" \u{b7} {}{}", item.model, remainder));
+                let remainder = identity.split_off(label_len);
+                identity.push_str(&format!(" \u{b7} {}{}", item.model, remainder));
             }
-            let glyph_width = crate::width::display_width(glyph);
-            let fitted = crate::width::truncate_with_ellipsis(
-                &scrub_controls(&suffix),
-                rule_width.saturating_sub(2 + glyph_width + 1),
-            );
-            let mut row = Vec::new();
-            push_str_cells(&mut row, "  ", &CellStyle::default());
-            push_str_cells(&mut row, glyph, &glyph_style);
-            push_str_cells(&mut row, " ", &CellStyle::default());
-            push_str_cells(&mut row, &fitted, &body_style);
-            rows.push(row);
-
             let elapsed = item
                 .started_at
                 .map(|started_at| started_at.elapsed().as_secs())
@@ -2664,46 +2649,37 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 format!("{elapsed}s")
             };
             let activity = if item.activity.is_empty() {
-                match item.status {
-                    SubtaskStatus::Pending => "waiting",
-                    SubtaskStatus::Running => "analyzing task",
-                    SubtaskStatus::Completed => "completed",
-                    SubtaskStatus::Failed => "failed",
-                }
+                "analyzing task"
             } else {
                 item.activity.as_str()
             };
-            let content_width = rule_width.saturating_sub(6);
+            let content = format!("{} \u{b7} {activity}", scrub_controls(&identity));
+            let glyph_width = crate::width::display_width(glyph);
+            let content_width = rule_width.saturating_sub(2 + glyph_width + 1);
             let fitted =
-                format_subtask_progress(activity, &elapsed, item.output_tokens, content_width);
-            let mut progress_row = Vec::new();
-            push_str_cells(&mut progress_row, "    ", &CellStyle::default());
+                format_subtask_progress(&content, &elapsed, item.output_tokens, content_width);
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", &CellStyle::default());
             push_str_cells(
-                &mut progress_row,
-                if self.caps.unicode_symbols {
-                    "\u{2514} "
-                } else {
-                    "- "
-                },
-                &self.style_for(Role::Muted),
+                &mut row,
+                glyph,
+                &self.style_for(Role::Brand),
             );
-            push_str_cells(&mut progress_row, &fitted, &self.style_for(Role::Secondary));
-            rows.push(progress_row);
+            push_str_cells(&mut row, " ", &CellStyle::default());
+            push_str_cells(&mut row, &fitted, &self.style_for(Role::Secondary));
+            rows.push(row);
         }
-        if has_hidden && budget > 0 {
-            let hidden = &ordered[visible_items..];
-            let count = |status| hidden.iter().filter(|item| item.status == status).count();
+        if needs_summary && rows.len() < cap {
             let mut parts = Vec::new();
-            for (status, label) in [
-                (SubtaskStatus::Failed, "failed"),
-                (SubtaskStatus::Running, "running"),
-                (SubtaskStatus::Pending, "pending"),
-                (SubtaskStatus::Completed, "completed"),
-            ] {
-                let n = count(status);
-                if n > 0 {
-                    parts.push(format!("{n} {label}"));
-                }
+            let hidden_running = running.len().saturating_sub(visible_running);
+            if hidden_running > 0 {
+                parts.push(format!("{hidden_running} running"));
+            }
+            if pending > 0 {
+                parts.push(format!("{pending} pending"));
+            }
+            if failed > 0 {
+                parts.push(format!("{failed} failed"));
             }
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &CellStyle::default());
@@ -14743,12 +14719,13 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
         let grid = vterm.dump();
-        assert!(grid.contains("Subtasks 1/3 completed"));
+        assert!(grid.contains("Subtasks · 1/3 finished · 2 running · 0 pending"));
         assert!(grid.contains("explore#2"));
         assert!(grid.contains("\u{25cf} explore#2"));
         assert!(grid.contains("explore#2 · deepseek-v4-flash · inspect codex"));
         assert!(grid.contains("reading files"));
         assert!(grid.contains("↑ 420 tokens"));
+        assert!(!grid.contains("explore#1"));
         assert!(!grid.contains("standing todo"));
         assert_eq!(
             r.current_footer_rows(),
@@ -14800,6 +14777,7 @@ mod tests {
 
         for width in 0..40 {
             let rows = r.build_subtask_rows(&progress, width);
+            assert!(rows.len() <= MAX_SUBTASK_PANEL_ROWS);
             assert!(
                 rows.iter().all(|row| row.len() <= width),
                 "width={width}, row widths={:?}",
@@ -14855,10 +14833,55 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         let grid = vterm.dump();
-        assert!(grid.contains("failed#1"));
         assert!(grid.contains("running#1"));
-        assert!(grid.contains("2 pending · 4 completed"));
-        assert!(!grid.contains("more running"));
+        assert!(!grid.contains("failed#1"));
+        assert!(grid.contains("5/8 finished · 1 running · 2 pending"));
+        assert!(grid.contains("2 pending · 1 failed"));
+    }
+
+    #[test]
+    fn subtask_panel_uses_five_rows_for_three_running_and_terminal_summary() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (r, _buf) = new_capturing(120, 24);
+        let item = |label: &str, state| SubtaskItem {
+            label: label.into(),
+            description: format!("inspect {label}"),
+            model: "GLM-5.2".into(),
+            activity: "正在分析结果".into(),
+            started_at: Some(std::time::Instant::now()),
+            output_tokens: 128,
+            status: state,
+        };
+        let progress = SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 2,
+            total: 7,
+            items: vec![
+                item("done#1", SubtaskStatus::Completed),
+                item("done#2", SubtaskStatus::Completed),
+                item("failed#1", SubtaskStatus::Failed),
+                item("explore#4", SubtaskStatus::Running),
+                item("explore#5", SubtaskStatus::Running),
+                item("explore#6", SubtaskStatus::Running),
+                item("pending#1", SubtaskStatus::Pending),
+            ],
+        };
+
+        let rows = r.build_subtask_rows(&progress, 120);
+        let text = rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>();
+
+        assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
+        assert!(text[0].contains("3/7 finished · 3 running · 1 pending"));
+        assert!(text.iter().any(|line| line.contains("explore#4")));
+        assert!(text.iter().any(|line| line.contains("explore#5")));
+        assert!(text.iter().any(|line| line.contains("explore#6")));
+        assert!(text[4].contains("1 pending · 1 failed"));
+        assert!(text.iter().all(|line| !line.contains("failed#1")));
+        assert!(text.iter().all(|line| !line.contains("pending#1")));
     }
 
     #[test]
@@ -14904,7 +14927,9 @@ mod tests {
             "footer must fit the physical screen"
         );
         assert_eq!(r.current_footer_rows(), r.last_painted_footer_rows);
-        assert!(vterm.dump().contains("Subtasks 0/3 completed"));
+        assert!(vterm
+            .dump()
+            .contains("Subtasks · 0/3 finished · 3 running · 0 pending"));
     }
 
     #[test]
@@ -14979,7 +15004,7 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         let grid = vterm.dump();
-        assert!(grid.contains("Subtasks 0/1 completed"));
+        assert!(grid.contains("Subtasks · 0/1 finished · 1 running · 0 pending"));
         assert!(!grid.contains("Thinking"));
         assert!(!r.live_spinner_active);
     }
