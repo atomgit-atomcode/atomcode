@@ -9520,6 +9520,16 @@ fn handle_input(
                     return Ok(());
                 }
             }
+            // A model-initiated `request_user_input` prompt replaces the input
+            // box with a footer panel (phase == UserInput). Its keys route to
+            // `handle_user_input_key`, but a bracketed paste arrives as a single
+            // Paste event — without this branch it fell through every arm and
+            // was silently dropped, so the user could only type answers.
+            if matches!(app.state.phase, UiPhase::UserInput) {
+                app.state.insert_user_input_paste(&text);
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
             // No modal: paste goes into the type-ahead buffer just like
             // keyboard input (Idle or Streaming, both consume it).
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming) {

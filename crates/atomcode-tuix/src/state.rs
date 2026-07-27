@@ -71,6 +71,19 @@ impl ApprovalPanel {
     }
 }
 
+/// Flatten a bracketed paste for a single-line answer field. First run the
+/// crate's canonical [`scrub_controls`](crate::sanitize::scrub_controls) so full
+/// ANSI escape SEQUENCES (CSI/OSC, not just the lone ESC byte) are stripped —
+/// same sanitizer every other render/paste sink uses. `scrub_controls`
+/// deliberately preserves `\t` / `\n` / `\r`, so collapse those to spaces here:
+/// the answer renders on one footer row and must not embed line breaks.
+fn flatten_paste(text: &str) -> String {
+    crate::sanitize::scrub_controls(text)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// The active `request_user_input` prompt, shown as a footer panel while
 /// `UiPhase::UserInput`. `None` when no interactive question is pending.
 /// Mirrors `ApprovalPanel`: it replaces the input box and the user answers with
@@ -228,6 +241,31 @@ impl UserInputPanel {
     /// Backspace on the "Other" row.
     pub fn pop_custom(&mut self) {
         self.custom_text.pop();
+    }
+    /// Insert pasted text into whichever free-text buffer the keyboard would
+    /// currently edit: the standalone `text` buffer (Text mode) or the "Other"
+    /// row's `custom_text` (single/multiple, only when the cursor is on that
+    /// row). Option/Submit rows have no free-text target, so paste is a no-op
+    /// there — mirroring the key path where non-digit chars are ignored.
+    /// Newlines/tabs are flattened to spaces because the answer renders on a
+    /// single footer row and must not embed control characters. A paste with no
+    /// printable content (e.g. a lone trailing newline from copying a whole
+    /// line) is dropped rather than inserted as a stray space — the keyboard
+    /// path can never produce that.
+    pub fn insert_paste(&mut self, text: &str) {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        let flattened = flatten_paste(text);
+        if flattened.trim().is_empty() {
+            return;
+        }
+        match self.mode {
+            UserInputMode::Text => self.text.push_str(&flattened),
+            UserInputMode::Single | UserInputMode::Multiple => {
+                if self.is_other_row() {
+                    self.custom_text.push_str(&flattened);
+                }
+            }
+        }
     }
     /// The chosen concrete-option labels for MULTIPLE mode (all checked
     /// concrete rows; the "Other" row is handled separately via `custom_text`).
@@ -466,6 +504,66 @@ mod user_input_custom_tests {
     }
 
     #[test]
+    fn paste_appends_to_text_mode_buffer() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Text, false));
+        p.text.push_str("ab");
+        p.insert_paste("cd");
+        assert_eq!(p.text, "abcd", "paste appends to the text-mode buffer");
+    }
+
+    #[test]
+    fn paste_appends_to_other_row_custom_text() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Single, true));
+        p.cursor = p.other_index(); // focus the "Other" free-text row
+        p.insert_paste("scope");
+        assert_eq!(
+            p.custom_text, "scope",
+            "on the Other row, paste feeds the custom-text buffer"
+        );
+    }
+
+    #[test]
+    fn paste_is_a_noop_on_a_concrete_option_row() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Single, true));
+        p.cursor = 0; // a concrete option — no free-text target, like typing
+        p.insert_paste("ignored");
+        assert!(p.text.is_empty() && p.custom_text.is_empty());
+    }
+
+    #[test]
+    fn paste_flattens_newlines_to_spaces() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Text, false));
+        p.insert_paste("a\r\nb\tc");
+        assert!(
+            !p.text.contains('\n') && !p.text.contains('\r') && !p.text.contains('\t'),
+            "single-line answer must not embed control chars: {:?}",
+            p.text
+        );
+        assert!(p.text.starts_with('a') && p.text.ends_with('c'));
+    }
+
+    #[test]
+    fn paste_strips_ansi_escape_sequences_not_just_the_esc_byte() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Text, false));
+        p.insert_paste("\x1b[31mred\x1b[0m");
+        assert_eq!(
+            p.text, "red",
+            "full CSI sequences are stripped, not left as literal `[31m`"
+        );
+    }
+
+    #[test]
+    fn paste_with_no_printable_content_is_dropped() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Text, false));
+        p.insert_paste("\r\n\t");
+        assert!(
+            p.text.is_empty(),
+            "a whitespace/newline-only paste must not insert a stray space: {:?}",
+            p.text
+        );
+    }
+
+    #[test]
     fn multiple_submit_index_and_checked_gate_on_custom() {
         let with = UserInputPanel::new(1, &req(UserInputMode::Multiple, true));
         assert_eq!(with.submit_index(), Some(3), "custom → other@2, submit@3");
@@ -551,6 +649,37 @@ mod user_input_batch_tests {
         assert!(!b.is_answered(0), "empty text → not answered");
         b.questions[0].text.push_str("hi");
         assert!(b.is_answered(0));
+    }
+
+    #[test]
+    fn paste_routes_to_the_current_batch_question() {
+        let mut st = UiState::new();
+        st.user_input_batch = Some(UserInputBatch::new(1, &[text_q("a"), text_q("b")]));
+        st.user_input_batch.as_mut().unwrap().next_question(); // focus question 1
+        st.insert_user_input_paste("pasted");
+        let b = st.user_input_batch.as_ref().unwrap();
+        assert_eq!(b.questions[0].text, "", "non-current question is untouched");
+        assert_eq!(b.questions[1].text, "pasted", "paste lands in current q");
+    }
+
+    #[test]
+    fn paste_on_the_submit_stop_is_a_noop() {
+        let mut st = UiState::new();
+        let mut batch = UserInputBatch::new(1, &[text_q("a")]);
+        while !batch.on_submit_stop() {
+            batch.next_question();
+        }
+        st.user_input_batch = Some(batch);
+        st.insert_user_input_paste("ignored"); // no question under the submit stop
+        assert_eq!(st.user_input_batch.as_ref().unwrap().questions[0].text, "");
+    }
+
+    #[test]
+    fn paste_routes_to_the_single_panel() {
+        let mut st = UiState::new();
+        st.user_input_panel = Some(UserInputPanel::new(9, &text_q("solo")));
+        st.insert_user_input_paste("value");
+        assert_eq!(st.user_input_panel.as_ref().unwrap().text, "value");
     }
 
     #[test]
@@ -1703,6 +1832,20 @@ impl UiState {
         self.user_input_batch = None;
         self.round_cap_panel = None;
         self.phase = UiPhase::Streaming;
+    }
+
+    /// Route a bracketed paste into the active `request_user_input` prompt:
+    /// the current question of a batch, or the single panel. No-op when neither
+    /// is present or the current answer target has no free-text field. Mirrors
+    /// how key events reach these panels via `handle_user_input_key`.
+    pub fn insert_user_input_paste(&mut self, text: &str) {
+        if let Some(batch) = self.user_input_batch.as_mut() {
+            if let Some(panel) = batch.questions.get_mut(batch.current) {
+                panel.insert_paste(text);
+            }
+        } else if let Some(panel) = self.user_input_panel.as_mut() {
+            panel.insert_paste(text);
+        }
     }
 
     /// Clear the round-cap checkpoint panel and resume streaming.
