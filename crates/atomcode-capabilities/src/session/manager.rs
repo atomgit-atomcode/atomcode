@@ -12,9 +12,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(test)]
 use std::sync::Barrier;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use atomcode_kernel::message::{Message, Role, SessionSnapshot, SNAPSHOT_VERSION};
 use serde::{de::IgnoredAny, Deserialize, Serialize};
@@ -33,6 +33,7 @@ pub const META_VERSION: u32 = 1;
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+const INFLIGHT_SNAPSHOT_VERSION: u32 = 1;
 pub const MAX_LEGACY_SESSION_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_JSONL_BYTES: usize = 512 * 1024 * 1024;
@@ -526,6 +527,13 @@ pub struct LoadedSession {
     pub meta: SessionMeta,
     pub snapshot: SessionSnapshot,
     pub presentation: PresentationFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct InflightSnapshot {
+    version: u32,
+    replay_safe: bool,
+    pub(super) snapshot: SessionSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1028,6 +1036,149 @@ impl SessionManager {
 
     pub fn legacy_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "json")
+    }
+
+    /// Separate recovery checkpoint written after a user prompt is accepted.
+    /// It is never part of the authoritative native aggregate.
+    fn inflight_path(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "snapshot.inflight")
+    }
+
+    /// Save an inflight checkpoint. The independent file does not take the meta
+    /// lock; callers must only write states that are safe to replay.
+    pub(crate) fn save_inflight_snapshot(
+        &self,
+        id: &str,
+        snap: &SessionSnapshot,
+        replay_safe: bool,
+    ) -> SessionResult<()> {
+        validate_snapshot(snap)?;
+        let checkpoint = InflightSnapshot {
+            version: INFLIGHT_SNAPSHOT_VERSION,
+            replay_safe,
+            snapshot: snap.clone(),
+        };
+        let bytes = serialize_bounded(&checkpoint, "inflight snapshot", MAX_SNAPSHOT_BYTES)?;
+        // No meta lock — the inflight file is independent of the canonical
+        // snapshot/meta/presentation aggregate and never participates in catalog
+        // reads.
+        atomic_write(&self.inflight_path(id)?, &bytes)
+    }
+
+    pub(crate) fn save_inflight_snapshot_with_lease(
+        &self,
+        lease: &SessionLease,
+        snap: &SessionSnapshot,
+        replay_safe: bool,
+    ) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        self.save_inflight_snapshot(lease.id(), snap, replay_safe)
+    }
+
+    /// Load the auxiliary checkpoint without changing canonical load semantics.
+    pub(crate) fn load_inflight_snapshot(
+        &self,
+        id: &str,
+    ) -> SessionResult<Option<InflightSnapshot>> {
+        let path = self.inflight_path(id)?;
+        match read_regular_file_bounded(&path, "inflight snapshot", MAX_SNAPSHOT_BYTES) {
+            Ok(bytes) => {
+                let checkpoint: InflightSnapshot = deserialize(&bytes, "inflight snapshot")?;
+                if checkpoint.version != INFLIGHT_SNAPSHOT_VERSION {
+                    return Err(SessionStoreError::Corrupt {
+                        kind: "inflight snapshot",
+                        message: format!(
+                            "unsupported version {} (expected {})",
+                            checkpoint.version, INFLIGHT_SNAPSHOT_VERSION
+                        ),
+                    });
+                }
+                validate_snapshot(&checkpoint.snapshot)?;
+                Ok(Some(checkpoint))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Remove the inflight snapshot file. Called on a clean `turn_complete` so
+    /// the next resume doesn't see a stale inflight from a turn that finished
+    /// normally. Best-effort: a missing file is not an error.
+    pub(crate) fn clear_inflight_snapshot(&self, id: &str) {
+        if let Ok(path) = self.inflight_path(id) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    pub(crate) fn mark_inflight_not_replayable(&self, id: &str) -> SessionResult<()> {
+        let Some(mut checkpoint) = self.load_inflight_snapshot(id)? else {
+            return Ok(());
+        };
+        if checkpoint.replay_safe {
+            checkpoint.replay_safe = false;
+            let bytes = serialize_bounded(&checkpoint, "inflight snapshot", MAX_SNAPSHOT_BYTES)?;
+            atomic_write(&self.inflight_path(id)?, &bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Whether an inflight snapshot exists for `id` — i.e. the previous session
+    /// terminated abnormally mid-turn. Drivers can call this after resume to
+    /// inform the user that their last turn was interrupted and partially
+    /// recovered.
+    #[cfg(test)]
+    pub(crate) fn has_inflight_snapshot(&self, id: &str) -> bool {
+        self.inflight_path(id).map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// Load a native session for runtime resume and recover one accepted user
+    /// prompt when a prior process died before reaching `turn_complete`.
+    ///
+    /// Recovery requires the active runtime lease and only accepts an inflight
+    /// snapshot that is exactly the canonical message prefix plus one final user
+    /// message. This rejects stale checkpoints and incomplete assistant/tool
+    /// rounds. General readers continue to use [`Self::load_native_session`] and
+    /// always receive the committed native aggregate.
+    pub fn load_native_session_for_resume(
+        &self,
+        lease: &SessionLease,
+    ) -> SessionResult<(LoadedSession, Option<Message>)> {
+        self.validate_active_lease(lease)?;
+        let mut loaded = self.load_native_session(lease.id())?;
+        let inflight = match self.load_inflight_snapshot(lease.id()) {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => return Ok((loaded, None)),
+            Err(error) => {
+                eprintln!(
+                    "[SessionManager] ignoring unreadable inflight snapshot for {}: {error}",
+                    lease.id()
+                );
+                self.clear_inflight_snapshot(lease.id());
+                return Ok((loaded, None));
+            }
+        };
+        let canonical_len = loaded.snapshot.messages.len();
+        let recoverable = inflight.snapshot.messages.len() == canonical_len.saturating_add(1)
+            && inflight.snapshot.messages[..canonical_len] == loaded.snapshot.messages
+            && inflight.snapshot.messages.last().is_some_and(|message| {
+                message.role == atomcode_kernel::message::Role::User
+                    && !message.synthetic
+                    && message.internal_origin.is_none()
+                    && message.tool_calls.is_empty()
+            });
+        if recoverable {
+            if inflight.replay_safe {
+                Ok((loaded, inflight.snapshot.messages.last().cloned()))
+            } else {
+                loaded.snapshot = inflight.snapshot;
+                Ok((loaded, None))
+            }
+        } else {
+            // A stale or unsafe auxiliary checkpoint must not shadow committed
+            // state on future resumes.
+            self.clear_inflight_snapshot(lease.id());
+            Ok((loaded, None))
+        }
     }
 
     /// Read a historical core session under the same no-follow and size bounds as
@@ -2475,6 +2626,7 @@ impl SessionManager {
         self.validate_lease(lease)?;
         let targets = [
             self.snapshot_path(id)?,
+            self.inflight_path(id)?,
             self.meta_path(id)?,
             self.jsonl_path(id)?,
             self.presentation_path(id)?,
@@ -2645,7 +2797,10 @@ fn scan_catalog_cached(sessions_root: &Path) -> CatalogScan {
     catalog_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(sessions_root.to_path_buf(), CachedCatalog { sig, scan: arc });
+        .insert(
+            sessions_root.to_path_buf(),
+            CachedCatalog { sig, scan: arc },
+        );
     scan
 }
 
@@ -4870,8 +5025,16 @@ mod tests {
         let second = SessionManager::scan_catalog(root.path());
         assert_eq!(first.entries.len(), 1);
         assert_eq!(
-            first.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
-            second.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            first
+                .entries
+                .iter()
+                .map(|e| e.id.clone())
+                .collect::<Vec<_>>(),
+            second
+                .entries
+                .iter()
+                .map(|e| e.id.clone())
+                .collect::<Vec<_>>(),
         );
 
         // Adding a session changes the fingerprint → the next scan reflects it
@@ -6068,5 +6231,134 @@ mod tests {
         assert_eq!(concurrent_only.models[0].tokens.total(), 1);
         assert_eq!(concurrent_only.unattributed_tokens, 3);
         assert_eq!(concurrent_only.total_tokens, 4);
+    }
+
+    #[test]
+    fn resume_recovers_only_one_user_message_beyond_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let id = "recover-user-prompt";
+        let lease = mgr.acquire_lease(id).unwrap();
+        let canonical = snap(&["completed"]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&canonical),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let inflight = snap(&["completed", "accepted before crash"]);
+        mgr.save_inflight_snapshot(id, &inflight, true).unwrap();
+
+        assert_eq!(
+            mgr.load_native_session(id).unwrap().snapshot,
+            canonical,
+            "general native loads remain canonical"
+        );
+        assert_eq!(
+            mgr.load_native_session_for_resume(&lease).unwrap(),
+            (
+                LoadedSession {
+                    meta: mgr.read_meta(id).unwrap(),
+                    snapshot: canonical,
+                    presentation: PresentationFile::default(),
+                },
+                inflight.messages.last().cloned(),
+            ),
+            "the leased resume boundary returns canonical history plus a prompt to replay"
+        );
+    }
+
+    #[test]
+    fn resume_rejects_inflight_assistant_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let id = "reject-unsafe-inflight";
+        let lease = mgr.acquire_lease(id).unwrap();
+        let canonical = snap(&["completed"]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&canonical),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let unsafe_inflight = SessionSnapshot::new(vec![
+            Message::user("completed"),
+            Message::assistant("tool round not committed", Vec::new()),
+        ]);
+        mgr.save_inflight_snapshot(id, &unsafe_inflight, true)
+            .unwrap();
+
+        assert_eq!(
+            mgr.load_native_session_for_resume(&lease).unwrap(),
+            (
+                LoadedSession {
+                    meta: mgr.read_meta(id).unwrap(),
+                    snapshot: canonical,
+                    presentation: PresentationFile::default(),
+                },
+                None,
+            )
+        );
+        assert!(
+            !mgr.has_inflight_snapshot(id),
+            "unsafe checkpoints are cleared so they cannot shadow later resumes"
+        );
+    }
+
+    #[test]
+    fn resume_does_not_replay_after_model_processing_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let id = "recover-without-replay";
+        let lease = mgr.acquire_lease(id).unwrap();
+        let canonical = snap(&["completed"]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&canonical),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let inflight = snap(&["completed", "possibly executed"]);
+        mgr.save_inflight_snapshot_with_lease(&lease, &inflight, true)
+            .unwrap();
+        mgr.mark_inflight_not_replayable(id).unwrap();
+
+        let (loaded, pending) = mgr.load_native_session_for_resume(&lease).unwrap();
+
+        assert_eq!(loaded.snapshot, inflight);
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn delete_removes_the_inflight_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let id = "delete-inflight";
+        let lease = mgr.acquire_lease(id).unwrap();
+        let snapshot = snap(&["accepted"]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snapshot),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        mgr.save_inflight_snapshot_with_lease(&lease, &snapshot, true)
+            .unwrap();
+
+        mgr.delete(&lease).unwrap();
+
+        assert!(!mgr.has_inflight_snapshot(id));
     }
 }

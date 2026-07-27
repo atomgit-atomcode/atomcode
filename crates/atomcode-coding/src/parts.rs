@@ -133,6 +133,9 @@ pub struct SessionBinding {
     pub(crate) lease: SessionLease,
     /// Canonical snapshot on resume/external binding; `None` on fresh.
     pub resume: Option<SessionSnapshot>,
+    /// Accepted user input recovered from an interrupted turn. It is replayed
+    /// through the normal runtime submit path after an agent becomes available.
+    pub(crate) pending_resume_prompt: Option<Message>,
     /// Fresh metadata prepared in memory but not yet catalog-visible. CodingRuntime
     /// publishes it only after the complete candidate graph has assembled.
     staged_fresh: Option<SessionMeta>,
@@ -500,6 +503,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 manager,
                 lease,
                 resume: None,
+                pending_resume_prompt: None,
                 staged_fresh: stage_fresh.then_some(meta),
             })
         }
@@ -509,7 +513,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             // Resume is a native-only boundary. Legacy/unconfirmed data must first
             // converge through a driver importer; accepting a lone snapshot here
             // would bypass ownership and manufacture an incomplete native session.
-            let loaded = manager.load_native_session(id).map_err(io::Error::from)?;
+            let (loaded, pending_resume_prompt) = manager
+                .load_native_session_for_resume(&lease)
+                .map_err(io::Error::from)?;
             // A version-mismatched snapshot must FAIL here, not fall through to the
             // kernel's empty-start seam — that would silently fresh-start under the
             // SAME session id and corrupt on-disk state.
@@ -519,6 +525,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 manager,
                 lease,
                 resume: Some(loaded.snapshot),
+                pending_resume_prompt,
                 staged_fresh: None,
             })
         }
@@ -541,6 +548,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 manager,
                 lease,
                 resume: Some(loaded.snapshot),
+                pending_resume_prompt: None,
                 staged_fresh: None,
             })
         }

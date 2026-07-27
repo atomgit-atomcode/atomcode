@@ -838,9 +838,7 @@ impl CodingRuntimeHandle {
     /// The runtime owner is the sole writer; drivers use this projection to
     /// distinguish recoverable authentication from configuration/build gaps.
     pub fn provider_unavailable_reason(&self) -> Option<ProviderUnavailableReason> {
-        decode_provider_unavailable_reason(
-            self.provider_unavailable_reason.load(Ordering::Acquire),
-        )
+        decode_provider_unavailable_reason(self.provider_unavailable_reason.load(Ordering::Acquire))
     }
 
     /// Whether a fire-and-forget driver command can be accepted in the current
@@ -2135,6 +2133,18 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut held_turn: Option<(u64, StopReason, Arc<SessionSnapshot>, RuntimeTurnStats)> = None;
         let mut ai_name_attempted = false;
         let mut persistence_failure = None;
+        if agent_available {
+            replay_pending_resume_prompt(
+                &agent,
+                resources.as_mut(),
+                controls.state.as_ref(),
+                generation,
+                &mut next_turn_id,
+                &mut active_turn,
+                &mut turn_stats,
+                &mut agent_available,
+            );
+        }
         if let Some(reason) = provider_unavailable_reason {
             let _ = runtime_event_tx.send(CodingRuntimeEvent::ProviderUnavailable {
                 reason,
@@ -3142,11 +3152,23 @@ fn spawn_runtime_owner_with_optional_agent(
                                 compaction_suspended = false;
                                 let provider = runtime.config.provider_name.clone();
                                 let model = runtime.config.model.clone();
-                                resources = Some(runtime);
-                                controls.state.store(
-                                    runtime_phase_state(generation, RuntimePhase::Ready),
-                                    Ordering::Release,
+                                replay_pending_resume_prompt(
+                                    &agent,
+                                    Some(&mut runtime),
+                                    controls.state.as_ref(),
+                                    generation,
+                                    &mut next_turn_id,
+                                    &mut active_turn,
+                                    &mut turn_stats,
+                                    &mut agent_available,
                                 );
+                                resources = Some(runtime);
+                                if active_turn.is_none() {
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::Ready),
+                                        Ordering::Release,
+                                    );
+                                }
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::ProviderChanged { provider, model },
                                 );
@@ -5000,6 +5022,51 @@ fn send_agent_command(agent: &Option<AgentHandle>, command: AgentCommand) -> boo
         .is_some_and(|agent| agent.commands.send(command).is_ok())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn replay_pending_resume_prompt(
+    agent: &Option<AgentHandle>,
+    resources: Option<&mut RuntimeResources>,
+    runtime_state: &AtomicU64,
+    generation: u64,
+    next_turn_id: &mut u64,
+    active_turn: &mut Option<u64>,
+    turn_stats: &mut RuntimeTurnStats,
+    agent_available: &mut bool,
+) {
+    let Some(runtime) = resources else {
+        return;
+    };
+    let Some(binding) = runtime.parts.session.as_mut() else {
+        return;
+    };
+    let Some(prompt) = binding.pending_resume_prompt.as_ref() else {
+        return;
+    };
+    *next_turn_id = next_turn_id.wrapping_add(1);
+    *active_turn = Some(*next_turn_id);
+    *turn_stats = RuntimeTurnStats::default();
+    runtime_state.store(
+        runtime_phase_state(generation, RuntimePhase::InTurn),
+        Ordering::Release,
+    );
+    if send_agent_command(
+        agent,
+        AgentCommand::SendMessage {
+            text: prompt.text.clone(),
+            images: prompt.images.clone(),
+        },
+    ) {
+        binding.pending_resume_prompt = None;
+    } else {
+        *agent_available = false;
+        *active_turn = None;
+        runtime_state.store(
+            runtime_phase_state(generation, RuntimePhase::Failed),
+            Ordering::Release,
+        );
+    }
+}
+
 async fn receive_agent_event(agent: &mut Option<AgentHandle>) -> Option<AgentEvent> {
     match agent.as_mut() {
         Some(agent) => agent.events.recv().await,
@@ -6071,11 +6138,9 @@ mod tests {
             _session_id: Option<&str>,
         ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
             if config.base_url.contains("llm-api.atomgit.com") {
-                Err(
-                    crate::ProviderBuildError::SourceBuildGatewayUnsupported {
-                        base_url: config.base_url.clone(),
-                    },
-                )
+                Err(crate::ProviderBuildError::SourceBuildGatewayUnsupported {
+                    base_url: config.base_url.clone(),
+                })
             } else {
                 Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(
                     vec![],
@@ -7166,10 +7231,7 @@ mod tests {
         })
         .await
         .expect("evaluator failure lost the held terminal");
-        assert!(
-            saw_inactive_goal,
-            "evaluator failure must deactivate /goal"
-        );
+        assert!(saw_inactive_goal, "evaluator failure must deactivate /goal");
         assert!(matches!(
             terminal,
             TurnCompletion::Completed {
@@ -7819,10 +7881,7 @@ mod tests {
         })
         .await
         .expect("evaluator panic did not produce a TurnFinished terminal");
-        assert!(
-            saw_inactive_goal,
-            "evaluator panic must deactivate /goal"
-        );
+        assert!(saw_inactive_goal, "evaluator panic must deactivate /goal");
         assert!(
             matches!(
                 terminal,
@@ -8575,6 +8634,55 @@ mod tests {
             CodingRuntimeEvent::RuntimeStopped(event_exit) if event_exit == exit
         ));
         assert_eq!(runtime.task.await.unwrap(), exit);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn runtime_replays_a_safe_recovered_prompt_through_a_normal_turn() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let dir = tempfile::tempdir().unwrap();
+        let id = "resume-safe-prompt";
+        let manager = atomcode_capabilities::session::SessionManager::for_project(dir.path());
+        let canonical = SessionSnapshot::new(vec![Message::user("completed")]);
+        persist_native_session(&manager, id, dir.path(), &canonical);
+        let inflight = SessionSnapshot::new(vec![
+            Message::user("completed"),
+            Message::user("continue after crash"),
+        ]);
+        std::fs::write(
+            manager.root().join(format!("{id}.snapshot.inflight")),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "replay_safe": true,
+                "snapshot": inflight,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut start = native_start(false);
+        start.agent.working_dir = dir.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.to_string());
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+        wait_for_turn_finished(&mut runtime).await;
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
+
+        let loaded = manager.load_native_session(id).unwrap();
+        assert!(loaded
+            .snapshot
+            .messages
+            .iter()
+            .any(|message| message.text == "continue after crash"));
+        assert!(
+            !manager
+                .root()
+                .join(format!("{id}.snapshot.inflight"))
+                .exists(),
+            "a completed replay must clear its recovery checkpoint"
+        );
     }
 
     #[tokio::test]
@@ -9911,8 +10019,7 @@ mod tests {
             .unwrap();
         wait_for_turn_finished(&mut runtime).await;
 
-        let manager =
-            atomcode_capabilities::session::SessionManager::for_project(project.path());
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
         let sessions = manager.list();
         assert_eq!(sessions.len(), 1);
         let report = atomcode_capabilities::session::aggregate_session_cost(

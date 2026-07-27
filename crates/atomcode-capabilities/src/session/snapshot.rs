@@ -246,6 +246,26 @@ impl LifecycleHooks for SnapshotHook {
         Ok(())
     }
 
+    /// Save the accepted user prompt after it has entered the conversation.
+    ///
+    /// Model responses are intentionally excluded: this hook runs before
+    /// requested tools execute, so persisting them could restore dangling tool
+    /// calls without their results.
+    async fn turn_start(&self, convo: &mut Conversation) {
+        let snapshot = SessionSnapshot::from_conversation(convo);
+        let result = match &self.lease {
+            Some(lease) => self
+                .mgr
+                .save_inflight_snapshot_with_lease(lease, &snapshot, true),
+            None => self
+                .mgr
+                .save_inflight_snapshot(&self.session_id, &snapshot, true),
+        };
+        if let Err(error) = result {
+            eprintln!("[SnapshotHook] inflight save at turn_start failed: {error}");
+        }
+    }
+
     /// Count this model round and retain the final request's usage/context figures.
     async fn on_model_response(&self, response: &mut Message) {
         let mut a = self.lock();
@@ -274,6 +294,10 @@ impl LifecycleHooks for SnapshotHook {
                 .tokens
                 .cached_input
                 .saturating_add(u64::from(meta.tokens.cached));
+        }
+        drop(a);
+        if let Err(error) = self.mgr.mark_inflight_not_replayable(&self.session_id) {
+            eprintln!("[SnapshotHook] inflight phase update failed: {error}");
         }
     }
 
@@ -365,6 +389,7 @@ impl LifecycleHooks for SnapshotHook {
         } else {
             if let Err(error) = self.mgr.save_snapshot(&self.session_id, &snap) {
                 eprintln!("[SnapshotHook] save_snapshot failed: {error}");
+                return;
             }
             let fresh = SessionMeta::new(&self.session_id, &self.working_dir, now);
             self.mgr
@@ -373,7 +398,11 @@ impl LifecycleHooks for SnapshotHook {
         if let Err(error) = result {
             self.record_persistence_error(&error);
             eprintln!("[SnapshotHook] update_meta failed: {error}");
+            // Preserve the accepted-prompt checkpoint until a later successful
+            // aggregate commit supersedes it.
+            return;
         }
+        self.mgr.clear_inflight_snapshot(&self.session_id);
     }
 }
 
@@ -1032,5 +1061,54 @@ mod tests {
         let presentation = mgr.read_presentation(id).unwrap();
         assert_eq!(presentation.entries.len(), 1);
         assert_eq!(presentation.entries[0].text, "concurrent append");
+    }
+
+    #[tokio::test]
+    async fn turn_start_checkpoints_the_accepted_user_prompt() {
+        let (hook, manager, _dir) = hook("inflight-prompt");
+        let mut conversation = convo_with(2);
+
+        hook.turn_start(&mut conversation).await;
+
+        assert_eq!(
+            manager
+                .load_inflight_snapshot("inflight-prompt")
+                .unwrap()
+                .unwrap()
+                .snapshot,
+            SessionSnapshot::from_conversation(&conversation)
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_turn_commit_clears_the_inflight_prompt() {
+        let (hook, manager, _dir) = hook("inflight-clear");
+        let mut conversation = convo_with(1);
+        hook.turn_start(&mut conversation).await;
+
+        hook.turn_complete(&conversation, &StopReason::Stopped, &TurnCtx::default())
+            .await;
+
+        assert!(!manager.has_inflight_snapshot("inflight-clear"));
+        assert_eq!(
+            manager.load_snapshot("inflight-clear").unwrap(),
+            SessionSnapshot::from_conversation(&conversation)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_unleased_snapshot_save_preserves_the_inflight_prompt() {
+        let (hook, manager, _dir) = hook("inflight-save-failure");
+        let mut conversation = convo_with(1);
+        hook.turn_start(&mut conversation).await;
+        std::fs::create_dir(manager.snapshot_path("inflight-save-failure").unwrap()).unwrap();
+
+        hook.turn_complete(&conversation, &StopReason::Stopped, &TurnCtx::default())
+            .await;
+
+        assert!(
+            manager.has_inflight_snapshot("inflight-save-failure"),
+            "the recovery checkpoint must survive a failed canonical save"
+        );
     }
 }
