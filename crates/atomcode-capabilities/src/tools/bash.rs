@@ -372,7 +372,8 @@ fn shell_tool_description(is_windows: bool, bash_present: bool, askpass_active: 
              USER to type it — you never see or handle the password. Just run the command \
              normally. Do NOT assume the shell is non-interactive, do NOT add \
              `-o BatchMode=yes` / `-n` / `</dev/null`, and do NOT avoid or give up on such \
-             commands."
+             commands. Such a command BLOCKS until the user answers the prompt, so pass a \
+             larger `timeout` (e.g. 300) to leave them time to type."
         };
     }
     if is_windows {
@@ -3143,6 +3144,8 @@ mod tests {
         assert!(with.contains("Interactive password prompts ARE supported"));
         assert!(with.contains("ssh user@host"));
         assert!(with.contains("BatchMode"));
+        // Interactive commands block on the prompt → steer toward a larger timeout.
+        assert!(with.contains("timeout"));
         // Off (webui/headless) it must NOT advertise a prompt that can't appear.
         let without = shell_tool_description(false, false, false);
         assert!(!without.contains("Interactive password prompts ARE supported"));
