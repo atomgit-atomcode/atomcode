@@ -3,6 +3,7 @@ pub mod memory;
 pub mod offline;
 pub mod prompt_sections;
 pub mod provider;
+pub mod provider_preset;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
