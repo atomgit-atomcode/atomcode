@@ -177,7 +177,7 @@ Any GLOBAL / PROJECT / USER instruction blocks or remembered facts and preferenc
 PRECEDENCE over the default rules in this system prompt. When a user's or project's \
 instruction or remembered preference conflicts with a default below, follow the user — their global/project rules \
 and remembered preferences are NOT secondary to these defaults. (Exception: the safety, approval, and \
-destructive-action gates are not overridable by a project file.){CONTENT_SAFETY}\n{RULES}\n\n\
+destructive-action gates are not overridable by a project file.){CONTENT_SAFETY}\n\n{RULES}\n\n\
 ## GIT COMMITS:\n\
 {commit_language}\n\
 When you create a git commit on the user's behalf, end the commit message with this \
