@@ -520,6 +520,141 @@ impl Config {
         }
         diags
     }
+
+    /// The unified account catalog: real `provider_accounts` plus one synthetic
+    /// account projected from each legacy `[providers.*]` (design §5). On an
+    /// exact id collision the new-schema account wins; see
+    /// [`Self::model_catalog_collisions`] for the diagnostics. Read-only — never
+    /// rewrites config.
+    pub fn logical_accounts(&self) -> HashMap<String, ProviderAccountConfig> {
+        let mut out: HashMap<String, ProviderAccountConfig> = HashMap::new();
+        for (name, p) in &self.providers {
+            out.insert(name.clone(), project_legacy_account(p));
+        }
+        // New-schema accounts take precedence on an exact id collision.
+        for (id, a) in &self.provider_accounts {
+            out.insert(id.clone(), a.clone());
+        }
+        out
+    }
+
+    /// The unified model catalog: real `models` plus one synthetic model
+    /// projected from each legacy `[providers.*]` (keyed by the legacy provider
+    /// name, so `default_provider` maps to the same selection id). New-schema
+    /// models win on collision.
+    pub fn logical_models(&self) -> HashMap<String, ModelProfileConfig> {
+        let mut out: HashMap<String, ModelProfileConfig> = HashMap::new();
+        for (name, p) in &self.providers {
+            out.insert(name.clone(), project_legacy_model(name, p));
+        }
+        for (id, m) in &self.models {
+            out.insert(id.clone(), m.clone());
+        }
+        out
+    }
+
+    /// Diagnostics for exact id collisions between new-schema entries and
+    /// legacy provider names (the new-schema entry wins). Visible, not silent.
+    pub fn model_catalog_collisions(&self) -> Vec<String> {
+        let mut diags = Vec::new();
+        for id in self.provider_accounts.keys() {
+            if self.providers.contains_key(id) {
+                diags.push(format!(
+                    "provider account `{id}` collides with a legacy provider of the same name; the new-schema account wins"
+                ));
+            }
+        }
+        for id in self.models.keys() {
+            if self.providers.contains_key(id) {
+                diags.push(format!(
+                    "model `{id}` collides with a legacy provider of the same name; the new-schema model wins"
+                ));
+            }
+        }
+        diags
+    }
+
+    /// The effective model selection id: the new `default_model` when set,
+    /// otherwise the legacy `default_provider` (which projects to a synthetic
+    /// model of the same id). `None` when neither is set. Bridges legacy and new
+    /// selection for the single resolution boundary (Task 4).
+    pub fn effective_model_selection(&self) -> Option<String> {
+        self.default_model.clone().or_else(|| {
+            let legacy = self.default_provider.trim();
+            (!legacy.is_empty()).then(|| legacy.to_string())
+        })
+    }
+
+    /// Convert a legacy `[providers.<name>]` into a new-schema account + model
+    /// in place (design §5 rule 5/6). Removes the legacy entry. Pure in-memory
+    /// mutation; the caller persists it through `ConfigStore` CAS. Errors if the
+    /// provider is unknown or the target ids already exist in the new schema.
+    pub fn upgrade_legacy_provider(&mut self, name: &str) -> Result<()> {
+        let provider = self
+            .providers
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("legacy provider `{name}` not found"))?;
+        if self.provider_accounts.contains_key(name) || self.models.contains_key(name) {
+            anyhow::bail!("cannot upgrade `{name}`: a new-schema account or model already uses that id");
+        }
+        let account = project_legacy_account(provider);
+        let model = project_legacy_model(name, provider);
+        self.provider_accounts.insert(name.to_string(), account);
+        self.models.insert(name.to_string(), model);
+        self.providers.remove(name);
+        // Keep the active selection pointing at the same model.
+        if self.default_provider == name && self.default_model.is_none() {
+            self.default_model = Some(name.to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Map a legacy `provider_type` wire string to the preset id whose
+/// [`provider_preset::ProviderType`] matches, so the projected account resolves
+/// to the correct wire protocol. The legacy `base_url` is carried on the account
+/// and overrides the preset default, so the choice of preset only fixes the
+/// protocol, never the endpoint.
+fn legacy_provider_to_preset_id(provider_type: &str) -> &'static str {
+    match provider_type {
+        "claude" | "anthropic" => "anthropic",
+        "ollama" => "ollama",
+        _ => "openai",
+    }
+}
+
+/// Project a legacy provider into a synthetic [`ProviderAccountConfig`].
+fn project_legacy_account(p: &ProviderConfig) -> ProviderAccountConfig {
+    ProviderAccountConfig {
+        provider: legacy_provider_to_preset_id(&p.provider_type).to_string(),
+        display_name: None,
+        api_key: p.api_key.clone(),
+        base_url: p.base_url.clone(),
+        user_agent: p.user_agent.clone(),
+        skip_tls_verify: p.skip_tls_verify,
+        enterprise_url: None,
+        ephemeral: p.ephemeral,
+    }
+}
+
+/// Project a legacy provider into a synthetic [`ModelProfileConfig`] keyed under
+/// the legacy provider `name` (its account id is the same `name`).
+fn project_legacy_model(name: &str, p: &ProviderConfig) -> ModelProfileConfig {
+    ModelProfileConfig {
+        account: name.to_string(),
+        model: p.model.clone(),
+        display_name: None,
+        context_window: p.context_window,
+        max_tokens: p.max_tokens,
+        capable_model: p.capable_model,
+        thinking_type: p.thinking_type.clone(),
+        thinking_keep: p.thinking_keep.clone(),
+        reasoning_history: p.reasoning_history.clone(),
+        reasoning_effort: p.reasoning_effort.clone(),
+        thinking_enabled: p.thinking_enabled,
+        thinking_budget: p.thinking_budget,
+        pricing: p.pricing,
+    }
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -2446,6 +2581,131 @@ capable_model = 5
             cfg.validate_provider_accounts_and_models().is_empty(),
             "{:?}",
             cfg.validate_provider_accounts_and_models()
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_projection_tests {
+    use super::*;
+
+    const LEGACY: &str = r#"
+default_provider = "MyDeepSeek"
+
+[providers.MyDeepSeek]
+type = "openai"
+base_url = "https://api.deepseek.com/v1"
+api_key = "sk-legacy"
+model = "deepseek-chat"
+context_window = 128000
+capable_model = 3
+"#;
+
+    #[test]
+    fn legacy_provider_projects_to_synthetic_account_and_model() {
+        let cfg: Config = toml::from_str(LEGACY).unwrap();
+        let accounts = cfg.logical_accounts();
+        let a = accounts.get("MyDeepSeek").expect("synthetic account");
+        assert_eq!(a.provider, "openai");
+        assert_eq!(a.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+        assert_eq!(a.api_key.as_deref(), Some("sk-legacy"));
+
+        let models = cfg.logical_models();
+        let m = models.get("MyDeepSeek").expect("synthetic model");
+        assert_eq!(m.account, "MyDeepSeek");
+        assert_eq!(m.model, "deepseek-chat");
+        assert_eq!(m.context_window, 128000);
+        assert_eq!(m.capable_model, Some(3));
+
+        assert_eq!(cfg.effective_model_selection().as_deref(), Some("MyDeepSeek"));
+    }
+
+    #[test]
+    fn mixed_schema_catalog_includes_legacy_and_new() {
+        let toml = format!(
+            "{LEGACY}\n[provider_accounts.corp]\nprovider = \"openai-compatible\"\nbase_url = \"https://llm.corp/v1\"\n\n[models.\"corp/code\"]\naccount = \"corp\"\nmodel = \"corp-code\"\ncontext_window = 200000\n"
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        let accounts = cfg.logical_accounts();
+        assert!(accounts.contains_key("MyDeepSeek"), "legacy projected");
+        assert!(accounts.contains_key("corp"), "new-schema account");
+        let models = cfg.logical_models();
+        assert!(models.contains_key("MyDeepSeek"));
+        assert!(models.contains_key("corp/code"));
+        assert!(cfg.validate_provider_accounts_and_models().is_empty());
+    }
+
+    #[test]
+    fn new_schema_wins_on_id_collision_with_diagnostic() {
+        let toml = r#"
+default_provider = "dup"
+
+[providers.dup]
+type = "openai"
+base_url = "https://legacy/v1"
+model = "legacy-model"
+context_window = 64000
+
+[provider_accounts.dup]
+provider = "deepseek"
+
+[models.dup]
+account = "dup"
+model = "new-model"
+context_window = 131072
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        // New-schema entries win.
+        assert_eq!(cfg.logical_accounts()["dup"].provider, "deepseek");
+        assert_eq!(cfg.logical_models()["dup"].model, "new-model");
+        // …and the collision is reported, not silent.
+        let diags = cfg.model_catalog_collisions();
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        assert!(diags.iter().all(|d| d.contains("dup")));
+    }
+
+    #[test]
+    fn effective_selection_prefers_default_model_over_default_provider() {
+        let toml = "default_provider = \"X\"\ndefault_model = \"acc/y\"\n\n[provider_accounts.acc]\nprovider = \"openai\"\n\n[models.\"acc/y\"]\naccount = \"acc\"\nmodel = \"y\"\ncontext_window = 8000\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.effective_model_selection().as_deref(), Some("acc/y"));
+    }
+
+    #[test]
+    fn upgrade_legacy_provider_moves_entry_and_repoints_default() {
+        let mut cfg: Config = toml::from_str(LEGACY).unwrap();
+        cfg.upgrade_legacy_provider("MyDeepSeek").unwrap();
+        assert!(!cfg.providers.contains_key("MyDeepSeek"), "legacy removed");
+        assert!(cfg.provider_accounts.contains_key("MyDeepSeek"));
+        assert!(cfg.models.contains_key("MyDeepSeek"));
+        assert_eq!(cfg.default_model.as_deref(), Some("MyDeepSeek"));
+        // Unknown / colliding upgrades error rather than corrupt.
+        assert!(cfg.upgrade_legacy_provider("nope").is_err());
+        let mut legacy2: Config = toml::from_str(LEGACY).unwrap();
+        legacy2.provider_accounts.insert(
+            "MyDeepSeek".into(),
+            provider::ProviderAccountConfig {
+                provider: "deepseek".into(),
+                display_name: None,
+                api_key: None,
+                base_url: None,
+                user_agent: None,
+                skip_tls_verify: false,
+                enterprise_url: None,
+                ephemeral: false,
+            },
+        );
+        assert!(legacy2.upgrade_legacy_provider("MyDeepSeek").is_err());
+    }
+
+    #[test]
+    fn legacy_only_config_is_not_rewritten_on_serialize() {
+        let cfg: Config = toml::from_str(LEGACY).unwrap();
+        let rendered = cfg.serialize_for_disk(None).unwrap();
+        assert!(rendered.contains("[providers.MyDeepSeek]"), "legacy section kept verbatim");
+        assert!(
+            !rendered.contains("[provider_accounts"),
+            "load/serialize must not auto-upgrade legacy into the new schema"
         );
     }
 }
