@@ -8882,17 +8882,24 @@ pub(crate) enum PersistedConfigReload {
 }
 
 fn resolved_provider_and_model(config: &Config) -> (String, String) {
-    let provider = if config.providers.contains_key(&config.default_provider) {
-        config.default_provider.clone()
-    } else {
-        config.providers.keys().min().cloned().unwrap_or_default()
-    };
-    let model = config
-        .providers
-        .get(&provider)
-        .map(|provider| provider.model.clone())
-        .unwrap_or_else(|| provider.clone());
-    (provider, model)
+    // Route through the single resolution boundary (§14.1) so the reload
+    // completion projects the ACTIVE selection for both schemas (returns the
+    // selection id + wire model). Falls back to the first catalog model when
+    // nothing resolves — parity with the old `providers.keys().min()`. For a
+    // legacy config this equals the previous `default_provider` + its model.
+    if let Ok(r) = config.resolve_model(None) {
+        return (r.selection_id, r.model);
+    }
+    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+    ids.sort();
+    ids.into_iter()
+        .find_map(|id| {
+            config
+                .resolve_model(Some(&id))
+                .ok()
+                .map(|r| (r.selection_id, r.model))
+        })
+        .unwrap_or_default()
 }
 
 fn select_committed_provider(
@@ -12107,25 +12114,43 @@ pub(crate) fn set_default_provider_and_reload(
     if provider_transition_pending(ctx) {
         return false;
     }
-    let Some(selected) = ctx.config.providers.get(provider_name) else {
-        renderer.render(UiLine::Error(format!(
-            "provider {provider_name:?} is no longer available"
-        )));
-        renderer.flush();
-        return false;
+    // `provider_name` is a selection id: a legacy provider name OR a new-schema
+    // model id (§14.1/§14.2). Validate through the single resolution boundary.
+    let resolved = match ctx.config.resolve_model(Some(provider_name)) {
+        Ok(r) => r,
+        Err(_) => {
+            renderer.render(UiLine::Error(format!(
+                "provider {provider_name:?} is no longer available"
+            )));
+            renderer.flush();
+            return false;
+        }
     };
-    if selected.ephemeral {
+    // Legacy ephemeral (OAuth /login) providers stay current-runtime-only.
+    if ctx
+        .config
+        .providers
+        .get(provider_name)
+        .map(|p| p.ephemeral)
+        .unwrap_or(false)
+    {
         return select_provider_and_reload(ctx, provider_name, renderer);
     }
-    let selected_model = selected.model.clone();
+    let selected_model = resolved.model.clone();
     let store = ctx.config_store.clone();
     let mut previous_persisted = None;
     let commit = match store.update(|config| {
-        if !config.providers.contains_key(provider_name) {
+        if config.resolve_model(Some(provider_name)).is_err() {
             anyhow::bail!("provider {provider_name:?} is no longer available");
         }
         previous_persisted = Some(config.clone());
-        config.default_provider = provider_name.to_string();
+        // `default_model` is the canonical selection (§14.1); keep the legacy
+        // `default_provider` in sync when the selection is a legacy provider so
+        // not-yet-migrated display consumers stay correct.
+        config.default_model = Some(provider_name.to_string());
+        if config.providers.contains_key(provider_name) {
+            config.default_provider = provider_name.to_string();
+        }
         Ok(())
     }) {
         Ok(commit) => commit,
@@ -12148,6 +12173,24 @@ pub(crate) fn set_default_provider_and_reload(
                 .providers
                 .entry(name.clone())
                 .or_insert_with(|| provider.clone());
+        }
+    }
+    // Ephemeral provider accounts (and their model profiles) aren't persisted,
+    // so re-add them to the desired config for the reload.
+    for (id, account) in &ctx.config.provider_accounts {
+        if account.ephemeral {
+            desired
+                .provider_accounts
+                .entry(id.clone())
+                .or_insert_with(|| account.clone());
+            for (mid, model) in &ctx.config.models {
+                if model.account == *id {
+                    desired
+                        .models
+                        .entry(mid.clone())
+                        .or_insert_with(|| model.clone());
+                }
+            }
         }
     }
     let origin_generation = ctx.runtime.current_generation();

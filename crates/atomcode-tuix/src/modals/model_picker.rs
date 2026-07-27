@@ -35,28 +35,29 @@ pub(crate) fn model_cycle_direction(
     }
 }
 
-/// Pick the adjacent provider in stable alphabetical order and wrap at both
-/// ends. `/model` exposes configured providers as the switchable model list, so
-/// the shortcut deliberately follows that same source of truth.
+/// Pick the adjacent model profile in stable id order and wrap at both ends.
+/// `/model` exposes the unified model catalog (legacy providers project to one
+/// model each), so the shortcut follows that same source of truth.
 pub(crate) fn adjacent_provider(config: &Config, direction: ModelCycleDirection) -> Option<String> {
-    let mut providers: Vec<&str> = config.providers.keys().map(String::as_str).collect();
-    providers.sort_unstable();
-    if providers.len() < 2 {
+    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+    ids.sort_unstable();
+    if ids.len() < 2 {
         return None;
     }
 
-    let current = providers
+    let current = config.effective_model_selection().unwrap_or_default();
+    let pos = ids
         .iter()
-        .position(|name| *name == config.default_provider)
+        .position(|id| *id == current)
         .unwrap_or(match direction {
-            ModelCycleDirection::Next => providers.len() - 1,
+            ModelCycleDirection::Next => ids.len() - 1,
             ModelCycleDirection::Previous => 0,
         });
     let target = match direction {
-        ModelCycleDirection::Next => (current + 1) % providers.len(),
-        ModelCycleDirection::Previous => (current + providers.len() - 1) % providers.len(),
+        ModelCycleDirection::Next => (pos + 1) % ids.len(),
+        ModelCycleDirection::Previous => (pos + ids.len() - 1) % ids.len(),
     };
-    Some(providers[target].to_string())
+    Some(ids[target].clone())
 }
 
 pub struct ModelPicker {
@@ -73,10 +74,10 @@ pub struct ModelPicker {
 
 impl ModelPicker {
     pub fn open(config: &Config) -> Self {
-        let mut providers: Vec<String> = config.providers.keys().cloned().collect();
+        let mut providers: Vec<String> = config.logical_models().into_keys().collect();
         providers.sort();
-        // Put the current default at top for quick re-confirmation.
-        let cur = config.default_provider.clone();
+        // Put the current selection at top for quick re-confirmation.
+        let cur = config.effective_model_selection().unwrap_or_default();
         if let Some(idx) = providers.iter().position(|p| *p == cur) {
             providers.swap(0, idx);
         }
@@ -89,29 +90,42 @@ impl ModelPicker {
         }
     }
 
-    /// Recompute `filtered` from `query`, matching against provider name,
-    /// provider_type, and model (all case-insensitive substring).
+    /// Recompute `filtered` from `query`, matching against the selection id,
+    /// account, wire model name, and display name (all case-insensitive).
     pub fn update_filter(&mut self, config: &Config) {
         let q = self.query.to_lowercase();
+        let models = config.logical_models();
+        let accounts = config.logical_accounts();
         self.filtered = self
             .providers
             .iter()
             .enumerate()
-            .filter(|(_, name)| {
+            .filter(|(_, id)| {
                 if q.is_empty() {
                     return true;
                 }
-                // Match provider name
-                if name.to_lowercase().contains(&q) {
+                if id.to_lowercase().contains(&q) {
                     return true;
                 }
-                // Match provider_type and model from config
-                if let Some(c) = config.providers.get(*name) {
-                    if c.provider_type.to_lowercase().contains(&q) {
+                if let Some(m) = models.get(*id) {
+                    if m.model.to_lowercase().contains(&q) {
                         return true;
                     }
-                    if c.model.to_lowercase().contains(&q) {
+                    if m.account.to_lowercase().contains(&q) {
                         return true;
+                    }
+                    if m
+                        .display_name
+                        .as_deref()
+                        .is_some_and(|d| d.to_lowercase().contains(&q))
+                    {
+                        return true;
+                    }
+                    // Vendor / protocol (the account's preset id).
+                    if let Some(a) = accounts.get(&m.account) {
+                        if a.provider.to_lowercase().contains(&q) {
+                            return true;
+                        }
                     }
                 }
                 false
@@ -241,11 +255,11 @@ fn build_menu_payload(p: &ModelPicker, ctx: &LoopCtx) -> MenuPayload {
     // renders as blank space and looks like the modal hung).
     if p.filtered.is_empty() {
         let label = if p.providers.is_empty() {
-            "(no providers configured — use /provider add)".to_string()
+            "(no models configured — use /provider add)".to_string()
         } else if p.query.is_empty() {
-            "(no providers match)".to_string()
+            "(no models match)".to_string()
         } else {
-            format!("(no providers match \"{}\" — Backspace to clear)", p.query)
+            format!("(no models match \"{}\" — Backspace to clear)", p.query)
         };
         return MenuPayload {
             items: vec![(label, String::new())],
@@ -256,18 +270,20 @@ fn build_menu_payload(p: &ModelPicker, ctx: &LoopCtx) -> MenuPayload {
             },
         };
     }
+    let models = ctx.config.logical_models();
     let items: Vec<(String, String)> = p
         .filtered
         .iter()
         .map(|&idx| {
-            let name = &p.providers[idx];
-            let desc = ctx
-                .config
-                .providers
-                .get(name)
-                .map(|c| format!("{} · {}", c.provider_type, c.model))
+            let id = &p.providers[idx];
+            let desc = models
+                .get(id)
+                .map(|m| {
+                    let name = m.display_name.as_deref().unwrap_or(&m.model);
+                    format!("{} · {}", m.account, name)
+                })
                 .unwrap_or_default();
-            (name.clone(), desc)
+            (id.clone(), desc)
         })
         .collect();
     MenuPayload {
@@ -333,6 +349,31 @@ mod tests {
         assert_eq!(p.selected, 0);
         // Default provider should be first
         assert_eq!(p.providers[0], "alpha");
+    }
+
+    #[test]
+    fn open_lists_new_schema_model_profiles() {
+        // One account, two model profiles — the picker lists them by selection
+        // id, current default first, and filters by wire model name.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "acc/coder",
+            "provider_accounts": { "acc": { "provider": "deepseek" } },
+            "models": {
+                "acc/coder": { "account": "acc", "model": "deepseek-coder", "context_window": 131072 },
+                "acc/chat":  { "account": "acc", "model": "deepseek-chat",   "context_window": 131072 }
+            }
+        }))
+        .unwrap();
+        let p = ModelPicker::open(&config);
+        assert_eq!(p.filtered.len(), 2);
+        assert_eq!(p.providers[0], "acc/coder"); // default selection first
+        assert!(p.providers.contains(&"acc/chat".to_string()));
+
+        let mut p2 = ModelPicker::open(&config);
+        p2.query = "chat".into();
+        p2.update_filter(&config);
+        assert_eq!(p2.filtered.len(), 1);
+        assert_eq!(p2.providers[p2.filtered[0]], "acc/chat");
     }
 
     #[test]
