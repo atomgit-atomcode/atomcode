@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::proxy::ProxyConfig;
 use atomcode_telemetry::TelemetryConfig;
-use provider::{ModelProfileConfig, ProviderAccountConfig, ProviderConfig};
+use provider::{ModelProfileConfig, ProviderAccountConfig, ProviderConfig, ResolvedModelConfig};
 
 // DEFAULT_SYSTEM_PROMPT removed — single source of truth is now
 // config/prompt_sections.rs::UNIFIED_PROMPT (~500 tok).
@@ -123,6 +123,10 @@ impl Default for SubAgentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Legacy default selection (a `[providers.*]` key). `#[serde(default)]` so a
+    /// pure new-schema config selecting via `default_model` needs neither legacy
+    /// field. Superseded by `default_model` (design §14.1).
+    #[serde(default)]
     pub default_provider: String,
     /// Optional provider key for /goal evaluator (fast model like Haiku).
     /// Falls back to `default_provider` when not set.
@@ -409,19 +413,21 @@ impl Config {
     /// TUIX Ctrl+V paste gate to decide whether to accept the image or
     /// reject with the "switch to a vision-capable model" hint.
     pub fn can_handle_attached_images(&self) -> bool {
+        // Route through the single resolution boundary (§14.1) so both schemas
+        // work and the active model matches what the runtime builds.
         let active_accepts = self
-            .providers
-            .get(&self.default_provider)
-            .map(|p| p.accepts_images())
+            .resolve_model(None)
+            .map(|r| crate::util::model_name_suggests_vision(&r.model))
             .unwrap_or(false);
         if active_accepts {
             return true;
         }
-        let vp_key = match self.vision_preprocessor_provider.as_deref() {
-            Some(k) if !k.is_empty() => k,
-            _ => return false,
-        };
-        self.providers.contains_key(vp_key)
+        // `vision_preprocessor_provider` is a model-selection id (legacy provider
+        // names still resolve via projection, §14.3): valid iff it resolves.
+        match self.vision_preprocessor_provider.as_deref() {
+            Some(k) if !k.is_empty() => self.resolve_model(Some(k)).is_ok(),
+            _ => false,
+        }
     }
 }
 
@@ -608,6 +614,106 @@ impl Config {
         }
         Ok(())
     }
+
+    /// THE single provider/model resolution boundary (design §3.4, §10). Given a
+    /// selection id (or `None` for the active [`Self::effective_model_selection`]),
+    /// resolve the model profile, its account, the preset, environment API keys,
+    /// and legacy projection into one flattened [`ResolvedModelConfig`] that
+    /// provider construction consumes. Every consumer (footer, runtime, CLI
+    /// overrides, daemon, respawn) must route through this, never re-derive from
+    /// raw fields (§14.1). Errors are secret-safe: they name ids/models, never
+    /// credentials.
+    pub fn resolve_model(&self, selection: Option<&str>) -> Result<ResolvedModelConfig> {
+        let selection_id = selection
+            .map(str::to_string)
+            .or_else(|| self.effective_model_selection())
+            .ok_or_else(|| {
+                anyhow::anyhow!("no model selected (set `default_model` or `default_provider`)")
+            })?;
+        let models = self.logical_models();
+        let model = models
+            .get(&selection_id)
+            .ok_or_else(|| anyhow::anyhow!("model `{selection_id}` not found"))?;
+        let accounts = self.logical_accounts();
+        let account = accounts.get(&model.account).ok_or_else(|| {
+            anyhow::anyhow!(
+                "model `{selection_id}` references unknown account `{}`",
+                model.account
+            )
+        })?;
+        let preset = provider_preset::preset_or_compatible(&account.provider);
+        let base_url = account
+            .base_url
+            .clone()
+            .or_else(|| preset.default_base_url.map(str::to_string));
+        let api_key = resolve_account_api_key(account, preset);
+        Ok(ResolvedModelConfig {
+            selection_id,
+            account_id: model.account.clone(),
+            provider_id: account.provider.clone(),
+            provider_type: preset.provider_type.wire().to_string(),
+            base_url,
+            api_key,
+            model: model.model.clone(),
+            context_window: model.context_window,
+            max_tokens: model.max_tokens,
+            system_prompt: model.system_prompt.clone(),
+            user_agent: account.user_agent.clone(),
+            skip_tls_verify: account.skip_tls_verify,
+            thinking_type: model.thinking_type.clone(),
+            thinking_keep: model.thinking_keep.clone(),
+            reasoning_history: model.reasoning_history.clone(),
+            reasoning_effort: model.reasoning_effort.clone(),
+            thinking_enabled: model.thinking_enabled,
+            thinking_budget: model.thinking_budget,
+            capable_model: model.capable_model,
+            pricing: model.pricing,
+        })
+    }
+}
+
+/// Resolve an account's API key with environment fallbacks, mirroring
+/// [`ProviderConfig::resolved_api_key`]: an explicit `$VAR`/`${VAR}` expands, a
+/// bare env-var name resolves, anything else is a literal; otherwise fall back
+/// to the preset's declared env var, then the wire-type env var, then
+/// `ATOMCODE_API_KEY`.
+fn resolve_account_api_key(
+    account: &ProviderAccountConfig,
+    preset: &provider_preset::ProviderPreset,
+) -> Option<String> {
+    if let Some(raw) = account.api_key.as_deref() {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            if trimmed.contains('$') {
+                let expanded = provider::expand_env_vars(trimmed);
+                if !expanded.trim().is_empty() {
+                    return Some(expanded);
+                }
+            } else if let Ok(v) = std::env::var(trimmed) {
+                if !v.trim().is_empty() {
+                    return Some(v);
+                }
+            } else {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    let wire_env = match preset.provider_type {
+        provider_preset::ProviderType::Anthropic => "ANTHROPIC_API_KEY",
+        provider_preset::ProviderType::Ollama => "OLLAMA_API_KEY",
+        provider_preset::ProviderType::OpenAi => "OPENAI_API_KEY",
+    };
+    for env in [preset.api_key_env, Some(wire_env), Some("ATOMCODE_API_KEY")]
+        .into_iter()
+        .flatten()
+    {
+        if let Ok(v) = std::env::var(env) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 /// Map a legacy `provider_type` wire string to the preset id whose
@@ -644,6 +750,7 @@ fn project_legacy_model(name: &str, p: &ProviderConfig) -> ModelProfileConfig {
         account: name.to_string(),
         model: p.model.clone(),
         display_name: None,
+        system_prompt: p.system_prompt.clone(),
         context_window: p.context_window,
         max_tokens: p.max_tokens,
         capable_model: p.capable_model,
@@ -1066,14 +1173,15 @@ fn render_hooks_json_section() -> String {
 }
 
 impl Config {
-    /// Context window of the currently-selected default provider.
-    /// Falls back to 128_000 when the default_provider is missing or
-    /// has no provider entry — matches pre-existing behavior at the
-    /// ~5 sites that previously open-coded this lookup.
+    /// Context window of the active selection, resolved through the single
+    /// [`Self::resolve_model`] boundary (§14.1) so the displayed window can never
+    /// diverge from what the runtime builds. Falls back to 128_000 when nothing
+    /// resolves. For a legacy config this equals the old
+    /// `providers[default_provider].context_window` lookup (the legacy provider
+    /// projects to a model of the same id), so behavior is unchanged.
     pub fn default_context_window(&self) -> usize {
-        self.providers
-            .get(&self.default_provider)
-            .map(|p| p.context_window)
+        self.resolve_model(None)
+            .map(|r| r.context_window)
             .unwrap_or(128_000)
     }
 
@@ -2508,6 +2616,7 @@ capable_model = 5
                 account: "oauth-live".into(),
                 model: "gpt-x".into(),
                 display_name: None,
+                system_prompt: None,
                 context_window: 128_000,
                 max_tokens: None,
                 capable_model: None,
@@ -2552,6 +2661,7 @@ capable_model = 5
                 account: "does-not-exist".into(), // dangling reference → error
                 model: "".into(),                 // empty model → error
                 display_name: None,
+                system_prompt: None,
                 context_window: 0, // zero window → error
                 max_tokens: None,
                 capable_model: None,
@@ -2707,5 +2817,67 @@ context_window = 131072
             !rendered.contains("[provider_accounts"),
             "load/serialize must not auto-upgrade legacy into the new schema"
         );
+    }
+
+    #[test]
+    fn resolve_model_resolves_a_legacy_selection() {
+        let cfg: Config = toml::from_str(LEGACY).unwrap();
+        let r = cfg.resolve_model(None).unwrap();
+        assert_eq!(r.selection_id, "MyDeepSeek");
+        assert_eq!(r.account_id, "MyDeepSeek");
+        assert_eq!(r.provider_type, "openai");
+        assert_eq!(r.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+        assert_eq!(r.api_key.as_deref(), Some("sk-legacy"));
+        assert_eq!(r.model, "deepseek-chat");
+        assert_eq!(r.context_window, 128000);
+        assert_eq!(r.capable_model, Some(3));
+    }
+
+    #[test]
+    fn resolve_model_uses_preset_default_base_url_when_account_omits_it() {
+        let toml = "default_model = \"acc/ds\"\n\n[provider_accounts.acc]\nprovider = \"deepseek\"\napi_key = \"sk-x\"\n\n[models.\"acc/ds\"]\naccount = \"acc\"\nmodel = \"deepseek-chat\"\ncontext_window = 131072\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let r = cfg.resolve_model(None).unwrap();
+        assert_eq!(r.provider_id, "deepseek");
+        assert_eq!(r.provider_type, "openai");
+        // Falls back to the deepseek preset's default endpoint.
+        assert_eq!(r.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+    }
+
+    #[test]
+    fn account_base_url_overrides_preset_default() {
+        let toml = "default_model = \"acc/ds\"\n\n[provider_accounts.acc]\nprovider = \"deepseek\"\nbase_url = \"https://mirror.internal/v1\"\n\n[models.\"acc/ds\"]\naccount = \"acc\"\nmodel = \"deepseek-chat\"\ncontext_window = 131072\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.resolve_model(None).unwrap().base_url.as_deref(),
+            Some("https://mirror.internal/v1")
+        );
+    }
+
+    #[test]
+    fn resolve_model_errors_are_secret_safe() {
+        // A resolution failure must never echo an account credential.
+        let toml = "default_model = \"missing\"\n\n[provider_accounts.acc]\nprovider = \"openai\"\napi_key = \"sk-SUPER-SECRET-XYZ\"\n\n[models.\"acc/m\"]\naccount = \"acc\"\nmodel = \"gpt\"\ncontext_window = 8000\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = cfg.resolve_model(None).unwrap_err().to_string();
+        assert!(err.contains("missing"), "{err}");
+        assert!(!err.contains("SUPER-SECRET"), "credential leaked in error: {err}");
+    }
+
+    #[test]
+    fn resolve_model_errors_without_a_selection() {
+        let cfg = Config::default(); // no default_model, empty default_provider
+        assert!(cfg.resolve_model(None).is_err());
+    }
+
+    #[test]
+    fn default_context_window_routes_through_resolution() {
+        // Legacy: equals providers[default_provider].context_window (128000).
+        let legacy: Config = toml::from_str(LEGACY).unwrap();
+        assert_eq!(legacy.default_context_window(), 128000);
+        // New schema: equals the selected model profile's window.
+        let toml = "default_model = \"acc/ds\"\n\n[provider_accounts.acc]\nprovider = \"deepseek\"\napi_key = \"sk-x\"\n\n[models.\"acc/ds\"]\naccount = \"acc\"\nmodel = \"deepseek-chat\"\ncontext_window = 200000\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.default_context_window(), 200000);
     }
 }

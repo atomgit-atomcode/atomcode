@@ -148,6 +148,10 @@ pub struct ModelProfileConfig {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Optional per-model system-prompt override (carried through resolution,
+    /// design §14.5). Projected from a legacy provider's `system_prompt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     #[serde(default = "default_context_window")]
     pub context_window: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,6 +174,53 @@ pub struct ModelProfileConfig {
     pub thinking_budget: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ProviderPricing>,
+}
+
+/// One flattened, immutable resolution of a model selection (design §3.4). This
+/// is the single value provider construction consumes — accounts, presets,
+/// legacy entries, and environment variables are all resolved away by
+/// [`super::Config::resolve_model`]. Carries everything a provider adapter needs
+/// (including the per-model dynamic `base_url` and `system_prompt`, §14.5) but
+/// owns no runtime state. Never serialized; `Debug` redacts the api key.
+#[derive(Clone)]
+pub struct ResolvedModelConfig {
+    pub selection_id: String,
+    pub account_id: String,
+    /// Preset id (or custom protocol id) the account referenced.
+    pub provider_id: String,
+    /// Wire protocol string the provider factory dispatches on.
+    pub provider_type: String,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub model: String,
+    pub context_window: usize,
+    pub max_tokens: Option<usize>,
+    pub system_prompt: Option<String>,
+    pub user_agent: Option<String>,
+    pub skip_tls_verify: bool,
+    pub thinking_type: Option<String>,
+    pub thinking_keep: Option<String>,
+    pub reasoning_history: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub thinking_enabled: Option<bool>,
+    pub thinking_budget: Option<u32>,
+    pub capable_model: Option<i64>,
+    pub pricing: Option<ProviderPricing>,
+}
+
+impl std::fmt::Debug for ResolvedModelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedModelConfig")
+            .field("selection_id", &self.selection_id)
+            .field("account_id", &self.account_id)
+            .field("provider_id", &self.provider_id)
+            .field("provider_type", &self.provider_type)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("model", &self.model)
+            .field("context_window", &self.context_window)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProviderConfig {
