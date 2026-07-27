@@ -48,7 +48,18 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        shell_tool_description(cfg!(target_os = "windows"), windows_bash_active())
+        // Only advertise interactive password support when the askpass helper is
+        // actually wired (Unix interactive TUI); off elsewhere (webui/headless/
+        // Windows) so the model isn't told about a prompt that can't appear.
+        #[cfg(unix)]
+        let askpass_active = crate::askpass::current_env().is_some();
+        #[cfg(not(unix))]
+        let askpass_active = false;
+        shell_tool_description(
+            cfg!(target_os = "windows"),
+            windows_bash_active(),
+            askpass_active,
+        )
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -290,7 +301,7 @@ pub(crate) fn windows_shell_label(bash_present: bool) -> &'static str {
 /// which cmd.exe can't parse, so the model thrashes into temp-file workarounds.
 /// Naming the real shell here removes the contradiction. Pure (takes a bool) so
 /// the Windows wording is unit-testable off Windows.
-fn shell_tool_description(is_windows: bool, bash_present: bool) -> &'static str {
+fn shell_tool_description(is_windows: bool, bash_present: bool, askpass_active: bool) -> &'static str {
     // Single-source the base paragraph so a Windows/Unix edit can't drift. A
     // macro (not a `const`) because `concat!` only splices literals.
     macro_rules! base {
@@ -347,12 +358,31 @@ fn shell_tool_description(is_windows: bool, bash_present: bool) -> &'static str 
              `nul` file in the working directory."
         };
     }
+    // Tell the model interactive password prompts work — ONLY when the askpass
+    // helper is actually active (Unix interactive TUI). Without this the model
+    // assumes the shell is non-interactive, rationalises "the password prompt
+    // can't appear", and gives up on `ssh`/`sudo` instead of just running them.
+    // With askpass the password is entered by the USER in a secure prompt (the
+    // model never sees it), so the guidance is only truthful when it's wired.
+    macro_rules! askpass_suffix {
+        () => {
+            "\n\
+             Interactive password prompts ARE supported here: a command that needs a \
+             password (e.g. `ssh user@host`, `sudo …`) surfaces a SECURE prompt for the \
+             USER to type it — you never see or handle the password. Just run the command \
+             normally. Do NOT assume the shell is non-interactive, do NOT add \
+             `-o BatchMode=yes` / `-n` / `</dev/null`, and do NOT avoid or give up on such \
+             commands."
+        };
+    }
     if is_windows {
         if bash_present {
             concat!(base!(), bash_suffix!())
         } else {
             concat!(base!(), cmd_suffix!())
         }
+    } else if askpass_active {
+        concat!(base!(), askpass_suffix!())
     } else {
         base!()
     }
@@ -2949,7 +2979,7 @@ mod tests {
     // quoting that cmd.exe can't parse, then thrashes into temp-file workarounds.
     #[test]
     fn windows_description_steers_to_cmd_not_bash() {
-        let win = shell_tool_description(true, false);
+        let win = shell_tool_description(true, false, false);
         assert!(win.contains("cmd.exe"), "windows desc must name cmd.exe");
         let lc = win.to_lowercase();
         assert!(
@@ -2965,7 +2995,7 @@ mod tests {
             "windows desc must warn off command substitution"
         );
 
-        let unix = shell_tool_description(false, false);
+        let unix = shell_tool_description(false, false, false);
         assert!(
             !unix.contains("cmd.exe"),
             "unix desc must not mention cmd.exe"
@@ -2979,7 +3009,7 @@ mod tests {
     // and (c) steer file ops to the native read_file/grep/glob tools.
     #[test]
     fn windows_description_discourages_shell_mixing_and_steers_to_native_tools() {
-        let win = shell_tool_description(true, false);
+        let win = shell_tool_description(true, false, false);
         let lc = win.to_lowercase();
         // Don't switch shells: cmd.exe only, no PowerShell, no git-bash `cmd //c`.
         assert!(
@@ -3000,7 +3030,7 @@ mod tests {
         assert!(win.contains("grep"), "must steer to grep: {win}");
         assert!(win.contains("read_file"), "must steer to read_file: {win}");
         // The unix description stays lean (no Windows shell noise).
-        let unix = shell_tool_description(false, false);
+        let unix = shell_tool_description(false, false, false);
         assert!(
             !unix.contains("PowerShell") && !unix.contains("//c"),
             "unix desc unchanged: {unix}"
@@ -3013,7 +3043,7 @@ mod tests {
     // cmd.exe, emits `dir C:\Windows` / `%VAR%` / `type` which then run in bash and break.
     #[test]
     fn windows_with_bash_present_tells_model_bash_not_cmd() {
-        let d = shell_tool_description(true, true);
+        let d = shell_tool_description(true, true, false);
         let lc = d.to_lowercase();
         // Must NOT claim cmd.exe / demand cmd-only syntax when bash is what runs.
         assert!(
@@ -3056,7 +3086,7 @@ mod tests {
     // guidance (unchanged from before the fix).
     #[test]
     fn windows_without_bash_keeps_cmd_guidance() {
-        let d = shell_tool_description(true, false);
+        let d = shell_tool_description(true, false, false);
         assert!(d.contains("cmd.exe"), "no bash → cmd.exe guidance: {d}");
         assert!(
             d.contains("$("),
@@ -3087,7 +3117,7 @@ mod tests {
     // audit-style pipelines (wc/sort/uniq/git log) still legitimately use bash.
     #[test]
     fn unix_description_steers_file_ops_to_native_tools() {
-        let unix = shell_tool_description(false, false);
+        let unix = shell_tool_description(false, false, false);
         for tool in ["read_file", "grep", "glob", "list_directory"] {
             assert!(
                 unix.contains(tool),
@@ -3103,6 +3133,22 @@ mod tests {
             !unix.contains("cmd.exe"),
             "unix desc must not mention cmd.exe"
         );
+    }
+
+    #[test]
+    fn askpass_active_advertises_interactive_password_support() {
+        // With askpass wired (Unix TUI) the model is told ssh/sudo password
+        // prompts work, so it runs them instead of assuming non-interactive.
+        let with = shell_tool_description(false, false, true);
+        assert!(with.contains("Interactive password prompts ARE supported"));
+        assert!(with.contains("ssh user@host"));
+        assert!(with.contains("BatchMode"));
+        // Off (webui/headless) it must NOT advertise a prompt that can't appear.
+        let without = shell_tool_description(false, false, false);
+        assert!(!without.contains("Interactive password prompts ARE supported"));
+        // Windows never advertises it (askpass is Unix-only) even if asked to.
+        let win = shell_tool_description(true, false, true);
+        assert!(!win.contains("Interactive password prompts ARE supported"));
     }
 
     #[test]
