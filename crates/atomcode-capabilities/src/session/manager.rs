@@ -2946,11 +2946,11 @@ fn migrate_sessions_from(legacy_root: &Path, target_root: &Path) -> SessionResul
         let parent = target.parent().expect("session target always has a bucket");
         fs::create_dir_all(parent).map_err(|error| io_at(parent, error))?;
         let mut input = File::open(source).map_err(|error| io_at(source, error))?;
-        let mut output = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(target)
-            .map_err(|error| io_at(target, error))?;
+        let mut output = OpenOptions::new();
+        output.create_new(true).write(true);
+        set_private_create_mode(&mut output);
+        let mut output = output.open(target).map_err(|error| io_at(target, error))?;
+        ensure_private_file_permissions(target, &output)?;
         io::copy(&mut input, &mut output).map_err(|error| io_at(target, error))?;
         output.sync_all().map_err(|error| io_at(target, error))?;
     }
@@ -3407,19 +3407,57 @@ fn open_read_file(path: &Path) -> SessionResult<File> {
 fn open_append_file(path: &Path) -> SessionResult<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
+    set_private_create_mode(&mut options);
     no_follow(&mut options);
     let file = options.open(path).map_err(|e| io_at(path, e))?;
     ensure_opened_regular(path, &file)?;
+    ensure_private_file_permissions(path, &file)?;
     Ok(file)
 }
 
 fn open_lock_file(path: &Path) -> SessionResult<File> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
+    set_private_create_mode(&mut options);
     no_follow(&mut options);
     let file = options.open(path).map_err(|e| io_at(path, e))?;
     ensure_opened_regular(path, &file)?;
+    ensure_private_file_permissions(path, &file)?;
     Ok(file)
+}
+
+fn set_private_create_mode(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
+}
+
+fn ensure_private_file_permissions(path: &Path, file: &File) -> SessionResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = file
+            .metadata()
+            .map_err(|error| io_at(path, error))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| io_at(path, error))?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        let _ = file;
+    }
+    Ok(())
 }
 
 fn ensure_opened_regular(path: &Path, file: &File) -> SessionResult<()> {
@@ -3554,11 +3592,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> SessionResult<()> {
         sequence
     ));
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp)
-            .map_err(|e| io_at(&tmp, e))?;
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        set_private_create_mode(&mut options);
+        let mut file = options.open(&tmp).map_err(|e| io_at(&tmp, e))?;
+        ensure_private_file_permissions(&tmp, &file)?;
         file.write_all(bytes).map_err(|e| io_at(&tmp, e))?;
         file.sync_all().map_err(|e| io_at(&tmp, e))?;
         fs::rename(&tmp, path).map_err(|e| io_at(path, e))?;
@@ -5791,6 +5829,51 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "no .tmp must survive a successful write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_writers_create_and_repair_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let atomic_path = dir.path().join("private.snapshot");
+        atomic_write(&atomic_path, b"first").unwrap();
+        assert_eq!(mode(&atomic_path), 0o600);
+        std::fs::set_permissions(&atomic_path, fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write(&atomic_path, b"second").unwrap();
+        assert_eq!(
+            mode(&atomic_path),
+            0o600,
+            "atomic replacement must tighten an existing session artifact"
+        );
+
+        let transcript_path = dir.path().join("private.jsonl");
+        drop(open_append_file(&transcript_path).unwrap());
+        assert_eq!(mode(&transcript_path), 0o600);
+        std::fs::set_permissions(&transcript_path, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_append_file(&transcript_path).unwrap());
+        assert_eq!(
+            mode(&transcript_path),
+            0o600,
+            "opening an existing transcript for append must tighten it before writing"
+        );
+
+        let lock_path = dir.path().join("private.lease");
+        drop(open_lock_file(&lock_path).unwrap());
+        assert_eq!(mode(&lock_path), 0o600);
+        std::fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_lock_file(&lock_path).unwrap());
+        assert_eq!(
+            mode(&lock_path),
+            0o600,
+            "opening an existing session lock must tighten it before use"
         );
     }
 

@@ -145,12 +145,8 @@ impl McpTokenStore {
     }
 
     fn save_file(&self, file: &McpAuthFile) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}", parent.display()))?;
-        }
         let text = toml::to_string_pretty(file).context("Failed to serialize MCP auth")?;
-        std::fs::write(&self.path, text)
+        crate::fs::atomic_write(&self.path, text.as_bytes(), 0o600)
             .with_context(|| format!("Failed to write {}", self.path.display()))
     }
 }
@@ -805,7 +801,8 @@ mod tests {
     #[test]
     fn token_store_round_trips_server_token() {
         let dir = tempfile::tempdir().unwrap();
-        let store = McpTokenStore::new(dir.path().join("mcp_auth.toml"));
+        let path = dir.path().join("mcp_auth.toml");
+        let store = McpTokenStore::new(path.clone());
         let token = McpOAuthToken {
             provider: "github".to_string(),
             issuer: Some("https://github.com".to_string()),
@@ -821,11 +818,32 @@ mod tests {
         };
         store.save_token("github", token).unwrap();
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "new OAuth token stores must be private");
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
         let loaded = store.load_token("github").unwrap().unwrap();
         assert_eq!(loaded.provider, "github");
         assert_eq!(loaded.access_token, "token");
         assert_eq!(loaded.scopes, vec!["repo"]);
         assert!(store.delete_token("github").unwrap());
         assert!(store.load_token("github").unwrap().is_none());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "rewriting an existing OAuth token store must tighten its permissions"
+            );
+        }
     }
 }
