@@ -16361,7 +16361,16 @@ fn handle_runtime_event(
                             ));
                         }
                         if let Some(announcement) = announce.filter(|value| !value.is_empty()) {
-                            renderer.render(UiLine::CommandOutput(announcement));
+                            // Retained mode gives the next user message its own
+                            // leading paragraph boundary. Do not encode that
+                            // layout in the translated `/model` announcement:
+                            // the trailing newline used to create a transient
+                            // blank row that could be consumed while the footer
+                            // and live body changed geometry. PlainRenderer
+                            // still terminates CommandOutput with `\n` itself.
+                            renderer.render(UiLine::CommandOutput(
+                                announcement.trim_end_matches(['\r', '\n']).to_string(),
+                            ));
                         }
                         if manual_reload_announce {
                             renderer.render(UiLine::CommandOutput(

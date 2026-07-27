@@ -6480,6 +6480,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     fn push_user_message(&mut self, text: &str, attachments: &[usize]) {
+        // A new user block owns its leading paragraph boundary. Local command
+        // output (for example `/model`) may not have a turn separator, while
+        // ordinary turns already end in a blank row. Reuse that row when it
+        // exists; otherwise insert exactly one before marking the message so
+        // navigation anchors point at the chevron rather than the spacer.
+        let tail_is_blank = self
+            .body_lines
+            .last()
+            .is_none_or(|row| row.iter().all(|cell| cell.ch == ' '));
+        if !tail_is_blank {
+            self.push_body_row(Vec::new());
+        }
         self.mark_message(crate::render::MarkKind::User);
         self.last_mark_was_assistant = false;
         let safe = scrub_controls(text);
@@ -13205,6 +13217,84 @@ mod tests {
     }
 
     #[test]
+    fn retained_user_after_local_command_output_has_one_leading_blank() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // A resumed/long-running session has a full body viewport. The
+        // screenshot regression only appears once new rows advance that
+        // viewport, not in a nearly empty transcript.
+        for i in 0..30 {
+            r.render(UiLine::CommandOutput(format!("older-{i:02}")));
+        }
+        // Match the real `/model` success path: the event loop removes the
+        // translated payload's line ending, then the idle prompt is painted
+        // before the next submission clears the composer and emits the echo.
+        r.render(UiLine::CommandOutput(
+            "Switched to provider · model; default for new sessions".into(),
+        ));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        r.render(UiLine::ClearTransient);
+        r.render(UiLine::User("now?".into()));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let output_row = (0..24)
+            .find(|row| vterm.row_text(*row).contains("Switched to provider"))
+            .unwrap_or_else(|| panic!("model output missing:\n{}", vterm.dump()));
+        let user_row = (0..24)
+            .find(|row| vterm.row_text(*row).contains("now?"))
+            .unwrap_or_else(|| panic!("user echo missing:\n{}", vterm.dump()));
+
+        assert_eq!(
+            user_row - output_row,
+            2,
+            "local command output and the next user message need exactly one blank row"
+        );
+        assert!(
+            vterm.row_text(output_row + 1).trim().is_empty(),
+            "the intervening physical terminal row must be blank:\n{}",
+            vterm.dump()
+        );
+    }
+
+    #[test]
+    fn retained_user_reuses_existing_leading_blank() {
+        let (mut r, _buf) = new_capturing(80, 24);
+
+        r.render(UiLine::User("first".into()));
+        let rows_after_first = r.body_lines.len();
+        r.render(UiLine::User("second".into()));
+
+        // The first user event already supplied its trailing spacer. The
+        // second event must reuse it rather than introducing another blank.
+        assert_eq!(r.body_lines.len(), rows_after_first + 2);
+        assert!(r.body_lines[rows_after_first - 1].is_empty());
+        assert!(r.body_lines[rows_after_first]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect::<String>()
+            .contains("second"));
+    }
+
+    #[test]
     fn retained_full_viewport_keeps_user_spinner_blank_and_logical_top() {
         let width = 80u16;
         let height = 12u16;
@@ -15731,9 +15821,9 @@ mod tests {
             attachments: Vec::new(),
         });
         let empty_footer_rows = r.current_footer_rows();
-        // Two text rows plus the standard blank separator appended by
-        // `push_user_message`.
-        let body_rows_before_echo = 12usize.saturating_sub(empty_footer_rows + 3);
+        // One leading separator, two text rows, plus the trailing separator
+        // appended by `push_user_message`.
+        let body_rows_before_echo = 12usize.saturating_sub(empty_footer_rows + 4);
         for i in 0..body_rows_before_echo {
             r.push_body_text(&format!("prior-{i}"), &CellStyle::default());
         }
