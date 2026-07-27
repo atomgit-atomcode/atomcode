@@ -11445,7 +11445,19 @@ pub(crate) fn set_agent_mode(
         renderer.render(UiLine::CommandOutput(msg));
         renderer.flush();
     }
-    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    // `redraw_idle_plain` renders `UiLine::InputPrompt`, whose retained handler
+    // treats reaching the idle prompt as "the turn is over" and
+    // `commit_inflight_tool()` + `clear_live_spinner()`. That is correct at
+    // idle, but this is also reached MID-TURN from the streaming Tab / Shift+Tab
+    // mode-cycle handler — where a tool is still in flight. Committing it early
+    // (then re-establishing the strip on the very next `draw_spinner_now`) makes
+    // the live spinner/thinking row flash a garbled frame that self-heals on the
+    // next paint (the reported "tab 切换时思考过程被覆盖，过一会儿恢复" bug).
+    // Only repaint the idle footer when actually idle; streaming callers own the
+    // repaint via `draw_spinner_now`.
+    if matches!(app.state.phase, crate::state::UiPhase::Idle) {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    }
 }
 
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {

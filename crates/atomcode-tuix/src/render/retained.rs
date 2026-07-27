@@ -10258,6 +10258,43 @@ mod tests {
         );
     }
 
+    /// The retained `InputPrompt` handler treats reaching the idle prompt as
+    /// "the turn is over": it `commit_inflight_tool()`s any running tool and
+    /// clears the live spinner. That is correct at idle, but destructive
+    /// mid-turn — committing a still-running tool and then re-establishing the
+    /// strip on the next `draw_spinner_now` is exactly what flashed a garbled
+    /// spinner/thinking row when Tab cycled the agent mode during streaming
+    /// ("tab 切换时思考过程被覆盖，过一会儿恢复"). This pins the hazard so the
+    /// `set_agent_mode` guard that skips the idle repaint while streaming can't
+    /// be dropped as "unnecessary".
+    #[test]
+    fn retained_input_prompt_commits_inflight_tool_hazard() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::ToolCallInFlight {
+            id: "t1".into(),
+            name: "Bash".into(),
+            detail: "cargo test".into(),
+            hint: None,
+        });
+        assert!(r.inflight_tool.is_some(), "tool is in flight");
+        assert!(r.inflight_tool_rows > 0, "inflight strip established");
+
+        // Idle repaint mid-stream — what `set_agent_mode` → `redraw_idle_plain`
+        // used to do unconditionally on a Tab mode-cycle.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        assert!(
+            r.inflight_tool.is_none(),
+            "InputPrompt committed the in-flight tool — set_agent_mode must skip \
+             this idle repaint while streaming"
+        );
+    }
+
     #[test]
     fn retained_inflight_fallback_rowcount_change_does_not_pop_real_content() {
         // Regression for the `lift_inflight_strip` re-entrancy: `render_inflight_tool`'s
