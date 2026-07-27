@@ -206,6 +206,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     鼠标拖选 + Ctrl+C                复制（atomcode 不接管鼠标）
 
   ── 会话 ──
+    F2 / Shift+F2                    下一个 / 上一个模型
     Ctrl+C                           取消当前轮 / 关闭弹层
     Esc Esc                          撤销上一轮
     Ctrl+D                           退出 atomcode

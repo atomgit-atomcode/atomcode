@@ -16,6 +16,49 @@ use crate::event_loop::{build_status, set_default_provider_and_reload, Buffer, L
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelCycleDirection {
+    Next,
+    Previous,
+}
+
+/// Map the global model-cycle shortcuts without stealing other modified
+/// function keys from the host terminal or future bindings.
+pub(crate) fn model_cycle_direction(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> Option<ModelCycleDirection> {
+    match (code, modifiers) {
+        (KeyCode::F(2), KeyModifiers::NONE) => Some(ModelCycleDirection::Next),
+        (KeyCode::F(2), KeyModifiers::SHIFT) => Some(ModelCycleDirection::Previous),
+        _ => None,
+    }
+}
+
+/// Pick the adjacent provider in stable alphabetical order and wrap at both
+/// ends. `/model` exposes configured providers as the switchable model list, so
+/// the shortcut deliberately follows that same source of truth.
+pub(crate) fn adjacent_provider(config: &Config, direction: ModelCycleDirection) -> Option<String> {
+    let mut providers: Vec<&str> = config.providers.keys().map(String::as_str).collect();
+    providers.sort_unstable();
+    if providers.len() < 2 {
+        return None;
+    }
+
+    let current = providers
+        .iter()
+        .position(|name| *name == config.default_provider)
+        .unwrap_or(match direction {
+            ModelCycleDirection::Next => providers.len() - 1,
+            ModelCycleDirection::Previous => 0,
+        });
+    let target = match direction {
+        ModelCycleDirection::Next => (current + 1) % providers.len(),
+        ModelCycleDirection::Previous => (current + providers.len() - 1) % providers.len(),
+    };
+    Some(providers[target].to_string())
+}
+
 pub struct ModelPicker {
     /// All provider names, sorted alphabetically with the current default first.
     pub providers: Vec<String>,
@@ -410,6 +453,77 @@ mod tests {
         );
         let p = ModelPicker::open(&config);
         assert_eq!(p.chosen_provider(), Some("alpha"));
+    }
+
+    #[test]
+    fn f2_shortcuts_map_to_cycle_directions() {
+        assert_eq!(
+            model_cycle_direction(KeyCode::F(2), KeyModifiers::NONE),
+            Some(ModelCycleDirection::Next)
+        );
+        assert_eq!(
+            model_cycle_direction(KeyCode::F(2), KeyModifiers::SHIFT),
+            Some(ModelCycleDirection::Previous)
+        );
+        assert_eq!(
+            model_cycle_direction(KeyCode::F(2), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(
+            model_cycle_direction(KeyCode::F(3), KeyModifiers::NONE),
+            None
+        );
+    }
+
+    #[test]
+    fn adjacent_provider_cycles_in_stable_sorted_order() {
+        let config = make_config(
+            vec![
+                ("charlie", "openai", "gpt-4"),
+                ("alpha", "anthropic", "claude-3"),
+                ("bravo", "ollama", "qwen"),
+            ],
+            "bravo",
+        );
+
+        assert_eq!(
+            adjacent_provider(&config, ModelCycleDirection::Next).as_deref(),
+            Some("charlie")
+        );
+        assert_eq!(
+            adjacent_provider(&config, ModelCycleDirection::Previous).as_deref(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn adjacent_provider_wraps_and_ignores_single_provider() {
+        let first = make_config(
+            vec![
+                ("charlie", "openai", "gpt-4"),
+                ("alpha", "anthropic", "claude-3"),
+            ],
+            "alpha",
+        );
+        assert_eq!(
+            adjacent_provider(&first, ModelCycleDirection::Previous).as_deref(),
+            Some("charlie")
+        );
+
+        let last = make_config(
+            vec![
+                ("charlie", "openai", "gpt-4"),
+                ("alpha", "anthropic", "claude-3"),
+            ],
+            "charlie",
+        );
+        assert_eq!(
+            adjacent_provider(&last, ModelCycleDirection::Next).as_deref(),
+            Some("alpha")
+        );
+
+        let only = make_config(vec![("alpha", "openai", "gpt-4")], "alpha");
+        assert_eq!(adjacent_provider(&only, ModelCycleDirection::Next), None);
     }
 
     #[test]

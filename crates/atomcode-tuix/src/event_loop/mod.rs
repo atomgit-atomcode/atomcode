@@ -10641,6 +10641,21 @@ fn handle_idle_key(
         }
     }
 
+    // F2 / Shift+F2: cycle through configured providers in stable model-list
+    // order. This idle-path handler runs after modal dispatch, so it cannot
+    // mutate a running turn or steal F2 from an active picker.
+    if let Some(direction) =
+        crate::modals::model_picker::model_cycle_direction(code, modifiers)
+    {
+        if let Some(provider) =
+            crate::modals::model_picker::adjacent_provider(&ctx.config, direction)
+        {
+            set_default_provider_and_reload(ctx, &provider, renderer);
+        }
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
     // Ctrl+V: try clipboard image first, fall back to text paste.
     if code == KeyCode::Char('v') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         if let Some((img, hash)) = try_paste_clipboard_image() {

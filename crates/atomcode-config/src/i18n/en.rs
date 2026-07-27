@@ -215,6 +215,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Drag + Ctrl+C                    Copy text (atomcode does not capture the mouse)
 
   ── Session ──
+    F2 / Shift+F2                    Next / previous model
     Ctrl+C                           Cancel current turn / dismiss modal
     Esc Esc                          Undo the previous turn
     Ctrl+D                           Exit AtomCode
