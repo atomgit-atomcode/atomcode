@@ -319,6 +319,19 @@ fn load_snapshot(working_dir: &Path, session_id: &str) -> Result<SessionSnapshot
         .ok_or_else(|| format!("session {session_id:?} not found"))
 }
 
+async fn bind_after_mcp_ready<T, E>(
+    readiness: impl std::future::Future<Output = Result<(), E>>,
+    bind: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String>
+where
+    E: std::fmt::Debug,
+{
+    readiness
+        .await
+        .map_err(|error| format!("MCP readiness wait failed: {error:?}"))?;
+    bind()
+}
+
 pub async fn ensure_headless_runtime(
     working_dir: PathBuf,
     telemetry: Arc<Telemetry>,
@@ -407,31 +420,32 @@ pub async fn ensure_headless_runtime(
         .await
         .map_err(|error| format!("failed to set live mode: {error}"))?;
 
-    // Wait for initial MCP tools to be published before the first turn so the
-    // system prompt includes MCP tool definitions. Without this, a headless
+    // Wait for initial MCP tools to be published to the mounted kernel catalog
+    // before the first turn. Without this, a headless
     // runtime created by `atomcode.exe webui` (which has no pre-existing
     // CodingRuntime from the TUI) would start its first turn before background
     // MCP connections complete, making MCP tools invisible to the agent even
     // though `/mcp/status` shows them as connected.
     // Timeout prevents a stalled MCP server from blocking the first message.
-    handle
-        .wait_mcp_ready(atomcode_capabilities::mcp::CONNECT_TIMEOUT)
-        .await
-        .map_err(|e| format!("MCP readiness wait failed: {e:?}"))?;
-
     let session_id = session
         .map(|session| session.id)
         .ok_or_else(|| "live runtime started without a persistent session".to_string())?;
-    let binding = hub()
-        .bind_with_provider(
-            session_id.clone(),
-            working_dir.clone(),
-            provider_name,
-            provider_fingerprint,
-            initial_snapshot,
-            Arc::new(handle.clone()),
-        )
-        .map_err(|error| format!("live hub bind failed: {error:?}"))?;
+    let binding = bind_after_mcp_ready(
+        handle.wait_mcp_ready(atomcode_capabilities::mcp::CONNECT_TIMEOUT),
+        || {
+            hub()
+                .bind_with_provider(
+                    session_id.clone(),
+                    working_dir.clone(),
+                    provider_name,
+                    provider_fingerprint,
+                    initial_snapshot,
+                    Arc::new(handle.clone()),
+                )
+                .map_err(|error| format!("live hub bind failed: {error:?}"))
+        },
+    )
+    .await?;
     let event_binding = binding.clone();
     let event_handle = handle.clone();
     tokio::spawn(async move {
@@ -477,4 +491,47 @@ pub async fn ensure_headless_runtime(
     *owner = Some(HeadlessRuntime { binding, handle });
     drop(owner);
     join().map_err(|error| format!("live hub join failed: {error:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_after_mcp_ready;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn headless_bind_waits_for_mcp_catalog_readiness() {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel::<()>();
+        let bound = Arc::new(AtomicBool::new(false));
+        let bound_in_task = Arc::clone(&bound);
+
+        let bind_task = tokio::spawn(async move {
+            bind_after_mcp_ready(
+                async move {
+                    waiting_tx.send(()).unwrap();
+                    ready_rx.await.expect("readiness sender must stay alive");
+                    Ok::<(), &'static str>(())
+                },
+                || {
+                    bound_in_task.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        waiting_rx.await.unwrap();
+        assert!(
+            !bound.load(Ordering::Acquire),
+            "the live hub must remain unbound while MCP tools are unpublished"
+        );
+
+        ready_tx.send(()).unwrap();
+        bind_task.await.unwrap().unwrap();
+        assert!(
+            bound.load(Ordering::Acquire),
+            "the live hub should bind after MCP tools reach the catalog"
+        );
+    }
 }
