@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::proxy::ProxyConfig;
 use atomcode_telemetry::TelemetryConfig;
-use provider::ProviderConfig;
+use provider::{ModelProfileConfig, ProviderAccountConfig, ProviderConfig};
 
 // DEFAULT_SYSTEM_PROMPT removed — single source of truth is now
 // config/prompt_sections.rs::UNIFIED_PROMPT (~500 tok).
@@ -130,7 +130,23 @@ pub struct Config {
     pub evaluator_provider: Option<String>,
     /// Default working directory. Saved on /cd, restored on startup.
     pub default_workdir: Option<String>,
+    /// Legacy flattened providers. `#[serde(default)]` so a pure new-schema
+    /// config (accounts + models only, no `[providers]`) loads (design §4).
+    #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+    /// Provider accounts (connection + credential), keyed by account id. New
+    /// schema (design §3.2); empty when only legacy `[providers.*]` are used.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub provider_accounts: HashMap<String, ProviderAccountConfig>,
+    /// Model profiles (selectable model + limits), keyed by selection id
+    /// (recommended `<account>/<model>`). New schema (design §3.3).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub models: HashMap<String, ModelProfileConfig>,
+    /// Canonical model selection (new schema, design §14.1). When set it
+    /// supersedes `default_provider` for resolution (wired in Task 4). Optional
+    /// so legacy configs (`default_provider` only) keep working unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
     /// Per-turn datalog settings. Missing from older configs → defaults to
     /// enabled=true, dir="$ATOMCODE_HOME/datalog" (project slug appended underneath).
     ///
@@ -416,6 +432,9 @@ impl Default for Config {
             evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
+            provider_accounts: HashMap::new(),
+            models: HashMap::new(),
+            default_model: None,
             datalog: Default::default(),
             notifications: Default::default(),
             network: Default::default(),
@@ -449,6 +468,57 @@ impl Config {
             default_provider: default_provider.into(),
             ..Default::default()
         }
+    }
+
+    /// Validate the new-schema provider accounts and model profiles. Returns a
+    /// diagnostic per problem (empty ⇒ valid). Pure — does not mutate. Checks
+    /// account endpoint requirements, model→account referential integrity,
+    /// context/token limits, and `default_model` resolvability. Mixed-schema
+    /// loading (Task 3) uses this to quarantine, rather than fail, bad entries.
+    pub fn validate_provider_accounts_and_models(&self) -> Vec<String> {
+        let mut diags = Vec::new();
+        for (id, account) in &self.provider_accounts {
+            if account.provider.trim().is_empty() {
+                diags.push(format!("provider account `{id}` is missing `provider`"));
+                continue;
+            }
+            // A preset (or the custom-compatible fallback) without a built-in
+            // base URL needs one supplied on the account.
+            let preset = provider_preset::preset_or_compatible(&account.provider);
+            if preset.default_base_url.is_none() && account.base_url.is_none() {
+                diags.push(format!(
+                    "provider account `{id}` uses `{}`, which has no default endpoint; set `base_url`",
+                    account.provider
+                ));
+            }
+        }
+        for (id, model) in &self.models {
+            if model.model.trim().is_empty() {
+                diags.push(format!("model `{id}` is missing `model`"));
+            }
+            if model.account.trim().is_empty() {
+                diags.push(format!("model `{id}` is missing `account`"));
+            } else if !self.provider_accounts.contains_key(&model.account) {
+                diags.push(format!(
+                    "model `{id}` references unknown account `{}`",
+                    model.account
+                ));
+            }
+            if model.context_window == 0 {
+                diags.push(format!("model `{id}` has context_window = 0"));
+            }
+            if model.max_tokens == Some(0) {
+                diags.push(format!("model `{id}` has max_tokens = 0"));
+            }
+        }
+        if let Some(sel) = &self.default_model {
+            if !self.models.contains_key(sel) {
+                diags.push(format!(
+                    "default_model `{sel}` does not match any model profile"
+                ));
+            }
+        }
+        diags
     }
 }
 
@@ -966,6 +1036,19 @@ impl Config {
         // Filter out ephemeral providers (e.g. OAuth /login) — they live in memory only.
         let mut persistent = self.clone();
         persistent.providers.retain(|_, v| !v.ephemeral);
+        // Same for ephemeral provider accounts (their api_key is runtime-only),
+        // and drop any model profile that would be orphaned by that removal so
+        // the saved file never references a stripped account.
+        let ephemeral_accounts: std::collections::HashSet<String> = self
+            .provider_accounts
+            .iter()
+            .filter(|(_, a)| a.ephemeral)
+            .map(|(k, _)| k.clone())
+            .collect();
+        persistent.provider_accounts.retain(|_, a| !a.ephemeral);
+        persistent
+            .models
+            .retain(|_, m| !ephemeral_accounts.contains(&m.account));
         // If default_provider is ephemeral, don't change the saved default
         if !self
             .providers
@@ -1705,6 +1788,9 @@ model = "missing-type"
             evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
+            provider_accounts: HashMap::new(),
+            models: HashMap::new(),
+            default_model: None,
             datalog: DatalogConfig {
                 enabled: false,
                 dir: Some("/var/log/ac".to_string()),
@@ -2207,5 +2293,159 @@ endpoint = "https://test.example/v1"
             Some("https://telemetry.example/v1")
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod provider_accounts_model_profiles_tests {
+    use super::*;
+
+    const NEW_SCHEMA: &str = r#"
+default_provider = ""
+default_model = "aliyun-default/qwen3-coder-plus"
+
+[provider_accounts.aliyun-default]
+provider = "aliyun"
+api_key = "sk-secret"
+
+[models."aliyun-default/qwen3-coder-plus"]
+account = "aliyun-default"
+model = "qwen3-coder-plus"
+context_window = 131072
+
+[models."aliyun-default/qwen3-max"]
+account = "aliyun-default"
+model = "qwen3-max"
+context_window = 131072
+capable_model = 5
+"#;
+
+    #[test]
+    fn new_schema_parses_accounts_models_and_default_model() {
+        let cfg: Config = toml::from_str(NEW_SCHEMA).unwrap();
+        assert_eq!(cfg.provider_accounts.len(), 1);
+        assert_eq!(cfg.provider_accounts["aliyun-default"].provider, "aliyun");
+        assert_eq!(cfg.models.len(), 2);
+        assert_eq!(
+            cfg.models["aliyun-default/qwen3-coder-plus"].model,
+            "qwen3-coder-plus"
+        );
+        assert_eq!(cfg.models["aliyun-default/qwen3-max"].capable_model, Some(5));
+        assert_eq!(
+            cfg.default_model.as_deref(),
+            Some("aliyun-default/qwen3-coder-plus")
+        );
+    }
+
+    #[test]
+    fn new_schema_round_trips_through_serialize() {
+        let cfg: Config = toml::from_str(NEW_SCHEMA).unwrap();
+        let rendered = cfg.serialize_for_disk(None).unwrap();
+        let reparsed: Config = toml::from_str(&rendered).unwrap();
+        assert_eq!(reparsed.default_model, cfg.default_model);
+        assert_eq!(reparsed.provider_accounts.len(), 1);
+        assert_eq!(reparsed.models.len(), 2);
+        assert_eq!(
+            reparsed.models["aliyun-default/qwen3-max"].context_window,
+            131072
+        );
+    }
+
+    #[test]
+    fn ephemeral_account_and_its_models_are_not_serialized() {
+        let mut cfg: Config = toml::from_str(NEW_SCHEMA).unwrap();
+        cfg.provider_accounts.insert(
+            "oauth-live".into(),
+            provider::ProviderAccountConfig {
+                provider: "openai".into(),
+                display_name: None,
+                api_key: Some("sk-runtime-only".into()),
+                base_url: None,
+                user_agent: None,
+                skip_tls_verify: false,
+                enterprise_url: None,
+                ephemeral: true,
+            },
+        );
+        cfg.models.insert(
+            "oauth-live/gpt".into(),
+            provider::ModelProfileConfig {
+                account: "oauth-live".into(),
+                model: "gpt-x".into(),
+                display_name: None,
+                context_window: 128_000,
+                max_tokens: None,
+                capable_model: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                pricing: None,
+            },
+        );
+        let rendered = cfg.serialize_for_disk(None).unwrap();
+        assert!(
+            !rendered.contains("sk-runtime-only"),
+            "ephemeral account credential leaked into saved config"
+        );
+        assert!(!rendered.contains("oauth-live"), "ephemeral account persisted");
+        // The persistent account + models survive.
+        assert!(rendered.contains("aliyun-default"));
+    }
+
+    #[test]
+    fn validation_catches_bad_references_and_limits() {
+        let mut cfg = Config::default();
+        cfg.provider_accounts.insert(
+            "corp".into(),
+            provider::ProviderAccountConfig {
+                provider: "openai-compatible".into(), // no default endpoint…
+                display_name: None,
+                api_key: None,
+                base_url: None, // …and none supplied → error
+                user_agent: None,
+                skip_tls_verify: false,
+                enterprise_url: None,
+                ephemeral: false,
+            },
+        );
+        cfg.models.insert(
+            "corp/bad".into(),
+            provider::ModelProfileConfig {
+                account: "does-not-exist".into(), // dangling reference → error
+                model: "".into(),                 // empty model → error
+                display_name: None,
+                context_window: 0, // zero window → error
+                max_tokens: None,
+                capable_model: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                pricing: None,
+            },
+        );
+        cfg.default_model = Some("nope".into()); // unresolvable default → error
+
+        let diags = cfg.validate_provider_accounts_and_models();
+        assert!(diags.iter().any(|d| d.contains("no default endpoint")), "{diags:?}");
+        assert!(diags.iter().any(|d| d.contains("unknown account")), "{diags:?}");
+        assert!(diags.iter().any(|d| d.contains("missing `model`")), "{diags:?}");
+        assert!(diags.iter().any(|d| d.contains("context_window = 0")), "{diags:?}");
+        assert!(diags.iter().any(|d| d.contains("default_model")), "{diags:?}");
+    }
+
+    #[test]
+    fn valid_new_schema_passes_validation() {
+        let cfg: Config = toml::from_str(NEW_SCHEMA).unwrap();
+        assert!(
+            cfg.validate_provider_accounts_and_models().is_empty(),
+            "{:?}",
+            cfg.validate_provider_accounts_and_models()
+        );
     }
 }

@@ -105,6 +105,73 @@ pub struct ProviderConfig {
     pub pricing: Option<ProviderPricing>,
 }
 
+/// A provider *account*: a reusable connection + credential identity (new schema,
+/// design §3.2). `provider` references a preset id (see
+/// [`super::provider_preset`]) or a custom-compatible preset. One account can
+/// back many [`ModelProfileConfig`]s, so two models from the same vendor no
+/// longer duplicate `type` / `base_url` / `api_key`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAccountConfig {
+    /// Preset id or custom protocol preset (`openai-compatible` /
+    /// `anthropic-compatible`).
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Overrides the preset's default base URL. Required for custom-compatible
+    /// providers (which have no preset default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_tls_verify: bool,
+    /// Enterprise/self-hosted control-plane URL for OAuth-style providers
+    /// (reserved; unused until an OAuth adapter lands).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enterprise_url: Option<String>,
+    /// Runtime-only account (e.g. OAuth `/login`); never persisted to disk.
+    #[serde(skip)]
+    pub ephemeral: bool,
+}
+
+/// A model *profile*: a selectable model plus its model-specific behavior (new
+/// schema, design §3.3). `account` references a [`ProviderAccountConfig`]; the
+/// profile owns only per-model limits, so an account can expose several models.
+/// The recommended selection-id key is `<account>/<model-or-alias>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfileConfig {
+    pub account: String,
+    /// Wire model name sent to the provider (kept separate from the selection id
+    /// so aliases / deployment names are supported).
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default = "default_context_window")]
+    pub context_window: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+    /// Per-model capability rank for the `task` subagent's strong/weak routing
+    /// (design §14.2). Higher = more capable; unset ⇒ does not participate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capable_model: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_keep: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_history: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ProviderPricing>,
+}
+
 impl ProviderConfig {
     /// True if this provider's active model can accept image inputs.
     /// Driven entirely by the model-name heuristic in
