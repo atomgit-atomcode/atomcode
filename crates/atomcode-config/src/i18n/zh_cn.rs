@@ -504,6 +504,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "未配置活跃的 Provider。使用 /provider 添加一个。".into(),
         Msg::CmdProviderUnavailable =>
             "Provider 当前不可用。请使用 /login 登录，或用 /provider 配置。".into(),
+        Msg::CmdProviderUnsupportedBuild =>
+            "当前构建不支持 AtomGit 官方网关。请安装官方版本，或使用 /provider 切换其他 Provider。".into(),
         Msg::CmdProviderReloading =>
             "正在切换 Provider/模型，请等待切换完成后再发送。".into(),
         Msg::SubmitHeldUntilProviderReady =>

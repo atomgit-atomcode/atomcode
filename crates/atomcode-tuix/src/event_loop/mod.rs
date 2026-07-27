@@ -1071,13 +1071,21 @@ fn runtime_ui_availability(phase: atomcode_coding::RuntimePhase) -> RuntimeUiAva
 /// different: it is an authoritative CodingRuntime phase shared by local and
 /// live submissions, so both paths must hold until the replacement commits.
 /// Fatal states (`Failed` / `Stopped`) still surface the error.
-fn hold_submit_until_ready(live: bool, availability: RuntimeUiAvailability) -> bool {
+fn hold_submit_until_ready(
+    live: bool,
+    availability: RuntimeUiAvailability,
+    unavailable_reason: Option<atomcode_coding::ProviderUnavailableReason>,
+) -> bool {
     availability == RuntimeUiAvailability::Reconfiguring
         || (!live
-            && matches!(
-                availability,
-                RuntimeUiAvailability::AwaitingProvider | RuntimeUiAvailability::Starting
-            ))
+            && (availability == RuntimeUiAvailability::Starting
+                || (availability == RuntimeUiAvailability::AwaitingProvider
+                    && matches!(
+                        unavailable_reason,
+                        None | Some(
+                            atomcode_coding::ProviderUnavailableReason::AuthenticationRequired
+                        )
+                    ))))
 }
 
 /// Guard for the type-ahead drain: a queued message must only be replayed when
@@ -1649,15 +1657,28 @@ mod submit_hold_tests {
         // deferred runtime still constructing — hold the prompt.
         assert!(hold_submit_until_ready(
             false,
-            RuntimeUiAvailability::AwaitingProvider
+            RuntimeUiAvailability::AwaitingProvider,
+            Some(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired),
         ));
         assert!(hold_submit_until_ready(
             false,
-            RuntimeUiAvailability::Starting
+            RuntimeUiAvailability::Starting,
+            None,
         ));
         assert!(hold_submit_until_ready(
             false,
-            RuntimeUiAvailability::Reconfiguring
+            RuntimeUiAvailability::Reconfiguring,
+            None,
+        ));
+        assert!(!hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::AwaitingProvider,
+            Some(atomcode_coding::ProviderUnavailableReason::UnsupportedBuild),
+        ));
+        assert!(!hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::AwaitingProvider,
+            Some(atomcode_coding::ProviderUnavailableReason::NotConfigured),
         ));
 
         // Fatal / normal states: never hold — either it would submit fine
@@ -1665,15 +1686,18 @@ mod submit_hold_tests {
         // must surface.
         assert!(!hold_submit_until_ready(
             false,
-            RuntimeUiAvailability::Available
+            RuntimeUiAvailability::Available,
+            None,
         ));
         assert!(!hold_submit_until_ready(
             false,
-            RuntimeUiAvailability::Failed
+            RuntimeUiAvailability::Failed,
+            None,
         ));
         assert!(!hold_submit_until_ready(
             false,
-            RuntimeUiAvailability::Stopped
+            RuntimeUiAvailability::Stopped,
+            None,
         ));
     }
 
@@ -1689,11 +1713,12 @@ mod submit_hold_tests {
             RuntimeUiAvailability::Failed,
             RuntimeUiAvailability::Stopped,
         ] {
-            assert!(!hold_submit_until_ready(true, availability));
+            assert!(!hold_submit_until_ready(true, availability, None));
         }
         assert!(hold_submit_until_ready(
             true,
-            RuntimeUiAvailability::Reconfiguring
+            RuntimeUiAvailability::Reconfiguring,
+            None,
         ));
     }
 
@@ -2106,6 +2131,18 @@ impl DeferredRuntimeControl {
         }
     }
 
+    fn provider_unavailable_reason(
+        &self,
+    ) -> Option<atomcode_coding::ProviderUnavailableReason> {
+        match &*self.state.borrow() {
+            atomcode_coding::DeferredRuntimeState::Ready(handle) => {
+                handle.provider_unavailable_reason()
+            }
+            atomcode_coding::DeferredRuntimeState::Starting
+            | atomcode_coding::DeferredRuntimeState::Failed(_) => None,
+        }
+    }
+
     fn normal_operation_allowed(&self) -> bool {
         match &*self.state.borrow() {
             atomcode_coding::DeferredRuntimeState::Ready(handle) => matches!(
@@ -2264,6 +2301,15 @@ impl RuntimeControl {
         match self {
             Self::Ready(ready) => runtime_ui_availability(ready.handle.status().phase),
             Self::Deferred(deferred) => deferred.ui_availability(),
+        }
+    }
+
+    fn provider_unavailable_reason(
+        &self,
+    ) -> Option<atomcode_coding::ProviderUnavailableReason> {
+        match self {
+            Self::Ready(ready) => ready.handle.provider_unavailable_reason(),
+            Self::Deferred(deferred) => deferred.provider_unavailable_reason(),
         }
     }
 
@@ -11022,7 +11068,12 @@ fn handle_idle_key(
                 }
                 {
                     let availability = ctx.runtime.ui_availability();
-                    if hold_submit_until_ready(ctx.live_binding.is_some(), availability) {
+                    let unavailable_reason = ctx.runtime.provider_unavailable_reason();
+                    if hold_submit_until_ready(
+                        ctx.live_binding.is_some(),
+                        availability,
+                        unavailable_reason,
+                    ) {
                         // New session whose provider is still recovering auth
                         // (AwaitingProvider) or still starting (daemon deferred).
                         // The message was already echoed above; hold it in the
@@ -11080,9 +11131,20 @@ fn handle_idle_key(
                             }
                         } else {
                             app.state.on_submit_rejected();
+                            let message = match unavailable_reason {
+                                Some(
+                                    atomcode_coding::ProviderUnavailableReason::UnsupportedBuild,
+                                ) => crate::i18n::Msg::CmdProviderUnsupportedBuild,
+                                Some(atomcode_coding::ProviderUnavailableReason::NotConfigured) => {
+                                    crate::i18n::Msg::CmdNoActiveProvider
+                                }
+                                Some(
+                                    atomcode_coding::ProviderUnavailableReason::AuthenticationRequired,
+                                )
+                                | None => crate::i18n::Msg::CmdProviderUnavailable,
+                            };
                             renderer.render(UiLine::Error(
-                                crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable)
-                                    .into_owned(),
+                                crate::i18n::t(message).into_owned(),
                             ));
                             // Commit cleared the input buffer before dispatch. Render that
                             // empty prompt so the retained renderer does not keep displaying
@@ -17134,6 +17196,9 @@ fn handle_coding_runtime_event(
                 }
                 atomcode_coding::ProviderUnavailableReason::AuthenticationRequired => {
                     crate::i18n::t(crate::i18n::Msg::CmdWhoamiNotSignedIn)
+                }
+                atomcode_coding::ProviderUnavailableReason::UnsupportedBuild => {
+                    crate::i18n::t(crate::i18n::Msg::CmdProviderUnsupportedBuild)
                 }
             };
             renderer.render(UiLine::CommandOutput(message.into_owned()));

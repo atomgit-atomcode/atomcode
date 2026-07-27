@@ -616,6 +616,7 @@ pub enum Msg<'a> {
     CmdCheckingUpdate,
     CmdNoActiveProvider,
     CmdProviderUnavailable,
+    CmdProviderUnsupportedBuild,
     CmdProviderReloading,
     SubmitHeldUntilProviderReady,
     SubmitHeldUntilLogin,

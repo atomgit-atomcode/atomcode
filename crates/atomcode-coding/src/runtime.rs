@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
@@ -390,6 +390,7 @@ impl Error for RuntimeError {}
 pub enum ProviderUnavailableReason {
     NotConfigured,
     AuthenticationRequired,
+    UnsupportedBuild,
 }
 
 impl fmt::Display for ProviderUnavailableReason {
@@ -399,6 +400,9 @@ impl fmt::Display for ProviderUnavailableReason {
             Self::AuthenticationRequired => {
                 f.write_str("provider authentication required — run /login")
             }
+            Self::UnsupportedBuild => f.write_str(
+                "this build cannot access the AtomGit gateway — use an official build or switch provider",
+            ),
         }
     }
 }
@@ -796,6 +800,7 @@ fn estimate_after_tokens(tokens_before: usize, bytes_before: usize, bytes_after:
 pub struct CodingRuntimeHandle {
     tx: mpsc::UnboundedSender<CodingRuntimeControl>,
     state: Arc<AtomicU64>,
+    provider_unavailable_reason: Arc<AtomicU8>,
     terminal: watch::Receiver<Option<RuntimeExit>>,
 }
 
@@ -827,6 +832,15 @@ impl CodingRuntimeHandle {
     /// Current actor-owned lifecycle state projected for fast driver checks.
     pub fn status(&self) -> RuntimeStatus {
         runtime_status(self.state.load(Ordering::Acquire))
+    }
+
+    /// Current reason an `AwaitingProvider` runtime cannot accept turns.
+    /// The runtime owner is the sole writer; drivers use this projection to
+    /// distinguish recoverable authentication from configuration/build gaps.
+    pub fn provider_unavailable_reason(&self) -> Option<ProviderUnavailableReason> {
+        decode_provider_unavailable_reason(
+            self.provider_unavailable_reason.load(Ordering::Acquire),
+        )
     }
 
     /// Whether a fire-and-forget driver command can be accepted in the current
@@ -1431,6 +1445,11 @@ impl CodingRuntime {
                             Some(ProviderUnavailableReason::AuthenticationRequired),
                         )
                     }
+                    Err(crate::ProviderBuildError::SourceBuildGatewayUnsupported { .. })
+                        if bootstrap == ProviderBootstrap::RecoverAuthentication =>
+                    {
+                        (None, Some(ProviderUnavailableReason::UnsupportedBuild))
+                    }
                     Err(error) => return Err(RuntimeStartError::Provider(error)),
                 }
             }
@@ -1596,6 +1615,7 @@ pub struct RuntimeExit {
 pub struct CodingRuntimeControlReceiver {
     rx: mpsc::UnboundedReceiver<CodingRuntimeControl>,
     state: Arc<AtomicU64>,
+    provider_unavailable_reason: Arc<AtomicU8>,
     terminal_tx: watch::Sender<Option<RuntimeExit>>,
 }
 
@@ -1741,18 +1761,39 @@ pub fn coding_runtime_control_channel() -> (CodingRuntimeHandle, CodingRuntimeCo
     // A standalone channel is immediately usable. The runtime owner overrides
     // this flag at spawn time when startup produced only a degraded placeholder.
     let state = Arc::new(AtomicU64::new(runtime_state(0, true)));
+    let provider_unavailable_reason = Arc::new(AtomicU8::new(0));
     (
         CodingRuntimeHandle {
             tx,
             state: Arc::clone(&state),
+            provider_unavailable_reason: Arc::clone(&provider_unavailable_reason),
             terminal,
         },
         CodingRuntimeControlReceiver {
             rx,
             state,
+            provider_unavailable_reason,
             terminal_tx,
         },
     )
+}
+
+fn encode_provider_unavailable_reason(reason: Option<ProviderUnavailableReason>) -> u8 {
+    match reason {
+        None => 0,
+        Some(ProviderUnavailableReason::NotConfigured) => 1,
+        Some(ProviderUnavailableReason::AuthenticationRequired) => 2,
+        Some(ProviderUnavailableReason::UnsupportedBuild) => 3,
+    }
+}
+
+fn decode_provider_unavailable_reason(value: u8) -> Option<ProviderUnavailableReason> {
+    match value {
+        1 => Some(ProviderUnavailableReason::NotConfigured),
+        2 => Some(ProviderUnavailableReason::AuthenticationRequired),
+        3 => Some(ProviderUnavailableReason::UnsupportedBuild),
+        _ => None,
+    }
 }
 
 const RUNTIME_PHASE_BITS: u64 = 3;
@@ -2056,6 +2097,10 @@ fn spawn_runtime_owner_with_optional_agent(
     };
     controls.state.store(
         runtime_phase_state(generation, initial_phase),
+        Ordering::Release,
+    );
+    controls.provider_unavailable_reason.store(
+        encode_provider_unavailable_reason(initial_unavailable_reason),
         Ordering::Release,
     );
 
@@ -3091,6 +3136,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 event_generation.store(generation, Ordering::Release);
                                 agent_available = true;
                                 provider_unavailable_reason = None;
+                                controls.provider_unavailable_reason.store(0, Ordering::Release);
                                 observed_tokens = None;
                                 snapshot_in_flight = false;
                                 compaction_suspended = false;
@@ -3121,6 +3167,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                         agent = None;
                                         agent_available = false;
                                         provider_unavailable_reason = None;
+                                        controls
+                                            .provider_unavailable_reason
+                                            .store(0, Ordering::Release);
                                         controls.state.store(
                                             runtime_phase_state(generation, RuntimePhase::Failed),
                                             Ordering::Release,
@@ -3130,6 +3179,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                         agent = Some(rollback);
                                         agent_available = true;
                                         provider_unavailable_reason = None;
+                                        controls
+                                            .provider_unavailable_reason
+                                            .store(0, Ordering::Release);
                                         controls.state.store(
                                             runtime_phase_state(generation, RuntimePhase::Ready),
                                             Ordering::Release,
@@ -3139,6 +3191,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                         agent = None;
                                         agent_available = false;
                                         provider_unavailable_reason = None;
+                                        controls
+                                            .provider_unavailable_reason
+                                            .store(0, Ordering::Release);
                                         controls.state.store(
                                             runtime_phase_state(generation, RuntimePhase::Failed),
                                             Ordering::Release,
@@ -3260,6 +3315,10 @@ fn spawn_runtime_owner_with_optional_agent(
                         event_generation.store(generation, Ordering::Release);
                         agent_available = false;
                         provider_unavailable_reason = Some(reason);
+                        controls.provider_unavailable_reason.store(
+                            encode_provider_unavailable_reason(Some(reason)),
+                            Ordering::Release,
+                        );
                         observed_tokens = None;
                         snapshot_in_flight = false;
                         controls.state.store(
@@ -5966,6 +6025,8 @@ mod tests {
         fail: std::sync::atomic::AtomicBool,
     }
 
+    struct SourceBuildGatewayFactory;
+
     struct FailAfterFirstBuildFactory {
         builds: std::sync::atomic::AtomicUsize,
     }
@@ -5995,6 +6056,26 @@ mod tests {
                 Err(crate::ProviderBuildError::Authentication(
                     "login required".into(),
                 ))
+            } else {
+                Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(
+                    vec![],
+                )))
+            }
+        }
+    }
+
+    impl CodingProviderFactory for SourceBuildGatewayFactory {
+        fn build(
+            &self,
+            config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            if config.base_url.contains("llm-api.atomgit.com") {
+                Err(
+                    crate::ProviderBuildError::SourceBuildGatewayUnsupported {
+                        base_url: config.base_url.clone(),
+                    },
+                )
             } else {
                 Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(
                     vec![],
@@ -8522,6 +8603,10 @@ mod tests {
             runtime.handle.status().phase,
             RuntimePhase::AwaitingProvider
         );
+        assert_eq!(
+            runtime.handle.provider_unavailable_reason(),
+            Some(ProviderUnavailableReason::AuthenticationRequired)
+        );
         assert!(matches!(
             runtime.handle.submit(UserInput::from("blocked")).await,
             Err(RuntimeError::ProviderUnavailable(
@@ -8536,7 +8621,58 @@ mod tests {
             RuntimeGeneration(1)
         );
         assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        assert_eq!(runtime.handle.provider_unavailable_reason(), None);
         runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_build_gateway_gap_starts_awaiting_provider_and_can_switch() {
+        let mut start = native_start(false);
+        start.agent.base_url = "https://llm-api.atomgit.com/v1".into();
+        start.provider_factory = Arc::new(SourceBuildGatewayFactory);
+
+        let runtime =
+            CodingRuntime::start_with_bootstrap(start, ProviderBootstrap::RecoverAuthentication)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            runtime.handle.status().phase,
+            RuntimePhase::AwaitingProvider
+        );
+        assert_eq!(
+            runtime.handle.provider_unavailable_reason(),
+            Some(ProviderUnavailableReason::UnsupportedBuild)
+        );
+        assert!(matches!(
+            runtime.handle.submit(UserInput::from("blocked")).await,
+            Err(RuntimeError::ProviderUnavailable(
+                ProviderUnavailableReason::UnsupportedBuild
+            ))
+        ));
+
+        let next = CodingAgentConfig::new("key", "https://example.test/v1", "ready", ".");
+        assert_eq!(
+            runtime.handle.reassemble_provider(next).await.unwrap(),
+            RuntimeGeneration(1)
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        assert_eq!(runtime.handle.provider_unavailable_reason(), None);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_source_build_gateway_gap_remains_startup_error() {
+        let mut start = native_start(false);
+        start.agent.base_url = "https://llm-api.atomgit.com/v1".into();
+        start.provider_factory = Arc::new(SourceBuildGatewayFactory);
+
+        assert!(matches!(
+            CodingRuntime::start_with_bootstrap(start, ProviderBootstrap::Required).await,
+            Err(RuntimeStartError::Provider(
+                crate::ProviderBuildError::SourceBuildGatewayUnsupported { base_url }
+            )) if base_url == "https://llm-api.atomgit.com/v1"
+        ));
     }
 
     #[tokio::test]
