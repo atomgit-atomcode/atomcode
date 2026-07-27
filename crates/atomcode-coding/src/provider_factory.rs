@@ -214,6 +214,52 @@ pub fn tier_provider_builder(
     Some(Arc::new(move || factory.build(&tier, None).ok()))
 }
 
+/// Build a tier [`CodingAgentConfig`] from an already-resolved model selection
+/// (design §14.2). Mirrors [`derive_tier_config`] but reads the flattened
+/// [`ResolvedModelConfig`], so a tier can be a model profile on any account.
+pub fn derive_tier_config_from_resolved(
+    base: &CodingAgentConfig,
+    resolved: &atomcode_config::config::provider::ResolvedModelConfig,
+) -> CodingAgentConfig {
+    let mut tier = base.clone();
+    tier.model = resolved.model.clone();
+    tier.provider_name = resolved.selection_id.clone();
+    tier.pricing = crate::resolve_resolved_pricing(resolved);
+    if let Some(base_url) = &resolved.base_url {
+        tier.base_url = base_url.clone();
+    }
+    if let Some(api_key) = &resolved.api_key {
+        tier.api_key = api_key.clone();
+    }
+    tier.provider_type = resolved.provider_type.clone();
+    tier.context_window = resolved.context_window as u32;
+    tier.chat_options.max_tokens = resolved.max_tokens.map(|value| value as u32);
+    tier.thinking_type = resolved.thinking_type.clone();
+    tier.thinking_keep = resolved.thinking_keep.clone();
+    tier.reasoning_history = resolved.reasoning_history.clone();
+    tier.thinking_enabled = resolved.thinking_enabled;
+    tier.user_agent = resolved.user_agent.clone();
+    tier.skip_tls_verify = resolved.skip_tls_verify;
+    tier.subagent_fast_provider = None;
+    tier.subagent_capable_provider = None;
+    tier.subagent_config = None;
+    tier
+}
+
+/// [`tier_provider_builder`] for a resolved model selection.
+pub fn tier_provider_builder_from_resolved(
+    factory: Arc<dyn CodingProviderFactory>,
+    base: &CodingAgentConfig,
+    host_model: &str,
+    resolved: &atomcode_config::config::provider::ResolvedModelConfig,
+) -> Option<SubagentProvider> {
+    if resolved.model == host_model {
+        return None;
+    }
+    let tier = derive_tier_config_from_resolved(base, resolved);
+    Some(Arc::new(move || factory.build(&tier, None).ok()))
+}
+
 pub fn resolve_subagent_tier_thunks(
     factory: Arc<dyn CodingProviderFactory>,
     base: &CodingAgentConfig,
@@ -228,10 +274,10 @@ pub fn resolve_subagent_tier_thunks(
     };
     let thunk_for = |key: &str| -> SubagentProvider {
         config
-            .providers
-            .get(key)
-            .and_then(|provider| {
-                tier_provider_builder(factory.clone(), base, host_model, key, provider)
+            .resolve_model(Some(key))
+            .ok()
+            .and_then(|resolved| {
+                tier_provider_builder_from_resolved(factory.clone(), base, host_model, &resolved)
             })
             .unwrap_or_else(none)
     };

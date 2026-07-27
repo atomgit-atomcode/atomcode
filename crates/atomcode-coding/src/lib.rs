@@ -65,7 +65,8 @@ pub use assemble::{
 pub use atomcode_kernel::message::ImageContent;
 pub use config::{
     apply_provider_config, resolve_loop_max_rounds, resolve_provider_pricing,
-    resolve_turn_max_rounds, CodingAgentConfig, CodingRuntimeConfig, SubagentProvider, TierProvider,
+    resolve_resolved_pricing, resolve_turn_max_rounds, CodingAgentConfig, CodingRuntimeConfig,
+    SubagentProvider, TierProvider,
 };
 pub use controllers::{GoalProgress, GoalTerminal, LoopProgress};
 pub use discipline::VerifyCadenceHook;

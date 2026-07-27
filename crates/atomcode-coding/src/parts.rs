@@ -1413,14 +1413,17 @@ pub fn assemble(
                 crate::subagent_tiers::resolve_tier_keys(registry, &cfg.model)
             {
                 let install_recorder = |cell: &Arc<crate::config::TierProvider>, key: &str| {
-                    if let Some(provider) = registry.providers.get(key) {
-                        let pricing = crate::resolve_provider_pricing(key, provider);
+                    // `key` is a model-selection id (design §14.2); resolve it the
+                    // same way the tier provider was built so usage attribution
+                    // (model name + pricing) matches.
+                    if let Ok(resolved) = registry.resolve_model(Some(key)) {
+                        let pricing = crate::resolve_resolved_pricing(&resolved);
                         let mut recorder =
                             atomcode_capabilities::session::DetachedUsageRecorder::new(
                                 b.manager.clone(),
                                 &b.id,
                                 key,
-                                &provider.model,
+                                &resolved.model,
                                 pricing,
                             );
                         if let Some(status) = parts.snapshot_persistence_status() {

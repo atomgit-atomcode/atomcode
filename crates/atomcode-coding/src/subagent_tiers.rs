@@ -1,37 +1,35 @@
-//! Resolve the `task` subagent's fast / capable tier keys from `Config.providers`, ranked by
-//! each provider's `capable_model` (higher = more capable). A provider WITHOUT `capable_model`
-//! set does not participate. Routing engages only when the HOST model itself participates AND
-//! there are ≥2 participants; otherwise both tiers collapse to the host's own key so the
-//! subagent runs on the current model (the self-configured / single-model case).
+//! Resolve the `task` subagent's fast / capable tier selection ids from the unified model
+//! catalog (design §14.2), ranked by each model profile's `capable_model` (higher = more
+//! capable). A model WITHOUT `capable_model` set does not participate. Routing engages only
+//! when the HOST model itself participates AND there are ≥2 participants; otherwise both tiers
+//! collapse to the host so the subagent runs on the current model (the self-configured /
+//! single-model case). Legacy `[providers.*]` project to catalog models of the same id, so
+//! this is behavior-identical to the old provider-map ranking for legacy configs.
 
 use atomcode_config::config::Config;
 
-/// Resolve `Some((fast_key, capable_key))` for the subagent tiers, given the current
-/// `host_model`, or `None` when routing should NOT engage (⇒ the subagent uses the current
-/// host provider for both tiers).
-/// - Only providers with `capable_model` set participate; higher rank ⇒ more capable.
+/// Resolve `Some((fast_id, capable_id))` — model-selection ids for the subagent tiers, given
+/// the current `host_model`, or `None` when routing should NOT engage (⇒ the subagent uses the
+/// current host model for both tiers).
+/// - Only catalog models with `capable_model` set participate; higher rank ⇒ more capable.
 /// - `fast` = the lowest-ranked participant, `capable` = the highest-ranked.
 /// - Returns `None` when the host model doesn't itself participate (a self-configured model),
-///   or when there are fewer than 2 participants. Returning `None` (rather than the host's
-///   key) avoids a subtle bug: if the host model isn't in `providers`, there is no reliable
-///   "host key" to collapse to.
-/// Deterministic: ties in rank are broken by provider key.
+///   or when there are fewer than 2 participants.
+/// Deterministic: ties in rank are broken by selection id.
 pub fn resolve_tier_keys(config: &Config, host_model: &str) -> Option<(String, String)> {
-    // A self-configured host (no `capable_model`) never routes, even if other providers
-    // carry a rank.
-    let host_participates = config
-        .providers
+    let models = config.logical_models();
+    // A self-configured host (no `capable_model`) never routes, even if other models carry a rank.
+    let host_participates = models
         .values()
-        .any(|pc| pc.model == host_model && pc.capable_model.is_some());
+        .any(|m| m.model == host_model && m.capable_model.is_some());
     if !host_participates {
         return None;
     }
 
-    // Rank the participating providers (ascending capability; ties broken by key).
-    let mut ranked: Vec<(&String, i64)> = config
-        .providers
+    // Rank the participating models (ascending capability; ties broken by selection id).
+    let mut ranked: Vec<(&String, i64)> = models
         .iter()
-        .filter_map(|(k, pc)| pc.capable_model.map(|c| (k, c)))
+        .filter_map(|(id, m)| m.capable_model.map(|c| (id, c)))
         .collect();
     if ranked.len() < 2 {
         return None;
@@ -128,5 +126,24 @@ mod tests {
         c.providers.insert("mine".into(), pc("x", None));
         c.default_provider = "mine".into();
         assert_eq!(resolve_tier_keys(&c, "x"), None);
+    }
+
+    #[test]
+    fn new_schema_routes_by_per_model_capable_rank_on_one_account() {
+        // §14.2: two model profiles on the SAME account, ranked per-model. Tiers
+        // resolve to model-selection ids — no duplicated connection settings.
+        let c: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "acc/cap",
+            "provider_accounts": { "acc": { "provider": "deepseek", "api_key": "sk" } },
+            "models": {
+                "acc/fast": { "account": "acc", "model": "deepseek-flash", "context_window": 131072, "capable_model": 0 },
+                "acc/cap":  { "account": "acc", "model": "deepseek-max",   "context_window": 131072, "capable_model": 5 }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            resolve_tier_keys(&c, "deepseek-max"),
+            Some(("acc/fast".to_string(), "acc/cap".to_string()))
+        );
     }
 }
