@@ -5018,24 +5018,27 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // and direct iteration would otherwise double-borrow.
         //
         // Keep the logical top row fixed while a transient strip is active,
-        // but also retain the newest permanent tail. At a full viewport the
-        // tail commonly ends in `User, blank`; keeping only the permanent
-        // prefix would hide that blank and make the spinner touch the user
-        // message. The middle omission is transient and is restored as soon
-        // as the spinner clears; preserving row 0 keeps the next overflow LF
-        // aligned with `scrolled_off`.
+        // and fill the remaining slots from the NEWEST permanent tail. The
+        // omitted rows are the OLDEST ones (right below the pinned top), and
+        // they reappear the instant the spinner clears; preserving row 0
+        // keeps the next overflow LF aligned with `scrolled_off`.
         let mut rows: Vec<Vec<Cell>> = if permanent_visible <= permanent_slots {
             self.body_lines[self.scrolled_off..permanent_end].to_vec()
         } else if permanent_slots == 0 {
             Vec::new()
         } else {
-            // Preserve only the two newest permanent rows (normally
-            // `latest user message, blank`) and keep the rest as a
-            // continuous prefix. This confines the transient omission to
-            // the bottom few rows, so clearing the spinner restores only a
-            // tiny cell diff instead of repainting the whole viewport.
-            let tail_slots = permanent_slots.saturating_sub(1).min(2);
-            let prefix_slots = permanent_slots.saturating_sub(tail_slots);
+            // Pin only physical row 0 (`body_lines[scrolled_off]`, required
+            // for overflow-LF alignment) and draw the newest
+            // `permanent_slots - 1` rows below it. The transient omission is
+            // thus confined to the OLDEST middle rows, never the recent tail.
+            //
+            // A prior version kept a large old prefix plus only the two
+            // newest rows, which dropped the recent middle — e.g. the user's
+            // own echo once a tool committed rows after it — so a just-
+            // submitted prompt disappeared until the turn finished. Tail-
+            // anchoring the remainder keeps that recent context on screen.
+            let prefix_slots = 1usize.min(permanent_slots);
+            let tail_slots = permanent_slots.saturating_sub(prefix_slots);
             let prefix_end = self.scrolled_off.saturating_add(prefix_slots);
             let tail_start = permanent_end.saturating_sub(tail_slots);
             let mut visible = self.body_lines[self.scrolled_off..prefix_end].to_vec();
@@ -16960,6 +16963,52 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("\n")
+        );
+    }
+
+    /// REPRO: during streaming with a full viewport, the user's own echo
+    /// row must stay visible. When a tool runs *after* the echo, the echo
+    /// becomes a middle permanent row; the live-spinner overlay's
+    /// "keep prefix + newest 2 permanent rows" heuristic omits the middle,
+    /// so the echo vanishes until the spinner clears (the reported bug).
+    #[test]
+    fn retained_streaming_spinner_keeps_user_echo_when_tool_follows() {
+        let w: u16 = 60;
+        let h: u16 = 20;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let cap = (h as usize).saturating_sub(r.current_footer_rows());
+        // Prior turn fills the viewport so the new turn overflows.
+        for i in 0..(cap + 4) {
+            r.render(UiLine::AssistantText(format!("prior-line-{:03}\n", i)));
+        }
+        // New turn: user echo, THEN a tool runs (so the echo is no longer
+        // one of the two newest permanent rows), THEN the spinner ticks.
+        let echo = "check-beijing-weather-please";
+        r.render(UiLine::User(echo.into()));
+        r.render(UiLine::AssistantText("WebSearch(beijing weather)\n".into()));
+        r.render(UiLine::AssistantText("sources: tianqi.com, exa.ai +3\n".into()));
+        r.render(UiLine::Spinner {
+            frame: "⠋".into(),
+            label: "Pondering…".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(
+            vterm.any_row(|row| row.contains(echo)),
+            "user echo must stay on screen while the spinner is active.\n{}",
+            vterm.dump()
         );
     }
 
