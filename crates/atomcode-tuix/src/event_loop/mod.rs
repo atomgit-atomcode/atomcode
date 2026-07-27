@@ -19650,7 +19650,14 @@ mod clipboard_hint_tests {
     }
 }
 
-fn status_context_usage(state: &UiState, configured_window: usize) -> (usize, usize) {
+fn status_context_usage(
+    state: &UiState,
+    configured_window: usize,
+    provider_available: bool,
+) -> (usize, usize) {
+    if !provider_available {
+        return (0, 0);
+    }
     match state.last_context.as_ref() {
         Some(snap) => (
             snap.sent_tokens,
@@ -19678,7 +19685,10 @@ mod status_context_usage_tests {
             ..ContextSnapshot::default()
         });
 
-        assert_eq!(status_context_usage(&state, 128_000), (22_800, 128_000));
+        assert_eq!(
+            status_context_usage(&state, 128_000, true),
+            (22_800, 128_000)
+        );
     }
 
     #[test]
@@ -19690,7 +19700,22 @@ mod status_context_usage_tests {
             ..ContextSnapshot::default()
         });
 
-        assert_eq!(status_context_usage(&state, 128_000), (22_800, 200_000));
+        assert_eq!(
+            status_context_usage(&state, 128_000, true),
+            (22_800, 200_000)
+        );
+    }
+
+    #[test]
+    fn unavailable_provider_does_not_invent_a_context_window() {
+        let mut state = UiState::new();
+        state.last_context = Some(ContextSnapshot {
+            sent_tokens: 22_800,
+            ctx_window: 200_000,
+            ..ContextSnapshot::default()
+        });
+
+        assert_eq!(status_context_usage(&state, 128_000, false), (0, 0));
     }
 }
 
@@ -19868,14 +19893,19 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else {
         None
     };
-    // Pull current ctx usage from the last ContextStats emission. Pre-
-    // first-turn `last_context` is None — render shows nothing then.
+    // Pull current ctx usage from the last ContextStats emission. Before the
+    // first turn, show zero usage against the configured provider window. When
+    // no provider is available, suppress both values instead of exposing
+    // Config's internal 128k fallback as an invented model capability.
     // Using `sent_tokens` (what was actually sent to the model on the
     // last turn) instead of cumulative `total_tokens` because the user
     // cares about "how close to overflow am I", not "how many tokens
     // has this session burned in total". See render::StatusLine docs.
-    let (ctx_used, ctx_window) =
-        status_context_usage(state, ctx.config.default_context_window());
+    let (ctx_used, ctx_window) = status_context_usage(
+        state,
+        ctx.config.default_context_window(),
+        !no_provider,
+    );
     // Session-name badge: surfaced only when the user has explicitly
     // renamed the conversation. Auto-named sessions (default /
     // session-* / first-message-derived) intentionally stay badge-less

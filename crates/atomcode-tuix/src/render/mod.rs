@@ -559,7 +559,8 @@ pub struct StatusLine {
     /// footer panel directly below the input box. It never enters scrollback.
     pub command_output: Option<String>,
     /// Tokens currently in the model's context (last turn's `sent_tokens`).
-    /// Pre-first-turn this is 0; the renderer hides the field then.
+    /// Pre-first-turn this is 0; when `ctx_window` is known the renderer shows
+    /// zero usage against that window.
     pub ctx_used: usize,
     /// Provider's context window (cap). 0 when not yet known — renderer
     /// falls back to a bare "12.3k tok" display in that case.

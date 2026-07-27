@@ -2353,7 +2353,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             String::new()
         };
-        let ctx_str = if status.ctx_used > 0 {
+        let ctx_str = if status.ctx_used > 0 || status.ctx_window > 0 {
             format_ctx_usage(status.ctx_used, status.ctx_window)
         } else {
             String::new()
@@ -8389,6 +8389,11 @@ mod tests {
     }
 
     #[test]
+    fn ctx_usage_with_known_window_shows_zero_before_first_turn() {
+        assert_eq!(format_ctx_usage(0, 1_000_000), "0/1m tok (0%)");
+    }
+
+    #[test]
     fn goal_row_shows_condition_round_and_elapsed() {
         // Wide row (unicode caps): ◎ marker + full condition + round + elapsed.
         let row = format_goal_row("重构 auth 模块直到测试全过", 3, 133, 80, true);
@@ -8695,6 +8700,17 @@ mod tests {
             pending_messages: Vec::new(),
             round_cap_panel: None,
         }
+    }
+
+    #[test]
+    fn status_row_shows_known_context_window_before_first_turn() {
+        let (r, _counter) = new_counting(80, 24);
+        let mut status = status_basic();
+        status.ctx_window = 1_000_000;
+
+        let row = r.build_status_row(&status, 80, false);
+        let visible: String = row.iter().map(|cell| cell.ch).collect();
+        assert!(visible.contains("0/1m tok (0%)"), "{visible:?}");
     }
 
     #[test]
