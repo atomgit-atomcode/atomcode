@@ -75,6 +75,9 @@ similar = { workspace = true, optional = true }
 # Decode subprocess (bash) output that isn't UTF-8: CJK Windows consoles emit OEM
 # codepage bytes (GBK/CP936, Big5, …), which otherwise render as `◇◇◇` mojibake.
 encoding_rs = { version = "0.8", optional = true }
+# Best-effort encoding detection for non-UTF-8 subprocess output on Unix and for
+# Windows codepages that are not covered by the explicit OEM mapping above.
+chardetng = { version = "0.1", optional = true }
 # `codeintel` capability deps (tree-sitter symbol extraction). Heavy C compilation, so
 # opt-in (NOT in default) — an embedder that wants only provider/tools skips all grammars.
 tree-sitter = { version = "0.26", optional = true }
@@ -136,7 +139,7 @@ default = ["provider", "tools"]
 provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:rustls", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:atomcode-config", "dep:getrandom", "dep:tracing", "dep:fs2"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
-tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "tokio/fs", "tokio/process", "tokio/io-util"]
+tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:chardetng", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "tokio/fs", "tokio/process", "tokio/io-util"]
 # Network tools (web_fetch / web_search). Opt-in on top of `tools` — pulls the HTTP stack
 # (reqwest + url + tokio/net for SSRF DNS checks). NOT in default: a tools-only embedder
 # that wants no network egress skips it.

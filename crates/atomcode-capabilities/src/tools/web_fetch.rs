@@ -73,7 +73,9 @@ impl Tool for WebFetchTool {
     fn description(&self) -> &str {
         "Fetch a web page over http(s) and return its content (HTML is converted to clean \
          text, or to Markdown with `format:\"markdown\"` to keep headings/links/code). Use \
-         after `web_search` to read a specific page (docs, README, API reference). Do NOT \
+         this tool when the user provides a specific http(s) URL to read, extract, or summarize; \
+         prefer it over running `curl` or `wget` through the shell because it handles page \
+         charset and rendering. Also use it after `web_search` to read a specific result. Do NOT \
          call this tool if a more specific, dedicated skill (listed under AVAILABLE SKILLS in the system prompt) \
          matches the URL or domain of the page you want to fetch (e.g., platform-specific issue trackers or document sites); \
          instead, you MUST use the use_skill tool. Only http/https URLs are allowed; requests to localhost / private / \
@@ -937,16 +939,31 @@ fn charset_from_meta(buf: &[u8]) -> Option<String> {
 }
 
 /// Decode the response body honoring its charset: HTTP `Content-Type` charset first, then an
-/// HTML `<meta>` charset, else UTF-8. Fixes mojibake on legacy-encoded pages (GBK/Big5/…).
+/// HTML `<meta>` charset, then valid UTF-8, and finally best-effort detection. Fixes mojibake
+/// on legacy-encoded pages (GBK/Big5/…) even when the server omits a charset declaration.
 fn decode_body(buf: &[u8], content_type: Option<&str>) -> String {
-    let enc = content_type
+    let declared = content_type
         .and_then(charset_from_content_type)
         .and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
         .or_else(|| {
             charset_from_meta(buf).and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
-        })
-        .unwrap_or(encoding_rs::UTF_8);
-    enc.decode(buf).0.into_owned()
+        });
+    if let Some(encoding) = declared {
+        return encoding.decode(buf).0.into_owned();
+    }
+    if let Ok(text) = std::str::from_utf8(buf) {
+        return text.to_owned();
+    }
+
+    let mut detector = chardetng::EncodingDetector::new();
+    detector.feed(buf, true);
+    let encoding = detector.guess(None, true);
+    let (decoded, _, had_errors) = encoding.decode(buf);
+    if had_errors {
+        String::from_utf8_lossy(buf).into_owned()
+    } else {
+        decoded.into_owned()
+    }
 }
 
 fn decode_entities(s: &str) -> String {
@@ -1045,6 +1062,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn description_prefers_web_fetch_for_user_supplied_urls() {
+        let description = WebFetchTool.description();
+        assert!(description.contains("user provides a specific http(s) URL"));
+        assert!(description.contains("prefer it over running `curl` or `wget`"));
+        assert!(description.contains("more specific, dedicated skill"));
+    }
+
+    #[test]
     fn decode_body_honors_charset_to_avoid_gbk_mojibake() {
         // Real GBK bytes (the gxeea.cn case): a blind UTF-8 read mangles these into mojibake.
         let (gbk, _, _) = encoding_rs::GBK.encode("广西考试院 2026");
@@ -1063,6 +1088,10 @@ mod tests {
         // 3. default UTF-8 when nothing declares a charset.
         let d3 = decode_body("héllo 世界".as_bytes(), Some("text/html"));
         assert_eq!(d3, "héllo 世界");
+
+        // 4. no declaration: invalid UTF-8 falls back to best-effort detection.
+        let d4 = decode_body(&gbk, Some("text/html"));
+        assert_eq!(d4, "广西考试院 2026");
 
         assert_eq!(
             charset_from_content_type("text/html; charset=GBK".to_ascii_lowercase().as_str()),
@@ -1305,6 +1334,28 @@ mod tests {
             )
             .is_error
         );
+    }
+
+    #[test]
+    fn render_body_decodes_gb2312_meta_without_http_charset() {
+        let source = "<html><head><meta charset=\"gb2312\"><title>中国广播网</title></head>\
+                      <body><h1>福建省新闻</h1><p>已移送司法机关处理。</p></body></html>";
+        let (body, _, had_errors) = encoding_rs::GBK.encode(source);
+        assert!(!had_errors);
+
+        let result = render_body(
+            "https://news.cnr.cn/example.shtml",
+            200,
+            Some("text/html".into()),
+            body.into_owned(),
+            false,
+            OutputFormat::Text,
+            None,
+        );
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.content.contains("福建省新闻"), "{result:?}");
+        assert!(result.content.contains("已移送司法机关处理"), "{result:?}");
     }
 
     #[test]

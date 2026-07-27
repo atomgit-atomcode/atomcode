@@ -892,11 +892,10 @@ fn build_command(command: &str) -> Result<tokio::process::Command, String> {
     Ok(cmd)
 }
 
-/// Decode subprocess output to text. UTF-8 is the fast path; if that fails we fall
-/// back to the console's OEM codepage (Windows) so CJK tools like `keytool`/`javac`
-/// are readable instead of `◇◇◇` mojibake. Off Windows there is no OEM codepage, so
-/// `console_codepage()` returns 0 and `decode_oem` degrades to lossy UTF-8 (the prior
-/// behavior, unchanged).
+/// Decode subprocess output to text. UTF-8 is the fast path; if that fails we first
+/// honor the console's OEM codepage (Windows), then use chardetng as a cross-platform
+/// fallback. The latter covers commands such as `curl` returning a legacy GB2312/GBK
+/// page on macOS/Linux without changing the command or its byte-level semantics.
 fn decode_output(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => return s.to_string(),
@@ -940,7 +939,96 @@ fn decode_oem(bytes: &[u8], codepage: u32) -> String {
             return decoded.into_owned();
         }
     }
-    String::from_utf8_lossy(bytes).into_owned()
+    decode_detected(bytes)
+}
+
+/// Codex-style best-effort legacy decoder for subprocess output when neither UTF-8 nor
+/// a known Windows OEM codepage applies. Detection is only reached for invalid UTF-8,
+/// so ordinary command output is byte-for-byte unchanged on the fast path.
+fn decode_detected(bytes: &[u8]) -> String {
+    let mut detector = chardetng::EncodingDetector::new();
+    detector.feed(bytes, true);
+    let mut encoding = detector.guess(None, true);
+    if encoding == encoding_rs::IBM866 && looks_like_windows_1252_punctuation(bytes) {
+        encoding = encoding_rs::WINDOWS_1252;
+    }
+    let (decoded, _, had_errors) = encoding.decode(bytes);
+    if !had_errors {
+        decoded.into_owned()
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+// chardetng can mistake short Windows-1252 strings containing curly quotes/dashes for
+// IBM866 because those byte ranges overlap. Keep this deliberately narrow so genuine
+// Cyrillic output is not rewritten.
+const WINDOWS_1252_PUNCT_BYTES: [u8; 8] = [
+    0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x99,
+];
+
+fn looks_like_windows_1252_punctuation(bytes: &[u8]) -> bool {
+    let mut saw_punctuation = false;
+    let mut saw_ascii_word = false;
+    for &byte in bytes {
+        if byte >= 0xA0 {
+            return false;
+        }
+        if (0x80..=0x9F).contains(&byte) {
+            if !WINDOWS_1252_PUNCT_BYTES.contains(&byte) {
+                return false;
+            }
+            saw_punctuation = true;
+        }
+        saw_ascii_word |= byte.is_ascii_alphabetic();
+    }
+    saw_punctuation && saw_ascii_word
+}
+
+/// Decode a streamed subprocess chunk without replacing a multibyte character split across
+/// two reads. UTF-8 can safely emit its valid prefix immediately. For legacy encodings, wait
+/// for a line boundary (or EOF) before detecting/decoding so a read boundary cannot bisect a
+/// GBK/Big5/Shift-JIS character.
+fn decode_stream_chunk(pending: &mut Vec<u8>, bytes: &[u8], eof: bool) -> Option<String> {
+    pending.extend_from_slice(bytes);
+    if pending.is_empty() {
+        return None;
+    }
+
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            let text = text.to_owned();
+            pending.clear();
+            return Some(text);
+        }
+        Err(error) if error.error_len().is_none() => {
+            let valid_up_to = error.valid_up_to();
+            if valid_up_to == 0 {
+                return None;
+            }
+            let text = std::str::from_utf8(&pending[..valid_up_to])
+                .expect("valid_up_to must end at a UTF-8 boundary")
+                .to_owned();
+            pending.drain(..valid_up_to);
+            return Some(text);
+        }
+        Err(_) => {}
+    }
+
+    let emit_len = if eof {
+        pending.len()
+    } else {
+        pending
+            .iter()
+            .rposition(|byte| matches!(byte, b'\n' | b'\r'))
+            .map_or(0, |index| index + 1)
+    };
+    if emit_len == 0 {
+        return None;
+    }
+    let text = decode_output(&pending[..emit_len]);
+    pending.drain(..emit_len);
+    Some(text)
 }
 
 #[cfg(windows)]
@@ -954,7 +1042,7 @@ fn console_codepage() -> u32 {
 
 #[cfg(not(windows))]
 fn console_codepage() -> u32 {
-    0 // no OEM codepage off Windows → decode_oem yields lossy UTF-8
+    0 // no OEM codepage off Windows → decode_oem delegates to chardetng
 }
 
 /// CSI parameter/intermediate/final consumption. `start` points just past the
@@ -2326,6 +2414,8 @@ pub async fn run_shell(
     let has_out_1 = has_any_output.clone();
     let has_out_2 = has_any_output.clone();
     let chunk_cb = &chunk_cb;
+    let mut stdout_decode_pending = Vec::new();
+    let mut stderr_decode_pending = Vec::new();
 
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         let (_, _) = tokio::join!(
@@ -2335,10 +2425,13 @@ pub async fn run_shell(
                     match tokio::time::timeout(idle_timeout, stdout.read(&mut buf)).await {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => {
-                            let chunk = decode_output(&buf[..n]);
                             stdout_buf.extend_from_slice(&buf[..n]);
                             has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
-                            chunk_cb(&sanitize_terminal_output(&chunk));
+                            if let Some(chunk) =
+                                decode_stream_chunk(&mut stdout_decode_pending, &buf[..n], false)
+                            {
+                                chunk_cb(&sanitize_terminal_output(&chunk));
+                            }
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
@@ -2355,10 +2448,16 @@ pub async fn run_shell(
                     match tokio::time::timeout(idle_timeout, stderr.read(&mut buf)).await {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => {
-                            let chunk = decode_output(&buf[..n]);
                             stderr_buf.extend_from_slice(&buf[..n]);
                             has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
-                            chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
+                            if let Some(chunk) =
+                                decode_stream_chunk(&mut stderr_decode_pending, &buf[..n], false)
+                            {
+                                chunk_cb(&format!(
+                                    "[stderr] {}",
+                                    sanitize_terminal_output(&chunk)
+                                ));
+                            }
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
@@ -2380,6 +2479,14 @@ pub async fn run_shell(
         }
     })
     .await;
+
+    // Flush undecoded tails even when the hard timeout cancelled the reader futures.
+    if let Some(chunk) = decode_stream_chunk(&mut stdout_decode_pending, &[], true) {
+        chunk_cb(&sanitize_terminal_output(&chunk));
+    }
+    if let Some(chunk) = decode_stream_chunk(&mut stderr_decode_pending, &[], true) {
+        chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
+    }
 
     let stdout_str = decode_output(&stdout_buf);
     let stderr_str = decode_output(&stderr_buf);
@@ -3377,13 +3484,54 @@ mod tests {
     }
 
     #[test]
-    fn decode_output_passes_utf8_through_and_lossy_off_windows() {
+    fn decode_output_passes_utf8_through_and_detects_legacy_encoding() {
         assert_eq!(decode_output("héllo".as_bytes()), "héllo");
-        // codepage 0 (the non-Windows sentinel) → lossy UTF-8, never GBK.
+
+        let source = "<html><meta charset=\"gb2312\">福建省新闻正文，已移送司法机关处理。</html>";
+        let (gbk, _, had_errors) = encoding_rs::GBK.encode(source);
+        assert!(!had_errors);
+        assert_eq!(decode_detected(&gbk), source);
+        assert_eq!(decode_oem(&gbk, 0), source);
+    }
+
+    #[test]
+    fn decode_detected_keeps_windows_1252_smart_punctuation() {
         assert_eq!(
-            decode_oem(&[0xC4, 0xE3, 0xBA, 0xC3], 0),
-            "\u{FFFD}\u{FFFD}\u{FFFD}"
+            decode_detected(&[0x93, b't', b'e', b's', b't', 0x94]),
+            "“test”"
         );
+    }
+
+    #[test]
+    fn streamed_decoder_keeps_split_utf8_and_gbk_characters() {
+        let mut pending = Vec::new();
+        assert_eq!(
+            decode_stream_chunk(&mut pending, &[0xE4, 0xBD], false),
+            None
+        );
+        assert_eq!(
+            decode_stream_chunk(&mut pending, &[0xA0, b'\n'], false).as_deref(),
+            Some("你\n")
+        );
+
+        let source = "福建省新闻正文，已移送司法机关处理。";
+        let (gbk, _, had_errors) = encoding_rs::GBK.encode(source);
+        assert!(!had_errors);
+        let split = gbk.len() - 1;
+        let mut pending = Vec::new();
+        assert_eq!(
+            decode_stream_chunk(&mut pending, &gbk[..split], false),
+            None
+        );
+        assert_eq!(
+            decode_stream_chunk(&mut pending, &gbk[split..], false),
+            None
+        );
+        assert_eq!(
+            decode_stream_chunk(&mut pending, &[b'\n'], false).as_deref(),
+            Some("福建省新闻正文，已移送司法机关处理。\n")
+        );
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
