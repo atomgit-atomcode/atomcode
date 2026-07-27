@@ -5269,27 +5269,31 @@ fn build_goal_evaluator_provider(
 ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
     if let Some(registry) = host.subagent_config.as_deref() {
         if let Some(key) = registry.evaluator_provider.as_deref() {
-            if let Some(provider) = registry.providers.get(key) {
+            // `evaluator_provider` is a model-selection id (a legacy provider name
+            // still resolves via projection, §14.3). Resolve through the single
+            // boundary so it works for both schemas.
+            if let Ok(resolved) = registry.resolve_model(Some(key)) {
                 let mut evaluator = host.clone();
                 evaluator.provider_name = key.to_owned();
-                evaluator.model = provider.model.clone();
-                evaluator.provider_type = provider.provider_type.clone();
-                evaluator.context_window = provider.context_window as u32;
-                evaluator.chat_options.max_tokens = provider.max_tokens.map(|value| value as u32);
-                evaluator.thinking_type = provider.thinking_type.clone();
-                evaluator.thinking_keep = provider.thinking_keep.clone();
-                evaluator.reasoning_history = provider.reasoning_history.clone();
-                evaluator.thinking_enabled = provider.thinking_enabled;
-                evaluator.user_agent = provider.user_agent.clone();
-                evaluator.skip_tls_verify = provider.skip_tls_verify;
+                evaluator.model = resolved.model.clone();
+                evaluator.provider_type = resolved.provider_type.clone();
+                evaluator.context_window = resolved.context_window as u32;
+                evaluator.chat_options.max_tokens =
+                    resolved.max_tokens.map(|value| value as u32);
+                evaluator.thinking_type = resolved.thinking_type.clone();
+                evaluator.thinking_keep = resolved.thinking_keep.clone();
+                evaluator.reasoning_history = resolved.reasoning_history.clone();
+                evaluator.thinking_enabled = resolved.thinking_enabled;
+                evaluator.user_agent = resolved.user_agent.clone();
+                evaluator.skip_tls_verify = resolved.skip_tls_verify;
                 evaluator.subagent_fast_provider = None;
                 evaluator.subagent_capable_provider = None;
                 evaluator.subagent_config = None;
                 // An evaluator is an independent provider boundary. Never let a
                 // missing target credential/endpoint inherit the host provider's
                 // values: that could send the host API key to another base URL.
-                evaluator.api_key = provider.resolved_api_key().unwrap_or_default();
-                evaluator.base_url = provider.base_url.clone().unwrap_or_default();
+                evaluator.api_key = resolved.api_key.clone().unwrap_or_default();
+                evaluator.base_url = resolved.base_url.clone().unwrap_or_default();
                 if let Ok(provider) = factory.build(&evaluator, session_id) {
                     return Ok(provider);
                 }
