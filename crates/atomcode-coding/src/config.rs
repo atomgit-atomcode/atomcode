@@ -38,6 +38,34 @@ pub fn resolve_provider_pricing(
     })
 }
 
+/// Pricing for an already-resolved model selection — the new resolution path
+/// (design §14.1/§14.5). Mirrors [`resolve_provider_pricing`] but reads the
+/// flattened [`ResolvedModelConfig`] instead of a raw `ProviderConfig`.
+pub fn resolve_resolved_pricing(
+    resolved: &atomcode_config::config::provider::ResolvedModelConfig,
+) -> Option<atomcode_capabilities::session::ModelPricing> {
+    let pricing = resolved
+        .pricing
+        .and_then(|pricing| pricing.validated())
+        .map(|pricing| atomcode_capabilities::provider::CatalogPricing {
+            input_per_million: pricing.input_per_million,
+            output_per_million: pricing.output_per_million,
+            cached_input_per_million: pricing.cached_input_per_million,
+        })
+        .or_else(|| {
+            atomcode_capabilities::provider::resolve_models_dev_pricing(
+                &resolved.selection_id,
+                resolved.base_url.as_deref().unwrap_or_default(),
+                &resolved.model,
+            )
+        })?;
+    Some(atomcode_capabilities::session::ModelPricing {
+        input_per_million: pricing.input_per_million,
+        output_per_million: pricing.output_per_million,
+        cached_input_per_million: pricing.cached_input_per_million,
+    })
+}
+
 /// Everything [`build_coding_agent`](crate::build_coding_agent) needs: provider
 /// credentials, the working directory the tools are scoped to, and liveness bounds.
 ///
@@ -213,56 +241,53 @@ impl CodingRuntimeConfig {
         dangerously_skip_permissions: bool,
         interactive: bool,
     ) -> Self {
-        let requested_provider = provider_override
+        // Resolve through the single boundary (design §14.1). The override is a
+        // model-selection id (a legacy provider name still resolves via
+        // projection); without one, the active `default_model`/`default_provider`
+        // selection is used. Fall back to the first catalog model so a missing or
+        // invalid selection still starts something — parity with the old
+        // `providers.keys().min()` fallback. For a legacy config the resolved
+        // `selection_id` equals the old provider key, so every field below is
+        // byte-identical to the previous `providers.get(name)` extraction.
+        let requested = provider_override
             .filter(|name| !name.is_empty())
-            .unwrap_or(&config.default_provider);
-        let provider_name = if config.providers.contains_key(requested_provider) {
-            requested_provider.to_string()
-        } else {
-            config.providers.keys().min().cloned().unwrap_or_default()
-        };
-        let provider = config.providers.get(&provider_name);
-        let pricing =
-            provider.and_then(|provider| resolve_provider_pricing(&provider_name, provider));
+            .map(str::to_string)
+            .unwrap_or_else(|| config.effective_model_selection().unwrap_or_default());
+        let resolved = config.resolve_model(Some(&requested)).ok().or_else(|| {
+            let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+            ids.sort();
+            ids.into_iter()
+                .find_map(|id| config.resolve_model(Some(&id)).ok())
+        });
+        let pricing = resolved.as_ref().and_then(resolve_resolved_pricing);
+        let r = resolved.as_ref();
         Self {
-            api_key: provider
-                .and_then(|provider| provider.resolved_api_key())
-                .unwrap_or_default(),
-            base_url: provider
-                .and_then(|provider| provider.base_url.clone())
-                .unwrap_or_default(),
-            model: provider
-                .map(|provider| provider.model.clone())
-                .unwrap_or_default(),
+            api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
+            base_url: r.and_then(|r| r.base_url.clone()).unwrap_or_default(),
+            model: r.map(|r| r.model.clone()).unwrap_or_default(),
             preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
                 None,
                 config.language,
             )),
-            provider_name,
+            provider_name: r.map(|r| r.selection_id.clone()).unwrap_or_default(),
             working_dir: working_dir.to_path_buf(),
-            context_window: provider
-                .map(|provider| provider.context_window as u32)
-                .unwrap_or(128_000),
-            max_tokens: provider
-                .and_then(|provider| provider.max_tokens)
-                .map(|value| value as u32),
+            context_window: r.map(|r| r.context_window as u32).unwrap_or(128_000),
+            max_tokens: r.and_then(|r| r.max_tokens).map(|value| value as u32),
             mcp: true,
             telemetry,
-            reasoning_history: provider.and_then(|provider| provider.reasoning_history.clone()),
-            reasoning_effort: provider.and_then(|provider| provider.reasoning_effort.clone()),
-            provider_type: provider
-                .map(|provider| provider.provider_type.clone())
+            reasoning_history: r.and_then(|r| r.reasoning_history.clone()),
+            reasoning_effort: r.and_then(|r| r.reasoning_effort.clone()),
+            provider_type: r
+                .map(|r| r.provider_type.clone())
                 .unwrap_or_else(|| "openai".into()),
-            thinking_enabled: provider.and_then(|provider| provider.thinking_enabled),
-            thinking_type: provider.and_then(|provider| provider.thinking_type.clone()),
-            thinking_keep: provider.and_then(|provider| provider.thinking_keep.clone()),
+            thinking_enabled: r.and_then(|r| r.thinking_enabled),
+            thinking_type: r.and_then(|r| r.thinking_type.clone()),
+            thinking_keep: r.and_then(|r| r.thinking_keep.clone()),
             dangerously_skip_permissions,
             interactive,
             keep_interrupted_context: config.keep_interrupted_context,
-            user_agent: provider.and_then(|provider| provider.user_agent.clone()),
-            skip_tls_verify: provider
-                .map(|provider| provider.skip_tls_verify)
-                .unwrap_or(false),
+            user_agent: r.and_then(|r| r.user_agent.clone()),
+            skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
             loop_max_rounds: resolve_loop_max_rounds(
                 config.loop_config.max_rounds,
                 std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
@@ -610,6 +635,80 @@ mod tests {
             runtime.agent_config().preferred_language,
             Some(Locale::ZhCn)
         );
+    }
+
+    #[test]
+    fn from_config_resolves_a_legacy_provider_unchanged() {
+        let source: atomcode_config::config::Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "MyDS",
+            "providers": {
+                "MyDS": {
+                    "type": "openai",
+                    "base_url": "https://api.deepseek.com/v1",
+                    "api_key": "sk-legacy",
+                    "model": "deepseek-chat",
+                    "context_window": 128000
+                }
+            }
+        }))
+        .unwrap();
+        let rt = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(rt.provider_name, "MyDS");
+        assert_eq!(rt.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(rt.api_key, "sk-legacy");
+        assert_eq!(rt.model, "deepseek-chat");
+        assert_eq!(rt.context_window, 128000);
+        assert_eq!(rt.provider_type, "openai");
+    }
+
+    #[test]
+    fn from_config_builds_a_new_schema_model_profile() {
+        // One account, and a model profile selected by its `<account>/<model>` id
+        // — the "one provider, multiple models" capability, resolved at the
+        // runtime build seam without any legacy `[providers.*]`.
+        let source: atomcode_config::config::Config = serde_json::from_value(serde_json::json!({
+            "default_model": "acc/coder",
+            "provider_accounts": { "acc": { "provider": "deepseek", "api_key": "sk-acc" } },
+            "models": {
+                "acc/coder": { "account": "acc", "model": "deepseek-coder", "context_window": 131072 },
+                "acc/chat": { "account": "acc", "model": "deepseek-chat", "context_window": 131072 }
+            }
+        }))
+        .unwrap();
+        // Default selection (acc/coder).
+        let rt = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(rt.provider_name, "acc/coder");
+        assert_eq!(rt.model, "deepseek-coder");
+        assert_eq!(rt.base_url, "https://api.deepseek.com/v1"); // preset default
+        assert_eq!(rt.api_key, "sk-acc"); // shared account credential
+        assert_eq!(rt.context_window, 131072);
+        // The second model on the SAME account, selected by id — no duplicated
+        // connection settings.
+        let rt2 = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            Some("acc/chat"),
+            None,
+            false,
+            true,
+        );
+        assert_eq!(rt2.model, "deepseek-chat");
+        assert_eq!(rt2.api_key, "sk-acc");
+        assert_eq!(rt2.base_url, "https://api.deepseek.com/v1");
     }
 
     #[test]
