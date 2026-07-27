@@ -12162,14 +12162,21 @@ pub(crate) fn set_default_provider_and_reload(
     true
 }
 
+/// Apply the config `/login` just persisted (fresh CodingPlan claim) to the
+/// running session. Passes `adopt_active_edits = true` (same as `/reload`): a
+/// successful `/login` re-claims models and rewrites the ACTIVE provider's own
+/// settings — notably `context_window` — so the running conversation MUST adopt
+/// them, otherwise the merge keeps the stale runtime copy and the footer window
+/// (e.g. `/100k`) never updates to the model's real window until the user runs
+/// `/reload` manually. When the active provider's config actually changed this
+/// triggers an async provider reload whose completion projects the new window.
 pub(crate) fn apply_persisted_config(
     ctx: &mut LoopCtx,
     config: Config,
     revision: ConfigRevision,
     renderer: &mut dyn Renderer,
 ) {
-    if let Err(error) = reconcile_persisted_config(ctx, ConfigSnapshot { config, revision }, false)
-    {
+    if let Err(error) = reconcile_persisted_config(ctx, ConfigSnapshot { config, revision }, true) {
         renderer.render(UiLine::Error(error.to_string()));
         renderer.flush();
     }
