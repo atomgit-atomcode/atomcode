@@ -703,6 +703,14 @@ impl Config {
     /// caller's own env expansion); new-schema selections are reconstructed via
     /// [`Self::resolve_model`].
     pub fn provider_config_for_selection(&self, selection_id: &str) -> Option<ProviderConfig> {
+        // New-schema entry wins on a colliding id — same precedence as
+        // `resolve_model` / `update_selection_reasoning`, so read and write agree.
+        if self.models.contains_key(selection_id) {
+            return self
+                .resolve_model(Some(selection_id))
+                .ok()
+                .map(|r| r.to_provider_config());
+        }
         if let Some(p) = self.providers.get(selection_id) {
             return Some(p.clone());
         }
@@ -713,9 +721,11 @@ impl Config {
 
     /// Whether a selection id resolves to any provider/model (legacy or new
     /// schema). Replaces bare `config.providers.contains_key(id)` guards that
-    /// would wrongly reject a new-schema selection.
+    /// would wrongly reject a new-schema selection. Short-circuits on the raw
+    /// maps first so the common case avoids materializing the folded catalog.
     pub fn selection_exists(&self, selection_id: &str) -> bool {
         self.providers.contains_key(selection_id)
+            || self.models.contains_key(selection_id)
             || self.logical_models().contains_key(selection_id)
     }
 
@@ -724,7 +734,8 @@ impl Config {
     /// the legacy `[providers.*]` entry. Returns `false` when `id` names no
     /// writable target (e.g. a purely projected legacy provider is writable via
     /// `providers`; a folded-only account is not). Used by `/think`, `/effort`,
-    /// and the daemon reasoning-effort setter so they work on new-schema models.
+    /// the daemon reasoning-effort + thinking setters so they work on new-schema
+    /// models.
     pub fn update_selection_reasoning(
         &mut self,
         id: &str,
@@ -734,6 +745,9 @@ impl Config {
             f(ReasoningFieldsMut {
                 thinking_enabled: &mut m.thinking_enabled,
                 thinking_budget: &mut m.thinking_budget,
+                thinking_type: &mut m.thinking_type,
+                thinking_keep: &mut m.thinking_keep,
+                reasoning_history: &mut m.reasoning_history,
                 reasoning_effort: &mut m.reasoning_effort,
             });
             true
@@ -741,6 +755,9 @@ impl Config {
             f(ReasoningFieldsMut {
                 thinking_enabled: &mut p.thinking_enabled,
                 thinking_budget: &mut p.thinking_budget,
+                thinking_type: &mut p.thinking_type,
+                thinking_keep: &mut p.thinking_keep,
+                reasoning_history: &mut p.reasoning_history,
                 reasoning_effort: &mut p.reasoning_effort,
             });
             true
@@ -757,6 +774,9 @@ impl Config {
 pub struct ReasoningFieldsMut<'a> {
     pub thinking_enabled: &'a mut Option<bool>,
     pub thinking_budget: &'a mut Option<u32>,
+    pub thinking_type: &'a mut Option<String>,
+    pub thinking_keep: &'a mut Option<String>,
+    pub reasoning_history: &'a mut Option<String>,
     pub reasoning_effort: &'a mut Option<String>,
 }
 
@@ -2992,13 +3012,17 @@ context_window = 131072
             "models": { "acc/ds": { "account": "acc", "model": "deepseek-chat", "context_window": 131072 } }
         }))
         .unwrap();
-        // New-schema model.
+        // New-schema model — covers the full reasoning/thinking field set.
         assert!(cfg.update_selection_reasoning("acc/ds", |r| {
             *r.thinking_enabled = Some(true);
             *r.reasoning_effort = Some("high".into());
+            *r.thinking_type = Some("enabled".into());
+            *r.thinking_keep = Some("all".into());
         }));
         assert_eq!(cfg.models["acc/ds"].thinking_enabled, Some(true));
         assert_eq!(cfg.models["acc/ds"].reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(cfg.models["acc/ds"].thinking_type.as_deref(), Some("enabled"));
+        assert_eq!(cfg.models["acc/ds"].thinking_keep.as_deref(), Some("all"));
         // Legacy provider.
         assert!(cfg.update_selection_reasoning("leg", |r| *r.thinking_budget = Some(2048)));
         assert_eq!(cfg.providers["leg"].thinking_budget, Some(2048));

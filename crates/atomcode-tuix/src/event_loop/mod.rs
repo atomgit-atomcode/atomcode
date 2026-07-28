@@ -12103,6 +12103,10 @@ pub(crate) fn select_provider_and_reload(
     };
     let selected_model = selected.model.clone();
     let mut desired = ctx.config.clone();
+    // `default_model` is canonical (`effective_model_selection` prefers it); set
+    // it too so a new-schema selection actually reloads instead of resolving the
+    // stale previous `default_model`.
+    desired.default_model = Some(provider_name.to_string());
     desired.default_provider = provider_name.to_string();
     let origin_generation = ctx.runtime.current_generation();
     atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);

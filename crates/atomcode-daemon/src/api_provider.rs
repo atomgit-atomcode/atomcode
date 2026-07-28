@@ -174,10 +174,14 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
     let config = match update_config(|config| {
         is_new = !config.providers.contains_key(&name);
         config.providers.insert(name.clone(), provider);
-        if req.set_default
-            || config.default_provider.is_empty()
-            || !config.providers.contains_key(&config.default_provider)
-        {
+        // Only claim the default when there isn't already a valid one — check the
+        // effective selection (new-schema `default_model` or legacy
+        // `default_provider`) so a CodingPlan default isn't wrongly clobbered.
+        let has_valid_default = config
+            .effective_model_selection()
+            .is_some_and(|s| config.selection_exists(&s));
+        if req.set_default || !has_valid_default {
+            config.default_model = Some(name.clone());
             config.default_provider = name.clone();
         }
         Ok(())
@@ -427,29 +431,34 @@ pub(crate) async fn patch_thinking(
     }
     let mut missing = false;
     let config = match update_config(|config| {
-        let Some(provider) = config.providers.get_mut(&name) else {
+        // Schema-aware write so the webui thinking editor works on a new-schema
+        // / folded CodingPlan model (which lives in `[models.*]`, not
+        // `[providers.*]`). Cloned reads keep the closure re-runnable under CAS.
+        let found = config.update_selection_reasoning(&name, |r| {
+            if let Some(enabled) = req.enabled {
+                *r.thinking_enabled = Some(enabled);
+            }
+            if let Some(budget) = req.budget {
+                *r.thinking_budget = Some(budget);
+            } else if req.enabled == Some(true) && r.thinking_budget.is_none() {
+                *r.thinking_budget = Some(10000);
+            }
+            if let Some(tt) = req.thinking_type.clone() {
+                *r.thinking_type = tt;
+            }
+            if let Some(tk) = req.keep.clone() {
+                *r.thinking_keep = tk;
+            }
+            if let Some(rh) = req.reasoning_history.clone() {
+                *r.reasoning_history = rh;
+            }
+            if let Some(re) = req.reasoning_effort.clone() {
+                *r.reasoning_effort = re;
+            }
+        });
+        if !found {
             missing = true;
             anyhow::bail!("provider {name:?} not found");
-        };
-        if let Some(enabled) = req.enabled {
-            provider.thinking_enabled = Some(enabled);
-        }
-        if let Some(budget) = req.budget {
-            provider.thinking_budget = Some(budget);
-        } else if req.enabled == Some(true) && provider.thinking_budget.is_none() {
-            provider.thinking_budget = Some(10000);
-        }
-        if let Some(tt) = req.thinking_type {
-            provider.thinking_type = tt;
-        }
-        if let Some(tk) = req.keep {
-            provider.thinking_keep = tk;
-        }
-        if let Some(rh) = req.reasoning_history {
-            provider.reasoning_history = rh;
-        }
-        if let Some(re) = req.reasoning_effort {
-            provider.reasoning_effort = re;
         }
         Ok(())
     }) {
@@ -464,7 +473,13 @@ pub(crate) async fn patch_thinking(
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
 
-    let default_provider = config.default_provider.clone();
-    let p = config.providers.get(&name).unwrap();
-    Json(provider_info(&name, p, &default_provider)).into_response()
+    let default_selection = config.effective_model_selection().unwrap_or_default();
+    let Some(p) = config.provider_config_for_selection(&name) else {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Provider '{}' vanished after update", name),
+        )
+        .into_response();
+    };
+    Json(provider_info(&name, &p, &default_selection)).into_response()
 }

@@ -858,7 +858,7 @@ impl Modal for ProviderPanel {
                         let ids = self.filtered_ids(&ctx.config);
                         if ids.is_empty() {
                             let msg = if self.query.trim().is_empty() {
-                                "(尚无 Provider — 按 a 添加第一个)"
+                                "(尚无 Provider — 按 Ctrl+A 添加第一个)"
                             } else {
                                 "(无匹配的 Provider)"
                             };
@@ -889,7 +889,7 @@ impl Modal for ProviderPanel {
                         let ids = self.filtered_ids(&ctx.config);
                         if ids.is_empty() {
                             let msg = if self.query.trim().is_empty() {
-                                "(尚无模型 — 在账号页按 a 添加)"
+                                "(尚无模型 — 在账号页按 Ctrl+A 添加)"
                             } else {
                                 "(无匹配的模型)"
                             };

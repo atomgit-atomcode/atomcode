@@ -1597,7 +1597,8 @@ pub(crate) async fn live_reasoning_effort(
     let commit = match store.update(|config| {
         target = requested
             .clone()
-            .unwrap_or_else(|| config.default_provider.clone());
+            .or_else(|| config.effective_model_selection())
+            .unwrap_or_default();
         // Schema-aware write: new-schema models live in `[models.*]`, legacy in
         // `[providers.*]`.
         let found = config.update_selection_reasoning(&target, |r| {

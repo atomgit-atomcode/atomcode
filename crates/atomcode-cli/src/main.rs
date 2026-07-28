@@ -2176,8 +2176,11 @@ fn apply_cli_runtime_overrides(
     model_override: Option<&str>,
 ) {
     let provider_name = provider_override
-        .unwrap_or(&config.default_provider)
-        .to_string();
+        .map(str::to_string)
+        // Fall back to the canonical active selection (new-schema `default_model`
+        // then legacy `default_provider`), not `default_provider` alone.
+        .or_else(|| config.effective_model_selection())
+        .unwrap_or_default();
     // Route the optional `--model` override to whichever schema holds the
     // selection (legacy `[providers.*]` or new-schema `[models.*]`); bail if the
     // selection is unknown so `--provider bogus` is a no-op as before.
