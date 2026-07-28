@@ -28,7 +28,6 @@ pub mod onboarding_wizard;
 pub mod password;
 pub mod plugin_manager;
 pub mod provider_panel;
-pub mod provider_wizard;
 pub mod proxy_picker;
 mod qr;
 pub mod session_picker;
@@ -42,7 +41,6 @@ pub use model_picker::ModelPicker;
 pub use onboarding_wizard::OnboardingWizard;
 pub use plugin_manager::PluginManager;
 pub use provider_panel::ProviderPanel;
-pub use provider_wizard::ProviderWizard;
 pub use proxy_picker::ProxyPicker;
 pub use session_picker::SessionPicker;
 

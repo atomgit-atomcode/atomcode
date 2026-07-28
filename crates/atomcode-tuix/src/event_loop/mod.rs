@@ -9733,13 +9733,13 @@ fn handle_input(
                             crate::event_loop::commands::run_login_flow(renderer, ctx)?;
                         }
                         if std::mem::take(&mut ctx.pending_open_provider_wizard) {
-                            let pw = crate::modals::ProviderWizard::MainMenu { selected: 0 };
-                            app.active_modal = Some(Box::new(pw));
+                            let panel = crate::modals::ProviderPanel::open();
+                            app.active_modal = Some(Box::new(panel));
                             if let Some(m) = app.active_modal.as_mut() {
                                 m.draw(&app.buf, &app.state, ctx, renderer);
                             }
-                            // ProviderWizard owns the next frame now; skip
-                            // the idle redraw below so we don't clobber it.
+                            // The panel owns the next frame now; skip the idle
+                            // redraw below so we don't clobber it.
                             return Ok(());
                         }
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -9967,11 +9967,6 @@ pub use crate::modals::ModelPicker;
 // `SessionPicker` moved to `crate::modals::session_picker`; re-exported
 // at `crate::modals::SessionPicker` for existing call sites.
 pub use crate::modals::SessionPicker;
-
-// `ProviderWizard` + `WizardStep` + `DraftProvider` moved to
-// `crate::modals::provider_wizard`; re-exported at `crate::modals` for
-// existing call sites (execute_slash_command).
-pub use crate::modals::ProviderWizard;
 
 /// Parse a committed `$<name> [args]` line into `(name, args)`. Returns `None`
 /// when the line is not `$`-prefixed or carries no skill name. Mirrors

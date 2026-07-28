@@ -9,7 +9,6 @@ use atomcode_config::config::provider::{ModelProfileConfig, ProviderAccountConfi
 use atomcode_config::config::{provider_preset, Config};
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::provider_wizard::unique_account_id;
 use super::{tab_chip, Modal, ModalAction};
 use crate::event_loop::{build_status, save_and_reload, set_default_provider_and_reload, Buffer, LoopCtx};
 use crate::render::{MenuKind, MenuPayload, Renderer, UiLine};
@@ -19,6 +18,21 @@ use crate::state::UiState;
 enum Tab {
     Accounts,
     Models,
+}
+
+/// A unique account id derived from a preset id, avoiding collisions with
+/// existing accounts or legacy provider names.
+fn unique_account_id(base: &str, ctx: &LoopCtx) -> String {
+    let taken = |id: &str| {
+        ctx.config.provider_accounts.contains_key(id) || ctx.config.providers.contains_key(id)
+    };
+    if !taken(base) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !taken(candidate))
+        .unwrap_or_else(|| base.to_string())
 }
 
 /// Which add-form field has focus.
