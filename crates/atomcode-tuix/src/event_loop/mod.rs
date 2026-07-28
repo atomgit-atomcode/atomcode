@@ -2977,6 +2977,18 @@ mod local_restore_scope_tests {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LanguageChangeNotice {
+    None,
+    LanguageCommand,
+}
+
+impl LanguageChangeNotice {
+    fn should_render(self, language_changed: bool) -> bool {
+        language_changed && self == Self::LanguageCommand
+    }
+}
+
 /// Bag of handles passed into the loop.
 pub(crate) struct PendingProviderReload {
     origin_generation: Option<atomcode_coding::RuntimeGeneration>,
@@ -2986,6 +2998,12 @@ pub(crate) struct PendingProviderReload {
     rollback_runtime_config: Option<Config>,
     previous_model_name: Option<String>,
     announce: Option<String>,
+    /// Render the language-switch confirmation when this reload completes.
+    ///
+    /// Language is persisted globally, so other TUI processes will observe the
+    /// same config revision and reload their prompt. Only the process that
+    /// handled the explicit `/language` action owns the success notice.
+    language_change_notice: LanguageChangeNotice,
     manual_reload_announce: bool,
     selection_mode_after_success: Option<crate::ProviderSelectionMode>,
 }
@@ -8270,6 +8288,13 @@ mod external_config_tests {
     }
 
     #[test]
+    fn language_change_notice_is_owned_by_the_explicit_command() {
+        assert!(!LanguageChangeNotice::None.should_render(true));
+        assert!(LanguageChangeNotice::LanguageCommand.should_render(true));
+        assert!(!LanguageChangeNotice::LanguageCommand.should_render(false));
+    }
+
+    #[test]
     fn active_ephemeral_provider_is_not_replaced_from_disk() {
         assert!(!should_reload_provider(
             crate::ProviderSelectionMode::FollowGlobalDefault,
@@ -9052,6 +9077,7 @@ fn reconcile_persisted_config(
         rollback_runtime_config: None,
         previous_model_name: None,
         announce: None,
+        language_change_notice: LanguageChangeNotice::None,
         manual_reload_announce,
         selection_mode_after_success: None,
     });
@@ -9167,6 +9193,7 @@ fn poll_external_auth(ctx: &mut LoopCtx) -> bool {
                     rollback_runtime_config: None,
                     previous_model_name: None,
                     announce: None,
+                    language_change_notice: LanguageChangeNotice::None,
                     manual_reload_announce: false,
                     selection_mode_after_success: None,
                 });
@@ -11882,6 +11909,24 @@ pub(crate) fn save_and_reload(
     success_message: String,
     persist_runtime_provider_as_default: bool,
 ) -> bool {
+    save_and_reload_with_notice(
+        ctx,
+        desired,
+        renderer,
+        success_message,
+        persist_runtime_provider_as_default,
+        LanguageChangeNotice::None,
+    )
+}
+
+fn save_and_reload_with_notice(
+    ctx: &mut LoopCtx,
+    desired: Config,
+    renderer: &mut dyn Renderer,
+    success_message: String,
+    persist_runtime_provider_as_default: bool,
+    language_change_notice: LanguageChangeNotice,
+) -> bool {
     if provider_transition_pending(ctx) {
         renderer.render(UiLine::Error(
             crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
@@ -11907,6 +11952,7 @@ pub(crate) fn save_and_reload(
             previous_model_name,
             renderer,
             success_message,
+            language_change_notice,
         ),
         Err(e) => {
             renderer.render(UiLine::Error(
@@ -11931,6 +11977,7 @@ fn stage_committed_config_reload(
     previous_model_name: String,
     renderer: &mut dyn Renderer,
     success_message: String,
+    language_change_notice: LanguageChangeNotice,
 ) -> bool {
     let rollback_persisted_config = Some(previous_persisted_config);
     let rollback_runtime_config = Some(previous_runtime_config);
@@ -11947,6 +11994,7 @@ fn stage_committed_config_reload(
                 rollback_runtime_config,
                 previous_model_name: Some(previous_model_name),
                 announce: None,
+                language_change_notice: LanguageChangeNotice::None,
                 manual_reload_announce: false,
                 selection_mode_after_success: None,
             },
@@ -11970,6 +12018,7 @@ fn stage_committed_config_reload(
         rollback_runtime_config,
         previous_model_name: Some(previous_model_name),
         announce: Some(success_message),
+        language_change_notice,
         manual_reload_announce: false,
         selection_mode_after_success: None,
     });
@@ -12028,6 +12077,7 @@ pub(crate) fn save_proxy_and_reload(
         previous_model_name,
         renderer,
         success_message,
+        LanguageChangeNotice::None,
     )
 }
 
@@ -12080,7 +12130,14 @@ pub(crate) fn save_language_and_reload(
 
     let mut desired = ctx.config.clone();
     desired.language = Some(locale);
-    save_and_reload(ctx, desired, renderer, String::new(), false)
+    save_and_reload_with_notice(
+        ctx,
+        desired,
+        renderer,
+        String::new(),
+        false,
+        LanguageChangeNotice::LanguageCommand,
+    )
 }
 
 /// Switch only this `CodingRuntime`. The shared `config.toml` default remains a
@@ -12133,6 +12190,7 @@ pub(crate) fn select_provider_and_reload(
             })
             .into_owned(),
         ),
+        language_change_notice: LanguageChangeNotice::None,
         manual_reload_announce: false,
         selection_mode_after_success: Some(crate::ProviderSelectionMode::Pinned),
     });
@@ -12242,6 +12300,7 @@ pub(crate) fn set_default_provider_and_reload(
                 rollback_runtime_config: Some(ctx.config.clone()),
                 previous_model_name: Some(ctx.model_name.clone()),
                 announce: None,
+                language_change_notice: LanguageChangeNotice::None,
                 manual_reload_announce: false,
                 selection_mode_after_success: None,
             },
@@ -12272,6 +12331,7 @@ pub(crate) fn set_default_provider_and_reload(
             })
             .into_owned(),
         ),
+        language_change_notice: LanguageChangeNotice::None,
         manual_reload_announce: false,
         selection_mode_after_success: Some(crate::ProviderSelectionMode::Pinned),
     });
@@ -16653,6 +16713,7 @@ fn handle_runtime_event(
                     let PendingProviderReload {
                         desired_config,
                         announce,
+                        language_change_notice,
                         manual_reload_announce,
                         selection_mode_after_success,
                         ..
@@ -16702,7 +16763,7 @@ fn handle_runtime_event(
                                 .into_owned(),
                         ));
                     } else {
-                        if language_changed {
+                        if language_change_notice.should_render(language_changed) {
                             let locale = crate::i18n::current_locale();
                             let label = match locale {
                                 atomcode_config::locale::Locale::En => "English",
