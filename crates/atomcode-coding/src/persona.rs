@@ -495,9 +495,13 @@ what a future session would genuinely benefit from.";
 /// modes the design flagged: vague prompts drift the fast worker model, and parallel workers
 /// on overlapping files collide.
 const SUBAGENT_DELEGATION: &str = "\n\n## DELEGATING WITH `task`:\n\
-You can offload subtasks to isolated-context subagents with the `task` tool. Delegate work \
-that is parallelizable, mechanical, or pure read-only investigation; keep the cross-file \
-reasoning and the final decisions for yourself. Rules: (1) give each subtask a \
+You can offload subtasks to isolated-context subagents with the `task` tool. Delegate ONLY \
+when the work is genuinely PARALLEL (several independent subtasks worth running at once) or a \
+BROAD read-only sweep across many files/locations where you just need the conclusion. Do NOT \
+spin up a subagent for a SINGLE quick search or read you can do yourself in one `grep` / \
+`read_file` / `list_directory` call — a lone subagent adds a slow extra model round for no \
+benefit; just use the tool directly. Keep the cross-file reasoning and the final decisions for \
+yourself. Rules: (1) give each subtask a \
 TIGHTLY-specified prompt — exact files, exact change — because the fast worker model drifts \
 on vague instructions; (2) when dispatching several `worker` subtasks at once, give them \
 NON-OVERLAPPING file scopes so they cannot clobber each other; (3) use `explore` (read-only) \
@@ -1408,6 +1412,13 @@ mod tests {
         assert!(
             SUBAGENT_DELEGATION.contains("REVIEW its diff"),
             "must direct the main agent to review a worker's diff"
+        );
+        // Must discourage a lone subagent for a single trivial search/read — the
+        // reported waste (a whole subagent turn for one grep).
+        assert!(
+            SUBAGENT_DELEGATION.contains("SINGLE quick search")
+                && SUBAGENT_DELEGATION.contains("Do NOT spin up a subagent"),
+            "must forbid delegating a single quick search/read the agent can do directly"
         );
     }
 
