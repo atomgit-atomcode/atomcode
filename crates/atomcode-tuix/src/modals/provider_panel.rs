@@ -210,9 +210,24 @@ impl EditForm {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ModelField {
     Account,
+    ApiKey,
     Model,
     Window,
     MakeDefault,
+}
+
+/// True iff adding a model to `account_id` should prompt for the provider's
+/// api_key: a non-CodingPlan account (CodingPlan uses the gateway signer) that
+/// has no explicit api_key yet. Filled once, stored on the account.
+fn account_needs_key(config: &Config, account_id: &str) -> bool {
+    if atomcode_config::config::is_codingplan_provider_name(account_id) {
+        return false;
+    }
+    config
+        .provider_accounts
+        .get(account_id)
+        .map(|a| a.api_key.as_deref().unwrap_or("").trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Add a model to an EXISTING account (the 模型 tab's `a`). Optionally editing an
@@ -220,7 +235,10 @@ enum ModelField {
 #[derive(Clone)]
 struct ModelForm {
     account_ids: Vec<String>,
+    /// Parallel to `account_ids`: whether that account still needs an api_key.
+    needs_key: Vec<bool>,
     account_idx: usize,
+    api_key: String,
     model: String,
     window: String,
     make_default: bool,
@@ -240,9 +258,15 @@ impl ModelForm {
         let account_idx = preferred
             .and_then(|p| account_ids.iter().position(|a| a == p))
             .unwrap_or(0);
+        let needs_key = account_ids
+            .iter()
+            .map(|id| account_needs_key(config, id))
+            .collect();
         Some(Self {
             account_ids,
+            needs_key,
             account_idx,
+            api_key: String::new(),
             model: String::new(),
             window: String::new(),
             make_default: true,
@@ -255,7 +279,9 @@ impl ModelForm {
         let m = config.logical_models().get(id).cloned()?;
         Some(Self {
             account_ids: vec![m.account.clone()],
+            needs_key: vec![false], // account already exists; edit its key via 账号页
             account_idx: 0,
+            api_key: String::new(),
             model: m.model.clone(),
             window: m.context_window.to_string(),
             make_default: config.effective_model_selection().as_deref() == Some(id),
@@ -268,21 +294,23 @@ impl ModelForm {
         &self.account_ids[self.account_idx]
     }
 
+    /// Whether the currently-selected account still needs an api_key.
+    fn account_needs_key(&self) -> bool {
+        self.needs_key.get(self.account_idx).copied().unwrap_or(false)
+    }
+
     fn fields(&self) -> Vec<ModelField> {
-        if self.edit_id.is_some() {
-            vec![
-                ModelField::Model,
-                ModelField::Window,
-                ModelField::MakeDefault,
-            ]
-        } else {
-            vec![
-                ModelField::Account,
-                ModelField::Model,
-                ModelField::Window,
-                ModelField::MakeDefault,
-            ]
+        let mut v = Vec::new();
+        if self.edit_id.is_none() {
+            v.push(ModelField::Account);
+            if self.account_needs_key() {
+                v.push(ModelField::ApiKey);
+            }
         }
+        v.push(ModelField::Model);
+        v.push(ModelField::Window);
+        v.push(ModelField::MakeDefault);
+        v
     }
 
     fn advance_focus(&mut self, forward: bool) {
@@ -306,6 +334,10 @@ impl ModelForm {
         } else {
             (self.account_idx + n - 1) % n
         };
+        // The ApiKey field appears/disappears with the account.
+        if !self.fields().contains(&self.focus) {
+            self.focus = ModelField::Account;
+        }
     }
 }
 
@@ -675,6 +707,16 @@ impl ProviderPanel {
             );
             model_id
         };
+        // A deferred provider api_key entered here fills the account once — all
+        // its models share it.
+        if form.edit_id.is_none() && form.account_needs_key() {
+            let key = form.api_key.trim();
+            if !key.is_empty() {
+                if let Some(a) = desired.provider_accounts.get_mut(form.account_id()) {
+                    a.api_key = Some(key.to_string());
+                }
+            }
+        }
         if form.make_default {
             desired.default_model = Some(selection_id.clone());
         }
@@ -831,11 +873,15 @@ impl Modal for ProviderPanel {
                     form.make_default = !form.make_default;
                 }
                 KeyCode::Char(c) => match form.focus {
+                    ModelField::ApiKey => form.api_key.push(c),
                     ModelField::Model => form.model.push(c),
                     ModelField::Window if c.is_ascii_digit() => form.window.push(c),
                     _ => {}
                 },
                 KeyCode::Backspace => match form.focus {
+                    ModelField::ApiKey => {
+                        form.api_key.pop();
+                    }
                     ModelField::Model => {
                         form.model.pop();
                     }
@@ -1213,6 +1259,15 @@ impl Modal for ProviderPanel {
                         ),
                         form.focus == ModelField::Account,
                     ));
+                    // This provider has no api_key yet — collect it once here.
+                    if form.account_needs_key() {
+                        let masked = "•".repeat(form.api_key.chars().count());
+                        items.push(field_row(
+                            "api_key",
+                            format!("{masked}   (该 provider 尚未配置)"),
+                            form.focus == ModelField::ApiKey,
+                        ));
+                    }
                 }
                 items.push(field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldModel),
@@ -1416,6 +1471,30 @@ mod tests {
         // No match → empty.
         p.query = "zzz".into();
         assert!(p.filtered_ids(&cfg).is_empty());
+    }
+
+    #[test]
+    fn model_form_prompts_for_key_on_keyless_provider() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "custom": { "provider": "openai-compatible", "base_url": "https://x/v1" },
+                "keyed": { "provider": "openai-compatible", "base_url": "https://y/v1", "api_key": "sk-1" }
+            }
+        }))
+        .unwrap();
+        assert!(account_needs_key(&cfg, "custom"));
+        assert!(!account_needs_key(&cfg, "keyed"));
+        // CodingPlan uses the gateway signer — never prompt.
+        assert!(!account_needs_key(&cfg, "AtomGit"));
+        // The model form shows an api_key field only for the keyless provider.
+        assert!(ModelForm::new_add(&cfg, Some("custom"))
+            .unwrap()
+            .fields()
+            .contains(&ModelField::ApiKey));
+        assert!(!ModelForm::new_add(&cfg, Some("keyed"))
+            .unwrap()
+            .fields()
+            .contains(&ModelField::ApiKey));
     }
 
     #[test]
