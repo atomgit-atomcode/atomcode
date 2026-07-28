@@ -57,19 +57,38 @@ struct AddForm {
     focus: FormField,
 }
 
+/// The `PRESETS` index of the custom `openai-compatible` / `anthropic-compatible`
+/// protocol preset — the only two the add form offers (fully-custom provider).
+fn compat_preset_idx(anthropic: bool) -> usize {
+    let id = if anthropic {
+        "anthropic-compatible"
+    } else {
+        "openai-compatible"
+    };
+    provider_preset::PRESETS
+        .iter()
+        .position(|p| p.id == id)
+        .unwrap_or(0)
+}
+
 impl AddForm {
-    fn new(preset_idx: usize) -> Self {
+    /// A fully-custom provider, protocol defaulting to OpenAI-compatible.
+    fn new() -> Self {
         Self {
             name: String::new(),
-            preset_idx,
-            // Pre-fill with the preset's default endpoint (editable — override
-            // for a custom deployment).
-            base_url: provider_preset::PRESETS[preset_idx]
-                .default_base_url
-                .map(str::to_string)
-                .unwrap_or_default(),
+            preset_idx: compat_preset_idx(false),
+            base_url: String::new(),
             api_key: String::new(),
             focus: FormField::Name,
+        }
+    }
+
+    /// Human protocol label for the toggle.
+    fn protocol_label(&self) -> &'static str {
+        if self.preset().id == "anthropic-compatible" {
+            "Anthropic"
+        } else {
+            "OpenAI"
         }
     }
 
@@ -98,19 +117,11 @@ impl AddForm {
         self.focus = fields[next];
     }
 
-    fn cycle_preset(&mut self, forward: bool) {
-        let n = provider_preset::PRESETS.len();
-        self.preset_idx = if forward {
-            (self.preset_idx + 1) % n
-        } else {
-            (self.preset_idx + n - 1) % n
-        };
-        // Re-prefill the endpoint with the newly-selected preset's default.
-        self.base_url = self
-            .preset()
-            .default_base_url
-            .map(str::to_string)
-            .unwrap_or_default();
+    fn cycle_preset(&mut self, _forward: bool) {
+        // Only two protocols (OpenAI-compatible ↔ Anthropic-compatible), so both
+        // directions toggle. Neither ships a default endpoint — keep base_url.
+        let to_anthropic = self.preset().id == "openai-compatible";
+        self.preset_idx = compat_preset_idx(to_anthropic);
         if !self.fields().contains(&self.focus) {
             self.focus = FormField::Name;
         }
@@ -154,6 +165,14 @@ impl EditForm {
         &provider_preset::PRESETS[self.preset_idx]
     }
 
+    fn protocol_label(&self) -> &'static str {
+        if self.preset().id == "anthropic-compatible" {
+            "Anthropic"
+        } else {
+            "OpenAI"
+        }
+    }
+
     /// Field sequence: vendor preset, base_url, api key (only when the selected
     /// preset is keyed).
     fn fields(&self) -> Vec<FormField> {
@@ -175,42 +194,16 @@ impl EditForm {
         self.focus = fields[next];
     }
 
-    fn cycle_preset(&mut self, forward: bool) {
-        let n = provider_preset::PRESETS.len();
-        self.preset_idx = if forward {
-            (self.preset_idx + 1) % n
-        } else {
-            (self.preset_idx + n - 1) % n
-        };
-        // Re-prefill the endpoint with the newly-selected preset's default (like
-        // Add) so switching vendor doesn't leave requests pointed at the old
-        // endpoint; the user can still override.
-        self.base_url = self
-            .preset()
-            .default_base_url
-            .map(str::to_string)
-            .unwrap_or_default();
+    fn cycle_preset(&mut self, _forward: bool) {
+        // Only two choices (OpenAI-compatible ↔ Anthropic-compatible), so both
+        // directions just toggle. Neither ships a default endpoint, so base_url
+        // stays as the user typed it.
+        let to_anthropic = self.preset().id == "openai-compatible";
+        self.preset_idx = compat_preset_idx(to_anthropic);
         if !self.fields().contains(&self.focus) {
             self.focus = FormField::Preset;
         }
     }
-}
-
-/// The `PRESETS` index for a stored provider id (new-schema preset id) or a
-/// legacy wire type; falls back to `openai`.
-fn preset_idx_for(provider: &str) -> usize {
-    provider_preset::PRESETS
-        .iter()
-        .position(|p| p.id == provider)
-        .or_else(|| {
-            let mapped = match provider {
-                "claude" | "anthropic" => "anthropic",
-                "ollama" => "ollama",
-                _ => "openai",
-            };
-            provider_preset::PRESETS.iter().position(|p| p.id == mapped)
-        })
-        .unwrap_or(0)
 }
 
 /// Which model-form field has focus.
@@ -479,15 +472,11 @@ impl ProviderPanel {
     /// on the 模型 tab). Returns true when saved (caller closes), false to stay.
     fn save_add(&self, form: &AddForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
         let preset = form.preset();
-        // Custom name → sanitized unique id; blank → derive from the preset.
-        let base_id = {
-            let sanitized = sanitize_account_name(form.name.trim());
-            if sanitized.is_empty() {
-                preset.id.to_string()
-            } else {
-                sanitized
-            }
-        };
+        // A fully-custom provider requires a name (it becomes the account id).
+        let base_id = sanitize_account_name(form.name.trim());
+        if base_id.is_empty() {
+            return false;
+        }
         let account_id = unique_account_id(&base_id, ctx);
         // base_url is pre-filled with the preset default and editable. Persist
         // only a genuine override; blank + no preset default = missing endpoint.
@@ -547,7 +536,14 @@ impl ProviderPanel {
                 a.map(|a| a.provider.clone()).unwrap_or_default(),
             )
         };
-        let preset_idx = preset_idx_for(&provider);
+        // Map the stored provider to a protocol toggle (OpenAI/Anthropic
+        // compatible). original == preset so a no-op edit leaves the real stored
+        // provider (e.g. "deepseek"/"openai") untouched (see save_edit's guard).
+        let anthropic = matches!(
+            provider_preset::preset_or_compatible(&provider).provider_type,
+            provider_preset::ProviderType::Anthropic
+        );
+        let preset_idx = compat_preset_idx(anthropic);
         EditForm {
             id: id.to_string(),
             is_legacy,
@@ -895,7 +891,7 @@ impl Modal for ProviderPanel {
                 self.pending_delete = None;
                 match self.tab {
                     // New account (+ its first model).
-                    Tab::Accounts => self.mode = Mode::Add(AddForm::new(0)),
+                    Tab::Accounts => self.mode = Mode::Add(AddForm::new()),
                     // Add a model to an existing account; if none exist yet, fall
                     // back to creating an account first.
                     Tab::Models => {
@@ -904,7 +900,7 @@ impl Modal for ProviderPanel {
                             self.account_filter.as_deref(),
                         ) {
                             Some(f) => Mode::Model(f),
-                            None => Mode::Add(AddForm::new(0)),
+                            None => Mode::Add(AddForm::new()),
                         };
                     }
                 }
@@ -962,7 +958,7 @@ impl Modal for ProviderPanel {
                             }
                         }
                         Tab::Accounts if id == ADD_PROVIDER_ROW => {
-                            self.mode = Mode::Add(AddForm::new(0));
+                            self.mode = Mode::Add(AddForm::new());
                         }
                         // Drill into the account: switch to the Models tab
                         // filtered to just this account. Manual Tab / Esc clears
@@ -1105,21 +1101,20 @@ impl Modal for ProviderPanel {
                 ));
                 items.push((String::new(), String::new()));
                 let name = if form.name.is_empty() {
-                    format!("({})", p.id) // placeholder: derived from the preset
+                    "(必填)".to_string()
                 } else {
                     form.name.clone()
                 };
                 items.push(field_row("名称", name, form.focus == FormField::Name));
                 items.push(field_row(
-                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldVendor),
+                    "协议",
                     format!(
                         "‹ {} ›   ({})",
-                        p.display_name,
+                        form.protocol_label(),
                         crate::i18n::t(crate::i18n::Msg::ProviderPanelSwitchHint)
                     ),
                     form.focus == FormField::Preset,
                 ));
-                // Always editable (pre-filled with the preset default).
                 items.push(field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldBaseUrl),
                     form.base_url.clone(),
@@ -1143,7 +1138,7 @@ impl Modal for ProviderPanel {
                     ));
                 }
                 // Account-only form — model/window/default moved to the 模型 tab.
-                hint = "Tab 下一项  ←→ 切厂商  ↵ 保存  Esc 返回  （模型到模型页加）".into();
+                hint = "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回  （名称必填；模型到模型页加）".into();
             }
             Mode::EditAccount(form) => {
                 let field_row = |label: &str, value: String, focused: bool| {
@@ -1160,10 +1155,10 @@ impl Modal for ProviderPanel {
                 items.push((String::new(), String::new()));
                 let p = form.preset();
                 items.push(field_row(
-                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldVendor),
+                    "协议",
                     format!(
                         "‹ {} ›   ({})",
-                        p.display_name,
+                        form.protocol_label(),
                         crate::i18n::t(crate::i18n::Msg::ProviderPanelSwitchHint)
                     ),
                     form.focus == FormField::Preset,
@@ -1184,7 +1179,7 @@ impl Modal for ProviderPanel {
                         form.focus == FormField::ApiKey,
                     ));
                 }
-                hint = "Tab 下一项  ←→ 切厂商  ↵ 保存  Esc 返回".into();
+                hint = "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回".into();
             }
             Mode::Model(form) => {
                 let field_row = |label: &str, value: String, focused: bool| {
@@ -1297,18 +1292,12 @@ impl Modal for ProviderPanel {
 mod tests {
     use super::*;
 
-    fn preset_idx(id: &str) -> usize {
-        provider_preset::PRESETS
-            .iter()
-            .position(|p| p.id == id)
-            .unwrap()
-    }
-
     #[test]
-    fn add_form_is_account_only_with_name_and_editable_base_url() {
-        // Account-only form: name, vendor preset, base_url (always), api key when keyed.
+    fn add_form_is_custom_provider_with_protocol_toggle() {
+        let mut f = AddForm::new();
+        // Fully-custom: name, protocol, base_url, api_key; base_url starts blank.
         assert_eq!(
-            AddForm::new(preset_idx("deepseek")).fields(),
+            f.fields(),
             vec![
                 FormField::Name,
                 FormField::Preset,
@@ -1316,16 +1305,14 @@ mod tests {
                 FormField::ApiKey,
             ]
         );
-        // base_url is pre-filled with the preset's default endpoint (editable).
-        assert!(!AddForm::new(preset_idx("deepseek")).base_url.is_empty());
-        // Ollama: keyless → no api_key field.
-        assert!(!AddForm::new(preset_idx("ollama"))
-            .fields()
-            .contains(&FormField::ApiKey));
-        // openai-compatible: no default endpoint → base_url blank, still shown.
-        let compat = AddForm::new(preset_idx("openai-compatible"));
-        assert!(compat.base_url.is_empty());
-        assert!(compat.fields().contains(&FormField::BaseUrl));
+        assert!(f.base_url.is_empty());
+        assert_eq!(f.protocol_label(), "OpenAI");
+        // ←→ toggles between the two protocols only (never a vendor list).
+        f.cycle_preset(true);
+        assert_eq!(f.protocol_label(), "Anthropic");
+        assert_eq!(f.preset().id, "anthropic-compatible");
+        f.cycle_preset(true);
+        assert_eq!(f.protocol_label(), "OpenAI");
     }
 
     #[test]
@@ -1347,14 +1334,16 @@ mod tests {
         let leg = ProviderPanel::open_edit(&cfg, "leg");
         assert!(leg.is_legacy);
         assert_eq!(leg.base_url, "https://legacy/v1");
-        // Vendor preset pre-filled from the legacy wire type.
-        assert_eq!(provider_preset::PRESETS[leg.preset_idx].id, "openai");
+        // Protocol toggle pre-filled from the wire (openai → OpenAI-compatible),
+        // and original == preset so a no-op edit won't rewrite the real provider.
+        assert_eq!(leg.protocol_label(), "OpenAI");
+        assert_eq!(leg.preset_idx, leg.original_preset_idx);
         let acc = ProviderPanel::open_edit(&cfg, "acc");
         assert!(!acc.is_legacy);
         assert_eq!(acc.base_url, "https://mirror/v1");
         assert!(acc.api_key.is_empty()); // blank = keep existing
-        // Vendor preset pre-filled from the account's provider id.
-        assert_eq!(provider_preset::PRESETS[acc.preset_idx].id, "deepseek");
+        // deepseek is openai-wire → OpenAI-compatible toggle.
+        assert_eq!(acc.protocol_label(), "OpenAI");
     }
 
     #[test]
