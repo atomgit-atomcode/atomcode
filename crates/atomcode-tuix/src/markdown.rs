@@ -52,6 +52,14 @@ pub struct MdState {
     /// An UNCLOSED / prematurely-finalized block does NOT increment this — only
     /// a real close fence does — so an incomplete block is never auto-copied.
     pub code_block_count: usize,
+    /// Trimmed text of the most recently rendered heading, used to DROP a
+    /// consecutive byte-identical repeat. Weak models sometimes emit the same
+    /// `## Section` twice with only a table (or blank line) between — a rendering
+    /// artefact the user reported. It persists across buffered tables and blank
+    /// lines but is CLEARED by any real content (prose / list / code), so a
+    /// heading legitimately reused in a later section (with content between) is
+    /// never suppressed. `None` = no heading since the last content reset.
+    pub last_heading: Option<String>,
 }
 
 /// Manual impl so `fence_char` / `fence_len` start at realistic sentinel
@@ -69,6 +77,7 @@ impl Default for MdState {
             code_buf: Vec::new(),
             last_code_block_source: None,
             code_block_count: 0,
+            last_heading: None,
         }
     }
 }
@@ -88,6 +97,7 @@ impl MdState {
         self.code_buf.clear();
         self.last_code_block_source = None;
         self.code_block_count = 0;
+        self.last_heading = None;
     }
 }
 
@@ -194,6 +204,7 @@ pub fn render_line_with_width(
             state.fence_char = c;
             state.fence_len = len;
             state.code_buf.clear();
+            state.last_heading = None; // a code block is real content
             return prefix_only();
         }
     }
@@ -223,6 +234,13 @@ pub fn render_line_with_width(
     // H4+ keeps italic-only so the deep-hierarchy levels still read as
     // "weaker than a real heading" without adding a third colour tier.
     if let Some((level, rest)) = parse_heading(line) {
+        // DROP a consecutive byte-identical heading (only tables/blanks between).
+        // Flush any buffered table first so its content is never lost — only the
+        // duplicated heading line itself is skipped.
+        if state.last_heading.as_deref() == Some(trimmed) {
+            return prefix_only();
+        }
+        state.last_heading = Some(trimmed.to_string());
         let inner = render_inline(rest, caps);
         let body = if !caps.colors {
             format!("{} {}", "#".repeat(level as usize), inner)
@@ -250,6 +268,7 @@ pub fn render_line_with_width(
     // the default-fg body text — visually distinct without adding another
     // bright colour tier. The space after the marker keeps readability.
     if let Some(item) = parse_list_item(line) {
+        state.last_heading = None; // real content ends the dedup window
         let inner = render_inline(&item.rest, caps);
         let indent = " ".repeat(item.indent);
         let body = if caps.colors {
@@ -267,7 +286,12 @@ pub fn render_line_with_width(
         return Some(prepend(body));
     }
 
-    // Default: inline-only
+    // Default: inline-only. Non-blank prose ends the dedup window (a heading
+    // reused after real content is legitimate); a blank line does NOT, so two
+    // identical headings separated only by whitespace still de-duplicate.
+    if !trimmed.is_empty() {
+        state.last_heading = None;
+    }
     Some(prepend(render_inline(line, caps)))
 }
 
@@ -1290,6 +1314,78 @@ mod tests {
             lang: Some("en_US.UTF-8".to_string()),
             ..Default::default()
         })
+    }
+
+    // Collect the rendered output of feeding `lines` one-by-one, then finalize.
+    fn render_all(lines: &[&str]) -> String {
+        let mut st = MdState::new();
+        let mut out = String::new();
+        for l in lines {
+            if let Some(r) = render_line(l, &mut st, plain_caps()) {
+                out.push_str(&r);
+                out.push('\n');
+            }
+        }
+        if let Some(r) = finalize(&mut st, plain_caps()) {
+            out.push_str(&r);
+        }
+        out
+    }
+
+    fn count(hay: &str, needle: &str) -> usize {
+        hay.matches(needle).count()
+    }
+
+    #[test]
+    fn duplicate_heading_after_table_is_dropped() {
+        // Weak-model artefact: same heading emitted twice with only a (stray)
+        // table between. The repeat must be dropped; the table content kept.
+        let out = render_all(&[
+            "| a | b |",
+            "|---|---|",
+            "| 1 | 2 |",
+            "## 三、未使用依赖分析",
+            "| c | d |",
+            "|---|---|",
+            "| 3 | 4 |",
+            "## 三、未使用依赖分析",
+        ]);
+        assert_eq!(
+            count(&out, "三、未使用依赖分析"),
+            1,
+            "consecutive identical heading (table between) must render once:\n{out}"
+        );
+    }
+
+    #[test]
+    fn duplicate_heading_across_blank_line_is_dropped() {
+        let out = render_all(&["## Section", "", "## Section"]);
+        assert_eq!(count(&out, "Section"), 1, "blank line must not un-dedup:\n{out}");
+    }
+
+    #[test]
+    fn heading_reused_after_real_content_is_kept() {
+        // Legitimate: same heading in two sections with prose between — NOT a
+        // duplicate, both must render.
+        let out = render_all(&[
+            "## Example",
+            "some explanatory prose here",
+            "## Example",
+        ]);
+        assert_eq!(count(&out, "Example"), 2, "content between must keep both:\n{out}");
+    }
+
+    #[test]
+    fn heading_reused_after_list_item_is_kept() {
+        let out = render_all(&["## Notes", "- a bullet point", "## Notes"]);
+        assert_eq!(count(&out, "Notes"), 2, "list content must keep both:\n{out}");
+    }
+
+    #[test]
+    fn different_consecutive_headings_both_render() {
+        let out = render_all(&["## First", "## Second"]);
+        assert_eq!(count(&out, "First"), 1);
+        assert_eq!(count(&out, "Second"), 1);
     }
 
     #[test]
