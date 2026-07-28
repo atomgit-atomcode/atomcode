@@ -9,7 +9,11 @@
 // palette. Esc cancels at any point.
 
 use anyhow::Result;
-use atomcode_config::config::provider::{ProviderConfig, ProviderPricing};
+use atomcode_config::config::provider::{
+    default_context_window_for, ModelProfileConfig, ProviderAccountConfig, ProviderConfig,
+    ProviderPricing,
+};
+use atomcode_config::config::provider_preset;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
@@ -58,6 +62,27 @@ pub enum ProviderWizard {
         providers: Vec<String>,
         selected: usize,
     },
+    /// Add via a curated vendor preset. `selected` indexes
+    /// [`provider_preset::PRESETS`]. Presets with a built-in endpoint run the
+    /// quick two-prompt [`ProviderWizard::AddPreset`] flow; presets without one
+    /// (the `*-compatible` custom endpoints) fall through to the manual
+    /// [`ProviderWizard::Add`] flow.
+    PresetPick { selected: usize },
+    /// Quick add for a preset with a built-in endpoint: prompt API key (unless
+    /// the preset is keyless, e.g. Ollama) then the model, and save as one
+    /// account + one model profile.
+    AddPreset {
+        preset_idx: usize,
+        step: PresetStep,
+        account: String,
+        api_key: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PresetStep {
+    ApiKey,
+    Model,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -219,23 +244,11 @@ fn handle_key(
                     };
                     match ITEMS[selected] {
                         "add" => {
-                            let new = ProviderWizard::Add {
-                                step: WizardStep::Template,
-                                draft: DraftProvider::default(),
-                                plan: Vec::new(),
-                                idx: 0,
-                            };
-                            show_add_step_prompt(
-                                WizardStep::Template,
-                                &DraftProvider::default(),
-                                0,
-                                0,
-                                buf,
-                                state,
-                                ctx,
-                                &new,
-                                renderer,
-                            );
+                            // Lead with vendor selection ("选厂商+填 key 即完成");
+                            // the custom-endpoint presets fall through to the
+                            // manual flow.
+                            let new = ProviderWizard::PresetPick { selected: 0 };
+                            redraw(buf, state, ctx, &new, renderer);
                             *wizard = new;
                         }
                         "edit" | "delete" | "set-default" if providers.is_empty() => {
@@ -708,7 +721,246 @@ fn handle_key(
             redraw(buf, state, ctx, wizard, renderer);
             Ok(ModalAction::Continue)
         }
+
+        // ── Preset vendor picker ──
+        ProviderWizard::PresetPick { mut selected } => {
+            let presets = provider_preset::PRESETS;
+            match code {
+                KeyCode::Up => selected = selected.saturating_sub(1),
+                KeyCode::Down => {
+                    if selected + 1 < presets.len() {
+                        selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let preset = &presets[selected];
+                    if preset.default_base_url.is_some() {
+                        // Quick flow: (API key unless keyless) → model.
+                        let account = unique_account_id(preset.id, ctx);
+                        let keyless =
+                            matches!(preset.auth_kind, provider_preset::AuthKind::None);
+                        let step = if keyless {
+                            PresetStep::Model
+                        } else {
+                            PresetStep::ApiKey
+                        };
+                        push(
+                            renderer,
+                            &format!(
+                                "  {} · {}",
+                                preset.display_name,
+                                preset.default_base_url.unwrap_or_default()
+                            ),
+                        );
+                        push(renderer, &preset_step_prompt(step, preset));
+                        *wizard = ProviderWizard::AddPreset {
+                            preset_idx: selected,
+                            step,
+                            account,
+                            api_key: String::new(),
+                        };
+                        redraw(buf, state, ctx, wizard, renderer);
+                        return Ok(ModalAction::Continue);
+                    }
+                    // Custom-endpoint preset (no built-in URL): manual flow,
+                    // pre-seeding the wire protocol.
+                    let draft = DraftProvider {
+                        provider_type: preset.provider_type.wire().to_string(),
+                        ..DraftProvider::default()
+                    };
+                    let new = ProviderWizard::Add {
+                        step: WizardStep::Template,
+                        draft: draft.clone(),
+                        plan: Vec::new(),
+                        idx: 0,
+                    };
+                    show_add_step_prompt(
+                        WizardStep::Template,
+                        &draft,
+                        0,
+                        0,
+                        buf,
+                        state,
+                        ctx,
+                        &new,
+                        renderer,
+                    );
+                    *wizard = new;
+                    return Ok(ModalAction::Continue);
+                }
+                _ => {}
+            }
+            *wizard = ProviderWizard::PresetPick { selected };
+            redraw(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
+        }
+
+        // ── Quick preset add: API key → model, saved as account + model ──
+        ProviderWizard::AddPreset {
+            preset_idx,
+            step,
+            account,
+            mut api_key,
+        } => {
+            if matches!(code, KeyCode::Enter) {
+                let answer = buf.expanded_text();
+                let shown = if matches!(step, PresetStep::ApiKey) && !answer.trim().is_empty() {
+                    "••••••".to_string()
+                } else {
+                    answer.clone()
+                };
+                push(renderer, &format!("  ↳ {}", shown));
+                buf.text.clear();
+                buf.cursor = 0;
+                let preset = &provider_preset::PRESETS[preset_idx];
+                match step {
+                    PresetStep::ApiKey => {
+                        api_key = answer.trim().to_string();
+                        push(renderer, &preset_step_prompt(PresetStep::Model, preset));
+                        *wizard = ProviderWizard::AddPreset {
+                            preset_idx,
+                            step: PresetStep::Model,
+                            account,
+                            api_key,
+                        };
+                        redraw(buf, state, ctx, wizard, renderer);
+                        return Ok(ModalAction::Continue);
+                    }
+                    PresetStep::Model => {
+                        let model = answer.trim().to_string();
+                        if model.is_empty() {
+                            push(renderer, &preset_step_prompt(PresetStep::Model, preset));
+                            *wizard = ProviderWizard::AddPreset {
+                                preset_idx,
+                                step: PresetStep::Model,
+                                account,
+                                api_key,
+                            };
+                            redraw(buf, state, ctx, wizard, renderer);
+                            return Ok(ModalAction::Continue);
+                        }
+                        if commit_preset_account(ctx, renderer, preset, &account, &api_key, &model) {
+                            return Ok(ModalAction::Close);
+                        }
+                        *wizard = ProviderWizard::AddPreset {
+                            preset_idx,
+                            step: PresetStep::Model,
+                            account,
+                            api_key,
+                        };
+                        redraw(buf, state, ctx, wizard, renderer);
+                        return Ok(ModalAction::Continue);
+                    }
+                }
+            }
+            forward_to_buffer(code, _mods, buf, state, ctx);
+            *wizard = ProviderWizard::AddPreset {
+                preset_idx,
+                step,
+                account,
+                api_key,
+            };
+            redraw(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
+        }
     }
+}
+
+/// A unique account id derived from the preset id, avoiding collisions with
+/// existing accounts or legacy provider names.
+fn unique_account_id(base: &str, ctx: &LoopCtx) -> String {
+    let taken = |id: &str| {
+        ctx.config.provider_accounts.contains_key(id) || ctx.config.providers.contains_key(id)
+    };
+    if !taken(base) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !taken(candidate))
+        .unwrap_or_else(|| base.to_string())
+}
+
+/// Prompt text for a preset add step.
+fn preset_step_prompt(step: PresetStep, preset: &provider_preset::ProviderPreset) -> String {
+    match step {
+        PresetStep::ApiKey => {
+            let env = preset
+                .api_key_env
+                .map(|e| format!(" (leave blank to use ${e})"))
+                .unwrap_or_default();
+            format!("API key for {}?{}", preset.display_name, env)
+        }
+        PresetStep::Model => format!("Model? (e.g. the model id from {})", preset.display_name),
+    }
+}
+
+/// Pure builder: turn a preset add into an `(account, model, model_id)` triple.
+/// Separated from the ctx/save so it can be unit-tested.
+fn build_preset_entry(
+    preset: &provider_preset::ProviderPreset,
+    account_id: &str,
+    api_key: &str,
+    model_name: &str,
+) -> (ProviderAccountConfig, ModelProfileConfig, String) {
+    let model_id = format!("{account_id}/{model_name}");
+    let account = ProviderAccountConfig {
+        provider: preset.id.to_string(),
+        display_name: None,
+        api_key: (!api_key.trim().is_empty()).then(|| api_key.trim().to_string()),
+        base_url: None,
+        user_agent: None,
+        skip_tls_verify: false,
+        enterprise_url: None,
+        ephemeral: false,
+    };
+    let model = ModelProfileConfig {
+        account: account_id.to_string(),
+        model: model_name.to_string(),
+        display_name: None,
+        system_prompt: None,
+        context_window: default_context_window_for(preset.provider_type.wire()),
+        max_tokens: None,
+        capable_model: None,
+        thinking_type: None,
+        thinking_keep: None,
+        reasoning_history: None,
+        reasoning_effort: None,
+        thinking_enabled: None,
+        thinking_budget: None,
+        pricing: None,
+    };
+    (account, model, model_id)
+}
+
+/// Build one account + one model profile from a preset add and save+reload,
+/// making the new model the default.
+fn commit_preset_account(
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    preset: &provider_preset::ProviderPreset,
+    account_id: &str,
+    api_key: &str,
+    model_name: &str,
+) -> bool {
+    let (account, model, model_id) = build_preset_entry(preset, account_id, api_key, model_name);
+    let mut desired = ctx.config.clone();
+    desired
+        .provider_accounts
+        .insert(account_id.to_string(), account);
+    desired.models.insert(model_id.clone(), model);
+    desired.default_model = Some(model_id);
+    save_and_reload(
+        ctx,
+        desired,
+        renderer,
+        crate::i18n::t(crate::i18n::Msg::ProviderAdded {
+            name: account_id,
+            model: model_name,
+        })
+        .into_owned(),
+        true,
+    )
 }
 
 /// Redraw the footer with the wizard's current menu/prompt. Text-input
@@ -774,9 +1026,27 @@ fn redraw(
                 kind: crate::render::MenuKind::SlashCommand,
             })
         }
+        ProviderWizard::PresetPick { selected } => {
+            let items: Vec<(String, String)> = provider_preset::PRESETS
+                .iter()
+                .map(|p| {
+                    let desc = p
+                        .default_base_url
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "custom endpoint — you'll enter the URL".to_string());
+                    (p.display_name.to_string(), desc)
+                })
+                .collect();
+            Some(MenuPayload {
+                items,
+                selected: *selected,
+                kind: crate::render::MenuKind::SlashCommand,
+            })
+        }
         // Q&A steps: plain input box, no overlay menu.
         ProviderWizard::Add { .. }
         | ProviderWizard::Edit { .. }
+        | ProviderWizard::AddPreset { .. }
         | ProviderWizard::DeleteConfirm { .. } => None,
     };
     renderer.render(UiLine::InputPrompt {
@@ -1487,6 +1757,30 @@ fn forward_to_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preset_add_builds_a_resolvable_account_and_model() {
+        // "select vendor + add key" → one account + one model, resolvable through
+        // the single boundary using the preset's built-in endpoint.
+        let preset = provider_preset::preset("deepseek").unwrap();
+        let (account, model, model_id) =
+            build_preset_entry(preset, "deepseek", "sk-test", "deepseek-chat");
+        assert_eq!(model_id, "deepseek/deepseek-chat");
+        assert_eq!(account.provider, "deepseek");
+        assert_eq!(account.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(model.account, "deepseek");
+        assert_eq!(model.model, "deepseek-chat");
+
+        let mut cfg = atomcode_config::config::Config::default();
+        cfg.provider_accounts.insert("deepseek".into(), account);
+        cfg.models.insert(model_id.clone(), model);
+        cfg.default_model = Some(model_id);
+        assert!(cfg.validate_provider_accounts_and_models().is_empty());
+        let r = cfg.resolve_model(None).unwrap();
+        assert_eq!(r.model, "deepseek-chat");
+        assert_eq!(r.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(r.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+    }
 
     #[test]
     fn parse_template_curl_openai() {
