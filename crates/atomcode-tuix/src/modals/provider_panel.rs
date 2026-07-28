@@ -443,7 +443,19 @@ impl ProviderPanel {
             }
             id.clone()
         } else {
-            let model_id = format!("{account_id}/{model_name}");
+            // Make the selection-id key unique so a slash in the model name (or a
+            // repeat add) never silently overwrites a different model profile.
+            let base = format!("{account_id}/{model_name}");
+            let model_id = if desired.models.contains_key(&base)
+                || desired.providers.contains_key(&base)
+            {
+                (2..)
+                    .map(|n| format!("{base}-{n}"))
+                    .find(|c| !desired.models.contains_key(c) && !desired.providers.contains_key(c))
+                    .unwrap_or(base)
+            } else {
+                base
+            };
             desired.models.insert(
                 model_id.clone(),
                 ModelProfileConfig {
@@ -488,13 +500,17 @@ impl ProviderPanel {
             desired.models.remove(id);
             desired.providers.remove(id); // legacy single-model provider
         }
-        // Clear a now-dangling default.
+        // Clear a now-dangling default (both the canonical `default_model` and
+        // the legacy `default_provider`, so neither points at the deleted entry).
         if desired
             .default_model
             .as_deref()
             .is_some_and(|d| desired.resolve_model(Some(d)).is_err())
         {
             desired.default_model = None;
+        }
+        if desired.resolve_model(Some(&desired.default_provider)).is_err() {
+            desired.default_provider.clear();
         }
         save_and_reload(
             ctx,
