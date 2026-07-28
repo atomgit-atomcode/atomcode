@@ -234,7 +234,19 @@ pub struct ProviderPanel {
     tab: Tab,
     selected: usize,
     mode: Mode,
+    /// Search/filter query for the list (the plugin-style search box).
+    query: String,
+    /// When set (via drilling into an account with ↵), the Models tab shows only
+    /// this account's models. Cleared by Tab / Esc.
+    account_filter: Option<String>,
 }
+
+/// Rows the List layout pushes before the first account/model row: the tab bar,
+/// a blank, the reserved plugin search box (index 2), and a blank separator.
+/// The selection offset MUST equal the number of these header pushes — keep this
+/// in lockstep with the `items.push(...)` calls at the top of the List arm in
+/// [`ProviderPanel::draw`].
+const LIST_HEADER_ROWS: usize = 4;
 
 impl ProviderPanel {
     pub fn open() -> Self {
@@ -242,6 +254,8 @@ impl ProviderPanel {
             tab: Tab::Accounts,
             selected: 0,
             mode: Mode::List,
+            query: String::new(),
+            account_filter: None,
         }
     }
 
@@ -268,19 +282,60 @@ impl ProviderPanel {
         ids
     }
 
-    fn current_len(&self, config: &Config) -> usize {
-        match self.tab {
-            Tab::Accounts => Self::account_ids(config).len(),
-            Tab::Models => Self::model_ids(config).len(),
-        }
-    }
-
-    fn selected_id(&self, config: &Config) -> Option<String> {
-        let ids = match self.tab {
+    /// Ids for the current tab, filtered by the search query (matched against
+    /// the id, vendor/preset, and model name).
+    fn filtered_ids(&self, config: &Config) -> Vec<String> {
+        let mut all = match self.tab {
             Tab::Accounts => Self::account_ids(config),
             Tab::Models => Self::model_ids(config),
         };
-        ids.get(self.selected).cloned()
+        let models = config.logical_models();
+        // Drill-in: on the Models tab, restrict to a single account when the
+        // user entered via ↵ on an account row (Tab / Esc clears it).
+        if self.tab == Tab::Models {
+            if let Some(acct) = &self.account_filter {
+                all.retain(|id| models.get(id).is_some_and(|m| &m.account == acct));
+            }
+        }
+        if self.query.trim().is_empty() {
+            return all;
+        }
+        let q = self.query.to_lowercase();
+        let accounts = config.logical_accounts();
+        all.into_iter()
+            .filter(|id| {
+                if id.to_lowercase().contains(&q) {
+                    return true;
+                }
+                match self.tab {
+                    Tab::Accounts => accounts
+                        .get(id)
+                        .is_some_and(|a| a.provider.to_lowercase().contains(&q)),
+                    Tab::Models => models.get(id).is_some_and(|m| {
+                        m.model.to_lowercase().contains(&q)
+                            || m.account.to_lowercase().contains(&q)
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    /// Switch to `tab`, resetting the selection and clearing both filters (the
+    /// search query and the account drill-in) so the destination shows its full
+    /// list.
+    fn switch_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.selected = 0;
+        self.query.clear();
+        self.account_filter = None;
+    }
+
+    fn current_len(&self, config: &Config) -> usize {
+        self.filtered_ids(config).len()
+    }
+
+    fn selected_id(&self, config: &Config) -> Option<String> {
+        self.filtered_ids(config).get(self.selected).cloned()
     }
 
     /// Persist the add form as one account + one model, optionally default.
@@ -526,7 +581,7 @@ impl Modal for ProviderPanel {
     fn handle_key(
         &mut self,
         code: KeyCode,
-        _mods: KeyModifiers,
+        mods: KeyModifiers,
         buf: &mut Buffer,
         state: &mut UiState,
         ctx: &mut LoopCtx,
@@ -673,17 +728,24 @@ impl Modal for ProviderPanel {
             return Ok(ModalAction::Continue);
         }
 
-        // ── List mode ──
+        // ── List mode (plugin-style: type filters, Ctrl+key acts) ──
         let len = self.current_len(&ctx.config);
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
         match code {
+            // Esc closes the panel outright. Clearing a filter is done with
+            // ←→ / Tab (which also switch tabs and reset both filters).
             KeyCode::Esc => return Ok(ModalAction::Close),
-            KeyCode::Tab | KeyCode::Right => {
-                self.tab = Tab::Models;
-                self.selected = 0;
-            }
-            KeyCode::BackTab | KeyCode::Left => {
-                self.tab = Tab::Accounts;
-                self.selected = 0;
+            // ← / → jump to that tab; Tab / Shift-Tab toggle (cycle) so you're
+            // never stuck. A manual tab switch drops the account drill-in filter
+            // (show all) — the search box has no cursor, so arrows are free here.
+            KeyCode::Left => self.switch_tab(Tab::Accounts),
+            KeyCode::Right => self.switch_tab(Tab::Models),
+            KeyCode::Tab | KeyCode::BackTab => {
+                let next = match self.tab {
+                    Tab::Accounts => Tab::Models,
+                    Tab::Models => Tab::Accounts,
+                };
+                self.switch_tab(next);
             }
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down => {
@@ -691,7 +753,8 @@ impl Modal for ProviderPanel {
                     self.selected += 1;
                 }
             }
-            KeyCode::Char('a') => {
+            // Ctrl+A: add. Letter keys are reserved for the search filter.
+            KeyCode::Char('a') if ctrl => {
                 match self.tab {
                     // New account (+ its first model).
                     Tab::Accounts => self.mode = Mode::Add(AddForm::new(0)),
@@ -705,7 +768,8 @@ impl Modal for ProviderPanel {
                     }
                 }
             }
-            KeyCode::Char('e') => {
+            // Ctrl+E: edit the selected row.
+            KeyCode::Char('e') if ctrl => {
                 if let Some(id) = self.selected_id(&ctx.config) {
                     self.mode = match self.tab {
                         Tab::Accounts => Mode::EditAccount(Self::open_edit(&ctx.config, &id)),
@@ -716,13 +780,23 @@ impl Modal for ProviderPanel {
                     };
                 }
             }
-            KeyCode::Char('d') => {
+            // Ctrl+D: delete the selected row.
+            KeyCode::Char('d') if ctrl => {
                 if let Some(id) = self.selected_id(&ctx.config) {
                     self.mode = Mode::DeleteConfirm {
                         id,
                         is_account: self.tab == Tab::Accounts,
                     };
                 }
+            }
+            // Type to filter.
+            KeyCode::Char(c) if !ctrl => {
+                self.query.push(c);
+                self.selected = 0;
+            }
+            KeyCode::Backspace => {
+                self.query.pop();
+                self.selected = 0;
             }
             KeyCode::Enter => {
                 if let Some(id) = self.selected_id(&ctx.config) {
@@ -733,19 +807,14 @@ impl Modal for ProviderPanel {
                                 return Ok(ModalAction::Close);
                             }
                         }
-                        // Drill into the account's models.
+                        // Drill into the account: switch to the Models tab
+                        // filtered to just this account. Manual Tab / Esc clears
+                        // the filter to show all models again.
                         Tab::Accounts => {
                             self.tab = Tab::Models;
-                            self.selected = Self::model_ids(&ctx.config)
-                                .iter()
-                                .position(|mid| {
-                                    ctx.config
-                                        .logical_models()
-                                        .get(mid)
-                                        .map(|m| m.account == id)
-                                        .unwrap_or(false)
-                                })
-                                .unwrap_or(0);
+                            self.account_filter = Some(id);
+                            self.query.clear();
+                            self.selected = 0;
                         }
                     }
                 }
@@ -762,22 +831,38 @@ impl Modal for ProviderPanel {
         let t1 = tab_chip("模型", self.tab == Tab::Models);
         items.push((format!("{t0}   {t1}"), String::new()));
         items.push((String::new(), String::new()));
-        let header_rows = items.len();
 
         let mut selected = items.len(); // nothing highlighted by default
-        let mut hint = String::new();
+        let hint: String; // assigned once per match arm below
+        // Forms use the box-less `PluginInfo` layout; the list uses the `Plugin`
+        // layout whose reserved index-2 slot is rendered as the search box.
+        let mut kind = MenuKind::PluginInfo;
+        let mut buf = String::new();
 
         match &self.mode {
             Mode::List => {
+                kind = MenuKind::Plugin;
+                buf = self.query.clone();
+                // Reserved search box (index 2) + blank separator (index 3): the
+                // plugin menu renders index 2 as the bordered input field. With
+                // the tab bar + blank already pushed, list rows start at
+                // LIST_HEADER_ROWS.
+                items.push((self.query.clone(), String::new()));
+                items.push((String::new(), String::new()));
                 let cur = ctx.config.effective_model_selection().unwrap_or_default();
                 let accounts = ctx.config.logical_accounts();
                 let models = ctx.config.logical_models();
                 let default_account = models.get(&cur).map(|m| m.account.clone());
                 match self.tab {
                     Tab::Accounts => {
-                        let ids = Self::account_ids(&ctx.config);
+                        let ids = self.filtered_ids(&ctx.config);
                         if ids.is_empty() {
-                            items.push(("(尚无 Provider — 按 a 添加第一个)".into(), String::new()));
+                            let msg = if self.query.trim().is_empty() {
+                                "(尚无 Provider — 按 a 添加第一个)"
+                            } else {
+                                "(无匹配的 Provider)"
+                            };
+                            items.push((msg.into(), String::new()));
                         }
                         for id in &ids {
                             let a = accounts.get(id);
@@ -796,12 +881,19 @@ impl Modal for ProviderPanel {
                             };
                             items.push((left, format!("{vendor} · {count} 模型{mark}")));
                         }
-                        hint = "a 添加  e 编辑  d 删除  ↵ 展开模型  Tab 切换  Esc 关闭".into();
+                        hint =
+                            "输入筛选  ↑↓ 选择  ↵ 展开模型  Ctrl+A 添加  Ctrl+E 编辑  Ctrl+D 删除  ←→/Tab 切换  Esc 关闭"
+                                .into();
                     }
                     Tab::Models => {
-                        let ids = Self::model_ids(&ctx.config);
+                        let ids = self.filtered_ids(&ctx.config);
                         if ids.is_empty() {
-                            items.push(("(尚无模型 — 在账号页按 a 添加)".into(), String::new()));
+                            let msg = if self.query.trim().is_empty() {
+                                "(尚无模型 — 在账号页按 a 添加)"
+                            } else {
+                                "(无匹配的模型)"
+                            };
+                            items.push((msg.into(), String::new()));
                         }
                         for id in &ids {
                             let m = models.get(id);
@@ -814,11 +906,21 @@ impl Modal for ProviderPanel {
                                 .unwrap_or_default();
                             items.push((id.clone(), desc));
                         }
-                        hint = "a 添加  e 编辑  d 删除  ↵ 设为默认  Tab 切换  Esc 关闭".into();
+                        hint = if let Some(acct) = &self.account_filter {
+                            format!(
+                                "〔仅账号 {acct}〕↑↓ 选择  ↵ 设为默认  Ctrl+E 编辑  Ctrl+D 删除  ←→/Tab 返回全部  Esc 关闭"
+                            )
+                        } else {
+                            "输入筛选  ↑↓ 选择  ↵ 设为默认  Ctrl+A 添加  Ctrl+E 编辑  Ctrl+D 删除  ←→/Tab 切换  Esc 关闭"
+                                .into()
+                        };
                     }
                 }
+                // List rows begin at LIST_HEADER_ROWS (tab bar, blank, search
+                // box, blank).
                 if self.current_len(&ctx.config) > 0 {
-                    selected = (self.selected + header_rows).min(items.len().saturating_sub(1));
+                    selected =
+                        (self.selected + LIST_HEADER_ROWS).min(items.len().saturating_sub(1));
                 }
             }
             Mode::Add(form) => {
@@ -944,11 +1046,12 @@ impl Modal for ProviderPanel {
         let payload = MenuPayload {
             items,
             selected,
-            kind: MenuKind::Plugin,
+            kind,
         };
+        let cursor_byte = buf.len();
         renderer.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
+            buf,
+            cursor_byte,
             menu: Some(payload),
             status: build_status(state, ctx),
             attachments: Vec::new(),
@@ -964,14 +1067,20 @@ impl Modal for ProviderPanel {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
-        if let Mode::Add(form) = &mut self.mode {
-            let clean = text.trim().lines().next().unwrap_or("").trim();
-            match form.focus {
+        let clean = text.trim().lines().next().unwrap_or("").trim();
+        match &mut self.mode {
+            Mode::Add(form) => match form.focus {
                 FormField::ApiKey => form.api_key.push_str(clean),
                 FormField::BaseUrl => form.base_url.push_str(clean),
                 FormField::Model => form.model.push_str(clean),
                 _ => {}
+            },
+            // Paste into the search filter.
+            Mode::List => {
+                self.query.push_str(clean);
+                self.selected = 0;
             }
+            _ => {}
         }
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
@@ -1059,5 +1168,82 @@ mod tests {
             ProviderPanel::model_ids(&cfg),
             vec!["acc/a".to_string(), "acc/z".to_string()]
         );
+    }
+
+    #[test]
+    fn query_filters_accounts_by_id_and_vendor() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "openai-main": { "provider": "openai" },
+                "deep": { "provider": "deepseek" }
+            },
+            "models": {
+                "openai-main/gpt": { "account": "openai-main", "model": "gpt", "context_window": 8000 },
+                "deep/chat": { "account": "deep", "model": "chat", "context_window": 8000 }
+            }
+        }))
+        .unwrap();
+        let mut p = ProviderPanel::open();
+        // Empty query → all accounts.
+        assert_eq!(p.filtered_ids(&cfg).len(), 2);
+        // Match by account id substring.
+        p.query = "deep".into();
+        assert_eq!(p.filtered_ids(&cfg), vec!["deep".to_string()]);
+        // Match by vendor even when the id doesn't contain it.
+        p.query = "openai".into();
+        assert_eq!(p.filtered_ids(&cfg), vec!["openai-main".to_string()]);
+        // No match → empty.
+        p.query = "zzz".into();
+        assert!(p.filtered_ids(&cfg).is_empty());
+    }
+
+    #[test]
+    fn account_filter_restricts_models_tab_to_one_account() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "AtomGit": { "provider": "openai" }, "other": { "provider": "openai" } },
+            "models": {
+                "AtomGit-a": { "account": "AtomGit", "model": "a", "context_window": 8000 },
+                "AtomGit-b": { "account": "AtomGit", "model": "b", "context_window": 8000 },
+                "other/x": { "account": "other", "model": "x", "context_window": 8000 }
+            }
+        }))
+        .unwrap();
+        let mut p = ProviderPanel::open();
+        p.tab = Tab::Models;
+        // No filter → all models.
+        assert_eq!(p.filtered_ids(&cfg).len(), 3);
+        // Drill into AtomGit → only its two models.
+        p.account_filter = Some("AtomGit".into());
+        assert_eq!(
+            p.filtered_ids(&cfg),
+            vec!["AtomGit-a".to_string(), "AtomGit-b".to_string()]
+        );
+        // A typed query narrows further, within the account.
+        p.query = "b".into();
+        assert_eq!(p.filtered_ids(&cfg), vec!["AtomGit-b".to_string()]);
+        // The account filter only applies to the Models tab.
+        p.query.clear();
+        p.tab = Tab::Accounts;
+        assert_eq!(p.filtered_ids(&cfg).len(), 2);
+    }
+
+    #[test]
+    fn query_filters_models_by_name_and_account() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "deepseek" } },
+            "models": {
+                "acc/chat": { "account": "acc", "model": "deepseek-chat", "context_window": 8000 },
+                "acc/reason": { "account": "acc", "model": "deepseek-reasoner", "context_window": 8000 }
+            }
+        }))
+        .unwrap();
+        let mut p = ProviderPanel::open();
+        p.tab = Tab::Models;
+        // Match by model name substring.
+        p.query = "reason".into();
+        assert_eq!(p.filtered_ids(&cfg), vec!["acc/reason".to_string()]);
+        // Account name matches both models.
+        p.query = "acc".into();
+        assert_eq!(p.filtered_ids(&cfg).len(), 2);
     }
 }

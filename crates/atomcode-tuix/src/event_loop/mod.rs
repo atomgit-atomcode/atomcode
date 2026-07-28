@@ -21418,10 +21418,10 @@ pub(crate) fn approval_denial_label(output: &str, success: bool) -> Option<Strin
 fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
     let applicable = reasoning_effort_applicable_on_provider(ctx);
     ctx.reasoning_effort = if applicable {
+        let sel = ctx.config.effective_model_selection().unwrap_or_default();
         ctx.config
-            .providers
-            .get(&ctx.config.default_provider)
-            .and_then(|p| p.reasoning_effort.clone())
+            .provider_config_for_selection(&sel)
+            .and_then(|p| p.reasoning_effort)
     } else {
         None
     };
@@ -21429,17 +21429,17 @@ fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
 
 /// Persist the current reasoning_effort to config.toml
 fn persist_reasoning_effort(ctx: &mut LoopCtx) {
-    let default_provider = ctx.config.default_provider.clone();
-    if let Some(p) = ctx.config.providers.get_mut(&default_provider) {
-        p.reasoning_effort = ctx.reasoning_effort.clone();
-    }
+    let selection = ctx.config.effective_model_selection().unwrap_or_default();
     let effort = ctx.reasoning_effort.clone();
+    // Schema-aware write (new-schema `[models.*]` or legacy `[providers.*]`).
+    ctx.config
+        .update_selection_reasoning(&selection, |r| *r.reasoning_effort = effort.clone());
     match ctx.config_store.update(|config| {
-        let provider = config
-            .providers
-            .get_mut(&default_provider)
-            .ok_or_else(|| anyhow::anyhow!("provider {default_provider:?} not found"))?;
-        provider.reasoning_effort = effort;
+        if !config.update_selection_reasoning(&selection, |r| {
+            *r.reasoning_effort = effort.clone()
+        }) {
+            anyhow::bail!("provider {selection:?} not found");
+        }
         Ok(())
     }) {
         Ok(commit) => ctx.observed_config_revision = Some(commit.snapshot.revision),
@@ -21448,12 +21448,12 @@ fn persist_reasoning_effort(ctx: &mut LoopCtx) {
 }
 
 pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
+    let selection = ctx.config.effective_model_selection().unwrap_or_default();
     let ptype = ctx
         .config
-        .providers
-        .get(&ctx.config.default_provider)
-        .map(|p| p.provider_type.as_str())
-        .unwrap_or("");
+        .provider_config_for_selection(&selection)
+        .map(|p| p.provider_type)
+        .unwrap_or_default();
     // Model-name check delegates to the provider so the UI "applicable" hint
     // and the actual request-body gate (OpenAiProvider) can never diverge.
     (ptype == "deepseek" || ptype == "openai")

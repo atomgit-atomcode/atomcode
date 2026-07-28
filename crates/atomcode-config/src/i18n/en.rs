@@ -46,8 +46,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ✓ {} active\n", plan).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
             format!("  × CodingPlan {} tier setup failed — {}\n", tier, reason).into(),
-        Msg::CpAddedProviders { count, plural_s } =>
-            format!("  ✓ Added {} provider{}:\n", count, plural_s).into(),
+        Msg::CpAddedProviders { accounts, models } =>
+            format!(
+                "  ✓ Added {} account{} · {} model{}:\n",
+                accounts,
+                if accounts == 1 { "" } else { "s" },
+                models,
+                if models == 1 { "" } else { "s" }
+            )
+            .into(),
         Msg::CpLocked { name } =>
             // SGR 31 = standard red foreground, SGR 39 = reset to
             // default fg. Standard (not bright) so the terminal's
@@ -60,7 +67,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             // the meaning, just without the colour.
             format!("      \x1b[31m× {}  (requires Pro plan or higher)\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
-            format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
+            format!("      • {}  ·  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  (default)".into(),
         Msg::CpVisionAuto { kind } =>
             format!("  ✓ Vision preprocessor → {}  (auto-detected)\n", kind).into(),

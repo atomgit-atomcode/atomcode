@@ -106,7 +106,7 @@ pub struct ClaimResponse {
 /// Every field is `#[serde(default)]` so an older server that
 /// omits a key still deserialises (atomcode falls back to the
 /// constants in `coding_plan::setup` — `LLM_BASE_URL`,
-/// `PROVIDER_TYPE`, `CONTEXT_WINDOW`). The eligibility check
+/// `PROVIDER_TYPE`, `MIN_CONTEXT_WINDOW`). The eligibility check
 /// (whether the user's plan tier actually covers this model)
 /// lives in `plan_available`, the server-side decision —
 /// `is_infinity` and `is_atomcode_exclusive` are flagged
@@ -138,11 +138,11 @@ pub struct ModelEntry {
     /// AtomGit gateway is OpenAI-compatible by default).
     #[serde(default, rename = "type")]
     pub provider_type: Option<String>,
-    /// Per-model context window in tokens. `None` falls back to
-    /// `coding_plan::setup::CONTEXT_WINDOW` (the 64k value the
-    /// legacy `/login` flow hard-coded). Letting the server drive
-    /// this lets bigger models (e.g. GLM-4.6 128k) avoid being
-    /// silently truncated to the historical default.
+    /// Per-model context window in tokens. Floored at
+    /// `coding_plan::setup::MIN_CONTEXT_WINDOW` (128k) — a smaller or missing
+    /// server value is raised to that floor, a larger one is kept. Letting the
+    /// server drive this lets bigger models (e.g. Claude 200k) avoid being
+    /// silently truncated.
     #[serde(default)]
     pub context_window: Option<usize>,
     /// `true` iff the user's current plan tier (the one their `claim-v2`

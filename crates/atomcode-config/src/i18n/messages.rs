@@ -86,8 +86,8 @@ pub enum Msg<'a> {
         reason: &'a str,
     },
     CpAddedProviders {
-        count: usize,
-        plural_s: &'a str,
+        accounts: usize,
+        models: usize,
     },
     /// Locked-model row. `name` is expected to be pre-decorated with
     /// U+0336 combining strikethrough by the caller (see

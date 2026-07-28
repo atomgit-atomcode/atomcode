@@ -298,7 +298,7 @@ async fn exec_native_compact(
     // Validate the provider up front for a clean error (the old core path did
     // `providers.get(...).ok_or("Provider not found")`); without this a missing
     // key surfaces as a murkier build/network failure deeper in.
-    if !config.providers.contains_key(&resolved) {
+    if !config.selection_exists(&resolved) {
         anyhow::bail!("Provider '{resolved}' not found");
     }
 
@@ -376,8 +376,7 @@ async fn exec_context(
         atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())?;
     let resolved = crate::live_api::resolve_provider_name(&config, provider);
     let provider_config = config
-        .providers
-        .get(&resolved)
+        .provider_config_for_selection(&resolved)
         .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved))?;
     let ctx_window = provider_config.context_window as u32;
     let used_tokens = snapshot_used_tokens(&session.snapshot.messages);
@@ -683,8 +682,8 @@ fn exec_status(
         .unwrap_or_default();
     let model = config
         .as_ref()
-        .and_then(|c| c.providers.get(&provider_name))
-        .map(|p| p.model.clone())
+        .and_then(|c| c.provider_config_for_selection(&provider_name))
+        .map(|p| p.model)
         .unwrap_or_default();
     let auth = atomcode_auth::get_stored_auth();
 

@@ -213,7 +213,7 @@ pub fn provider_fingerprint(
 ) -> Result<String, String> {
     use sha2::{Digest, Sha256};
 
-    if !config.providers.contains_key(provider_name) {
+    if !config.selection_exists(provider_name) {
         return Err(format!("provider {provider_name:?} not found"));
     }
     let mut normalized = config.clone();
@@ -383,7 +383,7 @@ pub async fn ensure_headless_runtime(
     let config =
         atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())
             .map_err(|error| error.to_string())?;
-    if !config.providers.contains_key(&provider_name) {
+    if !config.selection_exists(&provider_name) {
         return Err(format!("provider {provider_name:?} not found"));
     }
     let provider_fingerprint = provider_fingerprint(&config, &provider_name)?;

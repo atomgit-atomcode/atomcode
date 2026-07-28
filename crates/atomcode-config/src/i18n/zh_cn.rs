@@ -46,8 +46,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ✓ {} 生效\n", plan).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
             format!("  × CodingPlan {} 套餐配置失败 — {}\n", tier, reason).into(),
-        Msg::CpAddedProviders { count, plural_s: _ } =>
-            format!("  ✓ 已添加 {} 个 Provider：\n", count).into(),
+        Msg::CpAddedProviders { accounts, models } =>
+            format!("  ✓ 已添加 {} 个账号 · {} 个模型：\n", accounts, models).into(),
         Msg::CpLocked { name } =>
             // SGR 31 / 39 = 标准红前景 + 默认色重置。用标准色（不
             // 是亮色）让终端按当前主题映射 —— Solarized / Dracula /
@@ -56,7 +56,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             // 但 `× … （需要升级成 Pro 以上套餐）` 文本本身仍能传达含义。
             format!("      \x1b[31m× {}  （需要升级成 Pro 以上套餐）\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
-            format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
+            format!("      • {}  ·  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  （默认）".into(),
         Msg::CpVisionAuto { kind } =>
             format!("  ✓ 视觉预处理器 → {}  （自动检测）\n", kind).into(),

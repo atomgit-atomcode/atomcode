@@ -95,13 +95,21 @@ pub(crate) async fn get_providers() -> impl IntoResponse {
         Ok(c) => c,
         Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let providers: Vec<ProviderInfo> = config
-        .providers
+    // List the unified catalog so new-schema / folded CodingPlan models (absent
+    // from `config.providers`) remain visible and selectable.
+    let default_selection = config.effective_model_selection().unwrap_or_default();
+    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+    ids.sort();
+    let providers: Vec<ProviderInfo> = ids
         .iter()
-        .map(|(name, p)| provider_info(name, p, &config.default_provider))
+        .filter_map(|id| {
+            config
+                .provider_config_for_selection(id)
+                .map(|p| provider_info(id, &p, &default_selection))
+        })
         .collect();
     Json(serde_json::json!({
-        "default_provider": config.default_provider,
+        "default_provider": default_selection,
         "providers": providers,
     }))
     .into_response()
@@ -381,10 +389,14 @@ pub(crate) async fn set_default_provider(Path(name): Path<String>) -> impl IntoR
     let mut missing = false;
     let requested = name.clone();
     let config = match update_config(|config| {
-        if !config.providers.contains_key(&requested) {
+        if !config.selection_exists(&requested) {
             missing = true;
             anyhow::bail!("provider {requested:?} not found");
         }
+        // `default_model` is the canonical selection (`effective_model_selection`
+        // prefers it); keep the legacy `default_provider` synced so a new-schema
+        // selection actually takes effect.
+        config.default_model = Some(requested.clone());
         config.default_provider = requested.clone();
         Ok(())
     }) {

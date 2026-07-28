@@ -30,15 +30,26 @@ fn empty_config() -> Config {
 }
 
 /// Build a sanitized ConfigResponse from a loaded Config.
+///
+/// Lists the unified model catalog (`logical_models`) so new-schema and folded
+/// CodingPlan models — which no longer live in `config.providers` — are still
+/// selectable in the webui. Each selection id is reconstructed into a
+/// `ProviderConfig` view via the resolution boundary.
 pub(crate) fn config_response(config: &Config) -> ConfigResponse {
-    let providers = config
-        .providers
+    let default_selection = config.effective_model_selection().unwrap_or_default();
+    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+    ids.sort();
+    let providers = ids
         .iter()
-        .map(|(name, p)| provider_info(name, p, &config.default_provider))
+        .filter_map(|id| {
+            config
+                .provider_config_for_selection(id)
+                .map(|p| provider_info(id, &p, &default_selection))
+        })
         .collect();
     ConfigResponse {
         path: Config::default_path(),
-        default_provider: config.default_provider.clone(),
+        default_provider: default_selection,
         default_workdir: config.default_workdir.clone(),
         providers,
     }
@@ -161,6 +172,34 @@ mod tests {
             capable_model: None,
             pricing: None,
         }
+    }
+
+    #[test]
+    fn config_response_lists_new_schema_and_folded_codingplan_models() {
+        // A config where the selectable models live ONLY in the new schema
+        // (provider_accounts + models) — none in [providers.*].
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "AtomGit-GLM-5.2",
+            "provider_accounts": { "AtomGit": { "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1" } },
+            "models": {
+                "AtomGit-GLM-5.2": { "account": "AtomGit", "model": "GLM-5.2", "context_window": 128000 },
+                "AtomGit-Qwen": { "account": "AtomGit", "model": "Qwen", "context_window": 128000 }
+            }
+        }))
+        .unwrap();
+        let resp = config_response(&config);
+        let names: Vec<&str> = resp.providers.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"AtomGit-GLM-5.2"), "new-schema model listed");
+        assert!(names.contains(&"AtomGit-Qwen"));
+        assert_eq!(resp.default_provider, "AtomGit-GLM-5.2");
+        let glm = resp
+            .providers
+            .iter()
+            .find(|p| p.name == "AtomGit-GLM-5.2")
+            .unwrap();
+        assert!(glm.is_default);
+        assert!(glm.requires_login, "gateway base_url ⇒ requires login");
+        assert_eq!(glm.model, "GLM-5.2");
     }
 
     #[test]

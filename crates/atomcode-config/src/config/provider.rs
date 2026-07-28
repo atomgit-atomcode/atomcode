@@ -223,6 +223,37 @@ impl std::fmt::Debug for ResolvedModelConfig {
     }
 }
 
+impl ResolvedModelConfig {
+    /// Reconstruct a legacy-shaped [`ProviderConfig`] from this resolution.
+    /// Lets consumers that still key off `config.providers` (the daemon live
+    /// runtime, the TUI `/think`/`/effort` readers) accept a new-schema or
+    /// folded-CodingPlan selection without a full schema migration. `ephemeral`
+    /// is always `false` — a resolved selection is a persisted/projected model,
+    /// never a runtime-only provider handle.
+    pub fn to_provider_config(&self) -> ProviderConfig {
+        ProviderConfig {
+            provider_type: self.provider_type.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            system_prompt: self.system_prompt.clone(),
+            user_agent: self.user_agent.clone(),
+            context_window: self.context_window,
+            max_tokens: self.max_tokens,
+            thinking_type: self.thinking_type.clone(),
+            thinking_keep: self.thinking_keep.clone(),
+            reasoning_history: self.reasoning_history.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            thinking_enabled: self.thinking_enabled,
+            thinking_budget: self.thinking_budget,
+            skip_tls_verify: self.skip_tls_verify,
+            ephemeral: false,
+            capable_model: self.capable_model,
+            pricing: self.pricing,
+        }
+    }
+}
+
 impl ProviderConfig {
     /// True if this provider's active model can accept image inputs.
     /// Driven entirely by the model-name heuristic in

@@ -3996,10 +3996,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let box_focused = selected && menu_kind == super::MenuKind::SessionList;
                 if name.is_empty() && !box_focused {
                     let muted = self.style_for(Role::Muted);
+                    // Locale-aware, menu-neutral: `Plugin` is shared by the plugin
+                    // manager AND the provider panel, so the placeholder must not
+                    // say "plugins". Both are type-to-filter boxes.
+                    let zh = matches!(crate::i18n::current_locale(), crate::i18n::Locale::ZhCn);
                     let placeholder = if menu_kind == super::MenuKind::SessionList {
-                        "Search sessions..."
+                        if zh {
+                            "搜索会话…"
+                        } else {
+                            "Search sessions..."
+                        }
+                    } else if zh {
+                        "输入以筛选…"
                     } else {
-                        "Search plugins..."
+                        "Type to filter..."
                     };
                     push_str_cells(&mut content_row, placeholder, &muted);
                 } else {

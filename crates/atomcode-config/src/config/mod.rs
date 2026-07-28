@@ -539,7 +539,16 @@ impl Config {
     pub fn logical_accounts(&self) -> HashMap<String, ProviderAccountConfig> {
         let mut out: HashMap<String, ProviderAccountConfig> = HashMap::new();
         for (name, p) in &self.providers {
-            out.insert(name.clone(), project_legacy_account(p));
+            if is_codingplan_provider_name(name) {
+                // All CodingPlan flat providers share one gateway + OAuth signer;
+                // fold them into a single account per wire format. Fields are
+                // uniform across the group, so the first one seen defines them.
+                let id = codingplan_group_account_id(&p.provider_type);
+                out.entry(id.to_string())
+                    .or_insert_with(|| project_legacy_account(p));
+            } else {
+                out.insert(name.clone(), project_legacy_account(p));
+            }
         }
         // New-schema accounts take precedence on an exact id collision.
         for (id, a) in &self.provider_accounts {
@@ -555,7 +564,14 @@ impl Config {
     pub fn logical_models(&self) -> HashMap<String, ModelProfileConfig> {
         let mut out: HashMap<String, ModelProfileConfig> = HashMap::new();
         for (name, p) in &self.providers {
-            out.insert(name.clone(), project_legacy_model(name, p));
+            // Model id stays the legacy provider name (so `default_provider`
+            // resolves); only the parent account folds for CodingPlan providers.
+            let account = if is_codingplan_provider_name(name) {
+                codingplan_group_account_id(&p.provider_type).to_string()
+            } else {
+                name.clone()
+            };
+            out.insert(name.clone(), project_legacy_model(&account, p));
         }
         for (id, m) in &self.models {
             out.insert(id.clone(), m.clone());
@@ -609,6 +625,8 @@ impl Config {
         }
         let account = project_legacy_account(provider);
         let model = project_legacy_model(name, provider);
+        // Note: manual upgrade keeps the model under its own account `name`;
+        // CodingPlan grouping happens only via the read-only projection above.
         self.provider_accounts.insert(name.to_string(), account);
         self.models.insert(name.to_string(), model);
         self.providers.remove(name);
@@ -674,6 +692,72 @@ impl Config {
             pricing: model.pricing,
         })
     }
+
+    /// A legacy-shaped [`ProviderConfig`] view of any selection id — a legacy
+    /// `[providers.*]` key OR a new-schema model id (including a folded
+    /// CodingPlan model). Consumers that still key off `config.providers`
+    /// (the daemon live runtime, `/think`/`/effort`) call this so a new-schema
+    /// selection resolves instead of returning `None`.
+    ///
+    /// Legacy providers are returned verbatim (raw api_key preserved for the
+    /// caller's own env expansion); new-schema selections are reconstructed via
+    /// [`Self::resolve_model`].
+    pub fn provider_config_for_selection(&self, selection_id: &str) -> Option<ProviderConfig> {
+        if let Some(p) = self.providers.get(selection_id) {
+            return Some(p.clone());
+        }
+        self.resolve_model(Some(selection_id))
+            .ok()
+            .map(|r| r.to_provider_config())
+    }
+
+    /// Whether a selection id resolves to any provider/model (legacy or new
+    /// schema). Replaces bare `config.providers.contains_key(id)` guards that
+    /// would wrongly reject a new-schema selection.
+    pub fn selection_exists(&self, selection_id: &str) -> bool {
+        self.providers.contains_key(selection_id)
+            || self.logical_models().contains_key(selection_id)
+    }
+
+    /// Apply a mutation to a selection's thinking/reasoning fields regardless of
+    /// which schema stores it: prefer the new-schema `[models.*]` entry, else
+    /// the legacy `[providers.*]` entry. Returns `false` when `id` names no
+    /// writable target (e.g. a purely projected legacy provider is writable via
+    /// `providers`; a folded-only account is not). Used by `/think`, `/effort`,
+    /// and the daemon reasoning-effort setter so they work on new-schema models.
+    pub fn update_selection_reasoning(
+        &mut self,
+        id: &str,
+        f: impl FnOnce(ReasoningFieldsMut<'_>),
+    ) -> bool {
+        if let Some(m) = self.models.get_mut(id) {
+            f(ReasoningFieldsMut {
+                thinking_enabled: &mut m.thinking_enabled,
+                thinking_budget: &mut m.thinking_budget,
+                reasoning_effort: &mut m.reasoning_effort,
+            });
+            true
+        } else if let Some(p) = self.providers.get_mut(id) {
+            f(ReasoningFieldsMut {
+                thinking_enabled: &mut p.thinking_enabled,
+                thinking_budget: &mut p.thinking_budget,
+                reasoning_effort: &mut p.reasoning_effort,
+            });
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Mutable borrow of the reasoning/thinking fields common to a legacy
+/// `ProviderConfig` and a new-schema `ModelProfileConfig`, so callers can toggle
+/// them without caring which schema stores the selection. See
+/// [`Config::update_selection_reasoning`].
+pub struct ReasoningFieldsMut<'a> {
+    pub thinking_enabled: &'a mut Option<bool>,
+    pub thinking_budget: &'a mut Option<u32>,
+    pub reasoning_effort: &'a mut Option<String>,
 }
 
 /// Resolve an account's API key with environment fallbacks, mirroring
@@ -733,6 +817,31 @@ fn legacy_provider_to_preset_id(provider_type: &str) -> &'static str {
     }
 }
 
+/// The `[providers.*]` keys the CodingPlan login flow writes: the bare `AtomGit`
+/// (single model) plus `AtomGit-<sanitized>` (multi-model). They all share one
+/// gateway base_url + OAuth signer, so the projection folds them into one
+/// synthetic account per wire format rather than one account each.
+///
+/// Single source of truth — `atomcode-codingplan` and `atomcode-tuix` delegate
+/// here instead of re-implementing the prefix rule.
+pub fn is_codingplan_provider_name(name: &str) -> bool {
+    name == "AtomGit" || name.starts_with("AtomGit-")
+}
+
+/// The synthetic account id a legacy CodingPlan provider folds into. An account
+/// carries exactly one preset (one wire format), so models are grouped by wire
+/// format: openai → `AtomGit`, claude → `AtomGit-anthropic`, ollama →
+/// `AtomGit-ollama`. Matches the ids the `/login` flow writes into the new
+/// schema, so a re-login is a no-op transition. `pub` so `atomcode-codingplan`
+/// can label the login report by account.
+pub fn codingplan_group_account_id(provider_type: &str) -> &'static str {
+    match legacy_provider_to_preset_id(provider_type) {
+        "anthropic" => "AtomGit-anthropic",
+        "ollama" => "AtomGit-ollama",
+        _ => "AtomGit",
+    }
+}
+
 /// Project a legacy provider into a synthetic [`ProviderAccountConfig`].
 fn project_legacy_account(p: &ProviderConfig) -> ProviderAccountConfig {
     ProviderAccountConfig {
@@ -747,11 +856,13 @@ fn project_legacy_account(p: &ProviderConfig) -> ProviderAccountConfig {
     }
 }
 
-/// Project a legacy provider into a synthetic [`ModelProfileConfig`] keyed under
-/// the legacy provider `name` (its account id is the same `name`).
-fn project_legacy_model(name: &str, p: &ProviderConfig) -> ModelProfileConfig {
+/// Project a legacy provider into a synthetic [`ModelProfileConfig`] belonging to
+/// `account_id`. The model's own id (the catalog key) stays the legacy provider
+/// name at the call site, so `default_provider` keeps resolving; only the parent
+/// account can differ (CodingPlan providers fold into a shared account).
+fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileConfig {
     ModelProfileConfig {
-        account: name.to_string(),
+        account: account_id.to_string(),
         model: p.model.clone(),
         display_name: None,
         system_prompt: p.system_prompt.clone(),
@@ -2847,6 +2958,92 @@ context_window = 131072
             !rendered.contains("[provider_accounts"),
             "load/serialize must not auto-upgrade legacy into the new schema"
         );
+    }
+
+    #[test]
+    fn provider_config_for_selection_covers_legacy_and_new_schema() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "providers": { "leg": { "type": "openai", "base_url": "https://legacy/v1", "model": "m", "context_window": 8000 } },
+            "provider_accounts": { "acc": { "provider": "deepseek", "base_url": "https://mirror/v1" } },
+            "models": { "acc/ds": { "account": "acc", "model": "deepseek-chat", "context_window": 131072 } }
+        }))
+        .unwrap();
+        // Legacy provider returned verbatim.
+        let leg = cfg.provider_config_for_selection("leg").unwrap();
+        assert_eq!(leg.model, "m");
+        assert_eq!(leg.base_url.as_deref(), Some("https://legacy/v1"));
+        // New-schema model id reconstructs a ProviderConfig via resolve_model.
+        let new = cfg.provider_config_for_selection("acc/ds").unwrap();
+        assert_eq!(new.model, "deepseek-chat");
+        assert_eq!(new.base_url.as_deref(), Some("https://mirror/v1"));
+        assert_eq!(new.context_window, 131072);
+        assert!(!new.ephemeral);
+        // Unknown id → None.
+        assert!(cfg.provider_config_for_selection("nope").is_none());
+        assert!(cfg.selection_exists("leg") && cfg.selection_exists("acc/ds"));
+        assert!(!cfg.selection_exists("nope"));
+    }
+
+    #[test]
+    fn update_selection_reasoning_writes_to_correct_schema() {
+        let mut cfg: Config = serde_json::from_value(serde_json::json!({
+            "providers": { "leg": { "type": "openai", "base_url": "https://legacy/v1", "model": "m", "context_window": 8000 } },
+            "provider_accounts": { "acc": { "provider": "deepseek" } },
+            "models": { "acc/ds": { "account": "acc", "model": "deepseek-chat", "context_window": 131072 } }
+        }))
+        .unwrap();
+        // New-schema model.
+        assert!(cfg.update_selection_reasoning("acc/ds", |r| {
+            *r.thinking_enabled = Some(true);
+            *r.reasoning_effort = Some("high".into());
+        }));
+        assert_eq!(cfg.models["acc/ds"].thinking_enabled, Some(true));
+        assert_eq!(cfg.models["acc/ds"].reasoning_effort.as_deref(), Some("high"));
+        // Legacy provider.
+        assert!(cfg.update_selection_reasoning("leg", |r| *r.thinking_budget = Some(2048)));
+        assert_eq!(cfg.providers["leg"].thinking_budget, Some(2048));
+        // Unknown id → false, no write.
+        assert!(!cfg.update_selection_reasoning("nope", |r| *r.thinking_enabled = Some(false)));
+    }
+
+    #[test]
+    fn codingplan_flat_providers_fold_into_grouped_accounts() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "AtomGit-GLM-5.2": { "type": "openai", "base_url": "https://llm-api.atomgit.com/v1", "model": "GLM-5.2", "context_window": 64000 },
+                "AtomGit-Qwen": { "type": "openai", "base_url": "https://llm-api.atomgit.com/v1", "model": "Qwen", "context_window": 64000 },
+                "AtomGit-anthropic-claude": { "type": "claude", "base_url": "https://llm-api.atomgit.com/v1", "model": "claude-3.5", "context_window": 200000 },
+                "my-openai": { "type": "openai", "base_url": "https://api.openai.com/v1", "model": "gpt-4", "context_window": 128000 }
+            }
+        }))
+        .unwrap();
+        let accounts = cfg.logical_accounts();
+        // Two openai CodingPlan models collapse into ONE account; claude gets its
+        // own; the user's manual provider is untouched.
+        assert!(accounts.contains_key("AtomGit"));
+        assert!(accounts.contains_key("AtomGit-anthropic"));
+        assert!(accounts.contains_key("my-openai"));
+        assert!(!accounts.contains_key("AtomGit-GLM-5.2"), "folded away");
+        assert!(!accounts.contains_key("AtomGit-Qwen"), "folded away");
+
+        let models = cfg.logical_models();
+        // Model ids stay = legacy provider keys (default_provider stays resolvable),
+        // only the parent account folds.
+        assert_eq!(models["AtomGit-GLM-5.2"].account, "AtomGit");
+        assert_eq!(models["AtomGit-Qwen"].account, "AtomGit");
+        assert_eq!(models["AtomGit-anthropic-claude"].account, "AtomGit-anthropic");
+        assert_eq!(models["my-openai"].account, "my-openai");
+
+        // Resolving by the stable legacy id still works and keeps the gateway
+        // base_url (so the OAuth request signer still fires).
+        let r = cfg.resolve_model(Some("AtomGit-GLM-5.2")).unwrap();
+        assert_eq!(r.account_id, "AtomGit");
+        assert_eq!(r.model, "GLM-5.2");
+        assert_eq!(r.provider_type, "openai");
+        assert!(r.base_url.as_deref().unwrap().contains("atomgit"));
+        let c = cfg.resolve_model(Some("AtomGit-anthropic-claude")).unwrap();
+        assert_eq!(c.account_id, "AtomGit-anthropic");
+        assert_eq!(c.provider_type, "anthropic");
     }
 
     #[test]

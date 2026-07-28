@@ -179,7 +179,10 @@ fn live_current_provider() -> String {
 pub(crate) fn resolve_provider_name(config: &Config, provider_name: Option<&str>) -> String {
     provider_name
         .map(|s| s.to_string())
-        .unwrap_or_else(|| config.default_provider.clone())
+        // Prefer the canonical selection (`default_model` then legacy
+        // `default_provider`) so a new-schema default resolves correctly.
+        .or_else(|| config.effective_model_selection())
+        .unwrap_or_default()
 }
 
 // ============================================================================
@@ -275,7 +278,10 @@ pub(crate) fn chat_runtime_config(
     working_dir: &Path,
     telemetry: Arc<Telemetry>,
 ) -> atomcode_coding::CodingRuntimeConfig {
-    let p = config.providers.get(provider_name);
+    // Resolve through the boundary so a new-schema / folded-CodingPlan selection
+    // (which no longer lives in `config.providers`) still builds a runtime.
+    let resolved = config.provider_config_for_selection(provider_name);
+    let p = resolved.as_ref();
     atomcode_coding::CodingRuntimeConfig {
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
@@ -1121,7 +1127,7 @@ pub(crate) async fn preprocess_image_caption(
     // Configured but absent from `config.providers` ⇒ Failed (mirror the retired
     // core `maybe_preprocess`): fold the failure marker so the caller strips the
     // images — otherwise raw image bytes reach a text-only model (HTTP 400).
-    let Some(vl_pc) = config.providers.get(&vl_name).cloned() else {
+    let Some(vl_pc) = config.provider_config_for_selection(&vl_name) else {
         return fold_vl_failure(message);
     };
     let vl_model = vl_model_display(&vl_pc.model).to_string();
@@ -1200,7 +1206,7 @@ async fn preprocess_live_caption(
     // The main model name is what decides vision-capability (`should_skip`); the
     // one-off VL request rides `session_id` onto the same upstream account.
     let name = resolve_provider_name(&config, provider_name);
-    let active_model = match config.providers.get(&name) {
+    let active_model = match config.provider_config_for_selection(&name) {
         Some(pc) => pc.model.clone(),
         None => return message.to_string(),
     };
@@ -1253,7 +1259,7 @@ pub(crate) async fn live_message(
                 }));
             }
         };
-        if !config.providers.contains_key(&requested_provider) {
+        if !config.selection_exists(&requested_provider) {
             return Json(serde_json::json!({
                 "accepted": false,
                 "error": format!("provider {requested_provider:?} not found"),
@@ -1420,7 +1426,7 @@ pub(crate) async fn live_provider(
             }));
         }
     };
-    if !config.providers.contains_key(&req.provider) {
+    if !config.selection_exists(&req.provider) {
         return Json(serde_json::json!({
             "ok": false,
             "error": format!("provider {:?} not found", req.provider),
@@ -1592,12 +1598,16 @@ pub(crate) async fn live_reasoning_effort(
         target = requested
             .clone()
             .unwrap_or_else(|| config.default_provider.clone());
-        let Some(provider) = config.providers.get_mut(&target) else {
+        // Schema-aware write: new-schema models live in `[models.*]`, legacy in
+        // `[providers.*]`.
+        let found = config.update_selection_reasoning(&target, |r| {
+            previous_effort = r.reasoning_effort.clone();
+            *r.reasoning_effort = effort.clone();
+        });
+        if !found {
             provider_missing = true;
             anyhow::bail!("provider {target:?} not found");
-        };
-        previous_effort = provider.reasoning_effort.clone();
-        provider.reasoning_effort = effort;
+        }
         Ok(())
     }) {
         Ok(commit) => commit,
@@ -1645,9 +1655,9 @@ pub(crate) async fn live_reasoning_effort(
         if let Err(error) = reload_result {
             let rollback_error =
                 match store.update_if_revision(&commit.snapshot.revision, |config| {
-                    if let Some(provider) = config.providers.get_mut(&target) {
-                        provider.reasoning_effort = previous_effort;
-                    }
+                    config.update_selection_reasoning(&target, |r| {
+                        *r.reasoning_effort = previous_effort.clone();
+                    });
                     Ok(())
                 }) {
                     Ok(Some(_)) | Ok(None) => None,

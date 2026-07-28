@@ -3117,8 +3117,8 @@ fn execute_slash_command_impl(
         }
         "think" => {
             let sub = arg.trim().to_ascii_lowercase();
-            let provider_name = ctx.config.default_provider.clone();
-            let provider = ctx.config.providers.get(&provider_name);
+            let provider_name = ctx.config.effective_model_selection().unwrap_or_default();
+            let provider = ctx.config.provider_config_for_selection(&provider_name);
             match provider {
                 None => {
                     renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
@@ -3142,11 +3142,9 @@ fn execute_slash_command_impl(
                     } else if sub == "on" {
                         let budget = p.thinking_budget.unwrap_or(10_000);
                         let mut desired = ctx.config.clone();
-                        desired
-                            .providers
-                            .get_mut(&provider_name)
-                            .unwrap()
-                            .thinking_enabled = Some(true);
+                        desired.update_selection_reasoning(&provider_name, |r| {
+                            *r.thinking_enabled = Some(true)
+                        });
                         save_and_reload(
                             ctx,
                             desired,
@@ -3156,11 +3154,9 @@ fn execute_slash_command_impl(
                         );
                     } else if sub == "off" {
                         let mut desired = ctx.config.clone();
-                        desired
-                            .providers
-                            .get_mut(&provider_name)
-                            .unwrap()
-                            .thinking_enabled = Some(false);
+                        desired.update_selection_reasoning(&provider_name, |r| {
+                            *r.thinking_enabled = Some(false)
+                        });
                         save_and_reload(
                             ctx,
                             desired,
@@ -3173,11 +3169,9 @@ fn execute_slash_command_impl(
                         match num_str.parse::<u32>() {
                             Ok(n) if n >= 1024 => {
                                 let mut desired = ctx.config.clone();
-                                desired
-                                    .providers
-                                    .get_mut(&provider_name)
-                                    .unwrap()
-                                    .thinking_budget = Some(n);
+                                desired.update_selection_reasoning(&provider_name, |r| {
+                                    *r.thinking_budget = Some(n)
+                                });
                                 save_and_reload(
                                     ctx,
                                     desired,
@@ -3208,7 +3202,7 @@ fn execute_slash_command_impl(
         }
         "effort" => {
             let sub = arg.trim().to_ascii_lowercase();
-            let provider_name = ctx.config.default_provider.clone();
+            let provider_name = ctx.config.effective_model_selection().unwrap_or_default();
             let applicable = crate::event_loop::reasoning_effort_applicable_on_provider(ctx);
             if !applicable {
                 renderer.render(UiLine::CommandOutput(
@@ -3217,7 +3211,7 @@ fn execute_slash_command_impl(
                 renderer.flush();
                 return Ok(());
             }
-            let provider = ctx.config.providers.get(&provider_name);
+            let provider = ctx.config.provider_config_for_selection(&provider_name);
             match provider {
                 None => {
                     renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
@@ -3233,11 +3227,9 @@ fn execute_slash_command_impl(
                         renderer.flush();
                     } else if sub == "high" || sub == "max" {
                         let mut desired = ctx.config.clone();
-                        desired
-                            .providers
-                            .get_mut(&provider_name)
-                            .unwrap()
-                            .reasoning_effort = Some(sub.to_string());
+                        desired.update_selection_reasoning(&provider_name, |r| {
+                            *r.reasoning_effort = Some(sub.to_string())
+                        });
                         crate::event_loop::save_and_reload(
                             ctx,
                             desired,
@@ -3247,11 +3239,9 @@ fn execute_slash_command_impl(
                         );
                     } else if sub == "off" {
                         let mut desired = ctx.config.clone();
-                        desired
-                            .providers
-                            .get_mut(&provider_name)
-                            .unwrap()
-                            .reasoning_effort = None;
+                        desired.update_selection_reasoning(&provider_name, |r| {
+                            *r.reasoning_effort = None
+                        });
                         crate::event_loop::save_and_reload(
                             ctx,
                             desired,
