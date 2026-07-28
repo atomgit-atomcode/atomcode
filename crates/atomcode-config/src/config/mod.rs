@@ -504,7 +504,11 @@ impl Config {
             }
             if model.account.trim().is_empty() {
                 diags.push(format!("model `{id}` is missing `account`"));
-            } else if !self.provider_accounts.contains_key(&model.account) {
+            } else if !self.provider_accounts.contains_key(&model.account)
+                // A model may reference a legacy provider (which projects to a
+                // synthetic account of the same id) — that resolves, so accept it.
+                && !self.providers.contains_key(&model.account)
+            {
                 diags.push(format!(
                     "model `{id}` references unknown account `{}`",
                     model.account
@@ -1292,6 +1296,14 @@ impl Config {
         persistent
             .models
             .retain(|_, m| !ephemeral_accounts.contains(&m.account));
+        // If `default_model` pointed at a now-stripped ephemeral model, don't
+        // persist a dangling selection — restore the disk value if we have one,
+        // else clear it so `resolve_model(None)` falls back cleanly.
+        if let Some(sel) = persistent.default_model.clone() {
+            if !persistent.models.contains_key(&sel) && !persistent.providers.contains_key(&sel) {
+                persistent.default_model = disk.and_then(|d| d.default_model.clone());
+            }
+        }
         // If default_provider is ephemeral, don't change the saved default
         if !self
             .providers
@@ -2806,6 +2818,24 @@ context_window = 131072
             },
         );
         assert!(legacy2.upgrade_legacy_provider("MyDeepSeek").is_err());
+    }
+
+    #[test]
+    fn model_referencing_a_legacy_provider_account_validates_and_resolves() {
+        // A new-schema model may point its `account` at a legacy provider name
+        // (which projects to a synthetic account). Validation must accept it and
+        // resolution must succeed.
+        let toml = "default_model = \"leg/extra\"\n\n[providers.leg]\ntype = \"openai\"\nbase_url = \"https://api.deepseek.com/v1\"\napi_key = \"sk-leg\"\nmodel = \"deepseek-chat\"\ncontext_window = 128000\n\n[models.\"leg/extra\"]\naccount = \"leg\"\nmodel = \"deepseek-coder\"\ncontext_window = 131072\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            cfg.validate_provider_accounts_and_models().is_empty(),
+            "{:?}",
+            cfg.validate_provider_accounts_and_models()
+        );
+        let r = cfg.resolve_model(None).unwrap();
+        assert_eq!(r.model, "deepseek-coder");
+        assert_eq!(r.api_key.as_deref(), Some("sk-leg"));
+        assert_eq!(r.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
     }
 
     #[test]
