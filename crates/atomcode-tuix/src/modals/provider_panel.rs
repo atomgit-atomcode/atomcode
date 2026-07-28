@@ -419,9 +419,19 @@ impl ProviderPanel {
             .collect();
         with_count.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let mut ids: Vec<String> = with_count.into_iter().map(|(id, _)| id).collect();
-        // Unconfigured preset vendors as quick-add rows.
+        // Unconfigured preset vendors as quick-add rows. A vendor is only
+        // quick-addable as a raw-key account when it has a concrete endpoint
+        // that isn't the CodingPlan gateway: the compat presets are reached via
+        // the trailing custom row; the AtomGit gateway (id "atomgit", matched
+        // case-insensitively vs the CodingPlan "AtomGit" fold) must go through
+        // the OAuth signer via /login; and presets without a default base_url
+        // (e.g. xiaomi-mimo) have nothing to dispatch against.
         for p in provider_preset::PRESETS {
-            if matches!(p.id, "openai-compatible" | "anthropic-compatible")
+            let has_dispatchable_endpoint = p
+                .default_base_url
+                .is_some_and(|u| !atomcode_auth::gateway_crypto::is_atomgit_gateway(u));
+            if !has_dispatchable_endpoint
+                || matches!(p.id, "openai-compatible" | "anthropic-compatible")
                 || atomcode_config::config::is_codingplan_provider_name(p.id)
                 || ids.iter().any(|i| i == p.id)
             {
@@ -1560,6 +1570,12 @@ mod tests {
         // Custom-endpoint presets are reached via the add-custom row, not listed.
         assert!(!ids.contains(&"openai-compatible".to_string()));
         assert!(!ids.contains(&"anthropic-compatible".to_string()));
+        // The lowercase "atomgit" gateway preset must NOT be quick-addable as a
+        // raw-key account — it has to go through the CodingPlan OAuth signer.
+        assert!(!ids.contains(&"atomgit".to_string()));
+        // A preset without a default endpoint (nothing to dispatch against) is
+        // not listed either.
+        assert!(!ids.contains(&"xiaomi-mimo".to_string()));
         // A keyed preset vendor prompts for a key when you add its first model.
         assert!(account_needs_key(&cfg, "deepseek"));
         assert!(!account_needs_key(&cfg, "AtomGit"));
