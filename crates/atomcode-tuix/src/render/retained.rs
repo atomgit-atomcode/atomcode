@@ -4998,15 +4998,26 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Clone before drawing — `screen.draw_row` takes &mut self.screen
         // and direct iteration would otherwise double-borrow.
         //
-        // Keep the logical top row fixed while a transient strip is active,
-        // and fill the remaining slots from the NEWEST permanent tail. The
-        // omitted rows are the OLDEST ones (right below the pinned top), and
-        // they reappear the instant the spinner clears; preserving row 0
-        // keeps the next overflow LF aligned with `scrolled_off`.
+        // A permanent-only viewport must stay continuous from `scrolled_off`:
+        // the next overflow LF promotes physical row 0 and advances that
+        // logical boundary by one. Footer growth can make the retained body
+        // temporarily taller than its new capacity; in that case omit the
+        // newest tail rather than creating a non-contiguous projection.
+        //
+        // A live spinner is different: it is transient and must keep the
+        // newest permanent tail visible beneath the pinned logical top. The
+        // resulting middle omission is recorded by
+        // `live_spinner_tail_compacted` and restored before any permanent push.
         let mut rows: Vec<Vec<Cell>> = if permanent_visible <= permanent_slots {
             self.body_lines[self.scrolled_off..permanent_end].to_vec()
         } else if permanent_slots == 0 {
             Vec::new()
+        } else if transient_rows == 0 {
+            let continuous_end = self
+                .scrolled_off
+                .saturating_add(permanent_slots)
+                .min(permanent_end);
+            self.body_lines[self.scrolled_off..continuous_end].to_vec()
         } else {
             // Pin only physical row 0 (`body_lines[scrolled_off]`, required
             // for overflow-LF alignment) and draw the newest
@@ -19224,6 +19235,23 @@ mod tests {
             cap_after
         );
 
+        // A footer-only geometry change must leave the physical body as a
+        // continuous projection starting at `scrolled_off`. The next permanent
+        // push advances `scrolled_off` by emitting bottom-row LFs, so any
+        // head+tail compaction here would make those LFs promote different
+        // physical rows than the logical rows being acknowledged.
+        for screen_row in 0..cap_after {
+            let expected: String = r.body_lines[r.scrolled_off + screen_row]
+                .iter()
+                .map(|cell| cell.ch)
+                .collect();
+            assert_eq!(
+                vterm.row_text(screen_row).trim_end(),
+                expected.trim_end(),
+                "footer growth broke the body/scrolled_off projection at screen row {screen_row}"
+            );
+        }
+
         // User hits Enter → /whoami runs. Menu stays in state at push
         // time (the InputPrompt that clears it doesn't fire until AFTER
         // CommandOutput; see the BPUSH trace). Each push must catch up
@@ -19265,6 +19293,28 @@ mod tests {
             "auth: row leaked into footer region.\n\nGrid:\n{}",
             vterm.dump()
         );
+
+        // End-to-end user-visible invariant: after the catch-up LFs, every
+        // pre-existing body row lives in exactly one place across native
+        // scrollback and the current viewport. A projection mismatch would
+        // promote tail rows while advancing `scrolled_off` over different
+        // logical rows, leaving duplicates and gaps when the user scrolls.
+        let terminal_rows = vterm
+            .scrollback_texts()
+            .into_iter()
+            .chain((0..h as usize).map(|row| vterm.row_text(row)))
+            .collect::<Vec<_>>();
+        for i in 0..(cap_before + 10) {
+            let marker = format!("filler-{i:03}");
+            let count = terminal_rows
+                .iter()
+                .filter(|row| row.contains(&marker))
+                .count();
+            assert_eq!(
+                count, 1,
+                "{marker} must occur exactly once across scrollback and viewport"
+            );
+        }
     }
 
     /// Repro: user runs `/whoami` AFTER the body has already overflowed
