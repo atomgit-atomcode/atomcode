@@ -15564,6 +15564,50 @@ mod kernel_terminal_projection_tests {
     }
 }
 
+fn project_token_usage(meta: atomcode_kernel::message::MessageMeta) -> AgentEvent {
+    AgentEvent::TokenUsage {
+        tokens: meta.tokens,
+        used_tokens: meta.used_tokens as usize,
+        ctx_window: meta.ctx_window as usize,
+    }
+}
+
+#[cfg(test)]
+mod token_usage_projection_tests {
+    use super::{project_token_usage, AgentEvent};
+    use atomcode_kernel::message::MessageMeta;
+    use atomcode_kernel::stream::TokenUsage;
+
+    #[test]
+    fn kernel_usage_preserves_footer_pressure_and_cost_breakdown() {
+        let event = project_token_usage(MessageMeta {
+            tokens: TokenUsage {
+                prompt: 4_200,
+                completion: 270,
+                cached: 3_100,
+            },
+            used_tokens: 58_200,
+            ctx_window: 1_000_000,
+            ..MessageMeta::default()
+        });
+
+        match event {
+            AgentEvent::TokenUsage {
+                tokens,
+                used_tokens,
+                ctx_window,
+            } => {
+                assert_eq!(tokens.prompt, 4_200);
+                assert_eq!(tokens.completion, 270);
+                assert_eq!(tokens.cached, 3_100);
+                assert_eq!(used_tokens, 58_200);
+                assert_eq!(ctx_window, 1_000_000);
+            }
+            other => panic!("unexpected projected event: {other:?}"),
+        }
+    }
+}
+
 fn project_kernel_event(
     event: atomcode_kernel::event::AgentEvent,
     ctx: &mut LoopCtx,
@@ -15625,13 +15669,7 @@ fn project_kernel_event(
                 duration: started.elapsed(),
             })
         }
-        Kernel::Usage(meta) => Some(AgentEvent::TokenUsage(
-            atomcode_kernel::stream::TokenUsage {
-                prompt: meta.tokens.prompt,
-                completion: meta.tokens.completion,
-                cached: meta.tokens.cached,
-            },
-        )),
+        Kernel::Usage(meta) => Some(project_token_usage(meta)),
         Kernel::Error { message, .. } => Some(AgentEvent::Error {
             error: message,
             snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
@@ -18811,8 +18849,12 @@ fn handle_agent_event(
             // over yet); the next idle/streaming redraw picks up the new
             // pending state on its own.
         }
-        AgentEvent::TokenUsage(u) => {
-            state.on_token_usage();
+        AgentEvent::TokenUsage {
+            tokens: u,
+            used_tokens,
+            ctx_window,
+        } => {
+            state.on_token_usage(used_tokens, ctx_window);
             state.prompt_tokens += u.prompt as usize;
             state.completion_tokens += u.completion as usize;
             state.cached_tokens += u.cached as usize;

@@ -2,8 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use atomcode_kernel::event::ToolBatchCall;
-use atomcode_kernel::message::ImageContent;
-use atomcode_kernel::message::SessionSnapshot;
+use atomcode_kernel::message::{ImageContent, SessionSnapshot};
 use atomcode_kernel::stream::TokenUsage;
 use atomcode_kernel::tool::ToolCall;
 
@@ -54,7 +53,14 @@ pub enum UiEvent {
         call: ToolCall,
         snapshot: SessionSnapshot,
     },
-    TokenUsage(TokenUsage),
+    TokenUsage {
+        /// Raw provider token breakdown used by session/cost counters.
+        tokens: TokenUsage,
+        /// Prompt occupancy of the most recent request, used by the footer.
+        used_tokens: usize,
+        /// Context cap paired with `used_tokens`.
+        ctx_window: usize,
+    },
     PhaseChange(UiAgentPhase),
     TurnComplete {
         duration: Duration,

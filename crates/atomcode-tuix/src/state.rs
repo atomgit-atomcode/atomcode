@@ -1403,10 +1403,20 @@ impl UiState {
         self.post_compaction_used_tokens = Some(used_tokens);
     }
 
-    /// A provider usage event is authoritative and releases the temporary
-    /// post-compaction projection before its ContextStats companion arrives.
-    pub fn on_token_usage(&mut self) {
+    /// A provider usage event is authoritative: release the temporary
+    /// post-compaction projection and refresh the footer's live context gauge.
+    ///
+    /// `used_tokens` is the prompt occupancy of the most recent request, not
+    /// the cumulative billable token total.
+    pub fn on_token_usage(&mut self, used_tokens: usize, ctx_window: usize) {
         self.post_compaction_used_tokens = None;
+        let snap = self
+            .last_context
+            .get_or_insert_with(ContextSnapshot::default);
+        snap.sent_tokens = used_tokens;
+        if ctx_window > 0 {
+            snap.ctx_window = ctx_window;
+        }
     }
 
     /// Refresh the cached context window after a model switch.
@@ -2075,11 +2085,23 @@ mod tests {
     fn real_usage_releases_post_compaction_projection() {
         let mut s = UiState::new();
         s.on_compaction_committed(12_000);
-        s.on_token_usage();
-        s.on_context_stats(0, 14_000, 0, 0, 8, 128_000, "engine-v2", "");
+        s.on_token_usage(14_000, 128_000);
 
         assert_eq!(s.last_context.as_ref().unwrap().sent_tokens, 14_000);
+        assert_eq!(s.last_context.as_ref().unwrap().ctx_window, 128_000);
         assert!(s.post_compaction_used_tokens.is_none());
+    }
+
+    #[test]
+    fn live_usage_refreshes_footer_context_gauge() {
+        let mut s = UiState::new();
+        s.on_model_window_changed(1_000_000);
+
+        s.on_token_usage(58_200, 1_000_000);
+
+        let snap = s.last_context.as_ref().expect("live context gauge");
+        assert_eq!(snap.sent_tokens, 58_200);
+        assert_eq!(snap.ctx_window, 1_000_000);
     }
 
     #[test]
