@@ -1897,13 +1897,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 bg: None,
             }
         } else if selected && is_plugin_mgr {
-            CellStyle {
-                fg: None,
-                bold: true,
-                reverse: false,
-                faint: false,
-                bg: None,
-            }
+            // Match /resume's selected colour (Accent on dark / Brand on light)
+            // so the highlight is consistent across the plugin + provider panels.
+            self.session_highlight_style()
         } else {
             // Use terminal default fg (Secondary) instead of Muted
             // (SGR 90 / DarkGrey). Several iTerm2 dark presets render
@@ -1944,9 +1940,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             style = self.style_for(Role::Muted);
         }
         if selected && content.starts_with("▸ ") && is_plugin_mgr {
-            let mut border_style = style.clone();
-            border_style.fg = self.style_for(Role::Border).fg;
-            push_str_cells_sgr(&mut row, "▸ ", border_style);
+            // Arrow + text share the highlight colour (parity with /resume).
+            push_str_cells_sgr(&mut row, "▸ ", style.clone());
             push_str_cells_sgr(&mut row, &content[4..], style.clone());
         } else {
             push_str_cells_sgr(&mut row, &content, style.clone());
