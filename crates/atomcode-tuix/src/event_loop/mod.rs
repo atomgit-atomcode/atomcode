@@ -8016,13 +8016,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 }
 
 fn resolved_provider_fingerprint(config: &Config) -> Option<Vec<u8>> {
-    let requested = config.default_provider.as_str();
-    let name = if config.providers.contains_key(requested) {
-        requested
-    } else {
-        config.providers.keys().min()?.as_str()
-    };
-    serde_json::to_vec(&(name, config.providers.get(name)?)).ok()
+    // Fingerprint the ACTIVE resolved selection (new-schema or legacy), falling
+    // back to the first catalog model — so a new-schema default isn't missed
+    // (its id no longer lives in `config.providers`).
+    let name = config
+        .effective_model_selection()
+        .filter(|n| config.selection_exists(n))
+        .or_else(|| {
+            let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+            ids.sort();
+            ids.into_iter().next()
+        })?;
+    let pc = config.provider_config_for_selection(&name)?;
+    serde_json::to_vec(&(name, pc)).ok()
 }
 
 fn provider_requires_atomgit_auth(config: &Config) -> bool {
@@ -12088,7 +12094,7 @@ pub(crate) fn select_provider_and_reload(
     if provider_transition_pending(ctx) {
         return false;
     }
-    let Some(selected) = ctx.config.providers.get(provider_name) else {
+    let Some(selected) = ctx.config.provider_config_for_selection(provider_name) else {
         renderer.render(UiLine::Error(format!(
             "provider {provider_name:?} is no longer available"
         )));

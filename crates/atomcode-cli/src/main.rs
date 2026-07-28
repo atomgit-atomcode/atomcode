@@ -2178,13 +2178,24 @@ fn apply_cli_runtime_overrides(
     let provider_name = provider_override
         .unwrap_or(&config.default_provider)
         .to_string();
-    let Some(provider) = config.providers.get_mut(&provider_name) else {
-        return;
-    };
+    // Route the optional `--model` override to whichever schema holds the
+    // selection (legacy `[providers.*]` or new-schema `[models.*]`); bail if the
+    // selection is unknown so `--provider bogus` is a no-op as before.
     if let Some(model) = model_override {
-        provider.model = model.to_string();
+        if let Some(p) = config.providers.get_mut(&provider_name) {
+            p.model = model.to_string();
+        } else if let Some(m) = config.models.get_mut(&provider_name) {
+            m.model = model.to_string();
+        } else {
+            return;
+        }
+    } else if !config.selection_exists(&provider_name) {
+        return;
     }
     if provider_override.is_some() {
+        // `default_model` is canonical (`effective_model_selection` prefers it);
+        // sync the legacy field too so a new-schema override takes effect.
+        config.default_model = Some(provider_name.clone());
         config.default_provider = provider_name;
     }
 }

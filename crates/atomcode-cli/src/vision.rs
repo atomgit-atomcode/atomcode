@@ -59,10 +59,11 @@ impl ImagePreprocessor for VlImagePreprocessor {
         else {
             return (UserInput { text, images }, None);
         };
-        // Configured but absent from `config.providers` ⇒ Failed (mirror the
-        // retired core `maybe_preprocess`): fold the failure marker + clear the
-        // images so raw bytes never reach a text-only model.
-        let Some(vl_pc) = config.providers.get(&vl_name).cloned() else {
+        // Resolve through the boundary so a new-schema / folded-CodingPlan VL
+        // selection (no longer in `config.providers`) still resolves. Absent ⇒
+        // Failed (mirror the retired core `maybe_preprocess`): fold the failure
+        // marker + clear the images so raw bytes never reach a text-only model.
+        let Some(vl_pc) = config.provider_config_for_selection(&vl_name) else {
             return apply_outcome(
                 text,
                 images,

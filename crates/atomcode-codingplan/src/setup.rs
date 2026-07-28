@@ -348,6 +348,18 @@ impl SetupReport {
                         .unwrap_or("openai");
                     atomcode_config::config::codingplan_group_account_id(wire)
                 };
+                // Map a registered selection key (e.g. `AtomGit-Qwen-…`) to the
+                // friendly `account · model` label; fall back to the raw key for
+                // a user-supplied value that isn't in this run's list.
+                let friendly = |key: &str| -> String {
+                    match info.provider_names.iter().position(|p| p == key) {
+                        Some(i) => {
+                            let model = &info.display_names[i];
+                            format!("{} · {}", account_for(model), model)
+                        }
+                        None => key.to_string(),
+                    }
+                };
                 for (pname, model) in info.provider_names.iter().zip(info.display_names.iter()) {
                     let suffix = if pname == &info.default_provider {
                         default_suffix_cow.as_ref()
@@ -363,10 +375,12 @@ impl SetupReport {
                 // Vision-preprocessor outcome line.
                 match &info.vision_preprocessor {
                     VisionPreprocessorOutcome::AutoSet(k) => {
-                        out.push_str(&t(Msg::CpVisionAuto { kind: k }));
+                        let label = friendly(k);
+                        out.push_str(&t(Msg::CpVisionAuto { kind: &label }));
                     }
                     VisionPreprocessorOutcome::UserSupplied(k) => {
-                        out.push_str(&t(Msg::CpVisionUserSupplied { kind: k }));
+                        let label = friendly(k);
+                        out.push_str(&t(Msg::CpVisionUserSupplied { kind: &label }));
                     }
                     VisionPreprocessorOutcome::Cleared => {
                         out.push_str(&t(Msg::CpVisionCleared));
@@ -2764,8 +2778,9 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
+        // Friendly account · model label, not the internal selection key.
         assert!(
-            out.contains("Vision preprocessor → AtomGit-Qwen-Qwen3-VL-32B-Instruct"),
+            out.contains("Vision preprocessor → AtomGit · Qwen/Qwen3-VL-32B-Instruct"),
             "render must include the auto-detected line: {out}",
         );
         assert!(out.contains("(auto-detected)"));
