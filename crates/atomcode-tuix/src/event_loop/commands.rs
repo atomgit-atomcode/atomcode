@@ -5017,6 +5017,7 @@ fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Mod
 /// 与手机远程执行共用。
 pub(crate) fn build_cost_report_text(
     mut report: atomcode_capabilities::session::SessionCostReport,
+    config: &atomcode_config::config::Config,
     current_provider: &str,
     current_model: &str,
     current_pricing: Option<atomcode_capabilities::session::ModelPricing>,
@@ -5035,6 +5036,16 @@ pub(crate) fn build_cost_report_text(
         });
     }
 
+    // Resolve a selection id to its account for a friendly `account · model`
+    // header (folded CodingPlan models share one `AtomGit` account); fall back to
+    // the raw id when it isn't in the catalog (e.g. a since-removed provider).
+    let catalog = config.logical_models();
+    let account_of = |pid: &str| -> String {
+        catalog
+            .get(pid)
+            .map(|m| m.account.clone())
+            .unwrap_or_else(|| pid.to_string())
+    };
     let mut sections = Vec::new();
     for item in report.models {
         let prompt = item.tokens.input.saturating_add(item.tokens.cached_input) as usize;
@@ -5062,8 +5073,10 @@ pub(crate) fn build_cost_report_text(
             })
         };
         sections.push(format!(
-            "{} / {}\n{}",
-            item.provider_id, item.model_id, body
+            "{} · {}\n{}",
+            account_of(&item.provider_id),
+            item.model_id,
+            body
         ));
     }
     if report.unattributed_tokens > 0 {
@@ -5078,12 +5091,15 @@ pub(crate) fn build_cost_report_text(
 }
 
 fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
-    let provider = ctx.config.default_provider.as_str();
+    // The CURRENT-turn row must pair the ACTIVE selection with the active model.
+    // Use the resolved selection id (matches `ctx.model_name`), not the possibly
+    // stale legacy `default_provider` — otherwise the row mislabels e.g.
+    // "agnes-ai · GLM-5.2".
+    let provider = ctx.config.effective_model_selection().unwrap_or_default();
     let pricing = ctx
         .config
-        .providers
-        .get(provider)
-        .and_then(|config| atomcode_coding::resolve_provider_pricing(provider, config));
+        .provider_config_for_selection(&provider)
+        .and_then(|config| atomcode_coding::resolve_provider_pricing(&provider, &config));
     let manager = session_manager_for_cost(
         ctx.current_session_project_bucket.as_deref(),
         &ctx.current_session.working_dir,
@@ -5147,7 +5163,7 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
         report.total_tokens = report.total_tokens.saturating_add(live_tokens.total());
         report.estimated_cost_usd = None;
     }
-    build_cost_report_text(report, provider, &ctx.model_name, pricing)
+    build_cost_report_text(report, &ctx.config, &provider, &ctx.model_name, pricing)
 }
 
 fn session_manager_for_cost(
@@ -8254,12 +8270,14 @@ mod todo_command_tests {
                 total_tokens: 1890,
                 estimated_cost_usd: None,
             },
+            &atomcode_config::config::Config::default(),
             "provider-b",
             "model-b",
             None,
         );
-        assert!(out.contains("provider-a / model-a"));
-        assert!(out.contains("provider-b / model-b"));
+        // Unknown ids (not in the catalog) fall back to the raw id; separator is `·`.
+        assert!(out.contains("provider-a · model-a"));
+        assert!(out.contains("provider-b · model-b"));
         assert!(out.contains("1323"));
         assert!(out.contains("567"));
         assert!(out.contains("89"));
