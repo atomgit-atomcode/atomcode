@@ -539,9 +539,14 @@ impl LlmProvider for OpenAiCompatProvider {
                                 // A body that died mid-read on a half-closed pooled socket
                                 // is the canonical poisoned-pool trigger. Rebuild BEFORE the
                                 // reopen so its FIRST attempt gets a fresh (empty) pool instead
-                                // of re-grabbing the dead socket. Only for the transient-transport
-                                // class — a logical/decode failure isn't cured by a new pool.
-                                if retry::chain_has_transient_io(&e) {
+                                // of re-grabbing the dead socket. Both the transient-transport
+                                // class and a TLS record-corruption alert (BadRecordMac/DecryptError)
+                                // poison the pool this way; a logical/decode failure isn't cured by a
+                                // new pool. (The reopened `open_stream` additionally escalates to
+                                // managed TLS-1.2 on its first OPEN-path corruption.)
+                                if retry::chain_has_transient_io(&e)
+                                    || retry::chain_has_tls_corruption(&e)
+                                {
                                     if let Err(rebuild_error) = client.rebuild(
                                         atomcode_config::tls::should_cap_url(&url),
                                     ) {
@@ -672,24 +677,50 @@ async fn open_stream(
             }
             Err(e) => {
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
-                    // A managed-endpoint connect failure is eligible for one
-                    // TLS-1.2 probe. The latch is set only after that probe gets
-                    // an HTTP response; unrelated endpoints never auto-downgrade.
-                    let try_tls12 =
-                        atomcode_config::tls::should_try_fallback(url, was_capped, e.is_connect());
+                    let tls_corruption = retry::chain_has_tls_corruption(&e);
+                    // A managed-endpoint TLS-1.2 probe is warranted by either a
+                    // connect failure (a TLS-1.3-hostile middlebox resetting the
+                    // handshake) OR a post-handshake record corruption
+                    // (BadRecordMac/DecryptError) — both curable by a 1.2 cap.
+                    // The corruption trigger needs no is_connect: it lands AFTER
+                    // the handshake. We escalate on the FIRST corruption rather
+                    // than a repeat — a MAC failure is active record corruption (a
+                    // stale pooled socket surfaces as ConnectionReset via
+                    // chain_has_transient_io, NOT a MAC failure), and tls.rs
+                    // already treats 1.2 as the known-good ceiling for these
+                    // managed endpoints, so there's nothing to gain by burning an
+                    // attempt on 1.3 first and escalating immediately stays robust
+                    // regardless of max_attempts. The latch is set only after the
+                    // probe gets an HTTP response; unrelated endpoints never
+                    // auto-downgrade. rebuild(true) applies BOTH a fresh pool and
+                    // the 1.2 cap, curing the stale-session and hostile-middlebox
+                    // flavors at once.
+                    let try_tls12 = atomcode_config::tls::should_try_fallback(
+                        url,
+                        was_capped,
+                        e.is_connect() || tls_corruption,
+                    );
                     let wait = retry::compute_backoff(attempt, policy);
                     tokio::time::sleep(wait).await;
-                    // Rebuild the client ONLY for the half-open-reuse class (a stale
-                    // pooled socket surfaces as ConnectionReset/EOF/TimedOut in the
-                    // chain) — that's the class a fresh pool actually cures. A plain
-                    // connect-refused / DNS / slow-gateway retry is NOT fixed by a new
-                    // pool, so rebuilding there would only churn a healthy pool (extra
-                    // TLS handshakes) and re-read proxy env on every attempt. Safe on
-                    // the OPEN path: no bytes consumed; a rebuild failure keeps the old
-                    // client. Rebuild failures are returned explicitly.
-                    if try_tls12 || retry::chain_has_transient_io(&e) {
-                        client.rebuild(try_tls12 || was_capped)?;
-                        tls12_probe = try_tls12;
+                    // Rebuild the client for the classes a fresh pool actually
+                    // cures: the half-open-reuse class (a stale pooled socket
+                    // surfaces as ConnectionReset/EOF/TimedOut) and TLS record
+                    // corruption (a desynced/mangled pooled TLS session). A plain
+                    // connect-refused / DNS / slow-gateway retry is NOT fixed by a
+                    // new pool, so rebuilding there would only churn a healthy pool
+                    // (extra TLS handshakes) and re-read proxy env on every attempt.
+                    // Safe on the OPEN path: no bytes consumed; a rebuild failure
+                    // keeps the old client and is returned explicitly.
+                    if try_tls12 || retry::chain_has_transient_io(&e) || tls_corruption {
+                        // `capped` = is the REBUILT client at a TLS-1.2 ceiling.
+                        // Carry it into `tls12_probe` (not bare `try_tls12`) so the
+                        // flag stays sticky while the client remains capped: if a
+                        // follow-up corruption retry keeps the 1.2 cap without
+                        // re-triggering `try_tls12`, a later success must still
+                        // latch the working downgrade for future clients.
+                        let capped = try_tls12 || was_capped;
+                        client.rebuild(capped)?;
+                        tls12_probe = capped;
                     }
                     attempt += 1;
                     continue;

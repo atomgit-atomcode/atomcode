@@ -82,7 +82,10 @@ pub(crate) fn should_retry_open_status(code: u16, owner: RateLimitRetryOwner) ->
 /// rebuilding the client's pool). We now also walk the source chain for a
 /// transient transport `io::Error` so the open loop reconnects transparently.
 pub(crate) fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect() || chain_has_transient_io(err)
+    err.is_timeout()
+        || err.is_connect()
+        || chain_has_transient_io(err)
+        || chain_has_tls_corruption(err)
 }
 
 /// True if any error in `err`'s `source()` chain is an `io::Error` whose kind
@@ -111,6 +114,44 @@ pub(crate) fn chain_has_transient_io(err: &(dyn std::error::Error + 'static)) ->
             ) {
                 return true;
             }
+        }
+        cur = e.source();
+    }
+    false
+}
+
+/// True if any error in `err`'s `source()` chain is a TLS **record corruption**
+/// failure — a data record whose AEAD tag / MAC did not verify. This covers
+/// BOTH directions of a mangled record (verified against rustls 0.23 `error.rs`
+/// Display, since we match the rendered chain, not a typed error — L1 avoids a
+/// rustls dep):
+///   - the PEER rejects a record WE sent → we receive its fatal alert, rendered
+///     `received fatal alert: BadRecordMac` / `… DecryptError`;
+///   - WE fail to authenticate a record the peer (or a middlebox) sent →
+///     rustls `Error::DecryptError`, rendered `cannot decrypt peer's message`.
+///
+/// Both are the signature of a stale/long-lived pooled TLS-1.3 connection whose
+/// state desynced, or a middlebox mangling TLS-1.3 records once the connection
+/// has run for a while ("跑着跑着就 BadRecordMac").
+///
+/// rustls surfaces these as an `io::Error` of kind `InvalidData` — too broad to
+/// fold into [`chain_has_transient_io`] (a malformed response *body* is also
+/// `InvalidData` and must stay non-retryable). Handshake-negotiation alerts
+/// (`HandshakeFailure`, …) are deliberately excluded: a fresh pool / TLS-1.2
+/// *corruption* escalation is the wrong remedy for those — the `is_connect()`
+/// fallback path owns handshake failures.
+///
+/// The recovery is scoped to the OPEN path (no response bytes consumed yet):
+/// rebuild the client's pool and, on a managed endpoint, escalate to TLS 1.2.
+pub(crate) fn chain_has_tls_corruption(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        let msg = e.to_string();
+        if msg.contains("BadRecordMac")
+            || msg.contains("DecryptError")
+            || msg.contains("cannot decrypt peer's message")
+        {
+            return true;
         }
         cur = e.source();
     }
@@ -503,6 +544,80 @@ mod tests {
         }
         impl std::error::Error for Plain {}
         assert!(!chain_has_transient_io(&Plain));
+    }
+
+    #[test]
+    fn chain_has_tls_corruption_detects_record_mac_and_decrypt_alerts() {
+        use std::io::{Error, ErrorKind};
+        // A gateway/middlebox mangling a TLS 1.3 data record surfaces as the
+        // peer's fatal alert. rustls maps it to ErrorKind::InvalidData — too
+        // broad to add to the transient list (a malformed *body* is also
+        // InvalidData) — so we detect the corruption class by its alert
+        // signature instead. Both the AEAD-tag failure (BadRecordMac) and its
+        // sibling DecryptError count.
+        assert!(chain_has_tls_corruption(&Wrap(Error::new(
+            ErrorKind::InvalidData,
+            "received fatal alert: BadRecordMac",
+        ))));
+        assert!(chain_has_tls_corruption(&Wrap(Error::new(
+            ErrorKind::InvalidData,
+            "received fatal alert: DecryptError",
+        ))));
+    }
+
+    #[test]
+    fn chain_has_tls_corruption_detects_local_inbound_decrypt_failure() {
+        use std::io::{Error, ErrorKind};
+        // The SYMMETRIC direction: a middlebox mangles a record the peer sent
+        // US, so OUR rustls fails to authenticate it and returns
+        // Error::DecryptError — which renders "cannot decrypt peer's message"
+        // (rustls 0.23 error.rs:991), containing NEITHER "BadRecordMac" nor the
+        // token "DecryptError". Must still be classified as corruption.
+        assert!(chain_has_tls_corruption(&Wrap(Error::new(
+            ErrorKind::InvalidData,
+            "cannot decrypt peer's message",
+        ))));
+    }
+
+    #[test]
+    fn chain_has_tls_corruption_ignores_logical_and_handshake_failures() {
+        use std::io::{Error, ErrorKind};
+        // A malformed response body is ALSO InvalidData but is a logical
+        // failure — a fresh connection won't help, so it must NOT be read as
+        // TLS corruption (mirrors chain_has_transient_io's InvalidData carve-out).
+        assert!(!chain_has_tls_corruption(&Wrap(Error::new(
+            ErrorKind::InvalidData,
+            "bad frame",
+        ))));
+        // A handshake-negotiation failure is fatal in a different way: a fresh
+        // pool / TLS-1.2 *corruption* escalation is the wrong remedy — the
+        // existing is_connect() fallback path owns handshake failures.
+        assert!(!chain_has_tls_corruption(&Wrap(Error::new(
+            ErrorKind::InvalidData,
+            "received fatal alert: HandshakeFailure",
+        ))));
+    }
+
+    #[test]
+    fn tls_corruption_and_transient_io_are_disjoint_classes() {
+        use std::io::{Error, ErrorKind};
+        // The two recovery classes must not overlap: corruption earns a fresh
+        // pool + managed TLS-1.2 escalation; a half-open socket drop just
+        // reconnects. A BadRecordMac must not be misread as ConnectionReset,
+        // and a reset must not be misread as corruption.
+        let corruption = Wrap(Error::new(
+            ErrorKind::InvalidData,
+            "received fatal alert: BadRecordMac",
+        ));
+        assert!(chain_has_tls_corruption(&corruption));
+        assert!(!chain_has_transient_io(&corruption));
+
+        let reset = Wrap(Error::new(
+            ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        ));
+        assert!(chain_has_transient_io(&reset));
+        assert!(!chain_has_tls_corruption(&reset));
     }
 
     #[test]

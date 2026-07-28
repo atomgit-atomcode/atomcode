@@ -51,8 +51,18 @@ pub fn should_cap_url(url: &str) -> bool {
 }
 
 /// Whether a failed request is eligible for one TLS-1.2 fallback attempt.
-pub fn should_try_fallback(url: &str, was_capped: bool, is_connect: bool) -> bool {
-    is_connect && !was_capped && is_managed_https_url(url)
+///
+/// `warrants_fallback` is the caller's judgement that THIS failure class is one
+/// a TLS-1.2 downgrade could actually cure. Two shapes qualify, both owned by
+/// the caller (this fn only adds the managed-and-uncapped gate):
+///   - a connection-establishment failure (`is_connect()`) — a TLS-1.3-hostile
+///     middlebox resetting the handshake;
+///   - a post-handshake TLS record corruption (`BadRecordMac`/`DecryptError`) —
+///     the same middlebox mangling records once the connection has run a while.
+///     (Note this one has no `is_connect` requirement — it lands after the
+///     handshake succeeds.)
+pub fn should_try_fallback(url: &str, was_capped: bool, warrants_fallback: bool) -> bool {
+    warrants_fallback && !was_capped && is_managed_https_url(url)
 }
 
 /// Match only HTTPS service hosts we operate. The label-aware AtomGit check
@@ -129,6 +139,25 @@ mod tests {
         assert!(should_try_fallback(managed, false, true));
         assert!(!should_try_fallback(managed, true, true));
         assert!(!should_try_fallback(managed, false, false));
+        assert!(!should_try_fallback(
+            "https://api.openai.com/v1/chat/completions",
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn fallback_gate_is_independent_of_which_failure_class_warrants_it() {
+        // The managed-and-uncapped gate is the same whether the trigger is a
+        // connect failure or a post-handshake corruption — the caller decides
+        // the class, this fn only gates on endpoint + cap. A corruption trigger
+        // (warrants_fallback=true) on a managed uncapped endpoint qualifies with
+        // NO is_connect involved.
+        let managed = "https://llm-api.atomgit.com/v1/chat/completions";
+        assert!(should_try_fallback(managed, false, true));
+        // Already capped at 1.2 → nothing lower to escalate to.
+        assert!(!should_try_fallback(managed, true, true));
+        // Never auto-downgrade a third-party endpoint we don't operate.
         assert!(!should_try_fallback(
             "https://api.openai.com/v1/chat/completions",
             false,
