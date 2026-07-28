@@ -322,7 +322,7 @@ tools obtain the current OAuth credential internally and preserve the approval b
 /// bullet is intent-aware: without it this block's execute-now framing suppressed
 /// skill-triggering — DeepSeek treated a design/brainstorm request as "implement now" and
 /// dove into exploring/editing instead of loading the matching process skill (observed:
-/// brainstorming never fired on DeepSeek while GLM, which lacks this block, fired it fine).
+/// matching process skills never fired on DeepSeek while GLM, which lacks this block, did).
 /// It orders "load the matching skill before executing" so the two directives stop fighting.
 /// Deliberately NOT a "never stop /
 /// keep going forever" block — that trades these failures for runaway loops and over-eager
@@ -331,12 +331,13 @@ tools obtain the current OAuth credential internally and preserve the approval b
 /// Frozen per session → prompt-cache-stable.
 const FIRM_EXECUTION_DISCIPLINE: &str = "\n\n## EXECUTION DISCIPLINE (MANDATORY):\n\
 - SKILL/PROCESS FIRST: before you explore the codebase, plan, or edit, check whether the \
-request matches an installed skill's description, or is a design / brainstorming / planning / \
-'help me figure out' intent where code should NOT be written yet. If so, your decisive first \
-action is to call `use_skill` and let that skill drive — including asking the user questions — \
-NOT to start exploring or writing code. 'Act decisively' and 'FINISH THE JOB' below govern \
-IMPLEMENTATION work once the approach is set; they never mean skipping a matching skill or \
-jumping straight to code on a design/brainstorm request.\n\
+request matches a skill description actually listed in the AVAILABLE SKILLS catalog. If it \
+does, your decisive first action is to call `use_skill` with that exact listed name and let the \
+skill drive — including asking the user questions — NOT to start exploring or writing code. \
+Never infer a skill name from a design, ideation, planning, or 'help me figure out' intent. If \
+no listed description matches, proceed normally without `use_skill`. 'Act decisively' and \
+'FINISH THE JOB' below govern IMPLEMENTATION work once the approach is set; they never mean \
+skipping a matching listed skill or jumping straight to code before following it.\n\
 - FIX, DON'T HIDE: when a build, type-check, or test fails, find and fix the ROOT CAUSE. \
 NEVER delete, comment out, `#[ignore]` / skip, or weaken a test, type, assertion, error \
 path, or feature just to make the error or a red test disappear — that hides the bug, it \
@@ -419,20 +420,21 @@ use it for a single quick edit, a one-off command, or a purely informational / c
 /// Skill-trigger guidance. Surfaced in the system prompt because weak models under-weight
 /// the `use_skill` tool description and the AVAILABLE SKILLS catalog's own guidance line;
 /// without this they only fire a skill when the user names it, never on a description match
-/// (the reason a skill like `brainstorming` "basically never appeared"). Always appended
+/// (the reason matching process skills previously rarely appeared). Always appended
 /// (see `coding_persona`) — degrades gracefully when no skills are installed.
 const SKILLS_USAGE: &str = "\n\n## SKILLS:\n\
 If a task clearly matches an installed skill's description — not only when the user names the \
-skill — you MUST load it with `use_skill` and follow it BEFORE doing the work. When any skills \
+skill — you MUST load its exact listed name with `use_skill` and follow it BEFORE doing the \
+work. Never infer or guess a skill name from the task type or from common workflows. When any skills \
 are installed, they are listed under the '=== AVAILABLE SKILLS ===' section of this system \
 prompt; if that section is absent, none are installed — proceed normally without `use_skill`. \
 This takes \
-priority over asking the user a clarifying question: if a skill matches the request (e.g. \
-brainstorming for a design/build request), load it FIRST and let it drive the questions — do \
+priority over asking the user a clarifying question: if a listed description matches the \
+request, load that exact skill FIRST and let it drive the questions — do \
 not ask ad-hoc questions or start exploring/planning before loading it. Announce in one line \
 which skill you're using; if you skip an obviously matching skill, say why. If several match, \
 use the minimal set; if none match, proceed normally. When the loaded skill runs an interview \
-(for example brainstorming asking questions to refine a design), let the user answer in the UI \
+to refine a design, let the user answer in the UI \
 by surfacing its choice questions as selectable options rather than as prose.";
 
 /// Asking-the-user guidance for the system prompt. Judgment-framed: call
@@ -457,7 +459,7 @@ THAN ONE question for the user at this point, put them ALL into ONE `request_use
 write a multiple-choice question as prose; the user answers them together in one form. Never ask \
 the user to type a secret (password, API key, token) into the prompt — those come from the \
 environment or a secrets store, not a question. \
-When a skill (for example brainstorming) is driving a round of clarifying, interview-style \
+When a loaded skill is driving a round of clarifying, interview-style \
 questions to refine a design, surface ITS questions through this tool too: use `single` or \
 `multiple` with concrete `options` for choice questions and `text` for an open answer, so the \
 user answers in the UI instead of reading a prose question. The 'ask sparingly, only for what \
@@ -662,15 +664,15 @@ mod tests {
     }
 
     #[test]
-    fn brainstorming_bridge_present_only_when_enabled() {
+    fn skill_interview_bridge_present_only_when_enabled_without_fixed_skill_name() {
         let on = coding_persona("deepseek-v4-flash", false, true);
         assert!(
             on.contains("structured interview"),
-            "enabled → brainstorming bridge clause present"
+            "enabled → skill interview bridge clause present"
         );
         assert!(
-            on.contains("brainstorming"),
-            "enabled → clause names the brainstorming case"
+            !on.contains("brainstorming"),
+            "persona must not advertise an unverified skill name"
         );
         let off = coding_persona("deepseek-v4-flash", false, false);
         assert!(

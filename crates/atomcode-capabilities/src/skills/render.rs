@@ -14,9 +14,7 @@
 //!    skill when the task *matches its description*, not only when the user names
 //!    it, and points at the create-a-feature / design-work case explicitly.
 //!
-//! Kept verbatim-identical to the core twin on purpose: the two `SkillRegistry`
-//! implementations don't share code (capabilities does not depend on core), same
-//! rationale as `model_suggests_vision`. If you edit one, edit both.
+//! This is the single native skill-catalog renderer.
 
 use std::path::Path;
 
@@ -34,7 +32,7 @@ pub const PER_SKILL_DESC_CAP: usize = 1024;
 /// reconcile the block in place across `--resume`.
 pub const CATALOG_HEADER: &str = "=== AVAILABLE SKILLS ===";
 
-const GUIDANCE: &str = "Skills are reusable instruction templates for specific tasks. If a task clearly matches a skill's description — not only when the user names the skill — you MUST load it with the `use_skill` tool and follow it BEFORE doing the work, INCLUDING before asking the user clarifying questions, exploring, or planning (the skill guides those steps). Announce in one line which skill you're using; if you skip an obviously matching skill, say why. For example, before designing or building a feature, a component, or a plan, load the matching skill first. If several skills match, use the minimal set that covers the request; if none match, proceed normally.";
+const GUIDANCE: &str = "Skills are reusable instruction templates for specific tasks. The names listed below are the only skill names you may pass directly to `use_skill`; never invent or guess a skill name from memory, task type, or common workflows. Match a task only against descriptions actually shown below. If a task clearly matches a shown skill's description — not only when the user names the skill — you MUST load that exact skill with `use_skill` and follow it BEFORE doing the work, INCLUDING before asking clarifying questions, exploring, or planning. If this catalog says skills were omitted, call `list_skills` before using an omitted or otherwise unlisted name, and use only an exact name it returns. If no available skill matches, proceed normally. If `use_skill` reports a missing skill, do not guess another name; briefly note it and continue with the best fallback. Announce in one line which skill you're using; if you skip an obviously matching shown skill, say why. If several shown skills match, use the minimal set that covers the request.";
 
 /// One catalog row, already reduced from a crate-specific `Skill`. `source_rank`
 /// is computed via [`source_rank`]; lower = higher priority when budget forces
@@ -172,6 +170,18 @@ mod tests {
         .unwrap();
         assert!(out.starts_with("=== AVAILABLE SKILLS ==="));
         assert!(out.contains("use_skill"));
+        assert!(
+            out.contains("only skill names you may pass directly"),
+            "catalog names form a closed set: {out}"
+        );
+        assert!(
+            out.contains("never invent or guess a skill name"),
+            "must prohibit hallucinated skill names: {out}"
+        );
+        assert!(
+            out.contains("If no available skill matches, proceed normally"),
+            "no-match fallback: {out}"
+        );
         // codex-style anti-bypass framing: mandatory-if-matches + justify a skip.
         assert!(out.contains("MUST"), "mandatory-if-matches framing");
         assert!(
@@ -216,6 +226,10 @@ mod tests {
         assert!(
             out.contains("more lower-priority skills not shown"),
             "omission note present"
+        );
+        assert!(
+            out.contains("call `list_skills`"),
+            "omitted names require discovery before invocation"
         );
         // Body must respect the budget (allow header+guidance+note overhead).
         assert!(

@@ -33,16 +33,17 @@ impl Tool for UseSkillTool {
     }
     fn description(&self) -> &str {
         "Invoke a named skill (a reusable prompt/workflow template) and return its content \
-         with your arguments substituted. Trigger a skill when the task matches its description \
-         — not only when the user names it. Installed skills are listed under \
-         '=== AVAILABLE SKILLS ===' in the system prompt; list_skills shows any lower-priority \
-         ones omitted there."
+         with your arguments substituted. The name must exactly match a skill listed under \
+         '=== AVAILABLE SKILLS ===' in the system prompt or returned by list_skills. Never invent \
+         or guess a skill name. Trigger a skill when the task matches its listed description — \
+         not only when the user names it. list_skills shows any lower-priority skills omitted \
+         from the prompt catalog."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "Skill name (see list_skills)" },
+                "name": { "type": "string", "description": "Exact skill name from AVAILABLE SKILLS or list_skills; never invent a name" },
                 "arguments": { "type": "string", "description": "Arguments passed to the skill (optional)" }
             },
             "required": ["name"]
@@ -63,7 +64,8 @@ impl Tool for UseSkillTool {
             None => {
                 let names: Vec<String> = self.registry.list().into_iter().map(|(n, _)| n).collect();
                 return err(format!(
-                    "use_skill: skill '{}' not found. Available: {}",
+                    "use_skill: skill '{}' not found. Available: {}. Do not guess another skill \
+                     name; use an exact available name or continue without a skill",
                     a.name,
                     if names.is_empty() {
                         "(none)".to_string()
@@ -162,6 +164,24 @@ mod tests {
             r.content.contains("a") && r.content.contains("b"),
             "{}",
             r.content
+        );
+        assert!(
+            r.content.contains("Do not guess another skill name"),
+            "{}",
+            r.content
+        );
+    }
+
+    #[test]
+    fn use_skill_schema_requires_an_exact_available_name() {
+        let tool = UseSkillTool::new(Arc::new(SkillRegistry::new()));
+        let schema = tool.parameters_schema().to_string();
+        assert!(schema.contains("Exact skill name"), "{schema}");
+        assert!(schema.contains("never invent"), "{schema}");
+        assert!(
+            tool.description().contains("must exactly match"),
+            "{}",
+            tool.description()
         );
     }
 

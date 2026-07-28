@@ -4,7 +4,7 @@
 //! A weak model (DeepSeek) under-weights the soft `## SKILLS:` guidance and the static
 //! `SKILL/PROCESS FIRST` persona line (both proved insufficient on real hardware): it
 //! opens by exploring the codebase and pre-solutioning instead of loading a matching
-//! process skill like `brainstorming`. This injects the skill-first directive with high
+//! process skill. This injects the skill-first directive with high
 //! recency — at the request TAIL, on the opening turn — the same ephemeral mechanism
 //! `TodoHook`/`StatusReminderHook` use.
 //!
@@ -41,10 +41,9 @@ impl SkillFirstHook {
     fn body() -> &'static str {
         "Before you explore the codebase, plan, or propose a solution: check the \
 \"=== AVAILABLE SKILLS ===\" catalog above. If this request matches a skill's description \
-— a design / build / \"help me figure out / plan this\" request matches `brainstorming` — \
-you MUST call `use_skill` with that skill NOW and let it drive: ask the user ONE question \
-at a time and do NOT pre-decide the solution or start exploring first. If nothing in the \
-catalog matches, proceed normally."
+shown in that catalog, you MUST call `use_skill` with that exact listed name NOW and let it \
+drive. Never infer a skill name merely from the task type. If no listed description matches, \
+proceed normally without `use_skill`."
     }
 }
 
@@ -77,11 +76,12 @@ mod tests {
     }
 
     #[test]
-    fn body_names_use_skill_brainstorming_and_one_at_a_time() {
+    fn body_requires_an_exact_catalog_match_without_naming_a_skill() {
         let b = SkillFirstHook::body();
         assert!(b.contains("use_skill"), "{b}");
-        assert!(b.contains("brainstorming"), "{b}");
-        assert!(b.contains("ONE question at a time"), "{b}");
+        assert!(b.contains("exact listed name"), "{b}");
+        assert!(b.contains("Never infer a skill name"), "{b}");
+        assert!(!b.contains("brainstorming"), "{b}");
     }
 
     #[tokio::test]
