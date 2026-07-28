@@ -132,15 +132,75 @@ fn sanitize_account_name(name: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Edit an existing account's connection/credential. `api_key` blank keeps the
-/// current secret; `base_url` is pre-filled and editable.
+/// Edit an existing account's vendor/connection/credential. `api_key` blank keeps
+/// the current secret; `base_url` and the vendor preset are pre-filled and
+/// editable.
 #[derive(Clone)]
 struct EditForm {
     id: String,
     is_legacy: bool,
+    preset_idx: usize,
     api_key: String,
     base_url: String,
     focus: FormField,
+}
+
+impl EditForm {
+    fn preset(&self) -> &'static provider_preset::ProviderPreset {
+        &provider_preset::PRESETS[self.preset_idx]
+    }
+
+    /// Field sequence: vendor preset, base_url, api key (only when the selected
+    /// preset is keyed).
+    fn fields(&self) -> Vec<FormField> {
+        let mut v = vec![FormField::Preset, FormField::BaseUrl];
+        if !matches!(self.preset().auth_kind, provider_preset::AuthKind::None) {
+            v.push(FormField::ApiKey);
+        }
+        v
+    }
+
+    fn advance_focus(&mut self, forward: bool) {
+        let fields = self.fields();
+        let cur = fields.iter().position(|f| *f == self.focus).unwrap_or(0);
+        let next = if forward {
+            (cur + 1) % fields.len()
+        } else {
+            (cur + fields.len() - 1) % fields.len()
+        };
+        self.focus = fields[next];
+    }
+
+    fn cycle_preset(&mut self, forward: bool) {
+        let n = provider_preset::PRESETS.len();
+        self.preset_idx = if forward {
+            (self.preset_idx + 1) % n
+        } else {
+            (self.preset_idx + n - 1) % n
+        };
+        // Unlike Add, keep the existing base_url — the user may want the same
+        // endpoint under a different protocol.
+        if !self.fields().contains(&self.focus) {
+            self.focus = FormField::Preset;
+        }
+    }
+}
+
+/// The `PRESETS` index for a stored provider id (new-schema preset id) or a
+/// legacy wire type; falls back to `openai`.
+fn preset_idx_for(provider: &str) -> usize {
+    provider_preset::PRESETS
+        .iter()
+        .position(|p| p.id == provider)
+        .or_else(|| {
+            let mapped = match provider {
+                "claude" | "anthropic" => "anthropic",
+                "ollama" => "ollama",
+                _ => "openai",
+            };
+            provider_preset::PRESETS.iter().position(|p| p.id == mapped)
+        })
+        .unwrap_or(0)
 }
 
 /// Which model-form field has focus.
@@ -432,21 +492,26 @@ impl ProviderPanel {
     fn open_edit(config: &Config, id: &str) -> EditForm {
         let is_legacy =
             !config.provider_accounts.contains_key(id) && config.providers.contains_key(id);
-        let base_url = if is_legacy {
-            config.providers.get(id).and_then(|p| p.base_url.clone())
+        let (base_url, provider) = if is_legacy {
+            let p = config.providers.get(id);
+            (
+                p.and_then(|p| p.base_url.clone()),
+                p.map(|p| p.provider_type.clone()).unwrap_or_default(),
+            )
         } else {
-            config
-                .provider_accounts
-                .get(id)
-                .and_then(|a| a.base_url.clone())
-        }
-        .unwrap_or_default();
+            let a = config.provider_accounts.get(id);
+            (
+                a.and_then(|a| a.base_url.clone()),
+                a.map(|a| a.provider.clone()).unwrap_or_default(),
+            )
+        };
         EditForm {
             id: id.to_string(),
             is_legacy,
+            preset_idx: preset_idx_for(&provider),
             api_key: String::new(),
-            base_url,
-            focus: FormField::ApiKey,
+            base_url: base_url.unwrap_or_default(),
+            focus: FormField::Preset,
         }
     }
 
@@ -454,9 +519,12 @@ impl ProviderPanel {
     fn save_edit(&self, form: &EditForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
         let api_key = form.api_key.trim();
         let base_url = form.base_url.trim();
+        let preset = form.preset();
         let mut desired = ctx.config.clone();
         if form.is_legacy {
             if let Some(p) = desired.providers.get_mut(&form.id) {
+                // Legacy dispatches on the wire `type`; store the preset's wire.
+                p.provider_type = preset.provider_type.wire().to_string();
                 if !api_key.is_empty() {
                     p.api_key = Some(api_key.to_string());
                 }
@@ -465,6 +533,8 @@ impl ProviderPanel {
                 }
             }
         } else if let Some(a) = desired.provider_accounts.get_mut(&form.id) {
+            // New-schema stores the preset id.
+            a.provider = preset.id.to_string();
             if !api_key.is_empty() {
                 a.api_key = Some(api_key.to_string());
             }
@@ -664,13 +734,10 @@ impl Modal for ProviderPanel {
         if let Mode::EditAccount(form) = &mut self.mode {
             match code {
                 KeyCode::Esc => self.mode = Mode::List,
-                KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
-                    form.focus = if form.focus == FormField::ApiKey {
-                        FormField::BaseUrl
-                    } else {
-                        FormField::ApiKey
-                    };
-                }
+                KeyCode::Tab | KeyCode::Down => form.advance_focus(true),
+                KeyCode::BackTab | KeyCode::Up => form.advance_focus(false),
+                KeyCode::Left if form.focus == FormField::Preset => form.cycle_preset(false),
+                KeyCode::Right if form.focus == FormField::Preset => form.cycle_preset(true),
                 KeyCode::Char(c) => match form.focus {
                     FormField::ApiKey => form.api_key.push(c),
                     FormField::BaseUrl => form.base_url.push(c),
@@ -1030,21 +1097,33 @@ impl Modal for ProviderPanel {
                     String::new(),
                 ));
                 items.push((String::new(), String::new()));
-                let masked = "•".repeat(form.api_key.chars().count());
+                let p = form.preset();
                 items.push(field_row(
-                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldApiKey),
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldVendor),
                     format!(
-                        "{masked}   ({})",
-                        crate::i18n::t(crate::i18n::Msg::ProviderPanelKeepOriginal)
+                        "‹ {} ›   ({})",
+                        p.display_name,
+                        crate::i18n::t(crate::i18n::Msg::ProviderPanelSwitchHint)
                     ),
-                    form.focus == FormField::ApiKey,
+                    form.focus == FormField::Preset,
                 ));
                 items.push(field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldBaseUrl),
                     form.base_url.clone(),
                     form.focus == FormField::BaseUrl,
                 ));
-                hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelAccountFormHint).into_owned();
+                if !matches!(p.auth_kind, provider_preset::AuthKind::None) {
+                    let masked = "•".repeat(form.api_key.chars().count());
+                    items.push(field_row(
+                        &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldApiKey),
+                        format!(
+                            "{masked}   ({})",
+                            crate::i18n::t(crate::i18n::Msg::ProviderPanelKeepOriginal)
+                        ),
+                        form.focus == FormField::ApiKey,
+                    ));
+                }
+                hint = "Tab 下一项  ←→ 切厂商  ↵ 保存  Esc 返回".into();
             }
             Mode::Model(form) => {
                 let field_row = |label: &str, value: String, focused: bool| {
@@ -1207,10 +1286,14 @@ mod tests {
         let leg = ProviderPanel::open_edit(&cfg, "leg");
         assert!(leg.is_legacy);
         assert_eq!(leg.base_url, "https://legacy/v1");
+        // Vendor preset pre-filled from the legacy wire type.
+        assert_eq!(provider_preset::PRESETS[leg.preset_idx].id, "openai");
         let acc = ProviderPanel::open_edit(&cfg, "acc");
         assert!(!acc.is_legacy);
         assert_eq!(acc.base_url, "https://mirror/v1");
         assert!(acc.api_key.is_empty()); // blank = keep existing
+        // Vendor preset pre-filled from the account's provider id.
+        assert_eq!(provider_preset::PRESETS[acc.preset_idx].id, "deepseek");
     }
 
     #[test]
