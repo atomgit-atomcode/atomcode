@@ -28,6 +28,7 @@ pub mod instructions;
 pub mod manager;
 pub mod presentation;
 pub mod recall;
+pub mod rewind;
 pub mod snapshot;
 pub mod status_reminder;
 pub mod transcript;
@@ -35,20 +36,24 @@ mod usage_provider;
 pub use context::SessionContextHook;
 pub use manager::{
     aggregate_session_cost, CatalogDiagnostic, CatalogDiagnosticKind, CatalogEntry,
-    CatalogLocation, CatalogPresence, CatalogScan, ForkInfo, ImportInfo, ImportKind, LoadedSession,
-    DetachedUsageRecorder, ModelCostSummary, ModelPricing, ModelUsageStat, SessionCostReport, SessionLease,
-    SessionManager, SessionMeta, SessionResult, SessionStoreError, StorageOwner, TokenBreakdown,
-    TurnStat,
+    CatalogLocation, CatalogPresence, CatalogScan, DetachedUsageRecorder, ForkInfo, ImportInfo,
+    ImportKind, LoadedSession, ModelCostSummary, ModelPricing, ModelUsageStat, SessionCostReport,
+    SessionLease, SessionManager, SessionMeta, SessionResult, SessionStoreError, StorageOwner,
+    TokenBreakdown, TurnStat,
 };
 pub use presentation::{
     anchor_from_legacy_position, DisplayAnchor, LegacyTurnBoundary, PresentationEntry,
     PresentationFile, PresentationRole,
 };
-pub use usage_provider::UsageRecordingProvider;
 pub use recall::{KeywordIndex, RecallIndex, RecallTool};
+pub use rewind::{
+    FileChangeSummary, RewindPoint, WorkspaceCheckpoint, WorkspaceCheckpointError,
+    WorkspaceRestoreReceipt,
+};
 pub use snapshot::SnapshotHook;
 pub use status_reminder::StatusReminderHook;
 pub use transcript::{ToolRecord, TranscriptHook, TurnRecord, UsageRecord};
+pub use usage_provider::UsageRecordingProvider;
 
 /// Current wall-clock as epoch MILLISECONDS, UTC. The single L1 time source the
 /// persistence hooks stamp records with (the kernel stays clock-free).

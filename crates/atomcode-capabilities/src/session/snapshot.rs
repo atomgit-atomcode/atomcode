@@ -17,9 +17,11 @@ use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
 
+use super::rewind::{RewindLedger, RewindPoint, LEDGER_VERSION};
 use super::{
     now_ms, ModelPricing, ModelUsageStat, PresentationFile, SessionLease, SessionManager,
-    SessionMeta, SessionStoreError, TokenBreakdown, TurnStat,
+    SessionMeta, SessionStoreError, TokenBreakdown, TurnStat, WorkspaceCheckpoint,
+    WorkspaceCheckpointError, WorkspaceRestoreReceipt,
 };
 
 /// Per-turn accumulation (reset each turn): duration, round/tool counts, and the final
@@ -84,6 +86,21 @@ pub struct SnapshotHook {
     accum: Mutex<TurnAccum>,
     persistence_status: SnapshotPersistenceStatus,
     attribution: Mutex<Option<ModelAttribution>>,
+    rewind: Mutex<RewindState>,
+}
+
+#[derive(Default)]
+struct RewindState {
+    checkpoint: Option<Arc<WorkspaceCheckpoint>>,
+    unavailable: Option<String>,
+    pending: Option<PendingRewindPoint>,
+    points: Vec<RewindPoint>,
+}
+
+struct PendingRewindPoint {
+    prompt_number: usize,
+    prompt_preview: String,
+    before_tree: String,
 }
 
 #[derive(Clone)]
@@ -99,14 +116,32 @@ impl SnapshotHook {
         session_id: impl Into<String>,
         working_dir: impl Into<String>,
     ) -> Self {
+        let session_id = session_id.into();
+        let working_dir = working_dir.into();
+        let (checkpoint, unavailable) =
+            match WorkspaceCheckpoint::for_session(std::path::Path::new(&working_dir), &session_id)
+            {
+                Ok(checkpoint) => (Some(Arc::new(checkpoint)), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+        let points = mgr
+            .load_rewind_ledger(&session_id)
+            .map(|ledger| ledger.points)
+            .unwrap_or_default();
         Self {
             mgr,
-            session_id: session_id.into(),
-            working_dir: working_dir.into(),
+            session_id,
+            working_dir,
             lease: None,
             accum: Mutex::new(TurnAccum::default()),
             persistence_status: SnapshotPersistenceStatus::default(),
             attribution: Mutex::new(None),
+            rewind: Mutex::new(RewindState {
+                checkpoint,
+                unavailable,
+                points,
+                ..RewindState::default()
+            }),
         }
     }
 
@@ -154,6 +189,60 @@ impl SnapshotHook {
 
     pub fn persistence_status(&self) -> SnapshotPersistenceStatus {
         self.persistence_status.clone()
+    }
+
+    pub fn rewind_points(&self) -> Vec<RewindPoint> {
+        self.rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .points
+            .clone()
+    }
+
+    pub fn code_rewind_unavailable(&self) -> Option<String> {
+        self.rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .unavailable
+            .clone()
+    }
+
+    pub fn restore_workspace(
+        &self,
+        point: &RewindPoint,
+    ) -> Result<WorkspaceRestoreReceipt, WorkspaceCheckpointError> {
+        let rewind = self
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let checkpoint = rewind.checkpoint.as_ref().ok_or_else(|| {
+            WorkspaceCheckpointError::Unsupported(
+                rewind
+                    .unavailable
+                    .clone()
+                    .unwrap_or_else(|| "code rewind is unavailable".into()),
+            )
+        })?;
+        let expected_current = rewind
+            .points
+            .last()
+            .map(|latest| latest.after_tree.as_str())
+            .unwrap_or(point.after_tree.as_str());
+        checkpoint.restore(&point.before_tree, expected_current)
+    }
+
+    pub fn compensate_workspace(
+        &self,
+        receipt: &WorkspaceRestoreReceipt,
+    ) -> Result<(), WorkspaceCheckpointError> {
+        let rewind = self
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let checkpoint = rewind.checkpoint.as_ref().ok_or_else(|| {
+            WorkspaceCheckpointError::Unsupported("code rewind is unavailable".into())
+        })?;
+        checkpoint.compensate(&receipt.recovery_tree, &receipt.restored_files)
     }
 
     fn record_persistence_error(&self, error: &SessionStoreError) {
@@ -252,6 +341,46 @@ impl LifecycleHooks for SnapshotHook {
     /// requested tools execute, so persisting them could restore dangling tool
     /// calls without their results.
     async fn turn_start(&self, convo: &mut Conversation) {
+        let prompt_number = convo
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == atomcode_kernel::message::Role::User && !message.synthetic
+            })
+            .count();
+        let prompt_preview = convo
+            .messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == atomcode_kernel::message::Role::User && !message.synthetic
+            })
+            .map(|message| message.text.chars().take(120).collect())
+            .unwrap_or_default();
+        let checkpoint = self
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .checkpoint
+            .clone();
+        let before_tree = match checkpoint {
+            Some(checkpoint) => tokio::task::spawn_blocking(move || checkpoint.capture())
+                .await
+                .ok()
+                .and_then(Result::ok),
+            None => None,
+        };
+        {
+            let mut rewind = self
+                .rewind
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            rewind.pending = before_tree.map(|before_tree| PendingRewindPoint {
+                prompt_number,
+                prompt_preview,
+                before_tree,
+            });
+        }
         let snapshot = SessionSnapshot::from_conversation(convo);
         let result = match &self.lease {
             Some(lease) => self
@@ -305,6 +434,32 @@ impl LifecycleHooks for SnapshotHook {
     /// session meta (bump turn/message counts, append this turn's stat, stamp updated_at).
     /// Both are best-effort — an IO failure must never panic or break the turn.
     async fn turn_complete(&self, convo: &Conversation, reason: &StopReason, ctx: &TurnCtx) {
+        let (pending, checkpoint) = {
+            let mut rewind = self
+                .rewind
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (rewind.pending.take(), rewind.checkpoint.clone())
+        };
+        let turn_id = ctx.turn_id;
+        let completed_rewind = match (pending, checkpoint) {
+            (Some(pending), Some(checkpoint)) => tokio::task::spawn_blocking(move || {
+                let after_tree = checkpoint.capture().ok()?;
+                let files = checkpoint.diff(&pending.before_tree, &after_tree).ok()?;
+                Some(RewindPoint {
+                    turn_id,
+                    prompt_number: pending.prompt_number,
+                    prompt_preview: pending.prompt_preview,
+                    before_tree: pending.before_tree,
+                    after_tree,
+                    files,
+                })
+            })
+            .await
+            .ok()
+            .flatten(),
+            _ => None,
+        };
         let mut snap = SessionSnapshot::from_conversation(convo);
         // `from_conversation` DERIVES the id high-water marks from stored metas; a
         // turn that died before any assistant message was stored is invisible to
@@ -401,6 +556,41 @@ impl LifecycleHooks for SnapshotHook {
             // Preserve the accepted-prompt checkpoint until a later successful
             // aggregate commit supersedes it.
             return;
+        }
+        if let Some(point) = completed_rewind {
+            let mut rewind = self
+                .rewind
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let previous_points = rewind.points.clone();
+            rewind.points.push(point);
+            const MAX_REWIND_POINTS: usize = 100;
+            if rewind.points.len() > MAX_REWIND_POINTS {
+                let excess = rewind.points.len() - MAX_REWIND_POINTS;
+                rewind.points.drain(..excess);
+            }
+            let ledger = RewindLedger {
+                version: LEDGER_VERSION,
+                points: rewind.points.clone(),
+            };
+            if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+                if let Err(error) = checkpoint.retain_points(&ledger.points) {
+                    eprintln!("[SnapshotHook] rewind refs update failed: {error}");
+                    rewind.points = previous_points;
+                    return;
+                }
+            }
+            let saved = match &self.lease {
+                Some(lease) => self.mgr.save_rewind_ledger_with_lease(lease, &ledger),
+                None => self.mgr.save_rewind_ledger(&self.session_id, &ledger),
+            };
+            if let Err(error) = saved {
+                eprintln!("[SnapshotHook] rewind ledger save failed: {error}");
+                if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+                    let _ = checkpoint.retain_points(&previous_points);
+                }
+                rewind.points = previous_points;
+            }
         }
         self.mgr.clear_inflight_snapshot(&self.session_id);
     }

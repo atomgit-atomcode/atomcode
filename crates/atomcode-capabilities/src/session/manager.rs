@@ -1034,6 +1034,62 @@ impl SessionManager {
         self.path_for(id, "ui.json")
     }
 
+    fn rewind_path(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "rewind.json")
+    }
+
+    pub(crate) fn load_rewind_ledger(
+        &self,
+        id: &str,
+    ) -> SessionResult<super::rewind::RewindLedger> {
+        let path = self.rewind_path(id)?;
+        match read_regular_file_bounded(&path, "rewind ledger", MAX_META_BYTES) {
+            Ok(bytes) => {
+                let ledger: super::rewind::RewindLedger =
+                    serde_json::from_slice(&bytes).map_err(|source| {
+                        SessionStoreError::Corrupt {
+                            kind: "rewind ledger",
+                            message: format!("{}: {source}", path.display()),
+                        }
+                    })?;
+                ledger
+                    .validate()
+                    .map_err(|message| SessionStoreError::Corrupt {
+                        kind: "rewind ledger",
+                        message: format!("{}: {message}", path.display()),
+                    })?;
+                Ok(ledger)
+            }
+            Err(SessionStoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(super::rewind::RewindLedger {
+                    version: super::rewind::LEDGER_VERSION,
+                    points: Vec::new(),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn save_rewind_ledger(
+        &self,
+        id: &str,
+        ledger: &super::rewind::RewindLedger,
+    ) -> SessionResult<()> {
+        let bytes = serialize_bounded(ledger, "rewind ledger", MAX_META_BYTES)?;
+        atomic_write(&self.rewind_path(id)?, &bytes)
+    }
+
+    pub(crate) fn save_rewind_ledger_with_lease(
+        &self,
+        lease: &SessionLease,
+        ledger: &super::rewind::RewindLedger,
+    ) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        self.save_rewind_ledger(lease.id(), ledger)
+    }
+
     pub fn legacy_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "json")
     }
@@ -2627,6 +2683,7 @@ impl SessionManager {
         let targets = [
             self.snapshot_path(id)?,
             self.inflight_path(id)?,
+            self.rewind_path(id)?,
             self.meta_path(id)?,
             self.jsonl_path(id)?,
             self.presentation_path(id)?,
