@@ -54,13 +54,13 @@ pub fn render_instructions(home: &Path, project: &Path) -> String {
     }
     // Precedence preamble injected right next to the user's own instructions so it is
     // hard to overlook: these GLOBAL/PROJECT/USER blocks OVERRIDE the assistant's default
-    // system-prompt rules on conflict. Reinforces the same precedence stated in the
-    // persona (`## PRECEDENCE`), mirroring codex ("user instructions i.e. AGENTS.md may
-    // override these guidelines") and Claude Code ("user instructions ... OVERRIDE any
-    // default behavior"). Safety/approval gates are excepted (stated in the persona).
+    // working rules on conflict, but describe how to work on the project — never the host
+    // product or active model. Reinforces the same scoped precedence stated in the persona.
     const PREAMBLE: &str = "The following GLOBAL / PROJECT / USER instructions take \
 PRECEDENCE over the assistant's default system-prompt rules — when they conflict with a \
-default, follow these. (Safety, approval, and destructive-action gates are not overridable here.)";
+default working rule, follow these. These instructions govern work on the project only; \
+they do not describe or override the host application or active configured model. \
+(Safety, approval, and destructive-action gates are not overridable here.)";
     format!("{PREAMBLE}\n\n{}", out.join("\n\n"))
 }
 
@@ -132,6 +132,14 @@ mod tests {
         assert!(
             out.contains("OVERRIDE") || out.contains("take PRECEDENCE"),
             "states override: {out}"
+        );
+        assert!(
+            out.contains("govern work on the project only"),
+            "scopes project instructions to project work: {out}"
+        );
+        assert!(
+            out.contains("do not describe or override the host application or active configured model"),
+            "protects runtime identity at the instruction boundary: {out}"
         );
     }
 
