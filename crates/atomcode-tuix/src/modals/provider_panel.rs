@@ -102,9 +102,21 @@ impl AddForm {
     }
 }
 
+/// Edit an existing account's connection/credential. `api_key` blank keeps the
+/// current secret; `base_url` is pre-filled and editable.
+#[derive(Clone)]
+struct EditForm {
+    id: String,
+    is_legacy: bool,
+    api_key: String,
+    base_url: String,
+    focus: FormField,
+}
+
 enum Mode {
     List,
     Add(AddForm),
+    EditAccount(EditForm),
     /// Confirm deleting an account (with its models) or a single model.
     DeleteConfirm { id: String, is_account: bool },
 }
@@ -240,6 +252,50 @@ impl ProviderPanel {
         )
     }
 
+    /// Build an edit form pre-filled from the selected account.
+    fn open_edit(config: &Config, id: &str) -> EditForm {
+        let is_legacy =
+            !config.provider_accounts.contains_key(id) && config.providers.contains_key(id);
+        let base_url = if is_legacy {
+            config.providers.get(id).and_then(|p| p.base_url.clone())
+        } else {
+            config.provider_accounts.get(id).and_then(|a| a.base_url.clone())
+        }
+        .unwrap_or_default();
+        EditForm {
+            id: id.to_string(),
+            is_legacy,
+            api_key: String::new(),
+            base_url,
+            focus: FormField::ApiKey,
+        }
+    }
+
+    /// Apply an account edit in place (blank fields keep the current value), save.
+    fn save_edit(&self, form: &EditForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
+        let api_key = form.api_key.trim();
+        let base_url = form.base_url.trim();
+        let mut desired = ctx.config.clone();
+        if form.is_legacy {
+            if let Some(p) = desired.providers.get_mut(&form.id) {
+                if !api_key.is_empty() {
+                    p.api_key = Some(api_key.to_string());
+                }
+                if !base_url.is_empty() {
+                    p.base_url = Some(base_url.to_string());
+                }
+            }
+        } else if let Some(a) = desired.provider_accounts.get_mut(&form.id) {
+            if !api_key.is_empty() {
+                a.api_key = Some(api_key.to_string());
+            }
+            if !base_url.is_empty() {
+                a.base_url = Some(base_url.to_string());
+            }
+        }
+        save_and_reload(ctx, desired, renderer, format!("已更新 {}", form.id), true)
+    }
+
     /// Delete the account (and its models) or a single model, then save.
     fn commit_delete(
         &self,
@@ -350,6 +406,44 @@ impl Modal for ProviderPanel {
             return Ok(ModalAction::Continue);
         }
 
+        // ── Edit account ──
+        if let Mode::EditAccount(form) = &mut self.mode {
+            match code {
+                KeyCode::Esc => self.mode = Mode::List,
+                KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
+                    form.focus = if form.focus == FormField::ApiKey {
+                        FormField::BaseUrl
+                    } else {
+                        FormField::ApiKey
+                    };
+                }
+                KeyCode::Char(c) => match form.focus {
+                    FormField::ApiKey => form.api_key.push(c),
+                    FormField::BaseUrl => form.base_url.push(c),
+                    _ => {}
+                },
+                KeyCode::Backspace => match form.focus {
+                    FormField::ApiKey => {
+                        form.api_key.pop();
+                    }
+                    FormField::BaseUrl => {
+                        form.base_url.pop();
+                    }
+                    _ => {}
+                },
+                KeyCode::Enter => {
+                    let form = form.clone();
+                    if self.save_edit(&form, ctx, renderer) {
+                        return Ok(ModalAction::Close);
+                    }
+                    self.mode = Mode::EditAccount(form);
+                }
+                _ => {}
+            }
+            self.draw(buf, state, ctx, renderer);
+            return Ok(ModalAction::Continue);
+        }
+
         // ── List mode ──
         let len = self.current_len(&ctx.config);
         match code {
@@ -371,6 +465,11 @@ impl Modal for ProviderPanel {
             KeyCode::Char('a') => {
                 // Start the add form at the first endpoint-backed preset.
                 self.mode = Mode::Add(AddForm::new(0));
+            }
+            KeyCode::Char('e') if self.tab == Tab::Accounts => {
+                if let Some(id) = self.selected_id(&ctx.config) {
+                    self.mode = Mode::EditAccount(Self::open_edit(&ctx.config, &id));
+                }
             }
             KeyCode::Char('d') => {
                 if let Some(id) = self.selected_id(&ctx.config) {
@@ -452,7 +551,7 @@ impl Modal for ProviderPanel {
                             };
                             items.push((left, format!("{vendor} · {count} 模型{mark}")));
                         }
-                        hint = "a 添加  d 删除  ↵ 展开模型  Tab 切换  Esc 关闭".into();
+                        hint = "a 添加  e 编辑  d 删除  ↵ 展开模型  Tab 切换  Esc 关闭".into();
                     }
                     Tab::Models => {
                         let ids = Self::model_ids(&ctx.config);
@@ -526,6 +625,26 @@ impl Modal for ProviderPanel {
                     form.focus == FormField::MakeDefault,
                 ));
                 hint = "Tab 下一项  ←→ 切厂商  空格 勾选  ↵ 保存  Esc 返回".into();
+            }
+            Mode::EditAccount(form) => {
+                let field_row = |label: &str, value: String, focused: bool| {
+                    let marker = if focused { "▸ " } else { "  " };
+                    (format!("{marker}{label}: {value}"), String::new())
+                };
+                items.push((format!("【编辑账号 {}】", form.id), String::new()));
+                items.push((String::new(), String::new()));
+                let masked = "•".repeat(form.api_key.chars().count());
+                items.push(field_row(
+                    "api_key",
+                    format!("{masked}   (留空保留原值)"),
+                    form.focus == FormField::ApiKey,
+                ));
+                items.push(field_row(
+                    "base_url",
+                    form.base_url.clone(),
+                    form.focus == FormField::BaseUrl,
+                ));
+                hint = "Tab 切换  ↵ 保存  Esc 返回".into();
             }
             Mode::DeleteConfirm { id, is_account } => {
                 items.push((String::new(), String::new()));
@@ -603,6 +722,23 @@ mod tests {
         assert!(AddForm::new(preset_idx("openai-compatible"))
             .fields()
             .contains(&FormField::BaseUrl));
+    }
+
+    #[test]
+    fn open_edit_prefills_and_detects_legacy() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "providers": { "leg": { "type": "openai", "base_url": "https://legacy/v1", "model": "m", "context_window": 8000 } },
+            "provider_accounts": { "acc": { "provider": "deepseek", "base_url": "https://mirror/v1" } },
+            "models": { "acc/m": { "account": "acc", "model": "x", "context_window": 8000 } }
+        }))
+        .unwrap();
+        let leg = ProviderPanel::open_edit(&cfg, "leg");
+        assert!(leg.is_legacy);
+        assert_eq!(leg.base_url, "https://legacy/v1");
+        let acc = ProviderPanel::open_edit(&cfg, "acc");
+        assert!(!acc.is_legacy);
+        assert_eq!(acc.base_url, "https://mirror/v1");
+        assert!(acc.api_key.is_empty()); // blank = keep existing
     }
 
     #[test]
