@@ -326,7 +326,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelModelsHint =>
             "筛选 · ↑↓选择 · ↵默认 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
         Msg::ProviderPanelFilteredModelsHint { account } =>
-            format!("〔{account}〕· ↑↓选择 · ↵默认 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab全部 · Esc关闭").into(),
+            format!("〔{account}〕· ↑↓选择 · ↵默认 · Ctrl+A加模型 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab全部 · Esc关闭").into(),
         Msg::ProviderPanelModelSaved { model } => format!("已保存模型“{model}”。").into(),
         Msg::ProviderPanelAddTitle => "【添加 Provider 账号】".into(),
         Msg::ProviderPanelEditAccountTitle { account } =>

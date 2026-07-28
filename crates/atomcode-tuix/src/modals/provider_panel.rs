@@ -140,6 +140,10 @@ struct EditForm {
     id: String,
     is_legacy: bool,
     preset_idx: usize,
+    /// The preset the account started on — so save_edit rewrites the vendor ONLY
+    /// when the user actually changed it (a no-op edit must not lossily normalize
+    /// a `deepseek`/custom provider to the `openai` fallback).
+    original_preset_idx: usize,
     api_key: String,
     base_url: String,
     focus: FormField,
@@ -178,8 +182,14 @@ impl EditForm {
         } else {
             (self.preset_idx + n - 1) % n
         };
-        // Unlike Add, keep the existing base_url — the user may want the same
-        // endpoint under a different protocol.
+        // Re-prefill the endpoint with the newly-selected preset's default (like
+        // Add) so switching vendor doesn't leave requests pointed at the old
+        // endpoint; the user can still override.
+        self.base_url = self
+            .preset()
+            .default_base_url
+            .map(str::to_string)
+            .unwrap_or_default();
         if !self.fields().contains(&self.focus) {
             self.focus = FormField::Preset;
         }
@@ -227,14 +237,19 @@ struct ModelForm {
 }
 
 impl ModelForm {
-    fn new_add(config: &Config) -> Option<Self> {
+    fn new_add(config: &Config, preferred: Option<&str>) -> Option<Self> {
         let account_ids = ProviderPanel::account_ids(config);
         if account_ids.is_empty() {
             return None;
         }
+        // Preselect the drilled-into account (if any) so "add a model to THIS
+        // account" is one keystroke, not a hunt through the ‹account› cycle.
+        let account_idx = preferred
+            .and_then(|p| account_ids.iter().position(|a| a == p))
+            .unwrap_or(0);
         Some(Self {
             account_ids,
-            account_idx: 0,
+            account_idx,
             model: String::new(),
             window: String::new(),
             make_default: true,
@@ -505,10 +520,12 @@ impl ProviderPanel {
                 a.map(|a| a.provider.clone()).unwrap_or_default(),
             )
         };
+        let preset_idx = preset_idx_for(&provider);
         EditForm {
             id: id.to_string(),
             is_legacy,
-            preset_idx: preset_idx_for(&provider),
+            preset_idx,
+            original_preset_idx: preset_idx,
             api_key: String::new(),
             base_url: base_url.unwrap_or_default(),
             focus: FormField::Preset,
@@ -520,12 +537,22 @@ impl ProviderPanel {
         let api_key = form.api_key.trim();
         let base_url = form.base_url.trim();
         let preset = form.preset();
+        // Only rewrite the vendor when the user actually changed it — a no-op
+        // edit must not normalize a `deepseek`/custom provider to the fallback
+        // preset. When the new preset is keyless, drop any stale api_key.
+        let vendor_changed = form.preset_idx != form.original_preset_idx;
+        let clear_key =
+            vendor_changed && matches!(preset.auth_kind, provider_preset::AuthKind::None);
         let mut desired = ctx.config.clone();
         if form.is_legacy {
             if let Some(p) = desired.providers.get_mut(&form.id) {
-                // Legacy dispatches on the wire `type`; store the preset's wire.
-                p.provider_type = preset.provider_type.wire().to_string();
-                if !api_key.is_empty() {
+                if vendor_changed {
+                    // Legacy dispatches on the wire `type`; store the preset's wire.
+                    p.provider_type = preset.provider_type.wire().to_string();
+                }
+                if clear_key {
+                    p.api_key = None;
+                } else if !api_key.is_empty() {
                     p.api_key = Some(api_key.to_string());
                 }
                 if !base_url.is_empty() {
@@ -533,9 +560,13 @@ impl ProviderPanel {
                 }
             }
         } else if let Some(a) = desired.provider_accounts.get_mut(&form.id) {
-            // New-schema stores the preset id.
-            a.provider = preset.id.to_string();
-            if !api_key.is_empty() {
+            if vendor_changed {
+                // New-schema stores the preset id.
+                a.provider = preset.id.to_string();
+            }
+            if clear_key {
+                a.api_key = None;
+            } else if !api_key.is_empty() {
                 a.api_key = Some(api_key.to_string());
             }
             if !base_url.is_empty() {
@@ -841,7 +872,10 @@ impl Modal for ProviderPanel {
                     // Add a model to an existing account; if none exist yet, fall
                     // back to creating an account first.
                     Tab::Models => {
-                        self.mode = match ModelForm::new_add(&ctx.config) {
+                        self.mode = match ModelForm::new_add(
+                            &ctx.config,
+                            self.account_filter.as_deref(),
+                        ) {
                             Some(f) => Mode::Model(f),
                             None => Mode::Add(AddForm::new(0)),
                         };
@@ -1304,9 +1338,19 @@ mod tests {
         }))
         .unwrap();
         // Add: account is a selectable field, defaults to an existing account.
-        let add = ModelForm::new_add(&cfg).unwrap();
+        let add = ModelForm::new_add(&cfg, None).unwrap();
         assert!(add.fields().contains(&ModelField::Account));
         assert_eq!(add.account_id(), "acc");
+        // A preferred (drilled-into) account is preselected.
+        let cfg2: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "a1": { "provider": "deepseek" }, "z9": { "provider": "openai" } },
+            "models": { "a1/m": { "account": "a1", "model": "x", "context_window": 8000 } }
+        }))
+        .unwrap();
+        assert_eq!(
+            ModelForm::new_add(&cfg2, Some("z9")).unwrap().account_id(),
+            "z9"
+        );
         // Edit: account locked; model + window pre-filled; id preserved.
         let edit = ModelForm::new_edit(&cfg, "acc/m").unwrap();
         assert!(!edit.fields().contains(&ModelField::Account));

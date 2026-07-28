@@ -1180,8 +1180,12 @@ fn persist_codingplan_as_new_schema(config: &mut Config) {
     // `default_model` so the two never disagree — otherwise the login report and
     // legacy readers show one model while `effective_model_selection` resolves
     // another (e.g. report says glm-5.1-fallback but the runtime runs deepseek).
+    // Only sync a VALID default_model, so a stale one can't clobber an otherwise
+    // valid legacy `default_provider`.
     if let Some(dm) = config.default_model.clone() {
-        config.default_provider = dm;
+        if config.logical_models().contains_key(&dm) {
+            config.default_provider = dm;
+        }
     }
 }
 

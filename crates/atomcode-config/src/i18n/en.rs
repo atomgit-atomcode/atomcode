@@ -345,7 +345,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelModelsHint =>
             "Filter · ↑↓ select · ↵ default · Ctrl+A add · Ctrl+E edit · Ctrl+Dx2 delete · Tab switch · Esc close".into(),
         Msg::ProviderPanelFilteredModelsHint { account } =>
-            format!("[{account}] · ↑↓ select · ↵ default · Ctrl+E edit · Ctrl+Dx2 delete · Tab all · Esc close").into(),
+            format!("[{account}] · ↑↓ select · ↵ default · Ctrl+A add model · Ctrl+E edit · Ctrl+Dx2 delete · Tab all · Esc close").into(),
         Msg::ProviderPanelModelSaved { model } => format!("Saved model \"{model}\".").into(),
         Msg::ProviderPanelAddTitle => "[Add provider account]".into(),
         Msg::ProviderPanelEditAccountTitle { account } =>
