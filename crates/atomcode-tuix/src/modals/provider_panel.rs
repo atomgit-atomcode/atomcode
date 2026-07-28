@@ -155,6 +155,9 @@ struct EditForm {
     /// when the user actually changed it (a no-op edit must not lossily normalize
     /// a `deepseek`/custom provider to the `openai` fallback).
     original_preset_idx: usize,
+    /// CodingPlan (AtomGit) account: gateway-managed, so only base_url is editable
+    /// — the protocol and api_key are locked (rewriting them breaks the gateway).
+    vendor_locked: bool,
     api_key: String,
     base_url: String,
     focus: FormField,
@@ -173,9 +176,11 @@ impl EditForm {
         }
     }
 
-    /// Field sequence: vendor preset, base_url, api key (only when the selected
-    /// preset is keyed).
+    /// Field sequence. A gateway-locked account only exposes base_url.
     fn fields(&self) -> Vec<FormField> {
+        if self.vendor_locked {
+            return vec![FormField::BaseUrl];
+        }
         let mut v = vec![FormField::Preset, FormField::BaseUrl];
         if !matches!(self.preset().auth_kind, provider_preset::AuthKind::None) {
             v.push(FormField::ApiKey);
@@ -195,6 +200,9 @@ impl EditForm {
     }
 
     fn cycle_preset(&mut self, _forward: bool) {
+        if self.vendor_locked {
+            return; // gateway-managed — protocol not editable
+        }
         // Only two choices (OpenAI-compatible ↔ Anthropic-compatible), so both
         // directions just toggle. Neither ships a default endpoint, so base_url
         // stays as the user typed it.
@@ -505,9 +513,15 @@ impl ProviderPanel {
     fn save_add(&self, form: &AddForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
         let preset = form.preset();
         // A fully-custom provider requires a name (it becomes the account id).
-        let base_id = sanitize_account_name(form.name.trim());
+        let mut base_id = sanitize_account_name(form.name.trim());
         if base_id.is_empty() {
             return false;
+        }
+        // Don't let a user account land in the CodingPlan (`AtomGit*`) namespace,
+        // or it'd be misclassified as gateway-managed (undeletable, never prompts
+        // for a key).
+        if atomcode_config::config::is_codingplan_provider_name(&base_id) {
+            base_id = format!("custom-{base_id}");
         }
         let account_id = unique_account_id(&base_id, ctx);
         // base_url is pre-filled with the preset default and editable. Persist
@@ -576,14 +590,21 @@ impl ProviderPanel {
             provider_preset::ProviderType::Anthropic
         );
         let preset_idx = compat_preset_idx(anthropic);
+        let vendor_locked = atomcode_config::config::is_codingplan_provider_name(id);
         EditForm {
             id: id.to_string(),
             is_legacy,
             preset_idx,
             original_preset_idx: preset_idx,
+            vendor_locked,
             api_key: String::new(),
             base_url: base_url.unwrap_or_default(),
-            focus: FormField::Preset,
+            // Locked accounts start on the only editable field.
+            focus: if vendor_locked {
+                FormField::BaseUrl
+            } else {
+                FormField::Preset
+            },
         }
     }
 
@@ -592,10 +613,12 @@ impl ProviderPanel {
         let api_key = form.api_key.trim();
         let base_url = form.base_url.trim();
         let preset = form.preset();
-        // Only rewrite the vendor when the user actually changed it — a no-op
-        // edit must not normalize a `deepseek`/custom provider to the fallback
-        // preset. When the new preset is keyless, drop any stale api_key.
-        let vendor_changed = form.preset_idx != form.original_preset_idx;
+        // Only rewrite the vendor when the user actually changed it (and the
+        // account isn't gateway-locked) — a no-op edit must not normalize a
+        // `deepseek`/custom provider to the fallback preset, and a CodingPlan
+        // account's wire must never change. When the new preset is keyless, drop
+        // any stale api_key.
+        let vendor_changed = !form.vendor_locked && form.preset_idx != form.original_preset_idx;
         let clear_key =
             vendor_changed && matches!(preset.auth_kind, provider_preset::AuthKind::None);
         let mut desired = ctx.config.clone();
@@ -1200,21 +1223,26 @@ impl Modal for ProviderPanel {
                 ));
                 items.push((String::new(), String::new()));
                 let p = form.preset();
-                items.push(field_row(
-                    "协议",
-                    format!(
-                        "‹ {} ›   ({})",
-                        form.protocol_label(),
-                        crate::i18n::t(crate::i18n::Msg::ProviderPanelSwitchHint)
-                    ),
-                    form.focus == FormField::Preset,
-                ));
+                if form.vendor_locked {
+                    // Gateway-managed: protocol read-only, no api_key.
+                    items.push((format!("  协议: {} (锁定)", form.protocol_label()), String::new()));
+                } else {
+                    items.push(field_row(
+                        "协议",
+                        format!(
+                            "‹ {} ›   ({})",
+                            form.protocol_label(),
+                            crate::i18n::t(crate::i18n::Msg::ProviderPanelSwitchHint)
+                        ),
+                        form.focus == FormField::Preset,
+                    ));
+                }
                 items.push(field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldBaseUrl),
                     form.base_url.clone(),
                     form.focus == FormField::BaseUrl,
                 ));
-                if !matches!(p.auth_kind, provider_preset::AuthKind::None) {
+                if !form.vendor_locked && !matches!(p.auth_kind, provider_preset::AuthKind::None) {
                     let masked = "•".repeat(form.api_key.chars().count());
                     items.push(field_row(
                         &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldApiKey),
@@ -1225,7 +1253,11 @@ impl Modal for ProviderPanel {
                         form.focus == FormField::ApiKey,
                     ));
                 }
-                hint = "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回".into();
+                hint = if form.vendor_locked {
+                    "Tab 下一项  ↵ 保存  Esc 返回  （CodingPlan 仅可改 base_url）".into()
+                } else {
+                    "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回".into()
+                };
             }
             Mode::Model(form) => {
                 let field_row = |label: &str, value: String, focused: bool| {
@@ -1471,6 +1503,23 @@ mod tests {
         // No match → empty.
         p.query = "zzz".into();
         assert!(p.filtered_ids(&cfg).is_empty());
+    }
+
+    #[test]
+    fn edit_codingplan_account_locks_vendor_and_key() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "AtomGit": { "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1" },
+                "custom": { "provider": "openai-compatible", "base_url": "https://x/v1", "api_key": "sk-1" }
+            }
+        }))
+        .unwrap();
+        let locked = ProviderPanel::open_edit(&cfg, "AtomGit");
+        assert!(locked.vendor_locked);
+        // Only base_url is editable — no protocol toggle, no api_key.
+        assert_eq!(locked.fields(), vec![FormField::BaseUrl]);
+        // A user account is not locked.
+        assert!(!ProviderPanel::open_edit(&cfg, "custom").vendor_locked);
     }
 
     #[test]
