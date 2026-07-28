@@ -7111,7 +7111,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // loop below isn't blocked, and the warning — when it arrives a
     // second or two later — wakes the loop via `wake_tx` so the status
     // row repaints without the user needing to press a key.
-    if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+    if monitor::is_codingplan_provider(&resolved_provider_and_model(&ctx.config).0) {
         let cooled = ctx
             .monitor_last_check_at
             .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
@@ -11177,7 +11177,7 @@ fn handle_idle_key(
                             // to a CodingPlan-managed provider, gated by a 15-min
                             // cooldown so rapid-fire messages don't spam the API.
                             // Non-CodingPlan users skip entirely (zero network).
-                            if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+                            if monitor::is_codingplan_provider(&resolved_provider_and_model(&ctx.config).0) {
                                 let cooled = ctx
                                     .monitor_last_check_at
                                     .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
@@ -18606,7 +18606,7 @@ fn handle_agent_event(
             // (with cooldown) so the right-aligned hint reflects the
             // tokens the turn just consumed. Gated to CodingPlan users
             // only; non-CodingPlan paths skip all network activity.
-            if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+            if monitor::is_codingplan_provider(&resolved_provider_and_model(&ctx.config).0) {
                 let cooled = ctx
                     .usage_last_check_at
                     .map(|t| t.elapsed() >= usage_monitor::USAGE_COOLDOWN)
@@ -19998,7 +19998,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             crate::i18n::t(crate::i18n::Msg::StatusRuntimeUnavailable).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
-    } else if let Some(warning) = monitor::is_codingplan_provider(&ctx.config.default_provider)
+    } else if let Some(warning) = monitor::is_codingplan_provider(&resolved_provider_and_model(&ctx.config).0)
         .then(|| ctx.monitor_warning.lock().ok().and_then(|g| g.clone()))
         .flatten()
     {

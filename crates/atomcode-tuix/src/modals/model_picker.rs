@@ -38,9 +38,25 @@ pub(crate) fn model_cycle_direction(
 /// Pick the adjacent model profile in stable id order and wrap at both ends.
 /// `/model` exposes the unified model catalog (legacy providers project to one
 /// model each), so the shortcut follows that same source of truth.
+/// Selection ids ordered so models from the same account are adjacent (sort by
+/// `(account, wire model)`), matching the `/model` list order (design §8).
+fn grouped_selection_ids(config: &Config) -> Vec<String> {
+    let models = config.logical_models();
+    let mut ids: Vec<String> = models.keys().cloned().collect();
+    ids.sort_by(|a, b| {
+        let key = |id: &String| {
+            models
+                .get(id)
+                .map(|m| (m.account.clone(), m.model.clone()))
+                .unwrap_or_else(|| (id.clone(), String::new()))
+        };
+        key(a).cmp(&key(b))
+    });
+    ids
+}
+
 pub(crate) fn adjacent_provider(config: &Config, direction: ModelCycleDirection) -> Option<String> {
-    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
-    ids.sort_unstable();
+    let ids = grouped_selection_ids(config);
     if ids.len() < 2 {
         return None;
     }
@@ -74,13 +90,27 @@ pub struct ModelPicker {
 
 impl ModelPicker {
     pub fn open(config: &Config) -> Self {
-        let mut providers: Vec<String> = config.logical_models().into_keys().collect();
-        providers.sort();
-        // Put the current selection at top for quick re-confirmation.
+        // Group models from the same account together (design §8). Bring the
+        // current selection's WHOLE account group to the top (current first
+        // within it) so switching between siblings is easy and the group stays
+        // intact — never split the default out of its group.
+        let grouped = grouped_selection_ids(config);
         let cur = config.effective_model_selection().unwrap_or_default();
-        if let Some(idx) = providers.iter().position(|p| *p == cur) {
-            providers.swap(0, idx);
-        }
+        let models = config.logical_models();
+        let account_of = |id: &str| models.get(id).map(|m| m.account.clone());
+        let providers = if let Some(cur_account) = account_of(&cur) {
+            let (mut group, rest): (Vec<String>, Vec<String>) = grouped
+                .into_iter()
+                .partition(|id| account_of(id).as_deref() == Some(cur_account.as_str()));
+            if let Some(i) = group.iter().position(|x| *x == cur) {
+                let current = group.remove(i);
+                group.insert(0, current);
+            }
+            group.extend(rest);
+            group
+        } else {
+            grouped
+        };
         let filtered: Vec<usize> = (0..providers.len()).collect();
         Self {
             providers,
@@ -349,6 +379,32 @@ mod tests {
         assert_eq!(p.selected, 0);
         // Default provider should be first
         assert_eq!(p.providers[0], "alpha");
+    }
+
+    #[test]
+    fn open_groups_same_account_models_together() {
+        // Two models on one account must stay adjacent even when a legacy
+        // provider's id sorts between them; and the current selection's group
+        // leads without splitting the sibling out.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "aaa",
+            "providers": { "mmm": { "type": "openai", "base_url": "https://x/v1", "model": "m", "context_window": 8000 } },
+            "provider_accounts": { "openrouter": { "provider": "openrouter" } },
+            "models": {
+                "aaa": { "account": "openrouter", "model": "model-a", "context_window": 8000 },
+                "zzz": { "account": "openrouter", "model": "model-z", "context_window": 8000 }
+            }
+        }))
+        .unwrap();
+        let p = ModelPicker::open(&config);
+        assert_eq!(p.providers[0], "aaa"); // current selection leads
+        let pos = |id: &str| p.providers.iter().position(|x| x == id).unwrap();
+        let (a, z, m) = (pos("aaa"), pos("zzz"), pos("mmm"));
+        assert!(
+            !(m > a.min(z) && m < a.max(z)),
+            "legacy provider split the account group: {:?}",
+            p.providers
+        );
     }
 
     #[test]
