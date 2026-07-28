@@ -8667,6 +8667,25 @@ mod external_config_tests {
     }
 
     #[test]
+    fn new_schema_selection_projects_and_follows_default() {
+        // Regression for the reload-completion §14.1 gap: a new-schema model id
+        // must resolve through select_committed_provider (not be rejected, which
+        // would leave the footer/model name stale), and be seen as following its
+        // persisted default.
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "acc/coder",
+            "provider_accounts": { "acc": { "provider": "deepseek", "api_key": "sk" } },
+            "models": { "acc/coder": { "account": "acc", "model": "deepseek-coder", "context_window": 131072 } }
+        }))
+        .unwrap();
+        let (out, model) =
+            select_committed_provider(cfg, "acc/coder", None).expect("new-schema id resolves");
+        assert_eq!(model, "deepseek-coder");
+        assert_eq!(out.default_model.as_deref(), Some("acc/coder"));
+        assert!(config_commits_provider(&out, "acc/coder"));
+    }
+
+    #[test]
     fn provider_reload_terminal_requires_the_current_exact_generation() {
         assert!(provider_reload_terminal_matches(
             atomcode_coding::RuntimeGeneration(5),
@@ -8871,7 +8890,10 @@ fn provider_projection_is_current(
 }
 
 fn config_commits_provider(config: &Config, provider: &str) -> bool {
-    config.default_provider == provider
+    // Compare the RESOLVED active selection (§14.1) rather than raw
+    // `default_provider`, so a new-schema config (selecting via `default_model`)
+    // is correctly seen as "following its persisted default" instead of pinned.
+    resolved_provider_and_model(config).0 == provider
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8907,11 +8929,20 @@ fn select_committed_provider(
     provider: &str,
     expected_model: Option<&str>,
 ) -> Option<(Config, String)> {
-    let model = config.providers.get(provider)?.model.clone();
+    // `provider` is a selection id — a legacy provider name OR a new-schema
+    // model id. Resolve through the single boundary (§14.1) so a new-schema
+    // selection projects instead of being rejected (which would leave the
+    // footer/model name stale after the switch).
+    let model = config.resolve_model(Some(provider)).ok()?.model;
     if expected_model.is_some_and(|expected| expected != model) {
         return None;
     }
-    config.default_provider = provider.to_string();
+    // Point the canonical `default_model` at this selection; keep the legacy
+    // `default_provider` in sync when it is a legacy provider.
+    config.default_model = Some(provider.to_string());
+    if config.providers.contains_key(provider) {
+        config.default_provider = provider.to_string();
+    }
     Some((config, model))
 }
 
@@ -15770,8 +15801,12 @@ fn sync_provider_projection_from_snapshot(
         return ProviderProjectionResult::Deferred;
     };
     let model = runtime_model.unwrap_or(&configured_model).to_string();
+    // Compare the RESOLVED active selection, not raw `default_provider`, so a
+    // new-schema selection (identified by its model id) is correctly detected as
+    // already-current instead of being re-projected every completion (§14.1).
+    let current_selection = resolved_provider_and_model(&ctx.config).0;
     if provider_projection_is_current(
-        &ctx.config.default_provider,
+        &current_selection,
         &ctx.model_name,
         ctx.observed_config_revision.as_ref(),
         &provider,
