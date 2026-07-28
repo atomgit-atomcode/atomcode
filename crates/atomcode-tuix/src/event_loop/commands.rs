@@ -30,8 +30,7 @@ use crate::custom_commands::ArgsRequirement;
 use crate::i18n::{t, Msg};
 use crate::modals::usage::{UsageData, UsageModal};
 use crate::modals::{
-    DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProviderWizard,
-    ProxyPicker,
+    DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProxyPicker,
 };
 use crate::render::{Renderer, UiLine};
 use crate::session::{Session, SessionId};
@@ -1773,11 +1772,7 @@ fn execute_slash_command_impl(
             }
         }
         "provider" => {
-            *active_modal = Some(Box::new(ProviderWizard::MainMenu { selected: 0 }));
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::ProviderWizardHeader).into_owned(),
-            ));
-            renderer.flush();
+            *active_modal = Some(Box::new(crate::modals::ProviderPanel::open()));
         }
         "proxy" => {
             *active_modal = Some(Box::new(ProxyPicker::open(&ctx.config)));

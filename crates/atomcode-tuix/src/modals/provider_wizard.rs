@@ -868,7 +868,7 @@ fn handle_key(
 
 /// A unique account id derived from the preset id, avoiding collisions with
 /// existing accounts or legacy provider names.
-fn unique_account_id(base: &str, ctx: &LoopCtx) -> String {
+pub(crate) fn unique_account_id(base: &str, ctx: &LoopCtx) -> String {
     let taken = |id: &str| {
         ctx.config.provider_accounts.contains_key(id) || ctx.config.providers.contains_key(id)
     };
@@ -897,7 +897,7 @@ fn preset_step_prompt(step: PresetStep, preset: &provider_preset::ProviderPreset
 
 /// Pure builder: turn a preset add into an `(account, model, model_id)` triple.
 /// Separated from the ctx/save so it can be unit-tested.
-fn build_preset_entry(
+pub(crate) fn build_preset_entry(
     preset: &provider_preset::ProviderPreset,
     account_id: &str,
     api_key: &str,
