@@ -231,11 +231,15 @@ fn account_needs_key(config: &Config, account_id: &str) -> bool {
     if atomcode_config::config::is_codingplan_provider_name(account_id) {
         return false;
     }
-    config
-        .provider_accounts
-        .get(account_id)
-        .map(|a| a.api_key.as_deref().unwrap_or("").trim().is_empty())
-        .unwrap_or(false)
+    match config.provider_accounts.get(account_id) {
+        Some(a) => a.api_key.as_deref().unwrap_or("").trim().is_empty(),
+        // Not yet configured (a preset-vendor quick-add) — needs a key iff the
+        // preset is keyed (account_id == preset id).
+        None => !matches!(
+            provider_preset::preset_or_compatible(account_id).auth_kind,
+            provider_preset::AuthKind::None
+        ),
+    }
 }
 
 /// Add a model to an EXISTING account (the 模型 tab's `a`). Optionally editing an
@@ -393,11 +397,12 @@ impl ProviderPanel {
         }
     }
 
-    /// Account ids sorted (new-schema + legacy projected), stable.
-    /// Accounts shown on the 账号 tab: new-schema `provider_accounts` + folded
-    /// CodingPlan accounts only. Pure-legacy `[providers.*]` are EXCLUDED — they
-    /// appear flattened as individual models on the 模型 tab. Sorted by model
-    /// count DESC (configured providers first), then name.
+    /// The 账号 tab list: configured accounts first (new-schema + folded
+    /// CodingPlan, sorted by model-count DESC), then every unconfigured preset
+    /// VENDOR (deepseek/openai/… — name only) so the user can pick one and add a
+    /// model to it. Pure-legacy `[providers.*]` are excluded (they show flattened
+    /// on the 模型 tab); the custom-endpoint presets are reached via the trailing
+    /// "＋ 添加自定义 provider" row instead.
     fn account_ids(config: &Config) -> Vec<String> {
         let accounts = config.logical_accounts();
         let models = config.logical_models();
@@ -413,7 +418,18 @@ impl ProviderPanel {
             })
             .collect();
         with_count.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        with_count.into_iter().map(|(id, _)| id).collect()
+        let mut ids: Vec<String> = with_count.into_iter().map(|(id, _)| id).collect();
+        // Unconfigured preset vendors as quick-add rows.
+        for p in provider_preset::PRESETS {
+            if matches!(p.id, "openai-compatible" | "anthropic-compatible")
+                || atomcode_config::config::is_codingplan_provider_name(p.id)
+                || ids.iter().any(|i| i == p.id)
+            {
+                continue;
+            }
+            ids.push(p.id.to_string());
+        }
+        ids
     }
 
     /// Model selection ids grouped by account (matches the /model order).
@@ -668,12 +684,14 @@ impl ProviderPanel {
         if model_name.is_empty() {
             return false;
         }
+        // For an unconfigured preset-vendor quick-add, the account id IS the
+        // preset id, so fall back to it.
         let preset_id = ctx
             .config
             .logical_accounts()
             .get(&account_id)
             .map(|a| a.provider.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| account_id.clone());
         let wire = provider_preset::preset_or_compatible(&preset_id)
             .provider_type
             .wire();
@@ -685,6 +703,28 @@ impl ProviderPanel {
             .filter(|w| *w > 0)
             .unwrap_or_else(|| atomcode_config::config::provider::default_context_window_for(wire));
         let mut desired = ctx.config.clone();
+        // Materialize a preset-vendor account on first use (quick-add from the
+        // list): create the account with the preset's defaults; its api_key is
+        // filled by the key-write block below.
+        if form.edit_id.is_none()
+            && !desired.provider_accounts.contains_key(&account_id)
+            && !atomcode_config::config::is_codingplan_provider_name(&account_id)
+        {
+            let preset = provider_preset::preset_or_compatible(&account_id);
+            desired.provider_accounts.insert(
+                account_id.clone(),
+                ProviderAccountConfig {
+                    provider: account_id.clone(),
+                    display_name: None,
+                    api_key: None,
+                    base_url: preset.default_base_url.map(str::to_string),
+                    user_agent: None,
+                    skip_tls_verify: false,
+                    enterprise_url: None,
+                    ephemeral: false,
+                },
+            );
+        }
         let selection_id = if let Some(id) = &form.edit_id {
             // Edit in place — new-schema model or legacy provider.
             if let Some(m) = desired.models.get_mut(id) {
@@ -1492,17 +1532,37 @@ mod tests {
         }))
         .unwrap();
         let mut p = ProviderPanel::open();
-        // Empty query → all accounts.
-        assert_eq!(p.filtered_ids(&cfg).len(), 2);
-        // Match by account id substring.
+        // Empty query → configured accounts + all unconfigured preset vendors.
+        let all = p.filtered_ids(&cfg);
+        assert!(all.contains(&"openai-main".to_string()) && all.contains(&"deep".to_string()));
+        assert!(all.len() > 2, "preset vendors are also listed");
+        // Match by id substring: the "deep" account AND the "deepseek" preset.
         p.query = "deep".into();
-        assert_eq!(p.filtered_ids(&cfg), vec!["deep".to_string()]);
-        // Match by vendor even when the id doesn't contain it.
+        let d = p.filtered_ids(&cfg);
+        assert!(d.contains(&"deep".to_string()) && d.contains(&"deepseek".to_string()));
+        // Match by vendor: "openai-main" (provider openai) surfaces for "openai".
         p.query = "openai".into();
-        assert_eq!(p.filtered_ids(&cfg), vec!["openai-main".to_string()]);
+        assert!(p.filtered_ids(&cfg).contains(&"openai-main".to_string()));
         // No match → empty.
-        p.query = "zzz".into();
+        p.query = "zzznomatch".into();
         assert!(p.filtered_ids(&cfg).is_empty());
+    }
+
+    #[test]
+    fn account_ids_lists_unconfigured_preset_vendors() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "AtomGit": { "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1" } }
+        }))
+        .unwrap();
+        let ids = ProviderPanel::account_ids(&cfg);
+        assert!(ids.first() == Some(&"AtomGit".to_string()), "configured first");
+        assert!(ids.contains(&"deepseek".to_string()), "unconfigured vendor listed");
+        // Custom-endpoint presets are reached via the add-custom row, not listed.
+        assert!(!ids.contains(&"openai-compatible".to_string()));
+        assert!(!ids.contains(&"anthropic-compatible".to_string()));
+        // A keyed preset vendor prompts for a key when you add its first model.
+        assert!(account_needs_key(&cfg, "deepseek"));
+        assert!(!account_needs_key(&cfg, "AtomGit"));
     }
 
     #[test]
@@ -1570,10 +1630,12 @@ mod tests {
         // A typed query narrows further, within the account.
         p.query = "b".into();
         assert_eq!(p.filtered_ids(&cfg), vec!["AtomGit-b".to_string()]);
-        // The account filter only applies to the Models tab.
+        // The account filter only applies to the Models tab; the Accounts tab
+        // lists both configured accounts (plus preset vendors).
         p.query.clear();
         p.tab = Tab::Accounts;
-        assert_eq!(p.filtered_ids(&cfg).len(), 2);
+        let acc = p.filtered_ids(&cfg);
+        assert!(acc.contains(&"AtomGit".to_string()) && acc.contains(&"other".to_string()));
     }
 
     #[test]
