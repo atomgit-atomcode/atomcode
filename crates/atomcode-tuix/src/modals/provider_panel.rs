@@ -344,6 +344,10 @@ pub struct ProviderPanel {
 /// [`ProviderPanel::draw`].
 const LIST_HEADER_ROWS: usize = 4;
 
+/// Virtual last row on the 账号 tab: "+ 添加自定义 provider". Not a real id, so it
+/// never collides with an account; selecting it opens the add-account form.
+const ADD_PROVIDER_ROW: &str = "\u{1}add-provider";
+
 impl ProviderPanel {
     pub fn open() -> Self {
         Self {
@@ -357,10 +361,26 @@ impl ProviderPanel {
     }
 
     /// Account ids sorted (new-schema + legacy projected), stable.
+    /// Accounts shown on the 账号 tab: new-schema `provider_accounts` + folded
+    /// CodingPlan accounts only. Pure-legacy `[providers.*]` are EXCLUDED — they
+    /// appear flattened as individual models on the 模型 tab. Sorted by model
+    /// count DESC (configured providers first), then name.
     fn account_ids(config: &Config) -> Vec<String> {
-        let mut ids: Vec<String> = config.logical_accounts().into_keys().collect();
-        ids.sort();
-        ids
+        let accounts = config.logical_accounts();
+        let models = config.logical_models();
+        let mut with_count: Vec<(String, usize)> = accounts
+            .keys()
+            .filter(|id| {
+                config.provider_accounts.contains_key(*id)
+                    || atomcode_config::config::is_codingplan_provider_name(id)
+            })
+            .map(|id| {
+                let count = models.values().filter(|m| &m.account == id).count();
+                (id.clone(), count)
+            })
+            .collect();
+        with_count.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        with_count.into_iter().map(|(id, _)| id).collect()
     }
 
     /// Model selection ids grouped by account (matches the /model order).
@@ -440,12 +460,19 @@ impl ProviderPanel {
         }
     }
 
+    /// Selectable row count, including the trailing "+ add provider" row on the
+    /// 账号 tab.
     fn current_len(&self, config: &Config) -> usize {
-        self.filtered_ids(config).len()
+        self.filtered_ids(config).len() + usize::from(self.tab == Tab::Accounts)
     }
 
     fn selected_id(&self, config: &Config) -> Option<String> {
-        self.filtered_ids(config).get(self.selected).cloned()
+        let ids = self.filtered_ids(config);
+        // The virtual add row sits just past the real accounts on the 账号 tab.
+        if self.tab == Tab::Accounts && self.selected == ids.len() {
+            return Some(ADD_PROVIDER_ROW.to_string());
+        }
+        ids.get(self.selected).cloned()
     }
 
     /// Persist the add form as one provider ACCOUNT (no model — models are added
@@ -885,7 +912,7 @@ impl Modal for ProviderPanel {
             // Ctrl+E: edit the selected row.
             KeyCode::Char('e') if ctrl => {
                 self.pending_delete = None;
-                if let Some(id) = self.selected_id(&ctx.config) {
+                if let Some(id) = self.selected_id(&ctx.config).filter(|i| i != ADD_PROVIDER_ROW) {
                     self.mode = match self.tab {
                         Tab::Accounts => Mode::EditAccount(Self::open_edit(&ctx.config, &id)),
                         Tab::Models => match ModelForm::new_edit(&ctx.config, &id) {
@@ -898,9 +925,13 @@ impl Modal for ProviderPanel {
             // Ctrl+D twice: the first press arms the selected logical row; the
             // second deletes it without leaving the list for a confirmation UI.
             KeyCode::Char('d') if ctrl => {
-                if let Some(id) = self.selected_id(&ctx.config) {
+                if let Some(id) = self.selected_id(&ctx.config).filter(|i| i != ADD_PROVIDER_ROW) {
                     let is_account = self.tab == Tab::Accounts;
-                    if self.confirm_double_delete(&id, is_account)
+                    // The CodingPlan (AtomGit) provider is managed by /login and
+                    // can't be deleted here.
+                    if is_account && atomcode_config::config::is_codingplan_provider_name(&id) {
+                        self.pending_delete = None;
+                    } else if self.confirm_double_delete(&id, is_account)
                         && self.commit_delete(&id, is_account, ctx, renderer)
                     {
                         return Ok(ModalAction::Close);
@@ -929,6 +960,9 @@ impl Modal for ProviderPanel {
                             if set_default_provider_and_reload(ctx, &id, renderer) {
                                 return Ok(ModalAction::Close);
                             }
+                        }
+                        Tab::Accounts if id == ADD_PROVIDER_ROW => {
+                            self.mode = Mode::Add(AddForm::new(0));
                         }
                         // Drill into the account: switch to the Models tab
                         // filtered to just this account. Manual Tab / Esc clears
@@ -985,39 +1019,32 @@ impl Modal for ProviderPanel {
                 match self.tab {
                     Tab::Accounts => {
                         let ids = self.filtered_ids(&ctx.config);
-                        if ids.is_empty() {
-                            let msg = if self.query.trim().is_empty() {
-                                crate::i18n::t(crate::i18n::Msg::ProviderPanelEmptyAccounts)
-                            } else {
-                                crate::i18n::t(crate::i18n::Msg::ProviderPanelNoMatchingAccounts)
-                            };
-                            items.push((msg.into_owned(), String::new()));
-                        }
                         for id in &ids {
                             let a = accounts.get(id);
                             let count = models.values().filter(|m| m.account == *id).count();
-                            let is_legacy = !ctx.config.provider_accounts.contains_key(id)
-                                && ctx.config.providers.contains_key(id);
-                            let mut left = id.clone();
-                            if is_legacy {
-                                left.push_str(&format!(
-                                    " [{}]",
-                                    crate::i18n::t(crate::i18n::Msg::ProviderPanelLegacyBadge)
-                                ));
-                            }
-                            let vendor = a.map(|a| a.provider.clone()).unwrap_or_default();
-                            let mark = if default_account.as_deref() == Some(id) {
-                                format!(
-                                    "  [{}]",
-                                    crate::i18n::t(crate::i18n::Msg::ProviderPanelDefaultBadge)
-                                )
-                            } else {
+                            // 0-model providers show just the name; configured
+                            // ones show "vendor · N 模型 [默认]".
+                            let desc = if count == 0 {
                                 String::new()
+                            } else {
+                                let vendor = a.map(|a| a.provider.clone()).unwrap_or_default();
+                                let mark = if default_account.as_deref() == Some(id) {
+                                    format!(
+                                        "  [{}]",
+                                        crate::i18n::t(crate::i18n::Msg::ProviderPanelDefaultBadge)
+                                    )
+                                } else {
+                                    String::new()
+                                };
+                                let model_count = crate::i18n::t(
+                                    crate::i18n::Msg::ProviderPanelModelCount { count },
+                                );
+                                format!("{vendor} · {model_count}{mark}")
                             };
-                            let model_count =
-                                crate::i18n::t(crate::i18n::Msg::ProviderPanelModelCount { count });
-                            items.push((left, format!("{vendor} · {model_count}{mark}")));
+                            items.push((id.clone(), desc));
                         }
+                        // Trailing "+ 添加自定义 provider" affordance (also Ctrl+A).
+                        items.push(("＋ 添加自定义 provider".to_string(), String::new()));
                         hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelAccountsHint)
                             .into_owned();
                     }
