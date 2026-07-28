@@ -327,6 +327,47 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepProgress { current, total } =>
             format!("({current}/{total})").into(),
 
+        // ── Provider panel ──
+        Msg::ProviderPanelTabAccounts => "Accounts".into(),
+        Msg::ProviderPanelTabModels => "Models".into(),
+        Msg::ProviderPanelEmptyAccounts =>
+            "(No provider accounts yet — press Ctrl+A to add one)".into(),
+        Msg::ProviderPanelNoMatchingAccounts => "(No matching provider accounts)".into(),
+        Msg::ProviderPanelEmptyModels =>
+            "(No models yet — press Ctrl+A to add one)".into(),
+        Msg::ProviderPanelNoMatchingModels => "(No matching models)".into(),
+        Msg::ProviderPanelLegacyBadge => "legacy".into(),
+        Msg::ProviderPanelDefaultBadge => "default".into(),
+        Msg::ProviderPanelModelCount { count } =>
+            format!("{count} model{}", if count == 1 { "" } else { "s" }).into(),
+        Msg::ProviderPanelAccountsHint =>
+            "Filter · ↑↓ select · ↵ models · Ctrl+A add · Ctrl+E edit · Ctrl+Dx2 delete · Tab switch · Esc close".into(),
+        Msg::ProviderPanelModelsHint =>
+            "Filter · ↑↓ select · ↵ default · Ctrl+A add · Ctrl+E edit · Ctrl+Dx2 delete · Tab switch · Esc close".into(),
+        Msg::ProviderPanelFilteredModelsHint { account } =>
+            format!("[{account}] · ↑↓ select · ↵ default · Ctrl+E edit · Ctrl+Dx2 delete · Tab all · Esc close").into(),
+        Msg::ProviderPanelModelSaved { model } => format!("Saved model \"{model}\".").into(),
+        Msg::ProviderPanelAddTitle => "[Add provider account]".into(),
+        Msg::ProviderPanelEditAccountTitle { account } =>
+            format!("[Edit account {account}]").into(),
+        Msg::ProviderPanelAddModelTitle => "[Add model]".into(),
+        Msg::ProviderPanelEditModelTitle => "[Edit model]".into(),
+        Msg::ProviderPanelFieldVendor => "Provider".into(),
+        Msg::ProviderPanelFieldAccount => "Account".into(),
+        Msg::ProviderPanelFieldBaseUrl => "Base URL".into(),
+        Msg::ProviderPanelFieldApiKey => "API key".into(),
+        Msg::ProviderPanelFieldModel => "Model".into(),
+        Msg::ProviderPanelFieldWindow => "Context window".into(),
+        Msg::ProviderPanelFieldMakeDefault => "Set as default".into(),
+        Msg::ProviderPanelSwitchHint => "←→ to switch".into(),
+        Msg::ProviderPanelEnvHint { env } => format!("blank uses ${env}").into(),
+        Msg::ProviderPanelDefaultValue => "default".into(),
+        Msg::ProviderPanelKeepOriginal => "blank keeps current value".into(),
+        Msg::ProviderPanelProviderFormHint =>
+            "Tab Next  ←→ Switch provider  Space Toggle  ↵ Save  Esc Back".into(),
+        Msg::ProviderPanelAccountFormHint => "Tab Switch  ↵ Save  Esc Back".into(),
+        Msg::ProviderPanelModelFormHint =>
+            "Tab Next  ←→ Switch account  Space Toggle  ↵ Save  Esc Back".into(),
         // ── Model picker ──
         Msg::ModelSwitched { provider, model } =>
             format!("  Switched to {provider} · {model} for this session\n").into(),

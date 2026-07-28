@@ -309,6 +309,46 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepProgress { current, total } =>
             format!("（{current}/{total}）").into(),
 
+        // ── Provider 面板 ──
+        Msg::ProviderPanelTabAccounts => "账号".into(),
+        Msg::ProviderPanelTabModels => "模型".into(),
+        Msg::ProviderPanelEmptyAccounts =>
+            "（尚无 Provider 账号 — 按 Ctrl+A 添加）".into(),
+        Msg::ProviderPanelNoMatchingAccounts => "（无匹配的 Provider 账号）".into(),
+        Msg::ProviderPanelEmptyModels =>
+            "（尚无模型 — 按 Ctrl+A 添加）".into(),
+        Msg::ProviderPanelNoMatchingModels => "（无匹配的模型）".into(),
+        Msg::ProviderPanelLegacyBadge => "旧".into(),
+        Msg::ProviderPanelDefaultBadge => "默认".into(),
+        Msg::ProviderPanelModelCount { count } => format!("{count} 个模型").into(),
+        Msg::ProviderPanelAccountsHint =>
+            "筛选 · ↑↓选择 · ↵模型 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
+        Msg::ProviderPanelModelsHint =>
+            "筛选 · ↑↓选择 · ↵默认 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
+        Msg::ProviderPanelFilteredModelsHint { account } =>
+            format!("〔{account}〕· ↑↓选择 · ↵默认 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab全部 · Esc关闭").into(),
+        Msg::ProviderPanelModelSaved { model } => format!("已保存模型“{model}”。").into(),
+        Msg::ProviderPanelAddTitle => "【添加 Provider 账号】".into(),
+        Msg::ProviderPanelEditAccountTitle { account } =>
+            format!("【编辑账号 {account}】").into(),
+        Msg::ProviderPanelAddModelTitle => "【添加模型】".into(),
+        Msg::ProviderPanelEditModelTitle => "【编辑模型】".into(),
+        Msg::ProviderPanelFieldVendor => "厂商".into(),
+        Msg::ProviderPanelFieldAccount => "账号".into(),
+        Msg::ProviderPanelFieldBaseUrl => "Base URL".into(),
+        Msg::ProviderPanelFieldApiKey => "API 密钥".into(),
+        Msg::ProviderPanelFieldModel => "模型".into(),
+        Msg::ProviderPanelFieldWindow => "上下文窗口".into(),
+        Msg::ProviderPanelFieldMakeDefault => "设为默认".into(),
+        Msg::ProviderPanelSwitchHint => "←→ 切换".into(),
+        Msg::ProviderPanelEnvHint { env } => format!("留空使用 ${env}").into(),
+        Msg::ProviderPanelDefaultValue => "默认".into(),
+        Msg::ProviderPanelKeepOriginal => "留空保留原值".into(),
+        Msg::ProviderPanelProviderFormHint =>
+            "Tab 下一项  ←→ 切厂商  空格 勾选  ↵ 保存  Esc 返回".into(),
+        Msg::ProviderPanelAccountFormHint => "Tab 切换  ↵ 保存  Esc 返回".into(),
+        Msg::ProviderPanelModelFormHint =>
+            "Tab 下一项  ←→ 切账号  空格 勾选  ↵ 保存  Esc 返回".into(),
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
             format!("  当前会话已切换到 {provider} · {model}\n").into(),

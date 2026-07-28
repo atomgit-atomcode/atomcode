@@ -10,7 +10,9 @@ use atomcode_config::config::{provider_preset, Config};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{tab_chip, Modal, ModalAction};
-use crate::event_loop::{build_status, save_and_reload, set_default_provider_and_reload, Buffer, LoopCtx};
+use crate::event_loop::{
+    build_status, save_and_reload, set_default_provider_and_reload, Buffer, LoopCtx,
+};
 use crate::render::{MenuKind, MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
@@ -186,7 +188,11 @@ impl ModelForm {
 
     fn fields(&self) -> Vec<ModelField> {
         if self.edit_id.is_some() {
-            vec![ModelField::Model, ModelField::Window, ModelField::MakeDefault]
+            vec![
+                ModelField::Model,
+                ModelField::Window,
+                ModelField::MakeDefault,
+            ]
         } else {
             vec![
                 ModelField::Account,
@@ -226,8 +232,6 @@ enum Mode {
     Add(AddForm),
     EditAccount(EditForm),
     Model(ModelForm),
-    /// Confirm deleting an account (with its models) or a single model.
-    DeleteConfirm { id: String, is_account: bool },
 }
 
 pub struct ProviderPanel {
@@ -239,6 +243,9 @@ pub struct ProviderPanel {
     /// When set (via drilling into an account with ↵), the Models tab shows only
     /// this account's models. Cleared by Tab / Esc.
     account_filter: Option<String>,
+    /// The row armed by the first Ctrl+D. A second Ctrl+D deletes only when the
+    /// same logical row is still selected; every other list action disarms it.
+    pending_delete: Option<(String, bool)>,
 }
 
 /// Rows the List layout pushes before the first account/model row: the tab bar,
@@ -256,6 +263,7 @@ impl ProviderPanel {
             mode: Mode::List,
             query: String::new(),
             account_filter: None,
+            pending_delete: None,
         }
     }
 
@@ -312,8 +320,7 @@ impl ProviderPanel {
                         .get(id)
                         .is_some_and(|a| a.provider.to_lowercase().contains(&q)),
                     Tab::Models => models.get(id).is_some_and(|m| {
-                        m.model.to_lowercase().contains(&q)
-                            || m.account.to_lowercase().contains(&q)
+                        m.model.to_lowercase().contains(&q) || m.account.to_lowercase().contains(&q)
                     }),
                 }
             })
@@ -328,6 +335,20 @@ impl ProviderPanel {
         self.selected = 0;
         self.query.clear();
         self.account_filter = None;
+        self.pending_delete = None;
+    }
+
+    /// Arm a row on the first Ctrl+D and confirm it on the second. Returning
+    /// true means the caller should perform the destructive operation.
+    fn confirm_double_delete(&mut self, id: &str, is_account: bool) -> bool {
+        let target = (id.to_string(), is_account);
+        if self.pending_delete.as_ref() == Some(&target) {
+            self.pending_delete = None;
+            true
+        } else {
+            self.pending_delete = Some(target);
+            false
+        }
     }
 
     fn current_len(&self, config: &Config) -> usize {
@@ -423,7 +444,10 @@ impl ProviderPanel {
         let base_url = if is_legacy {
             config.providers.get(id).and_then(|p| p.base_url.clone())
         } else {
-            config.provider_accounts.get(id).and_then(|a| a.base_url.clone())
+            config
+                .provider_accounts
+                .get(id)
+                .and_then(|a| a.base_url.clone())
         }
         .unwrap_or_default();
         EditForm {
@@ -457,7 +481,13 @@ impl ProviderPanel {
                 a.base_url = Some(base_url.to_string());
             }
         }
-        save_and_reload(ctx, desired, renderer, format!("已更新 {}", form.id), true)
+        save_and_reload(
+            ctx,
+            desired,
+            renderer,
+            crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &form.id }).into_owned(),
+            true,
+        )
     }
 
     /// Add a model to an existing account, or edit an existing model's wire name
@@ -483,9 +513,7 @@ impl ProviderPanel {
             .parse::<usize>()
             .ok()
             .filter(|w| *w > 0)
-            .unwrap_or_else(|| {
-                atomcode_config::config::provider::default_context_window_for(wire)
-            });
+            .unwrap_or_else(|| atomcode_config::config::provider::default_context_window_for(wire));
         let mut desired = ctx.config.clone();
         let selection_id = if let Some(id) = &form.edit_id {
             // Edit in place — new-schema model or legacy provider.
@@ -533,9 +561,18 @@ impl ProviderPanel {
             model_id
         };
         if form.make_default {
-            desired.default_model = Some(selection_id);
+            desired.default_model = Some(selection_id.clone());
         }
-        save_and_reload(ctx, desired, renderer, "已保存模型".to_string(), true)
+        save_and_reload(
+            ctx,
+            desired,
+            renderer,
+            crate::i18n::t(crate::i18n::Msg::ProviderPanelModelSaved {
+                model: &selection_id,
+            })
+            .into_owned(),
+            true,
+        )
     }
 
     /// Delete the account (and its models) or a single model, then save.
@@ -564,14 +601,17 @@ impl ProviderPanel {
         {
             desired.default_model = None;
         }
-        if desired.resolve_model(Some(&desired.default_provider)).is_err() {
+        if desired
+            .resolve_model(Some(&desired.default_provider))
+            .is_err()
+        {
             desired.default_provider.clear();
         }
         save_and_reload(
             ctx,
             desired,
             renderer,
-            format!("已删除 {id}"),
+            crate::i18n::t(crate::i18n::Msg::ProviderDeleted { name: id }).into_owned(),
             true,
         )
     }
@@ -587,22 +627,6 @@ impl Modal for ProviderPanel {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
-        // ── Delete confirm ──
-        if let Mode::DeleteConfirm { id, is_account } = &self.mode {
-            let (id, is_account) = (id.clone(), *is_account);
-            match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if self.commit_delete(&id, is_account, ctx, renderer) {
-                        return Ok(ModalAction::Close);
-                    }
-                    self.mode = Mode::List;
-                }
-                _ => self.mode = Mode::List,
-            }
-            self.draw(buf, state, ctx, renderer);
-            return Ok(ModalAction::Continue);
-        }
-
         // ── Add form ──
         if let Mode::Add(form) = &mut self.mode {
             match code {
@@ -747,14 +771,19 @@ impl Modal for ProviderPanel {
                 };
                 self.switch_tab(next);
             }
-            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                self.pending_delete = None;
+            }
             KeyCode::Down => {
                 if self.selected + 1 < len {
                     self.selected += 1;
                 }
+                self.pending_delete = None;
             }
             // Ctrl+A: add. Letter keys are reserved for the search filter.
             KeyCode::Char('a') if ctrl => {
+                self.pending_delete = None;
                 match self.tab {
                     // New account (+ its first model).
                     Tab::Accounts => self.mode = Mode::Add(AddForm::new(0)),
@@ -770,6 +799,7 @@ impl Modal for ProviderPanel {
             }
             // Ctrl+E: edit the selected row.
             KeyCode::Char('e') if ctrl => {
+                self.pending_delete = None;
                 if let Some(id) = self.selected_id(&ctx.config) {
                     self.mode = match self.tab {
                         Tab::Accounts => Mode::EditAccount(Self::open_edit(&ctx.config, &id)),
@@ -780,25 +810,33 @@ impl Modal for ProviderPanel {
                     };
                 }
             }
-            // Ctrl+D: delete the selected row.
+            // Ctrl+D twice: the first press arms the selected logical row; the
+            // second deletes it without leaving the list for a confirmation UI.
             KeyCode::Char('d') if ctrl => {
                 if let Some(id) = self.selected_id(&ctx.config) {
-                    self.mode = Mode::DeleteConfirm {
-                        id,
-                        is_account: self.tab == Tab::Accounts,
-                    };
+                    let is_account = self.tab == Tab::Accounts;
+                    if self.confirm_double_delete(&id, is_account)
+                        && self.commit_delete(&id, is_account, ctx, renderer)
+                    {
+                        return Ok(ModalAction::Close);
+                    }
+                } else {
+                    self.pending_delete = None;
                 }
             }
             // Type to filter.
             KeyCode::Char(c) if !ctrl => {
                 self.query.push(c);
                 self.selected = 0;
+                self.pending_delete = None;
             }
             KeyCode::Backspace => {
                 self.query.pop();
                 self.selected = 0;
+                self.pending_delete = None;
             }
             KeyCode::Enter => {
+                self.pending_delete = None;
                 if let Some(id) = self.selected_id(&ctx.config) {
                     match self.tab {
                         // Set default + switch session.
@@ -819,7 +857,7 @@ impl Modal for ProviderPanel {
                     }
                 }
             }
-            _ => {}
+            _ => self.pending_delete = None,
         }
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
@@ -827,15 +865,21 @@ impl Modal for ProviderPanel {
 
     fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let mut items: Vec<(String, String)> = Vec::new();
-        let t0 = tab_chip("账号", self.tab == Tab::Accounts);
-        let t1 = tab_chip("模型", self.tab == Tab::Models);
+        let t0 = tab_chip(
+            &crate::i18n::t(crate::i18n::Msg::ProviderPanelTabAccounts),
+            self.tab == Tab::Accounts,
+        );
+        let t1 = tab_chip(
+            &crate::i18n::t(crate::i18n::Msg::ProviderPanelTabModels),
+            self.tab == Tab::Models,
+        );
         items.push((format!("{t0}   {t1}"), String::new()));
         items.push((String::new(), String::new()));
 
         let mut selected = items.len(); // nothing highlighted by default
         let hint: String; // assigned once per match arm below
-        // Forms use the box-less `PluginInfo` layout; the list uses the `Plugin`
-        // layout whose reserved index-2 slot is rendered as the search box.
+                          // Forms use the box-less `PluginInfo` layout; the list uses the `Plugin`
+                          // layout whose reserved index-2 slot is rendered as the search box.
         let mut kind = MenuKind::PluginInfo;
         let mut buf = String::new();
 
@@ -858,11 +902,11 @@ impl Modal for ProviderPanel {
                         let ids = self.filtered_ids(&ctx.config);
                         if ids.is_empty() {
                             let msg = if self.query.trim().is_empty() {
-                                "(尚无 Provider — 按 Ctrl+A 添加第一个)"
+                                crate::i18n::t(crate::i18n::Msg::ProviderPanelEmptyAccounts)
                             } else {
-                                "(无匹配的 Provider)"
+                                crate::i18n::t(crate::i18n::Msg::ProviderPanelNoMatchingAccounts)
                             };
-                            items.push((msg.into(), String::new()));
+                            items.push((msg.into_owned(), String::new()));
                         }
                         for id in &ids {
                             let a = accounts.get(id);
@@ -871,33 +915,47 @@ impl Modal for ProviderPanel {
                                 && ctx.config.providers.contains_key(id);
                             let mut left = id.clone();
                             if is_legacy {
-                                left.push_str(" [旧]");
+                                left.push_str(&format!(
+                                    " [{}]",
+                                    crate::i18n::t(crate::i18n::Msg::ProviderPanelLegacyBadge)
+                                ));
                             }
                             let vendor = a.map(|a| a.provider.clone()).unwrap_or_default();
                             let mark = if default_account.as_deref() == Some(id) {
-                                "  [默认]"
+                                format!(
+                                    "  [{}]",
+                                    crate::i18n::t(crate::i18n::Msg::ProviderPanelDefaultBadge)
+                                )
                             } else {
-                                ""
+                                String::new()
                             };
-                            items.push((left, format!("{vendor} · {count} 模型{mark}")));
+                            let model_count =
+                                crate::i18n::t(crate::i18n::Msg::ProviderPanelModelCount { count });
+                            items.push((left, format!("{vendor} · {model_count}{mark}")));
                         }
-                        hint =
-                            "输入筛选  ↑↓ 选择  ↵ 展开模型  Ctrl+A 添加  Ctrl+E 编辑  Ctrl+D 删除  ←→/Tab 切换  Esc 关闭"
-                                .into();
+                        hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelAccountsHint)
+                            .into_owned();
                     }
                     Tab::Models => {
                         let ids = self.filtered_ids(&ctx.config);
                         if ids.is_empty() {
                             let msg = if self.query.trim().is_empty() {
-                                "(尚无模型 — 在账号页按 Ctrl+A 添加)"
+                                crate::i18n::t(crate::i18n::Msg::ProviderPanelEmptyModels)
                             } else {
-                                "(无匹配的模型)"
+                                crate::i18n::t(crate::i18n::Msg::ProviderPanelNoMatchingModels)
                             };
-                            items.push((msg.into(), String::new()));
+                            items.push((msg.into_owned(), String::new()));
                         }
                         for id in &ids {
                             let m = models.get(id);
-                            let mark = if *id == cur { "  ● [默认]" } else { "" };
+                            let mark = if *id == cur {
+                                format!(
+                                    "  ● [{}]",
+                                    crate::i18n::t(crate::i18n::Msg::ProviderPanelDefaultBadge)
+                                )
+                            } else {
+                                String::new()
+                            };
                             let desc = m
                                 .map(|m| {
                                     let name = m.display_name.as_deref().unwrap_or(&m.model);
@@ -907,12 +965,12 @@ impl Modal for ProviderPanel {
                             items.push((id.clone(), desc));
                         }
                         hint = if let Some(acct) = &self.account_filter {
-                            format!(
-                                "〔仅账号 {acct}〕↑↓ 选择  ↵ 设为默认  Ctrl+E 编辑  Ctrl+D 删除  ←→/Tab 返回全部  Esc 关闭"
-                            )
+                            crate::i18n::t(crate::i18n::Msg::ProviderPanelFilteredModelsHint {
+                                account: acct,
+                            })
+                            .into_owned()
                         } else {
-                            "输入筛选  ↑↓ 选择  ↵ 设为默认  Ctrl+A 添加  Ctrl+E 编辑  Ctrl+D 删除  ←→/Tab 切换  Esc 关闭"
-                                .into()
+                            crate::i18n::t(crate::i18n::Msg::ProviderPanelModelsHint).into_owned()
                         };
                     }
                 }
@@ -929,16 +987,23 @@ impl Modal for ProviderPanel {
                     let marker = if focused { "▸ " } else { "  " };
                     (format!("{marker}{label}: {value}"), String::new())
                 };
-                items.push(("【添加 Provider】".into(), String::new()));
+                items.push((
+                    crate::i18n::t(crate::i18n::Msg::ProviderPanelAddTitle).into_owned(),
+                    String::new(),
+                ));
                 items.push((String::new(), String::new()));
                 items.push(field_row(
-                    "厂商",
-                    format!("‹ {} ›   (←→ 切换)", p.display_name),
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldVendor),
+                    format!(
+                        "‹ {} ›   ({})",
+                        p.display_name,
+                        crate::i18n::t(crate::i18n::Msg::ProviderPanelSwitchHint)
+                    ),
                     form.focus == FormField::Preset,
                 ));
                 if p.default_base_url.is_none() {
                     items.push(field_row(
-                        "base_url",
+                        &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldBaseUrl),
                         form.base_url.clone(),
                         form.focus == FormField::BaseUrl,
                     ));
@@ -947,51 +1012,72 @@ impl Modal for ProviderPanel {
                     let masked = "•".repeat(form.api_key.chars().count());
                     let env_hint = p
                         .api_key_env
-                        .map(|e| format!("   (留空用 ${e})"))
+                        .map(|e| {
+                            format!(
+                                "   ({})",
+                                crate::i18n::t(crate::i18n::Msg::ProviderPanelEnvHint { env: e })
+                            )
+                        })
                         .unwrap_or_default();
                     items.push(field_row(
-                        "api_key",
+                        &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldApiKey),
                         format!("{masked}{env_hint}"),
                         form.focus == FormField::ApiKey,
                     ));
                 }
                 items.push(field_row(
-                    "模型",
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldModel),
                     form.model.clone(),
                     form.focus == FormField::Model,
                 ));
                 let win = if form.window.is_empty() {
-                    "(默认)".to_string()
+                    format!(
+                        "({})",
+                        crate::i18n::t(crate::i18n::Msg::ProviderPanelDefaultValue)
+                    )
                 } else {
                     form.window.clone()
                 };
-                items.push(field_row("窗口", win, form.focus == FormField::Window));
                 items.push(field_row(
-                    "设为默认",
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldWindow),
+                    win,
+                    form.focus == FormField::Window,
+                ));
+                items.push(field_row(
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldMakeDefault),
                     if form.make_default { "[✓]" } else { "[ ]" }.to_string(),
                     form.focus == FormField::MakeDefault,
                 ));
-                hint = "Tab 下一项  ←→ 切厂商  空格 勾选  ↵ 保存  Esc 返回".into();
+                hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelProviderFormHint).into_owned();
             }
             Mode::EditAccount(form) => {
                 let field_row = |label: &str, value: String, focused: bool| {
                     let marker = if focused { "▸ " } else { "  " };
                     (format!("{marker}{label}: {value}"), String::new())
                 };
-                items.push((format!("【编辑账号 {}】", form.id), String::new()));
+                items.push((
+                    crate::i18n::t(crate::i18n::Msg::ProviderPanelEditAccountTitle {
+                        account: &form.id,
+                    })
+                    .into_owned(),
+                    String::new(),
+                ));
                 items.push((String::new(), String::new()));
                 let masked = "•".repeat(form.api_key.chars().count());
                 items.push(field_row(
-                    "api_key",
-                    format!("{masked}   (留空保留原值)"),
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldApiKey),
+                    format!(
+                        "{masked}   ({})",
+                        crate::i18n::t(crate::i18n::Msg::ProviderPanelKeepOriginal)
+                    ),
                     form.focus == FormField::ApiKey,
                 ));
                 items.push(field_row(
-                    "base_url",
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldBaseUrl),
                     form.base_url.clone(),
                     form.focus == FormField::BaseUrl,
                 ));
-                hint = "Tab 切换  ↵ 保存  Esc 返回".into();
+                hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelAccountFormHint).into_owned();
             }
             Mode::Model(form) => {
                 let field_row = |label: &str, value: String, focused: bool| {
@@ -999,45 +1085,57 @@ impl Modal for ProviderPanel {
                     (format!("{marker}{label}: {value}"), String::new())
                 };
                 let title = if form.edit_id.is_some() {
-                    "【编辑模型】"
+                    crate::i18n::t(crate::i18n::Msg::ProviderPanelEditModelTitle)
                 } else {
-                    "【添加模型】"
+                    crate::i18n::t(crate::i18n::Msg::ProviderPanelAddModelTitle)
                 };
-                items.push((title.into(), String::new()));
+                items.push((title.into_owned(), String::new()));
                 items.push((String::new(), String::new()));
                 if form.edit_id.is_some() {
                     // Account locked on edit — show it, not editable.
-                    items.push(("  账号: ".to_string() + form.account_id(), String::new()));
+                    items.push((
+                        format!(
+                            "  {}: {}",
+                            crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldAccount),
+                            form.account_id()
+                        ),
+                        String::new(),
+                    ));
                 } else {
                     items.push(field_row(
-                        "账号",
-                        format!("‹ {} ›   (←→ 切换)", form.account_id()),
+                        &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldAccount),
+                        format!(
+                            "‹ {} ›   ({})",
+                            form.account_id(),
+                            crate::i18n::t(crate::i18n::Msg::ProviderPanelSwitchHint)
+                        ),
                         form.focus == ModelField::Account,
                     ));
                 }
                 items.push(field_row(
-                    "模型",
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldModel),
                     form.model.clone(),
                     form.focus == ModelField::Model,
                 ));
                 let win = if form.window.is_empty() {
-                    "(默认)".to_string()
+                    format!(
+                        "({})",
+                        crate::i18n::t(crate::i18n::Msg::ProviderPanelDefaultValue)
+                    )
                 } else {
                     form.window.clone()
                 };
-                items.push(field_row("窗口", win, form.focus == ModelField::Window));
                 items.push(field_row(
-                    "设为默认",
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldWindow),
+                    win,
+                    form.focus == ModelField::Window,
+                ));
+                items.push(field_row(
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldMakeDefault),
                     if form.make_default { "[✓]" } else { "[ ]" }.to_string(),
                     form.focus == ModelField::MakeDefault,
                 ));
-                hint = "Tab 下一项  ←→ 切账号  空格 勾选  ↵ 保存  Esc 返回".into();
-            }
-            Mode::DeleteConfirm { id, is_account } => {
-                items.push((String::new(), String::new()));
-                let what = if *is_account { "账号(及其模型)" } else { "模型" };
-                items.push((format!("确认删除{what} `{id}`？", ), String::new()));
-                hint = "y 确认  n/Esc 取消".into();
+                hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelModelFormHint).into_owned();
             }
         }
 
@@ -1079,6 +1177,7 @@ impl Modal for ProviderPanel {
             Mode::List => {
                 self.query.push_str(clean);
                 self.selected = 0;
+                self.pending_delete = None;
             }
             _ => {}
         }
@@ -1092,7 +1191,10 @@ mod tests {
     use super::*;
 
     fn preset_idx(id: &str) -> usize {
-        provider_preset::PRESETS.iter().position(|p| p.id == id).unwrap()
+        provider_preset::PRESETS
+            .iter()
+            .position(|p| p.id == id)
+            .unwrap()
     }
 
     #[test]
@@ -1245,5 +1347,22 @@ mod tests {
         // Account name matches both models.
         p.query = "acc".into();
         assert_eq!(p.filtered_ids(&cfg).len(), 2);
+    }
+
+    #[test]
+    fn delete_requires_two_presses_on_the_same_logical_row() {
+        let mut panel = ProviderPanel::open();
+
+        assert!(!panel.confirm_double_delete("account-a", true));
+        assert_eq!(panel.pending_delete, Some(("account-a".to_string(), true)));
+        assert!(panel.confirm_double_delete("account-a", true));
+        assert!(panel.pending_delete.is_none());
+
+        assert!(!panel.confirm_double_delete("account-a", true));
+        assert!(!panel.confirm_double_delete("account-b", true));
+        assert_eq!(panel.pending_delete, Some(("account-b".to_string(), true)));
+
+        // An account and model with the same id are still distinct targets.
+        assert!(!panel.confirm_double_delete("account-b", false));
     }
 }

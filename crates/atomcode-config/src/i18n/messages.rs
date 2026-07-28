@@ -359,7 +359,48 @@ pub enum Msg<'a> {
         current: usize,
         total: usize,
     },
-
+    // ── Provider panel ──
+    ProviderPanelTabAccounts,
+    ProviderPanelTabModels,
+    ProviderPanelEmptyAccounts,
+    ProviderPanelNoMatchingAccounts,
+    ProviderPanelEmptyModels,
+    ProviderPanelNoMatchingModels,
+    ProviderPanelLegacyBadge,
+    ProviderPanelDefaultBadge,
+    ProviderPanelModelCount {
+        count: usize,
+    },
+    ProviderPanelAccountsHint,
+    ProviderPanelModelsHint,
+    ProviderPanelFilteredModelsHint {
+        account: &'a str,
+    },
+    ProviderPanelModelSaved {
+        model: &'a str,
+    },
+    ProviderPanelAddTitle,
+    ProviderPanelEditAccountTitle {
+        account: &'a str,
+    },
+    ProviderPanelAddModelTitle,
+    ProviderPanelEditModelTitle,
+    ProviderPanelFieldVendor,
+    ProviderPanelFieldAccount,
+    ProviderPanelFieldBaseUrl,
+    ProviderPanelFieldApiKey,
+    ProviderPanelFieldModel,
+    ProviderPanelFieldWindow,
+    ProviderPanelFieldMakeDefault,
+    ProviderPanelSwitchHint,
+    ProviderPanelEnvHint {
+        env: &'a str,
+    },
+    ProviderPanelDefaultValue,
+    ProviderPanelKeepOriginal,
+    ProviderPanelProviderFormHint,
+    ProviderPanelAccountFormHint,
+    ProviderPanelModelFormHint,
     // ── Model picker ──
     ModelSwitched {
         provider: &'a str,
@@ -582,10 +623,16 @@ pub enum Msg<'a> {
     CmdNoProviders,
     CmdSessionListLoading,
     CmdNoSessions,
-    CmdUnknownCommand { name: &'a str },
+    CmdUnknownCommand {
+        name: &'a str,
+    },
     /// /cmd with args: required but no arguments supplied.
-    CmdCustomArgRequired { name: &'a str },
-    CmdLoginFailed { error: &'a str },
+    CmdCustomArgRequired {
+        name: &'a str,
+    },
+    CmdLoginFailed {
+        error: &'a str,
+    },
     CmdLogoutDone,
     CmdLogoutFailed {
         error: &'a str,

@@ -599,6 +599,64 @@ mod tests {
     }
 
     #[test]
+    fn provider_panel_copy_is_localized_in_both_languages() {
+        let en_tabs = (
+            t_with(Locale::En, Msg::ProviderPanelTabAccounts),
+            t_with(Locale::En, Msg::ProviderPanelTabModels),
+        );
+        let zh_tabs = (
+            t_with(Locale::ZhCn, Msg::ProviderPanelTabAccounts),
+            t_with(Locale::ZhCn, Msg::ProviderPanelTabModels),
+        );
+        assert_eq!(en_tabs.0, "Accounts");
+        assert_eq!(en_tabs.1, "Models");
+        assert_eq!(zh_tabs.0, "账号");
+        assert_eq!(zh_tabs.1, "模型");
+
+        let en_hint = t_with(Locale::En, Msg::ProviderPanelAccountsHint);
+        let zh_hint = t_with(Locale::ZhCn, Msg::ProviderPanelAccountsHint);
+        assert!(en_hint.contains("add") && en_hint.contains("delete"));
+        assert!(zh_hint.contains("添加") && zh_hint.contains("删除"));
+        assert!(en_hint.contains("Ctrl+Dx2"));
+        assert!(zh_hint.contains("Ctrl+Dx2"));
+        assert!(en_hint.contains("Ctrl+A") && en_hint.contains("Ctrl+E"));
+        assert!(zh_hint.contains("Ctrl+A") && zh_hint.contains("Ctrl+E"));
+
+        assert_eq!(
+            t_with(Locale::En, Msg::ProviderPanelEmptyModels),
+            "(No models yet — press Ctrl+A to add one)"
+        );
+        assert_eq!(
+            t_with(Locale::ZhCn, Msg::ProviderPanelEmptyModels),
+            "（尚无模型 — 按 Ctrl+A 添加）"
+        );
+
+        assert_eq!(
+            t_with(
+                Locale::En,
+                Msg::ProviderPanelModelSaved {
+                    model: "deepseek-chat"
+                }
+            ),
+            "Saved model \"deepseek-chat\"."
+        );
+        assert_eq!(
+            t_with(
+                Locale::ZhCn,
+                Msg::ProviderPanelModelSaved {
+                    model: "deepseek-chat"
+                }
+            ),
+            "已保存模型“deepseek-chat”。"
+        );
+
+        let en_row = t_with(Locale::En, Msg::ProviderPanelModelCount { count: 3 });
+        let zh_row = t_with(Locale::ZhCn, Msg::ProviderPanelModelCount { count: 3 });
+        assert_eq!(en_row, "3 models");
+        assert_eq!(zh_row, "3 个模型");
+    }
+
+    #[test]
     fn usage_modal_i18n_present_both_langs() {
         macro_rules! check {
             ($variant:expr) => {{
