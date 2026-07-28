@@ -278,8 +278,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDeleteKept => "(kept)".into(),
         Msg::ProviderDefaultSet { name } =>
             format!("Default set to {name}.").into(),
-        Msg::ProviderAdded { name, model } =>
-            format!("Added provider \"{name}\" and switched to {name} · {model}.").into(),
+        Msg::ProviderAdded { name } =>
+            format!("Added account \"{name}\". Add models to it on the Models tab (Ctrl+A).").into(),
         Msg::ProviderUpdated { name } =>
             format!("Updated \"{name}\".").into(),
         Msg::ProviderStepName => "Provider name?".into(),

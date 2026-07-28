@@ -40,35 +40,36 @@ fn unique_account_id(base: &str, ctx: &LoopCtx) -> String {
 /// Which add-form field has focus.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FormField {
+    Name,
     Preset,
     BaseUrl,
     ApiKey,
-    Model,
-    Window,
-    MakeDefault,
 }
 
+/// Add a provider ACCOUNT (name + protocol + endpoint + credential). Models are
+/// added separately on the 模型 tab, so this form has no model field.
 #[derive(Clone)]
 struct AddForm {
+    name: String,
     preset_idx: usize,
     base_url: String,
     api_key: String,
-    model: String,
-    window: String,
-    make_default: bool,
     focus: FormField,
 }
 
 impl AddForm {
     fn new(preset_idx: usize) -> Self {
         Self {
+            name: String::new(),
             preset_idx,
-            base_url: String::new(),
+            // Pre-fill with the preset's default endpoint (editable — override
+            // for a custom deployment).
+            base_url: provider_preset::PRESETS[preset_idx]
+                .default_base_url
+                .map(str::to_string)
+                .unwrap_or_default(),
             api_key: String::new(),
-            model: String::new(),
-            window: String::new(),
-            make_default: true,
-            focus: FormField::Preset,
+            focus: FormField::Name,
         }
     }
 
@@ -76,20 +77,13 @@ impl AddForm {
         &provider_preset::PRESETS[self.preset_idx]
     }
 
-    /// The visible field sequence for the current preset (base_url only for
-    /// endpoint-less custom presets; api key only for keyed presets).
+    /// Field sequence: custom name, vendor preset, base_url (always editable),
+    /// api key (only for keyed presets).
     fn fields(&self) -> Vec<FormField> {
-        let p = self.preset();
-        let mut v = vec![FormField::Preset];
-        if p.default_base_url.is_none() {
-            v.push(FormField::BaseUrl);
-        }
-        if !matches!(p.auth_kind, provider_preset::AuthKind::None) {
+        let mut v = vec![FormField::Name, FormField::Preset, FormField::BaseUrl];
+        if !matches!(self.preset().auth_kind, provider_preset::AuthKind::None) {
             v.push(FormField::ApiKey);
         }
-        v.push(FormField::Model);
-        v.push(FormField::Window);
-        v.push(FormField::MakeDefault);
         v
     }
 
@@ -111,11 +105,31 @@ impl AddForm {
         } else {
             (self.preset_idx + n - 1) % n
         };
-        // Keep focus valid if the field set changed.
+        // Re-prefill the endpoint with the newly-selected preset's default.
+        self.base_url = self
+            .preset()
+            .default_base_url
+            .map(str::to_string)
+            .unwrap_or_default();
         if !self.fields().contains(&self.focus) {
-            self.focus = FormField::Preset;
+            self.focus = FormField::Name;
         }
     }
+}
+
+/// Sanitize a user-typed account name into a TOML-key-safe id: keep
+/// alphanumerics / `-` / `_` / `.`, collapse everything else to `-`, trim stray
+/// dashes. Empty result ⇒ caller falls back to the preset id.
+fn sanitize_account_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 /// Edit an existing account's connection/credential. `api_key` blank keeps the
@@ -359,36 +373,35 @@ impl ProviderPanel {
         self.filtered_ids(config).get(self.selected).cloned()
     }
 
-    /// Persist the add form as one account + one model, optionally default.
-    /// Returns true when saved (caller closes), false to stay on the form.
+    /// Persist the add form as one provider ACCOUNT (no model — models are added
+    /// on the 模型 tab). Returns true when saved (caller closes), false to stay.
     fn save_add(&self, form: &AddForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
         let preset = form.preset();
-        let model_name = form.model.trim();
-        if model_name.is_empty() {
-            return false;
-        }
-        let account_id = unique_account_id(preset.id, ctx);
-        let model_id = format!("{account_id}/{model_name}");
-        let base_url = if preset.default_base_url.is_none() {
+        // Custom name → sanitized unique id; blank → derive from the preset.
+        let base_id = {
+            let sanitized = sanitize_account_name(form.name.trim());
+            if sanitized.is_empty() {
+                preset.id.to_string()
+            } else {
+                sanitized
+            }
+        };
+        let account_id = unique_account_id(&base_id, ctx);
+        // base_url is pre-filled with the preset default and editable. Persist
+        // only a genuine override; blank + no preset default = missing endpoint.
+        let base_url = {
             let b = form.base_url.trim();
             if b.is_empty() {
-                return false; // custom endpoint requires a URL
+                if preset.default_base_url.is_none() {
+                    return false; // custom endpoint requires a URL
+                }
+                None
+            } else if Some(b) == preset.default_base_url {
+                None // equals the preset default — keep config clean
+            } else {
+                Some(b.to_string())
             }
-            Some(b.to_string())
-        } else {
-            None
         };
-        let context_window = form
-            .window
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|w| *w > 0)
-            .unwrap_or_else(|| {
-                atomcode_config::config::provider::default_context_window_for(
-                    preset.provider_type.wire(),
-                )
-            });
         let account = ProviderAccountConfig {
             provider: preset.id.to_string(),
             display_name: None,
@@ -402,37 +415,15 @@ impl ProviderPanel {
             enterprise_url: None,
             ephemeral: false,
         };
-        let model = ModelProfileConfig {
-            account: account_id.clone(),
-            model: model_name.to_string(),
-            display_name: None,
-            system_prompt: None,
-            context_window,
-            max_tokens: None,
-            capable_model: None,
-            thinking_type: None,
-            thinking_keep: None,
-            reasoning_history: None,
-            reasoning_effort: None,
-            thinking_enabled: None,
-            thinking_budget: None,
-            pricing: None,
-        };
         let mut desired = ctx.config.clone();
-        desired.provider_accounts.insert(account_id, account);
-        desired.models.insert(model_id.clone(), model);
-        if form.make_default {
-            desired.default_model = Some(model_id);
-        }
+        desired
+            .provider_accounts
+            .insert(account_id.clone(), account);
         save_and_reload(
             ctx,
             desired,
             renderer,
-            crate::i18n::t(crate::i18n::Msg::ProviderAdded {
-                name: preset.display_name,
-                model: model_name,
-            })
-            .into_owned(),
+            crate::i18n::t(crate::i18n::Msg::ProviderAdded { name: &account_id }).into_owned(),
             true,
         )
     }
@@ -637,28 +628,21 @@ impl Modal for ProviderPanel {
                 KeyCode::BackTab | KeyCode::Up => form.advance_focus(false),
                 KeyCode::Left if form.focus == FormField::Preset => form.cycle_preset(false),
                 KeyCode::Right if form.focus == FormField::Preset => form.cycle_preset(true),
-                KeyCode::Char(' ') if form.focus == FormField::MakeDefault => {
-                    form.make_default = !form.make_default;
-                }
                 KeyCode::Char(c) => match form.focus {
+                    FormField::Name => form.name.push(c),
                     FormField::BaseUrl => form.base_url.push(c),
                     FormField::ApiKey => form.api_key.push(c),
-                    FormField::Model => form.model.push(c),
-                    FormField::Window if c.is_ascii_digit() => form.window.push(c),
                     _ => {}
                 },
                 KeyCode::Backspace => match form.focus {
+                    FormField::Name => {
+                        form.name.pop();
+                    }
                     FormField::BaseUrl => {
                         form.base_url.pop();
                     }
                     FormField::ApiKey => {
                         form.api_key.pop();
-                    }
-                    FormField::Model => {
-                        form.model.pop();
-                    }
-                    FormField::Window => {
-                        form.window.pop();
                     }
                     _ => {}
                 },
@@ -667,7 +651,7 @@ impl Modal for ProviderPanel {
                     if self.save_add(&form, ctx, renderer) {
                         return Ok(ModalAction::Close);
                     }
-                    // Save refused (empty model / missing URL): keep editing.
+                    // Save refused (missing endpoint): keep editing.
                     self.mode = Mode::Add(form);
                 }
                 _ => {}
@@ -992,6 +976,12 @@ impl Modal for ProviderPanel {
                     String::new(),
                 ));
                 items.push((String::new(), String::new()));
+                let name = if form.name.is_empty() {
+                    format!("({})", p.id) // placeholder: derived from the preset
+                } else {
+                    form.name.clone()
+                };
+                items.push(field_row("名称", name, form.focus == FormField::Name));
                 items.push(field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldVendor),
                     format!(
@@ -1001,13 +991,12 @@ impl Modal for ProviderPanel {
                     ),
                     form.focus == FormField::Preset,
                 ));
-                if p.default_base_url.is_none() {
-                    items.push(field_row(
-                        &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldBaseUrl),
-                        form.base_url.clone(),
-                        form.focus == FormField::BaseUrl,
-                    ));
-                }
+                // Always editable (pre-filled with the preset default).
+                items.push(field_row(
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldBaseUrl),
+                    form.base_url.clone(),
+                    form.focus == FormField::BaseUrl,
+                ));
                 if !matches!(p.auth_kind, provider_preset::AuthKind::None) {
                     let masked = "•".repeat(form.api_key.chars().count());
                     let env_hint = p
@@ -1025,30 +1014,8 @@ impl Modal for ProviderPanel {
                         form.focus == FormField::ApiKey,
                     ));
                 }
-                items.push(field_row(
-                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldModel),
-                    form.model.clone(),
-                    form.focus == FormField::Model,
-                ));
-                let win = if form.window.is_empty() {
-                    format!(
-                        "({})",
-                        crate::i18n::t(crate::i18n::Msg::ProviderPanelDefaultValue)
-                    )
-                } else {
-                    form.window.clone()
-                };
-                items.push(field_row(
-                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldWindow),
-                    win,
-                    form.focus == FormField::Window,
-                ));
-                items.push(field_row(
-                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldMakeDefault),
-                    if form.make_default { "[✓]" } else { "[ ]" }.to_string(),
-                    form.focus == FormField::MakeDefault,
-                ));
-                hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelProviderFormHint).into_owned();
+                // Account-only form — model/window/default moved to the 模型 tab.
+                hint = "Tab 下一项  ←→ 切厂商  ↵ 保存  Esc 返回  （模型到模型页加）".into();
             }
             Mode::EditAccount(form) => {
                 let field_row = |label: &str, value: String, focused: bool| {
@@ -1170,7 +1137,7 @@ impl Modal for ProviderPanel {
             Mode::Add(form) => match form.focus {
                 FormField::ApiKey => form.api_key.push_str(clean),
                 FormField::BaseUrl => form.base_url.push_str(clean),
-                FormField::Model => form.model.push_str(clean),
+                FormField::Name => form.name.push_str(clean),
                 _ => {}
             },
             // Paste into the search filter.
@@ -1198,26 +1165,35 @@ mod tests {
     }
 
     #[test]
-    fn add_form_fields_depend_on_preset() {
-        // DeepSeek: keyed with a built-in endpoint → no base_url, has api_key.
+    fn add_form_is_account_only_with_name_and_editable_base_url() {
+        // Account-only form: name, vendor preset, base_url (always), api key when keyed.
         assert_eq!(
             AddForm::new(preset_idx("deepseek")).fields(),
             vec![
+                FormField::Name,
                 FormField::Preset,
+                FormField::BaseUrl,
                 FormField::ApiKey,
-                FormField::Model,
-                FormField::Window,
-                FormField::MakeDefault
             ]
         );
+        // base_url is pre-filled with the preset's default endpoint (editable).
+        assert!(!AddForm::new(preset_idx("deepseek")).base_url.is_empty());
         // Ollama: keyless → no api_key field.
         assert!(!AddForm::new(preset_idx("ollama"))
             .fields()
             .contains(&FormField::ApiKey));
-        // openai-compatible: no default endpoint → base_url required.
-        assert!(AddForm::new(preset_idx("openai-compatible"))
-            .fields()
-            .contains(&FormField::BaseUrl));
+        // openai-compatible: no default endpoint → base_url blank, still shown.
+        let compat = AddForm::new(preset_idx("openai-compatible"));
+        assert!(compat.base_url.is_empty());
+        assert!(compat.fields().contains(&FormField::BaseUrl));
+    }
+
+    #[test]
+    fn sanitize_account_name_makes_toml_safe_ids() {
+        assert_eq!(sanitize_account_name("Xiaomi MiMo"), "Xiaomi-MiMo");
+        assert_eq!(sanitize_account_name("my/vendor@v1"), "my-vendor-v1");
+        assert_eq!(sanitize_account_name("  --keep_me.1--  "), "keep_me.1");
+        assert_eq!(sanitize_account_name("！！！"), "");
     }
 
     #[test]

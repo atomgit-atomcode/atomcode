@@ -306,7 +306,6 @@ pub enum Msg<'a> {
     },
     ProviderAdded {
         name: &'a str,
-        model: &'a str,
     },
     ProviderUpdated {
         name: &'a str,
