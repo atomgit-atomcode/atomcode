@@ -1088,6 +1088,24 @@ fn hold_submit_until_ready(
                     ))))
 }
 
+/// Provider-unavailable events can arrive during startup before a queued
+/// provider recovery completes. Do not write `NotConfigured` into permanent
+/// scrollback: the footer already owns that persistent state, and a stale
+/// startup line becomes contradictory once the runtime is ready.
+fn provider_unavailable_announcement(
+    reason: atomcode_coding::ProviderUnavailableReason,
+) -> Option<crate::i18n::Msg<'static>> {
+    match reason {
+        atomcode_coding::ProviderUnavailableReason::NotConfigured => None,
+        atomcode_coding::ProviderUnavailableReason::AuthenticationRequired => {
+            Some(crate::i18n::Msg::CmdWhoamiNotSignedIn)
+        }
+        atomcode_coding::ProviderUnavailableReason::UnsupportedBuild => {
+            Some(crate::i18n::Msg::CmdProviderUnsupportedBuild)
+        }
+    }
+}
+
 /// Guard for the type-ahead drain: a queued message must only be replayed when
 /// the local foreground runtime is actually `Available`. Without this, a
 /// foreground event arriving while the runtime is still `AwaitingProvider` /
@@ -1699,6 +1717,24 @@ mod submit_hold_tests {
             RuntimeUiAvailability::Stopped,
             None,
         ));
+    }
+
+    #[test]
+    fn startup_not_configured_event_does_not_pollute_scrollback() {
+        assert_eq!(
+            provider_unavailable_announcement(
+                atomcode_coding::ProviderUnavailableReason::NotConfigured
+            ),
+            None
+        );
+        assert!(provider_unavailable_announcement(
+            atomcode_coding::ProviderUnavailableReason::AuthenticationRequired
+        )
+        .is_some());
+        assert!(provider_unavailable_announcement(
+            atomcode_coding::ProviderUnavailableReason::UnsupportedBuild
+        )
+        .is_some());
     }
 
     #[test]
@@ -17545,19 +17581,12 @@ fn handle_coding_runtime_event(
             }
         }
         CodingRuntimeEvent::ProviderUnavailable { reason, .. } => {
-            let message = match reason {
-                atomcode_coding::ProviderUnavailableReason::NotConfigured => {
-                    crate::i18n::t(crate::i18n::Msg::CmdNoActiveProvider)
-                }
-                atomcode_coding::ProviderUnavailableReason::AuthenticationRequired => {
-                    crate::i18n::t(crate::i18n::Msg::CmdWhoamiNotSignedIn)
-                }
-                atomcode_coding::ProviderUnavailableReason::UnsupportedBuild => {
-                    crate::i18n::t(crate::i18n::Msg::CmdProviderUnsupportedBuild)
-                }
-            };
-            renderer.render(UiLine::CommandOutput(message.into_owned()));
-            renderer.flush();
+            if let Some(message) = provider_unavailable_announcement(reason) {
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(message).into_owned(),
+                ));
+                renderer.flush();
+            }
         }
         _ => {}
     }
