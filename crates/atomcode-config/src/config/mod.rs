@@ -1458,35 +1458,29 @@ impl Config {
         Ok(content)
     }
 
-    pub fn active_provider(&self, override_name: Option<&str>) -> Result<&ProviderConfig> {
-        // Defence against an accidentally-empty `default_provider` (e.g.
-        // an older /logout path wrote "" back to config.toml) OR a
-        // `default_provider` that points to a provider section the user
-        // has since deleted from config.toml.  Rather than failing at
-        // startup, fall back to a lexicographically-first provider so
-        // the TUI still boots and the user can self-correct via /provider.
-        let name: &str = override_name
+    /// The active provider resolved to a legacy-shaped [`ProviderConfig`], via
+    /// the unified catalog so a new-schema / folded-CodingPlan selection resolves
+    /// (its id no longer lives in `config.providers`). Falls back to the first
+    /// catalog model when the selection is empty or dangling, so the TUI still
+    /// boots and the user can self-correct via `/provider`.
+    pub fn active_provider(&self, override_name: Option<&str>) -> Result<ProviderConfig> {
+        let selection = override_name
             .filter(|s| !s.is_empty())
-            .unwrap_or(&self.default_provider);
-        let fallback = || {
-            self.providers
-                .keys()
-                .min()
-                .map(String::as_str)
-                .ok_or_else(|| anyhow::anyhow!("No providers configured — run /login or /provider"))
+            .map(str::to_string)
+            .or_else(|| self.effective_model_selection());
+        let first_catalog = || {
+            let mut ids: Vec<String> = self.logical_models().into_keys().collect();
+            ids.sort();
+            ids.into_iter().next()
         };
-        let name: &str = if name.is_empty() { fallback()? } else { name };
-        match self.providers.get(name) {
-            Some(p) => Ok(p),
-            None => {
-                // default_provider / override pointed to a key that no
-                // longer exists — fall back to the first available.
-                let fallback_name = fallback()?;
-                // SAFETY: fallback() just returned Ok from self.providers,
-                // so the key must exist.
-                Ok(self.providers.get(fallback_name).unwrap())
-            }
-        }
+        let name = selection
+            .filter(|s| self.selection_exists(s))
+            .or_else(first_catalog)
+            .ok_or_else(|| {
+                anyhow::anyhow!("No providers configured — run /login or /provider")
+            })?;
+        self.provider_config_for_selection(&name)
+            .ok_or_else(|| anyhow::anyhow!("No providers configured — run /login or /provider"))
     }
 
     /// Resolve the atomcode config dir. Pure function for testability —
@@ -3002,6 +2996,26 @@ context_window = 131072
         assert!(cfg.provider_config_for_selection("nope").is_none());
         assert!(cfg.selection_exists("leg") && cfg.selection_exists("acc/ds"));
         assert!(!cfg.selection_exists("nope"));
+    }
+
+    #[test]
+    fn active_provider_resolves_new_schema_when_providers_empty() {
+        // A CodingPlan-style config: everything in the new schema, no legacy
+        // `[providers.*]`. active_provider must still resolve (regression: it
+        // used to read only config.providers → Err → footer "未配置").
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "AtomGit-deepseek-v4-flash",
+            "provider_accounts": { "AtomGit": { "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1" } },
+            "models": { "AtomGit-deepseek-v4-flash": { "account": "AtomGit", "model": "deepseek-v4-flash", "context_window": 128000 } }
+        }))
+        .unwrap();
+        assert!(cfg.providers.is_empty());
+        let p = cfg.active_provider(None).unwrap();
+        assert_eq!(p.model, "deepseek-v4-flash");
+        assert_eq!(p.base_url.as_deref(), Some("https://llm-api.atomgit.com/v1"));
+        // Falls back to a catalog model when the selection is dangling.
+        let p2 = cfg.active_provider(Some("nope")).unwrap();
+        assert_eq!(p2.model, "deepseek-v4-flash");
     }
 
     #[test]

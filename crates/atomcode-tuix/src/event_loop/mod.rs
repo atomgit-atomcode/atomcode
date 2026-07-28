@@ -8053,8 +8053,8 @@ fn provider_requires_atomgit_auth(config: &Config) -> bool {
     config
         .active_provider(None)
         .ok()
-        .and_then(|provider| provider.base_url.as_deref())
-        .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway)
+        .and_then(|provider| provider.base_url)
+        .is_some_and(|url| atomcode_auth::gateway_crypto::is_atomgit_gateway(&url))
 }
 
 fn should_reload_provider(

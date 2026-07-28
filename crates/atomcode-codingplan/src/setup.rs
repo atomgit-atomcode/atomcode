@@ -961,11 +961,13 @@ fn step_models_and_register(
         );
     }
 
-    let previous_default = config.default_provider.clone();
+    // Use the canonical active selection (default_model → default_provider) so a
+    // new-schema default is preserved and the report marks the right model.
+    let previous_default = config.effective_model_selection().unwrap_or_default();
     let previous_model = config
-        .providers
+        .logical_models()
         .get(&previous_default)
-        .map(|provider| provider.model.clone());
+        .map(|m| m.model.clone());
 
     // Wipe any stale AtomGit* entries so we don't accumulate old names.
     let stale: Vec<String> = config
@@ -1086,11 +1088,11 @@ pub fn merge_successful_config(
     let StepResult::Ok(models) = &report.models else {
         anyhow::bail!("CodingPlan model refresh did not complete");
     };
-    let previous_default = latest.default_provider.clone();
+    let previous_default = latest.effective_model_selection().unwrap_or_default();
     let previous_model = latest
-        .providers
+        .logical_models()
         .get(&previous_default)
-        .map(|provider| provider.model.clone());
+        .map(|m| m.model.clone());
 
     latest
         .providers
@@ -1173,6 +1175,13 @@ fn persist_codingplan_as_new_schema(config: &mut Config) {
         .is_some_and(|m| config.logical_models().contains_key(m));
     if !default_model_valid && is_codingplan_provider_name(&config.default_provider) {
         config.default_model = Some(config.default_provider.clone());
+    }
+    // Keep the legacy `default_provider` in lock-step with the canonical
+    // `default_model` so the two never disagree — otherwise the login report and
+    // legacy readers show one model while `effective_model_selection` resolves
+    // another (e.g. report says glm-5.1-fallback but the runtime runs deepseek).
+    if let Some(dm) = config.default_model.clone() {
+        config.default_provider = dm;
     }
 }
 
