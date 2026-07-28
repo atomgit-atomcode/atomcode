@@ -113,10 +113,105 @@ struct EditForm {
     focus: FormField,
 }
 
+/// Which model-form field has focus.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ModelField {
+    Account,
+    Model,
+    Window,
+    MakeDefault,
+}
+
+/// Add a model to an EXISTING account (the 模型 tab's `a`). Optionally editing an
+/// existing model in place (`edit_id` set → account is fixed, id preserved).
+#[derive(Clone)]
+struct ModelForm {
+    account_ids: Vec<String>,
+    account_idx: usize,
+    model: String,
+    window: String,
+    make_default: bool,
+    focus: ModelField,
+    /// When set, this is an edit of an existing model id (account locked).
+    edit_id: Option<String>,
+}
+
+impl ModelForm {
+    fn new_add(config: &Config) -> Option<Self> {
+        let account_ids = ProviderPanel::account_ids(config);
+        if account_ids.is_empty() {
+            return None;
+        }
+        Some(Self {
+            account_ids,
+            account_idx: 0,
+            model: String::new(),
+            window: String::new(),
+            make_default: true,
+            focus: ModelField::Account,
+            edit_id: None,
+        })
+    }
+
+    fn new_edit(config: &Config, id: &str) -> Option<Self> {
+        let m = config.logical_models().get(id).cloned()?;
+        Some(Self {
+            account_ids: vec![m.account.clone()],
+            account_idx: 0,
+            model: m.model.clone(),
+            window: m.context_window.to_string(),
+            make_default: config.effective_model_selection().as_deref() == Some(id),
+            focus: ModelField::Model,
+            edit_id: Some(id.to_string()),
+        })
+    }
+
+    fn account_id(&self) -> &str {
+        &self.account_ids[self.account_idx]
+    }
+
+    fn fields(&self) -> Vec<ModelField> {
+        if self.edit_id.is_some() {
+            vec![ModelField::Model, ModelField::Window, ModelField::MakeDefault]
+        } else {
+            vec![
+                ModelField::Account,
+                ModelField::Model,
+                ModelField::Window,
+                ModelField::MakeDefault,
+            ]
+        }
+    }
+
+    fn advance_focus(&mut self, forward: bool) {
+        let fields = self.fields();
+        let cur = fields.iter().position(|f| *f == self.focus).unwrap_or(0);
+        let next = if forward {
+            (cur + 1) % fields.len()
+        } else {
+            (cur + fields.len() - 1) % fields.len()
+        };
+        self.focus = fields[next];
+    }
+
+    fn cycle_account(&mut self, forward: bool) {
+        let n = self.account_ids.len();
+        if n == 0 {
+            return;
+        }
+        self.account_idx = if forward {
+            (self.account_idx + 1) % n
+        } else {
+            (self.account_idx + n - 1) % n
+        };
+    }
+}
+
 enum Mode {
     List,
     Add(AddForm),
     EditAccount(EditForm),
+    Model(ModelForm),
     /// Confirm deleting an account (with its models) or a single model.
     DeleteConfirm { id: String, is_account: bool },
 }
@@ -296,6 +391,72 @@ impl ProviderPanel {
         save_and_reload(ctx, desired, renderer, format!("已更新 {}", form.id), true)
     }
 
+    /// Add a model to an existing account, or edit an existing model's wire name
+    /// + window in place (preserving its other fields), then save.
+    fn save_model(&self, form: &ModelForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
+        let account_id = form.account_id().to_string();
+        let model_name = form.model.trim();
+        if model_name.is_empty() {
+            return false;
+        }
+        let preset_id = ctx
+            .config
+            .logical_accounts()
+            .get(&account_id)
+            .map(|a| a.provider.clone())
+            .unwrap_or_default();
+        let wire = provider_preset::preset_or_compatible(&preset_id)
+            .provider_type
+            .wire();
+        let context_window = form
+            .window
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|w| *w > 0)
+            .unwrap_or_else(|| {
+                atomcode_config::config::provider::default_context_window_for(wire)
+            });
+        let mut desired = ctx.config.clone();
+        let selection_id = if let Some(id) = &form.edit_id {
+            // Edit in place — new-schema model or legacy provider.
+            if let Some(m) = desired.models.get_mut(id) {
+                m.model = model_name.to_string();
+                m.context_window = context_window;
+            } else if let Some(p) = desired.providers.get_mut(id) {
+                p.model = model_name.to_string();
+                p.context_window = context_window;
+            }
+            id.clone()
+        } else {
+            let model_id = format!("{account_id}/{model_name}");
+            desired.models.insert(
+                model_id.clone(),
+                ModelProfileConfig {
+                    account: account_id,
+                    model: model_name.to_string(),
+                    display_name: None,
+                    system_prompt: None,
+                    context_window,
+                    max_tokens: None,
+                    capable_model: None,
+                    thinking_type: None,
+                    thinking_keep: None,
+                    reasoning_history: None,
+                    reasoning_effort: None,
+                    thinking_enabled: None,
+                    thinking_budget: None,
+                    pricing: None,
+                },
+            );
+            model_id
+        };
+        if form.make_default {
+            desired.default_model = Some(selection_id);
+        }
+        save_and_reload(ctx, desired, renderer, "已保存模型".to_string(), true)
+    }
+
     /// Delete the account (and its models) or a single model, then save.
     fn commit_delete(
         &self,
@@ -444,6 +605,44 @@ impl Modal for ProviderPanel {
             return Ok(ModalAction::Continue);
         }
 
+        // ── Add / edit model ──
+        if let Mode::Model(form) = &mut self.mode {
+            match code {
+                KeyCode::Esc => self.mode = Mode::List,
+                KeyCode::Tab | KeyCode::Down => form.advance_focus(true),
+                KeyCode::BackTab | KeyCode::Up => form.advance_focus(false),
+                KeyCode::Left if form.focus == ModelField::Account => form.cycle_account(false),
+                KeyCode::Right if form.focus == ModelField::Account => form.cycle_account(true),
+                KeyCode::Char(' ') if form.focus == ModelField::MakeDefault => {
+                    form.make_default = !form.make_default;
+                }
+                KeyCode::Char(c) => match form.focus {
+                    ModelField::Model => form.model.push(c),
+                    ModelField::Window if c.is_ascii_digit() => form.window.push(c),
+                    _ => {}
+                },
+                KeyCode::Backspace => match form.focus {
+                    ModelField::Model => {
+                        form.model.pop();
+                    }
+                    ModelField::Window => {
+                        form.window.pop();
+                    }
+                    _ => {}
+                },
+                KeyCode::Enter => {
+                    let form = form.clone();
+                    if self.save_model(&form, ctx, renderer) {
+                        return Ok(ModalAction::Close);
+                    }
+                    self.mode = Mode::Model(form);
+                }
+                _ => {}
+            }
+            self.draw(buf, state, ctx, renderer);
+            return Ok(ModalAction::Continue);
+        }
+
         // ── List mode ──
         let len = self.current_len(&ctx.config);
         match code {
@@ -463,12 +662,28 @@ impl Modal for ProviderPanel {
                 }
             }
             KeyCode::Char('a') => {
-                // Start the add form at the first endpoint-backed preset.
-                self.mode = Mode::Add(AddForm::new(0));
+                match self.tab {
+                    // New account (+ its first model).
+                    Tab::Accounts => self.mode = Mode::Add(AddForm::new(0)),
+                    // Add a model to an existing account; if none exist yet, fall
+                    // back to creating an account first.
+                    Tab::Models => {
+                        self.mode = match ModelForm::new_add(&ctx.config) {
+                            Some(f) => Mode::Model(f),
+                            None => Mode::Add(AddForm::new(0)),
+                        };
+                    }
+                }
             }
-            KeyCode::Char('e') if self.tab == Tab::Accounts => {
+            KeyCode::Char('e') => {
                 if let Some(id) = self.selected_id(&ctx.config) {
-                    self.mode = Mode::EditAccount(Self::open_edit(&ctx.config, &id));
+                    self.mode = match self.tab {
+                        Tab::Accounts => Mode::EditAccount(Self::open_edit(&ctx.config, &id)),
+                        Tab::Models => match ModelForm::new_edit(&ctx.config, &id) {
+                            Some(f) => Mode::Model(f),
+                            None => Mode::List,
+                        },
+                    };
                 }
             }
             KeyCode::Char('d') => {
@@ -569,7 +784,7 @@ impl Modal for ProviderPanel {
                                 .unwrap_or_default();
                             items.push((id.clone(), desc));
                         }
-                        hint = "a 添加  d 删除  ↵ 设为默认  Tab 切换  Esc 关闭".into();
+                        hint = "a 添加  e 编辑  d 删除  ↵ 设为默认  Tab 切换  Esc 关闭".into();
                     }
                 }
                 if self.current_len(&ctx.config) > 0 {
@@ -645,6 +860,46 @@ impl Modal for ProviderPanel {
                     form.focus == FormField::BaseUrl,
                 ));
                 hint = "Tab 切换  ↵ 保存  Esc 返回".into();
+            }
+            Mode::Model(form) => {
+                let field_row = |label: &str, value: String, focused: bool| {
+                    let marker = if focused { "▸ " } else { "  " };
+                    (format!("{marker}{label}: {value}"), String::new())
+                };
+                let title = if form.edit_id.is_some() {
+                    "【编辑模型】"
+                } else {
+                    "【添加模型】"
+                };
+                items.push((title.into(), String::new()));
+                items.push((String::new(), String::new()));
+                if form.edit_id.is_some() {
+                    // Account locked on edit — show it, not editable.
+                    items.push(("  账号: ".to_string() + form.account_id(), String::new()));
+                } else {
+                    items.push(field_row(
+                        "账号",
+                        format!("‹ {} ›   (←→ 切换)", form.account_id()),
+                        form.focus == ModelField::Account,
+                    ));
+                }
+                items.push(field_row(
+                    "模型",
+                    form.model.clone(),
+                    form.focus == ModelField::Model,
+                ));
+                let win = if form.window.is_empty() {
+                    "(默认)".to_string()
+                } else {
+                    form.window.clone()
+                };
+                items.push(field_row("窗口", win, form.focus == ModelField::Window));
+                items.push(field_row(
+                    "设为默认",
+                    if form.make_default { "[✓]" } else { "[ ]" }.to_string(),
+                    form.focus == ModelField::MakeDefault,
+                ));
+                hint = "Tab 下一项  ←→ 切账号  空格 勾选  ↵ 保存  Esc 返回".into();
             }
             Mode::DeleteConfirm { id, is_account } => {
                 items.push((String::new(), String::new()));
@@ -739,6 +994,25 @@ mod tests {
         assert!(!acc.is_legacy);
         assert_eq!(acc.base_url, "https://mirror/v1");
         assert!(acc.api_key.is_empty()); // blank = keep existing
+    }
+
+    #[test]
+    fn model_form_add_vs_edit() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "deepseek" } },
+            "models": { "acc/m": { "account": "acc", "model": "deepseek-chat", "context_window": 131072 } }
+        }))
+        .unwrap();
+        // Add: account is a selectable field, defaults to an existing account.
+        let add = ModelForm::new_add(&cfg).unwrap();
+        assert!(add.fields().contains(&ModelField::Account));
+        assert_eq!(add.account_id(), "acc");
+        // Edit: account locked; model + window pre-filled; id preserved.
+        let edit = ModelForm::new_edit(&cfg, "acc/m").unwrap();
+        assert!(!edit.fields().contains(&ModelField::Account));
+        assert_eq!(edit.model, "deepseek-chat");
+        assert_eq!(edit.window, "131072");
+        assert_eq!(edit.edit_id.as_deref(), Some("acc/m"));
     }
 
     #[test]
