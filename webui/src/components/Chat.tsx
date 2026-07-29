@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, type CommandResult, UserInputRequestEvent } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, type CommandResult, UserInputRequestEvent } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -1428,7 +1428,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         const SESSION_MUTATING = new Set(['undo', 'compact']);
         if (SESSION_MUTATING.has(command)) {
           if (busyRef.current) { pushCommandNotice(t('cmd.session.busy')); return; }
-          if (sync) { pushCommandNotice(t('cmd.session.syncUnsupported')); return; }
+          if (sync) {
+            // sync 模式：compact 派发到共享实时运行时（结果经 /live 的 Warning 事件
+            // 渲染压缩标记）；undo 暂无实时路径，维持拒绝。
+            if (command === 'compact') {
+              pushCommandNotice(t('cmd.compact.pending'));
+              try {
+                const { accepted } = await postLiveCompact();
+                if (!accepted) pushCommandNotice(t('cmd.compact.syncNoRuntime'));
+              } catch (e) {
+                pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
+              }
+              return;
+            }
+            pushCommandNotice(t('cmd.session.syncUnsupported'));
+            return;
+          }
         }
         if (command === 'compact') pushCommandNotice(t('cmd.compact.pending'));
         const isCompact = command === 'compact';

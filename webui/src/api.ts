@@ -776,6 +776,18 @@ export async function postLiveStop(): Promise<void> {
   if (!body.accepted) throw new Error('live runtime rejected the stop request');
 }
 
+/** Sync-mode manual compaction: dispatch a compaction against the shared live
+ *  runtime. `accepted:false` means no live runtime is bound (nothing to compact). */
+export async function postLiveCompact(): Promise<{ accepted: boolean }> {
+  const resp = await fetch('/live/compact', {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`live compact failed: ${resp.status}`);
+  const body = await resp.json() as { accepted?: boolean };
+  return { accepted: body.accepted === true };
+}
+
 /** Ask the bound native runtime to resume an existing session. */
 export async function postLiveSwitchSession(sessionId: string): Promise<void> {
   const resp = await fetch('/live/switch_session', {
