@@ -6553,13 +6553,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Top padding row of the block.
         self.push_body_row(Self::bg_blank_row(w, &bg));
 
-        // Prefixed content rows (❯ / ▎ + text), each padded to block width.
+        // Content rows: `❯ ` on the first row, then a plain bg-filled indent of
+        // equal width on continuation rows. The panel background now delineates
+        // the block, so the coloured `▎` continuation bar is redundant — drop it,
+        // keeping the indent so wrapped/multi-line text stays aligned and the
+        // background has no left-edge hole.
+        let chevron = self.caps.prompt_chevron();
+        let cont_indent = " ".repeat(crate::width::display_width(chevron));
         let mut rows = self.build_prefixed_rows(
-            self.caps.prompt_chevron(),
+            chevron,
             &accent,
             &safe,
             &text_style,
-            Some((self.caps.prompt_continuation_bar(), &accent)),
+            Some((cont_indent.as_str(), &bg)),
         );
         for row in &mut rows {
             Self::pad_row_to_width(row, w, bg.clone());
@@ -15951,16 +15957,20 @@ mod tests {
         assert!(found, "no row containing the user text 'hello' found");
     }
 
-    /// A multi-line user message gets a full-height left marker: the `❯` chevron
-    /// on the first row, then a coloured `▎` bar (Accent) on every continuation
-    /// row — so the block reads as one unit (opencode's `┃` border, fg-only).
+    /// A multi-line user message reads as one unit via the panel background,
+    /// not a coloured bar: the `❯` chevron sits on the first row, and every
+    /// continuation row starts with a plain bg-filled indent (no `▎` bar) so
+    /// the block is delineated by its background alone.
     #[test]
-    fn retained_multiline_user_message_has_full_height_bar() {
+    fn retained_multiline_user_message_continuation_is_bg_no_bar() {
         let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let expected_bg =
+            crate::render::theme::role(r.caps, crate::render::theme::Role::PanelBg);
         r.render(UiLine::User("first line\nsecond line".into()));
 
         let mut saw_chevron = false;
-        let mut saw_bar = false;
+        let mut saw_continuation = false;
         for row in &r.body_lines {
             let text: String = row.iter().map(|c| c.ch).collect();
             if text.contains("first line") {
@@ -15973,20 +15983,26 @@ mod tests {
                 );
             }
             if text.contains("second line") {
-                saw_bar = true;
-                let bar = row.first().expect("continuation row must not be empty");
-                assert_eq!(bar.ch, '\u{258e}', "continuation must start with a ▎ bar");
+                saw_continuation = true;
+                let head = row.first().expect("continuation row must not be empty");
                 assert_eq!(
-                    bar.style.fg,
-                    Some(Color::Cyan),
-                    "the bar must be Accent (cyan), got {:?}",
-                    bar.style.fg
+                    head.ch, ' ',
+                    "continuation must start with a plain indent, not a ▎ bar, got {:?}",
+                    head.ch
+                );
+                assert_eq!(
+                    head.style.bg, expected_bg,
+                    "the continuation indent must carry the panel background"
+                );
+                assert!(
+                    row.iter().all(|c| c.ch != '\u{258e}'),
+                    "continuation row must not contain a ▎ bar"
                 );
             }
         }
         assert!(
-            saw_chevron && saw_bar,
-            "expected a chevron row and a bar continuation row"
+            saw_chevron && saw_continuation,
+            "expected a chevron row and a continuation row"
         );
     }
 
@@ -16100,12 +16116,14 @@ mod tests {
         assert!(visible.iter().any(|row| row.contains("second line")));
     }
 
-    /// Windows / no-unicode-font terminals: the continuation bar falls back to an
-    /// ASCII `|` (2 display cols, same as `❯`→`>`), so layout stays identical and
-    /// no tofu glyph appears.
+    /// No-colour terminals keep the `▎` continuation bar (there is no panel
+    /// background to delineate a multi-line block without it). On Windows /
+    /// no-unicode-font terminals that bar falls back to an ASCII `|` (2 display
+    /// cols, same as `❯`→`>`), so layout stays identical and no tofu appears.
     #[test]
     fn retained_multiline_user_bar_ascii_fallback() {
         let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = false; // no panel background → bar is kept as the grouping cue
         r.caps.unicode_symbols = false; // Windows legacy conhost / no-unicode font
         r.render(UiLine::User("first line\nsecond line".into()));
 
