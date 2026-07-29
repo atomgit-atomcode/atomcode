@@ -82,7 +82,7 @@ pub use approval::{
     ApprovalResponse, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
 pub use ast_grep::AstGrepTool;
-pub use output_artifact::{artifact_id, ArtifactMiddleware, ArtifactStore, THRESHOLD_BYTES};
+pub use output_artifact::{artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES};
 #[cfg(feature = "atomgit")]
 pub use atomgit::{
     atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, AtomgitPrTool, AtomgitRepoTool,

@@ -227,3 +227,204 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
+
+pub struct FetchOutputTool {
+    store: Arc<ArtifactStore>,
+}
+
+impl FetchOutputTool {
+    pub fn new(store: Arc<ArtifactStore>) -> Self {
+        Self { store }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct FetchArgs {
+    artifact_id: String,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+const FETCH_MAX_LIMIT: usize = 64 * 1024;
+
+#[async_trait::async_trait]
+impl atomcode_kernel::tool::Tool for FetchOutputTool {
+    fn name(&self) -> &str {
+        "fetch_output"
+    }
+
+    fn description(&self) -> &str {
+        "Read more of a large tool output that was truncated. Pass the artifact_id from a \
+truncation marker plus a byte offset and limit. Returns the requested byte slice; if the \
+artifact is unavailable, re-run the original command instead."
+    }
+
+    fn read_only_hint(&self) -> bool {
+        true
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string", "description": "id from a truncation marker"},
+                "offset": {"type": "integer", "description": "byte offset to start at (default 0)"},
+                "limit": {"type": "integer", "description": "max bytes to return (default/max 65536)"}
+            },
+            "required": ["artifact_id"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        args: &str,
+        _ctx: &atomcode_kernel::tool::ToolContext,
+    ) -> atomcode_kernel::tool::ToolResult {
+        let call_id = String::new();
+        let parsed: FetchArgs = match serde_json::from_str(args) {
+            Ok(a) => a,
+            Err(e) => {
+                return atomcode_kernel::tool::ToolResult {
+                    call_id,
+                    content: format!("invalid fetch_output args: {e}"),
+                    is_error: true,
+                    images: vec![],
+                }
+            }
+        };
+
+        let limit = parsed.limit.unwrap_or(FETCH_MAX_LIMIT).min(FETCH_MAX_LIMIT);
+
+        match self.store.get(&parsed.artifact_id, parsed.offset, limit) {
+            Ok(Some(bytes)) => {
+                // Get total size for pagination hint.
+                let total = self
+                    .store
+                    .get(&parsed.artifact_id, 0, usize::MAX)
+                    .map(|o| o.map(|b| b.len()).unwrap_or(0))
+                    .unwrap_or(0);
+                let end = parsed.offset + bytes.len();
+                let body = String::from_utf8_lossy(&bytes);
+                let hint = if end < total {
+                    format!(
+                        "\n\n[showing bytes {}–{} of {}; call fetch_output(artifact_id=\"{}\", offset={}) for more]",
+                        parsed.offset, end, total, parsed.artifact_id, end
+                    )
+                } else {
+                    format!(
+                        "\n\n[showing bytes {}–{} of {} (end)]",
+                        parsed.offset, end, total
+                    )
+                };
+                atomcode_kernel::tool::ToolResult {
+                    call_id,
+                    content: format!("{}{}", body, hint),
+                    is_error: false,
+                    images: vec![],
+                }
+            }
+            Ok(None) => atomcode_kernel::tool::ToolResult {
+                call_id,
+                content: format!(
+                    "Artifact {} is no longer available (truncated captures don't survive across machines or after cleanup). \
+Re-run the original command to regenerate its output.",
+                    parsed.artifact_id
+                ),
+                is_error: true,
+                images: vec![],
+            },
+            Err(e) => atomcode_kernel::tool::ToolResult {
+                call_id,
+                content: format!("fetch_output failed: {}", e),
+                is_error: true,
+                images: vec![],
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod fetch_output_tests {
+    use super::*;
+    use atomcode_kernel::tool::{Tool, ToolContext};
+    use tokio_util::sync::CancellationToken;
+
+    fn ctx(dir: &std::path::Path) -> ToolContext {
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_slices_paginates_and_reports_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(ArtifactStore::new(dir.path()));
+        let id = store.put(&b"A".repeat(100_000)).unwrap();
+        let tool = FetchOutputTool::new(store.clone());
+        let test_ctx = ctx(dir.path());
+
+        // slice with explicit offset/limit
+        let r = tool
+            .execute(
+                &format!(r#"{{"artifact_id":"{}","offset":0,"limit":10}}"#, id),
+                &test_ctx,
+            )
+            .await;
+        assert!(!r.is_error, "first fetch should succeed: {}", r.content);
+        assert!(
+            r.content.starts_with("AAAAAAAAAA"),
+            "content should start with 10 As: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("of 100000"),
+            "pagination hint should mention total: {}",
+            r.content
+        );
+
+        // limit hard-capped at 64 KiB even if bigger requested
+        let r = tool
+            .execute(
+                &format!(
+                    r#"{{"artifact_id":"{}","offset":0,"limit":999999}}"#,
+                    id
+                ),
+                &test_ctx,
+            )
+            .await;
+        assert!(
+            !r.is_error,
+            "fetch with huge limit should succeed (get capped): {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("65536") || r.content.contains("of 100000"),
+            "pagination hint should show the hard cap or total: {}",
+            r.content
+        );
+
+        // missing artifact → terminal, actionable error, no "fetch" retry wording
+        let r = tool
+            .execute(
+                r#"{"artifact_id":"0000000000000000","offset":0,"limit":10}"#,
+                &test_ctx,
+            )
+            .await;
+        assert!(r.is_error, "missing artifact should be an error: {}", r.content);
+        assert!(
+            r.content.to_lowercase().contains("re-run"),
+            "error should tell user to re-run: {}",
+            r.content
+        );
+        assert!(
+            !r.content.to_lowercase().contains("try fetch again"),
+            "error should not suggest fetching again: {}",
+            r.content
+        );
+    }
+}
