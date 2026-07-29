@@ -35,8 +35,8 @@ use atomcode_capabilities::skills::{
 };
 use atomcode_capabilities::tools::{
     register_coding_tools_with_vision, ApprovalMiddleware, BashWorkspaceGate,
-    OpenFileWorkspaceGate, ReadFileTool, SensitivePathGate, WebFetchTool, WebSearchTool,
-    WriteApprovalGate,
+    OpenFileWorkspaceGate, ReadFileTool, RepairToolArgsMiddleware, SensitivePathGate, WebFetchTool,
+    WebSearchTool, WriteApprovalGate,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::checkpoint::CompactionCheckpoint;
@@ -1242,13 +1242,12 @@ pub fn assemble(
             cfg.preferred_language,
             crate::persona::todo_switch_enabled(),
             crate::persona::request_user_input_switch_enabled(),
-        ));
-    // Tool telemetry registers FIRST. It is observation-only — it never rewrites args
-    // or blocks — so its position does not affect the approve-what-runs contract (an
-    // ARG-REWRITING gate, e.g. CC PreToolUse `updatedInput`, must instead sit BEFORE
-    // approval so the user approves the POST-rewrite bytes — see the CC hooks block
-    // below). Going first means its `before` always stamps the call, so a tool that
-    // approval then DENIES is still recorded (the after-chain runs for every middleware).
+        ))
+        // Repair model-produced arguments before any observer or policy gate reads them.
+        // Approval must inspect the same bytes that the tool executes.
+        .middleware(Arc::new(RepairToolArgsMiddleware));
+    // Tool telemetry is the first observation middleware. It never rewrites or blocks.
+    // Its `before` always stamps the call, including a call that approval later denies.
     if let Some(tel) = &cfg.telemetry {
         builder = builder.middleware(Arc::new(crate::telemetry::ToolTelemetryMiddleware::new(
             tel.clone(),
