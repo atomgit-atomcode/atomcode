@@ -20422,10 +20422,35 @@ fn status_context_usage(
     }
 }
 
+/// Whether the footer should present the foreground as having no configured
+/// provider.
+///
+/// Configuration has two supported schemas: legacy `[providers.*]` and native
+/// `[provider_accounts.*]` + `[models.*]`. Checking `config.providers` directly
+/// only sees the legacy half and makes a perfectly usable native model appear
+/// as "(未配置)" whenever no CodingPlan auth is stored. Route through the same
+/// active-provider resolution boundary used to build the runtime instead.
+fn status_provider_unconfigured(
+    unavailable_reason: Option<atomcode_coding::ProviderUnavailableReason>,
+    config: &Config,
+    has_stored_auth: bool,
+) -> bool {
+    match unavailable_reason {
+        Some(atomcode_coding::ProviderUnavailableReason::NotConfigured) => true,
+        Some(
+            atomcode_coding::ProviderUnavailableReason::AuthenticationRequired
+            | atomcode_coding::ProviderUnavailableReason::UnsupportedBuild,
+        ) => false,
+        None => config.active_provider(None).is_err() && !has_stored_auth,
+    }
+}
+
 #[cfg(test)]
 mod status_context_usage_tests {
-    use super::status_context_usage;
+    use super::{status_context_usage, status_provider_unconfigured};
     use crate::state::{ContextSnapshot, UiState};
+    use atomcode_coding::ProviderUnavailableReason;
+    use atomcode_config::Config;
 
     #[test]
     fn configured_model_window_fills_narrow_usage_snapshot() {
@@ -20468,6 +20493,52 @@ mod status_context_usage_tests {
 
         assert_eq!(status_context_usage(&state, 128_000, false), (0, 0));
     }
+
+    #[test]
+    fn native_model_configuration_is_not_reported_as_unconfigured() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "account/model",
+            "provider_accounts": {
+                "account": {
+                    "provider": "openai",
+                    "base_url": "https://api.example.test/v1"
+                }
+            },
+            "models": {
+                "account/model": {
+                    "account": "account",
+                    "model": "example-model",
+                    "context_window": 128000
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(config.providers.is_empty(), "legacy table stays empty");
+        assert!(!status_provider_unconfigured(None, &config, false));
+    }
+
+    #[test]
+    fn provider_reason_distinguishes_configuration_from_other_unavailability() {
+        let config = Config::default();
+        assert!(status_provider_unconfigured(None, &config, false));
+        assert!(!status_provider_unconfigured(None, &config, true));
+        assert!(status_provider_unconfigured(
+            Some(ProviderUnavailableReason::NotConfigured),
+            &config,
+            true
+        ));
+        assert!(!status_provider_unconfigured(
+            Some(ProviderUnavailableReason::AuthenticationRequired),
+            &config,
+            false
+        ));
+        assert!(!status_provider_unconfigured(
+            Some(ProviderUnavailableReason::UnsupportedBuild),
+            &config,
+            false
+        ));
+    }
 }
 
 pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
@@ -20480,11 +20551,16 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     //   2. Upgrade-available hint (existing behavior).
     //   3. None.
     let runtime_availability = ctx.runtime.ui_availability();
-    let no_provider = matches!(
+    let unavailable_reason = ctx.runtime.provider_unavailable_reason();
+    let no_provider = status_provider_unconfigured(
+        unavailable_reason,
+        &ctx.config,
+        atomcode_auth::get_stored_auth().is_some(),
+    );
+    let provider_waiting = matches!(
         runtime_availability,
         RuntimeUiAvailability::AwaitingProvider
-    ) || (ctx.config.providers.is_empty()
-        && atomcode_auth::get_stored_auth().is_none());
+    ) && !no_provider;
     let runtime_failed = matches!(runtime_availability, RuntimeUiAvailability::Failed);
     // Open-source build pointed at an AtomGit gateway: any chat will
     // fail-fast with `CpOfficialBuildRequired`. Surface that diagnosis
@@ -20513,6 +20589,21 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else if no_provider {
         Some((
             crate::i18n::t(crate::i18n::Msg::StatusNoProvider).into_owned(),
+            crate::render::HintSeverity::Warning,
+        ))
+    } else if provider_waiting {
+        let message = match unavailable_reason {
+            Some(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired) => {
+                crate::i18n::Msg::CmdWhoamiNotSignedIn
+            }
+            Some(
+                atomcode_coding::ProviderUnavailableReason::UnsupportedBuild
+                | atomcode_coding::ProviderUnavailableReason::NotConfigured,
+            )
+            | None => crate::i18n::Msg::CmdProviderUnavailable,
+        };
+        Some((
+            crate::i18n::t(message).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
     } else if runtime_failed {

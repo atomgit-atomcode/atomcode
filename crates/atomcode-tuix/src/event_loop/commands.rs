@@ -562,8 +562,7 @@ pub(crate) fn attach_live_runtime(
                     // inline markers, so without this the synchronized TUI echoes an
                     // image-bearing message with an empty attachment row (the empty
                     // box under the user text).
-                    let echo =
-                        super::echo_text_with_image_markers(input.text, input.images.len());
+                    let echo = super::echo_text_with_image_markers(input.text, input.images.len());
                     if event_tx
                         .send(super::bg_runtime::RuntimeEvent {
                             runtime_id,
