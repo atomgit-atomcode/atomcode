@@ -76,6 +76,16 @@ pub(crate) fn adjacent_provider(config: &Config, direction: ModelCycleDirection)
     Some(ids[target].clone())
 }
 
+/// Whether `/model` has anything selectable in either supported config schema.
+///
+/// `config.providers` only covers the legacy schema. The picker itself is built
+/// from `logical_models()`, so its open guard must use that same unified
+/// catalog or native `provider_accounts + models` configurations are rejected
+/// before the picker can render them.
+pub(crate) fn has_selectable_models(config: &Config) -> bool {
+    !config.logical_models().is_empty()
+}
+
 pub struct ModelPicker {
     /// All provider names, sorted alphabetically with the current default first.
     pub providers: Vec<String>,
@@ -429,6 +439,26 @@ mod tests {
         p2.update_filter(&config);
         assert_eq!(p2.filtered.len(), 1);
         assert_eq!(p2.providers[p2.filtered[0]], "acc/chat");
+    }
+
+    #[test]
+    fn model_command_accepts_new_schema_model_profiles() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "acc/coder",
+            "provider_accounts": { "acc": { "provider": "deepseek" } },
+            "models": {
+                "acc/coder": {
+                    "account": "acc",
+                    "model": "deepseek-coder",
+                    "context_window": 131072
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(config.providers.is_empty(), "legacy table stays empty");
+        assert!(has_selectable_models(&config));
+        assert!(!has_selectable_models(&Config::default()));
     }
 
     #[test]

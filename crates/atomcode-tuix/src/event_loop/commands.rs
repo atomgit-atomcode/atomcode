@@ -1670,7 +1670,7 @@ fn execute_slash_command_impl(
             reset_to_new_session(ctx, state, renderer);
         }
         "model" => {
-            if ctx.config.providers.is_empty() {
+            if !crate::modals::model_picker::has_selectable_models(&ctx.config) {
                 renderer.render(UiLine::CommandOutput(t(Msg::CmdNoProviders).into_owned()));
                 renderer.flush();
             } else {
