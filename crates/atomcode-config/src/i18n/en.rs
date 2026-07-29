@@ -1194,6 +1194,14 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             model
         )
         .into(),
+        Msg::VisionPreprocessorUnresolvable { model, provider } => format!(
+            "Current model \"{}\" does not support image input; the configured \
+             vision_preprocessor_provider \"{}\" does not resolve (check the name \
+             matches a provider/model in your config). Fix the name, or use \
+             /model to switch to a vision-capable model.",
+            model, provider
+        )
+        .into(),
         // ── --dangerously-skip-permissions / -y ──
         Msg::BypassWarningBanner =>
             "\u{26a0} --dangerously-skip-permissions is active: all tool calls are auto-approved (no permission prompts)\n".into(),

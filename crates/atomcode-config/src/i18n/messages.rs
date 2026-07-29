@@ -1542,6 +1542,15 @@ pub enum Msg<'a> {
         model: &'a str,
     },
 
+    /// Like `ModelNoImageSupport`, but a `vision_preprocessor_provider` IS
+    /// configured — it just doesn't resolve (typo'd / removed name). Names the
+    /// offending value so the user fixes the name instead of thinking they
+    /// never set it. `model` = current model; `provider` = unresolvable value.
+    VisionPreprocessorUnresolvable {
+        model: &'a str,
+        provider: &'a str,
+    },
+
     // ── --dangerously-skip-permissions / -y ──
     /// Scrollback warning banner when --dangerously-skip-permissions is active
     /// in TUI mode. Includes leading "⚠ " and trailing "\n".

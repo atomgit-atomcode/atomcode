@@ -1160,6 +1160,13 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             model
         )
         .into(),
+        Msg::VisionPreprocessorUnresolvable { model, provider } => format!(
+            "当前模型 \"{}\" 不支持图片输入；已配置的 vision_preprocessor_provider \"{}\" \
+             无法解析（请检查名称是否与配置中的 provider/model 一致）。\
+             请修正该名称，或用 /model 切换到支持视觉的模型。",
+            model, provider
+        )
+        .into(),
         // ── --dangerously-skip-permissions / -y ──
         Msg::BypassWarningBanner =>
             "\u{26a0} --dangerously-skip-permissions 已启用：所有工具调用将自动批准（无权限提示）\n".into(),

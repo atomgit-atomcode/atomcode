@@ -557,11 +557,18 @@ pub(crate) fn attach_live_runtime(
                 if let atomcode_daemon::live_hub::LiveViewEvent::InputAccepted(input) =
                     observation.event
                 {
+                    // Re-attach `[Image #N]` markers dropped by the text-only echo:
+                    // a webui submit keeps images separate (`input.images`) with no
+                    // inline markers, so without this the synchronized TUI echoes an
+                    // image-bearing message with an empty attachment row (the empty
+                    // box under the user text).
+                    let echo =
+                        super::echo_text_with_image_markers(input.text, input.images.len());
                     if event_tx
                         .send(super::bg_runtime::RuntimeEvent {
                             runtime_id,
                             event: super::bg_runtime::RuntimeEventPayload::Ui(
-                                super::ui_event::UiEvent::UserEcho(input.text),
+                                super::ui_event::UiEvent::UserEcho(echo),
                             ),
                         })
                         .is_err()

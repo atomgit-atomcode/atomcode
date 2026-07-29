@@ -405,6 +405,23 @@ pub enum UiTheme {
     Light,
 }
 
+/// Why an attached image can (or cannot) reach a model that will process it —
+/// the resolution behind [`Config::can_handle_attached_images`]. Lets the paste
+/// gate tell the user WHY it rejected: nothing configured (switch model / set a
+/// preprocessor) vs. a preprocessor IS set but its name doesn't resolve (a
+/// typo), which the old blanket "未配置" message wrongly reported as absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageAttachSupport {
+    /// The active model accepts images, or `vision_preprocessor_provider`
+    /// resolves — the image will be handled.
+    Supported,
+    /// Active model is text-only and no `vision_preprocessor_provider` is set.
+    Unconfigured,
+    /// `vision_preprocessor_provider` IS set but does not resolve to a real
+    /// model-selection id (typo'd / removed name). Carries the offending value.
+    PreprocessorUnresolvable(String),
+}
+
 impl Config {
     /// True iff attaching an image to the active turn will reach a model
     /// that can process it — either the active provider accepts images
@@ -413,6 +430,13 @@ impl Config {
     /// TUIX Ctrl+V paste gate to decide whether to accept the image or
     /// reject with the "switch to a vision-capable model" hint.
     pub fn can_handle_attached_images(&self) -> bool {
+        matches!(self.image_attach_support(), ImageAttachSupport::Supported)
+    }
+
+    /// Resolved reason behind [`Self::can_handle_attached_images`] so the paste
+    /// gate can distinguish "nothing configured" from "preprocessor configured
+    /// but unresolvable" (a typo) and message accordingly.
+    pub fn image_attach_support(&self) -> ImageAttachSupport {
         // Route through the single resolution boundary (§14.1) so both schemas
         // work and the active model matches what the runtime builds.
         let active_accepts = self
@@ -420,13 +444,19 @@ impl Config {
             .map(|r| crate::util::model_name_suggests_vision(&r.model))
             .unwrap_or(false);
         if active_accepts {
-            return true;
+            return ImageAttachSupport::Supported;
         }
         // `vision_preprocessor_provider` is a model-selection id (legacy provider
         // names still resolve via projection, §14.3): valid iff it resolves.
         match self.vision_preprocessor_provider.as_deref() {
-            Some(k) if !k.is_empty() => self.resolve_model(Some(k)).is_ok(),
-            _ => false,
+            Some(k) if !k.is_empty() => {
+                if self.resolve_model(Some(k)).is_ok() {
+                    ImageAttachSupport::Supported
+                } else {
+                    ImageAttachSupport::PreprocessorUnresolvable(k.to_string())
+                }
+            }
+            _ => ImageAttachSupport::Unconfigured,
         }
     }
 }
@@ -2545,6 +2575,32 @@ model = "missing-type"
     fn can_handle_attached_images_false_when_preprocessor_key_is_empty_string() {
         let cfg = cfg_with("deepseek-v4-flash", Some(""));
         assert!(!cfg.can_handle_attached_images());
+    }
+
+    #[test]
+    fn image_attach_support_distinguishes_unconfigured_from_misconfigured() {
+        use super::ImageAttachSupport as S;
+        // Text-only main, nothing set → Unconfigured.
+        assert_eq!(
+            cfg_with("deepseek-v4-flash", None).image_attach_support(),
+            S::Unconfigured
+        );
+        // Empty string is treated as unset, not a misconfigured name.
+        assert_eq!(
+            cfg_with("deepseek-v4-flash", Some("")).image_attach_support(),
+            S::Unconfigured
+        );
+        // Configured but the name doesn't resolve → names the offending value
+        // so the gate can say "typo" instead of the misleading "未配置".
+        assert_eq!(
+            cfg_with("deepseek-v4-flash", Some("NoSuchProvider")).image_attach_support(),
+            S::PreprocessorUnresolvable("NoSuchProvider".to_string())
+        );
+        // Active vision model → Supported regardless of preprocessor.
+        assert_eq!(
+            cfg_with("claude-sonnet-4-5", None).image_attach_support(),
+            S::Supported
+        );
     }
 
     #[test]

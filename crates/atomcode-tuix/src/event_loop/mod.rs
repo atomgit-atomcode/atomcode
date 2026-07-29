@@ -396,6 +396,55 @@ fn image_markers_in_order(text: &str) -> Vec<usize> {
     out
 }
 
+/// Re-attach `[Image #N]` markers to a live-sync `UserEcho` whose text carries
+/// none. A webui/live submit keeps images STRUCTURALLY separate (`UserInput
+/// { text, images }`) with no inline markers, but the TUI echo renders the
+/// `└ [Image #N]` rows by scanning the text (`image_markers_in_order`) — so an
+/// image-bearing webui message would echo with an empty attachment row in a
+/// synchronized TUI. Append one marker per image (1-based) so the existing
+/// `UserEcho → UserWithAttachments` render surfaces them, matching how a native
+/// TUI paste (whose text already contains the markers) is echoed.
+///
+/// No-ops when there are no images, or when the text already carries markers
+/// (a native-paste echo forwarded through the same seam) so we never double up.
+pub(crate) fn echo_text_with_image_markers(text: String, image_count: usize) -> String {
+    if image_count == 0 || text.contains("[Image #") {
+        return text;
+    }
+    let markers = (1..=image_count)
+        .map(|n| format!("[Image #{n}]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.trim().is_empty() {
+        markers
+    } else {
+        format!("{text} {markers}")
+    }
+}
+
+/// The paste-gate rejection line for an attached image, or `None` when images
+/// ARE supported. Distinguishes "nothing configured" (`ModelNoImageSupport`)
+/// from a configured-but-unresolvable `vision_preprocessor_provider`
+/// (`VisionPreprocessorUnresolvable`, which names the typo'd value) so the
+/// message stops telling users who DID configure a preprocessor that it is
+/// "未配置". Shared by every gate that surfaces the rejection to the user.
+fn image_attach_reject_line(config: &Config, model: &str) -> Option<String> {
+    use atomcode_config::config::ImageAttachSupport as S;
+    match config.image_attach_support() {
+        S::Supported => None,
+        S::Unconfigured => {
+            Some(crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport { model }).into_owned())
+        }
+        S::PreprocessorUnresolvable(provider) => Some(
+            crate::i18n::t(crate::i18n::Msg::VisionPreprocessorUnresolvable {
+                model,
+                provider: &provider,
+            })
+            .into_owned(),
+        ),
+    }
+}
+
 pub(crate) fn compute_input_attachments(
     state: &crate::state::UiState,
     buf_text: &str,
@@ -9407,13 +9456,8 @@ fn attach_image_to_input(
     let Some((img, hash)) = img_hash else {
         return Ok(false);
     };
-    if !ctx.config.can_handle_attached_images() {
-        renderer.render(UiLine::Error(
-            crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport {
-                model: &ctx.model_name,
-            })
-            .into_owned(),
-        ));
+    if let Some(reject) = image_attach_reject_line(&ctx.config, &ctx.model_name) {
+        renderer.render(UiLine::Error(reject));
         renderer.flush();
         if matches!(app.state.phase, UiPhase::Idle) {
             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -10894,13 +10938,8 @@ fn handle_idle_key(
             // ModelArts.81001 "message[N].content[0] has invalid
             // field(s): text, type" for GLM-5.1). Helper in
             // `Config::can_handle_attached_images`.
-            if !ctx.config.can_handle_attached_images() {
-                renderer.render(UiLine::Error(
-                    crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport {
-                        model: &ctx.model_name,
-                    })
-                    .into_owned(),
-                ));
+            if let Some(reject) = image_attach_reject_line(&ctx.config, &ctx.model_name) {
+                renderer.render(UiLine::Error(reject));
                 renderer.flush();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
@@ -11785,6 +11824,28 @@ mod image_marker_tests {
         assert_eq!(marks("no images here"), Vec::<usize>::new());
         // Malformed markers are ignored.
         assert_eq!(marks("[Image #] [Image #x] [Image #3]"), vec![3]);
+    }
+
+    use super::echo_text_with_image_markers as reecho;
+
+    #[test]
+    fn reattaches_markers_for_webui_image_echo() {
+        // webui text has no inline markers; append one per image so the
+        // synchronized TUI echoes `└ [Image #N]` rows instead of an empty box.
+        assert_eq!(reecho("识别图片内容".into(), 1), "识别图片内容 [Image #1]");
+        assert_eq!(reecho("look".into(), 2), "look [Image #1] [Image #2]");
+        // And the appended markers are what the echo renderer will pick up.
+        assert_eq!(marks(&reecho("hi".into(), 2)), vec![1, 2]);
+    }
+
+    #[test]
+    fn reecho_noops_without_images_or_when_markers_present() {
+        // No images: unchanged.
+        assert_eq!(reecho("just text".into(), 0), "just text");
+        // Native-paste echo already carries markers: never double up.
+        assert_eq!(reecho("typed [Image #1]".into(), 1), "typed [Image #1]");
+        // Empty text + images: markers only, no leading space.
+        assert_eq!(reecho("".into(), 1), "[Image #1]");
     }
 }
 
