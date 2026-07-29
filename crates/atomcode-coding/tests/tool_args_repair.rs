@@ -87,7 +87,13 @@ async fn full_assembly_repairs_tool_arguments_before_execution() {
 #[tokio::test]
 async fn full_assembly_approval_sees_the_repaired_arguments_that_execute() {
     let project = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    // The write gate intentionally auto-approves the OS temp directory. Put the
+    // target under the workspace's build output instead: it is outside this
+    // test's project root but not covered by the temp-path exception.
+    let workspace_target = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("target");
+    let outside = tempfile::tempdir_in(workspace_target).unwrap();
     let file_path = outside.path().join("approved.txt");
     let cfg = CodingAgentConfig::new("k", "http://localhost:0", "mock-model", project.path());
     let mut parts = prepare(
@@ -116,6 +122,7 @@ async fn full_assembly_approval_sees_the_repaired_arguments_that_execute() {
         .unwrap();
 
     let mut approved_args = None;
+    let mut saw_tool_result = false;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while let Some(event) = handle.events.recv().await {
             match event {
@@ -140,13 +147,24 @@ async fn full_assembly_approval_sees_the_repaired_arguments_that_execute() {
                         })
                         .unwrap();
                 }
-                AgentEvent::TurnComplete { .. } => break,
+                AgentEvent::ToolResult { result } if result.call_id == "write-1" => {
+                    assert!(
+                        !result.is_error,
+                        "approved repaired arguments must execute successfully: {result:?}"
+                    );
+                    saw_tool_result = true;
+                    // This test has proved the approval/execution contract. Stop
+                    // the active turn before shutdown so VerifyCadence does not
+                    // spend several seconds retrying a follow-up model response.
+                    commands.send(AgentCommand::Cancel).unwrap();
+                    break;
+                }
                 _ => {}
             }
         }
     })
     .await
-    .expect("turn timed out waiting for repaired-argument approval");
+    .expect("turn timed out waiting for repaired-argument execution");
 
     commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
@@ -154,5 +172,6 @@ async fn full_assembly_approval_sees_the_repaired_arguments_that_execute() {
         approved_args.is_some(),
         "out-of-workspace write must request approval"
     );
+    assert!(saw_tool_result, "approved repaired call must execute");
     assert_eq!(std::fs::read_to_string(file_path).unwrap(), "repaired");
 }

@@ -185,9 +185,13 @@ fn build_coding_agent_from_tools(
 /// Register the neutral coding tools + codeintel into a fresh registry and mount the
 /// union (everything visible to the model).
 fn mount_coding_tools(vision: bool) -> Result<MountedTools, String> {
-    let (mut registry, mut names) = base_coding_tools(vision);
+    let (registry, names) = base_coding_tools(vision);
     #[cfg(feature = "atomgit")]
-    register_atomgit_capabilities(&mut registry, &mut names)?;
+    let (registry, names) = {
+        let (mut registry, mut names) = (registry, names);
+        register_atomgit_capabilities(&mut registry, &mut names)?;
+        (registry, names)
+    };
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     Ok(registry.mount(&refs))
 }
