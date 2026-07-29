@@ -2875,11 +2875,9 @@ body {
 }
 .landing-chip:hover { border-color: var(--app-brand); color: var(--app-brand); }
 
-/* 复用的输入框在落地态下居中、全宽（而非底部悬浮） */
+/* 复用的输入框在落地态下居中、全宽（而非底部悬浮）。
+   文本区沿用通用的两行初始高度，内容输入后仍由 textarea 自动增高。 */
 .landing-inner .input-box { width: 100%; }
-/* 落地页（新建对话）输入框默认更高 —— 约 4 行（line-height 1.5 → 6em 内容高），
-   更醒目、便于多行输入；会话内底部输入框仍维持 2 行。 */
-.landing-inner .message-input { min-height: 6em; }
 
 /* 建议胶囊行 */
 .landing-suggestions {
