@@ -447,7 +447,9 @@ impl LiveViewHub {
     pub async fn reload_capabilities(&self) -> Result<atomcode_coding::SessionChanged, HubError> {
         let (binding, handle) = self.bound_handle()?;
         let changed = handle
-            .reload_capabilities()
+            .reload_capabilities_with_plugin_skills(Some(crate::gather_plugin_skill_dirs_for(
+                &binding.working_dir,
+            )))
             .await
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
         self.commit_changed_snapshot(&binding, &handle, &changed)

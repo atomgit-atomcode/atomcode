@@ -51,7 +51,7 @@ pub use kernel_runtime::{
 };
 pub use runtime_host::{
     coding_plan_rate_limit_source, coding_provider_factory, gather_plugin_skill_dirs,
-    installed_plugin_hook_source,
+    gather_plugin_skill_dirs_for, installed_plugin_hook_source,
 };
 pub(crate) mod live_api;
 pub use live_api::live_set_mode;
@@ -4846,14 +4846,11 @@ pub struct SkillInfo {
 /// GET /skills - List user-invocable skills for the current project.
 async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
-    // Standard home/project skill dirs, then installed-plugin skill dirs — same
-    // two layers `core::skill::reload` loaded (its plugin layer via
-    // `iter_installed_plugin_assets`; here via `gather_plugin_skill_dirs`).
+    // Standard home/project skill dirs, then installed-plugin skill dirs.
+    // Keep this composition in the plugin integration layer so the shared
+    // SkillRegistry remains independent of plugin storage.
     let mut registry = atomcode_capabilities::skills::SkillRegistry::new();
-    registry.reload(&working_dir);
-    for (dir, namespace) in crate::gather_plugin_skill_dirs() {
-        registry.load_dir(&dir, Some(&namespace));
-    }
+    atomcode_capabilities::plugin::loader::reload_skill_registry(&mut registry, &working_dir);
     let skills: Vec<SkillInfo> = registry
         .user_invocable()
         .map(|s| SkillInfo {

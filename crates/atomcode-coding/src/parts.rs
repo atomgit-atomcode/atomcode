@@ -86,9 +86,9 @@ pub struct PrepareOptions {
     /// Plugin-contributed skill directories, each paired with its namespace
     /// (the plugin manifest's `name`). Loaded AFTER `skill_dirs` so plugin
     /// skills are registered as `<namespace>:<skill-name>` — same convention
-    /// the slash-menu's `core::SkillRegistry::reload` uses. Empty = no
-    /// plugin skills (the L1 `capabilities::SkillRegistry::load` cannot reach
-    /// the core plugin loader by design — driver feeds these in).
+    /// the slash menu uses. Empty = no plugin skills. The registry remains
+    /// source-neutral; the driver discovers installed-plugin directories and
+    /// feeds them in.
     pub plugin_skill_dirs: Vec<(PathBuf, String)>,
     /// Connect MCP servers from `<working_dir>/.mcp.json` (+ global config).
     pub mcp: bool,

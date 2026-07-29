@@ -32,15 +32,14 @@ pub fn installed_plugin_hook_source() -> Arc<dyn PluginHookSource> {
 }
 
 pub fn gather_plugin_skill_dirs() -> Vec<(std::path::PathBuf, String)> {
-    let mut out = Vec::new();
-    for assets in atomcode_capabilities::plugin::loader::iter_installed_plugin_assets() {
-        for sd in assets.skills_dirs() {
-            if sd.exists() {
-                out.push((sd, assets.plugin.clone()));
-            }
-        }
-    }
-    out
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    gather_plugin_skill_dirs_for(&working_dir)
+}
+
+pub fn gather_plugin_skill_dirs_for(
+    working_dir: &std::path::Path,
+) -> Vec<(std::path::PathBuf, String)> {
+    atomcode_capabilities::plugin::loader::installed_plugin_skill_dirs(working_dir)
 }
 
 #[derive(Debug, Default)]

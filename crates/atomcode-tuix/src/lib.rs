@@ -614,7 +614,7 @@ pub async fn run(
         atomcode_capabilities::skills::SkillRegistry::new(),
     ));
     if let Ok(mut registry) = skill_registry.write() {
-        let _ = registry.reload(&working_dir);
+        let _ = event_loop::reload_skill_registry(&mut registry, &working_dir);
     }
 
     // ── Plugin marketplace bootstrap (detached) ──
@@ -647,7 +647,7 @@ pub async fn run(
                 // freshly-installed skills are visible to the slash
                 // menu + agent loop without a restart.
                 if let Ok(mut guard) = registry.write() {
-                    let _ = guard.reload(&work_dir);
+                    let _ = event_loop::reload_skill_registry(&mut guard, &work_dir);
                 }
                 events
             })

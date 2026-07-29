@@ -1300,8 +1300,20 @@ impl CodingRuntimeHandle {
     }
 
     pub async fn reload_capabilities(&self) -> Result<SessionChanged, RuntimeError> {
+        self.reload_capabilities_with_plugin_skills(None).await
+    }
+
+    /// Reload the capability graph, optionally replacing the plugin skill
+    /// directories captured at runtime startup. Drivers call this after plugin
+    /// install/update/uninstall so the replacement generation sees current
+    /// disk state rather than the stale startup snapshot.
+    pub async fn reload_capabilities_with_plugin_skills(
+        &self,
+        plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
+    ) -> Result<SessionChanged, RuntimeError> {
         self.withdraw_mcp_tools().await?;
-        self.reprepare_target(ReprepareTarget::Reload).await
+        self.reprepare_target(ReprepareTarget::Reload { plugin_skill_dirs })
+            .await
     }
 
     pub async fn resume_session(
@@ -2040,7 +2052,9 @@ pub enum RewindFinalization {
 #[derive(Clone)]
 pub enum ReprepareTarget {
     Exact(ReprepareInput),
-    Reload,
+    Reload {
+        plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
+    },
     Fresh,
     Resume(String),
     ResumeWithLease {
@@ -3888,7 +3902,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
-                        let withdraws_mcp = matches!(&target, ReprepareTarget::Reload);
+                        let withdraws_mcp = matches!(&target, ReprepareTarget::Reload { .. });
                         let resolved = match resolve_reprepare_input(&runtime, target) {
                             Ok(input) => input,
                             Err(error) => {
@@ -5611,8 +5625,11 @@ fn resolve_reprepare_input(
 ) -> Result<Option<(ReprepareInput, Option<SessionLease>)>, RuntimeError> {
     match target {
         ReprepareTarget::Exact(input) => Ok(Some((input, None))),
-        ReprepareTarget::Reload => {
+        ReprepareTarget::Reload { plugin_skill_dirs } => {
             let mut prepare = runtime.prepare.clone();
+            if let Some(plugin_skill_dirs) = plugin_skill_dirs {
+                prepare.plugin_skill_dirs = plugin_skill_dirs;
+            }
             prepare.session = match runtime.parts.session.as_ref() {
                 Some(binding) => crate::SessionMode::Resume(binding.id.clone()),
                 None => crate::SessionMode::Disabled,

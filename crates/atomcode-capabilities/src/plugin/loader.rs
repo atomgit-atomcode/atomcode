@@ -218,6 +218,16 @@ pub fn installed_plugin_hook_trust_status() -> Vec<PluginHookTrust> {
 /// missing or the plugin home is not configured. Skips entries whose
 /// plugin_dir does not exist on disk (keeps reload resilient to deletions).
 pub fn iter_installed_plugin_assets() -> Vec<InstalledPluginAssets> {
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    iter_installed_plugin_assets_for(&working_dir)
+}
+
+/// Iterate over installed plugins visible from `working_dir`.
+///
+/// User-scoped plugins are global. Project/local plugins are resolved from the
+/// supplied directory rather than the process current directory, so a driver
+/// can reload capabilities after `/cd` without discovering the wrong project.
+pub fn iter_installed_plugin_assets_for(working_dir: &Path) -> Vec<InstalledPluginAssets> {
     let mut result = Vec::new();
 
     // User scope (global).
@@ -252,10 +262,9 @@ pub fn iter_installed_plugin_assets() -> Vec<InstalledPluginAssets> {
     }
 
     // Project and Local scopes.
-    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     for scope in [InstallScope::Project, InstallScope::Local] {
-        if let Some(project_root) = paths::project_plugins_root(&working_dir, &scope) {
-            if let Some(state_path) = paths::project_installed_plugins_file(&working_dir, &scope) {
+        if let Some(project_root) = paths::project_plugins_root(working_dir, &scope) {
+            if let Some(state_path) = paths::project_installed_plugins_file(working_dir, &scope) {
                 if state_path.exists() {
                     if let Ok(state) = load_installed_plugins_file(&state_path) {
                         for e in state.plugins.into_values() {
@@ -283,6 +292,35 @@ pub fn iter_installed_plugin_assets() -> Vec<InstalledPluginAssets> {
     }
 
     result
+}
+
+/// Plugin skill directories visible from `working_dir`, paired with the
+/// namespace used by [`crate::skills::SkillRegistry::load_dir`].
+pub fn installed_plugin_skill_dirs(working_dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    for assets in iter_installed_plugin_assets_for(working_dir) {
+        for dir in assets.skills_dirs() {
+            if dir.exists() {
+                out.push((dir, assets.plugin.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Reload standard skills and then overlay installed-plugin skills.
+///
+/// This composition lives in the plugin integration layer so
+/// [`crate::skills::SkillRegistry`] remains source-neutral.
+pub fn reload_skill_registry(
+    registry: &mut crate::skills::SkillRegistry,
+    working_dir: &Path,
+) -> Vec<String> {
+    let warnings = registry.reload(working_dir);
+    for (dir, namespace) in installed_plugin_skill_dirs(working_dir) {
+        registry.load_dir(&dir, Some(&namespace));
+    }
+    warnings
 }
 
 #[cfg(test)]
@@ -650,5 +688,49 @@ mod tests {
                 description.chars().take(60).collect::<String>()
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_skill_dirs_use_the_supplied_project_directory() {
+        let _home = isolated_home();
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let scope = InstallScope::Project;
+        let project_root = paths::project_plugins_root(project.path(), &scope).unwrap();
+        let plugin_dir = project_root.join("installed/mp/probe");
+        std::fs::create_dir_all(plugin_dir.join("skills/check")).unwrap();
+        std::fs::write(
+            plugin_dir.join("skills/check/SKILL.md"),
+            "---\nname: check\ndescription: project probe\n---\nbody\n",
+        )
+        .unwrap();
+
+        let mut state = super::super::state::InstalledPluginsFile::default();
+        state.plugins.insert(
+            super::super::state::plugin_id("probe", "mp"),
+            super::super::state::InstalledPluginEntry {
+                marketplace: "mp".into(),
+                plugin: "probe".into(),
+                plugin_dir: "installed/mp/probe".into(),
+                installed_at: "now".into(),
+                scope: scope.clone(),
+            },
+        );
+        let state_path = paths::project_installed_plugins_file(project.path(), &scope).unwrap();
+        super::super::state::save_installed_plugins_file(&state_path, &state).unwrap();
+
+        let dirs = installed_plugin_skill_dirs(project.path());
+        assert_eq!(dirs, vec![(plugin_dir.join("skills"), "probe".into())]);
+        let mut registry = crate::skills::SkillRegistry::new();
+        assert!(reload_skill_registry(&mut registry, project.path()).is_empty());
+        assert!(
+            registry.get("probe:check").is_some(),
+            "production reload composition omitted the project plugin skill"
+        );
+        assert!(
+            installed_plugin_skill_dirs(other.path()).is_empty(),
+            "project plugin leaked into a different working directory"
+        );
     }
 }

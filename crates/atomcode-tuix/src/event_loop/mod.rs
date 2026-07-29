@@ -1952,6 +1952,7 @@ enum ReadyRuntimeRequest {
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
     ReloadCapabilities {
+        plugin_skill_dirs: Vec<(PathBuf, String)>,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
@@ -2203,10 +2204,14 @@ impl ReadyRuntimeControl {
                     });
                 }
                 ReadyRuntimeRequest::ReloadCapabilities {
+                    plugin_skill_dirs,
                     runtime_id,
                     event_tx,
                 } => {
-                    let result = self.handle.reload_capabilities().await;
+                    let result = self
+                        .handle
+                        .reload_capabilities_with_plugin_skills(Some(plugin_skill_dirs))
+                        .await;
                     let _ = event_tx.send(bg_runtime::RuntimeEvent {
                         runtime_id,
                         event: bg_runtime::RuntimeEventPayload::Driver(
@@ -2707,11 +2712,13 @@ impl RuntimeControl {
 
     pub fn reload_capabilities(
         &self,
+        plugin_skill_dirs: Vec<(PathBuf, String)>,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
         match self {
             Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ReloadCapabilities {
+                plugin_skill_dirs,
                 runtime_id,
                 event_tx,
             }),
@@ -2724,7 +2731,9 @@ impl RuntimeControl {
                     }
                 };
                 tokio::spawn(async move {
-                    let result = handle.reload_capabilities().await;
+                    let result = handle
+                        .reload_capabilities_with_plugin_skills(Some(plugin_skill_dirs))
+                        .await;
                     let _ = event_tx.send(bg_runtime::RuntimeEvent {
                         runtime_id,
                         event: bg_runtime::RuntimeEventPayload::Driver(
@@ -12102,11 +12111,9 @@ fn redraw_after_slash(
 /// assets become visible to the slash-command palette and the agent
 /// loop within the same session.
 ///
-/// Hook executor is NOT rebuilt here: in this codebase the executor
-/// lives entirely on the agent side (see `agent::mod` lines around
-/// 718–722) and is reconstructed per `cd`. New hook plugins therefore
-/// pick up at the next `/cd` (or process restart). Per spec §8 this
-/// deferred behavior is acceptable.
+/// The runtime capability reload below rebuilds the complete agent-side
+/// capability graph, including plugin skills and hooks, before publishing the
+/// replacement generation.
 /// Returns `(skills_loaded, skip_warnings)`. Caller decides how (and
 /// whether) to surface the warnings — the TUI gates them behind verbose
 /// mode (Ctrl+O) and always shows a `N loaded / M skipped` summary on
@@ -12120,7 +12127,11 @@ pub(crate) fn request_capability_reload(ctx: &mut LoopCtx) -> Result<(), String>
         return Err(crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned());
     }
     ctx.runtime
-        .reload_capabilities(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
+        .reload_capabilities(
+            atomcode_capabilities::plugin::loader::installed_plugin_skill_dirs(&ctx.working_dir),
+            ctx.foreground_runtime_id,
+            ctx.runtime_event_tx.clone(),
+        )
         .map_err(|error| {
             crate::i18n::t(crate::i18n::Msg::CmdCapabilityReloadFailed {
                 error: &error.to_string(),
@@ -12169,11 +12180,18 @@ fn complete_mcp_reload_notice(
     })
 }
 
+pub(crate) fn reload_skill_registry(
+    registry: &mut atomcode_capabilities::skills::SkillRegistry,
+    working_dir: &std::path::Path,
+) -> Vec<String> {
+    atomcode_capabilities::plugin::loader::reload_skill_registry(registry, working_dir)
+}
+
 pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
     let mut loaded = 0usize;
     let mut warnings = Vec::new();
     if let Ok(mut guard) = ctx.skill_registry.write() {
-        warnings = guard.reload(&ctx.working_dir);
+        warnings = reload_skill_registry(&mut guard, &ctx.working_dir);
         loaded = guard.all().count();
     }
     ctx.custom_commands = crate::custom_commands::CustomCommandRegistry::load(&ctx.working_dir);
@@ -14911,10 +14929,11 @@ pub(super) fn handle_plugin_job_event(
             renderer.flush();
         }
         PluginJobEvent::PluginAlreadyInstalled { id } => {
-            // Stale install? Try reload + expand so the user still
-            // gets an answer if the plugin was installed but not loaded.
+            // The files are already present, but this process may predate the
+            // install (or have missed an earlier reload). Always refresh both
+            // the UI registry and runtime capability graph.
+            let _ = reload_plugins(ctx);
             if let Some(topic) = ctx.pending_guide_topic.take() {
-                let _ = reload_plugins(ctx);
                 if let Some(rendered) = commands::expand_skill(ctx, "ask", &topic) {
                     renderer.render(UiLine::CommandOutput(
                         crate::i18n::t(crate::i18n::Msg::CmdGuideAutoInvoke { topic: &topic })

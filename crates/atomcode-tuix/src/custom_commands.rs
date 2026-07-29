@@ -115,7 +115,9 @@ impl CustomCommandRegistry {
             &mut commands,
         );
         // Plugin layer
-        for assets in atomcode_capabilities::plugin::loader::iter_installed_plugin_assets() {
+        for assets in
+            atomcode_capabilities::plugin::loader::iter_installed_plugin_assets_for(project_root)
+        {
             Self::load_from_dir(&assets.commands_dir(), Some(&assets.plugin), &mut commands);
         }
         Self { commands }

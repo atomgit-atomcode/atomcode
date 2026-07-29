@@ -2305,7 +2305,7 @@ async fn spawn_native_cli_runtime(
     };
     let prepare = atomcode_coding::PrepareOptions {
         session,
-        plugin_skill_dirs: atomcode_daemon::gather_plugin_skill_dirs(),
+        plugin_skill_dirs: atomcode_daemon::gather_plugin_skill_dirs_for(&cfg.working_dir),
         mcp: cfg.mcp,
         rate_limit_source: Some(atomcode_daemon::coding_plan_rate_limit_source()),
         ..atomcode_coding::PrepareOptions::default()

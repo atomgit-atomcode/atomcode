@@ -85,14 +85,7 @@ fn add_install_reload_flow() {
     // skill dirs — the two layers the retired `core::skill::reload` combined.
     let working = tempfile::tempdir().unwrap();
     let mut reg = atomcode_capabilities::skills::SkillRegistry::new();
-    reg.reload(working.path());
-    for assets in atomcode_capabilities::plugin::loader::iter_installed_plugin_assets() {
-        for sd in assets.skills_dirs() {
-            if sd.exists() {
-                reg.load_dir(&sd, Some(&assets.plugin));
-            }
-        }
-    }
+    atomcode_capabilities::plugin::loader::reload_skill_registry(&mut reg, working.path());
     assert!(reg.get("e2e:sk").is_some(), "missing skill e2e:sk");
 
     // Verify the TUI-owned CustomCommandRegistry sees `e2e:c`; plugin install
