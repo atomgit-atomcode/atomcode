@@ -100,6 +100,15 @@ pub const PRESETS: &[ProviderPreset] = &[
         model_source: ModelSource::DiscoveryApi,
     },
     ProviderPreset {
+        id: "taotoken",
+        display_name: "TaoToken",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://taotoken.net/api/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: None,
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
         id: "aliyun",
         display_name: "Alibaba Cloud Model Studio",
         provider_type: ProviderType::OpenAi,
@@ -227,13 +236,13 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// The curated vendor set (13 vendors + 2 generic compatible presets) must
+    /// The curated vendor set (14 vendors + 2 generic compatible presets) must
     /// all be present and resolvable by id.
     #[test]
     fn registry_covers_the_curated_vendors() {
         assert!(
-            PRESETS.len() >= 15,
-            "expected the curated vendor set (>=15), got {}",
+            PRESETS.len() >= 16,
+            "expected the curated vendor set (>=16), got {}",
             PRESETS.len()
         );
         for id in [
@@ -247,6 +256,7 @@ mod tests {
             "minimax",
             "siliconflow",
             "openrouter",
+            "taotoken",
             "openai",
             "anthropic",
             "ollama",
@@ -263,6 +273,19 @@ mod tests {
         for p in PRESETS {
             assert!(seen.insert(p.id), "duplicate preset id: {}", p.id);
         }
+    }
+
+    #[test]
+    fn taotoken_uses_its_openai_compatible_endpoint() {
+        let taotoken = preset("taotoken").expect("taotoken preset");
+        assert_eq!(taotoken.display_name, "TaoToken");
+        assert_eq!(taotoken.provider_type, ProviderType::OpenAi);
+        assert_eq!(
+            taotoken.default_base_url,
+            Some("https://taotoken.net/api/v1")
+        );
+        assert_eq!(taotoken.auth_kind, AuthKind::ApiKey);
+        assert_eq!(taotoken.model_source, ModelSource::Manual);
     }
 
     #[test]

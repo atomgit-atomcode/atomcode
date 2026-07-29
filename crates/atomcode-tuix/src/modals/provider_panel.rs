@@ -445,6 +445,29 @@ impl ProviderPanel {
         ids
     }
 
+    /// Human-facing account label. Stable account ids remain the selection and
+    /// persistence keys; only preset-shaped accounts inherit the preset's
+    /// display name so custom account ids are never relabelled as their wire
+    /// provider.
+    fn account_label(config: &Config, id: &str) -> String {
+        if let Some(account) = config.provider_accounts.get(id) {
+            if let Some(display_name) = account
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                return display_name.to_string();
+            }
+            if account.provider != id {
+                return id.to_string();
+            }
+        }
+        provider_preset::preset(id)
+            .map(|preset| preset.display_name.to_string())
+            .unwrap_or_else(|| id.to_string())
+    }
+
     /// Model selection ids grouped by account (matches the /model order).
     fn model_ids(config: &Config) -> Vec<String> {
         let models = config.logical_models();
@@ -1183,7 +1206,7 @@ impl Modal for ProviderPanel {
                                     });
                                 format!("{vendor} · {model_count}{mark}")
                             };
-                            items.push((id.clone(), desc));
+                            items.push((Self::account_label(&ctx.config, id), desc));
                         }
                         // Trailing "+ 添加自定义 provider" affordance (also Ctrl+A).
                         items.push(("＋ 添加自定义 provider".to_string(), String::new()));
@@ -1600,6 +1623,11 @@ mod tests {
             ids.first() == Some(&"AtomGit".to_string()),
             "configured first"
         );
+        assert_eq!(
+            ids.get(1).map(String::as_str),
+            Some("taotoken"),
+            "TaoToken should be the first quick-add vendor below AtomGit"
+        );
         assert!(
             ids.contains(&"deepseek".to_string()),
             "unconfigured vendor listed"
@@ -1616,6 +1644,29 @@ mod tests {
         // A keyed preset vendor prompts for a key when you add its first model.
         assert!(account_needs_key(&cfg, "deepseek"));
         assert!(!account_needs_key(&cfg, "AtomGit"));
+    }
+
+    #[test]
+    fn account_label_uses_preset_display_name_without_replacing_custom_ids() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "custom-openai": { "provider": "openai" },
+                "named": { "provider": "openai", "display_name": "My Gateway" },
+                "taotoken": { "provider": "taotoken" }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(ProviderPanel::account_label(&cfg, "taotoken"), "TaoToken");
+        assert_eq!(
+            ProviderPanel::account_label(&Config::default(), "taotoken"),
+            "TaoToken"
+        );
+        assert_eq!(
+            ProviderPanel::account_label(&cfg, "custom-openai"),
+            "custom-openai"
+        );
+        assert_eq!(ProviderPanel::account_label(&cfg, "named"), "My Gateway");
     }
 
     #[test]
