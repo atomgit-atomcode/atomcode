@@ -1355,11 +1355,7 @@ impl Modal for PluginManager {
             if let Some(desc) = description {
                 let trimmed = desc.trim();
                 if !trimmed.is_empty() {
-                    let truncated = if trimmed.len() > 60 {
-                        format!("{}...", &trimmed[..57])
-                    } else {
-                        trimmed.to_string()
-                    };
+                    let truncated = truncate_plugin_desc(trimmed);
                     final_items.push((
                         format!("  Description: {}{}\x1b[39m", muted_esc(), truncated),
                         String::new(),
@@ -1434,11 +1430,7 @@ impl Modal for PluginManager {
                         if let Some(desc) = description {
                             let trimmed = desc.trim();
                             if !trimmed.is_empty() {
-                                let truncated = if trimmed.len() > 60 {
-                                    format!("{}...", &trimmed[..57])
-                                } else {
-                                    trimmed.to_string()
-                                };
+                                let truncated = truncate_plugin_desc(trimmed);
                                 final_items.push((
                                     format!("    {}{}\x1b[39m", muted_esc(), truncated),
                                     String::new(),
@@ -1615,6 +1607,15 @@ fn get_directory_modified_date(name: &str) -> String {
     "unknown".to_string()
 }
 
+/// Truncate a plugin description for single-line display in the manager.
+/// `trimmed` is caller-trimmed and non-empty. Uses the grapheme/CJK-safe
+/// `truncate_with_ellipsis` (display-column budget of 60) — a raw byte slice
+/// here would panic on a non-ASCII description and, under `panic = "abort"`,
+/// crash the whole process.
+fn truncate_plugin_desc(trimmed: &str) -> String {
+    crate::width::truncate_with_ellipsis(trimmed, 60)
+}
+
 fn is_official_marketplace(source: &str) -> bool {
     source == "https://atomgit.com/atomgit_atomcode/atomcode-plugins-official.git"
         || source == "git@atomgit.com:atomgit_atomcode/atomcode-plugins-official.git"
@@ -1787,6 +1788,29 @@ mod tests {
         assert_eq!(m.url_input, "git");
         m.url_input.pop();
         assert_eq!(m.url_input, "gi");
+    }
+
+    /// Regression: a plugin description containing CJK text must not panic when
+    /// truncated. The old code byte-sliced `&trimmed[..57]`, which panics when
+    /// byte 57 lands inside a multi-byte character — and under `panic = "abort"`
+    /// that aborts the whole process (repro: `/plugin` → a large official
+    /// marketplace with Chinese descriptions → Update). Two ASCII bytes then 20
+    /// 3-byte CJK chars = 62 bytes > 60, and byte 57 sits inside the char
+    /// spanning bytes 56–58, so `[..57]` is not on a char boundary.
+    #[test]
+    fn truncate_plugin_desc_cjk_does_not_panic() {
+        let desc = format!("ab{}", "描".repeat(20));
+        assert!(desc.len() > 60, "fixture must exceed the truncation threshold");
+        assert!(
+            !desc.is_char_boundary(57),
+            "fixture must straddle byte 57 to exercise the old panic"
+        );
+        let out = truncate_plugin_desc(&desc); // must not panic
+        assert!(!out.is_empty());
+        assert!(
+            crate::width::display_width(&out) <= 60,
+            "truncated description must fit the display budget"
+        );
     }
 
     #[test]
