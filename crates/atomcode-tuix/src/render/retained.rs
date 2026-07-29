@@ -1016,33 +1016,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     /// A full-block-width row of `bg`-styled spaces — the top/bottom padding
-    /// lines that give the user-input block its "breathing" block look.
+    /// lines that give the user-input block its "breathing" block look. Fills
+    /// to `w = screen.width() − PAD_COL` via the shared `pad_row_to_width`,
+    /// leaving the same right margin the content rows do (which also avoids
+    /// writing the final column and its auto-wrap hazard).
     fn bg_blank_row(w: usize, bg: &CellStyle) -> Vec<Cell> {
         let mut row = Vec::with_capacity(w);
-        for _ in 0..w {
-            row.push(Cell {
-                ch: ' ',
-                style: bg.clone(),
-                width: 1,
-            });
-        }
+        Self::pad_row_to_width(&mut row, w, bg.clone());
         row
-    }
-
-    /// Extend `row` with `bg`-styled spaces until it spans `w` display
-    /// columns, so the background reads as one full-width block. `w` is
-    /// `screen.width() − PAD_COL`, matching `build_prefixed_rows`' wrap
-    /// budget and leaving the same right margin (which also avoids writing
-    /// the final column and its auto-wrap hazard).
-    fn pad_row_bg(row: &mut Vec<Cell>, w: usize, bg: &CellStyle) {
-        let cur: usize = row.iter().map(|c| c.width as usize).sum();
-        for _ in cur..w {
-            row.push(Cell {
-                ch: ' ',
-                style: bg.clone(),
-                width: 1,
-            });
-        }
     }
 
     /// Theme-aware muting via SGR 2 (faint). Renders the role's fg
@@ -6581,7 +6562,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Some((self.caps.prompt_continuation_bar(), &accent)),
         );
         for row in &mut rows {
-            Self::pad_row_bg(row, w, &bg);
+            Self::pad_row_to_width(row, w, bg.clone());
         }
         for row in rows {
             self.push_body_row(row);
@@ -6600,7 +6581,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 Some((&indent, &bg)),
             );
             for row in &mut arows {
-                Self::pad_row_bg(row, w, &bg);
+                Self::pad_row_to_width(row, w, bg.clone());
             }
             for row in arows {
                 self.push_body_row(row);
