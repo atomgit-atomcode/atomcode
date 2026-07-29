@@ -77,6 +77,29 @@ test('live control APIs reject protocol-level failures', async () => {
   }
 });
 
+test('postLiveUserInput rejects an answer the runtime did not accept', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({ accepted: false }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } },
+  )) as typeof fetch;
+
+  try {
+    const { postLiveUserInput } = await import('./api.ts');
+    await assert.rejects(
+      () => postLiveUserInput({
+        request_id: 42,
+        declined: false,
+        selected: ['继续'],
+        text: null,
+      }),
+      /did not accept/i,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('collection APIs reject server error payloads instead of returning non-arrays', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(

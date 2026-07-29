@@ -1768,10 +1768,13 @@ pub(crate) async fn live_user_input(
             "text": req.text,
         }),
     };
-    let ok = crate::native_live::respond_confirmed(req.request_id, value)
-        .await
-        .is_ok();
-    axum::Json(serde_json::json!({ "accepted": ok }))
+    match crate::native_live::respond_confirmed(req.request_id, value).await {
+        Ok(()) => axum::Json(serde_json::json!({ "accepted": true })),
+        Err(error) => axum::Json(serde_json::json!({
+            "accepted": false,
+            "error": format!("user input request was not accepted: {error:?}"),
+        })),
+    }
 }
 
 #[derive(serde::Deserialize)]

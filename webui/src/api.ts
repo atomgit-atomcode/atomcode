@@ -930,5 +930,9 @@ export async function postLiveUserInput(
     body: JSON.stringify(body),
   });
   if (!resp.ok) throw new Error(`answer live user input failed: ${resp.status}`);
-  return resp.json();
+  const result = await resp.json() as { accepted: boolean; error?: string };
+  if (!result.accepted) {
+    throw new Error(result.error ?? 'live runtime did not accept the user input answer');
+  }
+  return result;
 }

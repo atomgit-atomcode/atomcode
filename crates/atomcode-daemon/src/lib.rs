@@ -1378,6 +1378,38 @@ fn catalog_entry_with_project(
     }
 }
 
+fn active_catalog_location() -> Option<atomcode_capabilities::session::CatalogLocation> {
+    crate::native_live::binding().ok().map(|binding| {
+        atomcode_capabilities::session::CatalogLocation {
+            id: binding.session_id,
+            project_bucket:
+                atomcode_capabilities::session::SessionManager::project_hash(
+                    &binding.working_dir,
+                ),
+        }
+    })
+}
+
+fn catalog_entry_is_visible(
+    sessions_root: &std::path::Path,
+    entry: &atomcode_capabilities::session::CatalogEntry,
+    active: Option<&atomcode_capabilities::session::CatalogLocation>,
+) -> bool {
+    if entry.message_count > 0 {
+        return true;
+    }
+    if active.is_some_and(|location| {
+        location.id == entry.id && location.project_bucket == entry.project_bucket
+    }) {
+        return true;
+    }
+    if entry.presence == atomcode_capabilities::session::CatalogPresence::LegacyOnly {
+        return false;
+    }
+    NativeSessionManager::with_root(sessions_root.join(&entry.project_bucket))
+        .has_valid_inflight_snapshot(&entry.id)
+}
+
 static SESSION_CATALOG_IO: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// Run bulk catalog scans off the async runtime and serialize them so queued
@@ -1401,17 +1433,26 @@ where
 
 /// List sessions for a project
 fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionSummary>> {
-    list_sessions_in_root(&NativeSessionManager::sessions_root(), project_hash)
+    let active = active_catalog_location();
+    list_sessions_in_root(
+        &NativeSessionManager::sessions_root(),
+        project_hash,
+        active.as_ref(),
+    )
 }
 
 fn list_sessions_in_root(
     sessions_root: &std::path::Path,
     project_hash: &str,
+    active: Option<&atomcode_capabilities::session::CatalogLocation>,
 ) -> std::io::Result<Vec<SessionSummary>> {
     let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
         .entries
         .into_iter()
-        .filter(|entry| entry.project_bucket == project_hash && entry.message_count > 0)
+        .filter(|entry| {
+            entry.project_bucket == project_hash
+                && catalog_entry_is_visible(sessions_root, entry, active)
+        })
         .collect();
     NativeSessionManager::collapse_fork_lineages(&mut entries);
     crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
@@ -1423,16 +1464,18 @@ fn list_sessions_in_root(
 
 /// List all sessions across all projects
 fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
-    list_all_sessions_in_root(&NativeSessionManager::sessions_root())
+    let active = active_catalog_location();
+    list_all_sessions_in_root(&NativeSessionManager::sessions_root(), active.as_ref())
 }
 
 fn list_all_sessions_in_root(
     sessions_root: &std::path::Path,
+    active: Option<&atomcode_capabilities::session::CatalogLocation>,
 ) -> std::io::Result<Vec<SessionMetaWithProject>> {
     let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
         .entries
         .into_iter()
-        .filter(|entry| entry.message_count > 0)
+        .filter(|entry| catalog_entry_is_visible(sessions_root, entry, active))
         .collect();
     NativeSessionManager::collapse_fork_lineages(&mut entries);
     // Bound snapshot hydration to the same newest-50 surface the API returns.
@@ -6104,7 +6147,7 @@ mod tests {
             .unwrap();
         drop(lease);
 
-        let sessions = list_sessions_in_root(tmp.path(), project_bucket).unwrap();
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, None).unwrap();
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "修复 VS Code 历史标题");
@@ -6112,6 +6155,70 @@ mod tests {
             manager.read_meta(session_id).unwrap().name,
             "修复 VS Code 历史标题"
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_listing_keeps_a_zero_count_session_with_valid_inflight_work() {
+        use atomcode_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, SnapshotHook, StorageOwner,
+        };
+        use atomcode_kernel::hook::LifecycleHooks;
+        use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let session_id = "running-first-turn";
+        let manager = std::sync::Arc::new(SessionManager::with_root(
+            tmp.path().join(project_bucket),
+        ));
+        let lease = manager.acquire_lease(session_id).unwrap();
+        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&SessionSnapshot::new(Vec::new())),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+
+        let hook =
+            SnapshotHook::new(manager.clone(), session_id, "/project").with_lease(lease);
+        let mut conversation = Conversation::default();
+        conversation.push(Message::user("正在执行的首轮任务"));
+        hook.turn_start(&mut conversation).await;
+
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, None).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_id);
+        assert_eq!(
+            sessions[0].message_count, 0,
+            "catalog meta remains canonical until turn completion"
+        );
+    }
+
+    #[test]
+    fn daemon_listing_exposes_only_the_active_empty_session() {
+        use atomcode_capabilities::session::{CatalogLocation, SessionManager, SessionMeta};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let manager = SessionManager::with_root(tmp.path().join(project_bucket));
+        for id in ["active-empty", "unused-empty"] {
+            manager
+                .write_meta(&SessionMeta::new(id, "/project", 1))
+                .unwrap();
+        }
+        let active = CatalogLocation {
+            id: "active-empty".into(),
+            project_bucket: project_bucket.into(),
+        };
+
+        let sessions =
+            list_sessions_in_root(tmp.path(), project_bucket, Some(&active)).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "active-empty");
     }
 
     #[test]
@@ -6141,7 +6248,7 @@ mod tests {
             .unwrap();
         drop(lease);
 
-        let global = list_all_sessions_in_root(tmp.path()).unwrap();
+        let global = list_all_sessions_in_root(tmp.path(), None).unwrap();
         let search = search_sessions_by_name_in_root(tmp.path(), "可搜索").unwrap();
 
         assert_eq!(global.len(), 1);
@@ -6170,7 +6277,7 @@ mod tests {
         )
         .unwrap();
 
-        let sessions = list_sessions_in_root(tmp.path(), project_bucket).unwrap();
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, None).unwrap();
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "inspect this image");
@@ -6193,7 +6300,7 @@ mod tests {
             manager.write_meta(&meta).unwrap();
         }
 
-        let sessions = list_all_sessions_in_root(tmp.path()).unwrap();
+        let sessions = list_all_sessions_in_root(tmp.path(), None).unwrap();
 
         assert_eq!(sessions.len(), 50);
         assert_eq!(sessions[0].meta.id, "history-50");

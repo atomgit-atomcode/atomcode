@@ -1116,8 +1116,9 @@ impl SessionManager {
         };
         let bytes = serialize_bounded(&checkpoint, "inflight snapshot", MAX_SNAPSHOT_BYTES)?;
         // No meta lock — the inflight file is independent of the canonical
-        // snapshot/meta/presentation aggregate and never participates in catalog
-        // reads.
+        // snapshot/meta/presentation aggregate. Catalog readers may use only its
+        // validated existence as a visibility signal; its contents never replace
+        // canonical metadata in a list projection.
         atomic_write(&self.inflight_path(id)?, &bytes)
     }
 
@@ -1178,10 +1179,17 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Whether an inflight snapshot exists for `id` — i.e. the previous session
-    /// terminated abnormally mid-turn. Drivers can call this after resume to
-    /// inform the user that their last turn was interrupted and partially
-    /// recovered.
+    /// Whether `id` has a well-formed inflight checkpoint.
+    ///
+    /// This is a read-only driver/catalog projection seam. It does not imply the
+    /// checkpoint is replay-safe: once model processing starts, the checkpoint
+    /// remains useful evidence that a zero-count session has accepted work even
+    /// though automatic replay may be disabled.
+    pub fn has_valid_inflight_snapshot(&self, id: &str) -> bool {
+        matches!(self.load_inflight_snapshot(id), Ok(Some(_)))
+    }
+
+    /// Test-only raw existence check used by cleanup/failure-path assertions.
     #[cfg(test)]
     pub(crate) fn has_inflight_snapshot(&self, id: &str) -> bool {
         self.inflight_path(id).map(|p| p.exists()).unwrap_or(false)
