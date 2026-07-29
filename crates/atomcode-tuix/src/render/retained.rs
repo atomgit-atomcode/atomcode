@@ -13242,18 +13242,16 @@ mod tests {
             .find(|r| vterm.row_text(*r).contains("Hello world"))
             .unwrap_or_else(|| panic!("Hello world missing:\n{}", vterm.dump()));
 
-        // The user block now emits a bg-padding row above and below the content
-        // row, so there are 3 rows between user content and assistant text
-        // (bg_blank_bottom + paragraph_blank + assistant_text). The test
-        // verifies no ghost blank was inserted by the leading '\n' in the model
-        // output — if it were, the gap would be 4.
+        // The background hugs the user content, leaving one paragraph blank
+        // before assistant text. A leading '\n' from the model must not add a
+        // second ghost spacer.
         assert_eq!(
             hello_row - user_row,
-            3,
-            "expected 2 blank rows between user and assistant, got {} \
+            2,
+            "expected 1 blank row between user and assistant, got {} \
              blank row(s) — leading `\\n` from model created a ghost \
              spacer:\n{}",
-            hello_row.saturating_sub(user_row).saturating_sub(2),
+            hello_row.saturating_sub(user_row).saturating_sub(1),
             vterm.dump()
         );
     }
@@ -13301,19 +13299,16 @@ mod tests {
 
         // Expected layout (bottom-anchored):
         //   <user_row>:     "❯ hi-from-user"
-        //   <user_row + 1>: blank (bg_blank_bottom padding row)
-        //   <user_row + 2>: blank (UiLine::User's paragraph spacer)
-        //   <user_row + 3>: "Hello world"  ← replaced spinner in-place
+        //   <user_row + 1>: blank (UiLine::User's paragraph spacer)
+        //   <user_row + 2>: "Hello world"  ← replaced spinner in-place
         //
-        // The user block now has a bg padding row below the content, so
-        // there are 2 blank rows between content and assistant. No extra
-        // gap introduced by spinner replacement would make it 4 blanks.
+        // No extra gap may be introduced by spinner replacement.
         assert_eq!(
             hello_row - user_row,
-            3,
-            "expected 2 spacer rows between user and assistant, got {} \
+            2,
+            "expected 1 spacer row between user and assistant, got {} \
              rows gap:\n{}",
-            hello_row.saturating_sub(user_row).saturating_sub(2),
+            hello_row.saturating_sub(user_row).saturating_sub(1),
             vterm.dump()
         );
     }
@@ -13366,10 +13361,10 @@ mod tests {
 
         assert_eq!(
             spin_row - user_row,
-            3,
-            "expected exactly 2 blank rows between user message and \
-            spinner (bg_blank_bottom + paragraph spacer), got {} blank row(s):\n{}",
-            spin_row.saturating_sub(user_row).saturating_sub(2),
+            2,
+            "expected exactly 1 paragraph blank between user message and \
+            spinner, got {} blank row(s):\n{}",
+            spin_row.saturating_sub(user_row).saturating_sub(1),
             vterm.dump()
         );
     }
@@ -13423,8 +13418,8 @@ mod tests {
 
         assert_eq!(
             user_row - output_row,
-            3,
-            "local command output and the next user message need paragraph blank + bg_blank_top rows"
+            2,
+            "local command output and the next user message need one paragraph blank"
         );
         assert!(
             vterm.row_text(output_row + 1).trim().is_empty(),
@@ -13443,12 +13438,11 @@ mod tests {
 
         // The first user event already supplied its trailing spacer. The
         // second event must reuse it rather than introducing another blank.
-        // Each user block is now 4 rows: bg_blank_top + content + bg_blank_bottom + paragraph blank.
-        // The second message reuses the trailing paragraph blank from the first, so it adds 4 rows.
-        assert_eq!(r.body_lines.len(), rows_after_first + 4);
+        // Each user block is content + paragraph blank. The second message
+        // reuses the first block's trailing blank as its leading boundary.
+        assert_eq!(r.body_lines.len(), rows_after_first + 2);
         assert!(r.body_lines[rows_after_first - 1].is_empty());
-        // Content row is offset by 1 due to the new bg_blank_top padding row.
-        assert!(r.body_lines[rows_after_first + 1]
+        assert!(r.body_lines[rows_after_first]
             .iter()
             .map(|cell| cell.ch)
             .collect::<String>()
@@ -13511,9 +13505,8 @@ mod tests {
 
         assert_eq!(
             spinner_row - user_row,
-            3,
-            "full viewport must retain exactly two blank rows between user and spinner \
-             (bg_blank_bottom + paragraph spacer):\n{}",
+            2,
+            "full viewport must retain exactly one paragraph blank between user and spinner:\n{}",
             vterm.dump()
         );
         assert_eq!(
@@ -16176,9 +16169,9 @@ mod tests {
             attachments: Vec::new(),
         });
         let empty_footer_rows = r.current_footer_rows();
-        // One leading separator + bg_blank_top + two text rows + bg_blank_bottom +
-        // trailing separator appended by `push_user_message` = 6 rows total.
-        let body_rows_before_echo = 12usize.saturating_sub(empty_footer_rows + 6);
+        // One leading separator + two text rows + trailing separator appended
+        // by `push_user_message` = 4 rows total.
+        let body_rows_before_echo = 12usize.saturating_sub(empty_footer_rows + 4);
         for i in 0..body_rows_before_echo {
             r.push_body_text(&format!("prior-{i}"), &CellStyle::default());
         }
@@ -16621,15 +16614,15 @@ mod tests {
     #[test]
     fn retained_message_marks_decremented_on_drain() {
         let (mut r, _buf) = new_capturing(80, 24);
-        // Each UiLine::User pushes 4 body rows (bg_blank_top + text + bg_blank_bottom + spacer).
-        // 5005 users → 20020 body rows. drain = 20020 - 5000 = 15020 rows from front.
-        // Marks at line_idx < 15020 are dropped; the first surviving mark is at
-        // original idx=15020, which normalises to 0 after subtracting the drain.
+        // Each UiLine::User pushes 2 body rows (text + paragraph spacer).
+        // 5005 users → 10010 body rows. drain = 10010 - 5000 = 5010 rows from front.
+        // Marks at line_idx < 5010 are dropped; the first surviving mark is at
+        // original idx=5010, which normalises to 0 after subtracting the drain.
         for i in 0..5005 {
             r.render(UiLine::User(format!("line {}", i)));
         }
-        // 15020 / 4 = 3755 marks dropped; 5005 - 3755 = 1250 survive.
-        assert_eq!(r.message_marks.len(), 1250);
+        // 5010 / 2 = 2505 marks dropped; 5005 - 2505 = 2500 survive.
+        assert_eq!(r.message_marks.len(), 2500);
         assert_eq!(
             r.message_marks[0].line_idx, 0,
             "first surviving mark should point at body_lines[0] after drain"
