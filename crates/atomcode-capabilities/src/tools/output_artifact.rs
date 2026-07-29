@@ -57,6 +57,20 @@ impl ArtifactStore {
         let end = start.saturating_add(limit).min(bytes.len());
         Ok(Some(bytes[start..end].to_vec()))
     }
+
+    /// Byte length of a stored artifact — an O(1) `metadata` stat, so the fetch
+    /// pagination hint doesn't re-read the whole (≤4 MiB) blob just for its size.
+    /// `Ok(None)` for a missing file or an id that isn't `[0-9a-f]{16}`.
+    pub fn size(&self, id: &str) -> std::io::Result<Option<u64>> {
+        if !is_valid_id(id) {
+            return Ok(None);
+        }
+        match std::fs::metadata(self.dir.join(id)) {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 pub const THRESHOLD_BYTES: usize = 16 * 1024;
@@ -163,6 +177,16 @@ mod tests {
         assert_eq!(store.get(&id, 100, 4).unwrap().unwrap(), b"");
         // limit past end → clamped
         assert_eq!(store.get(&id, 14, 999).unwrap().unwrap(), b"ef");
+    }
+
+    #[test]
+    fn size_is_metadata_len_and_none_for_missing_or_bad_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::ArtifactStore::new(dir.path());
+        let id = store.put(&b"z".repeat(1234)).unwrap();
+        assert_eq!(store.size(&id).unwrap(), Some(1234));
+        assert_eq!(store.size("0123456789abcdef").unwrap(), None); // absent
+        assert_eq!(store.size("../etc/passwd").unwrap(), None); // traversal → rejected
     }
 
     #[test]
@@ -282,65 +306,44 @@ artifact is unavailable, re-run the original command instead."
         args: &str,
         _ctx: &atomcode_kernel::tool::ToolContext,
     ) -> atomcode_kernel::tool::ToolResult {
-        let call_id = String::new();
         let parsed: FetchArgs = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => {
-                return atomcode_kernel::tool::ToolResult {
-                    call_id,
-                    content: format!("invalid fetch_output args: {e}"),
-                    is_error: true,
-                    images: vec![],
-                }
-            }
+            Err(e) => return super::err(format!("invalid fetch_output args: {e}")),
         };
 
         let limit = parsed.limit.unwrap_or(FETCH_MAX_LIMIT).min(FETCH_MAX_LIMIT);
 
         match self.store.get(&parsed.artifact_id, parsed.offset, limit) {
             Ok(Some(bytes)) => {
-                // Get total size for pagination hint.
+                // Total via an O(1) metadata stat, not a full re-read.
                 let total = self
                     .store
-                    .get(&parsed.artifact_id, 0, usize::MAX)
-                    .map(|o| o.map(|b| b.len()).unwrap_or(0))
-                    .unwrap_or(0);
-                let end = parsed.offset + bytes.len();
+                    .size(&parsed.artifact_id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0) as usize;
+                // Clamp the reported window to the artifact so an offset past the
+                // end yields a coherent "at end" hint (never "5000–5000 of 3000").
+                // `start <= total` holds, so `end` lands in `[start, total]`.
+                let start = parsed.offset.min(total);
+                let end = start.saturating_add(bytes.len()).min(total);
                 let body = String::from_utf8_lossy(&bytes);
                 let hint = if end < total {
                     format!(
-                        "\n\n[showing bytes {}–{} of {}; call fetch_output(artifact_id=\"{}\", offset={}) for more]",
-                        parsed.offset, end, total, parsed.artifact_id, end
+                        "\n\n[showing bytes {start}–{end} of {total}; call fetch_output(artifact_id=\"{}\", offset={end}) for more]",
+                        parsed.artifact_id
                     )
                 } else {
-                    format!(
-                        "\n\n[showing bytes {}–{} of {} (end)]",
-                        parsed.offset, end, total
-                    )
+                    format!("\n\n[showing bytes {start}–{end} of {total} (end)]")
                 };
-                atomcode_kernel::tool::ToolResult {
-                    call_id,
-                    content: format!("{}{}", body, hint),
-                    is_error: false,
-                    images: vec![],
-                }
+                super::ok(format!("{body}{hint}"))
             }
-            Ok(None) => atomcode_kernel::tool::ToolResult {
-                call_id,
-                content: format!(
-                    "Artifact {} is no longer available (truncated captures don't survive across machines or after cleanup). \
+            Ok(None) => super::err(format!(
+                "Artifact {} is no longer available (truncated captures don't survive across machines or after cleanup). \
 Re-run the original command to regenerate its output.",
-                    parsed.artifact_id
-                ),
-                is_error: true,
-                images: vec![],
-            },
-            Err(e) => atomcode_kernel::tool::ToolResult {
-                call_id,
-                content: format!("fetch_output failed: {}", e),
-                is_error: true,
-                images: vec![],
-            },
+                parsed.artifact_id
+            )),
+            Err(e) => super::err(format!("fetch_output failed: {e}")),
         }
     }
 }
@@ -424,6 +427,23 @@ mod fetch_output_tests {
         assert!(
             !r.content.to_lowercase().contains("try fetch again"),
             "error should not suggest fetching again: {}",
+            r.content
+        );
+
+        // offset PAST the end → coherent "at end" hint, not "N–N of <smaller>".
+        let small = std::sync::Arc::new(ArtifactStore::new(dir.path()));
+        let sid = small.put(b"abc").unwrap(); // 3 bytes
+        let tool2 = FetchOutputTool::new(small);
+        let r = tool2
+            .execute(
+                &format!(r#"{{"artifact_id":"{}","offset":5000,"limit":10}}"#, sid),
+                &test_ctx,
+            )
+            .await;
+        assert!(!r.is_error, "past-end fetch is not an error: {}", r.content);
+        assert!(
+            r.content.contains("3–3 of 3 (end)"),
+            "past-end window clamps to total, coherent hint: {}",
             r.content
         );
     }
