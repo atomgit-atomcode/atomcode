@@ -9776,6 +9776,44 @@ fn handle_input(
             modifiers,
             ..
         }) => {
+            // A raw Ctrl+V reaches us as a key event rather than bracketed
+            // paste on several terminals. While a modal owns input, treat it as
+            // text paste before modal key handling; otherwise forms receive a
+            // literal `v` and URLs/API keys appear impossible to paste.
+            //
+            // Ctrl+Shift+V remains untouched for terminals that translate it
+            // into bracketed paste. Image attachment is intentionally skipped
+            // while a modal is open because provider/password fields are text.
+            if app.active_modal.is_some() && is_paste_image_chord(code, modifiers) {
+                if let Some(text) = try_paste_clipboard_text() {
+                    let streaming = matches!(app.state.phase, UiPhase::Streaming);
+                    if let Some(modal) = app.active_modal.as_mut() {
+                        let action = modal.handle_paste(
+                            &text,
+                            &mut app.buf,
+                            &mut app.state,
+                            ctx,
+                            renderer,
+                        )?;
+                        if matches!(action, ModalAction::Close) {
+                            app.active_modal = None;
+                            if streaming {
+                                draw_spinner_now(
+                                    &mut app.state,
+                                    &app.buf,
+                                    ctx,
+                                    renderer,
+                                    app.message_queue.len(),
+                                    app.menu.selected,
+                                );
+                            } else {
+                                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
             // A capturing modal (the password prompt) installs mid-turn while a
             // tool runs (phase == Streaming). It must receive EVERY key
             // regardless of phase — otherwise typed chars leak into the

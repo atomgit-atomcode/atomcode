@@ -389,6 +389,41 @@ const LIST_HEADER_ROWS: usize = 4;
 const ADD_PROVIDER_ROW: &str = "\u{1}add-provider";
 
 impl ProviderPanel {
+    /// Apply a single-line paste to the field currently being edited.
+    ///
+    /// Provider form values are all single-line. Normalize terminal line
+    /// endings and use only the first pasted line so an accidental trailing
+    /// newline cannot leak into an account id, URL, key, or model name.
+    fn apply_paste_text(&mut self, text: &str) {
+        let clean = text.trim().split(['\r', '\n']).next().unwrap_or("").trim();
+        match &mut self.mode {
+            Mode::Add(form) => match form.focus {
+                FormField::ApiKey => form.api_key.push_str(clean),
+                FormField::BaseUrl => form.base_url.push_str(clean),
+                FormField::Name => form.name.push_str(clean),
+                FormField::Preset => {}
+            },
+            Mode::EditAccount(form) => match form.focus {
+                FormField::ApiKey => form.api_key.push_str(clean),
+                FormField::BaseUrl => form.base_url.push_str(clean),
+                FormField::Name | FormField::Preset => {}
+            },
+            Mode::Model(form) => match form.focus {
+                ModelField::ApiKey => form.api_key.push_str(clean),
+                ModelField::Model => form.model.push_str(clean),
+                ModelField::Window => form
+                    .window
+                    .extend(clean.chars().filter(char::is_ascii_digit)),
+                ModelField::Account | ModelField::MakeDefault => {}
+            },
+            Mode::List => {
+                self.query.push_str(clean);
+                self.selected = 0;
+                self.pending_delete = None;
+            }
+        }
+    }
+
     pub fn open() -> Self {
         Self {
             tab: Tab::Accounts,
@@ -1458,22 +1493,7 @@ impl Modal for ProviderPanel {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
-        let clean = text.trim().lines().next().unwrap_or("").trim();
-        match &mut self.mode {
-            Mode::Add(form) => match form.focus {
-                FormField::ApiKey => form.api_key.push_str(clean),
-                FormField::BaseUrl => form.base_url.push_str(clean),
-                FormField::Name => form.name.push_str(clean),
-                _ => {}
-            },
-            // Paste into the search filter.
-            Mode::List => {
-                self.query.push_str(clean);
-                self.selected = 0;
-                self.pending_delete = None;
-            }
-            _ => {}
-        }
+        self.apply_paste_text(text);
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
     }
@@ -1564,6 +1584,67 @@ mod tests {
         assert_eq!(edit.model, "deepseek-chat");
         assert_eq!(edit.window, "131072");
         assert_eq!(edit.edit_id.as_deref(), Some("acc/m"));
+    }
+
+    #[test]
+    fn paste_routes_to_account_and_model_form_fields() {
+        let mut panel = ProviderPanel::open();
+
+        let mut add = AddForm::new();
+        add.focus = FormField::BaseUrl;
+        panel.mode = Mode::Add(add);
+        panel.apply_paste_text("  https://api.example.test/v1\r\nignored");
+        let Mode::Add(add) = &panel.mode else {
+            panic!("expected add-account form");
+        };
+        assert_eq!(add.base_url, "https://api.example.test/v1");
+
+        panel.apply_paste_text("\n\n  /with-leading-newlines\r\nignored");
+        let Mode::Add(add) = &panel.mode else {
+            panic!("expected add-account form");
+        };
+        assert_eq!(
+            add.base_url,
+            "https://api.example.test/v1/with-leading-newlines"
+        );
+
+        let mut edit = EditForm {
+            id: "account".into(),
+            is_legacy: false,
+            preset_idx: compat_preset_idx(false),
+            original_preset_idx: compat_preset_idx(false),
+            vendor_locked: false,
+            api_key: String::new(),
+            base_url: String::new(),
+            focus: FormField::ApiKey,
+        };
+        edit.focus = FormField::ApiKey;
+        panel.mode = Mode::EditAccount(edit);
+        panel.apply_paste_text("  sk-provider-key  \n");
+        let Mode::EditAccount(edit) = &panel.mode else {
+            panic!("expected edit-account form");
+        };
+        assert_eq!(edit.api_key, "sk-provider-key");
+
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "openai", "api_key": "configured" } }
+        }))
+        .unwrap();
+        let mut model = ModelForm::new_add(&cfg, Some("acc")).unwrap();
+        model.focus = ModelField::Model;
+        panel.mode = Mode::Model(model);
+        panel.apply_paste_text("  vendor/model-name  \r");
+        let Mode::Model(model) = &mut panel.mode else {
+            panic!("expected model form");
+        };
+        assert_eq!(model.model, "vendor/model-name");
+
+        model.focus = ModelField::Window;
+        panel.apply_paste_text("128K tokens");
+        let Mode::Model(model) = &panel.mode else {
+            panic!("expected model form");
+        };
+        assert_eq!(model.window, "128");
     }
 
     #[test]
