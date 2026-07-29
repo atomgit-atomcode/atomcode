@@ -14776,7 +14776,17 @@ fn turn_summary_label(
         // Streaming→Idle redraw can clobber it, but this line renders cleanly at
         // Idle. `.take()` consumes it so it can't leak into a later turn.
         let reason = state.last_turn_error.take();
-        let reason = reason.as_deref().map(summary_reason_headline);
+        // If a visible line already showed the cause this turn (red Error line /
+        // muted rate-limit line), render a bare `✗ 已中断 · …` — folding the same
+        // reason here would duplicate it. Only fold when nothing showed it above
+        // (the original "no cause visible anywhere" case). `.take()` the flag so
+        // it can't leak into a later turn's summary.
+        let shown_above = std::mem::replace(&mut state.turn_error_line_shown, false);
+        let reason = if shown_above {
+            None
+        } else {
+            reason.as_deref().map(summary_reason_headline)
+        };
         // An errored turn already rendered a red Error line just above; a
         // celebratory "✓ Nailed it" under it is contradictory, and we don't
         // burn a DONE_LABELS rotation slot on a failure.
@@ -14793,6 +14803,7 @@ fn turn_summary_label(
         // produced no summary (SnapshotUnavailable / RuntimeStopped), so it can
         // never fold into a LATER errored summary.
         state.last_turn_error = None;
+        state.turn_error_line_shown = false;
         let done = state.next_done_label();
         crate::i18n::t(crate::i18n::Msg::TurnSummary {
             done,
@@ -14836,9 +14847,13 @@ mod turn_error_reason_tests {
     use super::*;
 
     #[test]
-    fn errored_summary_folds_reason_and_consumes_it() {
+    fn errored_summary_folds_reason_when_nothing_showed_it_above() {
+        // Fallback path: an error path captured a reason but rendered NO visible
+        // cause line (`turn_error_line_shown` stays false) — the summary MUST
+        // fold the reason so the user still sees the cause.
         let mut state = UiState::new();
         state.last_turn_error = Some("账户余额不足（HTTP 402）".to_string());
+        assert!(!state.turn_error_line_shown);
         let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "3.2s");
         // Reason folded into the separator label (not a separate line).
         assert!(label.contains("账户余额不足（HTTP 402）"), "{label}");
@@ -14848,6 +14863,53 @@ mod turn_error_reason_tests {
         );
         // Consumed: cannot leak into the next turn.
         assert!(state.last_turn_error.is_none());
+    }
+
+    #[test]
+    fn errored_summary_suppresses_reason_when_shown_above() {
+        // A red Error / muted rate-limit line already showed the cause this turn,
+        // so the summary renders bare — no duplicate reason.
+        let mut state = UiState::new();
+        state.last_turn_error = Some("API key 未授权或已失效（HTTP 401）".to_string());
+        state.turn_error_line_shown = true;
+        let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "697ms");
+        // Still an interrupted summary…
+        assert!(
+            label.contains("已中断") || label.contains("Stopped"),
+            "{label}"
+        );
+        // …but the cause is NOT repeated — it's visible in the line above.
+        assert!(!label.contains("401"), "reason should not be folded: {label}");
+        // Both the reason and the flag are consumed for the next turn.
+        assert!(state.last_turn_error.is_none());
+        assert!(!state.turn_error_line_shown);
+    }
+
+    #[test]
+    fn deferred_summary_dedups_using_snapshot_across_on_submit() {
+        // A goal/loop round errored and showed its cause line, so its separator
+        // was DEFERRED with `turn_error_line_shown` snapshotted into the
+        // PendingSeparator. A later turn's `on_submit` then reset the LIVE flag.
+        // The deferred flush restores the snapshot, so it must still suppress the
+        // (already-shown) cause instead of folding it a second time.
+        let mut state = UiState::new();
+        state.last_turn_error = Some("API key 未授权或已失效（HTTP 401）".to_string());
+        state.turn_error_line_shown = true;
+        let snapshot = state.turn_error_line_shown; // captured at defer time
+
+        // A later turn begins: the live flag is reset, but the pending reason
+        // (last_turn_error) is intentionally NOT cleared by on_submit.
+        state.on_submit();
+        assert!(!state.turn_error_line_shown);
+        assert!(state.last_turn_error.is_some());
+
+        // Deferred flush restores the snapshot before building the summary.
+        state.turn_error_line_shown = snapshot;
+        let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "697ms");
+        assert!(
+            !label.contains("401"),
+            "deferred errored summary should dedup via snapshot: {label}"
+        );
     }
 
     #[test]
@@ -14917,6 +14979,9 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
     } else {
         // Reached only if a non-goal/non-loop turn was ever buffered (today
         // they render immediately). Kept as a correct fallback either way.
+        // Restore the defer-time shown-flag so this errored summary dedups the
+        // cause correctly even if a later turn's `on_submit` reset the live flag.
+        state.turn_error_line_shown = ps.error_line_shown;
         turn_summary_label(
             state,
             ps.errored,
@@ -18659,6 +18724,7 @@ fn handle_agent_event(
                     was_goal_round: true,
                     was_loop_round: false,
                     errored,
+                    error_line_shown: state.turn_error_line_shown,
                     cached_pct,
                 });
             } else if state.loop_label.is_some() {
@@ -18674,6 +18740,7 @@ fn handle_agent_event(
                     was_goal_round: false,
                     was_loop_round: true,
                     errored,
+                    error_line_shown: state.turn_error_line_shown,
                     cached_pct,
                 });
             } else {
@@ -18860,6 +18927,10 @@ fn handle_agent_event(
             // on a real terminal — the `✗ 已中断` summary renders cleanly at Idle,
             // so binding the reason to it guarantees the user sees the cause.
             state.last_turn_error = Some(error.clone());
+            // The cause is now visible in a committed red line above, so the
+            // errored turn-summary renders bare (`✗ 已中断 · …`) instead of
+            // folding the same reason a second time.
+            state.turn_error_line_shown = true;
             renderer.render(UiLine::Error(error));
             renderer.flush();
             // Diagnostic only. The runtime emits the authoritative
@@ -19565,6 +19636,9 @@ fn handle_agent_event(
             // must NOT be captured as a turn-ending reason.
             if !auto_resuming {
                 state.last_turn_error = Some(line.clone());
+                // The pause reason is now visible in the muted line rendered just
+                // below, so the errored summary won't fold it a second time.
+                state.turn_error_line_shown = true;
             }
             renderer.render(UiLine::Muted(line));
             renderer.flush();

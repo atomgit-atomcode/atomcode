@@ -943,6 +943,15 @@ pub struct UiState {
     /// to `None` when a CLEAN summary renders (`turn_summary_label`) so a reason
     /// from an error path that produced no summary can never fold into a later turn.
     pub last_turn_error: Option<String>,
+    /// True once this turn already rendered a visible line carrying the failure
+    /// cause (the red `UiLine::Error` line, or the muted rate-limit line). When
+    /// set, `turn_summary_label` renders a bare `✗ 已中断 · …` and does NOT fold
+    /// the reason again — the cause is already visible just above, so folding it
+    /// into the summary would duplicate it. When a future/edge error path sets
+    /// `last_turn_error` WITHOUT rendering such a line, this stays `false` and the
+    /// summary folds the reason as a fallback (the original "no cause visible"
+    /// bug). Reset each turn in `on_submit`; consumed in `turn_summary_label`.
+    pub turn_error_line_shown: bool,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
     /// While waiting on a tool approval, holds the `"Running {Tool}"`
@@ -1170,6 +1179,11 @@ pub struct PendingSeparator {
     /// limit). Lets the deferred flush render the ✗ "stopped" summary instead
     /// of a celebratory ✓ for an incomplete turn.
     pub errored: bool,
+    /// Snapshot of `UiState::turn_error_line_shown` at defer time. The deferred
+    /// flush can land AFTER a later turn's `on_submit` has reset the live flag,
+    /// so we capture it here to decide correctly whether the errored summary
+    /// should fold the cause or render bare (the cause was already shown above).
+    pub error_line_shown: bool,
     /// Cache-hit ratio over the turn's input, if the provider reported cached
     /// tokens. `None` ⇒ no annotation. Rendered as `· N% cached`.
     pub cached_pct: Option<u8>,
@@ -1242,6 +1256,7 @@ impl UiState {
             last_assistant_response: String::new(),
             response_finalized: false,
             last_turn_error: None,
+            turn_error_line_shown: false,
             prior_phase: None,
             prior_spinner_label: None,
             approval_panel: None,
@@ -1534,6 +1549,9 @@ impl UiState {
         // blank-turn notice on TurnComplete).
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
+        // Fresh turn: no failure cause has been shown yet, so a summary this turn
+        // won't wrongly suppress its reason based on a prior turn's error line.
+        self.turn_error_line_shown = false;
         self.turn_output_chars = 0;
         // Seed the stall clock so the first silent stretch is measured from submit,
         // not a stale stamp from the previous turn (which would flash the warning).
