@@ -261,7 +261,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDefaultSet { name } =>
             format!("默认已设为 {name}。").into(),
         Msg::ProviderAdded { name } =>
-            format!("已添加账号 \"{name}\"。到「模型」页(Ctrl+A)给它添加模型。").into(),
+            format!("已添加账号 \"{name}\"。已进入其模型列表，按 Ctrl+A 添加模型。").into(),
         Msg::ProviderUpdated { name } =>
             format!("已更新 \"{name}\"。").into(),
         Msg::ProviderStepName => "Provider 名称？".into(),

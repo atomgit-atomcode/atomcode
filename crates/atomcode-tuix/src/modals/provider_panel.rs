@@ -509,6 +509,17 @@ impl ProviderPanel {
         self.pending_delete = None;
     }
 
+    /// Keep the panel open after creating an account and drill directly into
+    /// that account's model list.
+    fn show_models_for_account(&mut self, account_id: &str) {
+        self.tab = Tab::Models;
+        self.selected = 0;
+        self.mode = Mode::List;
+        self.query.clear();
+        self.account_filter = Some(account_id.to_string());
+        self.pending_delete = None;
+    }
+
     /// Arm a row on the first Ctrl+D and confirm it on the second. Returning
     /// true means the caller should perform the destructive operation.
     fn confirm_double_delete(&mut self, id: &str, is_account: bool) -> bool {
@@ -538,13 +549,19 @@ impl ProviderPanel {
     }
 
     /// Persist the add form as one provider ACCOUNT (no model — models are added
-    /// on the 模型 tab). Returns true when saved (caller closes), false to stay.
-    fn save_add(&self, form: &AddForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
+    /// on the 模型 tab). Returns the new account id when saved so the caller can
+    /// drill into its model list; `None` keeps the add form open.
+    fn save_add(
+        &self,
+        form: &AddForm,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Option<String> {
         let preset = form.preset();
         // A fully-custom provider requires a name (it becomes the account id).
         let mut base_id = sanitize_account_name(form.name.trim());
         if base_id.is_empty() {
-            return false;
+            return None;
         }
         // Don't let a user account land in the CodingPlan (`AtomGit*`) namespace,
         // or it'd be misclassified as gateway-managed (undeletable, never prompts
@@ -559,7 +576,7 @@ impl ProviderPanel {
             let b = form.base_url.trim();
             if b.is_empty() {
                 if preset.default_base_url.is_none() {
-                    return false; // custom endpoint requires a URL
+                    return None; // custom endpoint requires a URL
                 }
                 None
             } else if Some(b) == preset.default_base_url {
@@ -592,6 +609,7 @@ impl ProviderPanel {
             crate::i18n::t(crate::i18n::Msg::ProviderAdded { name: &account_id }).into_owned(),
             true,
         )
+        .then_some(account_id)
     }
 
     /// Build an edit form pre-filled from the selected account.
@@ -890,11 +908,12 @@ impl Modal for ProviderPanel {
                 },
                 KeyCode::Enter => {
                     let form = form.clone();
-                    if self.save_add(&form, ctx, renderer) {
-                        return Ok(ModalAction::Close);
+                    if let Some(account_id) = self.save_add(&form, ctx, renderer) {
+                        self.show_models_for_account(&account_id);
+                    } else {
+                        // Save refused (missing endpoint): keep editing.
+                        self.mode = Mode::Add(form);
                     }
-                    // Save refused (missing endpoint): keep editing.
-                    self.mode = Mode::Add(form);
                 }
                 _ => {}
             }
@@ -1670,6 +1689,23 @@ mod tests {
         p.tab = Tab::Accounts;
         let acc = p.filtered_ids(&cfg);
         assert!(acc.contains(&"AtomGit".to_string()) && acc.contains(&"other".to_string()));
+    }
+
+    #[test]
+    fn added_account_stays_open_on_its_models_page() {
+        let mut panel = ProviderPanel::open();
+        panel.selected = 3;
+        panel.query = "stale".into();
+        panel.pending_delete = Some(("old".into(), true));
+
+        panel.show_models_for_account("taotoken");
+
+        assert!(panel.tab == Tab::Models);
+        assert_eq!(panel.selected, 0);
+        assert!(matches!(panel.mode, Mode::List));
+        assert_eq!(panel.account_filter.as_deref(), Some("taotoken"));
+        assert!(panel.query.is_empty());
+        assert!(panel.pending_delete.is_none());
     }
 
     #[test]
