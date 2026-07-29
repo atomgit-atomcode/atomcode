@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use atomcode_capabilities::mcp::config::{McpConfigSource, McpServerConfig, McpTransportConfig};
-use atomcode_capabilities::mcp::{McpRegistry, McpToolAdapter, CONNECT_TIMEOUT};
+use atomcode_capabilities::mcp::{McpRegistry, McpToolAdapter, ServerStatus, CONNECT_TIMEOUT};
 use atomcode_kernel::conformance;
 use atomcode_kernel::tool::{ProgressSink, RiskLevel, Tool, ToolContext};
 use tokio_util::sync::CancellationToken;
@@ -23,6 +23,10 @@ fn _isolate_atomcode_home() {
 
 /// A stdio server config pointing at the in-tree `mcp-test-server` fixture binary.
 fn test_server_config(name: &str) -> McpServerConfig {
+    test_server_config_with_env(name, BTreeMap::new())
+}
+
+fn test_server_config_with_env(name: &str, env: BTreeMap<String, String>) -> McpServerConfig {
     McpServerConfig {
         name: name.to_string(),
         source: McpConfigSource::Project,
@@ -30,12 +34,18 @@ fn test_server_config(name: &str) -> McpServerConfig {
         config: McpTransportConfig::Stdio {
             command: env!("CARGO_BIN_EXE_mcp-test-server").to_string(),
             args: vec![],
-            env: BTreeMap::new(),
+            env,
             timeout_ms: Some(5_000),
         },
         trust: false,
         auto_approve: vec![],
     }
+}
+
+fn spawn_count(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|contents| contents.lines().count())
+        .unwrap_or_default()
 }
 
 fn ctx() -> ToolContext {
@@ -74,6 +84,181 @@ async fn registry_connect_discover_and_call_echo() {
     let result = adapter.execute(r#"{"message":"hi"}"#, &ctx()).await;
     assert!(!result.is_error, "echo call should succeed: {result:?}");
     assert_eq!(result.content, "echo:hi");
+}
+
+#[tokio::test]
+async fn stdio_reconnects_once_after_server_exit_for_concurrent_calls() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("exit-once");
+    let counter = temp.path().join("spawn-count");
+    let env = BTreeMap::from([
+        (
+            "MCP_TEST_EXIT_ONCE_MARKER".to_string(),
+            marker.display().to_string(),
+        ),
+        (
+            "MCP_TEST_SPAWN_COUNTER".to_string(),
+            counter.display().to_string(),
+        ),
+    ]);
+
+    let registry = McpRegistry::new();
+    registry
+        .add_server(test_server_config_with_env("recover", env))
+        .await
+        .expect("stdio MCP server should connect");
+    let registry = registry.share();
+    assert_eq!(spawn_count(&counter), 1);
+
+    let first = registry.call_tool("recover", "echo", serde_json::json!({ "message": "first" }));
+    let second = registry.call_tool(
+        "recover",
+        "echo",
+        serde_json::json!({ "message": "second" }),
+    );
+    let (first, second) = tokio::join!(first, second);
+
+    let outcomes = [first, second];
+    assert_eq!(
+        outcomes.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "the call handled by the replacement process should succeed"
+    );
+    let uncertain = outcomes
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .expect("the call sent to the dying process must not be replayed");
+    assert!(
+        uncertain.to_string().contains("result is unknown"),
+        "unexpected error: {uncertain:#}"
+    );
+    assert_eq!(
+        spawn_count(&counter),
+        2,
+        "initial process plus exactly one replacement should be spawned"
+    );
+    assert_eq!(
+        registry.server_statuses().await,
+        vec![("recover".to_string(), ServerStatus::Connected)]
+    );
+}
+
+#[tokio::test]
+async fn stdio_marks_server_failed_when_retry_connection_also_dies() {
+    let temp = tempfile::tempdir().unwrap();
+    let counter = temp.path().join("spawn-count");
+    let env = BTreeMap::from([
+        (
+            "MCP_TEST_EXIT_ON_EVERY_TOOLS_LIST".to_string(),
+            "1".to_string(),
+        ),
+        (
+            "MCP_TEST_SPAWN_COUNTER".to_string(),
+            counter.display().to_string(),
+        ),
+    ]);
+
+    let registry = McpRegistry::new();
+    registry
+        .add_server(test_server_config_with_env("always-dies", env))
+        .await
+        .expect("stdio MCP server should connect");
+
+    assert!(
+        registry
+            .list_tools_for_server("always-dies")
+            .await
+            .is_empty(),
+        "tools/list should fail after exactly one reconnect"
+    );
+    assert_eq!(spawn_count(&counter), 2);
+    assert!(matches!(
+        registry.server_statuses().await.as_slice(),
+        [(name, ServerStatus::Failed(_))] if name == "always-dies"
+    ));
+}
+
+#[tokio::test]
+async fn concurrent_failures_reconnect_the_generation_that_actually_failed() {
+    let temp = tempfile::tempdir().unwrap();
+    let exits = temp.path().join("remaining-exits");
+    let counter = temp.path().join("spawn-count");
+    std::fs::write(&exits, "2").unwrap();
+    let env = BTreeMap::from([
+        (
+            "MCP_TEST_EXIT_TOOL_CALLS_COUNTER".to_string(),
+            exits.display().to_string(),
+        ),
+        (
+            "MCP_TEST_SPAWN_COUNTER".to_string(),
+            counter.display().to_string(),
+        ),
+    ]);
+
+    let registry = McpRegistry::new();
+    registry
+        .add_server(test_server_config_with_env("two-exits", env))
+        .await
+        .expect("stdio MCP server should connect");
+    let registry = registry.share();
+
+    let first = registry.call_tool(
+        "two-exits",
+        "echo",
+        serde_json::json!({ "message": "first" }),
+    );
+    let second = registry.call_tool(
+        "two-exits",
+        "echo",
+        serde_json::json!({ "message": "second" }),
+    );
+    let (first, second) = tokio::join!(first, second);
+
+    for result in [first, second] {
+        let error = result.expect_err("fixture should terminate both tool calls");
+        assert!(
+            error.to_string().contains("result is unknown"),
+            "sent tool calls must not be replayed: {error:#}"
+        );
+    }
+    assert_eq!(
+        spawn_count(&counter),
+        3,
+        "each distinct failed generation should get one replacement"
+    );
+    assert_eq!(
+        registry.server_statuses().await,
+        vec![("two-exits".to_string(), ServerStatus::Connected)]
+    );
+}
+
+#[tokio::test]
+async fn status_detects_an_exited_child_before_the_next_request() {
+    let env = BTreeMap::from([(
+        "MCP_TEST_EXIT_AFTER_INITIALIZED".to_string(),
+        "1".to_string(),
+    )]);
+    let registry = McpRegistry::new();
+    registry
+        .add_server(test_server_config_with_env("already-exited", env))
+        .await
+        .expect("initialize handshake should complete before fixture exits");
+
+    let mut observed = false;
+    for _ in 0..20 {
+        if matches!(
+            registry.server_statuses().await.as_slice(),
+            [(name, ServerStatus::Failed(_))] if name == "already-exited"
+        ) {
+            observed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        observed,
+        "status should inspect the child instead of reporting a stale Connected state"
+    );
 }
 
 /// A malformed-arguments call must surface as a tool error (`is_error`), never a

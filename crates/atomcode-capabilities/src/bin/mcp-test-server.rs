@@ -1,6 +1,12 @@
+use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Read, Write};
 
 fn main() -> io::Result<()> {
+    if let Some(path) = std::env::var_os("MCP_TEST_SPAWN_COUNTER") {
+        let mut counter = OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(counter, "spawn")?;
+    }
+
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());
@@ -36,6 +42,9 @@ fn main() -> io::Result<()> {
                 })
             }),
             "tools/list" => id.map(|id| {
+                if std::env::var_os("MCP_TEST_EXIT_ON_EVERY_TOOLS_LIST").is_some() {
+                    std::process::exit(0);
+                }
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -59,6 +68,27 @@ fn main() -> io::Result<()> {
                 })
             }),
             "tools/call" => {
+                if let Some(path) = std::env::var_os("MCP_TEST_EXIT_TOOL_CALLS_COUNTER") {
+                    let path = std::path::PathBuf::from(path);
+                    let remaining = std::fs::read_to_string(&path)?
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(io::Error::other)?;
+                    if remaining > 0 {
+                        std::fs::write(path, (remaining - 1).to_string())?;
+                        return Ok(());
+                    }
+                }
+                if let Some(marker) = std::env::var_os("MCP_TEST_EXIT_ONCE_MARKER") {
+                    let marker = std::path::PathBuf::from(marker);
+                    if !marker.exists() {
+                        std::fs::write(marker, b"exited")?;
+                        return Ok(());
+                    }
+                }
+                if std::env::var_os("MCP_TEST_EXIT_ON_EVERY_TOOL_CALL").is_some() {
+                    return Ok(());
+                }
                 let message = request
                     .get("params")
                     .and_then(|params| params.get("arguments"))
@@ -81,6 +111,9 @@ fn main() -> io::Result<()> {
                 })
             }
             "notifications/initialized" => {
+                if std::env::var_os("MCP_TEST_EXIT_AFTER_INITIALIZED").is_some() {
+                    return Ok(());
+                }
                 if std::env::var_os("MCP_TEST_STDOUT_NOISE_AFTER_INITIALIZED").is_some() {
                     writeln!(writer, "✅ MCP server initialized and ready (stdio).")?;
                     writer.flush()?;
