@@ -34,9 +34,9 @@ use atomcode_capabilities::skills::{
     register_skill_tools, standard_skill_dirs, SkillCatalogHook, SkillRegistry,
 };
 use atomcode_capabilities::tools::{
-    register_coding_tools_with_vision, ApprovalMiddleware, BashWorkspaceGate,
-    OpenFileWorkspaceGate, ReadFileTool, SensitivePathGate, WebFetchTool, WebSearchTool,
-    WriteApprovalGate,
+    register_coding_tools_with_vision, ApprovalMiddleware, ArtifactMiddleware, ArtifactStore,
+    BashWorkspaceGate, FetchOutputTool, OpenFileWorkspaceGate, ReadFileTool, SensitivePathGate,
+    WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::checkpoint::CompactionCheckpoint;
@@ -1234,6 +1234,22 @@ pub fn assemble(
     // Tier-2 overflow summary uses the same metered provider so its summary LLM call is
     // likewise counted.
     let summary_provider = metered_provider;
+
+    // When a session is present, wire the artifact store: register the fetch_output tool
+    // so the model can retrieve large outputs, and prepare the middleware that intercepts
+    // oversized tool results and spills them to disk.  No session → no artifact I/O.
+    let artifact_store: Option<Arc<ArtifactStore>> =
+        parts.session.as_ref().and_then(|b| {
+            b.manager.artifacts_dir(&b.id).ok().map(|dir| {
+                Arc::new(ArtifactStore::new(dir))
+            })
+        });
+    if let Some(store) = &artifact_store {
+        parts
+            .registry
+            .register(Arc::new(FetchOutputTool::new(store.clone())));
+    }
+
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())
@@ -1462,6 +1478,12 @@ pub fn assemble(
         builder = builder.middleware(Arc::new(
             atomcode_capabilities::tools::GitPushLabelMiddleware::new(cfg.working_dir.clone()),
         ));
+    }
+    // Artifact spill middleware: intercepts oversized tool results and saves them to disk so
+    // the conversation only carries a preview + handle. Only wired when a session is present
+    // (no session = no on-disk store; the fetch_output tool is not registered either).
+    if let Some(store) = artifact_store {
+        builder = builder.middleware(Arc::new(ArtifactMiddleware::new(store)));
     }
     let agent = builder.build();
     // Commit model attribution only after every fallible assembly step has
@@ -2589,5 +2611,119 @@ mod tests {
         );
 
         reset_offline_verdict_for_test();
+    }
+
+    /// Unit-test the artifact wiring as `assemble` would build it:
+    /// big tool result → preview+handle stored → fetch_output retrieves full bytes.
+    #[tokio::test]
+    async fn artifact_wiring_store_middleware_and_fetch_roundtrip() {
+        use atomcode_capabilities::tools::{ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES};
+        use atomcode_kernel::middleware::ToolMiddleware;
+        use atomcode_kernel::tool::{ToolContext, ToolResult};
+        use atomcode_kernel::tool::Tool as _;
+        use tokio_util::sync::CancellationToken;
+
+        let artifacts_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(ArtifactStore::new(artifacts_tmp.path()));
+        let mw = ArtifactMiddleware::new(store.clone());
+        let fetch = FetchOutputTool::new(store.clone());
+
+        // (a) a big result gets spilled and the content is replaced with a preview+handle
+        let big = "Z".repeat(THRESHOLD_BYTES + 1);
+        let mut result = ToolResult {
+            call_id: "t1".into(),
+            content: big.clone(),
+            is_error: false,
+            images: vec![],
+        };
+        mw.after(&mut result).await;
+        assert!(
+            result.content.len() < big.len(),
+            "middleware must shorten the content"
+        );
+        assert!(
+            result.content.contains("fetch_output"),
+            "middleware must embed fetch_output hint"
+        );
+
+        // (b) artifact file exists on disk
+        let id = atomcode_capabilities::tools::artifact_id(big.as_bytes());
+        let artifact_path = artifacts_tmp.path().join(&id);
+        assert!(
+            artifact_path.exists(),
+            "artifact file must be present at {artifact_path:?}"
+        );
+
+        // (c) fetch_output retrieves the full bytes
+        let ctx = ToolContext {
+            working_dir: artifacts_tmp.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let fetch_result = fetch
+            .execute(
+                &format!(
+                    "{{\"artifact_id\":\"{id}\",\"offset\":0,\"limit\":{}}}",
+                    big.len()
+                ),
+                &ctx,
+            )
+            .await;
+        assert!(
+            !fetch_result.is_error,
+            "fetch_output must succeed: {}",
+            fetch_result.content
+        );
+        assert!(
+            fetch_result.content.starts_with('Z'),
+            "fetched bytes must start with the original content"
+        );
+    }
+
+    /// When no session is present, fetch_output must NOT appear in the assembled tools.
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn no_session_means_no_fetch_output_tool() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        // Disabled session: no artifact store, so fetch_output must not be mounted.
+        let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
+        // After assemble(), parts.mounted_tools is populated by the mount() call inside.
+        let mounted = parts
+            .mounted_tools
+            .as_ref()
+            .expect("mounted_tools must be set after assemble");
+        assert!(
+            mounted.get("fetch_output").is_none(),
+            "fetch_output must not be mounted when no session is present"
+        );
+    }
+
+    /// When a session IS present, fetch_output must appear in the assembled tools.
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_presence_mounts_fetch_output_tool() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let mut opts = io_free_opts();
+        opts.session = SessionMode::Fresh;
+        let mut parts = prepare(&cfg, opts).await.unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
+        let mounted = parts
+            .mounted_tools
+            .as_ref()
+            .expect("mounted_tools must be set after assemble");
+        assert!(
+            mounted.get("fetch_output").is_some(),
+            "fetch_output must be mounted when a session is present"
+        );
     }
 }

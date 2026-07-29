@@ -1014,6 +1014,11 @@ impl SessionManager {
     pub fn snapshot_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "snapshot")
     }
+    /// Directory under which per-session tool-output artifacts are stored.
+    /// Sibling of the snapshot: `<root>/<id>.artifacts/`.
+    pub fn artifacts_dir(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "artifacts")
+    }
     pub fn meta_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "meta")
     }
@@ -6553,5 +6558,14 @@ mod tests {
         mgr.delete(&lease).unwrap();
 
         assert!(!mgr.has_inflight_snapshot(id));
+    }
+
+    #[test]
+    fn artifacts_dir_is_sibling_of_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let snap = mgr.snapshot_path("abc").unwrap();
+        let art = mgr.artifacts_dir("abc").unwrap();
+        assert_eq!(art, snap.with_extension("artifacts"));
     }
 }

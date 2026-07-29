@@ -137,6 +137,7 @@ pub fn coding_tool_names() -> &'static [&'static str] {
             "search_replace",
             "ast_grep",
             "todowrite",
+            "fetch_output",
             "memory",
             "request_user_input",
         ];
@@ -155,6 +156,7 @@ pub fn coding_tool_names() -> &'static [&'static str] {
             "search_replace",
             "ast_grep",
             "todowrite",
+            "fetch_output",
             "request_user_input",
         ];
     }
@@ -501,11 +503,17 @@ mod tests {
             names.contains(&"request_user_input"),
             "coding_tool_names() must include 'request_user_input'"
         );
+        // "fetch_output" is always in coding_tool_names() — mount() drops it when the
+        // session-gated FetchOutputTool is not registered; the name itself is unconditional.
+        assert!(
+            names.contains(&"fetch_output"),
+            "coding_tool_names() must include 'fetch_output'"
+        );
         // No stale or duplicate names beyond EXPECTED_TOOL_NAMES + the gated extras.
         #[cfg(feature = "memory")]
-        let extras: &[&str] = &["memory", "request_user_input"];
+        let extras: &[&str] = &["memory", "request_user_input", "fetch_output"];
         #[cfg(not(feature = "memory"))]
-        let extras: &[&str] = &["request_user_input"];
+        let extras: &[&str] = &["request_user_input", "fetch_output"];
         let expected_full: Vec<&str> = EXPECTED_TOOL_NAMES
             .iter()
             .copied()
@@ -517,7 +525,7 @@ mod tests {
         sorted_expected.sort();
         assert_eq!(
             sorted_names, sorted_expected,
-            "coding_tool_names() must match EXPECTED_TOOL_NAMES + memory + request_user_input"
+            "coding_tool_names() must match EXPECTED_TOOL_NAMES + memory + request_user_input + fetch_output"
         );
     }
 
