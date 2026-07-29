@@ -1296,6 +1296,28 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_routes_manual_compact_to_bound_runtime() {
+        let hub = LiveViewHub::new();
+        let (control, commands) = control();
+        hub.bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
+            .unwrap();
+
+        hub.dispatch(DriverCommand::Compact(None)).unwrap();
+
+        assert!(matches!(
+            commands.lock().unwrap().as_slice(),
+            [DriverCommand::Compact(None)]
+        ));
+    }
+
+    #[test]
+    fn dispatch_compact_without_runtime_is_unbound() {
+        let hub = LiveViewHub::new();
+        let error = hub.dispatch(DriverCommand::Compact(None)).unwrap_err();
+        assert_eq!(error, HubError::Unbound);
+    }
+
+    #[test]
     fn session_change_fails_join_closed_until_matching_snapshot_is_committed() {
         let hub = LiveViewHub::new();
         let (control, _) = control();

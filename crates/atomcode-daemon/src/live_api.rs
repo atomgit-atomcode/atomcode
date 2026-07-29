@@ -1808,6 +1808,16 @@ pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResp
     Json(serde_json::json!({ "cancelled": cancelled }))
 }
 
+/// POST /live/compact —— webui/手机端在 sync 模式请求对共享实时运行时执行一次
+/// 手动压缩。派发 `DriverCommand::Compact(None)` 到 live hub；压缩结果经既有的
+/// `NativeLiveWireProjector`（CompactionFinished → Warning）回流到各视图。
+/// 返回 `{"accepted": bool}`：false 表示当前没有绑定的实时运行时（无可压缩对象）。
+pub(crate) async fn live_compact(State(_state): State<AppState>) -> impl IntoResponse {
+    let accepted =
+        crate::native_live::dispatch(atomcode_coding::DriverCommand::Compact(None)).is_ok();
+    Json(serde_json::json!({ "accepted": accepted }))
+}
+
 /// POST /live/mcp/trust — Trust the current project so its `.mcp.json` servers
 /// are allowed to connect on the next turn. Rebuilds the serving MCP registry
 /// so newly-allowed servers start connecting immediately.
