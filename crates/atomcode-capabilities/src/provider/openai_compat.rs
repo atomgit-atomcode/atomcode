@@ -17,7 +17,7 @@
 
 use super::reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
 use super::retry::{self, RetryPolicy};
-use super::sign::RequestSigner;
+use super::sign::{RequestSigner, RequestSigningError};
 use async_trait::async_trait;
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider, ReasoningEffort, ToolChoice};
@@ -608,6 +608,7 @@ async fn open_stream(
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     let mut tls12_probe = false;
+    let mut auth_recovery_attempted = false;
     loop {
         // Take the CURRENT client each attempt: a transport-error retry below
         // rebuilds it, so the retried attempt gets a fresh (empty) pool.
@@ -616,7 +617,7 @@ async fn open_stream(
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body_bytes.to_vec());
-        match signer {
+        let signed_auth = match signer {
             Some(signer) => {
                 let auth = signer.sign(body_bytes).map_err(|error| ProviderError {
                     retryable: false,
@@ -625,12 +626,16 @@ async fn open_stream(
                     ..Default::default()
                 })?;
                 req = req.bearer_auth(auth.bearer.as_deref().unwrap_or(api_key));
-                for (name, value) in auth.headers {
-                    req = req.header(name, value);
+                for (name, value) in &auth.headers {
+                    req = req.header(name.as_str(), value.as_str());
                 }
+                Some(auth)
             }
-            None => req = req.bearer_auth(api_key),
-        }
+            None => {
+                req = req.bearer_auth(api_key);
+                None
+            }
+        };
         // Stable session id → lets the forwarding gateway pin this conversation to
         // one upstream for prefix-cache affinity. Empty ⇒ omitted (sub-agent/summary).
         if !session_id.is_empty() {
@@ -645,6 +650,65 @@ async fn open_stream(
                 }
                 let code = resp.status().as_u16();
                 if !resp.status().is_success() {
+                    if code == reqwest::StatusCode::UNAUTHORIZED.as_u16() {
+                        if let (Some(signer), Some(rejected)) = (signer, signed_auth.as_ref()) {
+                            if !auth_recovery_attempted {
+                                auth_recovery_attempted = true;
+                                match signer.recover_unauthorized(rejected).await {
+                                    Ok(true) => {
+                                        let _ = resp.bytes().await;
+                                        continue;
+                                    }
+                                    Ok(false) => {}
+                                    Err(RequestSigningError::ReauthenticationRequired(_)) => {
+                                        let _ = resp.bytes().await;
+                                        return Err(ProviderError {
+                                            retryable: false,
+                                            message: atomcode_config::i18n::t(
+                                                atomcode_config::i18n::Msg::ChatAuthExpired,
+                                            )
+                                            .into_owned(),
+                                            http_status: Some(code),
+                                            code: Some("authentication_expired".to_string()),
+                                            ..Default::default()
+                                        });
+                                    }
+                                    Err(RequestSigningError::RecoveryTransient(message)) => {
+                                        let _ = resp.bytes().await;
+                                        return Err(ProviderError {
+                                            retryable: true,
+                                            message,
+                                            code: Some(
+                                                "authentication_refresh_transient".to_string(),
+                                            ),
+                                            ..Default::default()
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = resp.bytes().await;
+                                        return Err(ProviderError {
+                                            retryable: false,
+                                            message: error.to_string(),
+                                            code: Some(error.code().to_string()),
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+                            } else {
+                                let _ = resp.bytes().await;
+                                return Err(ProviderError {
+                                    retryable: false,
+                                    message: atomcode_config::i18n::t(
+                                        atomcode_config::i18n::Msg::ChatAuthExpired,
+                                    )
+                                    .into_owned(),
+                                    http_status: Some(code),
+                                    code: Some("authentication_expired".to_string()),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
                     if retry::should_retry_open_status(code, rate_limit_retry_owner)
                         && attempt < policy.max_attempts
                     {
@@ -1439,8 +1503,193 @@ struct PromptTokensDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{RequestSigningError, SignedAuth};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct RecoveringSigner {
+        generation: AtomicUsize,
+        recoveries: AtomicUsize,
+    }
+
+    #[derive(Clone, Copy)]
+    enum RecoveryFailure {
+        Transient,
+        ReauthenticationRequired,
+        Local,
+    }
+
+    struct FailingRecoverySigner(RecoveryFailure);
+
+    #[async_trait]
+    impl RequestSigner for FailingRecoverySigner {
+        fn sign(&self, _body: &[u8]) -> Result<SignedAuth, RequestSigningError> {
+            Ok(SignedAuth {
+                bearer: Some("rejected-token".to_string()),
+                ..Default::default()
+            })
+        }
+
+        async fn recover_unauthorized(
+            &self,
+            _rejected: &SignedAuth,
+        ) -> Result<bool, RequestSigningError> {
+            Err(match self.0 {
+                RecoveryFailure::Transient => {
+                    RequestSigningError::RecoveryTransient("broker unavailable".to_string())
+                }
+                RecoveryFailure::ReauthenticationRequired => {
+                    RequestSigningError::ReauthenticationRequired("refresh rejected".to_string())
+                }
+                RecoveryFailure::Local => {
+                    RequestSigningError::SigningFailed("auth store unavailable".to_string())
+                }
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RequestSigner for RecoveringSigner {
+        fn sign(&self, _body: &[u8]) -> Result<SignedAuth, RequestSigningError> {
+            Ok(SignedAuth {
+                bearer: Some(format!("token-{}", self.generation.load(Ordering::SeqCst))),
+                ..Default::default()
+            })
+        }
+
+        async fn recover_unauthorized(
+            &self,
+            rejected: &SignedAuth,
+        ) -> Result<bool, RequestSigningError> {
+            assert_eq!(rejected.bearer.as_deref(), Some("token-0"));
+            self.recoveries.fetch_add(1, Ordering::SeqCst);
+            self.generation.store(1, Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn refreshable_signer_recovers_one_401_and_resigns_retry() {
+        let server = MockServer::start().await;
+        let responses = std::sync::Arc::new(AtomicUsize::new(0));
+        let sequence = responses.clone();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if sequence.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(401).set_body_string("expired")
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: [DONE]\n\n")
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let signer = std::sync::Arc::new(RecoveringSigner {
+            generation: AtomicUsize::new(0),
+            recoveries: AtomicUsize::new(0),
+        });
+        let mut cfg =
+            OpenAiCompatConfig::new("unused", format!("{}/v1", server.uri()), "test-model");
+        cfg.request_signer = Some(signer.clone());
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .expect("401 recovery should reopen the request");
+        let events: Vec<_> = stream.collect().await;
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done { .. })));
+        assert_eq!(signer.recoveries.load(Ordering::SeqCst), 1);
+
+        let requests = server.received_requests().await.unwrap();
+        let authorization: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                request.headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(authorization, ["Bearer token-0", "Bearer token-1"]);
+    }
+
+    #[tokio::test]
+    async fn refreshable_signer_stops_after_second_401() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let signer = std::sync::Arc::new(RecoveringSigner {
+            generation: AtomicUsize::new(0),
+            recoveries: AtomicUsize::new(0),
+        });
+        let mut cfg =
+            OpenAiCompatConfig::new("unused", format!("{}/v1", server.uri()), "test-model");
+        cfg.request_signer = Some(signer.clone());
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+
+        let error = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .err()
+            .expect("a second 401 must terminate recovery");
+        assert_eq!(error.http_status, Some(401));
+        assert_eq!(error.code.as_deref(), Some("authentication_expired"));
+        assert!(error.message.contains("/login"));
+        assert_eq!(signer.recoveries.load(Ordering::SeqCst), 1);
+    }
+
+    async fn recovery_failure(kind: RecoveryFailure) -> ProviderError {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut cfg =
+            OpenAiCompatConfig::new("unused", format!("{}/v1", server.uri()), "test-model");
+        cfg.request_signer = Some(std::sync::Arc::new(FailingRecoverySigner(kind)));
+        OpenAiCompatProvider::new(cfg)
+            .unwrap()
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .err()
+            .expect("recovery failure must terminate this OPEN")
+    }
+
+    #[tokio::test]
+    async fn recovery_failure_preserves_transient_permanent_and_local_semantics() {
+        let transient = recovery_failure(RecoveryFailure::Transient).await;
+        assert!(transient.retryable);
+        assert_eq!(
+            transient.code.as_deref(),
+            Some("authentication_refresh_transient")
+        );
+        assert!(transient.message.contains("broker unavailable"));
+
+        let permanent = recovery_failure(RecoveryFailure::ReauthenticationRequired).await;
+        assert!(!permanent.retryable);
+        assert_eq!(permanent.code.as_deref(), Some("authentication_expired"));
+        assert!(permanent.message.contains("/login"));
+
+        let local = recovery_failure(RecoveryFailure::Local).await;
+        assert!(!local.retryable);
+        assert_eq!(local.code.as_deref(), Some("request_signing_failed"));
+        assert!(local.message.contains("auth store unavailable"));
+    }
 
     async fn open_429_request_count(
         owner: atomcode_kernel::provider::RateLimitRetryOwner,

@@ -1091,12 +1091,66 @@ fn urlencoding_decode(s: &str) -> String {
 /// Refresh the access token using the stored refresh_token via Platform Broker.
 /// Returns updated AuthInfo with new tokens, and saves it to disk.
 pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
+    refresh_auth_if_current(&auth.access_token, &auth.user.id)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("No refresh_token available — please /login again")]
+struct MissingRefreshToken;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Token refresh failed ({status}): {body}")]
+struct RefreshHttpStatus {
+    status: u16,
+    body: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthRecoveryFailureKind {
+    Transient,
+    ReauthenticationRequired,
+    Local,
+}
+
+/// Preserve the distinction used by provider recovery: transport/server
+/// failures may succeed on a later OPEN retry; rejected refresh credentials
+/// require `/login`; filesystem/account consistency errors are local failures.
+pub fn classify_auth_recovery_error(error: &anyhow::Error) -> AuthRecoveryFailureKind {
+    for cause in error.chain() {
+        if cause.downcast_ref::<MissingRefreshToken>().is_some() {
+            return AuthRecoveryFailureKind::ReauthenticationRequired;
+        }
+        if let Some(status) = cause.downcast_ref::<RefreshHttpStatus>() {
+            return if matches!(status.status, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529) {
+                AuthRecoveryFailureKind::Transient
+            } else if matches!(status.status, 400 | 401 | 403) {
+                AuthRecoveryFailureKind::ReauthenticationRequired
+            } else {
+                AuthRecoveryFailureKind::Local
+            };
+        }
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>() {
+            if request.is_timeout()
+                || request.is_connect()
+                || request.is_request()
+                || request.is_body()
+                || request.is_decode()
+            {
+                return AuthRecoveryFailureKind::Transient;
+            }
+        }
+    }
+    AuthRecoveryFailureKind::Local
+}
+
+/// Caller must hold `auth-refresh.lock`.
+fn refresh_access_token_unlocked(auth: &AuthInfo) -> Result<AuthInfo> {
     let auth = auth.clone();
     std::thread::spawn(move || {
         let refresh_token = auth
             .refresh_token
             .as_deref()
-            .context("No refresh_token available — please /login again")?;
+            .ok_or_else(|| anyhow::Error::new(MissingRefreshToken))?;
 
         let client = blocking_client()?;
 
@@ -1110,11 +1164,10 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
-            anyhow::bail!(
-                "Token refresh failed ({}): {} — please /login again",
-                status,
-                body
-            );
+            return Err(anyhow::Error::new(RefreshHttpStatus {
+                status: status.as_u16(),
+                body,
+            }));
         }
 
         #[derive(Deserialize)]
@@ -1159,11 +1212,51 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
                 .unwrap_or_else(|| auth.user.clone()),
         };
 
-        save_auth(&new_auth)?;
+        save_auth_unlocked(&new_auth)?;
         Ok(new_auth)
     })
     .join()
     .map_err(|_| anyhow::anyhow!("refresh_access_token thread panicked"))?
+}
+
+/// Recover from a server-side 401 for a token that the local expiry clock still
+/// considered valid.
+///
+/// The lock is cross-process because refresh tokens may rotate: multiple AtomCode
+/// windows must not consume the same refresh token concurrently. After acquiring
+/// it, reload `auth.toml`; another process may already have refreshed, in which
+/// case the newer credential is returned without another authority call.
+pub fn recover_auth_after_unauthorized(
+    rejected_access_token: &str,
+    expected_user_id: &str,
+) -> Result<ValidAuthSession> {
+    let auth = refresh_auth_if_current(rejected_access_token, expected_user_id)?;
+    if auth.access_token.trim().is_empty() || auth.user.id.trim().is_empty() {
+        anyhow::bail!("Invalid auth.toml — please use /login first");
+    }
+    Ok(ValidAuthSession {
+        access_token: auth.access_token,
+        user_id: auth.user.id,
+    })
+}
+
+/// Serialize refresh-token consumption across threads and processes. The
+/// rejected/current token is compared again after taking the lock so a waiter
+/// observes credentials refreshed by the winner instead of refreshing twice.
+fn refresh_auth_if_current(
+    rejected_access_token: &str,
+    expected_user_id: &str,
+) -> Result<AuthInfo> {
+    with_auth_lock(|| {
+        let auth = get_stored_auth().context("Not logged in — please use /login first")?;
+        if auth.user.id != expected_user_id {
+            anyhow::bail!("Login account changed — please retry the request");
+        }
+        if auth.access_token != rejected_access_token {
+            return Ok(auth);
+        }
+        refresh_access_token_unlocked(&auth)
+    })
 }
 
 fn get_valid_auth_info() -> Result<AuthInfo> {
@@ -1182,17 +1275,18 @@ fn get_valid_auth_info() -> Result<AuthInfo> {
         let expires_at = auth.created_at + expires_in;
 
         if now >= expires_at - 300 {
-            // Token expired or about to expire — try refresh
-            match refresh_access_token(&auth) {
+            // Token expired or about to expire — serialize refresh-token
+            // consumption and re-check auth.toml after taking the lock.
+            match refresh_auth_if_current(&auth.access_token, &auth.user.id) {
                 Ok(new_auth) => return Ok(new_auth),
                 Err(e) => anyhow::bail!("Token expired and refresh failed: {}", e),
             }
         }
     } else if auth.created_at == 0 {
         // Legacy auth.toml without created_at — no way to know if expired,
-        // try refresh if refresh_token is available, otherwise use as-is
+        // try refresh if refresh_token is available, otherwise use as-is.
         if auth.refresh_token.is_some() {
-            if let Ok(new_auth) = refresh_access_token(&auth) {
+            if let Ok(new_auth) = refresh_auth_if_current(&auth.access_token, &auth.user.id) {
                 return Ok(new_auth);
             }
         }
@@ -1235,11 +1329,13 @@ pub fn get_valid_token() -> Result<String> {
 /// confirmation. No `Err` distinguishes "file absent" from "file removed" —
 /// both are success from the user's perspective ("you're logged out").
 pub fn logout() -> Result<()> {
-    let auth_path = auth_file_path();
-    if auth_path.exists() {
-        std::fs::remove_file(&auth_path).context("Failed to remove auth file")?;
-    }
-    Ok(())
+    with_auth_lock(|| {
+        let auth_path = auth_file_path();
+        if auth_path.exists() {
+            std::fs::remove_file(&auth_path).context("Failed to remove auth file")?;
+        }
+        Ok(())
+    })
 }
 
 /// Get stored auth info
@@ -1255,19 +1351,48 @@ pub fn get_stored_auth() -> Option<AuthInfo> {
 
 /// Save auth info to file
 pub fn save_auth(auth: &AuthInfo) -> Result<()> {
+    with_auth_lock(|| save_auth_unlocked(auth))
+}
+
+/// Execute one authentication-store transaction. Every writer uses this seam so
+/// a refresh response cannot overwrite a concurrent login/logout from another
+/// thread or process.
+fn with_auth_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
     let auth_path = auth_file_path();
-
-    // Ensure parent directory exists
-    if let Some(parent) = auth_path.parent() {
-        std::fs::create_dir_all(parent).context("Failed to create auth directory")?;
-        // Set directory permissions to 0o700 (owner only) on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-        }
+    let parent = auth_path
+        .parent()
+        .context("Invalid auth file path — please use /login again")?;
+    std::fs::create_dir_all(parent).context("Failed to create auth directory")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .context("Failed to set auth directory permissions")?;
     }
+    with_auth_lock_file(&parent.join("auth-refresh.lock"), operation)
+}
 
+fn with_auth_lock_file<T>(
+    lock_path: &std::path::Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    use fs2::FileExt;
+    use std::fs::OpenOptions;
+
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .context("Failed to open auth refresh lock")?;
+    lock.lock_exclusive()
+        .context("Failed to acquire auth refresh lock")?;
+    operation()
+}
+
+/// Caller must hold `auth-refresh.lock`.
+fn save_auth_unlocked(auth: &AuthInfo) -> Result<()> {
+    let auth_path = auth_file_path();
     let content = toml::to_string_pretty(auth).context("Failed to serialize auth info")?;
     super::write_auth_file_secure(&auth_path, &content).context("Failed to write auth file")?;
 
@@ -1360,6 +1485,69 @@ fn parse_pasted_callback(input: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_recovery_failure_classifies_statuses_and_local_errors() {
+        let transient = anyhow::Error::new(RefreshHttpStatus {
+            status: 503,
+            body: "unavailable".to_string(),
+        });
+        assert_eq!(
+            classify_auth_recovery_error(&transient),
+            AuthRecoveryFailureKind::Transient
+        );
+
+        let rejected = anyhow::Error::new(RefreshHttpStatus {
+            status: 401,
+            body: "invalid refresh token".to_string(),
+        });
+        assert_eq!(
+            classify_auth_recovery_error(&rejected),
+            AuthRecoveryFailureKind::ReauthenticationRequired
+        );
+
+        let local = anyhow::anyhow!("failed to persist auth.toml");
+        assert_eq!(
+            classify_auth_recovery_error(&local),
+            AuthRecoveryFailureKind::Local
+        );
+    }
+
+    #[test]
+    fn auth_store_lock_serializes_concurrent_writers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("auth-refresh.lock");
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let lock_path = lock_path.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                with_auth_lock_file(&lock_path, || {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn strip_force_login_removes_trailing_param() {

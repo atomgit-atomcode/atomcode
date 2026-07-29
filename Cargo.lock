@@ -362,6 +362,7 @@ dependencies = [
  "atomcode-codingplan-crypto",
  "atomcode-config",
  "atomcode-telemetry",
+ "fs2",
  "libc",
  "reqwest",
  "serde",
