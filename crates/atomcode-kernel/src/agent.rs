@@ -589,6 +589,21 @@ fn tool_call_dedup_key(call: &ToolCall) -> (String, String) {
     (call.name.clone(), canonicalize_tool_args(&call.arguments))
 }
 
+/// Number of DISTINCT tool calls in `calls` by kernel identity (`name` +
+/// canonicalized arguments) — the exact count the tool loop uses to decide
+/// whether a step ran as a parallel batch (`>= 2` ⇒ a batch is emitted).
+///
+/// Exposed so the TUI's `/resume` replay groups exactly the steps that were
+/// batched live: gating on the raw `tool_calls.len()` would over-group a step
+/// whose duplicate calls the kernel collapsed to one (no batch was ever shown).
+pub fn distinct_tool_call_count(calls: &[ToolCall]) -> usize {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    calls
+        .iter()
+        .filter(|c| seen.insert(tool_call_dedup_key(c)))
+        .count()
+}
+
 // Canonicalization is owned by the kernel tool loop so every assembled agent uses
 // the same tool-call identity rules.
 fn canonicalize_tool_args(arguments: &str) -> String {

@@ -690,6 +690,27 @@ pub(crate) fn replay_session(
     // view for todowrite output; errors still show). Track parseable call ids.
     let mut todowrite_call_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // Call ids whose result is folded into a rebuilt parallel-batch child row
+    // (`build_replay_tool_batch`); their standalone tool RESULT row is suppressed
+    // so the replayed batch matches the compact live batch view.
+    let mut batched_result_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Persisted results keyed by call id, so a rebuilt batch child can show its
+    // final `→ N lines` / `→ ✗` suffix (batch metadata itself is never persisted).
+    let mut result_of: std::collections::HashMap<String, (bool, String)> =
+        std::collections::HashMap::new();
+    for m in &session.messages {
+        if m.role == Role::Tool {
+            if let Some(id) = m.tool_call_id.as_ref().filter(|id| !id.is_empty()) {
+                result_of.insert(id.clone(), (!m.is_error, m.text.clone()));
+            }
+        }
+    }
+    // Seed the persistent todo panel + id→title cache BEFORE rendering so a
+    // rebuilt batch's `todo update #N` children can splice in task titles the
+    // same way the live path does. (Also resets a prior session's panel/titles.)
+    state.active_todos = crate::event_loop::todo_progress_from_messages(&session.messages);
+    crate::event_loop::sync_todo_titles(state);
     for (i, m) in session.messages.iter().enumerate() {
         if is_real_user_message(m) {
             if seen_user {
@@ -716,24 +737,54 @@ pub(crate) fn replay_session(
                     renderer.render(UiLine::AssistantText(m.text.clone()));
                     renderer.render(UiLine::AssistantLineBreak);
                 }
-                for tc in &m.tool_calls {
-                    // todowrite → no inline block; the persistent panel is the sole
-                    // view. Suppress the (successful) tool RESULT below by remembering
-                    // the call id. Mirror the live path: only a PARSEABLE call is
-                    // suppressed — a bad one falls through to a normal tool row so its
-                    // error still shows.
-                    if tc.name == "todowrite"
-                        && atomcode_capabilities::tools::todo::parse_todos(&tc.arguments).is_ok()
-                    {
+                // Group iff this step actually ran as a batch live. The kernel
+                // emits a batch only when ≥2 calls are DISTINCT by identity
+                // (name + canonicalized args); a step whose duplicate calls it
+                // collapsed showed no batch header, so gating on raw
+                // `tool_calls.len()` would over-group and diverge from live.
+                if atomcode_kernel::agent::distinct_tool_call_count(&m.tool_calls) > 1 {
+                    // A multi-call assistant step ran as one parallel batch live.
+                    // Rebuild the grouped "Running N calls" header + child rows
+                    // (with folded result suffixes) instead of N standalone tool
+                    // rows, and remember the call ids so their individual tool
+                    // RESULT rows are suppressed below — matching the compact live
+                    // batch view the user saw before the resume.
+                    let (header, children) = crate::event_loop::build_replay_tool_batch(
+                        &m.tool_calls,
+                        &result_of,
+                        &state.todo_titles,
+                    );
+                    for tc in &m.tool_calls {
                         if !tc.id.is_empty() {
-                            todowrite_call_ids.insert(tc.id.clone());
+                            batched_result_ids.insert(tc.id.clone());
                         }
-                        continue;
                     }
-                    renderer.render(UiLine::ToolCall {
-                        name: crate::event_loop::display_tool_name(&tc.name),
-                        detail: format_tool_detail(&tc.name, &tc.arguments),
+                    renderer.render(UiLine::ToolGroupRender {
+                        batch_id: format!("replay-batch-{i}"),
+                        header,
+                        children,
                     });
+                } else {
+                    for tc in &m.tool_calls {
+                        // todowrite → no inline block; the persistent panel is the sole
+                        // view. Suppress the (successful) tool RESULT below by remembering
+                        // the call id. Mirror the live path: only a PARSEABLE call is
+                        // suppressed — a bad one falls through to a normal tool row so its
+                        // error still shows.
+                        if tc.name == "todowrite"
+                            && atomcode_capabilities::tools::todo::parse_todos(&tc.arguments)
+                                .is_ok()
+                        {
+                            if !tc.id.is_empty() {
+                                todowrite_call_ids.insert(tc.id.clone());
+                            }
+                            continue;
+                        }
+                        renderer.render(UiLine::ToolCall {
+                            name: crate::event_loop::display_tool_name(&tc.name),
+                            detail: format_tool_detail(&tc.name, &tc.arguments),
+                        });
+                    }
                 }
             }
             // Tool RESULT: kernel carries `tool_call_id` + `is_error` + flat
@@ -744,7 +795,11 @@ pub(crate) fn replay_session(
             Role::Tool => {
                 let success = !m.is_error;
                 let call_id = m.tool_call_id.as_deref().unwrap_or("");
-                if !(success && todowrite_call_ids.contains(call_id)) {
+                // Suppress a result that is either a (successful) todowrite — the
+                // panel is its sole view — or folded into a rebuilt batch child row.
+                let suppressed = (success && todowrite_call_ids.contains(call_id))
+                    || batched_result_ids.contains(call_id);
+                if !suppressed {
                     renderer.render(UiLine::ToolResult {
                         success,
                         summary: summarise(&m.text),
@@ -797,13 +852,9 @@ pub(crate) fn replay_session(
         .unwrap_or((0, 0));
     state.restore_context(used, window);
 
-    // Seed the persistent todo panel from the transcript (zero extra storage) —
-    // resets the previous session's panel and rehydrates the loaded one, so a
-    // session switch / resume lands on the correct list (folds todowrite + todo events).
-    state.active_todos = crate::event_loop::todo_progress_from_messages(&session.messages);
-    // Rehydrate the id→title cache from the seeded panel so `todo update #N` rows resolve
-    // names immediately after a resume (and drop the previous session's titles).
-    crate::event_loop::sync_todo_titles(state);
+    // The persistent todo panel + id→title cache were seeded BEFORE the render
+    // loop (so rebuilt batch children could enrich `todo update #N` titles); no
+    // second seeding is needed here.
 }
 
 #[cfg(test)]
@@ -1317,23 +1368,27 @@ mod tests {
         let mut session = Session::new(PathBuf::from("/tmp/x"));
         session.messages = vec![
             Message::user("go"),
+            // Single-call steps (len == 1) so this test stays focused on the
+            // standalone todowrite-suppression path; parallel-batch rebuild has
+            // its own test (`replay_rebuilds_parallel_batch_group`).
             Message::assistant(
                 "",
-                vec![
-                    ToolCall {
-                        id: "t1".into(),
-                        name: "todowrite".into(),
-                        arguments: r#"{"todos":[{"content":"task A","status":"in_progress"},{"content":"task B","status":"pending"}]}"#.into(),
-                    },
-                    ToolCall {
-                        id: "r1".into(),
-                        name: "read".into(),
-                        arguments: r#"{"path":"x"}"#.into(),
-                    },
-                ],
+                vec![ToolCall {
+                    id: "t1".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"task A","status":"in_progress"},{"content":"task B","status":"pending"}]}"#.into(),
+                }],
             ),
             // `is_error = !success`: a successful tool result is `false`.
             Message::tool_result("t1", "[~] task A\n[ ] task B", false),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "r1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"x"}"#.into(),
+                }],
+            ),
             Message::tool_result("r1", "file contents", false),
             // A FAILED todowrite (is_error=true): its error result must NOT be
             // suppressed (parity with live's `… && success` suppression). It IS
@@ -1418,6 +1473,153 @@ mod tests {
         assert!(
             results.iter().any(|s| s.contains("error: bad todo item")),
             "a FAILED todowrite's error result must NOT be suppressed: {results:?}"
+        );
+    }
+
+    #[test]
+    fn replay_rebuilds_parallel_batch_group() {
+        use atomcode_kernel::message::Message;
+        use atomcode_kernel::tool::ToolCall;
+
+        #[derive(Default)]
+        struct Rec {
+            lines: Vec<UiLine>,
+        }
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.lines.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {}
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        let mut session = Session::new(PathBuf::from("/tmp/x"));
+        // One assistant step with TWO tool calls == a parallel batch live.
+        session.messages = vec![
+            Message::user("go"),
+            Message::assistant(
+                "",
+                vec![
+                    ToolCall {
+                        id: "b1".into(),
+                        name: "bash".into(),
+                        arguments: r#"{"command":"echo hi"}"#.into(),
+                    },
+                    ToolCall {
+                        id: "b2".into(),
+                        name: "bash".into(),
+                        arguments: r#"{"command":"ls -la"}"#.into(),
+                    },
+                ],
+            ),
+            Message::tool_result("b1", "hi", false),
+            Message::tool_result("b2", "a\nb\nc", false),
+        ];
+
+        let mut state = UiState::with_unicode(true);
+        let mut rec = Rec::default();
+        replay_session(&mut rec, &mut state, &session, false);
+
+        // The two calls collapse into ONE grouped batch header, not two
+        // standalone ToolCall rows.
+        let groups: Vec<(&str, usize)> = rec
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                UiLine::ToolGroupRender {
+                    header, children, ..
+                } => Some((header.as_str(), children.len())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(groups.len(), 1, "one rebuilt batch group: {groups:?}");
+        assert_eq!(groups[0].1, 2, "both calls are children: {groups:?}");
+        assert!(
+            groups[0].0.contains("Running 2 bash calls"),
+            "same-name batch uses the tool label: {:?}",
+            groups[0].0
+        );
+
+        assert!(
+            !rec
+                .lines
+                .iter()
+                .any(|l| matches!(l, UiLine::ToolCall { .. })),
+            "batched calls must NOT also render as standalone tool rows"
+        );
+        // Each result is folded into its child (→ N lines), so no standalone
+        // ToolResult rows survive for the batched calls.
+        assert!(
+            !rec
+                .lines
+                .iter()
+                .any(|l| matches!(l, UiLine::ToolResult { .. })),
+            "batched results are folded into child rows, not shown expanded"
+        );
+    }
+
+    #[test]
+    fn replay_does_not_group_duplicate_calls_the_kernel_collapsed() {
+        use atomcode_kernel::message::Message;
+        use atomcode_kernel::tool::ToolCall;
+
+        #[derive(Default)]
+        struct Rec {
+            lines: Vec<UiLine>,
+        }
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.lines.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {}
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        let mut session = Session::new(PathBuf::from("/tmp/x"));
+        // Two calls with identical name + (key-reordered) args collapse to ONE
+        // distinct call, so the kernel emitted NO batch live. Replay must match:
+        // no "Running 2 calls" group.
+        session.messages = vec![
+            Message::user("go"),
+            Message::assistant(
+                "",
+                vec![
+                    ToolCall {
+                        id: "r1".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"x","limit":5}"#.into(),
+                    },
+                    ToolCall {
+                        id: "r2".into(),
+                        name: "read".into(),
+                        arguments: r#"{"limit":5,"path":"x"}"#.into(),
+                    },
+                ],
+            ),
+            Message::tool_result("r1", "contents", false),
+            Message::tool_result("r2", "contents", false),
+        ];
+
+        let mut state = UiState::with_unicode(true);
+        let mut rec = Rec::default();
+        replay_session(&mut rec, &mut state, &session, false);
+
+        assert!(
+            !rec
+                .lines
+                .iter()
+                .any(|l| matches!(l, UiLine::ToolGroupRender { .. })),
+            "kernel-collapsed duplicates must NOT render as a batch group"
         );
     }
 

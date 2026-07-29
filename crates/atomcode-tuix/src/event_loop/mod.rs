@@ -21529,6 +21529,113 @@ pub(crate) fn web_search_result_suffix(output: &str) -> Option<String> {
     })
 }
 
+/// Rebuild a parallel tool-batch group (header + child rows) for the `/resume`
+/// replay path, mirroring the live `AgentEvent::ToolBatchStarted` layout.
+///
+/// The saved transcript has no `parallel_safe` flag — batch metadata is a
+/// live-only UI construct that is never persisted — so the header always uses
+/// the non-"in parallel" form. That is exactly what non-read-only batches
+/// (bash / write / todowrite) showed live anyway; only a pure read-only batch
+/// loses the literal "in parallel" words after a resume.
+///
+/// Each child already carries its final `→ N lines` / `→ ✗` result suffix,
+/// computed from the persisted tool results (`result_of`: call_id → (success,
+/// output)), so the replayed group matches a *completed* live batch without any
+/// in-place child updates. `todo_titles` enriches `todo update` child rows the
+/// same way the live path does.
+pub(crate) fn build_replay_tool_batch(
+    calls: &[atomcode_kernel::tool::ToolCall],
+    result_of: &std::collections::HashMap<String, (bool, String)>,
+    todo_titles: &std::collections::HashMap<u64, String>,
+) -> (String, Vec<crate::render::ToolGroupChild>) {
+    let count = calls.len();
+    let unique_names: std::collections::HashSet<&str> =
+        calls.iter().map(|c| c.name.as_str()).collect();
+    let label = if unique_names.len() == 1 {
+        format!(
+            "Running {} {} calls",
+            count,
+            unique_names.iter().next().copied().unwrap_or("tool")
+        )
+    } else {
+        format!("Running {} tools", count)
+    };
+    let head_glyph = "\u{25cf}";
+    let child_glyph = "\u{2514}";
+    let arrow = "\u{2192}";
+    let header = format!("{} {}", head_glyph, label);
+
+    let raw_details: Vec<String> = calls
+        .iter()
+        .map(|c| format_tool_detail(&c.name, &c.arguments))
+        .collect();
+    let disambiguated = disambiguate_batch_details(
+        &calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        &calls
+            .iter()
+            .map(|c| c.arguments.as_str())
+            .collect::<Vec<_>>(),
+        &raw_details,
+    );
+    let mut todo_add_counter: usize = 0;
+    let children = calls
+        .iter()
+        .zip(disambiguated.iter())
+        .map(|(c, detail)| {
+            // Mirror the live todo `#N` numbering / update enrichment.
+            let detail = if c.name == "todo" || c.name == "todowrite" {
+                let action = serde_json::from_str::<serde_json::Value>(&c.arguments)
+                    .ok()
+                    .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string));
+                match action.as_deref() {
+                    Some("add") => {
+                        todo_add_counter += 1;
+                        format!("#{} {}", todo_add_counter, detail)
+                    }
+                    Some("update") => {
+                        enrich_todo_detail(&c.name, &c.arguments, detail, todo_titles)
+                    }
+                    _ => detail.clone(),
+                }
+            } else {
+                detail.clone()
+            };
+            // Result suffix from the persisted result — matches the live
+            // `ToolGroupChildUpdate`: `→ N lines` / `→ ✗` / web_search sources.
+            let suffix = match result_of.get(&c.id) {
+                Some((false, _)) => format!(" {} \u{2717}", arrow),
+                Some((true, output)) => {
+                    let web = (c.name == "web_search")
+                        .then(|| web_search_result_suffix(output))
+                        .flatten();
+                    if let Some(srcs) = web {
+                        format!(" {} {}", arrow, srcs)
+                    } else {
+                        let n = output.lines().count().max(1);
+                        let unit = if n == 1 { "line" } else { "lines" };
+                        format!(" {} {} {}", arrow, n, unit)
+                    }
+                }
+                // No persisted result (e.g. a batch cut off mid-turn): leave the
+                // child bare, exactly like a live child awaiting its result.
+                None => String::new(),
+            };
+            // bash → `Short det` (no parens); others → `Short(det)`. Matches the
+            // live completed-child (`ToolGroupChildUpdate`) formatting.
+            let body = if c.name.eq_ignore_ascii_case("bash") {
+                format!("{} {}", display_tool_name_short(&c.name), detail)
+            } else {
+                format!("{}({})", display_tool_name_short(&c.name), detail)
+            };
+            crate::render::ToolGroupChild {
+                call_id: c.id.clone(),
+                text: format!("  {} {}{}", child_glyph, body, suffix),
+            }
+        })
+        .collect();
+    (header, children)
+}
+
 pub(crate) fn summarise(output: &str) -> String {
     let first = output.lines().next().unwrap_or("(no output)");
     let n = output.lines().count();
