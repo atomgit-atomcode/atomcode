@@ -10,7 +10,7 @@ use atomcode_capabilities::provider::{
 use atomcode_capabilities::session::SessionContextHook;
 use atomcode_capabilities::tools::{
     coding_tool_names, register_coding_tools_with_vision, ApprovalMiddleware,
-    OpenFileWorkspaceGate, WriteApprovalGate,
+    OpenFileWorkspaceGate, RepairToolArgsMiddleware, WriteApprovalGate,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::provider::LlmProvider;
@@ -24,8 +24,8 @@ use std::sync::Arc;
 /// Wires, all through existing kernel seams (no kernel change):
 /// - **provider**: OpenAI-compatible adapter (L1) from the config's creds.
 /// - **tools**: the neutral fs/bash toolset + codeintel (L1), all mounted.
-/// - **approval**: an in-memory [`ApprovalMiddleware`] gate (L1) — registered FIRST, so a
-///   later rewriting middleware can never change what the user approved.
+/// - **argument repair**: normalize model-produced tool arguments before policy gates.
+/// - **approval**: an in-memory [`ApprovalMiddleware`] gate over the arguments that execute.
 /// - **persona**: the coding system prompt ([`coding_persona`]).
 /// - **discipline**: the [`VerifyCadenceHook`] edit-then-verify loop.
 /// - **liveness**: stream + request timeouts from the config (never unbounded).
@@ -112,6 +112,8 @@ fn build_coding_agent_from_tools(
         .provider(provider)
         .tools(tools)
         .persona(persona)
+        // Repair model-produced arguments before approval inspects them.
+        .middleware(Arc::new(RepairToolArgsMiddleware))
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
         // BEFORE approval so its `Allow` short-circuits the prompt.
@@ -123,7 +125,7 @@ fn build_coding_agent_from_tools(
         // out-of-workspace writes prompt with a per-path "Always". BEFORE the generic approval
         // gate so its `Allow` short-circuits the prompt. Pins the same immutable root.
         .middleware(Arc::new(WriteApprovalGate::pinned(cfg.working_dir.clone())))
-        // Approval runs BEFORE any (future) arg-rewriting middleware — load-bearing order.
+        // Approval runs after all argument rewriting.
         .middleware(Arc::new(ApprovalMiddleware::in_memory()))
         // Env / project-instructions / git context at session start (after persona).
         .hook(Arc::new(SessionContextHook::new(cfg.working_dir.clone())))
