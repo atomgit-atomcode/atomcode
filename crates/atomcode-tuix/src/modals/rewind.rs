@@ -154,6 +154,8 @@ impl RewindModal {
                 false,
             ));
         }
+        // Keep the footer visually separated from the final target row.
+        rows.push(DiffPanelRow::new(Vec::new()));
         rows
     }
 
@@ -225,7 +227,8 @@ impl RewindModal {
             ),
         };
         renderer.render(UiLine::DiffPanel {
-            title: row(Self::l("Rewind", "回退"), DiffPanelTone::Brand, true),
+            // Rewind is the product feature name and remains untranslated.
+            title: row("Rewind", DiffPanelTone::Brand, true),
             win_height: (rows.len() + 4).min(screen_height as usize).max(1) as u16,
             rows,
             footer: footer.to_string(),
@@ -373,5 +376,9 @@ mod tests {
                 .iter()
                 .any(|span| span.text.contains("more above") || span.text.contains("上方还有"))
         }));
+        assert!(
+            rows.last().is_some_and(|row| row.spans.is_empty()),
+            "the target list should leave one blank row before the footer"
+        );
     }
 }
