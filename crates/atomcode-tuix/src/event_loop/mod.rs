@@ -6573,8 +6573,9 @@ mod tool_format_tests {
 
     #[test]
     fn summarise_read_result_collapses_line_number_and_indent() {
-        // read_file emits `{n:>6}\t{indented source line}`; the preview should
-        // show `{n}  {trimmed content}` with no big left gap.
+        // read_file emits `{n}\t{indented source line}` (legacy transcripts may
+        // carry a padded `{n:>6}\t`, which the parser's `trim` still handles);
+        // the preview should show `{n}  {trimmed content}` with no big left gap.
         let out = "   873\t                    images: core_images,\n   874\t    other: 1,";
         assert_eq!(
             summarise_read_result(out),
@@ -21970,9 +21971,10 @@ pub(crate) fn summarise(output: &str) -> String {
 
 /// Collapse a `read_file` first-line preview into a tidy `{n}  {content}`.
 ///
-/// `read_file` formats each line as `{n:>6}\t{source line}` — the line number
-/// right-padded to 6 columns, a tab, then the source line WITH its own
-/// indentation. For a deeply-indented line the tab plus that indentation renders
+/// `read_file` formats each line as `{n}\t{source line}` — the line number, a
+/// tab, then the source line WITH its own indentation (legacy transcripts may
+/// carry a `{n:>6}\t` 6-column-padded number, which the `trim` below still
+/// handles). For a deeply-indented line the tab plus that indentation renders
 /// as a big empty gap between the number and the text. Recognise the
 /// `<digits>\t` prefix and collapse the tab + the content's leading whitespace to
 /// two spaces; fall back to the raw first line for anything else (directory
