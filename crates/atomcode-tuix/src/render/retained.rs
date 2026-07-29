@@ -6597,7 +6597,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 &bg,
                 &format!("└ [Image #{}]", n),
                 &muted,
-                None,
+                Some((&indent, &bg)),
             );
             for row in &mut arows {
                 Self::pad_row_bg(row, w, &bg);
