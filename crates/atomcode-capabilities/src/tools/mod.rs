@@ -35,6 +35,7 @@ const DEFAULT_CHILD_MAX_ROUNDS: u32 = 200;
 
 pub mod approval;
 pub mod ast_grep;
+pub mod output_artifact;
 /// AtomGit REST tools (repo / pr / issue). Opt-in `atomgit` feature.
 #[cfg(feature = "atomgit")]
 pub mod atomgit;
@@ -81,6 +82,7 @@ pub use approval::{
     ApprovalResponse, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
 pub use ast_grep::AstGrepTool;
+pub use output_artifact::{artifact_id, ArtifactStore};
 #[cfg(feature = "atomgit")]
 pub use atomgit::{
     atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, AtomgitPrTool, AtomgitRepoTool,
