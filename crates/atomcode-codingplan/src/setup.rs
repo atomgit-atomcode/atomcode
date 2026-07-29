@@ -1136,7 +1136,11 @@ pub fn merge_successful_config(
 /// the active selection never resets). Idempotent: prior new-schema CodingPlan
 /// entries are dropped and rewritten each run.
 fn persist_codingplan_as_new_schema(config: &mut Config) {
-    if !config.providers.keys().any(|k| is_codingplan_provider_name(k)) {
+    if !config
+        .providers
+        .keys()
+        .any(|k| is_codingplan_provider_name(k))
+    {
         return;
     }
     // Drop any prior new-schema CodingPlan entries FIRST, so the freshly-merged
@@ -1159,7 +1163,9 @@ fn persist_codingplan_as_new_schema(config: &mut Config) {
         .filter(|(_, m)| is_codingplan_provider_name(&m.account))
         .collect();
 
-    config.providers.retain(|k, _| !is_codingplan_provider_name(k));
+    config
+        .providers
+        .retain(|k, _| !is_codingplan_provider_name(k));
     for (id, a) in accounts {
         config.provider_accounts.insert(id, a);
     }
@@ -1286,7 +1292,6 @@ fn provider_names_for(model_names: &[String]) -> Vec<String> {
 fn sanitize_model_for_name(model: &str) -> String {
     model.replace('/', "-")
 }
-
 
 /// Build a ProviderConfig from a model-list entry. The server's
 /// per-model fields take precedence; missing fields fall back to the
@@ -2594,8 +2599,10 @@ mod tests {
             "AtomGit-GLM-5.2".into(),
             build_codingplan_provider(&entry("GLM-5.2")),
         );
-        cfg.providers
-            .insert("AtomGit-Qwen".into(), build_codingplan_provider(&entry("Qwen")));
+        cfg.providers.insert(
+            "AtomGit-Qwen".into(),
+            build_codingplan_provider(&entry("Qwen")),
+        );
         // A claude-wire model must land in its own account (an account carries
         // exactly one wire format).
         let claude_entry = super::super::types::ModelEntry {
@@ -2614,7 +2621,10 @@ mod tests {
         assert!(cfg.provider_accounts.contains_key("AtomGit"));
         assert!(cfg.provider_accounts.contains_key("AtomGit-anthropic"));
         assert_eq!(cfg.provider_accounts["AtomGit"].provider, "openai");
-        assert_eq!(cfg.provider_accounts["AtomGit-anthropic"].provider, "anthropic");
+        assert_eq!(
+            cfg.provider_accounts["AtomGit-anthropic"].provider,
+            "anthropic"
+        );
         // Model ids stay = legacy provider keys; only the parent account folds.
         assert_eq!(cfg.models["AtomGit-GLM-5.2"].account, "AtomGit");
         assert_eq!(cfg.models["AtomGit-Qwen"].account, "AtomGit");

@@ -621,7 +621,9 @@ impl Config {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("legacy provider `{name}` not found"))?;
         if self.provider_accounts.contains_key(name) || self.models.contains_key(name) {
-            anyhow::bail!("cannot upgrade `{name}`: a new-schema account or model already uses that id");
+            anyhow::bail!(
+                "cannot upgrade `{name}`: a new-schema account or model already uses that id"
+            );
         }
         let account = project_legacy_account(provider);
         let model = project_legacy_model(name, provider);
@@ -1476,9 +1478,7 @@ impl Config {
         let name = selection
             .filter(|s| self.selection_exists(s))
             .or_else(first_catalog)
-            .ok_or_else(|| {
-                anyhow::anyhow!("No providers configured — run /login or /provider")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("No providers configured — run /login or /provider"))?;
         self.provider_config_for_selection(&name)
             .ok_or_else(|| anyhow::anyhow!("No providers configured — run /login or /provider"))
     }
@@ -1704,7 +1704,8 @@ model = "working-model"
 model = "missing-type"
 api_key = "keep-me-secret"
 "#;
-        let (config, warnings) = Config::parse_disk_content_tolerant(source, Path::new("x")).unwrap();
+        let (config, warnings) =
+            Config::parse_disk_content_tolerant(source, Path::new("x")).unwrap();
         assert_eq!(config.providers.len(), 1);
         assert_eq!(warnings.len(), 1);
 
@@ -1777,10 +1778,9 @@ model = "missing-type"
         let (config, warnings) = Config::load_with_diagnostics(&path).unwrap();
         assert_eq!(config.default_provider, "Valid");
         assert_eq!(config.providers.len(), 1);
-        assert!(
-            warnings.iter().any(|warning| warning
-                == "default_provider \"Broken\" was unavailable; using \"Valid\"")
-        );
+        assert!(warnings.iter().any(
+            |warning| warning == "default_provider \"Broken\" was unavailable; using \"Valid\""
+        ));
     }
 
     #[test]
@@ -2710,7 +2710,10 @@ capable_model = 5
             cfg.models["aliyun-default/qwen3-coder-plus"].model,
             "qwen3-coder-plus"
         );
-        assert_eq!(cfg.models["aliyun-default/qwen3-max"].capable_model, Some(5));
+        assert_eq!(
+            cfg.models["aliyun-default/qwen3-max"].capable_model,
+            Some(5)
+        );
         assert_eq!(
             cfg.default_model.as_deref(),
             Some("aliyun-default/qwen3-coder-plus")
@@ -2771,7 +2774,10 @@ capable_model = 5
             !rendered.contains("sk-runtime-only"),
             "ephemeral account credential leaked into saved config"
         );
-        assert!(!rendered.contains("oauth-live"), "ephemeral account persisted");
+        assert!(
+            !rendered.contains("oauth-live"),
+            "ephemeral account persisted"
+        );
         // The persistent account + models survive.
         assert!(rendered.contains("aliyun-default"));
     }
@@ -2814,11 +2820,26 @@ capable_model = 5
         cfg.default_model = Some("nope".into()); // unresolvable default → error
 
         let diags = cfg.validate_provider_accounts_and_models();
-        assert!(diags.iter().any(|d| d.contains("no default endpoint")), "{diags:?}");
-        assert!(diags.iter().any(|d| d.contains("unknown account")), "{diags:?}");
-        assert!(diags.iter().any(|d| d.contains("missing `model`")), "{diags:?}");
-        assert!(diags.iter().any(|d| d.contains("context_window = 0")), "{diags:?}");
-        assert!(diags.iter().any(|d| d.contains("default_model")), "{diags:?}");
+        assert!(
+            diags.iter().any(|d| d.contains("no default endpoint")),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("unknown account")),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("missing `model`")),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("context_window = 0")),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("default_model")),
+            "{diags:?}"
+        );
     }
 
     #[test]
@@ -2864,7 +2885,10 @@ capable_model = 3
         assert_eq!(m.context_window, 128000);
         assert_eq!(m.capable_model, Some(3));
 
-        assert_eq!(cfg.effective_model_selection().as_deref(), Some("MyDeepSeek"));
+        assert_eq!(
+            cfg.effective_model_selection().as_deref(),
+            Some("MyDeepSeek")
+        );
     }
 
     #[test]
@@ -2967,7 +2991,10 @@ context_window = 131072
     fn legacy_only_config_is_not_rewritten_on_serialize() {
         let cfg: Config = toml::from_str(LEGACY).unwrap();
         let rendered = cfg.serialize_for_disk(None).unwrap();
-        assert!(rendered.contains("[providers.MyDeepSeek]"), "legacy section kept verbatim");
+        assert!(
+            rendered.contains("[providers.MyDeepSeek]"),
+            "legacy section kept verbatim"
+        );
         assert!(
             !rendered.contains("[provider_accounts"),
             "load/serialize must not auto-upgrade legacy into the new schema"
@@ -3012,7 +3039,10 @@ context_window = 131072
         assert!(cfg.providers.is_empty());
         let p = cfg.active_provider(None).unwrap();
         assert_eq!(p.model, "deepseek-v4-flash");
-        assert_eq!(p.base_url.as_deref(), Some("https://llm-api.atomgit.com/v1"));
+        assert_eq!(
+            p.base_url.as_deref(),
+            Some("https://llm-api.atomgit.com/v1")
+        );
         // Falls back to a catalog model when the selection is dangling.
         let p2 = cfg.active_provider(Some("nope")).unwrap();
         assert_eq!(p2.model, "deepseek-v4-flash");
@@ -3034,8 +3064,14 @@ context_window = 131072
             *r.thinking_keep = Some("all".into());
         }));
         assert_eq!(cfg.models["acc/ds"].thinking_enabled, Some(true));
-        assert_eq!(cfg.models["acc/ds"].reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(cfg.models["acc/ds"].thinking_type.as_deref(), Some("enabled"));
+        assert_eq!(
+            cfg.models["acc/ds"].reasoning_effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            cfg.models["acc/ds"].thinking_type.as_deref(),
+            Some("enabled")
+        );
         assert_eq!(cfg.models["acc/ds"].thinking_keep.as_deref(), Some("all"));
         // Legacy provider.
         assert!(cfg.update_selection_reasoning("leg", |r| *r.thinking_budget = Some(2048)));
@@ -3069,7 +3105,10 @@ context_window = 131072
         // only the parent account folds.
         assert_eq!(models["AtomGit-GLM-5.2"].account, "AtomGit");
         assert_eq!(models["AtomGit-Qwen"].account, "AtomGit");
-        assert_eq!(models["AtomGit-anthropic-claude"].account, "AtomGit-anthropic");
+        assert_eq!(
+            models["AtomGit-anthropic-claude"].account,
+            "AtomGit-anthropic"
+        );
         assert_eq!(models["my-openai"].account, "my-openai");
 
         // Resolving by the stable legacy id still works and keeps the gateway
@@ -3126,7 +3165,10 @@ context_window = 131072
         let cfg: Config = toml::from_str(toml).unwrap();
         let err = cfg.resolve_model(None).unwrap_err().to_string();
         assert!(err.contains("missing"), "{err}");
-        assert!(!err.contains("SUPER-SECRET"), "credential leaked in error: {err}");
+        assert!(
+            !err.contains("SUPER-SECRET"),
+            "credential leaked in error: {err}"
+        );
     }
 
     #[test]

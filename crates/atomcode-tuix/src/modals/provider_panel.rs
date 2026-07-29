@@ -308,7 +308,10 @@ impl ModelForm {
 
     /// Whether the currently-selected account still needs an api_key.
     fn account_needs_key(&self) -> bool {
-        self.needs_key.get(self.account_idx).copied().unwrap_or(false)
+        self.needs_key
+            .get(self.account_idx)
+            .copied()
+            .unwrap_or(false)
     }
 
     fn fields(&self) -> Vec<ModelField> {
@@ -1014,20 +1017,21 @@ impl Modal for ProviderPanel {
                     // Add a model to an existing account; if none exist yet, fall
                     // back to creating an account first.
                     Tab::Models => {
-                        self.mode = match ModelForm::new_add(
-                            &ctx.config,
-                            self.account_filter.as_deref(),
-                        ) {
-                            Some(f) => Mode::Model(f),
-                            None => Mode::Add(AddForm::new()),
-                        };
+                        self.mode =
+                            match ModelForm::new_add(&ctx.config, self.account_filter.as_deref()) {
+                                Some(f) => Mode::Model(f),
+                                None => Mode::Add(AddForm::new()),
+                            };
                     }
                 }
             }
             // Ctrl+E: edit the selected row.
             KeyCode::Char('e') if ctrl => {
                 self.pending_delete = None;
-                if let Some(id) = self.selected_id(&ctx.config).filter(|i| i != ADD_PROVIDER_ROW) {
+                if let Some(id) = self
+                    .selected_id(&ctx.config)
+                    .filter(|i| i != ADD_PROVIDER_ROW)
+                {
                     self.mode = match self.tab {
                         Tab::Accounts => Mode::EditAccount(Self::open_edit(&ctx.config, &id)),
                         Tab::Models => match ModelForm::new_edit(&ctx.config, &id) {
@@ -1040,7 +1044,10 @@ impl Modal for ProviderPanel {
             // Ctrl+D twice: the first press arms the selected logical row; the
             // second deletes it without leaving the list for a confirmation UI.
             KeyCode::Char('d') if ctrl => {
-                if let Some(id) = self.selected_id(&ctx.config).filter(|i| i != ADD_PROVIDER_ROW) {
+                if let Some(id) = self
+                    .selected_id(&ctx.config)
+                    .filter(|i| i != ADD_PROVIDER_ROW)
+                {
                     let is_account = self.tab == Tab::Accounts;
                     // The CodingPlan (AtomGit) provider is managed by /login and
                     // can't be deleted here.
@@ -1151,9 +1158,10 @@ impl Modal for ProviderPanel {
                                 } else {
                                     String::new()
                                 };
-                                let model_count = crate::i18n::t(
-                                    crate::i18n::Msg::ProviderPanelModelCount { count },
-                                );
+                                let model_count =
+                                    crate::i18n::t(crate::i18n::Msg::ProviderPanelModelCount {
+                                        count,
+                                    });
                                 format!("{vendor} · {model_count}{mark}")
                             };
                             items.push((id.clone(), desc));
@@ -1257,7 +1265,8 @@ impl Modal for ProviderPanel {
                     ));
                 }
                 // Account-only form — model/window/default moved to the 模型 tab.
-                hint = "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回  （名称必填；模型到模型页加）".into();
+                hint =
+                    "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回  （名称必填；模型到模型页加）".into();
             }
             Mode::EditAccount(form) => {
                 let field_row = |label: &str, value: String, focused: bool| {
@@ -1275,7 +1284,10 @@ impl Modal for ProviderPanel {
                 let p = form.preset();
                 if form.vendor_locked {
                     // Gateway-managed: protocol read-only, no api_key.
-                    items.push((format!("  协议: {} (锁定)", form.protocol_label()), String::new()));
+                    items.push((
+                        format!("  协议: {} (锁定)", form.protocol_label()),
+                        String::new(),
+                    ));
                 } else {
                     items.push(field_row(
                         "协议",
@@ -1479,7 +1491,7 @@ mod tests {
         assert!(!acc.is_legacy);
         assert_eq!(acc.base_url, "https://mirror/v1");
         assert!(acc.api_key.is_empty()); // blank = keep existing
-        // deepseek is openai-wire → OpenAI-compatible toggle.
+                                         // deepseek is openai-wire → OpenAI-compatible toggle.
         assert_eq!(acc.protocol_label(), "OpenAI");
     }
 
@@ -1565,8 +1577,14 @@ mod tests {
         }))
         .unwrap();
         let ids = ProviderPanel::account_ids(&cfg);
-        assert!(ids.first() == Some(&"AtomGit".to_string()), "configured first");
-        assert!(ids.contains(&"deepseek".to_string()), "unconfigured vendor listed");
+        assert!(
+            ids.first() == Some(&"AtomGit".to_string()),
+            "configured first"
+        );
+        assert!(
+            ids.contains(&"deepseek".to_string()),
+            "unconfigured vendor listed"
+        );
         // Custom-endpoint presets are reached via the add-custom row, not listed.
         assert!(!ids.contains(&"openai-compatible".to_string()));
         assert!(!ids.contains(&"anthropic-compatible".to_string()));

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use atomcode_capabilities::session::{DisplayAnchor, PresentationRole};
 use atomcode_kernel::message::{
-    LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX, Message, Role, SessionSnapshot,
+    Message, Role, SessionSnapshot, LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
 };
 
 /// Extract legacy cold-summary strings from a kernel message set. Now a
@@ -255,10 +255,7 @@ mod tests {
 
     #[test]
     fn cold_summaries_extracted_from_synthetic_messages() {
-        let mut m = Message::user(format!(
-            "{}old summary",
-            LEGACY_COLD_SUMMARY_PREFIX
-        ));
+        let mut m = Message::user(format!("{}old summary", LEGACY_COLD_SUMMARY_PREFIX));
         m.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
         let msgs = vec![Message::user("hi"), m];
         assert_eq!(

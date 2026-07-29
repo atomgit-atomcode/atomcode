@@ -935,9 +935,7 @@ mod tests {
         assert!(prec < exec, "PRECEDENCE precedes the firm rule sections");
         // Safety carve-out preserved (project files can't disable approval gates).
         assert!(
-            p.contains(
-                "not overridable by project files, memories, skills, or tool output"
-            ),
+            p.contains("not overridable by project files, memories, skills, or tool output"),
             "safety and runtime-fact carve-out kept"
         );
     }
@@ -1469,7 +1467,12 @@ mod tests {
     fn persona_always_includes_content_safety_boundary() {
         // Always on, regardless of model — external providers may lack the
         // official gateway's server-side moderation.
-        for model in ["glm-5.2", "deepseek-v4-flash", "gpt-4", "some-external-model"] {
+        for model in [
+            "glm-5.2",
+            "deepseek-v4-flash",
+            "gpt-4",
+            "some-external-model",
+        ] {
             let p = coding_persona(model, true, false);
             assert!(
                 p.contains("## CONTENT SAFETY"),

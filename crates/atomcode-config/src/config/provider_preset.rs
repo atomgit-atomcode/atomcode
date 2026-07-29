@@ -269,12 +269,18 @@ mod tests {
     fn every_preset_has_required_stable_fields() {
         for p in PRESETS {
             assert!(!p.id.is_empty(), "empty id");
-            assert!(!p.display_name.is_empty(), "empty display_name for {}", p.id);
+            assert!(
+                !p.display_name.is_empty(),
+                "empty display_name for {}",
+                p.id
+            );
             // Concrete hosted vendors ship a default base_url. The generic
             // `*-compatible` presets and open-weights models without a fixed
             // public endpoint (Xiaomi MiMo) legitimately leave it unset.
-            let endpoint_optional =
-                matches!(p.id, "openai-compatible" | "anthropic-compatible" | "xiaomi-mimo");
+            let endpoint_optional = matches!(
+                p.id,
+                "openai-compatible" | "anthropic-compatible" | "xiaomi-mimo"
+            );
             if !endpoint_optional {
                 assert!(
                     p.default_base_url.is_some(),

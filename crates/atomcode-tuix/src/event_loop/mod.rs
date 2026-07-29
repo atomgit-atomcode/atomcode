@@ -14968,7 +14968,10 @@ mod turn_error_reason_tests {
             "{label}"
         );
         // …but the cause is NOT repeated — it's visible in the line above.
-        assert!(!label.contains("401"), "reason should not be folded: {label}");
+        assert!(
+            !label.contains("401"),
+            "reason should not be folded: {label}"
+        );
         // Both the reason and the flag are consumed for the next turn.
         assert!(state.last_turn_error.is_none());
         assert!(!state.turn_error_line_shown);

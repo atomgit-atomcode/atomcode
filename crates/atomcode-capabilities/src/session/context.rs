@@ -201,7 +201,9 @@ impl LifecycleHooks for SessionContextHook {
                 convo.messages[i] = Message::system(refreshed);
             }
             // Legacy/pre-upgrade session that never carried the block — insert a full fresh one.
-            None => convo.messages.insert(leading, Message::system(self.render())),
+            None => convo
+                .messages
+                .insert(leading, Message::system(self.render())),
         }
     }
 }
@@ -330,7 +332,7 @@ mod tests {
         git_commit(repo.path(), "first");
         let hook = SessionContextHook::with_home(repo.path(), repo.path().join("nohome"));
         let saved = hook.render(); // captures HEAD #1
-        // HEAD moves after the save.
+                                   // HEAD moves after the save.
         std::fs::write(repo.path().join("b.txt"), "2").unwrap();
         git_commit(repo.path(), "second");
         let mut convo = Conversation::new();

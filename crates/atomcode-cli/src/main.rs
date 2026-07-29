@@ -1962,10 +1962,12 @@ fn spawn_deferred_tui_runtime(
             cfg,
             session_id.clone(),
             snapshot,
-            Some(std::sync::Arc::new(crate::vision::VlImagePreprocessor::new(
-                atomcode_daemon::coding_provider_factory(),
-                vl_base,
-            ))),
+            Some(std::sync::Arc::new(
+                crate::vision::VlImagePreprocessor::new(
+                    atomcode_daemon::coding_provider_factory(),
+                    vl_base,
+                ),
+            )),
         );
     let control = atomcode_tuix::RuntimeControl::deferred(native_control, runtime_state);
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2302,10 +2304,12 @@ async fn spawn_native_cli_runtime(
         // Restore the TUI's VL image recognition (dropped when the legacy
         // bridge was retired): convert images to text for non-vision models
         // inside the async turn, so it never blocks the UI. See `vision`.
-        image_preprocessor: Some(std::sync::Arc::new(crate::vision::VlImagePreprocessor::new(
-            atomcode_daemon::coding_provider_factory(),
-            agent.clone(),
-        ))),
+        image_preprocessor: Some(std::sync::Arc::new(
+            crate::vision::VlImagePreprocessor::new(
+                atomcode_daemon::coding_provider_factory(),
+                agent.clone(),
+            ),
+        )),
     };
     let runtime = match imported_lease {
         Some(lease) => {
@@ -2913,9 +2917,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                     if hooks.is_empty() {
                         println!("\n  (No hooks loaded. Check hooks.json / .hooks.json.)");
                     } else {
-                        println!(
-                            "\nAvailable hooks (test by event name or a command substring):"
-                        );
+                        println!("\nAvailable hooks (test by event name or a command substring):");
                         for h in &hooks {
                             println!("  🔹 {:<16} {}", event_name(h.event), h.command);
                         }
@@ -2965,7 +2967,8 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                                 Some(0) => ("✅ SUCCESS", "exit code 0".to_string()),
                                 Some(2) => (
                                     "⛔ BLOCK",
-                                    "exit code 2 — hook requested a block (CC contract)".to_string(),
+                                    "exit code 2 — hook requested a block (CC contract)"
+                                        .to_string(),
                                 ),
                                 Some(c) => ("❌ FAILURE", format!("exit code {}", c)),
                                 None => ("❌ FAILURE", "terminated by signal".to_string()),

@@ -1748,7 +1748,8 @@ impl RunningAgent {
                         } else {
                             // Explicit stop (Esc / picker) OR fail-closed default
                             // (no requester / timeout): the round cap is the reason.
-                            self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx).await;
+                            self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                                .await;
                             return;
                         }
                     } else {

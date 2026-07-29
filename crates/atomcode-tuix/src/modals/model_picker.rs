@@ -144,8 +144,7 @@ impl ModelPicker {
                     if m.account.to_lowercase().contains(&q) {
                         return true;
                     }
-                    if m
-                        .display_name
+                    if m.display_name
                         .as_deref()
                         .is_some_and(|d| d.to_lowercase().contains(&q))
                     {

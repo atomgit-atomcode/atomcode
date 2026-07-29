@@ -429,15 +429,13 @@ output_per_million = 0
                 cached_input_per_million: 0.0,
             })
         );
-        assert!(
-            ProviderPricing {
-                input_per_million: -1.0,
-                output_per_million: 0.0,
-                cached_input_per_million: 0.0,
-            }
-            .validated()
-            .is_none()
-        );
+        assert!(ProviderPricing {
+            input_per_million: -1.0,
+            output_per_million: 0.0,
+            cached_input_per_million: 0.0,
+        }
+        .validated()
+        .is_none());
     }
 
     #[test]

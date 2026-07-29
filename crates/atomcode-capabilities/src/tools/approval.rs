@@ -289,7 +289,10 @@ mod tests {
             PermissionDecision::AllowAlways
         );
         assert_eq!(parse_permission_decision("deny"), PermissionDecision::Deny);
-        assert_eq!(parse_permission_decision("garbage"), PermissionDecision::Deny);
+        assert_eq!(
+            parse_permission_decision("garbage"),
+            PermissionDecision::Deny
+        );
     }
 
     fn risky_call() -> ToolCall {

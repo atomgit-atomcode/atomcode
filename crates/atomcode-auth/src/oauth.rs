@@ -1411,8 +1411,7 @@ fn with_auth_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
         // Best-effort: a directory we can write to but can't chmod (unusual
         // mounts, or a dir owned by another user) must not block login / refresh /
         // logout. The file itself is still written 0600 by write_auth_file_secure.
-        if let Err(error) =
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        if let Err(error) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
         {
             tracing::warn!(%error, "failed to tighten auth directory permissions");
         }

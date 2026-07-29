@@ -398,8 +398,8 @@ fn load_content(path: &Path) -> Result<Content> {
     // Reject anything that isn't a regular file *before* reading a byte. A FIFO
     // or char device (e.g. /dev/zero) would otherwise make the blocking read
     // below hang or stream forever and freeze the event loop.
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("Failed to read {}", path.display()))?;
     if !meta.is_file() {
         anyhow::bail!("Not a regular file: {}", path.display());
     }
@@ -492,7 +492,13 @@ fn build_content_panel(
     // Gutter wide enough for the largest line number (min 2 cols).
     let gutter = c.total_lines.to_string().len().max(2);
     let mut rows: Vec<DiffPanelRow> = Vec::new();
-    for (idx, line) in c.lines.iter().enumerate().skip(c.scroll).take(content_height) {
+    for (idx, line) in c
+        .lines
+        .iter()
+        .enumerate()
+        .skip(c.scroll)
+        .take(content_height)
+    {
         rows.push(DiffPanelRow::new(vec![
             DiffPanelSpan::new(format!("{:>gutter$} ", idx + 1), DiffPanelTone::Muted),
             DiffPanelSpan::new(line.clone(), DiffPanelTone::Default),
@@ -646,7 +652,11 @@ mod tests {
         // A path-like query pointing at a real file becomes the index-0 row and
         // Enter would open exactly that path — even with zero project matches.
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let picker = picker_from(&PathBuf::from("/proj"), Vec::new(), &tmp.path().display().to_string());
+        let picker = picker_from(
+            &PathBuf::from("/proj"),
+            Vec::new(),
+            &tmp.path().display().to_string(),
+        );
         assert_eq!(picker.external.as_deref(), Some(tmp.path()));
         assert_eq!(picker.len(), 1);
         assert_eq!(picker.selected_path().as_deref(), Some(tmp.path()));
@@ -673,7 +683,11 @@ mod tests {
         // probe / external row.
         let picker = picker_from(
             &PathBuf::from("/proj"),
-            vec![Entry { rel_path: "main.rs".into(), is_dir: false, depth: 1 }],
+            vec![Entry {
+                rel_path: "main.rs".into(),
+                is_dir: false,
+                depth: 1,
+            }],
             "main",
         );
         assert!(picker.external.is_none());

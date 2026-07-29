@@ -2571,8 +2571,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .iter()
             .filter(|item| item.status == crate::render::SubtaskStatus::Pending)
             .count();
-        let needs_summary =
-            failed > 0 || pending > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
+        let needs_summary = failed > 0 || pending > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
         let summary_rows = usize::from(needs_summary && cap >= 2);
         let visible_running = running
             .min(MAX_VISIBLE_RUNNING_SUBTASKS)
@@ -2681,11 +2680,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 format_subtask_progress(&content, &elapsed, item.output_tokens, content_width);
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &CellStyle::default());
-            push_str_cells(
-                &mut row,
-                glyph,
-                &self.style_for(Role::Brand),
-            );
+            push_str_cells(&mut row, glyph, &self.style_for(Role::Brand));
             push_str_cells(&mut row, " ", &CellStyle::default());
             push_str_cells(&mut row, &fitted, &self.style_for(Role::Secondary));
             rows.push(row);
@@ -10283,10 +10278,18 @@ mod tests {
         let row = r
             .body_lines
             .iter()
-            .find(|row| row.iter().map(|cell| cell.ch).collect::<String>().contains("Task"))
+            .find(|row| {
+                row.iter()
+                    .map(|cell| cell.ch)
+                    .collect::<String>()
+                    .contains("Task")
+            })
             .expect("live Task row");
         let brand = r.style_for(Role::Brand).fg;
-        assert!(brand.is_some(), "capturing terminal should enable brand color");
+        assert!(
+            brand.is_some(),
+            "capturing terminal should enable brand color"
+        );
         assert!(
             row.iter()
                 .filter(|cell| !cell.ch.is_whitespace())
@@ -10298,7 +10301,12 @@ mod tests {
         let ordinary = r
             .body_lines
             .iter()
-            .find(|row| row.iter().map(|cell| cell.ch).collect::<String>().contains("Read"))
+            .find(|row| {
+                row.iter()
+                    .map(|cell| cell.ch)
+                    .collect::<String>()
+                    .contains("Read")
+            })
             .expect("ordinary live tool row");
         assert!(
             ordinary
@@ -15965,8 +15973,7 @@ mod tests {
     fn retained_multiline_user_message_continuation_is_bg_no_bar() {
         let (mut r, _buf) = new_capturing(80, 24);
         r.caps.colors = true;
-        let expected_bg =
-            crate::render::theme::role(r.caps, crate::render::theme::Role::PanelBg);
+        let expected_bg = crate::render::theme::role(r.caps, crate::render::theme::Role::PanelBg);
         r.render(UiLine::User("first line\nsecond line".into()));
 
         let mut saw_chevron = false;
@@ -16010,8 +16017,7 @@ mod tests {
     fn retained_user_message_renders_panel_bg_block() {
         let (mut r, _buf) = new_capturing(80, 24);
         r.caps.colors = true;
-        let expected_bg =
-            crate::render::theme::role(r.caps, crate::render::theme::Role::PanelBg);
+        let expected_bg = crate::render::theme::role(r.caps, crate::render::theme::Role::PanelBg);
         assert!(
             expected_bg.is_some(),
             "PanelBg must resolve to a colour when colours are on"
@@ -16022,7 +16028,12 @@ mod tests {
         let idx = r
             .body_lines
             .iter()
-            .position(|row| row.iter().map(|c| c.ch).collect::<String>().contains("hello"))
+            .position(|row| {
+                row.iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .contains("hello")
+            })
             .expect("user text row present");
 
         // Every cell on the content row carries the panel background, including
@@ -16042,12 +16053,16 @@ mod tests {
         let below = &r.body_lines[idx + 1];
         assert!(
             !above.is_empty()
-                && above.iter().all(|c| c.ch == ' ' && c.style.bg == expected_bg),
+                && above
+                    .iter()
+                    .all(|c| c.ch == ' ' && c.style.bg == expected_bg),
             "row above content must be a bg padding row"
         );
         assert!(
             !below.is_empty()
-                && below.iter().all(|c| c.ch == ' ' && c.style.bg == expected_bg),
+                && below
+                    .iter()
+                    .all(|c| c.ch == ' ' && c.style.bg == expected_bg),
             "row below content must be a bg padding row"
         );
     }
@@ -17255,7 +17270,9 @@ mod tests {
         let echo = "check-beijing-weather-please";
         r.render(UiLine::User(echo.into()));
         r.render(UiLine::AssistantText("WebSearch(beijing weather)\n".into()));
-        r.render(UiLine::AssistantText("sources: tianqi.com, exa.ai +3\n".into()));
+        r.render(UiLine::AssistantText(
+            "sources: tianqi.com, exa.ai +3\n".into(),
+        ));
         r.render(UiLine::Spinner {
             frame: "⠋".into(),
             label: "Pondering…".into(),

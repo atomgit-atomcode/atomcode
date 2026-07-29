@@ -1546,8 +1546,7 @@ mod tests {
         );
 
         assert!(
-            !rec
-                .lines
+            !rec.lines
                 .iter()
                 .any(|l| matches!(l, UiLine::ToolCall { .. })),
             "batched calls must NOT also render as standalone tool rows"
@@ -1555,8 +1554,7 @@ mod tests {
         // Each result is folded into its child (→ N lines), so no standalone
         // ToolResult rows survive for the batched calls.
         assert!(
-            !rec
-                .lines
+            !rec.lines
                 .iter()
                 .any(|l| matches!(l, UiLine::ToolResult { .. })),
             "batched results are folded into child rows, not shown expanded"
@@ -1615,8 +1613,7 @@ mod tests {
         replay_session(&mut rec, &mut state, &session, false);
 
         assert!(
-            !rec
-                .lines
+            !rec.lines
                 .iter()
                 .any(|l| matches!(l, UiLine::ToolGroupRender { .. })),
             "kernel-collapsed duplicates must NOT render as a batch group"

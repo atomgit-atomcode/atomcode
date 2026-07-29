@@ -455,7 +455,10 @@ async fn round_cap_checkpoint_continue_rearms_then_stop() {
     })
     .await;
     outcome.expect("round_cap_checkpoint_continue_rearms_then_stop must not hang");
-    assert_eq!(checkpoints, 2, "continue must re-arm to trigger a second checkpoint");
+    assert_eq!(
+        checkpoints, 2,
+        "continue must re-arm to trigger a second checkpoint"
+    );
     assert!(
         matches!(stop, Some(StopReason::MaxRounds)),
         "stop on second checkpoint must be MaxRounds; got {stop:?}"
@@ -613,7 +616,10 @@ async fn round_cap_checkpoint_off_keeps_hard_error() {
     .await;
     outcome.expect("round_cap_checkpoint_off_keeps_hard_error must not hang");
     assert_eq!(requests, 0, "checkpoint must never be emitted when off");
-    assert!(saw_error, "hard Error must still be emitted when checkpoint is off");
+    assert!(
+        saw_error,
+        "hard Error must still be emitted when checkpoint is off"
+    );
     assert!(
         matches!(stop, Some(StopReason::MaxRounds)),
         "stop must be MaxRounds when checkpoint is off; got {stop:?}"

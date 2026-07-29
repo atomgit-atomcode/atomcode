@@ -301,7 +301,11 @@ pub(crate) fn windows_shell_label(bash_present: bool) -> &'static str {
 /// which cmd.exe can't parse, so the model thrashes into temp-file workarounds.
 /// Naming the real shell here removes the contradiction. Pure (takes a bool) so
 /// the Windows wording is unit-testable off Windows.
-fn shell_tool_description(is_windows: bool, bash_present: bool, askpass_active: bool) -> &'static str {
+fn shell_tool_description(
+    is_windows: bool,
+    bash_present: bool,
+    askpass_active: bool,
+) -> &'static str {
     // Single-source the base paragraph so a Windows/Unix edit can't drift. A
     // macro (not a `const`) because `concat!` only splices literals.
     macro_rules! base {
@@ -963,9 +967,7 @@ fn decode_detected(bytes: &[u8]) -> String {
 // chardetng can mistake short Windows-1252 strings containing curly quotes/dashes for
 // IBM866 because those byte ranges overlap. Keep this deliberately narrow so genuine
 // Cyrillic output is not rewritten.
-const WINDOWS_1252_PUNCT_BYTES: [u8; 8] = [
-    0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x99,
-];
+const WINDOWS_1252_PUNCT_BYTES: [u8; 8] = [0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x99];
 
 fn looks_like_windows_1252_punctuation(bytes: &[u8]) -> bool {
     let mut saw_punctuation = false;
@@ -2453,10 +2455,7 @@ pub async fn run_shell(
                             if let Some(chunk) =
                                 decode_stream_chunk(&mut stderr_decode_pending, &buf[..n], false)
                             {
-                                chunk_cb(&format!(
-                                    "[stderr] {}",
-                                    sanitize_terminal_output(&chunk)
-                                ));
+                                chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
                             }
                         }
                         Ok(Err(_)) => break,

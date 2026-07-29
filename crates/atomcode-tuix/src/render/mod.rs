@@ -716,7 +716,10 @@ pub fn round_cap_view(cap: u32, base: u32, cursor: usize, stats: &str) -> UserIn
         options: vec![
             // `base` (the re-arm step), not `cap`: after a continuation `cap` has
             // grown but only `base` more rounds are granted before the next prompt.
-            ("继续".to_string(), Some(format!("再跑 {base} 轮后重新确认"))),
+            (
+                "继续".to_string(),
+                Some(format!("再跑 {base} 轮后重新确认")),
+            ),
             ("停止".to_string(), Some("结束本回合".to_string())),
         ],
         cursor,

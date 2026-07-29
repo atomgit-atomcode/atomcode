@@ -1360,25 +1360,33 @@ mod tests {
     #[test]
     fn duplicate_heading_across_blank_line_is_dropped() {
         let out = render_all(&["## Section", "", "## Section"]);
-        assert_eq!(count(&out, "Section"), 1, "blank line must not un-dedup:\n{out}");
+        assert_eq!(
+            count(&out, "Section"),
+            1,
+            "blank line must not un-dedup:\n{out}"
+        );
     }
 
     #[test]
     fn heading_reused_after_real_content_is_kept() {
         // Legitimate: same heading in two sections with prose between — NOT a
         // duplicate, both must render.
-        let out = render_all(&[
-            "## Example",
-            "some explanatory prose here",
-            "## Example",
-        ]);
-        assert_eq!(count(&out, "Example"), 2, "content between must keep both:\n{out}");
+        let out = render_all(&["## Example", "some explanatory prose here", "## Example"]);
+        assert_eq!(
+            count(&out, "Example"),
+            2,
+            "content between must keep both:\n{out}"
+        );
     }
 
     #[test]
     fn heading_reused_after_list_item_is_kept() {
         let out = render_all(&["## Notes", "- a bullet point", "## Notes"]);
-        assert_eq!(count(&out, "Notes"), 2, "list content must keep both:\n{out}");
+        assert_eq!(
+            count(&out, "Notes"),
+            2,
+            "list content must keep both:\n{out}"
+        );
     }
 
     #[test]

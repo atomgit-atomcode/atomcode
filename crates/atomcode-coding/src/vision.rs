@@ -169,7 +169,10 @@ mod tests {
 
     #[test]
     fn vl_model_display_strips_vendor_prefix() {
-        assert_eq!(vl_model_display("Qwen/Qwen3-VL-8B-Instruct"), "Qwen3-VL-8B-Instruct");
+        assert_eq!(
+            vl_model_display("Qwen/Qwen3-VL-8B-Instruct"),
+            "Qwen3-VL-8B-Instruct"
+        );
         assert_eq!(vl_model_display("qwen-vl-max"), "qwen-vl-max");
         assert_eq!(vl_model_display("a/b/c"), "c");
         assert_eq!(vl_model_display("trailing/"), "trailing/"); // empty tail → whole
@@ -179,7 +182,10 @@ mod tests {
     fn should_skip_when_no_images_or_vision_model() {
         assert!(should_skip("glm-4-flash", false), "no images → skip");
         assert!(should_skip("qwen-vl-max", true), "vision model → skip");
-        assert!(!should_skip("glm-4-flash", true), "text model + images → run");
+        assert!(
+            !should_skip("glm-4-flash", true),
+            "text model + images → run"
+        );
     }
 
     #[tokio::test]
