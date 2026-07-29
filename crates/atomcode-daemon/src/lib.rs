@@ -2479,7 +2479,32 @@ pub struct ModelInfo {
     pub reasoning_effort: Option<String>,
 }
 
-/// GET /models - List all available models from configured providers
+/// Build the `/models` list from the UNIFIED model catalog (`logical_models`)
+/// so folded CodingPlan / new-schema `[models.*]` models — which no longer live
+/// in `config.providers` — appear in the webui + VSCode model pickers, matching
+/// `/config` (`config_response`) and `/providers` (`get_providers`). The old
+/// body iterated only `config.providers` and so silently dropped them.
+fn models_from_config(config: &Config) -> Vec<ModelInfo> {
+    let default_selection = config.effective_model_selection().unwrap_or_default();
+    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+    ids.sort();
+    ids.iter()
+        .filter_map(|id| {
+            config.provider_config_for_selection(id).map(|p| ModelInfo {
+                provider: id.clone(),
+                model: p.model.clone(),
+                provider_type: p.provider_type.clone(),
+                is_default: id == &default_selection,
+                effort_applicable: atomcode_capabilities::provider::reason_effort_applicable(
+                    &p.model,
+                ),
+                reasoning_effort: p.reasoning_effort.clone(),
+            })
+        })
+        .collect()
+}
+
+/// GET /models - List all selectable models from the unified catalog.
 async fn get_models() -> impl IntoResponse {
     let config_path = Config::default_path();
     let config = match Config::load(&config_path) {
@@ -2493,20 +2518,7 @@ async fn get_models() -> impl IntoResponse {
         }
     };
 
-    let models: Vec<ModelInfo> = config
-        .providers
-        .iter()
-        .map(|(name, p)| ModelInfo {
-            provider: name.clone(),
-            model: p.model.clone(),
-            provider_type: p.provider_type.clone(),
-            is_default: name == &config.default_provider,
-            effort_applicable: atomcode_capabilities::provider::reason_effort_applicable(&p.model),
-            reasoning_effort: p.reasoning_effort.clone(),
-        })
-        .collect();
-
-    (StatusCode::OK, Json(models)).into_response()
+    (StatusCode::OK, Json(models_from_config(&config))).into_response()
 }
 
 // ============== Streaming Chat API ==============
@@ -5417,6 +5429,51 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn models_endpoint_lists_new_schema_and_folded_codingplan_models() {
+        // Selectable models living ONLY in the new schema (models/provider_accounts),
+        // NOT in [providers.*] — the `/models` endpoint used to iterate only
+        // `config.providers` and silently dropped these from the webui picker.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "AtomGit-GLM-5.2",
+            "provider_accounts": { "AtomGit": { "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1" } },
+            "models": {
+                "AtomGit-GLM-5.2": { "account": "AtomGit", "model": "GLM-5.2", "context_window": 128000 },
+                "AtomGit-Qwen": { "account": "AtomGit", "model": "Qwen", "context_window": 128000 }
+            }
+        }))
+        .unwrap();
+
+        let models = models_from_config(&config);
+        let ids: Vec<&str> = models.iter().map(|m| m.provider.as_str()).collect();
+        assert!(ids.contains(&"AtomGit-GLM-5.2"), "new-schema model listed: {ids:?}");
+        assert!(ids.contains(&"AtomGit-Qwen"), "{ids:?}");
+        let glm = models.iter().find(|m| m.provider == "AtomGit-GLM-5.2").unwrap();
+        assert!(glm.is_default, "effective selection is the default");
+        assert_eq!(glm.model, "GLM-5.2");
+    }
+
+    #[test]
+    fn models_endpoint_still_lists_legacy_providers() {
+        // No models lost: a pure old-schema config ([providers.*]) is unchanged.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "claude",
+            "providers": {
+                "claude": { "type": "claude", "model": "claude-opus-4-7" },
+                "glm": { "type": "openai", "model": "z-ai/glm-5" }
+            }
+        }))
+        .unwrap();
+
+        let models = models_from_config(&config);
+        let ids: Vec<&str> = models.iter().map(|m| m.provider.as_str()).collect();
+        assert!(ids.contains(&"claude") && ids.contains(&"glm"), "{ids:?}");
+        assert!(
+            models.iter().find(|m| m.provider == "claude").unwrap().is_default,
+            "default_provider maps to the default selection"
+        );
+    }
 
     #[test]
     fn delete_session_errors_preserve_storage_semantics() {
