@@ -2779,6 +2779,9 @@ impl SessionManager {
                 Err(e) => return Err(io_at(&p, e)),
             }
         }
+        if let Ok(dir) = self.artifacts_dir(id) {
+            let _ = fs::remove_dir_all(&dir); // best-effort; absent dir is fine
+        }
         Ok(())
     }
 
@@ -6157,6 +6160,20 @@ mod tests {
 
         mgr.delete(&lease).unwrap();
         assert!(!mgr.snapshot_path("s1").unwrap().exists());
+    }
+
+    #[test]
+    fn delete_removes_artifacts_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        mgr.save_snapshot("s1", &snap(&["keep"])).unwrap();
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let art = mgr.artifacts_dir("s1").unwrap();
+        std::fs::create_dir_all(&art).unwrap();
+        std::fs::write(art.join("deadbeefdeadbeef"), b"x").unwrap();
+        assert!(art.exists());
+        mgr.delete(&lease).unwrap();
+        assert!(!art.exists(), "artifacts dir removed with the session");
     }
 
     #[cfg(unix)]
