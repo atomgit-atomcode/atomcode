@@ -591,6 +591,19 @@ impl LlmProvider for OpenAiCompatProvider {
     }
 }
 
+/// The uniform "your session expired, re-run `/login`" terminal error surfaced
+/// when auth recovery cannot refresh the rejected credential (both the "refresh
+/// rejected" and the "a second 401 after recovery" paths).
+fn authentication_expired_error(code: u16) -> ProviderError {
+    ProviderError {
+        retryable: false,
+        message: atomcode_config::i18n::t(atomcode_config::i18n::Msg::ChatAuthExpired).into_owned(),
+        http_status: Some(code),
+        code: Some("authentication_expired".to_string()),
+        ..Default::default()
+    }
+}
+
 /// Open one chat/completions stream, retrying the OPEN (transient status /
 /// transport) per `policy`. Builds the request fresh each attempt so a signer
 /// (if any) re-auths with a new nonce/timestamp. Returns the live `Response` on
@@ -662,16 +675,7 @@ async fn open_stream(
                                     Ok(false) => {}
                                     Err(RequestSigningError::ReauthenticationRequired(_)) => {
                                         let _ = resp.bytes().await;
-                                        return Err(ProviderError {
-                                            retryable: false,
-                                            message: atomcode_config::i18n::t(
-                                                atomcode_config::i18n::Msg::ChatAuthExpired,
-                                            )
-                                            .into_owned(),
-                                            http_status: Some(code),
-                                            code: Some("authentication_expired".to_string()),
-                                            ..Default::default()
-                                        });
+                                        return Err(authentication_expired_error(code));
                                     }
                                     Err(RequestSigningError::RecoveryTransient(message)) => {
                                         let _ = resp.bytes().await;
@@ -696,16 +700,7 @@ async fn open_stream(
                                 }
                             } else {
                                 let _ = resp.bytes().await;
-                                return Err(ProviderError {
-                                    retryable: false,
-                                    message: atomcode_config::i18n::t(
-                                        atomcode_config::i18n::Msg::ChatAuthExpired,
-                                    )
-                                    .into_owned(),
-                                    http_status: Some(code),
-                                    code: Some("authentication_expired".to_string()),
-                                    ..Default::default()
-                                });
+                                return Err(authentication_expired_error(code));
                             }
                         }
                     }
