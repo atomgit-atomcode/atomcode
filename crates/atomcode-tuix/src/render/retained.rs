@@ -1000,6 +1000,51 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
+    /// Background style for the user-input block. `bg` comes from the
+    /// theme-aware `Role::PanelBg` (dark 236 / light 254); `fg` stays `None`
+    /// so the text keeps the terminal's default foreground. Returns
+    /// `bg: None` when colours are disabled — the caller treats that as
+    /// "no block, use the plain layout".
+    fn style_panel_bg(&self) -> CellStyle {
+        CellStyle {
+            fg: None,
+            bg: role(self.caps, Role::PanelBg),
+            bold: false,
+            reverse: false,
+            faint: false,
+        }
+    }
+
+    /// A full-block-width row of `bg`-styled spaces — the top/bottom padding
+    /// lines that give the user-input block its "breathing" block look.
+    fn bg_blank_row(w: usize, bg: &CellStyle) -> Vec<Cell> {
+        let mut row = Vec::with_capacity(w);
+        for _ in 0..w {
+            row.push(Cell {
+                ch: ' ',
+                style: bg.clone(),
+                width: 1,
+            });
+        }
+        row
+    }
+
+    /// Extend `row` with `bg`-styled spaces until it spans `w` display
+    /// columns, so the background reads as one full-width block. `w` is
+    /// `screen.width() − PAD_COL`, matching `build_prefixed_rows`' wrap
+    /// budget and leaving the same right margin (which also avoids writing
+    /// the final column and its auto-wrap hazard).
+    fn pad_row_bg(row: &mut Vec<Cell>, w: usize, bg: &CellStyle) {
+        let cur: usize = row.iter().map(|c| c.width as usize).sum();
+        for _ in cur..w {
+            row.push(Cell {
+                ch: ' ',
+                style: bg.clone(),
+                width: 1,
+            });
+        }
+    }
+
     /// Theme-aware muting via SGR 2 (faint). Renders the role's fg
     /// at ~50% intensity so secondary text reads as "subordinate"
     /// without picking a fixed gray that may collide with the user's
@@ -6475,10 +6520,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     fn push_user_message(&mut self, text: &str, attachments: &[usize]) {
-        // A new user block owns its leading paragraph boundary. Local command
-        // output (for example `/model`) may not have a turn separator, while
-        // ordinary turns already end in a blank row. Reuse that row when it
-        // exists; otherwise insert exactly one before marking the message so
+        // A new user block owns its leading paragraph boundary. Reuse the
+        // previous turn's trailing blank when present; otherwise insert one so
         // navigation anchors point at the chevron rather than the spacer.
         let tail_is_blank = self
             .body_lines
@@ -6490,27 +6533,82 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.mark_message(crate::render::MarkKind::User);
         self.last_mark_was_assistant = false;
         let safe = scrub_controls(text);
-        // The coloured marker (Accent / cyan) flags "this is the user's input" —
-        // the same role opencode gives its coloured left border. The first row
-        // gets the `❯` chevron; continuation rows of a multi-line message get a
-        // full-height `▎` bar so the block reads as one unit. The message text
-        // itself stays the terminal's DEFAULT foreground (like opencode's
-        // `<text fg={theme.text}>`); colouring the whole sentence read as too
-        // vivid. Colour on the marker, not the text.
-        let accent = self.style_bold(Role::Accent);
-        let text_style = CellStyle::default();
-        self.push_body_prefixed_cont(
+
+        let bg = self.style_panel_bg();
+
+        // No panel background (NO_COLOR / colours disabled): keep the original
+        // plain layout byte-for-byte so nothing regresses.
+        if bg.bg.is_none() {
+            let accent = self.style_bold(Role::Accent);
+            let text_style = CellStyle::default();
+            self.push_body_prefixed_cont(
+                self.caps.prompt_chevron(),
+                &accent,
+                self.caps.prompt_continuation_bar(),
+                &accent,
+                &safe,
+                &text_style,
+            );
+            let muted = self.style_for(Role::Muted);
+            for n in attachments {
+                self.push_body_text(&format!("└ [Image #{}]", n), &muted);
+            }
+            self.push_body_row(Vec::new());
+            self.md_state.reset();
+            return;
+        }
+
+        let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
+
+        // Marker / text / attachment styles keep their fg but gain the panel
+        // bg so the colour sits behind the whole block.
+        let mut accent = self.style_bold(Role::Accent);
+        accent.bg = bg.bg;
+        let mut text_style = CellStyle::default();
+        text_style.bg = bg.bg;
+        let mut muted = self.style_for(Role::Muted);
+        muted.bg = bg.bg;
+
+        // Top padding row of the block.
+        self.push_body_row(Self::bg_blank_row(w, &bg));
+
+        // Prefixed content rows (❯ / ▎ + text), each padded to block width.
+        let mut rows = self.build_prefixed_rows(
             self.caps.prompt_chevron(),
-            &accent,
-            self.caps.prompt_continuation_bar(),
             &accent,
             &safe,
             &text_style,
+            Some((self.caps.prompt_continuation_bar(), &accent)),
         );
-        let muted = self.style_for(Role::Muted);
-        for n in attachments {
-            self.push_body_text(&format!("└ [Image #{}]", n), &muted);
+        for row in &mut rows {
+            Self::pad_row_bg(row, w, &bg);
         }
+        for row in rows {
+            self.push_body_row(row);
+        }
+
+        // Attachment rows live inside the block. Reuse build_prefixed_rows with
+        // a PAD_COL-wide bg indent as the "prefix" so glyph downgrade + wrap
+        // (to width − 2·PAD_COL) match the plain `push_body_text` path.
+        for n in attachments {
+            let indent = " ".repeat(PAD_COL);
+            let mut arows = self.build_prefixed_rows(
+                &indent,
+                &bg,
+                &format!("└ [Image #{}]", n),
+                &muted,
+                None,
+            );
+            for row in &mut arows {
+                Self::pad_row_bg(row, w, &bg);
+            }
+            for row in arows {
+                self.push_body_row(row);
+            }
+        }
+
+        // Bottom padding row of the block, then a plain paragraph gap.
+        self.push_body_row(Self::bg_blank_row(w, &bg));
         self.push_body_row(Vec::new());
         self.md_state.reset();
     }
@@ -13137,15 +13235,18 @@ mod tests {
             .find(|r| vterm.row_text(*r).contains("Hello world"))
             .unwrap_or_else(|| panic!("Hello world missing:\n{}", vterm.dump()));
 
-        // Exactly ONE blank between user and assistant (the
-        // user-message spacer). A ghost blank would make it 2.
+        // The user block now emits a bg-padding row above and below the content
+        // row, so there are 3 rows between user content and assistant text
+        // (bg_blank_bottom + paragraph_blank + assistant_text). The test
+        // verifies no ghost blank was inserted by the leading '\n' in the model
+        // output — if it were, the gap would be 4.
         assert_eq!(
             hello_row - user_row,
-            2,
-            "expected 1 blank row between user and assistant, got {} \
+            3,
+            "expected 2 blank rows between user and assistant, got {} \
              blank row(s) — leading `\\n` from model created a ghost \
              spacer:\n{}",
-            hello_row.saturating_sub(user_row).saturating_sub(1),
+            hello_row.saturating_sub(user_row).saturating_sub(2),
             vterm.dump()
         );
     }
@@ -13192,18 +13293,20 @@ mod tests {
             .unwrap_or_else(|| panic!("assistant text row missing:\n{}", vterm.dump()));
 
         // Expected layout (bottom-anchored):
-        //   <user_row>:     "> 你好啊"
-        //   <user_row + 1>: blank (UiLine::User's spacer)
-        //   <user_row + 2>: "Hello world"  ← replaced spinner in-place
+        //   <user_row>:     "❯ hi-from-user"
+        //   <user_row + 1>: blank (bg_blank_bottom padding row)
+        //   <user_row + 2>: blank (UiLine::User's paragraph spacer)
+        //   <user_row + 3>: "Hello world"  ← replaced spinner in-place
         //
-        // Critical invariant: exactly ONE blank row between them.
-        // No extra gap would mean 2 consecutive blanks.
+        // The user block now has a bg padding row below the content, so
+        // there are 2 blank rows between content and assistant. No extra
+        // gap introduced by spinner replacement would make it 4 blanks.
         assert_eq!(
             hello_row - user_row,
-            2,
-            "expected 1 spacer row between user and assistant, got {} \
+            3,
+            "expected 2 spacer rows between user and assistant, got {} \
              rows gap:\n{}",
-            hello_row.saturating_sub(user_row).saturating_sub(1),
+            hello_row.saturating_sub(user_row).saturating_sub(2),
             vterm.dump()
         );
     }
@@ -13256,10 +13359,10 @@ mod tests {
 
         assert_eq!(
             spin_row - user_row,
-            2,
-            "expected exactly 1 blank row between user message and \
-            spinner, got {} blank row(s):\n{}",
-            spin_row.saturating_sub(user_row).saturating_sub(1),
+            3,
+            "expected exactly 2 blank rows between user message and \
+            spinner (bg_blank_bottom + paragraph spacer), got {} blank row(s):\n{}",
+            spin_row.saturating_sub(user_row).saturating_sub(2),
             vterm.dump()
         );
     }
@@ -13313,8 +13416,8 @@ mod tests {
 
         assert_eq!(
             user_row - output_row,
-            2,
-            "local command output and the next user message need exactly one blank row"
+            3,
+            "local command output and the next user message need paragraph blank + bg_blank_top rows"
         );
         assert!(
             vterm.row_text(output_row + 1).trim().is_empty(),
@@ -13333,9 +13436,12 @@ mod tests {
 
         // The first user event already supplied its trailing spacer. The
         // second event must reuse it rather than introducing another blank.
-        assert_eq!(r.body_lines.len(), rows_after_first + 2);
+        // Each user block is now 4 rows: bg_blank_top + content + bg_blank_bottom + paragraph blank.
+        // The second message reuses the trailing paragraph blank from the first, so it adds 4 rows.
+        assert_eq!(r.body_lines.len(), rows_after_first + 4);
         assert!(r.body_lines[rows_after_first - 1].is_empty());
-        assert!(r.body_lines[rows_after_first]
+        // Content row is offset by 1 due to the new bg_blank_top padding row.
+        assert!(r.body_lines[rows_after_first + 1]
             .iter()
             .map(|cell| cell.ch)
             .collect::<String>()
@@ -13398,8 +13504,9 @@ mod tests {
 
         assert_eq!(
             spinner_row - user_row,
-            2,
-            "full viewport must retain exactly one blank row between user and spinner:\n{}",
+            3,
+            "full viewport must retain exactly two blank rows between user and spinner \
+             (bg_blank_bottom + paragraph spacer):\n{}",
             vterm.dump()
         );
         assert_eq!(
@@ -15902,6 +16009,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retained_user_message_renders_panel_bg_block() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let expected_bg =
+            crate::render::theme::role(r.caps, crate::render::theme::Role::PanelBg);
+        assert!(
+            expected_bg.is_some(),
+            "PanelBg must resolve to a colour when colours are on"
+        );
+        r.render(UiLine::User("hello".into()));
+
+        // Locate the content row (the one carrying the user's text).
+        let idx = r
+            .body_lines
+            .iter()
+            .position(|row| row.iter().map(|c| c.ch).collect::<String>().contains("hello"))
+            .expect("user text row present");
+
+        // Every cell on the content row carries the panel background, including
+        // the ❯ marker cell and the trailing padding spaces.
+        let content = &r.body_lines[idx];
+        assert!(
+            content.iter().all(|c| c.style.bg == expected_bg),
+            "all content cells must carry PanelBg, got {:?}",
+            content.iter().map(|c| c.style.bg).collect::<Vec<_>>()
+        );
+        // Padded to screen width − PAD_COL (80 − 2 = 78) display columns.
+        let cols: usize = content.iter().map(|c| c.width as usize).sum();
+        assert_eq!(cols, 78, "content row padded to screen width − PAD_COL");
+
+        // A full-width background blank sits directly above and below.
+        let above = &r.body_lines[idx - 1];
+        let below = &r.body_lines[idx + 1];
+        assert!(
+            !above.is_empty()
+                && above.iter().all(|c| c.ch == ' ' && c.style.bg == expected_bg),
+            "row above content must be a bg padding row"
+        );
+        assert!(
+            !below.is_empty()
+                && below.iter().all(|c| c.ch == ' ' && c.style.bg == expected_bg),
+            "row below content must be a bg padding row"
+        );
+    }
+
+    #[test]
+    fn retained_user_message_no_bg_when_colours_disabled() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = false;
+        r.render(UiLine::User("hello".into()));
+        for row in &r.body_lines {
+            for c in row {
+                assert_eq!(c.style.bg, None, "no background when colours are disabled");
+            }
+        }
+    }
+
     /// Submitting a recalled prompt clears the composer before its permanent
     /// user echo is laid out. Otherwise a wrapped history entry keeps the
     /// footer artificially tall while the echo is appended, which promotes
@@ -15918,9 +16083,9 @@ mod tests {
             attachments: Vec::new(),
         });
         let empty_footer_rows = r.current_footer_rows();
-        // One leading separator, two text rows, plus the trailing separator
-        // appended by `push_user_message`.
-        let body_rows_before_echo = 12usize.saturating_sub(empty_footer_rows + 4);
+        // One leading separator + bg_blank_top + two text rows + bg_blank_bottom +
+        // trailing separator appended by `push_user_message` = 6 rows total.
+        let body_rows_before_echo = 12usize.saturating_sub(empty_footer_rows + 6);
         for i in 0..body_rows_before_echo {
             r.push_body_text(&format!("prior-{i}"), &CellStyle::default());
         }
@@ -16361,15 +16526,15 @@ mod tests {
     #[test]
     fn retained_message_marks_decremented_on_drain() {
         let (mut r, _buf) = new_capturing(80, 24);
-        // Each UiLine::User pushes 2 body rows (user text + blank spacer).
-        // 5005 users → 10010 body rows. drain = 10010 - 5000 = 5010 rows from front.
-        // Marks at line_idx < 5010 are dropped; the first surviving mark is at
-        // original idx=5010, which normalises to 0 after subtracting the drain.
+        // Each UiLine::User pushes 4 body rows (bg_blank_top + text + bg_blank_bottom + spacer).
+        // 5005 users → 20020 body rows. drain = 20020 - 5000 = 15020 rows from front.
+        // Marks at line_idx < 15020 are dropped; the first surviving mark is at
+        // original idx=15020, which normalises to 0 after subtracting the drain.
         for i in 0..5005 {
             r.render(UiLine::User(format!("line {}", i)));
         }
-        // 5010 / 2 = 2505 marks dropped; 5005 - 2505 = 2500 survive.
-        assert_eq!(r.message_marks.len(), 2500);
+        // 15020 / 4 = 3755 marks dropped; 5005 - 3755 = 1250 survive.
+        assert_eq!(r.message_marks.len(), 1250);
         assert_eq!(
             r.message_marks[0].line_idx, 0,
             "first surviving mark should point at body_lines[0] after drain"
