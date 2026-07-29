@@ -215,7 +215,7 @@ fn format_loop_row(
 /// `todo_panel_rows`). No blank padding — a short list shows short.
 const MAX_TODO_PANEL_ROWS: usize = 7;
 /// Header + at most three live children + one folded terminal/pending summary.
-const MAX_SUBTASK_PANEL_ROWS: usize = 5;
+const MAX_SUBTASK_PANEL_ROWS: usize = 6;
 const MAX_VISIBLE_RUNNING_SUBTASKS: usize = 3;
 
 fn format_subtask_progress(activity: &str, elapsed: &str, tokens: u64, width: usize) -> String {
@@ -1013,17 +1013,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             reverse: false,
             faint: false,
         }
-    }
-
-    /// A full-block-width row of `bg`-styled spaces — the top/bottom padding
-    /// lines that give the user-input block its "breathing" block look. Fills
-    /// to `w = screen.width() − PAD_COL` via the shared `pad_row_to_width`,
-    /// leaving the same right margin the content rows do (which also avoids
-    /// writing the final column and its auto-wrap hazard).
-    fn bg_blank_row(w: usize, bg: &CellStyle) -> Vec<Cell> {
-        let mut row = Vec::with_capacity(w);
-        Self::pad_row_to_width(&mut row, w, bg.clone());
-        row
     }
 
     /// Theme-aware muting via SGR 2 (faint). Renders the role's fg
@@ -2572,11 +2561,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .filter(|item| item.status == crate::render::SubtaskStatus::Pending)
             .count();
         let needs_summary = failed > 0 || pending > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
-        let summary_rows = usize::from(needs_summary && cap >= 2);
+        let spacer_rows = usize::from(cap >= 2);
+        let summary_rows = usize::from(needs_summary && cap >= spacer_rows + 2);
         let visible_running = running
             .min(MAX_VISIBLE_RUNNING_SUBTASKS)
-            .min(cap.saturating_sub(1 + summary_rows));
-        1 + visible_running + summary_rows
+            .min(cap.saturating_sub(spacer_rows + 1 + summary_rows));
+        spacer_rows + 1 + visible_running + summary_rows
     }
 
     /// Build the fixed Task fan-out panel. Only running children own detailed
@@ -2594,6 +2584,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return Vec::new();
         }
         let mut rows = Vec::new();
+        // Keep the transient task panel visually separate from the conversation
+        // above it. On very short terminals the single available row remains
+        // the header, so cosmetic spacing never displaces useful status.
+        if cap >= 2 {
+            rows.push(Vec::new());
+        }
 
         let bold = CellStyle {
             bold: true,
@@ -2622,22 +2618,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .items
             .iter()
             .filter(|item| item.status == SubtaskStatus::Pending)
-            .count();
+            .collect::<Vec<_>>();
         let finished = subtasks.completed.saturating_add(failed);
         push_str_cells(
             &mut header,
             &format!(
                 " \u{b7} {finished}/{} finished \u{b7} {} running \u{b7} {pending} pending",
                 subtasks.total,
-                running.len()
+                running.len(),
+                pending = pending.len()
             ),
             &detail,
         );
         rows.push(header);
 
         let needs_summary =
-            failed > 0 || pending > 0 || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
-        let summary_rows = usize::from(needs_summary && cap >= 2);
+            failed > 0 || !pending.is_empty() || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
+        let summary_rows = usize::from(needs_summary && cap >= rows.len() + 1);
         let visible_running = running
             .len()
             .min(MAX_VISIBLE_RUNNING_SUBTASKS)
@@ -2688,11 +2685,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if needs_summary && rows.len() < cap {
             let mut parts = Vec::new();
             let hidden_running = running.len().saturating_sub(visible_running);
+            let expands_single_pending = pending.len() == 1 && hidden_running == 0 && failed == 0;
             if hidden_running > 0 {
                 parts.push(format!("{hidden_running} running"));
             }
-            if pending > 0 {
-                parts.push(format!("{pending} pending"));
+            if expands_single_pending {
+                let item = pending[0];
+                let mut identity = if item.description.is_empty() {
+                    item.label.clone()
+                } else {
+                    format!("{} \u{b7} {}", item.label, item.description)
+                };
+                if !item.model.is_empty() {
+                    let label_len = item.label.len();
+                    let remainder = identity.split_off(label_len);
+                    identity.push_str(&format!(" \u{b7} {}{}", item.model, remainder));
+                }
+                parts.push(format!("{} \u{b7} pending", scrub_controls(&identity)));
+            } else if !pending.is_empty() {
+                parts.push(format!("{} pending", pending.len()));
             }
             if failed > 0 {
                 parts.push(format!("{failed} failed"));
@@ -2703,7 +2714,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 &mut row,
                 &format!(
                     "{} {}",
-                    if self.caps.unicode_symbols {
+                    if expands_single_pending && self.caps.unicode_symbols {
+                        "\u{25cb}"
+                    } else if expands_single_pending {
+                        "[ ]"
+                    } else if self.caps.unicode_symbols {
                         "\u{2026}"
                     } else {
                         "..."
@@ -6545,9 +6560,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let mut muted = self.style_for(Role::Muted);
         muted.bg = bg.bg;
 
-        // Top padding row of the block.
-        self.push_body_row(Self::bg_blank_row(w, &bg));
-
         // Content rows: `❯ ` on the first row, then a plain bg-filled indent of
         // equal width on continuation rows. The panel background now delineates
         // the block, so the coloured `▎` continuation bar is redundant — drop it,
@@ -6589,8 +6601,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         }
 
-        // Bottom padding row of the block, then a plain paragraph gap.
-        self.push_body_row(Self::bg_blank_row(w, &bg));
+        // Keep the usual paragraph gap after the user message, but let the
+        // panel background hug the actual content without top/bottom padding.
         self.push_body_row(Vec::new());
         self.md_state.reset();
     }
@@ -14850,6 +14862,14 @@ mod tests {
             r.last_painted_footer_rows,
             "subtask footer height math must mirror the painted rows"
         );
+        let subtask_header = (0..vterm.height() as usize)
+            .find(|&row| vterm.row_text(row).contains("Subtasks"))
+            .expect("subtask header rendered");
+        assert!(
+            subtask_header > 0 && vterm.row_text(subtask_header - 1).trim().is_empty(),
+            "subtask panel must leave one blank row below the conversation:\n{}",
+            vterm.dump()
+        );
     }
 
     #[test]
@@ -14958,7 +14978,7 @@ mod tests {
     }
 
     #[test]
-    fn subtask_panel_uses_five_rows_for_three_running_and_terminal_summary() {
+    fn subtask_panel_uses_six_rows_for_three_running_and_terminal_summary() {
         use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
 
         let (r, _buf) = new_capturing(120, 24);
@@ -14993,13 +15013,52 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
-        assert!(text[0].contains("3/7 finished · 3 running · 1 pending"));
+        assert!(text[0].trim().is_empty());
+        assert!(text[1].contains("3/7 finished · 3 running · 1 pending"));
         assert!(text.iter().any(|line| line.contains("explore#4")));
         assert!(text.iter().any(|line| line.contains("explore#5")));
         assert!(text.iter().any(|line| line.contains("explore#6")));
-        assert!(text[4].contains("1 pending · 1 failed"));
+        assert!(text[5].contains("1 pending · 1 failed"));
         assert!(text.iter().all(|line| !line.contains("failed#1")));
         assert!(text.iter().all(|line| !line.contains("pending#1")));
+    }
+
+    #[test]
+    fn subtask_panel_expands_the_only_pending_task() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (r, _buf) = new_capturing(120, 24);
+        let item = |label: &str, state| SubtaskItem {
+            label: label.into(),
+            description: format!("inspect {label}"),
+            model: "GLM-5.2".into(),
+            activity: "working".into(),
+            started_at: Some(std::time::Instant::now()),
+            output_tokens: 128,
+            status: state,
+        };
+        let progress = SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 0,
+            total: 4,
+            items: vec![
+                item("explore#1", SubtaskStatus::Running),
+                item("explore#2", SubtaskStatus::Running),
+                item("explore#3", SubtaskStatus::Running),
+                item("explore#4", SubtaskStatus::Pending),
+            ],
+        };
+
+        let text = r
+            .build_subtask_rows(&progress, 120)
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>();
+
+        assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
+        assert!(text[0].trim().is_empty());
+        assert!(text[5].contains("explore#4 · GLM-5.2 · inspect explore#4 · pending"));
+        assert!(!text[5].contains("1 pending"));
     }
 
     #[test]
@@ -15048,6 +15107,37 @@ mod tests {
         assert!(vterm
             .dump()
             .contains("Subtasks · 0/3 finished · 3 running · 0 pending"));
+    }
+
+    #[test]
+    fn subtask_panel_two_row_budget_matches_the_rows_actually_painted() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, _buf) = new_capturing(80, 7);
+        r.status = status_basic();
+        let progress = SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 0,
+            total: 1,
+            items: vec![SubtaskItem {
+                label: "pending#1".into(),
+                description: "wait for a slot".into(),
+                model: "GLM-5.2".into(),
+                activity: String::new(),
+                started_at: None,
+                output_tokens: 0,
+                status: SubtaskStatus::Pending,
+            }],
+        };
+
+        assert_eq!(r.subtask_panel_cap(), 2, "exercise the exact edge case");
+        let rows = r.build_subtask_rows(&progress, 80);
+        assert_eq!(rows.len(), 2, "spacer + header fit; summary must fold");
+        assert_eq!(
+            r.subtask_panel_row_count(&progress),
+            rows.len(),
+            "footer reservation must equal the rows that will be painted"
+        );
     }
 
     #[test]
@@ -16048,22 +16138,13 @@ mod tests {
         let cols: usize = content.iter().map(|c| c.width as usize).sum();
         assert_eq!(cols, 78, "content row padded to screen width − PAD_COL");
 
-        // A full-width background blank sits directly above and below.
-        let above = &r.body_lines[idx - 1];
+        // The panel background hugs the content: no blank background padding
+        // row above or below. The normal paragraph spacer remains below.
+        assert_eq!(idx, 0, "no bg padding row may precede the content");
         let below = &r.body_lines[idx + 1];
         assert!(
-            !above.is_empty()
-                && above
-                    .iter()
-                    .all(|c| c.ch == ' ' && c.style.bg == expected_bg),
-            "row above content must be a bg padding row"
-        );
-        assert!(
-            !below.is_empty()
-                && below
-                    .iter()
-                    .all(|c| c.ch == ' ' && c.style.bg == expected_bg),
-            "row below content must be a bg padding row"
+            below.is_empty(),
+            "the row below content must be the plain paragraph spacer"
         );
     }
 
