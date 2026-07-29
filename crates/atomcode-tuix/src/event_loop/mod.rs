@@ -5240,6 +5240,39 @@ mod menu_tests {
     }
 
     #[test]
+    fn skills_sub_mode_multi_fragment_filters_then_closes_on_complete_skill() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
+        skills.register(skill_fixture("skills:atomcode-smoke-test", "smoke", true));
+        skills.register(skill_fixture("skills:delegating-to-atomcode", "delegate", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        // `/skills atom smoke` keeps the menu OPEN and narrows to the one skill
+        // matching both fragments — the reported bug (a space used to kill it).
+        let items = build_menu_items("/skills atom smoke", 0, &reg, &custom, Some(&lock), None)
+            .expect("multi-fragment filter must keep the menu open");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, "atomcode-smoke-test");
+
+        // Once the first token is a COMPLETE skill followed by a space, the user
+        // is typing task args — close the menu so Enter submits (and the accepted
+        // `/skills <full-name> ` rewrite lands here after selection).
+        assert!(
+            build_menu_items(
+                "/skills atomcode-smoke-test ",
+                0,
+                &reg,
+                &custom,
+                Some(&lock),
+                None
+            )
+            .is_none(),
+            "a complete skill + space must close the menu so Enter submits"
+        );
+    }
+
+    #[test]
     fn effort_top_level_is_gateway_only() {
         // `/effort` at the top level surfaces the gateway entry, not the
         // individual high/max/off choices (those live behind `/effort `).
@@ -5312,6 +5345,28 @@ mod menu_tests {
 
         assert!(build_skill_menu_items(Some(&lock), "zz").is_empty());
         assert!(build_skill_menu_items(None, "").is_empty());
+    }
+
+    #[test]
+    fn build_skill_menu_items_multi_fragment_and_filter() {
+        // Multiple space-separated fragments must ALL match (AND), so a long
+        // hyphenated name is reachable by typing loose fragments of it.
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
+        skills.register(skill_fixture("skills:atomcode-smoke-test", "smoke", true));
+        skills.register(skill_fixture("skills:delegating-to-atomcode", "delegate", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        // Single fragment `atomcode` matches BOTH (substring), like the menu today.
+        assert_eq!(build_skill_menu_items(Some(&lock), "atomcode").len(), 2);
+
+        // `atom smoke` (two fragments) narrows to just the smoke-test skill —
+        // it contains both "atom" and "smoke"; delegating-to-atomcode does not.
+        let narrowed = build_skill_menu_items(Some(&lock), "atom smoke");
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].0, "atomcode-smoke-test");
+
+        // A fragment matched by neither name yields nothing.
+        assert!(build_skill_menu_items(Some(&lock), "atom nope").is_empty());
     }
 
     #[test]
@@ -10254,7 +10309,15 @@ fn build_skill_menu_items(
                     .unwrap_or(skill.name.as_str());
                 let full_lower = skill.name.to_ascii_lowercase();
                 let bare_lower = bare.to_ascii_lowercase();
-                if bare_lower.contains(prefix_lower) || full_lower.contains(prefix_lower) {
+                // Multi-fragment AND filter: every whitespace-separated fragment
+                // must appear (in the bare OR full name) so `atom smoke` narrows
+                // to `atomcode-smoke-test`. Empty filter ⇒ no fragments ⇒ vacuous
+                // true ⇒ list all. A single fragment behaves exactly as the old
+                // single-substring match (`bra` ⇒ brainstorming).
+                let matches_all = prefix_lower
+                    .split_whitespace()
+                    .all(|frag| bare_lower.contains(frag) || full_lower.contains(frag));
+                if matches_all {
                     let bare_is_unique = skills.iter().all(|other| {
                         other.name == skill.name
                             || other
@@ -10340,7 +10403,19 @@ fn build_menu_items(
     // to `/skills <name>` so the `skills` arm in execute_slash_command
     // looks up `skills:<name>` in the registry and dispatches.
     if let Some(after) = buf.strip_prefix("/skills ") {
-        if after.contains(char::is_whitespace) {
+        // Once the FIRST token is a complete user-invocable skill followed by a
+        // space, the user has moved past filtering — they're typing the skill's
+        // task args (or a second greedy skill) — so close the menu and let Enter
+        // submit. Until then, treat `after` as a multi-fragment fuzzy filter so
+        // `atom smoke` narrows to `atomcode-smoke-test` instead of the old
+        // "any space kills the menu" (which made multi-word filtering dead).
+        let first = after.split_whitespace().next().unwrap_or("");
+        let first_is_complete_skill = after.contains(char::is_whitespace)
+            && skill_registry
+                .and_then(|reg| reg.read().ok())
+                .and_then(|r| r.get(first).map(|s| s.user_invocable))
+                .unwrap_or(false);
+        if first_is_complete_skill {
             return None;
         }
         let items = build_skill_menu_items(skill_registry, &after.to_ascii_lowercase());
