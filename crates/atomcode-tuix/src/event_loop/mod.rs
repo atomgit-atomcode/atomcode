@@ -10809,14 +10809,10 @@ fn handle_idle_key(
             EmptyEscIntercept::TriggerUndo => {
                 app.exit_pending = None;
                 app.esc_undo_last_at = Some(now);
-                renderer.render(UiLine::CommandOutput(
-                    match crate::i18n::current_locale() {
-                        crate::i18n::Locale::ZhCn => "正在加载回退点…",
-                        crate::i18n::Locale::En => "Loading Rewind points…",
-                    }
-                    .to_string(),
-                ));
-                renderer.flush();
+                // The catalog is loaded asynchronously and immediately replaced
+                // by the Rewind modal. Do not append a permanent loading line to
+                // scrollback: closing the modal would expose that stale status as
+                // if it were conversation output. Failures are surfaced below.
                 if let Err(error) = ctx
                     .runtime
                     .refresh_rewind_catalog(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
