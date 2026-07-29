@@ -1690,12 +1690,8 @@ async fn run() -> Result<i32> {
     let model_name = runtime_cfg.model.clone();
     let provider_bootstrap = if is_headless {
         atomcode_coding::ProviderBootstrap::Required
-    } else if config.providers.is_empty() {
-        atomcode_coding::ProviderBootstrap::Unavailable(
-            atomcode_coding::ProviderUnavailableReason::NotConfigured,
-        )
     } else {
-        atomcode_coding::ProviderBootstrap::RecoverAuthentication
+        interactive_provider_bootstrap(&runtime_cfg)
     };
     let (native_runtime, native_coding_cfg, continued_session) = spawn_native_cli_runtime(
         &runtime_cfg,
@@ -2233,6 +2229,24 @@ fn runtime_config_from(
     // The process locale has already resolved CLI `--lang` > config > env.
     runtime.preferred_language = Some(atomcode_tuix::i18n::current_locale());
     runtime
+}
+
+/// Select the interactive startup mode through the same unified provider/model
+/// resolution result that will be assembled by the runtime.
+///
+/// Inspecting the raw config here would either see only the legacy schema or
+/// repeat resolution with subtly different fallback behavior. `runtime_cfg`
+/// already owns the exact resolved provider/model for this spawn.
+fn interactive_provider_bootstrap(
+    runtime_cfg: &atomcode_coding::CodingRuntimeConfig,
+) -> atomcode_coding::ProviderBootstrap {
+    if !runtime_cfg.model.is_empty() {
+        atomcode_coding::ProviderBootstrap::RecoverAuthentication
+    } else {
+        atomcode_coding::ProviderBootstrap::Unavailable(
+            atomcode_coding::ProviderUnavailableReason::NotConfigured,
+        )
+    }
 }
 
 async fn spawn_native_cli_runtime(
@@ -3598,7 +3612,8 @@ mod tests {
         apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
         headless_completion_notify_reason, is_completion_invocation, merge_startup_notices,
-        print_shell_completion, resolve_working_dir, runtime_config_from,
+        interactive_provider_bootstrap, print_shell_completion, resolve_working_dir,
+        runtime_config_from,
         should_fork_busy_continue, truncate_log_line, Cli, Commands, DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
@@ -3785,6 +3800,84 @@ mod tests {
         assert_eq!(ov.provider_name, "direct");
         assert_eq!(ov.api_key, "sk-direct");
         assert_eq!(ov.reasoning_history.as_deref(), Some("exclude"));
+    }
+
+    #[test]
+    fn interactive_restart_recovers_new_schema_provider() {
+        let config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_model = "taotoken/glm_for_coding"
+
+                [provider_accounts.taotoken]
+                provider = "openai"
+                base_url = "https://example.test/v1"
+                api_key = "test"
+
+                [models."taotoken/glm_for_coding"]
+                account = "taotoken"
+                model = "glm_for_coding"
+                context_window = 131072
+            "#,
+        )
+        .unwrap();
+        let runtime_cfg =
+            runtime_config_from(&config, std::path::Path::new("/tmp"), None, None, false, true);
+
+        assert!(config.providers.is_empty(), "legacy table stays empty");
+        assert_eq!(
+            interactive_provider_bootstrap(&runtime_cfg),
+            atomcode_coding::ProviderBootstrap::RecoverAuthentication
+        );
+        let empty_runtime_cfg = runtime_config_from(
+            &atomcode_config::config::Config::default(),
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(
+            interactive_provider_bootstrap(&empty_runtime_cfg),
+            atomcode_coding::ProviderBootstrap::Unavailable(
+                atomcode_coding::ProviderUnavailableReason::NotConfigured
+            )
+        );
+    }
+
+    #[test]
+    fn interactive_bootstrap_uses_runtime_fallback_resolution() {
+        let config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_model = "broken"
+
+                [provider_accounts.missing]
+                provider = "openai"
+
+                [models.broken]
+                account = "unknown"
+                model = "broken-model"
+                context_window = 131072
+
+                [provider_accounts.usable]
+                provider = "openai"
+                base_url = "https://example.test/v1"
+                api_key = "test"
+
+                [models.usable]
+                account = "usable"
+                model = "fallback-model"
+                context_window = 131072
+            "#,
+        )
+        .unwrap();
+        let runtime_cfg =
+            runtime_config_from(&config, std::path::Path::new("/tmp"), None, None, false, true);
+
+        assert_eq!(runtime_cfg.model, "fallback-model");
+        assert_eq!(
+            interactive_provider_bootstrap(&runtime_cfg),
+            atomcode_coding::ProviderBootstrap::RecoverAuthentication
+        );
     }
 
     #[test]

@@ -11852,7 +11852,43 @@ pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
     if ctx.is_plain_renderer {
         return false;
     }
-    ctx.config.providers.is_empty() && atomcode_auth::get_stored_auth().is_none()
+    provider_configuration_missing(&ctx.config, atomcode_auth::get_stored_auth().is_some())
+}
+
+fn provider_configuration_missing(config: &Config, has_stored_auth: bool) -> bool {
+    config.active_provider(None).is_err() && !has_stored_auth
+}
+
+#[cfg(test)]
+mod onboarding_provider_tests {
+    use super::provider_configuration_missing;
+    use atomcode_config::Config;
+
+    #[test]
+    fn new_schema_provider_does_not_trigger_onboarding_after_restart() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "taotoken/glm_for_coding",
+            "provider_accounts": {
+                "taotoken": {
+                    "provider": "openai",
+                    "base_url": "https://example.test/v1"
+                }
+            },
+            "models": {
+                "taotoken/glm_for_coding": {
+                    "account": "taotoken",
+                    "model": "glm_for_coding",
+                    "context_window": 131072
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(config.providers.is_empty(), "legacy table stays empty");
+        assert!(!provider_configuration_missing(&config, false));
+        assert!(provider_configuration_missing(&Config::default(), false));
+        assert!(!provider_configuration_missing(&Config::default(), true));
+    }
 }
 
 /// Extract current + latest version from the `ALREADY_LATEST` error
