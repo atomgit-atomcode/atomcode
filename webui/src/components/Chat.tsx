@@ -1432,12 +1432,25 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             // sync 模式：compact 派发到共享实时运行时（结果经 /live 的 Warning 事件
             // 渲染压缩标记）；undo 暂无实时路径，维持拒绝。
             if (command === 'compact') {
-              pushCommandNotice(t('cmd.compact.pending'));
+              // Keep a handle on the pending notice so a failed dispatch can retract
+              // it — otherwise a stale "Compacting…" line lingers next to the error.
+              const pendingNote: Message = {
+                role: 'system',
+                parts: [{ kind: 'notice', text: t('cmd.compact.pending') }],
+                ts: Date.now(),
+              };
+              setMessages((prev) => [...prev, pendingNote]);
+              // Gate sendMessage while the dispatch is in flight, mirroring the
+              // non-sync path (compactingRef guards the submit handler).
+              compactingRef.current = true;
               try {
                 const { accepted } = await postLiveCompact();
                 if (!accepted) pushCommandNotice(t('cmd.compact.syncNoRuntime'));
               } catch (e) {
+                setMessages((prev) => prev.filter((m) => m !== pendingNote));
                 pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
+              } finally {
+                compactingRef.current = false;
               }
               return;
             }
