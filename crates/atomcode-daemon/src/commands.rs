@@ -4,13 +4,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::AppState;
+#[cfg(test)]
+use atomcode_capabilities::session::SessionMeta as NativeSessionMeta;
 use atomcode_capabilities::session::{
     LoadedSession, SessionLease as NativeSessionLease, SessionManager as NativeSessionManager,
     SessionStoreError,
 };
 use atomcode_config::config::memory::MemoryStore;
-#[cfg(test)]
-use atomcode_capabilities::session::SessionMeta as NativeSessionMeta;
 
 #[derive(serde::Serialize)]
 pub(crate) struct CostModelResult {
@@ -870,13 +870,7 @@ mod tests {
         std::fs::create_dir_all(project_memory.path().parent().unwrap()).unwrap();
         std::fs::write(project_memory.path(), "- remembered fact\n").unwrap();
         let status = render_context_file_status_block(project.path());
-        assert!(status.contains(
-            &project
-                .path()
-                .join("AGENTS.md")
-                .display()
-                .to_string()
-        ));
+        assert!(status.contains(&project.path().join("AGENTS.md").display().to_string()));
         assert!(status.contains(&project_memory.path().display().to_string()));
         assert!(status.contains("(PROJECT)") || status.contains("（PROJECT）"));
     }

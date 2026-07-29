@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
-    DisplayAnchor, PresentationEntry, SessionLease, SessionStoreError, TurnStat,
+    DisplayAnchor, PresentationEntry, RewindPoint, RewindTransactionReceipt, SessionLease,
+    SessionStoreError, TurnStat,
 };
 #[cfg(test)]
 use atomcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
@@ -95,6 +96,8 @@ pub enum CodingRuntimeEvent {
     GoalChanged(GoalProgress),
     LoopChanged(LoopProgress),
     UndoFinished(Result<UndoResult, RuntimeError>),
+    RewindCatalogRefreshed(Result<RewindCatalog, RuntimeError>),
+    RewindFinished(Result<RewindResult, RuntimeError>),
     ContextStatsRefreshed(Result<RuntimeContextStats, RuntimeError>),
     SnapshotRestoreFinished {
         correlation_id: u64,
@@ -155,6 +158,99 @@ pub struct UndoResult {
     pub restored_prompt: String,
     pub target_n: usize,
     pub prompts_before: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RewindScope {
+    Conversation,
+    Code,
+    ConversationAndCode,
+}
+
+impl RewindScope {
+    fn restores_conversation(self) -> bool {
+        matches!(self, Self::Conversation | Self::ConversationAndCode)
+    }
+
+    fn restores_code(self) -> bool {
+        matches!(self, Self::Code | Self::ConversationAndCode)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RewindCatalog {
+    pub generation: RuntimeGeneration,
+    pub revision: u64,
+    pub points: Vec<RewindPoint>,
+    pub code_unavailable: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RewindResult {
+    pub generation: RuntimeGeneration,
+    pub scope: RewindScope,
+    pub point: RewindPoint,
+    pub snapshot: Arc<SessionSnapshot>,
+    pub restored_prompt: Option<String>,
+    pub restored_files: Vec<String>,
+}
+
+/// Internal ownership token carried by [`CodingRuntimeControl::BeginRewind`].
+///
+/// Public only because the driver control protocol is public; callers should use
+/// [`CodingRuntimeHandle::rewind_from_catalog`] rather than construct or inspect it.
+#[doc(hidden)]
+pub struct RewindTransactionGuard {
+    tx: mpsc::UnboundedSender<CodingRuntimeControl>,
+    generation: u64,
+    receipt: Option<RewindTransactionReceipt>,
+}
+
+impl RewindTransactionGuard {
+    fn new(
+        tx: mpsc::UnboundedSender<CodingRuntimeControl>,
+        generation: u64,
+        receipt: RewindTransactionReceipt,
+    ) -> Self {
+        Self {
+            tx,
+            generation,
+            receipt: Some(receipt),
+        }
+    }
+
+    fn receipt(&self) -> &RewindTransactionReceipt {
+        self.receipt
+            .as_ref()
+            .expect("active rewind transaction has a receipt")
+    }
+
+    fn commit(mut self) -> RewindTransactionReceipt {
+        self.receipt
+            .take()
+            .expect("active rewind transaction has a receipt")
+    }
+
+    fn take_for_compensation(&mut self) -> RewindTransactionReceipt {
+        self.receipt
+            .take()
+            .expect("active rewind transaction has a receipt")
+    }
+}
+
+impl Drop for RewindTransactionGuard {
+    fn drop(&mut self) {
+        let Some(receipt) = self.receipt.take() else {
+            return;
+        };
+        let (done, _result) = oneshot::channel();
+        let _ = self.tx.send(CodingRuntimeControl::FinishRewind {
+            generation: self.generation,
+            receipt,
+            outcome: RewindFinalization::Recover,
+            done,
+        });
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -309,6 +405,10 @@ pub enum DriverCommand {
     ReloadProvider(CodingAgentConfig),
     DeactivateProvider(ProviderUnavailableReason),
     UndoToPrompt(Option<usize>),
+    Rewind {
+        turn_id: u64,
+        scope: RewindScope,
+    },
     RefreshContextStats,
     RestoreSnapshot(SessionSnapshot),
     RestoreSnapshotCorrelated {
@@ -355,6 +455,8 @@ pub enum RuntimeError {
     ReconfigureFailed(String),
     InvalidWorkingDirectory(String),
     UndoOutOfRange { requested: usize, available: usize },
+    RewindPointUnavailable { turn_id: u64 },
+    CodeRewindUnavailable(String),
 }
 
 impl fmt::Display for RuntimeError {
@@ -380,6 +482,12 @@ impl fmt::Display for RuntimeError {
                 f,
                 "cannot undo prompt {requested}; only {available} user prompts are available"
             ),
+            Self::RewindPointUnavailable { turn_id } => {
+                write!(f, "rewind point for turn {turn_id} is unavailable")
+            }
+            Self::CodeRewindUnavailable(reason) => {
+                write!(f, "code rewind is unavailable: {reason}")
+            }
         }
     }
 }
@@ -878,6 +986,13 @@ impl CodingRuntimeHandle {
                 });
                 return Ok(());
             }
+            DriverCommand::Rewind { turn_id, scope } => {
+                let handle = self.clone();
+                tokio::spawn(async move {
+                    let _ = handle.rewind(turn_id, scope).await;
+                });
+                return Ok(());
+            }
             DriverCommand::RefreshContextStats => {
                 let handle = self.clone();
                 tokio::spawn(async move {
@@ -942,7 +1057,9 @@ impl CodingRuntimeHandle {
                     done,
                 }
             }
-            DriverCommand::UndoToPrompt(_) | DriverCommand::RefreshContextStats => {
+            DriverCommand::UndoToPrompt(_)
+            | DriverCommand::Rewind { .. }
+            | DriverCommand::RefreshContextStats => {
                 unreachable!("handled before control conversion")
             }
             DriverCommand::RestoreSnapshot(snapshot) => {
@@ -1225,16 +1342,172 @@ impl CodingRuntimeHandle {
         let generation = self.status().generation;
         let original = self.snapshot_with_revision().await?;
         let undo = undo_snapshot_to_prompt(&original.undo_snapshot, nth)?;
+        self.apply_undo(generation, original.revision, original.undo_snapshot, undo)
+            .await
+    }
+
+    async fn apply_undo(
+        &self,
+        generation: u64,
+        expected_revision: u64,
+        original: Arc<SessionSnapshot>,
+        undo: SnapshotUndoResult,
+    ) -> Result<UndoResult, RuntimeError> {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::ApplyUndo {
                 generation,
-                expected_revision: original.revision,
-                original: original.undo_snapshot,
+                expected_revision,
+                original,
                 truncated: undo.snapshot,
                 restored_prompt: undo.restored_prompt,
                 target_n: undo.target_n,
                 prompts_before: undo.prompts_before,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    pub async fn rewind_points(&self) -> Result<RewindCatalog, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::RewindCatalog {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    pub async fn rewind(
+        &self,
+        turn_id: u64,
+        scope: RewindScope,
+    ) -> Result<RewindResult, RuntimeError> {
+        let catalog = self.rewind_points().await?;
+        self.rewind_from_catalog(catalog, turn_id, scope).await
+    }
+
+    /// Execute a choice made from a previously rendered catalog.
+    ///
+    /// Keeping the catalog's generation and conversation revision is
+    /// intentional: a modal must not silently reinterpret an old turn id
+    /// against a session selected while that modal was open.
+    pub async fn rewind_from_catalog(
+        &self,
+        catalog: RewindCatalog,
+        turn_id: u64,
+        scope: RewindScope,
+    ) -> Result<RewindResult, RuntimeError> {
+        let point = catalog
+            .points
+            .iter()
+            .find(|point| point.turn_id == turn_id)
+            .cloned()
+            .ok_or(RuntimeError::RewindPointUnavailable { turn_id })?;
+        if scope.restores_code() {
+            if let Some(reason) = catalog.code_unavailable {
+                return Err(RuntimeError::CodeRewindUnavailable(reason));
+            }
+        }
+        let original = self.snapshot_with_revision().await?;
+        if original.revision != catalog.revision {
+            return Err(RuntimeError::Busy);
+        }
+        let undo = if scope.restores_conversation() {
+            Some(undo_snapshot_to_prompt(
+                &original.undo_snapshot,
+                Some(point.prompt_number),
+            )?)
+        } else {
+            None
+        };
+        let (begin_done, begin_result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::BeginRewind {
+                generation: catalog.generation.0,
+                expected_revision: catalog.revision,
+                point: point.clone(),
+                restore_code: scope.restores_code(),
+                target_snapshot: undo.as_ref().map(|undo| undo.snapshot.clone()),
+                recovery_tx: self.tx.clone(),
+                done: begin_done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        let mut transaction = begin_result
+            .await
+            .map_err(|_| RuntimeError::Unavailable)??;
+        if scope == RewindScope::Code {
+            let restored_files = transaction.receipt().restored_files().to_vec();
+            let receipt = transaction.commit();
+            self.finish_rewind(catalog.generation.0, receipt, RewindFinalization::Commit)
+                .await?;
+            return Ok(RewindResult {
+                generation: catalog.generation,
+                scope,
+                point,
+                snapshot: original.undo_snapshot,
+                restored_prompt: None,
+                restored_files,
+            });
+        }
+        let undo = undo.expect("conversation rewind must have an undo plan");
+        match self
+            .apply_undo(
+                catalog.generation.0,
+                catalog.revision,
+                original.undo_snapshot,
+                undo,
+            )
+            .await
+        {
+            Ok(result) => {
+                let receipt = transaction.commit();
+                let restored_files = receipt.restored_files().to_vec();
+                self.finish_rewind(result.generation.0, receipt, RewindFinalization::Commit)
+                    .await?;
+                Ok(RewindResult {
+                    generation: result.generation,
+                    scope,
+                    point,
+                    snapshot: result.snapshot,
+                    restored_prompt: Some(result.restored_prompt),
+                    restored_files,
+                })
+            }
+            Err(error) => {
+                let receipt = transaction.take_for_compensation();
+                match self
+                    .finish_rewind(
+                        catalog.generation.0,
+                        receipt,
+                        RewindFinalization::Compensate,
+                    )
+                    .await
+                {
+                    Ok(()) => Err(error),
+                    Err(compensation) => Err(RuntimeError::ReconfigureFailed(format!(
+                        "{error}; rewind compensation failed: {compensation}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    async fn finish_rewind(
+        &self,
+        generation: u64,
+        receipt: RewindTransactionReceipt,
+        outcome: RewindFinalization,
+    ) -> Result<(), RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::FinishRewind {
+                generation,
+                receipt,
+                outcome,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -1711,6 +1984,25 @@ pub enum CodingRuntimeControl {
         prompts_before: usize,
         done: oneshot::Sender<Result<UndoResult, RuntimeError>>,
     },
+    RewindCatalog {
+        generation: u64,
+        done: oneshot::Sender<Result<RewindCatalog, RuntimeError>>,
+    },
+    BeginRewind {
+        generation: u64,
+        expected_revision: u64,
+        point: RewindPoint,
+        restore_code: bool,
+        target_snapshot: Option<SessionSnapshot>,
+        recovery_tx: mpsc::UnboundedSender<CodingRuntimeControl>,
+        done: oneshot::Sender<Result<RewindTransactionGuard, RuntimeError>>,
+    },
+    FinishRewind {
+        generation: u64,
+        receipt: RewindTransactionReceipt,
+        outcome: RewindFinalization,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     RestoreSnapshot {
         generation: u64,
         snapshot: SessionSnapshot,
@@ -1734,6 +2026,14 @@ pub enum CodingRuntimeControl {
         generation: u64,
         done: oneshot::Sender<Result<(), RuntimeError>>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum RewindFinalization {
+    Commit,
+    Compensate,
+    Recover,
 }
 
 #[doc(hidden)]
@@ -2773,6 +3073,228 @@ fn spawn_runtime_owner_with_optional_agent(
                                 }
                             }
                         }
+                    }
+                    Some(CodingRuntimeControl::RewindCatalog {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if request_generation != generation
+                            || active_turn.is_some()
+                            || compaction_suspended
+                            || compactions.is_active()
+                        {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let Some(hook) = runtime.parts.snapshot_hook() else {
+                            let _ = done.send(Ok(RewindCatalog {
+                                generation: RuntimeGeneration(generation),
+                                revision: conversation_revision,
+                                points: Vec::new(),
+                                code_unavailable: Some(
+                                    "rewind requires a persistent session".into(),
+                                ),
+                            }));
+                            continue;
+                        };
+                        if let Some(reason) = hook.rewind_transaction_unavailable() {
+                            let _ = done.send(Err(RuntimeError::ReconfigureFailed(reason)));
+                            continue;
+                        }
+                        let _ = done.send(Ok(RewindCatalog {
+                            generation: RuntimeGeneration(generation),
+                            revision: conversation_revision,
+                            points: hook.rewind_points(),
+                            code_unavailable: hook.code_rewind_unavailable(),
+                        }));
+                    }
+                    Some(CodingRuntimeControl::BeginRewind {
+                        generation: request_generation,
+                        expected_revision,
+                        point,
+                        restore_code,
+                        target_snapshot,
+                        recovery_tx,
+                        done,
+                    }) => {
+                        if request_generation != generation
+                            || expected_revision != conversation_revision
+                            || active_turn.is_some()
+                            || compaction_suspended
+                            || compactions.is_active()
+                        {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let Some(hook) = runtime.parts.snapshot_hook() else {
+                            let _ = done.send(Err(RuntimeError::CodeRewindUnavailable(
+                                "rewind requires a persistent session".into(),
+                            )));
+                            continue;
+                        };
+                        if !hook
+                            .rewind_points()
+                            .iter()
+                            .any(|candidate| candidate == &point)
+                        {
+                            let _ = done.send(Err(RuntimeError::RewindPointUnavailable {
+                                turn_id: point.turn_id,
+                            }));
+                            continue;
+                        }
+                        controls.state.store(
+                            runtime_phase_state(generation, RuntimePhase::Reconfiguring),
+                            Ordering::Release,
+                        );
+                        let hook = Arc::clone(&hook);
+                        let point = point.clone();
+                        let receipt = match tokio::task::spawn_blocking(move || {
+                            hook.begin_rewind(&point, restore_code, target_snapshot)
+                        })
+                        .await
+                        {
+                            Ok(Ok(receipt)) => receipt,
+                            Ok(Err(error)) => {
+                                let compensation_failed = matches!(
+                                    &error,
+                                    atomcode_capabilities::session::WorkspaceCheckpointError::Compensation { .. }
+                                );
+                                if compensation_failed {
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::Failed),
+                                        Ordering::Release,
+                                    );
+                                    agent_available = false;
+                                    let _ = send_agent_command(&agent, AgentCommand::Shutdown);
+                                    agent = None;
+                                } else {
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::Ready),
+                                        Ordering::Release,
+                                    );
+                                }
+                                let error = if restore_code {
+                                    RuntimeError::CodeRewindUnavailable(error.to_string())
+                                } else {
+                                    RuntimeError::ReconfigureFailed(format!(
+                                        "rewind checkpoint update failed: {error}"
+                                    ))
+                                };
+                                let _ = done.send(Err(error));
+                                continue;
+                            }
+                            Err(error) => {
+                                // A panicked blocking transaction may have
+                                // mutated the worktree or ledger after writing
+                                // its recovery journal. Do not claim Ready.
+                                controls.state.store(
+                                    runtime_phase_state(generation, RuntimePhase::Failed),
+                                    Ordering::Release,
+                                );
+                                agent_available = false;
+                                let _ = send_agent_command(&agent, AgentCommand::Shutdown);
+                                agent = None;
+                                let _ = done.send(Err(RuntimeError::CodeRewindUnavailable(
+                                    format!("rewind checkpoint task failed: {error}"),
+                                )));
+                                continue;
+                            }
+                        };
+                        // The guard is installed before crossing the oneshot
+                        // boundary. If the receiver disappears before polling
+                        // the delivered value, dropping the channel payload
+                        // still queues Recover back to this owner.
+                        let transaction =
+                            RewindTransactionGuard::new(recovery_tx, generation, receipt);
+                        let _ = done.send(Ok(transaction));
+                    }
+                    Some(CodingRuntimeControl::FinishRewind {
+                        generation: request_generation,
+                        receipt,
+                        outcome,
+                        done,
+                    }) => {
+                        if outcome != RewindFinalization::Recover
+                            && request_generation != generation
+                        {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let Some(hook) = runtime.parts.snapshot_hook() else {
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::Failed),
+                                Ordering::Release,
+                            );
+                            agent_available = false;
+                            let _ = send_agent_command(&agent, AgentCommand::Shutdown);
+                            agent = None;
+                            let _ = done.send(Err(RuntimeError::CodeRewindUnavailable(
+                                "rewind finalization lost its session checkpoint".into(),
+                            )));
+                            continue;
+                        };
+                        let result = tokio::task::spawn_blocking(move || match outcome {
+                            RewindFinalization::Commit => hook.commit_rewind(receipt),
+                            RewindFinalization::Compensate => hook.compensate_rewind(receipt),
+                            RewindFinalization::Recover => hook.recover_rewind(receipt),
+                        })
+                        .await;
+                        let failure = match result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(error)) => Some(format!(
+                                "rewind {} failed: {error}",
+                                match outcome {
+                                    RewindFinalization::Commit => "commit",
+                                    RewindFinalization::Compensate => "compensation",
+                                    RewindFinalization::Recover => "recovery",
+                                }
+                            )),
+                            Err(error) => Some(format!(
+                                "rewind {} task failed: {error}",
+                                match outcome {
+                                    RewindFinalization::Commit => "commit",
+                                    RewindFinalization::Compensate => "compensation",
+                                    RewindFinalization::Recover => "recovery",
+                                }
+                            )),
+                        };
+                        if let Some(message) = failure {
+                            // The durable journal remains authoritative and will
+                            // retry recovery on the next session open. This
+                            // runtime must stop accepting work because its
+                            // in-memory conversation/worktree relationship is
+                            // no longer proven consistent.
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::Failed),
+                                Ordering::Release,
+                            );
+                            agent_available = false;
+                            let _ = send_agent_command(&agent, AgentCommand::Shutdown);
+                            agent = None;
+                            let _ = done.send(Err(RuntimeError::ReconfigureFailed(message)));
+                            continue;
+                        }
+                        if controls.state.load(Ordering::Acquire)
+                            == runtime_phase_state(generation, RuntimePhase::Reconfiguring)
+                        {
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::Ready),
+                                Ordering::Release,
+                            );
+                        }
+                        let _ = done.send(Ok(()));
                     }
                     Some(CodingRuntimeControl::Cancel {
                         generation: request_generation,
@@ -4985,6 +5507,15 @@ fn reject_runtime_control(
         CodingRuntimeControl::ApplyUndo { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
+        CodingRuntimeControl::RewindCatalog { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::BeginRewind { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::FinishRewind { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
         CodingRuntimeControl::RestoreSnapshot { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
@@ -5278,8 +5809,7 @@ fn build_goal_evaluator_provider(
                 evaluator.model = resolved.model.clone();
                 evaluator.provider_type = resolved.provider_type.clone();
                 evaluator.context_window = resolved.context_window as u32;
-                evaluator.chat_options.max_tokens =
-                    resolved.max_tokens.map(|value| value as u32);
+                evaluator.chat_options.max_tokens = resolved.max_tokens.map(|value| value as u32);
                 evaluator.thinking_type = resolved.thinking_type.clone();
                 evaluator.thinking_keep = resolved.thinking_keep.clone();
                 evaluator.reasoning_history = resolved.reasoning_history.clone();
@@ -6036,6 +6566,58 @@ mod tests {
 
     struct TestProviderFactory {
         fail: bool,
+    }
+
+    struct MutatingProviderFactory {
+        path: std::path::PathBuf,
+        fail_second_build: bool,
+        builds: std::sync::atomic::AtomicUsize,
+    }
+
+    struct MutatingProvider {
+        path: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MutatingProvider {
+        fn model_name(&self) -> &str {
+            "mutating-test-provider"
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[atomcode_kernel::tool::ToolDef],
+            _options: &atomcode_kernel::provider::ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            std::fs::write(&self.path, "generated by the agent\n").unwrap();
+            use atomcode_kernel::stream::StreamEvent;
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta("answer".into()),
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+
+    impl CodingProviderFactory for MutatingProviderFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            let build = self.builds.fetch_add(1, Ordering::AcqRel);
+            if self.fail_second_build && build == 1 {
+                return Err(crate::ProviderBuildError::Adapter(
+                    "candidate provider failed".into(),
+                ));
+            }
+            Ok(Arc::new(MutatingProvider {
+                path: self.path.clone(),
+            }))
+        }
     }
 
     struct UsageProvider {
@@ -10507,6 +11089,378 @@ mod tests {
             .all(|message| message.text != "first prompt"));
         let current = runtime.handle.snapshot().await.unwrap();
         assert_eq!(current.messages, result.snapshot.messages);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn rewind_catalog_and_conversation_scope_are_runtime_owned() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(project.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("first rewind prompt"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+
+        let catalog = runtime.handle.rewind_points().await.unwrap();
+        assert_eq!(catalog.points.len(), 1);
+        assert_eq!(catalog.points[0].prompt_number, 1);
+        assert_eq!(catalog.points[0].prompt_preview, "first rewind prompt");
+        assert_eq!(catalog.code_unavailable, None);
+
+        let result = runtime
+            .handle
+            .rewind(catalog.points[0].turn_id, RewindScope::Conversation)
+            .await
+            .unwrap();
+        assert_eq!(result.scope, RewindScope::Conversation);
+        assert_eq!(
+            result.restored_prompt.as_deref(),
+            Some("first rewind prompt")
+        );
+        assert!(result.restored_files.is_empty());
+        assert!(result
+            .snapshot
+            .messages
+            .iter()
+            .all(|message| message.text != "first rewind prompt"));
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    async fn mutating_rewind_runtime(
+        fail_second_build: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        CodingRuntime,
+        RewindPoint,
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(project.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let generated = project.path().join("generated.txt");
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Fresh;
+        start.provider_factory = Arc::new(MutatingProviderFactory {
+            path: generated.clone(),
+            fail_second_build,
+            builds: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("write generated.txt"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        assert_eq!(
+            std::fs::read_to_string(&generated).unwrap(),
+            "generated by the agent\n"
+        );
+        let point = runtime
+            .handle
+            .rewind_points()
+            .await
+            .unwrap()
+            .points
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(point.files.iter().any(|file| file.path == "generated.txt"));
+        (home, project, generated, runtime, point)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn code_only_rewind_restores_workspace_but_keeps_conversation() {
+        let (_home, _project, generated, runtime, point) = mutating_rewind_runtime(false).await;
+
+        let result = runtime
+            .handle
+            .rewind(point.turn_id, RewindScope::Code)
+            .await
+            .unwrap();
+
+        assert!(!generated.exists());
+        assert_eq!(result.restored_prompt, None);
+        assert_eq!(result.restored_files, vec!["generated.txt"]);
+        assert!(result
+            .snapshot
+            .messages
+            .iter()
+            .any(|message| message.text == "write generated.txt"));
+        assert!(runtime
+            .handle
+            .rewind_points()
+            .await
+            .unwrap()
+            .points
+            .is_empty());
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn combined_rewind_restores_workspace_and_conversation() {
+        let (_home, _project, generated, runtime, point) = mutating_rewind_runtime(false).await;
+
+        let result = runtime
+            .handle
+            .rewind(point.turn_id, RewindScope::ConversationAndCode)
+            .await
+            .unwrap();
+
+        assert!(!generated.exists());
+        assert_eq!(
+            result.restored_prompt.as_deref(),
+            Some("write generated.txt")
+        );
+        assert_eq!(result.restored_files, vec!["generated.txt"]);
+        assert!(result
+            .snapshot
+            .messages
+            .iter()
+            .all(|message| message.text != "write generated.txt"));
+        assert!(runtime
+            .handle
+            .rewind_points()
+            .await
+            .unwrap()
+            .points
+            .is_empty());
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn code_rewind_preserves_workspace_changes_made_after_the_turn() {
+        let (_home, _project, generated, runtime, point) = mutating_rewind_runtime(false).await;
+        std::fs::write(&generated, "user changed this after the turn\n").unwrap();
+
+        let error = runtime
+            .handle
+            .rewind(point.turn_id, RewindScope::Code)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RuntimeError::CodeRewindUnavailable(_)));
+        assert_eq!(
+            std::fs::read_to_string(&generated).unwrap(),
+            "user changed this after the turn\n"
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn combined_rewind_compensates_workspace_when_agent_rebuild_fails() {
+        let (_home, _project, generated, runtime, point) = mutating_rewind_runtime(true).await;
+
+        let error = runtime
+            .handle
+            .rewind(point.turn_id, RewindScope::ConversationAndCode)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RuntimeError::ReconfigureFailed(_)));
+        assert_eq!(
+            std::fs::read_to_string(&generated).unwrap(),
+            "generated by the agent\n"
+        );
+        let snapshot = runtime.handle.snapshot().await.unwrap();
+        assert!(snapshot
+            .messages
+            .iter()
+            .any(|message| message.text == "write generated.txt"));
+        assert_eq!(
+            runtime.handle.rewind_points().await.unwrap().points,
+            vec![point]
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn cancelled_rewind_transaction_compensates_and_releases_runtime() {
+        let (_home, _project, generated, runtime, point) = mutating_rewind_runtime(false).await;
+        let catalog = runtime.handle.rewind_points().await.unwrap();
+        let (done, result) = oneshot::channel();
+        runtime
+            .handle
+            .tx
+            .send(CodingRuntimeControl::BeginRewind {
+                generation: catalog.generation.0,
+                expected_revision: catalog.revision,
+                point: point.clone(),
+                restore_code: true,
+                target_snapshot: None,
+                recovery_tx: runtime.handle.tx.clone(),
+                done,
+            })
+            .unwrap();
+        let transaction = result.await.unwrap().unwrap();
+        assert!(!generated.exists());
+
+        drop(transaction);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if runtime.handle.status().phase == RuntimePhase::Ready
+                    && generated.exists()
+                    && runtime
+                        .handle
+                        .rewind_points()
+                        .await
+                        .is_ok_and(|catalog| catalog.points == vec![point.clone()])
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled rewind did not compensate");
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn cancelled_begin_receiver_is_recovered_by_runtime_owner() {
+        let (_home, _project, generated, runtime, point) = mutating_rewind_runtime(false).await;
+        let catalog = runtime.handle.rewind_points().await.unwrap();
+        let (done, result) = oneshot::channel();
+        drop(result);
+        runtime
+            .handle
+            .tx
+            .send(CodingRuntimeControl::BeginRewind {
+                generation: catalog.generation.0,
+                expected_revision: catalog.revision,
+                point: point.clone(),
+                restore_code: true,
+                target_snapshot: None,
+                recovery_tx: runtime.handle.tx.clone(),
+                done,
+            })
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if runtime.handle.status().phase == RuntimePhase::Ready
+                    && generated.exists()
+                    && runtime
+                        .handle
+                        .rewind_points()
+                        .await
+                        .is_ok_and(|catalog| catalog.points == vec![point.clone()])
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owner did not recover an undelivered BeginRewind receipt");
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn abandoned_rewind_recovers_after_undo_advances_generation() {
+        let (_home, _project, _generated, runtime, point) = mutating_rewind_runtime(false).await;
+        let catalog = runtime.handle.rewind_points().await.unwrap();
+        let original = runtime.handle.snapshot_with_revision().await.unwrap();
+        let undo =
+            undo_snapshot_to_prompt(&original.undo_snapshot, Some(point.prompt_number)).unwrap();
+        let target_snapshot = undo.snapshot.clone();
+        let (done, result) = oneshot::channel();
+        runtime
+            .handle
+            .tx
+            .send(CodingRuntimeControl::BeginRewind {
+                generation: catalog.generation.0,
+                expected_revision: catalog.revision,
+                point,
+                restore_code: true,
+                target_snapshot: Some(target_snapshot.clone()),
+                recovery_tx: runtime.handle.tx.clone(),
+                done,
+            })
+            .unwrap();
+        let transaction = result.await.unwrap().unwrap();
+
+        let applied = runtime
+            .handle
+            .apply_undo(
+                catalog.generation.0,
+                catalog.revision,
+                original.undo_snapshot,
+                undo,
+            )
+            .await
+            .unwrap();
+        assert_ne!(applied.generation, catalog.generation);
+
+        let receipt = transaction.commit();
+        runtime
+            .handle
+            .finish_rewind(catalog.generation.0, receipt, RewindFinalization::Recover)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.handle.snapshot().await.unwrap().as_ref(),
+            &target_snapshot
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn rewind_from_stale_catalog_is_not_reinterpreted_against_live_state() {
+        let (_home, _project, _generated, runtime, point) = mutating_rewind_runtime(false).await;
+        let mut stale = runtime.handle.rewind_points().await.unwrap();
+        stale.generation = RuntimeGeneration(stale.generation.0.saturating_add(100));
+
+        let error = runtime
+            .handle
+            .rewind_from_catalog(stale, point.turn_id, RewindScope::Conversation)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RuntimeError::Busy));
+        assert_eq!(
+            runtime.handle.rewind_points().await.unwrap().points,
+            vec![point]
+        );
         runtime.handle.shutdown().await.unwrap();
     }
 

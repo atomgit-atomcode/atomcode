@@ -1206,7 +1206,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "[warning] Running with Administrator privileges — model may have access to system files.".into(),
 
         Msg::CtrlCAgainToExit => "  (press Ctrl+C again to exit)\n".into(),
-        Msg::EscAgainToUndo => "  (press Esc again to undo last turn)\n".into(),
+        Msg::EscAgainToUndo => "  (press Esc again to open Rewind)\n".into(),
         Msg::BashInputHint => "Enter to run as a bash command".into(),
         Msg::ShellModeHint => "! for shell mode".into(),
         Msg::PendingMessagesTitle =>

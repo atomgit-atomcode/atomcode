@@ -50,7 +50,7 @@ pub use rewind::{
     FileChangeSummary, RewindPoint, WorkspaceCheckpoint, WorkspaceCheckpointError,
     WorkspaceRestoreReceipt,
 };
-pub use snapshot::SnapshotHook;
+pub use snapshot::{RewindTransactionReceipt, SnapshotHook};
 pub use status_reminder::StatusReminderHook;
 pub use transcript::{ToolRecord, TranscriptHook, TurnRecord, UsageRecord};
 pub use usage_provider::UsageRecordingProvider;

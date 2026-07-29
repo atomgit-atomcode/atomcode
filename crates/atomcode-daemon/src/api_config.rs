@@ -189,7 +189,10 @@ mod tests {
         .unwrap();
         let resp = config_response(&config);
         let names: Vec<&str> = resp.providers.iter().map(|p| p.name.as_str()).collect();
-        assert!(names.contains(&"AtomGit-GLM-5.2"), "new-schema model listed");
+        assert!(
+            names.contains(&"AtomGit-GLM-5.2"),
+            "new-schema model listed"
+        );
         assert!(names.contains(&"AtomGit-Qwen"));
         assert_eq!(resp.default_provider, "AtomGit-GLM-5.2");
         let glm = resp

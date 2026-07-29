@@ -11,11 +11,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use atomcode_capabilities::mcp::McpRegistry;
+use atomcode_capabilities::tools::PermissionDecision;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_config::config::Config;
 use atomcode_kernel::message::{ImageContent, Message as KernelMessage, SessionSnapshot};
-use atomcode_capabilities::mcp::McpRegistry;
-use atomcode_capabilities::tools::PermissionDecision;
 use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -1111,7 +1111,9 @@ pub(crate) async fn preprocess_image_caption(
     message: &str,
     images: &[ImageContent],
 ) -> String {
-    use atomcode_coding::vision::{run_vl_caption, should_skip, vl_model_display, PreprocessOutcome};
+    use atomcode_coding::vision::{
+        run_vl_caption, should_skip, vl_model_display, PreprocessOutcome,
+    };
     // Short-circuit: no images, or the main model already accepts images.
     if should_skip(active_model, !images.is_empty()) {
         return message.to_string();
@@ -1705,9 +1707,11 @@ pub(crate) async fn live_permission(
             let reg = state.mcp_registry.read().await.clone();
             if let Some((server, tool)) = reg.split_tool_name(full).await {
                 let project_dir = state.project.read().await.working_dir.clone();
-                if let Err(e) =
-                    atomcode_capabilities::mcp::config::add_auto_approved_tool(&project_dir, &server, &tool)
-                {
+                if let Err(e) = atomcode_capabilities::mcp::config::add_auto_approved_tool(
+                    &project_dir,
+                    &server,
+                    &tool,
+                ) {
                     tracing::warn!("[permission] persist autoApprove failed: {e}");
                 }
                 reg.mark_tool_auto_approved(full);
@@ -1863,22 +1867,31 @@ mod tests {
             vec![img("orig-bytes")],
             "look at this\n\n[图片内容（由 vl 识别）]\na chart".into(),
         );
-        assert_eq!(runtime.text, "look at this\n\n[图片内容（由 vl 识别）]\na chart");
+        assert_eq!(
+            runtime.text,
+            "look at this\n\n[图片内容（由 vl 识别）]\na chart"
+        );
         assert_eq!(
             runtime.images,
             vec![img("orig-bytes")],
             "runtime conversation must KEEP the image so it persists across a refresh"
         );
-        assert_eq!(echo.text, "look at this", "display must show the user's original text");
-        assert_eq!(echo.images, vec![img("orig-bytes")], "display must keep the image");
+        assert_eq!(
+            echo.text, "look at this",
+            "display must show the user's original text"
+        );
+        assert_eq!(
+            echo.images,
+            vec![img("orig-bytes")],
+            "display must keep the image"
+        );
     }
 
     #[test]
     fn split_live_inputs_keeps_image_for_vision_model_when_not_preprocessed() {
         // A vision model needs no caption: runtime_text == message, so the raw image
         // flows to BOTH the model and the echo unchanged.
-        let (runtime, echo) =
-            split_live_inputs("hi".into(), vec![img("orig-bytes")], "hi".into());
+        let (runtime, echo) = split_live_inputs("hi".into(), vec![img("orig-bytes")], "hi".into());
         assert_eq!(runtime.text, "hi");
         assert_eq!(runtime.images, vec![img("orig-bytes")]);
         assert_eq!(echo.text, "hi");
@@ -1902,8 +1915,12 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn mcp_trust_round_trip_clears_blocked() {
-        use atomcode_capabilities::mcp::config::{McpConfigSource, McpServerConfig, McpTransportConfig};
-        use atomcode_capabilities::mcp::trust::{is_project_trusted, partition_by_trust, trust_project};
+        use atomcode_capabilities::mcp::config::{
+            McpConfigSource, McpServerConfig, McpTransportConfig,
+        };
+        use atomcode_capabilities::mcp::trust::{
+            is_project_trusted, partition_by_trust, trust_project,
+        };
 
         let store_dir = tempfile::tempdir().unwrap();
         // SAFETY: test seam; serial attribute prevents concurrent mutation.
@@ -1975,11 +1992,7 @@ mod tests {
             Some(atomcode_kernel::message::LEGACY_COLD_SUMMARY_ORIGIN.to_string());
         let mut buffer = vec![cold, Message::user("cancelled prompt")];
 
-        install_authoritative_terminal_snapshot(
-            &mut buffer,
-            SessionSnapshot::new(Vec::new()),
-            &[],
-        );
+        install_authoritative_terminal_snapshot(&mut buffer, SessionSnapshot::new(Vec::new()), &[]);
 
         assert!(buffer.is_empty());
         assert!(atomcode_kernel::message::cold_summaries_from_messages(&buffer).is_empty());
@@ -2197,9 +2210,8 @@ mod tests {
     #[test]
     fn restore_images_from_turn_base_preserves_history_user_display_payload() {
         let original_user = Message::user_with_images("识别图片内容", vec![img("aW1hZ2U=")]);
-        let final_user = Message::user(
-            "识别图片内容\n\n[图片内容（由 vl-provider 识别）]\n一张图片",
-        );
+        let final_user =
+            Message::user("识别图片内容\n\n[图片内容（由 vl-provider 识别）]\n一张图片");
 
         let messages = restore_images_from_turn_base(vec![final_user], &[original_user]);
 
@@ -2474,7 +2486,9 @@ mod tests {
         assert!(snapshot.messages[0].synthetic);
         assert_eq!(snapshot.messages[0].text, "after compact");
         // Cold summaries live inline as synthetic messages; none tagged here.
-        assert!(atomcode_kernel::message::cold_summaries_from_messages(&snapshot.messages).is_empty());
+        assert!(
+            atomcode_kernel::message::cold_summaries_from_messages(&snapshot.messages).is_empty()
+        );
     }
 
     #[test]
@@ -2497,7 +2511,8 @@ mod tests {
         meta2.owner = atomcode_capabilities::session::StorageOwner::Native;
         let snap2 = SessionSnapshot::new(vec![]);
         let pres2 = atomcode_capabilities::session::PresentationFile::default();
-        mgr2.commit_native_import(&lease2, Some(&snap2), Some(&pres2), &meta2).unwrap();
+        mgr2.commit_native_import(&lease2, Some(&snap2), Some(&pres2), &meta2)
+            .unwrap();
         drop(lease2);
 
         // Searching explicitly in proj1 bucket fails
@@ -2505,14 +2520,16 @@ mod tests {
             root.path(),
             &bucket1,
             "session-in-proj2",
-        ).unwrap();
+        )
+        .unwrap();
         assert!(res1.is_none());
 
         // Searching across any project finds it in proj2 bucket
         let res2 = crate::legacy_convert::prepare_catalog_session_resume_any_project_in_root(
             root.path(),
             "session-in-proj2",
-        ).unwrap();
+        )
+        .unwrap();
         assert!(res2.is_some());
         let prepared = res2.unwrap();
         assert_eq!(prepared.project_bucket, bucket2);

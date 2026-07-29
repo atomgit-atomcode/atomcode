@@ -52,7 +52,10 @@ mod tests {
         reg.register("sess-1".into(), tx);
 
         assert!(reg.deliver("sess-1", PermissionDecision::AllowOnce));
-        assert!(matches!(rx.recv().await, Some(PermissionDecision::AllowOnce)));
+        assert!(matches!(
+            rx.recv().await,
+            Some(PermissionDecision::AllowOnce)
+        ));
     }
 
     #[test]

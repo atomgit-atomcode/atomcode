@@ -137,7 +137,10 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
                 .into_response();
         }
     }
-    if req.pricing.is_some_and(|pricing| pricing.validated().is_none()) {
+    if req
+        .pricing
+        .is_some_and(|pricing| pricing.validated().is_none())
+    {
         return json_error(
             StatusCode::BAD_REQUEST,
             "pricing values must be finite and non-negative",

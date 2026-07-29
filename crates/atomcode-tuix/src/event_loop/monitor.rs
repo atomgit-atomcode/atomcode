@@ -232,7 +232,11 @@ mod tests {
         .unwrap();
         let mut got = local_atomgit_models(&new_cfg);
         got.sort();
-        assert_eq!(got, s(&["GLM-5.2", "Qwen"]), "only AtomGit-account models, not the user's");
+        assert_eq!(
+            got,
+            s(&["GLM-5.2", "Qwen"]),
+            "only AtomGit-account models, not the user's"
+        );
 
         // Un-migrated legacy flat providers still work via the projection fold.
         let legacy_cfg: Config = serde_json::from_value(serde_json::json!({

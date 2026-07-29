@@ -1172,7 +1172,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "[warning] 正在以管理员权限运行 — 模型可能可以访问系统文件。".into(),
 
         Msg::CtrlCAgainToExit => "  （再次按 Ctrl+C 退出）\n".into(),
-        Msg::EscAgainToUndo => "  （再次按 Esc 撤销上一轮）\n".into(),
+        Msg::EscAgainToUndo => "  （再次按 Esc 打开回退选择）\n".into(),
         Msg::BashInputHint => "回车执行 bash 命令".into(),
         Msg::ShellModeHint => "! 进入 shell 模式".into(),
         Msg::PendingMessagesTitle =>

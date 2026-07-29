@@ -479,10 +479,7 @@ fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
     out.push('\n');
     out.push_str(&t(Msg::StatusMemoryFilesHeader));
     for (scope_msg, store) in [
-        (
-            Msg::StatusMemoryScopeGlobal,
-            MemoryStore::global(),
-        ),
+        (Msg::StatusMemoryScopeGlobal, MemoryStore::global()),
         (
             Msg::StatusMemoryScopeProject,
             MemoryStore::project(working_dir),
@@ -1801,8 +1798,7 @@ fn execute_slash_command_impl(
                 // error text folds into the same snapshot so a failed diff still
                 // reports below the input box.
                 state.footer_usage = None;
-                state.footer_command_output =
-                    Some(build_diff_stat_text(ctx).unwrap_or_else(|e| e));
+                state.footer_command_output = Some(build_diff_stat_text(ctx).unwrap_or_else(|e| e));
             } else if ctx.is_plain_renderer || !matches!(state.phase, crate::state::UiPhase::Idle) {
                 match build_diff_stat_text(ctx) {
                     Ok(text) => renderer.render(UiLine::CommandOutput(text)),
@@ -3688,11 +3684,7 @@ fn execute_slash_command_impl(
                                 .to_string(),
                             ),
                         });
-                        render_custom_command_error(
-                            renderer,
-                            &CustomDispatch::NotFound,
-                            other,
-                        );
+                        render_custom_command_error(renderer, &CustomDispatch::NotFound, other);
                     }
                 }
             }
@@ -3707,10 +3699,7 @@ fn execute_slash_command_impl(
 /// 简写等）只注入一次。列表里存用户原始拼写（回显更友好），展开时 `expand_skill`
 /// 会再归一化。遇到第一个非 skill 的 token，它及其之后的内容（按原串偏移，保留原
 /// 空白）作为任务描述返回。单个 skill（后面无第二个 skill 词）等价于旧 `splitn(2)`。
-fn split_skill_names(
-    arg: &str,
-    resolve: impl Fn(&str) -> Option<String>,
-) -> (Vec<String>, String) {
+fn split_skill_names(arg: &str, resolve: impl Fn(&str) -> Option<String>) -> (Vec<String>, String) {
     let mut skills: Vec<String> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     let mut rest = arg.trim_start();
@@ -5027,13 +5016,15 @@ pub(crate) fn build_cost_report_text(
         .iter()
         .any(|item| item.provider_id == current_provider && item.model_id == current_model)
     {
-        report.models.push(atomcode_capabilities::session::ModelCostSummary {
-            provider_id: current_provider.to_string(),
-            model_id: current_model.to_string(),
-            tokens: Default::default(),
-            estimated_cost_usd: current_pricing.map(|_| 0.0),
-            explicitly_free: current_pricing.is_some_and(|pricing| pricing.is_free()),
-        });
+        report
+            .models
+            .push(atomcode_capabilities::session::ModelCostSummary {
+                provider_id: current_provider.to_string(),
+                model_id: current_model.to_string(),
+                tokens: Default::default(),
+                estimated_cost_usd: current_pricing.map(|_| 0.0),
+                explicitly_free: current_pricing.is_some_and(|pricing| pricing.is_free()),
+            });
     }
 
     // Resolve a selection id to its account for a friendly `account · model`
@@ -5060,16 +5051,30 @@ pub(crate) fn build_cost_report_text(
         let body = if item.explicitly_free {
             let cost = t(Msg::CostFree);
             t(Msg::CostReport {
-                prompt, completion, cached, cache_rate, total, cost: &cost,
+                prompt,
+                completion,
+                cached,
+                cache_rate,
+                total,
+                cost: &cost,
             })
         } else if let Some(estimated) = item.estimated_cost_usd {
             let cost = crate::pricing::format_cost(estimated);
             t(Msg::CostReport {
-                prompt, completion, cached, cache_rate, total, cost: &cost,
+                prompt,
+                completion,
+                cached,
+                cache_rate,
+                total,
+                cost: &cost,
             })
         } else {
             t(Msg::CostTokenReport {
-                prompt, completion, cached, cache_rate, total,
+                prompt,
+                completion,
+                cached,
+                cache_rate,
+                total,
             })
         };
         sections.push(format!(
@@ -5110,9 +5115,7 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
             // Never relabel older in-memory totals as the current model when
             // native metadata is unavailable. Only the active turn below has
             // a trustworthy current-generation identity.
-            let session_total = state
-                .prompt_tokens
-                .saturating_add(state.completion_tokens) as u64;
+            let session_total = state.prompt_tokens.saturating_add(state.completion_tokens) as u64;
             let live_total = state
                 .turn_prompt_tokens
                 .saturating_add(state.turn_completion_tokens) as u64;
@@ -5171,17 +5174,13 @@ fn session_manager_for_cost(
     working_dir: &std::path::Path,
 ) -> atomcode_capabilities::session::SessionManager {
     project_bucket
-        .filter(|bucket| {
-            bucket.len() == 16 && bucket.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
+        .filter(|bucket| bucket.len() == 16 && bucket.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .map(|bucket| {
             atomcode_capabilities::session::SessionManager::with_root(
                 atomcode_capabilities::session::SessionManager::sessions_root().join(bucket),
             )
         })
-        .unwrap_or_else(|| {
-            atomcode_capabilities::session::SessionManager::for_project(working_dir)
-        })
+        .unwrap_or_else(|| atomcode_capabilities::session::SessionManager::for_project(working_dir))
 }
 
 #[cfg(test)]
@@ -5687,9 +5686,7 @@ fn default_save_filename() -> String {
 
 /// Render the session's exportable turns as a markdown transcript. Pure /
 /// side-effect-free so it can be unit-tested independently of file I/O.
-fn render_save_markdown(
-    messages: &[atomcode_kernel::message::Message],
-) -> Option<String> {
+fn render_save_markdown(messages: &[atomcode_kernel::message::Message]) -> Option<String> {
     use atomcode_kernel::message::Role;
     let turns: Vec<(&Role, &str)> = messages
         .iter()
@@ -6781,7 +6778,11 @@ pub(crate) fn format_todo_command(
     // kernel `Message.tool_calls` is a flat field, so no content-variant match.
     let calls: Vec<(&str, &str)> = messages
         .iter()
-        .flat_map(|m| m.tool_calls.iter().map(|c| (c.name.as_str(), c.arguments.as_str())))
+        .flat_map(|m| {
+            m.tool_calls
+                .iter()
+                .map(|c| (c.name.as_str(), c.arguments.as_str()))
+        })
         .collect();
     let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
     if todos.is_empty() {
@@ -7204,13 +7205,7 @@ mod tests {
         std::fs::create_dir_all(project_memory.path().parent().unwrap()).unwrap();
         std::fs::write(project_memory.path(), "- remembered fact\n").unwrap();
         let status = render_context_file_status_block(project.path());
-        assert!(status.contains(
-            &project
-                .path()
-                .join("AGENTS.md")
-                .display()
-                .to_string()
-        ));
+        assert!(status.contains(&project.path().join("AGENTS.md").display().to_string()));
         assert!(status.contains(&project_memory.path().display().to_string()));
         assert!(status.contains("(PROJECT)") || status.contains("（PROJECT）"));
         assert!(
@@ -7746,7 +7741,9 @@ mod memory_command_tests {
 
 #[cfg(test)]
 mod todo_command_tests {
-    use super::{decide_custom_command, format_todo_command, render_custom_command_error, CustomDispatch};
+    use super::{
+        decide_custom_command, format_todo_command, render_custom_command_error, CustomDispatch,
+    };
     use crate::custom_commands::ArgsRequirement;
     use crate::render::{Renderer, UiLine};
     use atomcode_config::i18n::{t, Msg};
@@ -8105,10 +8102,7 @@ mod todo_command_tests {
                 msg, &rendered,
                 "Reject must render the CmdCustomArgRequired i18n message"
             ),
-            other => panic!(
-                "Reject must render UiLine::Error, got {:?}",
-                other
-            ),
+            other => panic!("Reject must render UiLine::Error, got {:?}", other),
         }
         assert_eq!(
             rec.flushed, 1,
@@ -8129,7 +8123,11 @@ mod todo_command_tests {
         // Submit no-op arm (which would silently swallow unknown commands
         // with zero user-visible feedback).
         let mut rec = RecRenderer::default();
-        render_custom_command_error(&mut rec, &CustomDispatch::Submit("review foo".into()), "myreview");
+        render_custom_command_error(
+            &mut rec,
+            &CustomDispatch::Submit("review foo".into()),
+            "myreview",
+        );
         assert!(
             rec.lines.is_empty(),
             "Submit must not render any error line, got {:?}",
@@ -8150,10 +8148,7 @@ mod todo_command_tests {
                 msg, &expected,
                 "NotFound must render the CmdUnknownCommand i18n message"
             ),
-            other => panic!(
-                "NotFound must render UiLine::Error, got {:?}",
-                other
-            ),
+            other => panic!("NotFound must render UiLine::Error, got {:?}", other),
         }
         assert_eq!(
             rec.flushed, 1,
@@ -8232,8 +8227,7 @@ mod todo_command_tests {
         }
         render_custom_command_error(&mut rec, &decision, "myreview");
         assert!(
-            rec
-                .lines
+            rec.lines
                 .iter()
                 .all(|line| !matches!(line, UiLine::Error(_))),
             "Submit must not render any Error line, got {:?}",
@@ -8250,9 +8244,7 @@ mod todo_command_tests {
     #[test]
     fn cost_report_keeps_models_separate_and_hides_unknown_price() {
         use crate::event_loop::commands::build_cost_report_text;
-        use atomcode_capabilities::session::{
-            ModelCostSummary, SessionCostReport, TokenBreakdown,
-        };
+        use atomcode_capabilities::session::{ModelCostSummary, SessionCostReport, TokenBreakdown};
         let out = build_cost_report_text(
             SessionCostReport {
                 models: vec![ModelCostSummary {
@@ -8406,8 +8398,7 @@ mod split_skill_names_tests {
         // Different case both resolve to canonical "brainstorming" → one skill,
         // NOT two (which would inject the same skill body twice). The first
         // spelling the user typed is kept for display.
-        let (skills, task) =
-            split_skill_names("BrainStorming brainstorming 任务", resolve);
+        let (skills, task) = split_skill_names("BrainStorming brainstorming 任务", resolve);
         assert_eq!(skills, vec!["BrainStorming"]);
         assert_eq!(task, "任务");
     }

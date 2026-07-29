@@ -57,9 +57,7 @@ mod skill_first;
 pub mod subagent_tiers;
 mod todo;
 
-pub use assemble::{
-    build_coding_agent, build_coding_agent_with, try_build_coding_agent_with,
-};
+pub use assemble::{build_coding_agent, build_coding_agent_with, try_build_coding_agent_with};
 /// The image type carried by [`UserInput`] / [`ImagePreprocessor`], re-exported
 /// so driver crates can implement the hook without naming `atomcode_kernel`.
 pub use atomcode_kernel::message::ImageContent;
@@ -84,19 +82,19 @@ pub use provider_factory::{
     CodingProviderFactory, DefaultCodingProviderFactory, ProviderAuthenticator, ProviderBuildError,
 };
 pub use rate_limit::{RateLimitWindow, RateLimitWindowSource};
-pub use vision::{run_vl_caption, should_skip, vl_model_display, PreprocessOutcome};
 pub use runtime::{
     CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
     CodingRuntimeStart, DeferredRuntimeState, DriverCommand, ImagePreprocessor, LocalContextInput,
     McpStatusSnapshot, McpToolsSnapshot, ProviderBootstrap, ProviderUnavailableReason,
-    ReconfigureKind, ReprepareInput, RuntimeContextStats, RuntimeError, RuntimeExit,
-    RuntimeExitReason, RuntimeGeneration, RuntimeMode, RuntimePhase, RuntimeRequest,
-    RuntimeSessionInfo, RuntimeSnapshotError, RuntimeStartError, RuntimeStatus, RuntimeTurnStats,
-    RuntimeUnavailable, SequencedRuntimeEvent, SessionChanged, SubmitReceipt, TurnCompletion,
-    UndoResult, UserInput, VisionNotice,
+    ReconfigureKind, ReprepareInput, RewindCatalog, RewindResult, RewindScope, RuntimeContextStats,
+    RuntimeError, RuntimeExit, RuntimeExitReason, RuntimeGeneration, RuntimeMode, RuntimePhase,
+    RuntimeRequest, RuntimeSessionInfo, RuntimeSnapshotError, RuntimeStartError, RuntimeStatus,
+    RuntimeTurnStats, RuntimeUnavailable, SequencedRuntimeEvent, SessionChanged, SubmitReceipt,
+    TurnCompletion, UndoResult, UserInput, VisionNotice,
 };
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use todo::TodoHook;
+pub use vision::{run_vl_caption, should_skip, vl_model_display, PreprocessOutcome};
 
 /// Re-export the CC external-hooks types so host adapters that resolve
 /// plugin-contributed hooks can name [`cc_hooks::HookConfig`] without a direct

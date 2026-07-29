@@ -33,6 +33,7 @@ pub const META_VERSION: u32 = 1;
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REWIND_TRANSACTION_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_META_BYTES;
 const INFLIGHT_SNAPSHOT_VERSION: u32 = 1;
 pub const MAX_LEGACY_SESSION_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -1038,6 +1039,10 @@ impl SessionManager {
         self.path_for(id, "rewind.json")
     }
 
+    fn rewind_transaction_path(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "rewind.txn.json")
+    }
+
     pub(crate) fn load_rewind_ledger(
         &self,
         id: &str,
@@ -1088,6 +1093,67 @@ impl SessionManager {
     ) -> SessionResult<()> {
         self.validate_active_lease(lease)?;
         self.save_rewind_ledger(lease.id(), ledger)
+    }
+
+    pub(crate) fn load_rewind_transaction(
+        &self,
+        id: &str,
+    ) -> SessionResult<Option<super::rewind::RewindTransactionJournal>> {
+        let path = self.rewind_transaction_path(id)?;
+        match read_regular_file_bounded(&path, "rewind transaction", MAX_REWIND_TRANSACTION_BYTES) {
+            Ok(bytes) => {
+                let journal: super::rewind::RewindTransactionJournal =
+                    serde_json::from_slice(&bytes).map_err(|source| {
+                        SessionStoreError::Corrupt {
+                            kind: "rewind transaction",
+                            message: format!("{}: {source}", path.display()),
+                        }
+                    })?;
+                journal
+                    .validate()
+                    .map_err(|message| SessionStoreError::Corrupt {
+                        kind: "rewind transaction",
+                        message: format!("{}: {message}", path.display()),
+                    })?;
+                Ok(Some(journal))
+            }
+            Err(SessionStoreError::NotFound { .. }) => Ok(None),
+            Err(SessionStoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn save_rewind_transaction_with_lease(
+        &self,
+        lease: &SessionLease,
+        journal: &super::rewind::RewindTransactionJournal,
+    ) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        journal
+            .validate()
+            .map_err(|message| SessionStoreError::Corrupt {
+                kind: "rewind transaction",
+                message,
+            })?;
+        let bytes = serialize_bounded(journal, "rewind transaction", MAX_REWIND_TRANSACTION_BYTES)?;
+        atomic_write(&self.rewind_transaction_path(lease.id())?, &bytes)
+    }
+
+    pub(crate) fn clear_rewind_transaction_with_lease(
+        &self,
+        lease: &SessionLease,
+    ) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        let path = self.rewind_transaction_path(lease.id())?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_at(&path, error)),
+        }
     }
 
     pub fn legacy_path(&self, id: &str) -> SessionResult<PathBuf> {
@@ -2692,6 +2758,7 @@ impl SessionManager {
             self.snapshot_path(id)?,
             self.inflight_path(id)?,
             self.rewind_path(id)?,
+            self.rewind_transaction_path(id)?,
             self.meta_path(id)?,
             self.jsonl_path(id)?,
             self.presentation_path(id)?,
@@ -2975,7 +3042,9 @@ fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
             };
             let direct_sidecar_id = name
                 .strip_suffix(".snapshot")
-                .or_else(|| name.strip_suffix(".jsonl"));
+                .or_else(|| name.strip_suffix(".jsonl"))
+                .or_else(|| name.strip_suffix(".rewind.txn.json"))
+                .or_else(|| name.strip_suffix(".rewind.json"));
             if let Some(id) = direct_sidecar_id {
                 match file_entry.file_type() {
                     Ok(file_type) if file_type.is_file() => {}
@@ -5182,6 +5251,51 @@ mod tests {
     }
 
     #[test]
+    fn catalog_treats_rewind_json_files_as_native_sidecars_not_legacy_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        let manager = SessionManager::with_root(&bucket);
+        let id = "rewind-catalog";
+        manager
+            .write_meta(&SessionMeta::new(id, "/project", 1))
+            .unwrap();
+        manager
+            .save_rewind_ledger(
+                id,
+                &super::super::rewind::RewindLedger {
+                    version: super::super::rewind::LEDGER_VERSION,
+                    points: Vec::new(),
+                },
+            )
+            .unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        manager
+            .save_rewind_transaction_with_lease(
+                &lease,
+                &super::super::rewind::RewindTransactionJournal {
+                    version: super::super::rewind::TRANSACTION_VERSION,
+                    previous_points: Vec::new(),
+                    retained_points: Vec::new(),
+                    recovery_tree: None,
+                    restored_files: Vec::new(),
+                    target_snapshot: None,
+                    committed: false,
+                },
+            )
+            .unwrap();
+
+        let scan = SessionManager::scan_catalog(root.path());
+
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].id, id);
+        assert!(
+            scan.diagnostics.is_empty(),
+            "rewind sidecars must not be parsed as legacy session JSON: {:?}",
+            scan.diagnostics
+        );
+    }
+
+    #[test]
     fn catalog_lookup_rejects_exact_and_prefix_ambiguity_across_buckets() {
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("1111111111111111");
@@ -5298,11 +5412,25 @@ mod tests {
             .unwrap();
 
         let lease = mgr.acquire_lease("s1").unwrap();
+        mgr.save_rewind_transaction_with_lease(
+            &lease,
+            &super::super::rewind::RewindTransactionJournal {
+                version: super::super::rewind::TRANSACTION_VERSION,
+                previous_points: Vec::new(),
+                retained_points: Vec::new(),
+                recovery_tree: None,
+                restored_files: Vec::new(),
+                target_snapshot: None,
+                committed: false,
+            },
+        )
+        .unwrap();
         mgr.delete(&lease).unwrap();
         assert!(!mgr.meta_path("s1").unwrap().exists());
         assert!(!mgr.snapshot_path("s1").unwrap().exists());
         assert!(!mgr.jsonl_path("s1").unwrap().exists());
         assert!(!mgr.presentation_path("s1").unwrap().exists());
+        assert!(!mgr.rewind_transaction_path("s1").unwrap().exists());
         // Idempotent: deleting again is fine.
         mgr.delete(&lease).unwrap();
     }

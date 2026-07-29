@@ -23,7 +23,7 @@ pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod ui_event;
 pub(crate) mod usage_monitor;
-use commands::{dispatch_undo, execute_slash_command, format_rate_limited_line};
+use commands::{execute_slash_command, format_rate_limited_line};
 pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
@@ -1865,6 +1865,17 @@ enum ReadyRuntimeRequest {
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
+    RewindCatalog {
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    Rewind {
+        catalog: atomcode_coding::RewindCatalog,
+        turn_id: u64,
+        scope: atomcode_coding::RewindScope,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
     ContextStats {
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
@@ -1966,6 +1977,8 @@ impl ReadyRuntimeControl {
             ReadyRuntimeRequest::Dispatch(command) => self.handle.accepts(command),
             ReadyRuntimeRequest::Compact(_)
             | ReadyRuntimeRequest::Undo { .. }
+            | ReadyRuntimeRequest::RewindCatalog { .. }
+            | ReadyRuntimeRequest::Rewind { .. }
             | ReadyRuntimeRequest::ContextStats { .. }
             | ReadyRuntimeRequest::RestoreSnapshot { .. }
             | ReadyRuntimeRequest::ResumeSession { .. }
@@ -2031,6 +2044,34 @@ impl ReadyRuntimeControl {
                         &event_tx,
                         runtime_id,
                         CodingRuntimeEvent::UndoFinished(result),
+                    );
+                }
+                ReadyRuntimeRequest::RewindCatalog {
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.rewind_points().await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::RewindCatalogRefreshed(result),
+                    );
+                }
+                ReadyRuntimeRequest::Rewind {
+                    catalog,
+                    turn_id,
+                    scope,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self
+                        .handle
+                        .rewind_from_catalog(catalog, turn_id, scope)
+                        .await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::RewindFinished(result),
                     );
                 }
                 ReadyRuntimeRequest::ContextStats {
@@ -2167,9 +2208,7 @@ impl DeferredRuntimeControl {
         }
     }
 
-    fn provider_unavailable_reason(
-        &self,
-    ) -> Option<atomcode_coding::ProviderUnavailableReason> {
+    fn provider_unavailable_reason(&self) -> Option<atomcode_coding::ProviderUnavailableReason> {
         match &*self.state.borrow() {
             atomcode_coding::DeferredRuntimeState::Ready(handle) => {
                 handle.provider_unavailable_reason()
@@ -2340,9 +2379,7 @@ impl RuntimeControl {
         }
     }
 
-    fn provider_unavailable_reason(
-        &self,
-    ) -> Option<atomcode_coding::ProviderUnavailableReason> {
+    fn provider_unavailable_reason(&self) -> Option<atomcode_coding::ProviderUnavailableReason> {
         match self {
             Self::Ready(ready) => ready.handle.provider_unavailable_reason(),
             Self::Deferred(deferred) => deferred.provider_unavailable_reason(),
@@ -2443,6 +2480,40 @@ impl RuntimeControl {
             Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
                 deferred.send(atomcode_coding::DriverCommand::RefreshContextStats)
             }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn refresh_rewind_catalog(
+        &self,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::RewindCatalog {
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn rewind(
+        &self,
+        catalog: atomcode_coding::RewindCatalog,
+        turn_id: u64,
+        scope: atomcode_coding::RewindScope,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::Rewind {
+                catalog,
+                turn_id,
+                scope,
+                runtime_id,
+                event_tx,
+            }),
             Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
     }
@@ -3264,6 +3335,11 @@ pub struct LoopCtx {
         std::path::PathBuf,
         Result<Vec<crate::session::SessionMeta>, String>,
     )>,
+    /// Runtime-owned Rewind points loaded after the double-Esc gesture. The
+    /// main loop installs the modal because this event handler does not own
+    /// `App::active_modal`.
+    pub(crate) pending_rewind_catalog:
+        Option<Result<atomcode_coding::RewindCatalog, atomcode_coding::RuntimeError>>,
     /// Fresh-session and directory transitions accepted by CodingRuntime but
     /// not yet committed. The input buffer remains authoritative while this is set.
     pub(crate) pending_session_transition: Option<PendingSessionTransition>,
@@ -8001,6 +8077,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
         drain_foreground_replay_events(&mut app, &mut ctx, renderer);
         install_pending_session_picker(&mut app, &mut ctx, renderer);
+        install_pending_rewind_modal(&mut app, &mut ctx, renderer);
 
         // ── Fixed-interval /loop decision (turn-completion driven) ──
         // Runs after EVERY select! wakeup, so it sees both edges that matter:
@@ -9041,11 +9118,7 @@ fn desired_config_from_snapshot_parts(
     }
 }
 
-fn desired_config_from_snapshot(
-    ctx: &LoopCtx,
-    persisted: Config,
-    manual_reload: bool,
-) -> Config {
+fn desired_config_from_snapshot(ctx: &LoopCtx, persisted: Config, manual_reload: bool) -> Config {
     desired_config_from_snapshot_parts(
         &ctx.config,
         ctx.provider_selection_mode,
@@ -10736,7 +10809,27 @@ fn handle_idle_key(
             EmptyEscIntercept::TriggerUndo => {
                 app.exit_pending = None;
                 app.esc_undo_last_at = Some(now);
-                dispatch_undo("", &app.state, ctx, renderer);
+                renderer.render(UiLine::CommandOutput(
+                    match crate::i18n::current_locale() {
+                        crate::i18n::Locale::ZhCn => "正在加载回退点…",
+                        crate::i18n::Locale::En => "Loading Rewind points…",
+                    }
+                    .to_string(),
+                ));
+                renderer.flush();
+                if let Err(error) = ctx
+                    .runtime
+                    .refresh_rewind_catalog(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
+                {
+                    renderer.render(UiLine::Error(format!(
+                        "{}: {error}",
+                        match crate::i18n::current_locale() {
+                            crate::i18n::Locale::ZhCn => "暂时无法打开回退",
+                            crate::i18n::Locale::En => "Rewind is unavailable",
+                        }
+                    )));
+                    renderer.flush();
+                }
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
@@ -10746,9 +10839,7 @@ fn handle_idle_key(
     // F2 / Shift+F2: cycle through configured providers in stable model-list
     // order. This idle-path handler runs after modal dispatch, so it cannot
     // mutate a running turn or steal F2 from an active picker.
-    if let Some(direction) =
-        crate::modals::model_picker::model_cycle_direction(code, modifiers)
-    {
+    if let Some(direction) = crate::modals::model_picker::model_cycle_direction(code, modifiers) {
         if let Some(provider) =
             crate::modals::model_picker::adjacent_provider(&ctx.config, direction)
         {
@@ -11241,7 +11332,9 @@ fn handle_idle_key(
                             // to a CodingPlan-managed provider, gated by a 15-min
                             // cooldown so rapid-fire messages don't spam the API.
                             // Non-CodingPlan users skip entirely (zero network).
-                            if monitor::is_codingplan_provider(&resolved_provider_and_model(&ctx.config).0) {
+                            if monitor::is_codingplan_provider(
+                                &resolved_provider_and_model(&ctx.config).0,
+                            ) {
                                 let cooled = ctx
                                     .monitor_last_check_at
                                     .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
@@ -11270,9 +11363,7 @@ fn handle_idle_key(
                                 )
                                 | None => crate::i18n::Msg::CmdProviderUnavailable,
                             };
-                            renderer.render(UiLine::Error(
-                                crate::i18n::t(message).into_owned(),
-                            ));
+                            renderer.render(UiLine::Error(crate::i18n::t(message).into_owned()));
                             // Commit cleared the input buffer before dispatch. Render that
                             // empty prompt so the retained renderer does not keep displaying
                             // the pre-commit text after the synchronous rejection.
@@ -13274,7 +13365,9 @@ fn classify_tui_user_input(payload: serde_json::Value) -> TuiUserInputPresentati
     {
         let requests = questions
             .iter()
-            .filter_map(|question| serde_json::from_value::<UserInputRequest>(question.clone()).ok())
+            .filter_map(|question| {
+                serde_json::from_value::<UserInputRequest>(question.clone()).ok()
+            })
             .collect::<Vec<_>>();
         return if requests.is_empty() {
             TuiUserInputPresentation::Invalid
@@ -15251,51 +15344,49 @@ fn update_subtask_progress(
     let started = parts
         .first()
         .is_some_and(|part| part.starts_with("\u{21bb} "));
-    let (label, model, activity, status) = if parts
-        .first()
-        .is_some_and(|part| *part == "\u{25cb} queued")
-    {
-        (
-            parts.get(1).copied().unwrap_or_default(),
-            parts.get(2).copied(),
-            Some("waiting"),
-            SubtaskStatus::Pending,
-        )
-    } else if let Some(label) = parts
-        .first()
-        .and_then(|part| part.strip_prefix("\u{21bb} "))
-    {
-        (
-            label,
-            parts.get(1).copied(),
-            Some("running"),
-            SubtaskStatus::Running,
-        )
-    } else if parts.first().is_some_and(|part| *part == "\u{2713} done") {
-        (
-            parts.get(1).copied().unwrap_or_default(),
-            parts.get(2).copied(),
-            Some("completed"),
-            SubtaskStatus::Completed,
-        )
-    } else if parts
-        .first()
-        .is_some_and(|part| part.starts_with("\u{2717} failed"))
-    {
-        (
-            parts.get(1).copied().unwrap_or_default(),
-            parts.get(2).copied(),
-            parts.first().copied(),
-            SubtaskStatus::Failed,
-        )
-    } else {
-        (
-            parts.first().copied().unwrap_or_default(),
-            None,
-            parts.get(1).copied(),
-            SubtaskStatus::Running,
-        )
-    };
+    let (label, model, activity, status) =
+        if parts.first().is_some_and(|part| *part == "\u{25cb} queued") {
+            (
+                parts.get(1).copied().unwrap_or_default(),
+                parts.get(2).copied(),
+                Some("waiting"),
+                SubtaskStatus::Pending,
+            )
+        } else if let Some(label) = parts
+            .first()
+            .and_then(|part| part.strip_prefix("\u{21bb} "))
+        {
+            (
+                label,
+                parts.get(1).copied(),
+                Some("running"),
+                SubtaskStatus::Running,
+            )
+        } else if parts.first().is_some_and(|part| *part == "\u{2713} done") {
+            (
+                parts.get(1).copied().unwrap_or_default(),
+                parts.get(2).copied(),
+                Some("completed"),
+                SubtaskStatus::Completed,
+            )
+        } else if parts
+            .first()
+            .is_some_and(|part| part.starts_with("\u{2717} failed"))
+        {
+            (
+                parts.get(1).copied().unwrap_or_default(),
+                parts.get(2).copied(),
+                parts.first().copied(),
+                SubtaskStatus::Failed,
+            )
+        } else {
+            (
+                parts.first().copied().unwrap_or_default(),
+                None,
+                parts.get(1).copied(),
+                SubtaskStatus::Running,
+            )
+        };
 
     let Some(item) = progress.items.iter_mut().find(|item| item.label == label) else {
         return None;
@@ -15324,20 +15415,19 @@ fn update_subtask_progress(
     {
         item.output_tokens = item.output_tokens.max(tokens);
     }
-    let terminal_line =
-        if matches!(status, SubtaskStatus::Completed | SubtaskStatus::Failed) {
-            let elapsed = item
-                .started_at
-                .map(|started_at| started_at.elapsed())
-                .unwrap_or_default();
-            Some(format!(
-                "{chunk} \u{b7} {} \u{b7} \u{2191} {} tokens",
-                crate::render::fmt_dur(elapsed),
-                crate::i18n::fmt_tokens(item.output_tokens as usize)
-            ))
-        } else {
-            None
-        };
+    let terminal_line = if matches!(status, SubtaskStatus::Completed | SubtaskStatus::Failed) {
+        let elapsed = item
+            .started_at
+            .map(|started_at| started_at.elapsed())
+            .unwrap_or_default();
+        Some(format!(
+            "{chunk} \u{b7} {} \u{b7} \u{2191} {} tokens",
+            crate::render::fmt_dur(elapsed),
+            crate::i18n::fmt_tokens(item.output_tokens as usize)
+        ))
+    } else {
+        None
+    };
     progress.completed = progress
         .items
         .iter()
@@ -15356,8 +15446,7 @@ fn task_output_has_error_state(output: &str) -> bool {
             let header = line.trim();
             if header.starts_with("<task id=\"")
                 && header.contains("\" model=\"")
-                && (header.ends_with(" state=\"error\">")
-                    || header.ends_with(" state=\"failed\">"))
+                && (header.ends_with(" state=\"error\">") || header.ends_with(" state=\"failed\">"))
             {
                 return true;
             }
@@ -15425,14 +15514,17 @@ mod subtask_progress_projection_tests {
     fn approval_defers_only_structured_retained_task_rows() {
         let args = r#"{"tasks":[{"subagent_type":"worker","description":"edit","prompt":"p","scope":["src/**"]}]}"#;
 
-        assert!(should_defer_task_approval_row("task", "call-7", args, false));
-        assert!(!should_defer_task_approval_row("task", "call-7", args, true));
-        assert!(!should_defer_task_approval_row("bash", "call-7", args, false));
+        assert!(should_defer_task_approval_row(
+            "task", "call-7", args, false
+        ));
         assert!(!should_defer_task_approval_row(
-            "task",
-            "call-7",
-            "{invalid",
-            false
+            "task", "call-7", args, true
+        ));
+        assert!(!should_defer_task_approval_row(
+            "bash", "call-7", args, false
+        ));
+        assert!(!should_defer_task_approval_row(
+            "task", "call-7", "{invalid", false
         ));
     }
 
@@ -15525,7 +15617,10 @@ mod subtask_progress_projection_tests {
             .is_none(),
             "replayed failures must not duplicate scrollback"
         );
-        assert_eq!(progress.completed, 1, "failed is finished but not completed");
+        assert_eq!(
+            progress.completed, 1,
+            "failed is finished but not completed"
+        );
     }
 
     #[test]
@@ -16109,6 +16204,44 @@ fn install_pending_session_picker(app: &mut App, ctx: &mut LoopCtx, renderer: &m
     }
 }
 
+fn install_pending_rewind_modal(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    if ctx.pending_rewind_catalog.is_none() || app.active_modal.is_some() {
+        return;
+    }
+    match ctx
+        .pending_rewind_catalog
+        .take()
+        .expect("pending rewind catalog checked Some above")
+    {
+        Ok(catalog) if catalog.points.is_empty() => {
+            renderer.render(UiLine::CommandOutput(
+                match crate::i18n::current_locale() {
+                    crate::i18n::Locale::ZhCn => "当前会话还没有可回退的回合。",
+                    crate::i18n::Locale::En => "This session has no Rewind points yet.",
+                }
+                .to_string(),
+            ));
+            renderer.flush();
+        }
+        Ok(catalog) => {
+            let modal: Box<dyn crate::modals::Modal> =
+                Box::new(crate::modals::RewindModal::open(catalog));
+            modal.draw(&app.buf, &app.state, ctx, renderer);
+            app.active_modal = Some(modal);
+        }
+        Err(error) => {
+            renderer.render(UiLine::Error(format!(
+                "{}: {error}",
+                match crate::i18n::current_locale() {
+                    crate::i18n::Locale::ZhCn => "加载回退点失败",
+                    crate::i18n::Locale::En => "Failed to load Rewind points",
+                }
+            )));
+            renderer.flush();
+        }
+    }
+}
+
 fn drain_foreground_replay_events(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     while let Some(event) = ctx.foreground_replay_events.pop_front() {
         handle_runtime_event(
@@ -16605,6 +16738,28 @@ fn handle_runtime_event(
                         }) => handle_undo_failure(requested, available, renderer),
                         Err(error) => {
                             renderer.render(UiLine::Error(format!("undo failed: {error}")));
+                            renderer.flush();
+                        }
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::RewindCatalogRefreshed(result) => {
+                    ctx.pending_rewind_catalog = Some(result);
+                    return;
+                }
+                CodingRuntimeEvent::RewindFinished(result) => {
+                    match result {
+                        Ok(result) => {
+                            handle_rewind_success(result, state, renderer, ctx, buf);
+                        }
+                        Err(error) => {
+                            renderer.render(UiLine::Error(format!(
+                                "{}: {error}",
+                                match crate::i18n::current_locale() {
+                                    crate::i18n::Locale::ZhCn => "回退失败",
+                                    crate::i18n::Locale::En => "Rewind failed",
+                                }
+                            )));
                             renderer.flush();
                         }
                     }
@@ -17512,6 +17667,70 @@ fn handle_undo_success(
     state.on_turn_complete();
 }
 
+fn handle_rewind_success(
+    result: atomcode_coding::RewindResult,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+    buf: &mut Buffer,
+) {
+    let restored_conversation = matches!(
+        result.scope,
+        atomcode_coding::RewindScope::Conversation
+            | atomcode_coding::RewindScope::ConversationAndCode
+    );
+    if restored_conversation {
+        let new_len = result.snapshot.messages.len();
+        commands::stop_active_loop(state, ctx);
+        ctx.current_session
+            .update_from_conversation_snapshot(result.snapshot.as_ref().clone());
+        ctx.current_session.retain_turn_stats_after_undo(new_len);
+        ctx.current_session.touch();
+        ctx.bg_manager
+            .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
+        crate::modals::session_picker::replay_session(renderer, state, &ctx.current_session, true);
+        if let Some(prompt) = result.restored_prompt {
+            buf.set_restored_text(prompt);
+        }
+    }
+
+    let scope = match (crate::i18n::current_locale(), result.scope) {
+        (crate::i18n::Locale::ZhCn, atomcode_coding::RewindScope::Conversation) => "对话",
+        (crate::i18n::Locale::ZhCn, atomcode_coding::RewindScope::Code) => "代码",
+        (crate::i18n::Locale::ZhCn, atomcode_coding::RewindScope::ConversationAndCode) => {
+            "对话和代码"
+        }
+        (crate::i18n::Locale::En, atomcode_coding::RewindScope::Conversation) => "conversation",
+        (crate::i18n::Locale::En, atomcode_coding::RewindScope::Code) => "code",
+        (crate::i18n::Locale::En, atomcode_coding::RewindScope::ConversationAndCode) => {
+            "conversation and code"
+        }
+    };
+    let message = match crate::i18n::current_locale() {
+        crate::i18n::Locale::ZhCn => format!(
+            "↩ 已将{scope}回退到“{}”之前{}。",
+            result.point.prompt_preview,
+            if result.restored_files.is_empty() {
+                String::new()
+            } else {
+                format!("（恢复 {} 个文件）", result.restored_files.len())
+            }
+        ),
+        crate::i18n::Locale::En => format!(
+            "↩ Rewound {scope} to before “{}”{}.",
+            result.point.prompt_preview,
+            if result.restored_files.is_empty() {
+                String::new()
+            } else {
+                format!(" (restored {} files)", result.restored_files.len())
+            }
+        ),
+    };
+    renderer.render(UiLine::CommandOutput(message));
+    renderer.flush();
+    state.on_turn_complete();
+}
+
 fn handle_undo_failure(requested: usize, available: usize, renderer: &mut dyn Renderer) {
     let line = if available == 0 {
         crate::i18n::t(crate::i18n::Msg::CmdUndoNoTurns).into_owned()
@@ -17585,9 +17804,8 @@ fn handle_coding_runtime_event(
                     // itself before running and remains visible even when replacing
                     // one message with one summary produces zero net removals.
                     // Manual and overflow paths retain their existing feedback.
-                    let silent_tool_fold =
-                        matches!(&outcome.trigger, CompactTrigger::Auto { .. })
-                            && !compaction_was_announced;
+                    let silent_tool_fold = matches!(&outcome.trigger, CompactTrigger::Auto { .. })
+                        && !compaction_was_announced;
                     if mirror_persisted && !silent_tool_fold {
                         renderer.render(UiLine::CompactionMark(
                             atomcode_config::i18n::format_compaction_mark(
@@ -17647,9 +17865,7 @@ fn handle_coding_runtime_event(
         }
         CodingRuntimeEvent::ProviderUnavailable { reason, .. } => {
             if let Some(message) = provider_unavailable_announcement(reason) {
-                renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(message).into_owned(),
-                ));
+                renderer.render(UiLine::CommandOutput(crate::i18n::t(message).into_owned()));
                 renderer.flush();
             }
         }
@@ -18586,10 +18802,7 @@ fn handle_agent_event(
                 // The approval panel already names the Task being approved.
                 // Keep its transcript row deferred so ToolCallResult can append
                 // exactly one permanent `Task(... completed · duration)` row.
-                pending_tools.insert(
-                    call.id.clone(),
-                    (display.clone(), detail.clone(), false),
-                );
+                pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), false));
             } else if let Some(entry) = pending_tools.get_mut(&call.id) {
                 let (disp, det, rendered) = entry;
                 if *rendered {
@@ -20209,9 +20422,10 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             crate::i18n::t(crate::i18n::Msg::StatusRuntimeUnavailable).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
-    } else if let Some(warning) = monitor::is_codingplan_provider(&resolved_provider_and_model(&ctx.config).0)
-        .then(|| ctx.monitor_warning.lock().ok().and_then(|g| g.clone()))
-        .flatten()
+    } else if let Some(warning) =
+        monitor::is_codingplan_provider(&resolved_provider_and_model(&ctx.config).0)
+            .then(|| ctx.monitor_warning.lock().ok().and_then(|g| g.clone()))
+            .flatten()
     {
         // Only surface the CodingPlan drift warning while a CodingPlan-managed
         // (AtomGit*) provider is active. A warning set on an AtomGit provider
@@ -20341,11 +20555,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // last turn) instead of cumulative `total_tokens` because the user
     // cares about "how close to overflow am I", not "how many tokens
     // has this session burned in total". See render::StatusLine docs.
-    let (ctx_used, ctx_window) = status_context_usage(
-        state,
-        ctx.config.default_context_window(),
-        !no_provider,
-    );
+    let (ctx_used, ctx_window) =
+        status_context_usage(state, ctx.config.default_context_window(), !no_provider);
     // Session-name badge: surfaced only when the user has explicitly
     // renamed the conversation. Auto-named sessions (default /
     // session-* / first-message-derived) intentionally stay badge-less
@@ -20479,10 +20690,9 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         subtasks: state.active_subtasks.clone(),
         approval,
         user_input,
-        round_cap_panel: state
-            .round_cap_panel
-            .as_ref()
-            .map(|p| crate::render::round_cap_view(p.cap, p.base, p.cursor, &round_cap_stats(state))),
+        round_cap_panel: state.round_cap_panel.as_ref().map(|p| {
+            crate::render::round_cap_view(p.cap, p.base, p.cursor, &round_cap_stats(state))
+        }),
     }
 }
 
@@ -21651,9 +21861,8 @@ fn persist_reasoning_effort(ctx: &mut LoopCtx) {
     ctx.config
         .update_selection_reasoning(&selection, |r| *r.reasoning_effort = effort.clone());
     match ctx.config_store.update(|config| {
-        if !config.update_selection_reasoning(&selection, |r| {
-            *r.reasoning_effort = effort.clone()
-        }) {
+        if !config.update_selection_reasoning(&selection, |r| *r.reasoning_effort = effort.clone())
+        {
             anyhow::bail!("provider {selection:?} not found");
         }
         Ok(())
@@ -22244,9 +22453,7 @@ mod format_shell_command_tests {
 
 #[cfg(test)]
 mod user_input_mode_tests {
-    use super::{
-        classify_tui_user_input, round_cap_should_auto_stop, TuiUserInputPresentation,
-    };
+    use super::{classify_tui_user_input, round_cap_should_auto_stop, TuiUserInputPresentation};
     use crate::state::AgentMode;
 
     #[test]
@@ -22302,11 +22509,7 @@ mod user_input_mode_tests {
     #[test]
     fn auto_mode_still_stops_round_cap_fail_closed() {
         assert!(round_cap_should_auto_stop(AgentMode::Auto));
-        for mode in [
-            AgentMode::Build,
-            AgentMode::Plan,
-            AgentMode::AcceptEdits,
-        ] {
+        for mode in [AgentMode::Build, AgentMode::Plan, AgentMode::AcceptEdits] {
             assert!(!round_cap_should_auto_stop(mode));
         }
     }
@@ -22352,7 +22555,10 @@ mod round_cap_key_tests {
     fn round_cap_enter_on_stop_chosen_continue_is_false() {
         let mut panel = RoundCapPanel::new(9, 200, 200);
         panel.move_down(); // cursor → 1 (stop)
-        assert!(!panel.chosen_continue(), "cursor=1 must map to chosen_continue()=false");
+        assert!(
+            !panel.chosen_continue(),
+            "cursor=1 must map to chosen_continue()=false"
+        );
     }
 
     /// Enter honors the cursor: cursor=0 (continue) → Some(true),
@@ -22416,8 +22622,11 @@ mod round_cap_key_tests {
     fn round_cap_move_up_clamps_to_continue() {
         let mut p = RoundCapPanel::new(7, 100, 100);
         p.move_down(); // cursor → 1
-        p.move_up();   // cursor → 0
-        assert!(p.chosen_continue(), "move_up brings cursor back to 'continue'");
+        p.move_up(); // cursor → 0
+        assert!(
+            p.chosen_continue(),
+            "move_up brings cursor back to 'continue'"
+        );
         p.move_up(); // clamped: cursor stays 0
         assert!(p.chosen_continue(), "move_up at 0 is idempotent");
     }

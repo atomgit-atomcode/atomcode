@@ -781,6 +781,10 @@ impl CodingParts {
         self.snapshot_persistence_status.clone()
     }
 
+    pub(crate) fn snapshot_hook(&self) -> Option<Arc<SnapshotHook>> {
+        self.snapshot_hook.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn report_snapshot_persistence_uncertain(&mut self, message: impl Into<String>) {
         self.snapshot_persistence_status

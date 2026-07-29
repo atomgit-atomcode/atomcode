@@ -248,9 +248,7 @@ pub async fn resume_session(
         _ => crate::legacy_convert::prepare_catalog_session_resume_any_project(&session_id)
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?
             .ok_or_else(|| {
-                HubError::RuntimeRejected(format!(
-                    "session {session_id:?} not found in catalog"
-                ))
+                HubError::RuntimeRejected(format!("session {session_id:?} not found in catalog"))
             })?,
     };
     let target_dir = PathBuf::from(&prepared.view.meta.working_dir);

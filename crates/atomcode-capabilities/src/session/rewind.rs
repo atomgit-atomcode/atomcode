@@ -6,6 +6,7 @@
 //! repository: this keeps ignore semantics predictable and lets the UI fail
 //! closed instead of pretending arbitrary filesystem side effects are reversible.
 
+use atomcode_kernel::message::SessionSnapshot;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -18,6 +19,7 @@ use std::sync::{Mutex, MutexGuard};
 
 const STORE_VERSION: &str = "atomcode-rewind-v1";
 pub(crate) const LEDGER_VERSION: u32 = 1;
+pub(crate) const TRANSACTION_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RewindLedger {
@@ -80,6 +82,11 @@ pub enum WorkspaceCheckpointError {
     },
     InvalidPath(String),
     Conflicts(Vec<String>),
+    Persistence(String),
+    Compensation {
+        operation: String,
+        compensation: String,
+    },
 }
 
 impl fmt::Display for WorkspaceCheckpointError {
@@ -89,6 +96,11 @@ impl fmt::Display for WorkspaceCheckpointError {
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Git { operation, stderr } => write!(f, "{operation} failed: {stderr}"),
             Self::InvalidPath(path) => write!(f, "unsafe workspace checkpoint path: {path}"),
+            Self::Persistence(message) => write!(f, "rewind ledger persistence failed: {message}"),
+            Self::Compensation {
+                operation,
+                compensation,
+            } => write!(f, "{operation}; rewind compensation failed: {compensation}"),
             Self::Conflicts(paths) => {
                 write!(
                     f,
@@ -108,6 +120,57 @@ pub struct WorkspaceRestoreReceipt {
     /// conversation-persistence failure.
     pub recovery_tree: String,
     pub restored_files: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceRestorePlan {
+    target_tree: String,
+    pub recovery_tree: String,
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RewindTransactionJournal {
+    pub version: u32,
+    pub previous_points: Vec<RewindPoint>,
+    pub retained_points: Vec<RewindPoint>,
+    pub recovery_tree: Option<String>,
+    pub restored_files: Vec<String>,
+    pub target_snapshot: Option<SessionSnapshot>,
+    pub committed: bool,
+}
+
+impl RewindTransactionJournal {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.version != TRANSACTION_VERSION {
+            return Err(format!(
+                "unsupported version {} (maximum {TRANSACTION_VERSION})",
+                self.version
+            ));
+        }
+        RewindLedger {
+            version: LEDGER_VERSION,
+            points: self.previous_points.clone(),
+        }
+        .validate()?;
+        RewindLedger {
+            version: LEDGER_VERSION,
+            points: self.retained_points.clone(),
+        }
+        .validate()?;
+        if !self.previous_points.starts_with(&self.retained_points) {
+            return Err("retained rewind points are not a prefix of previous points".into());
+        }
+        if let Some(tree) = self.recovery_tree.as_deref() {
+            validate_object_id(tree).map_err(|error| error.to_string())?;
+        } else if !self.restored_files.is_empty() {
+            return Err("restored files require a recovery tree".into());
+        }
+        for path in &self.restored_files {
+            validate_relative_path(path).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 pub struct WorkspaceCheckpoint {
@@ -218,12 +281,71 @@ impl WorkspaceCheckpoint {
                 return Err(WorkspaceCheckpointError::Conflicts(conflicts));
             }
             if let Err(error) = self.restore_files_locked(before, &files) {
-                let _ = self.restore_files_locked(&recovery_tree, &files);
+                if let Err(compensation) = self.restore_files_locked(&recovery_tree, &files) {
+                    return Err(WorkspaceCheckpointError::Compensation {
+                        operation: error.to_string(),
+                        compensation: compensation.to_string(),
+                    });
+                }
                 return Err(error);
             }
             Ok(WorkspaceRestoreReceipt {
                 recovery_tree,
                 restored_files: files,
+            })
+        })
+    }
+
+    /// Capture and validate a restore without changing the worktree. The caller
+    /// can durably persist the returned recovery tree before applying it.
+    pub(crate) fn prepare_restore(
+        &self,
+        before: &str,
+        after: &str,
+    ) -> Result<WorkspaceRestorePlan, WorkspaceCheckpointError> {
+        let _guard = self.guard();
+        self.with_process_lock(|| {
+            let recovery_tree = self.capture_locked()?;
+            let files = self.changed_files_locked(before, after)?;
+            let conflicts = self.conflicts_locked(after, &recovery_tree, &files)?;
+            if !conflicts.is_empty() {
+                return Err(WorkspaceCheckpointError::Conflicts(conflicts));
+            }
+            Ok(WorkspaceRestorePlan {
+                target_tree: before.to_string(),
+                recovery_tree,
+                files,
+            })
+        })
+    }
+
+    /// Apply a prepared restore only if affected files still match the recovery
+    /// tree captured by [`prepare_restore`](Self::prepare_restore).
+    pub(crate) fn apply_prepared_restore(
+        &self,
+        plan: &WorkspaceRestorePlan,
+    ) -> Result<WorkspaceRestoreReceipt, WorkspaceCheckpointError> {
+        let _guard = self.guard();
+        self.with_process_lock(|| {
+            let current = self.capture_locked()?;
+            let conflicts = self.conflicts_locked(&plan.recovery_tree, &current, &plan.files)?;
+            if !conflicts.is_empty() {
+                return Err(WorkspaceCheckpointError::Conflicts(conflicts));
+            }
+            if let Err(error) = self.restore_files_locked(&plan.target_tree, &plan.files) {
+                if let Err(compensation) =
+                    self.restore_files_locked(&plan.recovery_tree, &plan.files)
+                {
+                    return Err(WorkspaceCheckpointError::Compensation {
+                        operation: error.to_string(),
+                        compensation: compensation.to_string(),
+                    });
+                }
+                return Err(error);
+            }
+            Ok(WorkspaceRestoreReceipt {
+                recovery_tree: plan.recovery_tree.clone(),
+                restored_files: plan.files.clone(),
             })
         })
     }
@@ -242,30 +364,28 @@ impl WorkspaceCheckpoint {
         let _guard = self.guard();
         self.with_process_lock(|| {
             let mut wanted = BTreeSet::new();
+            let mut updates = Vec::new();
             for point in points {
                 validate_object_id(&point.before_tree)?;
                 validate_object_id(&point.after_tree)?;
                 let before_ref = format!("refs/atomcode/turn-{}/before", point.turn_id);
                 let after_ref = format!("refs/atomcode/turn-{}/after", point.turn_id);
-                self.run_owned([
-                    "update-ref".into(),
-                    before_ref.clone(),
-                    point.before_tree.clone(),
-                ])?;
-                self.run_owned([
-                    "update-ref".into(),
-                    after_ref.clone(),
-                    point.after_tree.clone(),
-                ])?;
+                updates.push(format!("update {before_ref} {}\n", point.before_tree));
+                updates.push(format!("update {after_ref} {}\n", point.after_tree));
                 wanted.insert(before_ref);
                 wanted.insert(after_ref);
             }
             let existing = self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])?;
             for reference in String::from_utf8_lossy(&existing.stdout).lines() {
                 if !reference.is_empty() && !wanted.contains(reference) {
-                    self.run_owned(["update-ref".into(), "-d".into(), reference.to_string()])?;
+                    updates.push(format!("delete {reference}\n"));
                 }
             }
+            let mut transaction = String::new();
+            for update in updates {
+                transaction.push_str(&update);
+            }
+            self.run_with_input(["update-ref", "--stdin"], transaction.as_bytes())?;
             Ok(())
         })
     }

@@ -83,10 +83,10 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use atomcode_auth as auth;
+use atomcode_capabilities::mcp::McpRegistry;
 use atomcode_capabilities::session::{SessionManager as NativeSessionManager, SessionStoreError};
 use atomcode_coding::CodingRuntimeEvent;
 use atomcode_config::config::Config;
-use atomcode_capabilities::mcp::McpRegistry;
 use atomcode_telemetry::detect_repo_origin;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
@@ -1378,15 +1378,33 @@ fn catalog_entry_with_project(
     }
 }
 
-fn active_catalog_location() -> Option<atomcode_capabilities::session::CatalogLocation> {
-    crate::native_live::binding().ok().map(|binding| {
-        atomcode_capabilities::session::CatalogLocation {
-            id: binding.session_id,
-            project_bucket:
-                atomcode_capabilities::session::SessionManager::project_hash(
-                    &binding.working_dir,
-                ),
-        }
+fn active_catalog_location(
+    entries: &[atomcode_capabilities::session::CatalogEntry],
+) -> Option<atomcode_capabilities::session::CatalogLocation> {
+    let binding = crate::native_live::binding().ok()?;
+    resolve_active_catalog_location(entries, &binding.session_id, &binding.working_dir)
+}
+
+fn resolve_active_catalog_location(
+    entries: &[atomcode_capabilities::session::CatalogEntry],
+    session_id: &str,
+    working_dir: &std::path::Path,
+) -> Option<atomcode_capabilities::session::CatalogLocation> {
+    let working_dir_key = atomcode_capabilities::pathnorm::path_case_key(working_dir);
+    let mut matches = entries.iter().filter(|entry| {
+        entry.id == session_id
+            && atomcode_capabilities::pathnorm::path_case_key(&entry.working_dir) == working_dir_key
+    });
+    let entry = matches.next()?;
+    // A logical working directory is not a physical catalog identity: resumed
+    // and imported sessions may live in a historical bucket. Fail closed on an
+    // ambiguous duplicate instead of manufacturing a bucket from the cwd.
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(atomcode_capabilities::session::CatalogLocation {
+        id: entry.id.clone(),
+        project_bucket: entry.project_bucket.clone(),
     })
 }
 
@@ -1433,7 +1451,8 @@ where
 
 /// List sessions for a project
 fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionSummary>> {
-    let active = active_catalog_location();
+    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root())?;
+    let active = active_catalog_location(&scan.entries);
     list_sessions_in_root(
         &NativeSessionManager::sessions_root(),
         project_hash,
@@ -1464,7 +1483,8 @@ fn list_sessions_in_root(
 
 /// List all sessions across all projects
 fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
-    let active = active_catalog_location();
+    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root())?;
+    let active = active_catalog_location(&scan.entries);
     list_all_sessions_in_root(&NativeSessionManager::sessions_root(), active.as_ref())
 }
 
@@ -2299,10 +2319,7 @@ fn delete_session_file(project_hash: &str, session_id: &str) -> anyhow::Result<(
 }
 
 fn valid_project_bucket(project_bucket: &str) -> bool {
-    project_bucket.len() == 16
-        && project_bucket
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
+    project_bucket.len() == 16 && project_bucket.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn delete_session_api_error(
@@ -2484,8 +2501,7 @@ async fn get_models() -> impl IntoResponse {
             model: p.model.clone(),
             provider_type: p.provider_type.clone(),
             is_default: name == &config.default_provider,
-            effort_applicable:
-                atomcode_capabilities::provider::reason_effort_applicable(&p.model),
+            effort_applicable: atomcode_capabilities::provider::reason_effort_applicable(&p.model),
             reasoning_effort: p.reasoning_effort.clone(),
         })
         .collect();
@@ -3757,8 +3773,7 @@ async fn process_chat_request(
         // conversation should still be resumable via /resume.
         {
             let conv = conversation.lock().await;
-            let snapshot =
-                atomcode_kernel::message::SessionSnapshot::new(conv.clone());
+            let snapshot = atomcode_kernel::message::SessionSnapshot::new(conv.clone());
             if let Err(e) = crate::legacy_convert::persist_pre_runtime_terminal(
                 &working_dir,
                 &session_id,
@@ -3791,7 +3806,8 @@ async fn process_chat_request(
         // Interactive approval: route /chat/permission decisions to the native runtime
         // request waiting for this turn.
         let perm_rx = if registered_permission_responder {
-            let (tx, rx) = mpsc::unbounded_channel::<atomcode_capabilities::tools::PermissionDecision>();
+            let (tx, rx) =
+                mpsc::unbounded_channel::<atomcode_capabilities::tools::PermissionDecision>();
             pending_permissions.register(perm_session_key.clone(), tx);
             Some(rx)
         } else {
@@ -3949,9 +3965,11 @@ async fn chat_permission(
             let reg = state.mcp_registry.read().await.clone();
             if let Some((server, tool)) = reg.split_tool_name(full).await {
                 let project_dir = state.project.read().await.working_dir.clone();
-                if let Err(e) =
-                    atomcode_capabilities::mcp::config::add_auto_approved_tool(&project_dir, &server, &tool)
-                {
+                if let Err(e) = atomcode_capabilities::mcp::config::add_auto_approved_tool(
+                    &project_dir,
+                    &server,
+                    &tool,
+                ) {
                     tracing::warn!("[permission] persist autoApprove failed: {e}");
                 }
                 reg.mark_tool_auto_approved(full);
@@ -6168,9 +6186,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project_bucket = "0123456789abcdef";
         let session_id = "running-first-turn";
-        let manager = std::sync::Arc::new(SessionManager::with_root(
-            tmp.path().join(project_bucket),
-        ));
+        let manager =
+            std::sync::Arc::new(SessionManager::with_root(tmp.path().join(project_bucket)));
         let lease = manager.acquire_lease(session_id).unwrap();
         let mut meta = SessionMeta::new(session_id, "/project", 1);
         meta.owner = StorageOwner::Native;
@@ -6183,8 +6200,7 @@ mod tests {
             )
             .unwrap();
 
-        let hook =
-            SnapshotHook::new(manager.clone(), session_id, "/project").with_lease(lease);
+        let hook = SnapshotHook::new(manager.clone(), session_id, "/project").with_lease(lease);
         let mut conversation = Conversation::default();
         conversation.push(Message::user("正在执行的首轮任务"));
         hook.turn_start(&mut conversation).await;
@@ -6215,10 +6231,38 @@ mod tests {
             project_bucket: project_bucket.into(),
         };
 
-        let sessions =
-            list_sessions_in_root(tmp.path(), project_bucket, Some(&active)).unwrap();
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, Some(&active)).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "active-empty");
+    }
+
+    #[test]
+    fn active_catalog_identity_uses_the_physical_historical_bucket() {
+        use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
+
+        let working_dir = std::path::PathBuf::from("/project/current-name");
+        let historical_bucket = "0123456789abcdef";
+        assert_ne!(
+            historical_bucket,
+            atomcode_capabilities::session::SessionManager::project_hash(&working_dir)
+        );
+        let entry = CatalogEntry {
+            id: "resumed-session".into(),
+            name: "resumed".into(),
+            fork_root_id: None,
+            project_bucket: historical_bucket.into(),
+            working_dir: working_dir.clone(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            message_count: 0,
+            turn_count: 0,
+            presence: CatalogPresence::NativeOnly,
+        };
+
+        let location =
+            resolve_active_catalog_location(&[entry], "resumed-session", &working_dir).unwrap();
+
+        assert_eq!(location.project_bucket, historical_bucket);
     }
 
     #[test]
@@ -6263,10 +6307,9 @@ mod tests {
         let project_bucket = "0123456789abcdef";
         let project = tmp.path().join(project_bucket);
         std::fs::create_dir_all(&project).unwrap();
-        let mut legacy: serde_json::Value = serde_json::from_slice(include_bytes!(
-            "../tests/fixtures/session/legacy_full.json"
-        ))
-        .unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/session/legacy_full.json"))
+                .unwrap();
         let session_id = legacy["id"].as_str().unwrap().to_string();
         legacy["name"] = serde_json::Value::String(format!("session-{session_id}"));
         legacy["user_renamed"] = serde_json::Value::Bool(false);
@@ -6762,11 +6805,20 @@ mod tests {
         ];
         attach_image_sets(&mut messages, vec![vec![real("A")], vec![real("B")]]);
 
-        assert_eq!(messages[0].images.as_ref().unwrap()[0].data, "A", "1st placeholder → 1st set");
-        assert!(messages[1].images.is_none(), "assistant untouched");
-        assert_eq!(messages[2].images.as_ref().unwrap()[0].data, "B", "2nd placeholder → 2nd set");
         assert_eq!(
-            messages[3].images.as_ref().unwrap()[0].data, "keep-me",
+            messages[0].images.as_ref().unwrap()[0].data,
+            "A",
+            "1st placeholder → 1st set"
+        );
+        assert!(messages[1].images.is_none(), "assistant untouched");
+        assert_eq!(
+            messages[2].images.as_ref().unwrap()[0].data,
+            "B",
+            "2nd placeholder → 2nd set"
+        );
+        assert_eq!(
+            messages[3].images.as_ref().unwrap()[0].data,
+            "keep-me",
             "a real image is never overwritten"
         );
     }
@@ -6976,5 +7028,4 @@ mod channel_mode_tests {
         assert!(!approval_mode_requires_responder(ApprovalMode::Auto));
         assert!(!approval_mode_requires_responder(ApprovalMode::Plan));
     }
-
 }

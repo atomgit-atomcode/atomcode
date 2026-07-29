@@ -30,6 +30,7 @@ pub mod plugin_manager;
 pub mod provider_panel;
 pub mod proxy_picker;
 mod qr;
+pub mod rewind;
 pub mod session_picker;
 pub mod usage;
 pub mod usage_render;
@@ -42,6 +43,7 @@ pub use onboarding_wizard::OnboardingWizard;
 pub use plugin_manager::PluginManager;
 pub use provider_panel::ProviderPanel;
 pub use proxy_picker::ProxyPicker;
+pub use rewind::RewindModal;
 pub use session_picker::SessionPicker;
 
 /// Render one tab-bar chip with palette-independent styling, shared by every
