@@ -1607,13 +1607,16 @@ fn get_directory_modified_date(name: &str) -> String {
     "unknown".to_string()
 }
 
+/// Display-column budget for a plugin description rendered on one line
+/// (includes the trailing `…` column when truncation happens).
+const PLUGIN_DESC_DISPLAY_COLS: usize = 60;
+
 /// Truncate a plugin description for single-line display in the manager.
 /// `trimmed` is caller-trimmed and non-empty. Uses the grapheme/CJK-safe
-/// `truncate_with_ellipsis` (display-column budget of 60) — a raw byte slice
-/// here would panic on a non-ASCII description and, under `panic = "abort"`,
-/// crash the whole process.
+/// `truncate_with_ellipsis` — a raw byte slice here would panic on a
+/// non-ASCII description and, under `panic = "abort"`, crash the process.
 fn truncate_plugin_desc(trimmed: &str) -> String {
-    crate::width::truncate_with_ellipsis(trimmed, 60)
+    crate::width::truncate_with_ellipsis(trimmed, PLUGIN_DESC_DISPLAY_COLS)
 }
 
 fn is_official_marketplace(source: &str) -> bool {
@@ -1794,23 +1797,33 @@ mod tests {
     /// truncated. The old code byte-sliced `&trimmed[..57]`, which panics when
     /// byte 57 lands inside a multi-byte character — and under `panic = "abort"`
     /// that aborts the whole process (repro: `/plugin` → a large official
-    /// marketplace with Chinese descriptions → Update). Two ASCII bytes then 20
-    /// 3-byte CJK chars = 62 bytes > 60, and byte 57 sits inside the char
-    /// spanning bytes 56–58, so `[..57]` is not on a char boundary.
+    /// marketplace with Chinese descriptions → Update).
     #[test]
     fn truncate_plugin_desc_cjk_does_not_panic() {
-        let desc = format!("ab{}", "描".repeat(20));
-        assert!(desc.len() > 60, "fixture must exceed the truncation threshold");
+        // 2 ASCII + 20×3-byte CJK = 62 bytes; byte 57 sits inside the char
+        // spanning bytes 56–58, so the old `&trimmed[..57]` slice panicked here.
+        let straddling = format!("ab{}", "描".repeat(20));
         assert!(
-            !desc.is_char_boundary(57),
+            !straddling.is_char_boundary(57),
             "fixture must straddle byte 57 to exercise the old panic"
         );
-        let out = truncate_plugin_desc(&desc); // must not panic
-        assert!(!out.is_empty());
+        // Only 42 display columns (CJK = 2 cols each) → under budget, returned
+        // unchanged. The point is that it no longer panics.
+        assert_eq!(truncate_plugin_desc(&straddling), straddling);
+
+        // A description wider than the budget is truncated char-safely with an
+        // ellipsis, never exceeding the budget and never splitting a CJK char.
+        let wide = "描".repeat(40); // 80 display columns
+        let out = truncate_plugin_desc(&wide);
+        assert!(out.ends_with('…'), "over-budget description must be marked truncated");
+        assert!(crate::width::display_width(&out) <= PLUGIN_DESC_DISPLAY_COLS);
         assert!(
-            crate::width::display_width(&out) <= 60,
-            "truncated description must fit the display budget"
+            out.chars().all(|c| c == '描' || c == '…'),
+            "truncation must not split a CJK character"
         );
+
+        // Short ASCII is returned unchanged.
+        assert_eq!(truncate_plugin_desc("hello"), "hello");
     }
 
     #[test]
