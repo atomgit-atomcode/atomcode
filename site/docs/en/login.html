@@ -150,7 +150,7 @@ atomcode logout     # or /logout in the TUI — clears the OAuth token</code></p
       <h2>Which one should I pick?</h2>
       <ul>
         <li>First-time user &rarr; <strong>CodingPlan</strong> (<code>/login</code>) — free tokens, just use it.</li>
-        <li>Already have your own API key &rarr; skip <code>/login</code> and use the <strong>API key</strong> path (<code>/provider</code> or hand-edit config). If you also need AtomGit integrations (<code>/issue</code>, etc.), running <code>/login</code> later will claim CodingPlan and register <code>AtomGit-*</code> providers as a side effect.</li>
+        <li>Already have your own API key &rarr; skip <code>/login</code> and use the <strong>API key</strong> path (<code>/provider</code> or hand-edit config). If you later need the built-in AtomGit repository, PR, or Issue tools, run <code>/login</code> to authorize them; this also claims CodingPlan and registers <code>AtomGit-*</code> providers.</li>
         <li>Running in CI / scripts &rarr; <strong>API key</strong> via config file or env vars.</li>
         <li>Fully offline &rarr; configure an <strong>Ollama</strong> provider — no login required.</li>
       </ul>

@@ -76,7 +76,7 @@
 
   <main class="dmain prose-docs">
 <h1>内置工具</h1>
-      <p class="lede">AtomCode 目前内置 21 个工具,按能力分成文件与 Shell、代码图谱、Web、自动化四类。模型会根据任务自动挑选,大多数情况下你不需要手动指定。</p>
+      <p class="lede">AtomCode 内置文件与 Shell、代码图谱、Web、自动化和 AtomGit 原生操作等工具。模型会根据任务自动挑选，大多数情况下你不需要手动指定。</p>
 
       <h2>文件与 Shell(9 个)</h2>
       <table>
@@ -159,6 +159,20 @@
         </tbody>
       </table>
       <p>详见 <a href="./skills.html">Skills 扩展</a>。</p>
+
+      <h2 id="atomgit">AtomGit 集成（3 个）</h2>
+      <p>执行 <code>/login</code> 后，模型可以通过以下内置工具直接操作 AtomGit。你只需用自然语言描述目标，不再使用 <code>/issue</code> 斜杠命令。</p>
+      <table>
+        <thead>
+          <tr><th>工具</th><th>作用</th><th>需要确认</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>atomgit_repo</code></td><td>列出、查看、创建、删除、Fork 或 Clone 仓库，创建 Tag 并管理项目标签</td><td>写操作：是</td></tr>
+          <tr><td><code>atomgit_pr</code></td><td>列出、查看、创建或关闭 PR，管理 PR 评论，并关联或取消关联 Issue</td><td>写操作：是</td></tr>
+          <tr><td><code>atomgit_issue</code></td><td>列出或查看 Issue，创建 Issue，以及查看、新增、编辑或删除评论</td><td>写操作：是</td></tr>
+        </tbody>
+      </table>
+      <pre><code>示例：为这个 Bug 创建一个 AtomGit Issue，并附上复现步骤和环境信息。</code></pre>
 
       <h2>禁用特定工具</h2>
       <p>用 <code>--disable-tools</code> 参数可以在启动时把某些工具对模型完全隐藏。例如在 SWE-bench 沙箱里:</p>

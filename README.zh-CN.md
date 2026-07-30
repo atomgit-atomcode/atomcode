@@ -455,12 +455,13 @@ atomcode --prompt-file task.md
 | `/setup` | 首次运行：安装推荐 skill 并执行 |
 | `/welcome` | 重新运行引导向导 |
 | `/language` | 切换显示语言及默认 Git 提交消息语言 |
-| `/issue` | 反馈 bug / 提交功能需求（交互式向导） |
 | `/guide <问题>` | 向 atomcode-guide 询问使用方式 |
 | `/keys` | 查看键盘快捷键 |
 | `/help` | 查看命令与快捷键 |
 | `/quit`、`/exit` | 退出 AtomCode（或连按 Ctrl+C） |
 
+> **AtomGit Issue**：`/issue` 已移除。执行 `/login` 后，直接用自然语言提出需求即可，例如“为这个 Bug 创建一个 AtomGit Issue”，AtomCode 会调用内置的 `atomgit_issue` 工具。读取 Issue 可直接执行；创建 Issue，以及新增、编辑或删除评论仍需权限确认。
+>
 > **插件命令**：除了上面的内置命令，插件还能注册自己的斜杠命令。例如安装官方频道插件后即可使用 `/wechat`（显示 AtomCode 微信用户群二维码）：
 >
 > ```text

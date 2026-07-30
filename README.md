@@ -462,12 +462,16 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/setup` | First run: install the recommended skill and run it |
 | `/welcome` | Re-run the onboarding wizard |
 | `/language` | Switch display and default Git commit-message language |
-| `/issue` | Report a bug / request a feature (interactive wizard) |
 | `/guide <question>` | Ask atomcode-guide how to use AtomCode |
 | `/keys` | Show keyboard shortcuts |
 | `/help` | Show commands & shortcuts |
 | `/quit`, `/exit` | Exit AtomCode (or Ctrl+C ×2) |
 
+> **AtomGit Issues.** `/issue` has been removed. After `/login`, ask in natural
+> language—for example, “Create an AtomGit issue for this bug”—and AtomCode uses
+> its built-in `atomgit_issue` tool. Reading issues is automatic; creating an
+> issue or adding, editing, or deleting comments still requires approval.
+>
 > **Plugin commands.** Beyond the built-ins above, plugins can register their own slash commands. For example, install the official channel plugin to get `/wechat` (shows the AtomCode WeChat community group QR code):
 >
 > ```text

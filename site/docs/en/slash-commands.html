@@ -114,12 +114,16 @@
           <tr><td><code>/init</code></td><td>Scan the working directory and generate / refresh the <code>.atomcode.md</code> project instructions file — covering build / test commands, tech-stack summary, layout, etc.; injected as system prompt on subsequent launches</td></tr>
           <tr><td><code>/background &lt;task&gt;</code></td><td>Dispatch a task to an isolated background agent (read-only-leaning tool subset) without polluting the main conversation. Useful for "go check X on the side" sort of light exploration. See <a href="./sessions.html#bg">Background sessions</a></td></tr>
           <tr><td><code>/worktree &lt;subcommand&gt;</code></td><td>Git worktree isolation: <code>create</code> a new branch with its own worktree, <code>list</code> existing worktrees, <code>done</code> squash worktree changes back to the main branch, <code>cleanup</code> remove finished worktrees</td></tr>
-          <tr><td><code>/issue</code></td><td>Interactive wizard: file a new issue against the AtomGit repository for the current git repo (requires OAuth login; cwd must be a clone of an atomgit.com repository)</td></tr>
           <tr><td><code>/todo</code> · <code>/todo add &lt;task&gt;</code> · <code>/todo clear</code></td><td>Reprint the current todo list — derived from the session transcript (locates the most recent <code>todowrite</code> tool call and re-renders it), with "in-progress / done" status markers. <code>/todo add &lt;task&gt;</code> appends a task deterministically (no model round-trip); <code>/todo clear</code> empties the list. The list is stateless (nothing extra is written to disk); the model maintains it during long tasks and you can run this anytime to check progress</td></tr>
           <tr><td><code>/copy</code></td><td>Copy a code block from the last reply to the clipboard: <code>/copy</code> copies the only block, <code>/copy N</code> the N-th, <code>/copy all</code> every code block, <code>/copy msg</code> the whole reply as raw markdown</td></tr>
           <tr><td><code>/save</code></td><td>Export the current conversation to a markdown file: <code>/save</code> uses an auto-generated filename, <code>/save &lt;filename&gt;</code> a name you choose</td></tr>
         </tbody>
       </table>
+
+      <div class="callout callout-info">
+        <strong>AtomGit Issues are tools, not slash commands</strong>
+        <p><code>/issue</code> has been removed. After <code>/login</code>, ask in natural language—for example, “Create an AtomGit issue for this bug.” AtomCode will select the built-in <code>atomgit_issue</code> tool; write actions still require approval. See <a href="./tools.html#atomgit">Built-in Tools</a>.</p>
+      </div>
 
       <div class="callout callout-info">
         <strong>Read-only reports run mid-turn</strong>

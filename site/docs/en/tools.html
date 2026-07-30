@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Built-in Tools · AtomCode Docs</title>
-<meta name="description" content="All 21 built-in tools — filesystem, shell, code graph, web, automation.">
+<meta name="description" content="AtomCode built-in tools — filesystem, shell, code graph, web, automation, and native AtomGit operations.">
 <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
 <link rel="stylesheet" href="../docs.css">
 <script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
@@ -76,7 +76,7 @@
 
   <main class="dmain prose-docs">
 <h1>Built-in Tools</h1>
-      <p class="lede">AtomCode currently ships 21 built-in tools, grouped into four categories: filesystem &amp; shell, code graph, web, automation. The model picks tools per task — you almost never need to specify by hand.</p>
+      <p class="lede">AtomCode ships built-in tools for filesystem &amp; shell, code graph, web, automation, and native AtomGit operations. The model picks tools per task — you almost never need to specify them by hand.</p>
 
       <h2>Filesystem &amp; shell (9)</h2>
       <table>
@@ -159,6 +159,20 @@
         </tbody>
       </table>
       <p>See <a href="./skills.html">Skills</a> for details.</p>
+
+      <h2 id="atomgit">AtomGit integration (3)</h2>
+      <p>After <code>/login</code>, the model can operate AtomGit directly through these built-in tools. Describe the outcome in natural language; there is no <code>/issue</code> slash command.</p>
+      <table>
+        <thead>
+          <tr><th>Tool</th><th>Purpose</th><th>Confirmation?</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>atomgit_repo</code></td><td>List, inspect, create, delete, fork, or clone repositories; create tags and manage project labels</td><td>Writes: yes</td></tr>
+          <tr><td><code>atomgit_pr</code></td><td>List, inspect, create, close, and comment on pull requests; link or unlink related Issues</td><td>Writes: yes</td></tr>
+          <tr><td><code>atomgit_issue</code></td><td>List or inspect Issues; create an Issue and view, add, edit, or delete comments</td><td>Writes: yes</td></tr>
+        </tbody>
+      </table>
+      <pre><code>Ask: Create an AtomGit issue for this bug, including the reproduction steps and environment.</code></pre>
 
       <h2>Disabling specific tools</h2>
       <p>Use the <code>--disable-tools</code> flag at launch to hide tools from the model entirely. For example, inside the SWE-bench sandbox:</p>

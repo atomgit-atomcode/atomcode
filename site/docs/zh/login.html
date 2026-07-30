@@ -150,7 +150,7 @@ atomcode logout     # 或 TUI 内 /logout — 清除 OAuth token</code></pre>
       <h2>选哪个?</h2>
       <ul>
         <li>第一次使用 &rarr; <strong>CodingPlan</strong>(<code>/login</code>),免费额度直接用。</li>
-        <li>已有自己的 API Key &rarr; 跳过 <code>/login</code>,直接用 <strong>API Key</strong>(<code>/provider</code> 或手动编辑配置)。需要 AtomGit 集成(<code>/issue</code> 等)再跑 <code>/login</code>,但会顺带申领 CodingPlan 并注册 <code>AtomGit-*</code> provider。</li>
+        <li>已有自己的 API Key &rarr; 跳过 <code>/login</code>,直接用 <strong>API Key</strong>(<code>/provider</code> 或手动编辑配置)。后续需要内置的 AtomGit 仓库、PR 或 Issue 工具时再运行 <code>/login</code> 授权；该流程也会申领 CodingPlan 并注册 <code>AtomGit-*</code> provider。</li>
         <li>需要在 CI / 脚本里跑 &rarr; <strong>API Key</strong> + 配置文件或环境变量。</li>
         <li>完全离线 &rarr; 配置一个 <strong>Ollama</strong> provider,不需要任何登录。</li>
       </ul>
