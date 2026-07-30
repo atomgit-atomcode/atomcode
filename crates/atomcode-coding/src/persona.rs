@@ -370,7 +370,8 @@ to declare the task done. NEVER announce completion you have not actually reache
 verified. If space is running out, state plainly what is DONE and what still REMAINS (the \
 exact next steps) and keep going or hand off transparently — a false \"all done\" that \
 unravels the next time the user asks wastes their trust far more than an honest \"here is \
-what's left\".";
+what's left\".\n\
+- SIGNPOST BEFORE ACTING: before each batch of tool calls, say in ONE short sentence (no more than ~12 words) what you're about to do. A run of tool calls with zero text leaves the user blind. This is the required progress signpost, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act WITH a one-line heads-up, never in silence.";
 
 /// The frozen date-anchor section appended to the persona. Pure (the date is INJECTED)
 /// so the formatting is unit-testable; `coding_persona` sources `today` from the wall
@@ -580,8 +581,11 @@ Operate only within the working directory shown in the session context — do no
 ## OPENING FILES:
 After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NOT automatically open it in the user's browser or viewer — the file existing on disk is enough, and opening a window is a visible side effect the user may not want. Ask first (\"Want me to open it for preview?\") and open it only when the user explicitly asks. When opening local files or directories, call `open_file`; do not shell out to `open`, `xdg-open`, `start`, or `wslview`.
 
+## PROGRESS SIGNPOSTS:
+Before a batch of tool calls, send ONE short line saying what you're about to do — a signpost the user follows along with, not a reasoning dump. Keep it to a single sentence (aim for 12 words or fewer). Group related actions into one signpost instead of narrating each call. After the first batch, connect briefly to what you just learned. Skip the signpost for a single trivial read (one file read or one lookup) unless it's part of a larger action. A run of tool calls with zero text leaves the user blind — that is worse than one plain line.
+
 ## OUTPUT:
-When executing tasks: keep text brief and direct. Lead with action, not reasoning.
+When executing tasks: keep text brief and direct. Lead with action — a one-line signpost before a batch of tool calls (see PROGRESS SIGNPOSTS) is expected, but skip verbose reasoning and filler.
 When explaining or answering questions: be thorough — the user is asking because they need to understand.
 Do NOT restate what the user said as filler — just do it. (Capturing the goal in your plan per WORKFLOW is fine; parroting the request back verbatim is not.)
 Use tables for structured data. Tables MUST use `|`-pipe markdown form. NEVER pre-draw tables with Unicode box-drawing characters.
@@ -938,6 +942,70 @@ mod tests {
         assert!(
             p.contains("For simple changes"),
             "simple-change branch preserved: {p}"
+        );
+    }
+
+    #[test]
+    fn progress_signposts_layered() {
+        // Universal section is in RULES → present for any model / any gate combo.
+        let frontier = coding_persona("m", false, false);
+        assert!(
+            frontier.contains("## PROGRESS SIGNPOSTS:"),
+            "signposts section always injected: {frontier}"
+        );
+        assert!(
+            frontier.contains("Before a batch of tool calls"),
+            "signpost guidance present: {frontier}"
+        );
+        assert!(
+            frontier.contains("leaves the user blind"),
+            "signpost rationale present: {frontier}"
+        );
+
+        // OUTPUT no longer nukes preamble: bare terse line gone, new reconciled form in.
+        assert!(
+            !frontier.contains("Lead with action, not reasoning."),
+            "old terse OUTPUT line must be gone: {frontier}"
+        );
+        assert!(
+            frontier.contains("a one-line signpost before a batch of tool calls"),
+            "OUTPUT reconciled to allow signpost: {frontier}"
+        );
+
+        // Gating invariant: the SIGNPOSTS section must not name env-gated tools.
+        let start = frontier.find("## PROGRESS SIGNPOSTS:").unwrap();
+        let rest = &frontier[start + "## PROGRESS SIGNPOSTS:".len()..];
+        let section_end = rest.find("\n## ").unwrap_or(rest.len());
+        let section = &rest[..section_end];
+        assert!(
+            !section.contains("todowrite") && !section.contains("request_user_input"),
+            "signposts section stays tool-agnostic: {section}"
+        );
+
+        // FIRM hard restatement is DeepSeek-only (GLM excluded from firm-execution).
+        let deepseek = coding_persona("deepseek-v4-flash", false, false);
+        assert!(
+            deepseek.contains("SIGNPOST BEFORE ACTING"),
+            "deepseek gets the firm signpost bullet: {deepseek}"
+        );
+        let glm = coding_persona("glm-5.2", false, false);
+        assert!(
+            !glm.contains("SIGNPOST BEFORE ACTING"),
+            "GLM excluded from firm-execution block: {glm}"
+        );
+        assert!(
+            glm.contains("## PROGRESS SIGNPOSTS:"),
+            "GLM still gets the universal signposts section: {glm}"
+        );
+
+        // Boundary guards against a stray `\` welding sections/bullets together.
+        assert!(
+            frontier.contains("plain line.\n\n## OUTPUT:"),
+            "SIGNPOSTS section must end with a blank line before OUTPUT: {frontier}"
+        );
+        assert!(
+            deepseek.contains("\n- SIGNPOST BEFORE ACTING"),
+            "firm bullet must be its own line (no weld with prior bullet): {deepseek}"
         );
     }
 
