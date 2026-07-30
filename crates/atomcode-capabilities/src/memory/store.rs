@@ -16,6 +16,15 @@ pub struct MemoryStore {
     path: PathBuf,
 }
 
+/// Resolve the project-scope memory file. `override_dir` = the value of
+/// `ATOMCODE_PROJECT_MEMORY_DIR` (None/empty → default ".atomcode"). A relative value
+/// nests under `project_root`; an absolute value is used as-is (std `Path::join`
+/// semantics). `memory.md` is appended in either case.
+fn project_memory_path(project_root: &Path, override_dir: Option<&str>) -> PathBuf {
+    let dir = override_dir.filter(|s| !s.is_empty()).unwrap_or(".atomcode");
+    project_root.join(dir).join("memory.md")
+}
+
 impl MemoryStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
@@ -26,8 +35,11 @@ impl MemoryStore {
         Self::new(dir.join("memory.md"))
     }
 
+    /// Project-scope store. Honors `ATOMCODE_PROJECT_MEMORY_DIR` (host rebrand parity with
+    /// the global scope's `ATOMCODE_HOME`); default `.atomcode` is unchanged.
     pub fn project(project_root: &Path) -> Self {
-        Self::new(project_root.join(".atomcode").join("memory.md"))
+        let override_dir = std::env::var("ATOMCODE_PROJECT_MEMORY_DIR").ok();
+        Self::new(project_memory_path(project_root, override_dir.as_deref()))
     }
 
     pub fn path(&self) -> &Path {
@@ -247,6 +259,31 @@ mod tests {
         assert_eq!(store.append_deduped("uses tabs").unwrap(), false); // 大小写不敏感完全重复 → 跳
         assert_eq!(store.append_deduped("uses spaces").unwrap(), true); // 不同内容 → 写
         assert_eq!(store.load().len(), 2);
+    }
+
+    #[test]
+    fn project_memory_path_resolves_override() {
+        use std::path::Path;
+        let root = Path::new("/proj");
+        // Default (unset/empty) is byte-identical to today's hardcoded path.
+        assert_eq!(
+            super::project_memory_path(root, None),
+            Path::new("/proj/.atomcode/memory.md")
+        );
+        assert_eq!(
+            super::project_memory_path(root, Some("")),
+            Path::new("/proj/.atomcode/memory.md")
+        );
+        // Relative override nests under project_root.
+        assert_eq!(
+            super::project_memory_path(root, Some(".myapp")),
+            Path::new("/proj/.myapp/memory.md")
+        );
+        // Absolute override is used as-is (Path::join replaces the base).
+        assert_eq!(
+            super::project_memory_path(root, Some("/opt/brand/mem")),
+            Path::new("/opt/brand/mem/memory.md")
+        );
     }
 
     #[test]
