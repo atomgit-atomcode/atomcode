@@ -1703,6 +1703,39 @@ mod tests {
     }
 
     #[test]
+    fn fenced_cjk_diagram_repairs_display_but_preserves_copy_source() {
+        let mut state = MdState::new();
+        let source_lines = [
+            "┌────────────┐",
+            "│ config     │",
+            "│ 配置         │",
+            "│ auth       │",
+            "└────────────┘",
+        ];
+        let source = source_lines.join("\n");
+
+        assert!(render_line("```text", &mut state, plain_caps()).is_none());
+        for line in source_lines {
+            assert!(render_line(line, &mut state, plain_caps()).is_none());
+        }
+        let rendered = render_line("```", &mut state, plain_caps()).unwrap();
+
+        let widths = rendered
+            .lines()
+            .map(crate::width::display_width)
+            .collect::<Vec<_>>();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "diagram rows must align after markdown rendering: {widths:?}\n{rendered}"
+        );
+        assert_eq!(
+            state.last_code_block_source.as_deref(),
+            Some(source.as_str()),
+            "display normalization must not alter /copy or persisted source"
+        );
+    }
+
+    #[test]
     fn fenced_code_block_unknown_lang_emits_plain_indent() {
         // Plan-0: regardless of lang tag (known, unknown, or absent),
         // the body is emitted verbatim with a 2-space indent and zero
