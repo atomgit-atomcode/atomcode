@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.2</span>
+    <span class="dhdr-ver">v5.0.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -104,7 +104,7 @@
       <p>The format is plain Markdown — one entry per <code>- </code>-prefixed list item. Use <code>/remember</code> or hand-edit; AtomCode rereads on the next turn. <strong>Lines not starting with <code>- </code> are ignored</strong>, so feel free to add comments, blank lines, or grouping headings without affecting entries.</p>
 
       <h2>How the model "uses" memory</h2>
-      <p>For every request, AtomCode merges <strong>global + project memory</strong> and injects it into the system prompt (<code>crates/atomcode-core/src/agent/prompt.rs:64</code>), formatted as:</p>
+      <p>At session start, AtomCode merges <strong>global + project memory</strong> through the coding runtime memory hook (<code>crates/atomcode-coding/src/parts.rs</code>), formatted as:</p>
       <pre><code>=== MEMORY ===
 The user has asked you to remember these facts and preferences:
 

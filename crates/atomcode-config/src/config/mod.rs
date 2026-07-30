@@ -3,6 +3,7 @@ pub mod memory;
 pub mod offline;
 pub mod prompt_sections;
 pub mod provider;
+pub mod provider_preset;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::proxy::ProxyConfig;
 use atomcode_telemetry::TelemetryConfig;
-use provider::ProviderConfig;
+use provider::{ModelProfileConfig, ProviderAccountConfig, ProviderConfig, ResolvedModelConfig};
 
 // DEFAULT_SYSTEM_PROMPT removed — single source of truth is now
 // config/prompt_sections.rs::UNIFIED_PROMPT (~500 tok).
@@ -49,6 +50,20 @@ pub fn platform_rules() -> &'static str {
     }
 }
 
+/// `[coding]` table. Turn-level knobs for the main coding agent. `max_rounds` is
+/// the per-turn round cap (the interactive checkpoint threshold); `0` = unbounded.
+/// Env `ATOMCODE_TURN_MAX_ROUNDS` overrides this.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodingConfig {
+    pub max_rounds: u32,
+}
+impl Default for CodingConfig {
+    fn default() -> Self {
+        Self { max_rounds: 200 }
+    }
+}
+
 /// /loop command configuration. Persisted as the `[loop_config]` table
 /// (NOT `[loop]` — `loop` is a Rust keyword and is rejected by toml_edit).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,9 +81,8 @@ impl Default for LoopConfig {
 
 /// `[subagent]` execution policy for the `task` subagent tool.
 ///
-/// `max_concurrent`, `timeout_secs`, and `max_rounds` are the LIVE knobs: `coding::parts`
-/// reads them via `subagent_runtime_knobs` and wires them into `TaskTool`. Environment
-/// overrides are `ATOMCODE_SUBAGENT_TIMEOUT` and `ATOMCODE_SUBAGENT_MAX_ROUNDS`.
+/// `max_concurrent` and `max_rounds` are the LIVE knobs: `coding::parts` reads them via
+/// `subagent_runtime_knobs` and wires them into `TaskTool`.
 /// The tool's master ON/OFF is the env gate `ATOMCODE_SUBAGENT`
 /// (default ON, opt out with `ATOMCODE_SUBAGENT=0`) — NOT `enabled` here; `enabled`,
 /// `initial_turns`, and `max_turns` are vestigial from the retired `parallel_edit` dispatch
@@ -85,8 +99,8 @@ pub struct SubAgentConfig {
     pub max_turns: usize,
     /// Max parallel subagents the `task` tool runs at once (floored to 1). Default 3.
     pub max_concurrent: usize,
-    /// Per-subtask wall-time timeout in seconds (floored to 30s). Default 900 (15 min).
-    /// Overridden by the `ATOMCODE_SUBAGENT_TIMEOUT` env var when set.
+    /// Deprecated compatibility field. Subtasks no longer have a total wall-clock limit;
+    /// provider idle timeouts, `max_rounds`, and explicit cancellation own liveness.
     pub timeout_secs: u64,
     /// Per-subtask model-round high-water mark. Default 200; `0` means unbounded.
     /// Overridden by `ATOMCODE_SUBAGENT_MAX_ROUNDS` when set.
@@ -100,7 +114,7 @@ impl Default for SubAgentConfig {
             initial_turns: 4,
             max_turns: 12,
             max_concurrent: 3,
-            // Matches the `task` tool's shipped default so wiring config is not a silent change.
+            // Retained only so existing config files continue to deserialize unchanged.
             timeout_secs: 900,
             max_rounds: 200,
         }
@@ -109,6 +123,10 @@ impl Default for SubAgentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Legacy default selection (a `[providers.*]` key). `#[serde(default)]` so a
+    /// pure new-schema config selecting via `default_model` needs neither legacy
+    /// field. Superseded by `default_model` (design §14.1).
+    #[serde(default)]
     pub default_provider: String,
     /// Optional provider key for /goal evaluator (fast model like Haiku).
     /// Falls back to `default_provider` when not set.
@@ -116,7 +134,23 @@ pub struct Config {
     pub evaluator_provider: Option<String>,
     /// Default working directory. Saved on /cd, restored on startup.
     pub default_workdir: Option<String>,
+    /// Legacy flattened providers. `#[serde(default)]` so a pure new-schema
+    /// config (accounts + models only, no `[providers]`) loads (design §4).
+    #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+    /// Provider accounts (connection + credential), keyed by account id. New
+    /// schema (design §3.2); empty when only legacy `[providers.*]` are used.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub provider_accounts: HashMap<String, ProviderAccountConfig>,
+    /// Model profiles (selectable model + limits), keyed by selection id
+    /// (recommended `<account>/<model>`). New schema (design §3.3).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub models: HashMap<String, ModelProfileConfig>,
+    /// Canonical model selection (new schema, design §14.1). When set it
+    /// supersedes `default_provider` for resolution (wired in Task 4). Optional
+    /// so legacy configs (`default_provider` only) keep working unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
     /// Per-turn datalog settings. Missing from older configs → defaults to
     /// enabled=true, dir="$ATOMCODE_HOME/datalog" (project slug appended underneath).
     ///
@@ -161,6 +195,9 @@ pub struct Config {
     /// TOML section is `[loop_config]` (bare `loop` is a Rust keyword).
     #[serde(default)]
     pub loop_config: LoopConfig,
+    /// `[coding]` turn-level policy. Missing from older configs → max_rounds=200.
+    #[serde(default)]
+    pub coding: CodingConfig,
     /// Provider key (matches a key in `Config.providers`) of a vision-language
     /// model used to preprocess images before forwarding to a non-vision main
     /// provider. When `None` or empty, image preprocessing is disabled — pasted
@@ -368,6 +405,23 @@ pub enum UiTheme {
     Light,
 }
 
+/// Why an attached image can (or cannot) reach a model that will process it —
+/// the resolution behind [`Config::can_handle_attached_images`]. Lets the paste
+/// gate tell the user WHY it rejected: nothing configured (switch model / set a
+/// preprocessor) vs. a preprocessor IS set but its name doesn't resolve (a
+/// typo), which the old blanket "未配置" message wrongly reported as absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageAttachSupport {
+    /// The active model accepts images, or `vision_preprocessor_provider`
+    /// resolves — the image will be handled.
+    Supported,
+    /// Active model is text-only and no `vision_preprocessor_provider` is set.
+    Unconfigured,
+    /// `vision_preprocessor_provider` IS set but does not resolve to a real
+    /// model-selection id (typo'd / removed name). Carries the offending value.
+    PreprocessorUnresolvable(String),
+}
+
 impl Config {
     /// True iff attaching an image to the active turn will reach a model
     /// that can process it — either the active provider accepts images
@@ -376,19 +430,34 @@ impl Config {
     /// TUIX Ctrl+V paste gate to decide whether to accept the image or
     /// reject with the "switch to a vision-capable model" hint.
     pub fn can_handle_attached_images(&self) -> bool {
+        matches!(self.image_attach_support(), ImageAttachSupport::Supported)
+    }
+
+    /// Resolved reason behind [`Self::can_handle_attached_images`] so the paste
+    /// gate can distinguish "nothing configured" from "preprocessor configured
+    /// but unresolvable" (a typo) and message accordingly.
+    pub fn image_attach_support(&self) -> ImageAttachSupport {
+        // Route through the single resolution boundary (§14.1) so both schemas
+        // work and the active model matches what the runtime builds.
         let active_accepts = self
-            .providers
-            .get(&self.default_provider)
-            .map(|p| p.accepts_images())
+            .resolve_model(None)
+            .map(|r| crate::util::model_name_suggests_vision(&r.model))
             .unwrap_or(false);
         if active_accepts {
-            return true;
+            return ImageAttachSupport::Supported;
         }
-        let vp_key = match self.vision_preprocessor_provider.as_deref() {
-            Some(k) if !k.is_empty() => k,
-            _ => return false,
-        };
-        self.providers.contains_key(vp_key)
+        // `vision_preprocessor_provider` is a model-selection id (legacy provider
+        // names still resolve via projection, §14.3): valid iff it resolves.
+        match self.vision_preprocessor_provider.as_deref() {
+            Some(k) if !k.is_empty() => {
+                if self.resolve_model(Some(k)).is_ok() {
+                    ImageAttachSupport::Supported
+                } else {
+                    ImageAttachSupport::PreprocessorUnresolvable(k.to_string())
+                }
+            }
+            _ => ImageAttachSupport::Unconfigured,
+        }
     }
 }
 
@@ -399,6 +468,9 @@ impl Default for Config {
             evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
+            provider_accounts: HashMap::new(),
+            models: HashMap::new(),
+            default_model: None,
             datalog: Default::default(),
             notifications: Default::default(),
             network: Default::default(),
@@ -408,6 +480,7 @@ impl Default for Config {
             auto_commit: false,
             subagent: Default::default(),
             loop_config: Default::default(),
+            coding: CodingConfig::default(),
             vision_preprocessor_provider: None,
             language: None,
             ui: UiConfig::default(),
@@ -431,6 +504,430 @@ impl Config {
             default_provider: default_provider.into(),
             ..Default::default()
         }
+    }
+
+    /// Validate the new-schema provider accounts and model profiles. Returns a
+    /// diagnostic per problem (empty ⇒ valid). Pure — does not mutate. Checks
+    /// account endpoint requirements, model→account referential integrity,
+    /// context/token limits, and `default_model` resolvability. Mixed-schema
+    /// loading (Task 3) uses this to quarantine, rather than fail, bad entries.
+    pub fn validate_provider_accounts_and_models(&self) -> Vec<String> {
+        let mut diags = Vec::new();
+        for (id, account) in &self.provider_accounts {
+            if account.provider.trim().is_empty() {
+                diags.push(format!("provider account `{id}` is missing `provider`"));
+                continue;
+            }
+            // A preset (or the custom-compatible fallback) without a built-in
+            // base URL needs one supplied on the account.
+            let preset = provider_preset::preset_or_compatible(&account.provider);
+            if preset.default_base_url.is_none() && account.base_url.is_none() {
+                diags.push(format!(
+                    "provider account `{id}` uses `{}`, which has no default endpoint; set `base_url`",
+                    account.provider
+                ));
+            }
+        }
+        for (id, model) in &self.models {
+            if model.model.trim().is_empty() {
+                diags.push(format!("model `{id}` is missing `model`"));
+            }
+            if model.account.trim().is_empty() {
+                diags.push(format!("model `{id}` is missing `account`"));
+            } else if !self.provider_accounts.contains_key(&model.account)
+                // A model may reference a legacy provider (which projects to a
+                // synthetic account of the same id) — that resolves, so accept it.
+                && !self.providers.contains_key(&model.account)
+            {
+                diags.push(format!(
+                    "model `{id}` references unknown account `{}`",
+                    model.account
+                ));
+            }
+            if model.context_window == 0 {
+                diags.push(format!("model `{id}` has context_window = 0"));
+            }
+            if model.max_tokens == Some(0) {
+                diags.push(format!("model `{id}` has max_tokens = 0"));
+            }
+        }
+        if let Some(sel) = &self.default_model {
+            if !self.models.contains_key(sel) {
+                diags.push(format!(
+                    "default_model `{sel}` does not match any model profile"
+                ));
+            }
+        }
+        diags
+    }
+
+    /// The unified account catalog: real `provider_accounts` plus one synthetic
+    /// account projected from each legacy `[providers.*]` (design §5). On an
+    /// exact id collision the new-schema account wins; see
+    /// [`Self::model_catalog_collisions`] for the diagnostics. Read-only — never
+    /// rewrites config.
+    pub fn logical_accounts(&self) -> HashMap<String, ProviderAccountConfig> {
+        let mut out: HashMap<String, ProviderAccountConfig> = HashMap::new();
+        for (name, p) in &self.providers {
+            if is_codingplan_provider_name(name) {
+                // All CodingPlan flat providers share one gateway + OAuth signer;
+                // fold them into a single account per wire format. Fields are
+                // uniform across the group, so the first one seen defines them.
+                let id = codingplan_group_account_id(&p.provider_type);
+                out.entry(id.to_string())
+                    .or_insert_with(|| project_legacy_account(p));
+            } else {
+                out.insert(name.clone(), project_legacy_account(p));
+            }
+        }
+        // New-schema accounts take precedence on an exact id collision.
+        for (id, a) in &self.provider_accounts {
+            out.insert(id.clone(), a.clone());
+        }
+        out
+    }
+
+    /// The unified model catalog: real `models` plus one synthetic model
+    /// projected from each legacy `[providers.*]` (keyed by the legacy provider
+    /// name, so `default_provider` maps to the same selection id). New-schema
+    /// models win on collision.
+    pub fn logical_models(&self) -> HashMap<String, ModelProfileConfig> {
+        let mut out: HashMap<String, ModelProfileConfig> = HashMap::new();
+        for (name, p) in &self.providers {
+            // Model id stays the legacy provider name (so `default_provider`
+            // resolves); only the parent account folds for CodingPlan providers.
+            let account = if is_codingplan_provider_name(name) {
+                codingplan_group_account_id(&p.provider_type).to_string()
+            } else {
+                name.clone()
+            };
+            out.insert(name.clone(), project_legacy_model(&account, p));
+        }
+        for (id, m) in &self.models {
+            out.insert(id.clone(), m.clone());
+        }
+        out
+    }
+
+    /// Diagnostics for exact id collisions between new-schema entries and
+    /// legacy provider names (the new-schema entry wins). Visible, not silent.
+    pub fn model_catalog_collisions(&self) -> Vec<String> {
+        let mut diags = Vec::new();
+        for id in self.provider_accounts.keys() {
+            if self.providers.contains_key(id) {
+                diags.push(format!(
+                    "provider account `{id}` collides with a legacy provider of the same name; the new-schema account wins"
+                ));
+            }
+        }
+        for id in self.models.keys() {
+            if self.providers.contains_key(id) {
+                diags.push(format!(
+                    "model `{id}` collides with a legacy provider of the same name; the new-schema model wins"
+                ));
+            }
+        }
+        diags
+    }
+
+    /// The effective model selection id: the new `default_model` when set,
+    /// otherwise the legacy `default_provider` (which projects to a synthetic
+    /// model of the same id). `None` when neither is set. Bridges legacy and new
+    /// selection for the single resolution boundary (Task 4).
+    pub fn effective_model_selection(&self) -> Option<String> {
+        self.default_model.clone().or_else(|| {
+            let legacy = self.default_provider.trim();
+            (!legacy.is_empty()).then(|| legacy.to_string())
+        })
+    }
+
+    /// Convert a legacy `[providers.<name>]` into a new-schema account + model
+    /// in place (design §5 rule 5/6). Removes the legacy entry. Pure in-memory
+    /// mutation; the caller persists it through `ConfigStore` CAS. Errors if the
+    /// provider is unknown or the target ids already exist in the new schema.
+    pub fn upgrade_legacy_provider(&mut self, name: &str) -> Result<()> {
+        let provider = self
+            .providers
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("legacy provider `{name}` not found"))?;
+        if self.provider_accounts.contains_key(name) || self.models.contains_key(name) {
+            anyhow::bail!(
+                "cannot upgrade `{name}`: a new-schema account or model already uses that id"
+            );
+        }
+        let account = project_legacy_account(provider);
+        let model = project_legacy_model(name, provider);
+        // Note: manual upgrade keeps the model under its own account `name`;
+        // CodingPlan grouping happens only via the read-only projection above.
+        self.provider_accounts.insert(name.to_string(), account);
+        self.models.insert(name.to_string(), model);
+        self.providers.remove(name);
+        // Keep the active selection pointing at the same model.
+        if self.default_provider == name && self.default_model.is_none() {
+            self.default_model = Some(name.to_string());
+        }
+        Ok(())
+    }
+
+    /// THE single provider/model resolution boundary (design §3.4, §10). Given a
+    /// selection id (or `None` for the active [`Self::effective_model_selection`]),
+    /// resolve the model profile, its account, the preset, environment API keys,
+    /// and legacy projection into one flattened [`ResolvedModelConfig`] that
+    /// provider construction consumes. Every consumer (footer, runtime, CLI
+    /// overrides, daemon, respawn) must route through this, never re-derive from
+    /// raw fields (§14.1). Errors are secret-safe: they name ids/models, never
+    /// credentials.
+    pub fn resolve_model(&self, selection: Option<&str>) -> Result<ResolvedModelConfig> {
+        let selection_id = selection
+            .map(str::to_string)
+            .or_else(|| self.effective_model_selection())
+            .ok_or_else(|| {
+                anyhow::anyhow!("no model selected (set `default_model` or `default_provider`)")
+            })?;
+        let models = self.logical_models();
+        let model = models
+            .get(&selection_id)
+            .ok_or_else(|| anyhow::anyhow!("model `{selection_id}` not found"))?;
+        let accounts = self.logical_accounts();
+        let account = accounts.get(&model.account).ok_or_else(|| {
+            anyhow::anyhow!(
+                "model `{selection_id}` references unknown account `{}`",
+                model.account
+            )
+        })?;
+        let preset = provider_preset::preset_or_compatible(&account.provider);
+        let base_url = account
+            .base_url
+            .clone()
+            .or_else(|| preset.default_base_url.map(str::to_string));
+        let api_key = resolve_account_api_key(account, preset);
+        Ok(ResolvedModelConfig {
+            selection_id,
+            account_id: model.account.clone(),
+            provider_id: account.provider.clone(),
+            provider_type: preset.provider_type.wire().to_string(),
+            base_url,
+            api_key,
+            model: model.model.clone(),
+            context_window: model.context_window,
+            max_tokens: model.max_tokens,
+            system_prompt: model.system_prompt.clone(),
+            user_agent: account.user_agent.clone(),
+            skip_tls_verify: account.skip_tls_verify,
+            thinking_type: model.thinking_type.clone(),
+            thinking_keep: model.thinking_keep.clone(),
+            reasoning_history: model.reasoning_history.clone(),
+            reasoning_effort: model.reasoning_effort.clone(),
+            thinking_enabled: model.thinking_enabled,
+            thinking_budget: model.thinking_budget,
+            capable_model: model.capable_model,
+            pricing: model.pricing,
+        })
+    }
+
+    /// A legacy-shaped [`ProviderConfig`] view of any selection id — a legacy
+    /// `[providers.*]` key OR a new-schema model id (including a folded
+    /// CodingPlan model). Consumers that still key off `config.providers`
+    /// (the daemon live runtime, `/think`/`/effort`) call this so a new-schema
+    /// selection resolves instead of returning `None`.
+    ///
+    /// Legacy providers are returned verbatim (raw api_key preserved for the
+    /// caller's own env expansion); new-schema selections are reconstructed via
+    /// [`Self::resolve_model`].
+    pub fn provider_config_for_selection(&self, selection_id: &str) -> Option<ProviderConfig> {
+        // New-schema entry wins on a colliding id — same precedence as
+        // `resolve_model` / `update_selection_reasoning`, so read and write agree.
+        if self.models.contains_key(selection_id) {
+            return self
+                .resolve_model(Some(selection_id))
+                .ok()
+                .map(|r| r.to_provider_config());
+        }
+        if let Some(p) = self.providers.get(selection_id) {
+            return Some(p.clone());
+        }
+        self.resolve_model(Some(selection_id))
+            .ok()
+            .map(|r| r.to_provider_config())
+    }
+
+    /// Whether a selection id resolves to any provider/model (legacy or new
+    /// schema). Replaces bare `config.providers.contains_key(id)` guards that
+    /// would wrongly reject a new-schema selection. Short-circuits on the raw
+    /// maps first so the common case avoids materializing the folded catalog.
+    pub fn selection_exists(&self, selection_id: &str) -> bool {
+        self.providers.contains_key(selection_id)
+            || self.models.contains_key(selection_id)
+            || self.logical_models().contains_key(selection_id)
+    }
+
+    /// Apply a mutation to a selection's thinking/reasoning fields regardless of
+    /// which schema stores it: prefer the new-schema `[models.*]` entry, else
+    /// the legacy `[providers.*]` entry. Returns `false` when `id` names no
+    /// writable target (e.g. a purely projected legacy provider is writable via
+    /// `providers`; a folded-only account is not). Used by `/think`, `/effort`,
+    /// the daemon reasoning-effort + thinking setters so they work on new-schema
+    /// models.
+    pub fn update_selection_reasoning(
+        &mut self,
+        id: &str,
+        f: impl FnOnce(ReasoningFieldsMut<'_>),
+    ) -> bool {
+        if let Some(m) = self.models.get_mut(id) {
+            f(ReasoningFieldsMut {
+                thinking_enabled: &mut m.thinking_enabled,
+                thinking_budget: &mut m.thinking_budget,
+                thinking_type: &mut m.thinking_type,
+                thinking_keep: &mut m.thinking_keep,
+                reasoning_history: &mut m.reasoning_history,
+                reasoning_effort: &mut m.reasoning_effort,
+            });
+            true
+        } else if let Some(p) = self.providers.get_mut(id) {
+            f(ReasoningFieldsMut {
+                thinking_enabled: &mut p.thinking_enabled,
+                thinking_budget: &mut p.thinking_budget,
+                thinking_type: &mut p.thinking_type,
+                thinking_keep: &mut p.thinking_keep,
+                reasoning_history: &mut p.reasoning_history,
+                reasoning_effort: &mut p.reasoning_effort,
+            });
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Mutable borrow of the reasoning/thinking fields common to a legacy
+/// `ProviderConfig` and a new-schema `ModelProfileConfig`, so callers can toggle
+/// them without caring which schema stores the selection. See
+/// [`Config::update_selection_reasoning`].
+pub struct ReasoningFieldsMut<'a> {
+    pub thinking_enabled: &'a mut Option<bool>,
+    pub thinking_budget: &'a mut Option<u32>,
+    pub thinking_type: &'a mut Option<String>,
+    pub thinking_keep: &'a mut Option<String>,
+    pub reasoning_history: &'a mut Option<String>,
+    pub reasoning_effort: &'a mut Option<String>,
+}
+
+/// Resolve an account's API key with environment fallbacks, mirroring
+/// [`ProviderConfig::resolved_api_key`]: an explicit `$VAR`/`${VAR}` expands, a
+/// bare env-var name resolves, anything else is a literal; otherwise fall back
+/// to the preset's declared env var, then the wire-type env var, then
+/// `ATOMCODE_API_KEY`.
+fn resolve_account_api_key(
+    account: &ProviderAccountConfig,
+    preset: &provider_preset::ProviderPreset,
+) -> Option<String> {
+    if let Some(raw) = account.api_key.as_deref() {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            if trimmed.contains('$') {
+                let expanded = provider::expand_env_vars(trimmed);
+                if !expanded.trim().is_empty() {
+                    return Some(expanded);
+                }
+            } else if let Ok(v) = std::env::var(trimmed) {
+                if !v.trim().is_empty() {
+                    return Some(v);
+                }
+            } else {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    let wire_env = match preset.provider_type {
+        provider_preset::ProviderType::Anthropic => "ANTHROPIC_API_KEY",
+        provider_preset::ProviderType::Ollama => "OLLAMA_API_KEY",
+        provider_preset::ProviderType::OpenAi => "OPENAI_API_KEY",
+    };
+    for env in [preset.api_key_env, Some(wire_env), Some("ATOMCODE_API_KEY")]
+        .into_iter()
+        .flatten()
+    {
+        if let Ok(v) = std::env::var(env) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Map a legacy `provider_type` wire string to the preset id whose
+/// [`provider_preset::ProviderType`] matches, so the projected account resolves
+/// to the correct wire protocol. The legacy `base_url` is carried on the account
+/// and overrides the preset default, so the choice of preset only fixes the
+/// protocol, never the endpoint.
+fn legacy_provider_to_preset_id(provider_type: &str) -> &'static str {
+    match provider_type {
+        "claude" | "anthropic" => "anthropic",
+        "ollama" => "ollama",
+        _ => "openai",
+    }
+}
+
+/// The `[providers.*]` keys the CodingPlan login flow writes: the bare `AtomGit`
+/// (single model) plus `AtomGit-<sanitized>` (multi-model). They all share one
+/// gateway base_url + OAuth signer, so the projection folds them into one
+/// synthetic account per wire format rather than one account each.
+///
+/// Single source of truth — `atomcode-codingplan` and `atomcode-tuix` delegate
+/// here instead of re-implementing the prefix rule.
+pub fn is_codingplan_provider_name(name: &str) -> bool {
+    name == "AtomGit" || name.starts_with("AtomGit-")
+}
+
+/// The synthetic account id a legacy CodingPlan provider folds into. An account
+/// carries exactly one preset (one wire format), so models are grouped by wire
+/// format: openai → `AtomGit`, claude → `AtomGit-anthropic`, ollama →
+/// `AtomGit-ollama`. Matches the ids the `/login` flow writes into the new
+/// schema, so a re-login is a no-op transition. `pub` so `atomcode-codingplan`
+/// can label the login report by account.
+pub fn codingplan_group_account_id(provider_type: &str) -> &'static str {
+    match legacy_provider_to_preset_id(provider_type) {
+        "anthropic" => "AtomGit-anthropic",
+        "ollama" => "AtomGit-ollama",
+        _ => "AtomGit",
+    }
+}
+
+/// Project a legacy provider into a synthetic [`ProviderAccountConfig`].
+fn project_legacy_account(p: &ProviderConfig) -> ProviderAccountConfig {
+    ProviderAccountConfig {
+        provider: legacy_provider_to_preset_id(&p.provider_type).to_string(),
+        display_name: None,
+        api_key: p.api_key.clone(),
+        base_url: p.base_url.clone(),
+        user_agent: p.user_agent.clone(),
+        skip_tls_verify: p.skip_tls_verify,
+        enterprise_url: None,
+        ephemeral: p.ephemeral,
+    }
+}
+
+/// Project a legacy provider into a synthetic [`ModelProfileConfig`] belonging to
+/// `account_id`. The model's own id (the catalog key) stays the legacy provider
+/// name at the call site, so `default_provider` keeps resolving; only the parent
+/// account can differ (CodingPlan providers fold into a shared account).
+fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileConfig {
+    ModelProfileConfig {
+        account: account_id.to_string(),
+        model: p.model.clone(),
+        display_name: None,
+        system_prompt: p.system_prompt.clone(),
+        context_window: p.context_window,
+        max_tokens: p.max_tokens,
+        capable_model: p.capable_model,
+        thinking_type: p.thinking_type.clone(),
+        thinking_keep: p.thinking_keep.clone(),
+        reasoning_history: p.reasoning_history.clone(),
+        reasoning_effort: p.reasoning_effort.clone(),
+        thinking_enabled: p.thinking_enabled,
+        thinking_budget: p.thinking_budget,
+        pricing: p.pricing,
     }
 }
 
@@ -843,14 +1340,15 @@ fn render_hooks_json_section() -> String {
 }
 
 impl Config {
-    /// Context window of the currently-selected default provider.
-    /// Falls back to 128_000 when the default_provider is missing or
-    /// has no provider entry — matches pre-existing behavior at the
-    /// ~5 sites that previously open-coded this lookup.
+    /// Context window of the active selection, resolved through the single
+    /// [`Self::resolve_model`] boundary (§14.1) so the displayed window can never
+    /// diverge from what the runtime builds. Falls back to 128_000 when nothing
+    /// resolves. For a legacy config this equals the old
+    /// `providers[default_provider].context_window` lookup (the legacy provider
+    /// projects to a model of the same id), so behavior is unchanged.
     pub fn default_context_window(&self) -> usize {
-        self.providers
-            .get(&self.default_provider)
-            .map(|p| p.context_window)
+        self.resolve_model(None)
+            .map(|r| r.context_window)
             .unwrap_or(128_000)
     }
 
@@ -948,6 +1446,27 @@ impl Config {
         // Filter out ephemeral providers (e.g. OAuth /login) — they live in memory only.
         let mut persistent = self.clone();
         persistent.providers.retain(|_, v| !v.ephemeral);
+        // Same for ephemeral provider accounts (their api_key is runtime-only),
+        // and drop any model profile that would be orphaned by that removal so
+        // the saved file never references a stripped account.
+        let ephemeral_accounts: std::collections::HashSet<String> = self
+            .provider_accounts
+            .iter()
+            .filter(|(_, a)| a.ephemeral)
+            .map(|(k, _)| k.clone())
+            .collect();
+        persistent.provider_accounts.retain(|_, a| !a.ephemeral);
+        persistent
+            .models
+            .retain(|_, m| !ephemeral_accounts.contains(&m.account));
+        // If `default_model` pointed at a now-stripped ephemeral model, don't
+        // persist a dangling selection — restore the disk value if we have one,
+        // else clear it so `resolve_model(None)` falls back cleanly.
+        if let Some(sel) = persistent.default_model.clone() {
+            if !persistent.models.contains_key(&sel) && !persistent.providers.contains_key(&sel) {
+                persistent.default_model = disk.and_then(|d| d.default_model.clone());
+            }
+        }
         // If default_provider is ephemeral, don't change the saved default
         if !self
             .providers
@@ -971,35 +1490,27 @@ impl Config {
         Ok(content)
     }
 
-    pub fn active_provider(&self, override_name: Option<&str>) -> Result<&ProviderConfig> {
-        // Defence against an accidentally-empty `default_provider` (e.g.
-        // an older /logout path wrote "" back to config.toml) OR a
-        // `default_provider` that points to a provider section the user
-        // has since deleted from config.toml.  Rather than failing at
-        // startup, fall back to a lexicographically-first provider so
-        // the TUI still boots and the user can self-correct via /provider.
-        let name: &str = override_name
+    /// The active provider resolved to a legacy-shaped [`ProviderConfig`], via
+    /// the unified catalog so a new-schema / folded-CodingPlan selection resolves
+    /// (its id no longer lives in `config.providers`). Falls back to the first
+    /// catalog model when the selection is empty or dangling, so the TUI still
+    /// boots and the user can self-correct via `/provider`.
+    pub fn active_provider(&self, override_name: Option<&str>) -> Result<ProviderConfig> {
+        let selection = override_name
             .filter(|s| !s.is_empty())
-            .unwrap_or(&self.default_provider);
-        let fallback = || {
-            self.providers
-                .keys()
-                .min()
-                .map(String::as_str)
-                .ok_or_else(|| anyhow::anyhow!("No providers configured — run /login or /provider"))
+            .map(str::to_string)
+            .or_else(|| self.effective_model_selection());
+        let first_catalog = || {
+            let mut ids: Vec<String> = self.logical_models().into_keys().collect();
+            ids.sort();
+            ids.into_iter().next()
         };
-        let name: &str = if name.is_empty() { fallback()? } else { name };
-        match self.providers.get(name) {
-            Some(p) => Ok(p),
-            None => {
-                // default_provider / override pointed to a key that no
-                // longer exists — fall back to the first available.
-                let fallback_name = fallback()?;
-                // SAFETY: fallback() just returned Ok from self.providers,
-                // so the key must exist.
-                Ok(self.providers.get(fallback_name).unwrap())
-            }
-        }
+        let name = selection
+            .filter(|s| self.selection_exists(s))
+            .or_else(first_catalog)
+            .ok_or_else(|| anyhow::anyhow!("No providers configured — run /login or /provider"))?;
+        self.provider_config_for_selection(&name)
+            .ok_or_else(|| anyhow::anyhow!("No providers configured — run /login or /provider"))
     }
 
     /// Resolve the atomcode config dir. Pure function for testability —
@@ -1223,7 +1734,8 @@ model = "working-model"
 model = "missing-type"
 api_key = "keep-me-secret"
 "#;
-        let (config, warnings) = Config::parse_disk_content_tolerant(source, Path::new("x")).unwrap();
+        let (config, warnings) =
+            Config::parse_disk_content_tolerant(source, Path::new("x")).unwrap();
         assert_eq!(config.providers.len(), 1);
         assert_eq!(warnings.len(), 1);
 
@@ -1296,10 +1808,9 @@ model = "missing-type"
         let (config, warnings) = Config::load_with_diagnostics(&path).unwrap();
         assert_eq!(config.default_provider, "Valid");
         assert_eq!(config.providers.len(), 1);
-        assert!(
-            warnings.iter().any(|warning| warning
-                == "default_provider \"Broken\" was unavailable; using \"Valid\"")
-        );
+        assert!(warnings.iter().any(
+            |warning| warning == "default_provider \"Broken\" was unavailable; using \"Valid\""
+        ));
     }
 
     #[test]
@@ -1687,6 +2198,9 @@ model = "missing-type"
             evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
+            provider_accounts: HashMap::new(),
+            models: HashMap::new(),
+            default_model: None,
             datalog: DatalogConfig {
                 enabled: false,
                 dir: Some("/var/log/ac".to_string()),
@@ -1699,6 +2213,7 @@ model = "missing-type"
             auto_commit: false,
             subagent: Default::default(),
             loop_config: Default::default(),
+            coding: CodingConfig::default(),
             vision_preprocessor_provider: None,
             language: None,
             ui: Default::default(),
@@ -1729,6 +2244,7 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
+                pricing: None,
             },
         );
         cfg.save(&tmp).unwrap();
@@ -1942,6 +2458,7 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
+                pricing: None,
             },
         );
         cfg.save(tmp.path()).unwrap();
@@ -2021,6 +2538,7 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
+                pricing: None,
             },
         );
         Config {
@@ -2060,6 +2578,32 @@ model = "missing-type"
     }
 
     #[test]
+    fn image_attach_support_distinguishes_unconfigured_from_misconfigured() {
+        use super::ImageAttachSupport as S;
+        // Text-only main, nothing set → Unconfigured.
+        assert_eq!(
+            cfg_with("deepseek-v4-flash", None).image_attach_support(),
+            S::Unconfigured
+        );
+        // Empty string is treated as unset, not a misconfigured name.
+        assert_eq!(
+            cfg_with("deepseek-v4-flash", Some("")).image_attach_support(),
+            S::Unconfigured
+        );
+        // Configured but the name doesn't resolve → names the offending value
+        // so the gate can say "typo" instead of the misleading "未配置".
+        assert_eq!(
+            cfg_with("deepseek-v4-flash", Some("NoSuchProvider")).image_attach_support(),
+            S::PreprocessorUnresolvable("NoSuchProvider".to_string())
+        );
+        // Active vision model → Supported regardless of preprocessor.
+        assert_eq!(
+            cfg_with("claude-sonnet-4-5", None).image_attach_support(),
+            S::Supported
+        );
+    }
+
+    #[test]
     fn can_handle_attached_images_true_when_preprocessor_resolves() {
         // Main is text-only but a preprocessor is configured + present.
         let mut cfg = cfg_with("deepseek-v4-flash", Some("vl-helper"));
@@ -2083,6 +2627,7 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
+                pricing: None,
             },
         );
         assert!(cfg.can_handle_attached_images());
@@ -2184,5 +2729,518 @@ endpoint = "https://test.example/v1"
             Some("https://telemetry.example/v1")
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod provider_accounts_model_profiles_tests {
+    use super::*;
+
+    const NEW_SCHEMA: &str = r#"
+default_provider = ""
+default_model = "aliyun-default/qwen3-coder-plus"
+
+[provider_accounts.aliyun-default]
+provider = "aliyun"
+api_key = "sk-secret"
+
+[models."aliyun-default/qwen3-coder-plus"]
+account = "aliyun-default"
+model = "qwen3-coder-plus"
+context_window = 131072
+
+[models."aliyun-default/qwen3-max"]
+account = "aliyun-default"
+model = "qwen3-max"
+context_window = 131072
+capable_model = 5
+"#;
+
+    #[test]
+    fn new_schema_parses_accounts_models_and_default_model() {
+        let cfg: Config = toml::from_str(NEW_SCHEMA).unwrap();
+        assert_eq!(cfg.provider_accounts.len(), 1);
+        assert_eq!(cfg.provider_accounts["aliyun-default"].provider, "aliyun");
+        assert_eq!(cfg.models.len(), 2);
+        assert_eq!(
+            cfg.models["aliyun-default/qwen3-coder-plus"].model,
+            "qwen3-coder-plus"
+        );
+        assert_eq!(
+            cfg.models["aliyun-default/qwen3-max"].capable_model,
+            Some(5)
+        );
+        assert_eq!(
+            cfg.default_model.as_deref(),
+            Some("aliyun-default/qwen3-coder-plus")
+        );
+    }
+
+    #[test]
+    fn new_schema_round_trips_through_serialize() {
+        let cfg: Config = toml::from_str(NEW_SCHEMA).unwrap();
+        let rendered = cfg.serialize_for_disk(None).unwrap();
+        let reparsed: Config = toml::from_str(&rendered).unwrap();
+        assert_eq!(reparsed.default_model, cfg.default_model);
+        assert_eq!(reparsed.provider_accounts.len(), 1);
+        assert_eq!(reparsed.models.len(), 2);
+        assert_eq!(
+            reparsed.models["aliyun-default/qwen3-max"].context_window,
+            131072
+        );
+    }
+
+    #[test]
+    fn ephemeral_account_and_its_models_are_not_serialized() {
+        let mut cfg: Config = toml::from_str(NEW_SCHEMA).unwrap();
+        cfg.provider_accounts.insert(
+            "oauth-live".into(),
+            provider::ProviderAccountConfig {
+                provider: "openai".into(),
+                display_name: None,
+                api_key: Some("sk-runtime-only".into()),
+                base_url: None,
+                user_agent: None,
+                skip_tls_verify: false,
+                enterprise_url: None,
+                ephemeral: true,
+            },
+        );
+        cfg.models.insert(
+            "oauth-live/gpt".into(),
+            provider::ModelProfileConfig {
+                account: "oauth-live".into(),
+                model: "gpt-x".into(),
+                display_name: None,
+                system_prompt: None,
+                context_window: 128_000,
+                max_tokens: None,
+                capable_model: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                pricing: None,
+            },
+        );
+        let rendered = cfg.serialize_for_disk(None).unwrap();
+        assert!(
+            !rendered.contains("sk-runtime-only"),
+            "ephemeral account credential leaked into saved config"
+        );
+        assert!(
+            !rendered.contains("oauth-live"),
+            "ephemeral account persisted"
+        );
+        // The persistent account + models survive.
+        assert!(rendered.contains("aliyun-default"));
+    }
+
+    #[test]
+    fn validation_catches_bad_references_and_limits() {
+        let mut cfg = Config::default();
+        cfg.provider_accounts.insert(
+            "corp".into(),
+            provider::ProviderAccountConfig {
+                provider: "openai-compatible".into(), // no default endpoint…
+                display_name: None,
+                api_key: None,
+                base_url: None, // …and none supplied → error
+                user_agent: None,
+                skip_tls_verify: false,
+                enterprise_url: None,
+                ephemeral: false,
+            },
+        );
+        cfg.models.insert(
+            "corp/bad".into(),
+            provider::ModelProfileConfig {
+                account: "does-not-exist".into(), // dangling reference → error
+                model: "".into(),                 // empty model → error
+                display_name: None,
+                system_prompt: None,
+                context_window: 0, // zero window → error
+                max_tokens: None,
+                capable_model: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                pricing: None,
+            },
+        );
+        cfg.default_model = Some("nope".into()); // unresolvable default → error
+
+        let diags = cfg.validate_provider_accounts_and_models();
+        assert!(
+            diags.iter().any(|d| d.contains("no default endpoint")),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("unknown account")),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("missing `model`")),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("context_window = 0")),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("default_model")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn valid_new_schema_passes_validation() {
+        let cfg: Config = toml::from_str(NEW_SCHEMA).unwrap();
+        assert!(
+            cfg.validate_provider_accounts_and_models().is_empty(),
+            "{:?}",
+            cfg.validate_provider_accounts_and_models()
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_projection_tests {
+    use super::*;
+
+    const LEGACY: &str = r#"
+default_provider = "MyDeepSeek"
+
+[providers.MyDeepSeek]
+type = "openai"
+base_url = "https://api.deepseek.com/v1"
+api_key = "sk-legacy"
+model = "deepseek-chat"
+context_window = 128000
+capable_model = 3
+"#;
+
+    #[test]
+    fn legacy_provider_projects_to_synthetic_account_and_model() {
+        let cfg: Config = toml::from_str(LEGACY).unwrap();
+        let accounts = cfg.logical_accounts();
+        let a = accounts.get("MyDeepSeek").expect("synthetic account");
+        assert_eq!(a.provider, "openai");
+        assert_eq!(a.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+        assert_eq!(a.api_key.as_deref(), Some("sk-legacy"));
+
+        let models = cfg.logical_models();
+        let m = models.get("MyDeepSeek").expect("synthetic model");
+        assert_eq!(m.account, "MyDeepSeek");
+        assert_eq!(m.model, "deepseek-chat");
+        assert_eq!(m.context_window, 128000);
+        assert_eq!(m.capable_model, Some(3));
+
+        assert_eq!(
+            cfg.effective_model_selection().as_deref(),
+            Some("MyDeepSeek")
+        );
+    }
+
+    #[test]
+    fn mixed_schema_catalog_includes_legacy_and_new() {
+        let toml = format!(
+            "{LEGACY}\n[provider_accounts.corp]\nprovider = \"openai-compatible\"\nbase_url = \"https://llm.corp/v1\"\n\n[models.\"corp/code\"]\naccount = \"corp\"\nmodel = \"corp-code\"\ncontext_window = 200000\n"
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        let accounts = cfg.logical_accounts();
+        assert!(accounts.contains_key("MyDeepSeek"), "legacy projected");
+        assert!(accounts.contains_key("corp"), "new-schema account");
+        let models = cfg.logical_models();
+        assert!(models.contains_key("MyDeepSeek"));
+        assert!(models.contains_key("corp/code"));
+        assert!(cfg.validate_provider_accounts_and_models().is_empty());
+    }
+
+    #[test]
+    fn new_schema_wins_on_id_collision_with_diagnostic() {
+        let toml = r#"
+default_provider = "dup"
+
+[providers.dup]
+type = "openai"
+base_url = "https://legacy/v1"
+model = "legacy-model"
+context_window = 64000
+
+[provider_accounts.dup]
+provider = "deepseek"
+
+[models.dup]
+account = "dup"
+model = "new-model"
+context_window = 131072
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        // New-schema entries win.
+        assert_eq!(cfg.logical_accounts()["dup"].provider, "deepseek");
+        assert_eq!(cfg.logical_models()["dup"].model, "new-model");
+        // …and the collision is reported, not silent.
+        let diags = cfg.model_catalog_collisions();
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        assert!(diags.iter().all(|d| d.contains("dup")));
+    }
+
+    #[test]
+    fn effective_selection_prefers_default_model_over_default_provider() {
+        let toml = "default_provider = \"X\"\ndefault_model = \"acc/y\"\n\n[provider_accounts.acc]\nprovider = \"openai\"\n\n[models.\"acc/y\"]\naccount = \"acc\"\nmodel = \"y\"\ncontext_window = 8000\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.effective_model_selection().as_deref(), Some("acc/y"));
+    }
+
+    #[test]
+    fn upgrade_legacy_provider_moves_entry_and_repoints_default() {
+        let mut cfg: Config = toml::from_str(LEGACY).unwrap();
+        cfg.upgrade_legacy_provider("MyDeepSeek").unwrap();
+        assert!(!cfg.providers.contains_key("MyDeepSeek"), "legacy removed");
+        assert!(cfg.provider_accounts.contains_key("MyDeepSeek"));
+        assert!(cfg.models.contains_key("MyDeepSeek"));
+        assert_eq!(cfg.default_model.as_deref(), Some("MyDeepSeek"));
+        // Unknown / colliding upgrades error rather than corrupt.
+        assert!(cfg.upgrade_legacy_provider("nope").is_err());
+        let mut legacy2: Config = toml::from_str(LEGACY).unwrap();
+        legacy2.provider_accounts.insert(
+            "MyDeepSeek".into(),
+            provider::ProviderAccountConfig {
+                provider: "deepseek".into(),
+                display_name: None,
+                api_key: None,
+                base_url: None,
+                user_agent: None,
+                skip_tls_verify: false,
+                enterprise_url: None,
+                ephemeral: false,
+            },
+        );
+        assert!(legacy2.upgrade_legacy_provider("MyDeepSeek").is_err());
+    }
+
+    #[test]
+    fn model_referencing_a_legacy_provider_account_validates_and_resolves() {
+        // A new-schema model may point its `account` at a legacy provider name
+        // (which projects to a synthetic account). Validation must accept it and
+        // resolution must succeed.
+        let toml = "default_model = \"leg/extra\"\n\n[providers.leg]\ntype = \"openai\"\nbase_url = \"https://api.deepseek.com/v1\"\napi_key = \"sk-leg\"\nmodel = \"deepseek-chat\"\ncontext_window = 128000\n\n[models.\"leg/extra\"]\naccount = \"leg\"\nmodel = \"deepseek-coder\"\ncontext_window = 131072\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            cfg.validate_provider_accounts_and_models().is_empty(),
+            "{:?}",
+            cfg.validate_provider_accounts_and_models()
+        );
+        let r = cfg.resolve_model(None).unwrap();
+        assert_eq!(r.model, "deepseek-coder");
+        assert_eq!(r.api_key.as_deref(), Some("sk-leg"));
+        assert_eq!(r.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+    }
+
+    #[test]
+    fn legacy_only_config_is_not_rewritten_on_serialize() {
+        let cfg: Config = toml::from_str(LEGACY).unwrap();
+        let rendered = cfg.serialize_for_disk(None).unwrap();
+        assert!(
+            rendered.contains("[providers.MyDeepSeek]"),
+            "legacy section kept verbatim"
+        );
+        assert!(
+            !rendered.contains("[provider_accounts"),
+            "load/serialize must not auto-upgrade legacy into the new schema"
+        );
+    }
+
+    #[test]
+    fn provider_config_for_selection_covers_legacy_and_new_schema() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "providers": { "leg": { "type": "openai", "base_url": "https://legacy/v1", "model": "m", "context_window": 8000 } },
+            "provider_accounts": { "acc": { "provider": "deepseek", "base_url": "https://mirror/v1" } },
+            "models": { "acc/ds": { "account": "acc", "model": "deepseek-chat", "context_window": 131072 } }
+        }))
+        .unwrap();
+        // Legacy provider returned verbatim.
+        let leg = cfg.provider_config_for_selection("leg").unwrap();
+        assert_eq!(leg.model, "m");
+        assert_eq!(leg.base_url.as_deref(), Some("https://legacy/v1"));
+        // New-schema model id reconstructs a ProviderConfig via resolve_model.
+        let new = cfg.provider_config_for_selection("acc/ds").unwrap();
+        assert_eq!(new.model, "deepseek-chat");
+        assert_eq!(new.base_url.as_deref(), Some("https://mirror/v1"));
+        assert_eq!(new.context_window, 131072);
+        assert!(!new.ephemeral);
+        // Unknown id → None.
+        assert!(cfg.provider_config_for_selection("nope").is_none());
+        assert!(cfg.selection_exists("leg") && cfg.selection_exists("acc/ds"));
+        assert!(!cfg.selection_exists("nope"));
+    }
+
+    #[test]
+    fn active_provider_resolves_new_schema_when_providers_empty() {
+        // A CodingPlan-style config: everything in the new schema, no legacy
+        // `[providers.*]`. active_provider must still resolve (regression: it
+        // used to read only config.providers → Err → footer "未配置").
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "AtomGit-deepseek-v4-flash",
+            "provider_accounts": { "AtomGit": { "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1" } },
+            "models": { "AtomGit-deepseek-v4-flash": { "account": "AtomGit", "model": "deepseek-v4-flash", "context_window": 128000 } }
+        }))
+        .unwrap();
+        assert!(cfg.providers.is_empty());
+        let p = cfg.active_provider(None).unwrap();
+        assert_eq!(p.model, "deepseek-v4-flash");
+        assert_eq!(
+            p.base_url.as_deref(),
+            Some("https://llm-api.atomgit.com/v1")
+        );
+        // Falls back to a catalog model when the selection is dangling.
+        let p2 = cfg.active_provider(Some("nope")).unwrap();
+        assert_eq!(p2.model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn update_selection_reasoning_writes_to_correct_schema() {
+        let mut cfg: Config = serde_json::from_value(serde_json::json!({
+            "providers": { "leg": { "type": "openai", "base_url": "https://legacy/v1", "model": "m", "context_window": 8000 } },
+            "provider_accounts": { "acc": { "provider": "deepseek" } },
+            "models": { "acc/ds": { "account": "acc", "model": "deepseek-chat", "context_window": 131072 } }
+        }))
+        .unwrap();
+        // New-schema model — covers the full reasoning/thinking field set.
+        assert!(cfg.update_selection_reasoning("acc/ds", |r| {
+            *r.thinking_enabled = Some(true);
+            *r.reasoning_effort = Some("high".into());
+            *r.thinking_type = Some("enabled".into());
+            *r.thinking_keep = Some("all".into());
+        }));
+        assert_eq!(cfg.models["acc/ds"].thinking_enabled, Some(true));
+        assert_eq!(
+            cfg.models["acc/ds"].reasoning_effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            cfg.models["acc/ds"].thinking_type.as_deref(),
+            Some("enabled")
+        );
+        assert_eq!(cfg.models["acc/ds"].thinking_keep.as_deref(), Some("all"));
+        // Legacy provider.
+        assert!(cfg.update_selection_reasoning("leg", |r| *r.thinking_budget = Some(2048)));
+        assert_eq!(cfg.providers["leg"].thinking_budget, Some(2048));
+        // Unknown id → false, no write.
+        assert!(!cfg.update_selection_reasoning("nope", |r| *r.thinking_enabled = Some(false)));
+    }
+
+    #[test]
+    fn codingplan_flat_providers_fold_into_grouped_accounts() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "AtomGit-GLM-5.2": { "type": "openai", "base_url": "https://llm-api.atomgit.com/v1", "model": "GLM-5.2", "context_window": 64000 },
+                "AtomGit-Qwen": { "type": "openai", "base_url": "https://llm-api.atomgit.com/v1", "model": "Qwen", "context_window": 64000 },
+                "AtomGit-anthropic-claude": { "type": "claude", "base_url": "https://llm-api.atomgit.com/v1", "model": "claude-3.5", "context_window": 200000 },
+                "my-openai": { "type": "openai", "base_url": "https://api.openai.com/v1", "model": "gpt-4", "context_window": 128000 }
+            }
+        }))
+        .unwrap();
+        let accounts = cfg.logical_accounts();
+        // Two openai CodingPlan models collapse into ONE account; claude gets its
+        // own; the user's manual provider is untouched.
+        assert!(accounts.contains_key("AtomGit"));
+        assert!(accounts.contains_key("AtomGit-anthropic"));
+        assert!(accounts.contains_key("my-openai"));
+        assert!(!accounts.contains_key("AtomGit-GLM-5.2"), "folded away");
+        assert!(!accounts.contains_key("AtomGit-Qwen"), "folded away");
+
+        let models = cfg.logical_models();
+        // Model ids stay = legacy provider keys (default_provider stays resolvable),
+        // only the parent account folds.
+        assert_eq!(models["AtomGit-GLM-5.2"].account, "AtomGit");
+        assert_eq!(models["AtomGit-Qwen"].account, "AtomGit");
+        assert_eq!(
+            models["AtomGit-anthropic-claude"].account,
+            "AtomGit-anthropic"
+        );
+        assert_eq!(models["my-openai"].account, "my-openai");
+
+        // Resolving by the stable legacy id still works and keeps the gateway
+        // base_url (so the OAuth request signer still fires).
+        let r = cfg.resolve_model(Some("AtomGit-GLM-5.2")).unwrap();
+        assert_eq!(r.account_id, "AtomGit");
+        assert_eq!(r.model, "GLM-5.2");
+        assert_eq!(r.provider_type, "openai");
+        assert!(r.base_url.as_deref().unwrap().contains("atomgit"));
+        let c = cfg.resolve_model(Some("AtomGit-anthropic-claude")).unwrap();
+        assert_eq!(c.account_id, "AtomGit-anthropic");
+        assert_eq!(c.provider_type, "anthropic");
+    }
+
+    #[test]
+    fn resolve_model_resolves_a_legacy_selection() {
+        let cfg: Config = toml::from_str(LEGACY).unwrap();
+        let r = cfg.resolve_model(None).unwrap();
+        assert_eq!(r.selection_id, "MyDeepSeek");
+        assert_eq!(r.account_id, "MyDeepSeek");
+        assert_eq!(r.provider_type, "openai");
+        assert_eq!(r.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+        assert_eq!(r.api_key.as_deref(), Some("sk-legacy"));
+        assert_eq!(r.model, "deepseek-chat");
+        assert_eq!(r.context_window, 128000);
+        assert_eq!(r.capable_model, Some(3));
+    }
+
+    #[test]
+    fn resolve_model_uses_preset_default_base_url_when_account_omits_it() {
+        let toml = "default_model = \"acc/ds\"\n\n[provider_accounts.acc]\nprovider = \"deepseek\"\napi_key = \"sk-x\"\n\n[models.\"acc/ds\"]\naccount = \"acc\"\nmodel = \"deepseek-chat\"\ncontext_window = 131072\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let r = cfg.resolve_model(None).unwrap();
+        assert_eq!(r.provider_id, "deepseek");
+        assert_eq!(r.provider_type, "openai");
+        // Falls back to the deepseek preset's default endpoint.
+        assert_eq!(r.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+    }
+
+    #[test]
+    fn account_base_url_overrides_preset_default() {
+        let toml = "default_model = \"acc/ds\"\n\n[provider_accounts.acc]\nprovider = \"deepseek\"\nbase_url = \"https://mirror.internal/v1\"\n\n[models.\"acc/ds\"]\naccount = \"acc\"\nmodel = \"deepseek-chat\"\ncontext_window = 131072\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.resolve_model(None).unwrap().base_url.as_deref(),
+            Some("https://mirror.internal/v1")
+        );
+    }
+
+    #[test]
+    fn resolve_model_errors_are_secret_safe() {
+        // A resolution failure must never echo an account credential.
+        let toml = "default_model = \"missing\"\n\n[provider_accounts.acc]\nprovider = \"openai\"\napi_key = \"sk-SUPER-SECRET-XYZ\"\n\n[models.\"acc/m\"]\naccount = \"acc\"\nmodel = \"gpt\"\ncontext_window = 8000\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = cfg.resolve_model(None).unwrap_err().to_string();
+        assert!(err.contains("missing"), "{err}");
+        assert!(
+            !err.contains("SUPER-SECRET"),
+            "credential leaked in error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_model_errors_without_a_selection() {
+        let cfg = Config::default(); // no default_model, empty default_provider
+        assert!(cfg.resolve_model(None).is_err());
+    }
+
+    #[test]
+    fn default_context_window_routes_through_resolution() {
+        // Legacy: equals providers[default_provider].context_window (128000).
+        let legacy: Config = toml::from_str(LEGACY).unwrap();
+        assert_eq!(legacy.default_context_window(), 128000);
+        // New schema: equals the selected model profile's window.
+        let toml = "default_model = \"acc/ds\"\n\n[provider_accounts.acc]\nprovider = \"deepseek\"\napi_key = \"sk-x\"\n\n[models.\"acc/ds\"]\naccount = \"acc\"\nmodel = \"deepseek-chat\"\ncontext_window = 200000\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.default_context_window(), 200000);
     }
 }

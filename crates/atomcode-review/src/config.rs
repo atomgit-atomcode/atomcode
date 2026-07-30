@@ -63,6 +63,12 @@ pub struct ReviewAgentConfig {
     /// Engineering callers (e.g. the service, which reviews huge repos on NFS) set a bound
     /// like `8000` so a kernel-scale repo degrades automatically. `0` ⇒ never mount.
     pub graph_max_indexed_files: usize,
+    /// Skill directories to load `use_skill` / `list_skills` tools from. Empty (default)
+    /// ⇒ NO skill tools mounted, matching bare-CLI behavior: only some deployments / repos
+    /// opt into skills via `--skill-dir`. Each dir is scanned for `SKILL.md` (directory
+    /// skill with bundled `scripts/` / `references/`) or single `<name>.md` files.
+    /// LOW→HIGH priority order (later dirs override earlier on name collision).
+    pub skill_dirs: Vec<PathBuf>,
 }
 
 impl ReviewAgentConfig {
@@ -89,6 +95,7 @@ impl ReviewAgentConfig {
             progress: None,
             no_web: false,
             graph_max_indexed_files: usize::MAX, // no degrade by default (bare-CLI behavior)
+            skill_dirs: Vec::new(), // no skills by default (bare-CLI behavior)
         }
     }
 

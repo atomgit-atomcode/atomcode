@@ -66,6 +66,9 @@ fn age_windows(windows: &[RateLimitWindow], elapsed: Duration) -> Vec<RateLimitW
 /// over quota (transient 429) or no window data is available. Monthly windows (30d)
 /// are retired; the relevant window is the small (<= 5h) one.
 pub fn decide_from_windows(windows: &[RateLimitWindow], hint: &RateLimitHint) -> RateLimitDecision {
+    if hint.terminal {
+        return RateLimitDecision::from_hint(hint);
+    }
     // The blocking window is the 5h rolling one (<= 18000s; 30d monthly windows are
     // retired). Only a window the server flagged `quota_exhausted` justifies pausing on
     // its reset countdown; among those, the smallest reopens first. If NO in-range window
@@ -231,6 +234,8 @@ mod tests {
         let hint = RateLimitHint {
             http_status: Some(429),
             retry_after_secs: Some(30),
+            terminal: false,
+            attempt: 1,
         };
         assert_eq!(hook.on_rate_limit(&hint).await, None);
     }
@@ -241,6 +246,8 @@ mod tests {
         let hint = RateLimitHint {
             http_status: Some(429),
             retry_after_secs: None,
+            terminal: false,
+            attempt: 1,
         };
         assert_eq!(hook.on_rate_limit(&hint).await, None);
     }
@@ -286,6 +293,8 @@ mod tests {
         RateLimitHint {
             http_status: Some(429),
             retry_after_secs: None,
+            terminal: false,
+            attempt: 1,
         }
     }
 
@@ -318,6 +327,8 @@ mod tests {
             &RateLimitHint {
                 http_status: Some(429),
                 retry_after_secs: Some(15),
+                terminal: false,
+                attempt: 1,
             },
         );
         assert_eq!(d, RateLimitDecision::WaitAndRetry { secs: 15 });
@@ -336,33 +347,27 @@ mod tests {
                 &[win_sized(18000, 14160, false)],
                 &RateLimitHint {
                     http_status: Some(429),
-                    retry_after_secs: Some(20)
+                    retry_after_secs: Some(20),
+                    terminal: false,
+                    attempt: 1,
                 },
             ),
             RateLimitDecision::WaitAndRetry { secs: 20 },
         );
-        // With no retry hint we may pause, but must NOT surface the healthy window's reset
-        // time/countdown (that's what read as the bogus "5小时窗口已用尽 3h56m").
-        match decide_from_windows(
-            &[win_sized(18000, 14160, false)],
-            &RateLimitHint {
-                http_status: Some(429),
-                retry_after_secs: None,
-            },
-        ) {
-            RateLimitDecision::Pause {
-                reset_at_display,
-                secs_until_reset,
-                ..
-            } => {
-                assert!(
-                    reset_at_display.is_empty(),
-                    "must not show a healthy window's reset time"
-                );
-                assert_eq!(secs_until_reset, None);
-            }
-            RateLimitDecision::WaitAndRetry { .. } => {}
-        }
+        // With no retry hint, the kernel's generic transient policy supplies a
+        // bounded fallback; it must never borrow the healthy window's reset time.
+        assert!(matches!(
+            decide_from_windows(
+                &[win_sized(18000, 14160, false)],
+                &RateLimitHint {
+                    http_status: Some(429),
+                    retry_after_secs: None,
+                    terminal: false,
+                    attempt: 1,
+                },
+            ),
+            RateLimitDecision::WaitAndRetry { secs: 2..=4 },
+        ));
     }
 
     #[test]
@@ -405,6 +410,8 @@ mod tests {
         let h = RateLimitHint {
             http_status: Some(429),
             retry_after_secs: Some(30),
+            terminal: false,
+            attempt: 1,
         };
         assert_eq!(
             decide_from_windows(&[], &h),

@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.0.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.0.3-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -183,6 +183,28 @@ npm install -g @atomgit.com/atomcode
 # 使用 Homebrew 安装
 brew install --cask atomcode
 ```
+
+### Shell 补全
+
+AtomCode 可为 Bash、Zsh、Fish、PowerShell 和 Elvish 生成补全脚本。例如：
+
+```bash
+# Bash（当前会话）
+source <(atomcode completion bash)
+
+# Zsh（持久生效）
+mkdir -p ~/.zfunc
+atomcode completion zsh > ~/.zfunc/_atomcode
+# 同时在 ~/.zshrc 的 `compinit` 之前加入：fpath=(~/.zfunc $fpath)
+
+# Fish（持久生效）
+mkdir -p ~/.config/fish/completions
+atomcode completion fish > ~/.config/fish/completions/atomcode.fish
+```
+
+PowerShell 可运行 `atomcode completion powershell | Out-String |
+Invoke-Expression`。完整 Shell 列表见 `atomcode completion --help`。该能力只作用于
+外部命令行，不会改变 TUI 内 `Tab` 的模式切换行为。
 
 ### 依赖
 
@@ -433,12 +455,13 @@ atomcode --prompt-file task.md
 | `/setup` | 首次运行：安装推荐 skill 并执行 |
 | `/welcome` | 重新运行引导向导 |
 | `/language` | 切换显示语言及默认 Git 提交消息语言 |
-| `/issue` | 反馈 bug / 提交功能需求（交互式向导） |
 | `/guide <问题>` | 向 atomcode-guide 询问使用方式 |
 | `/keys` | 查看键盘快捷键 |
 | `/help` | 查看命令与快捷键 |
 | `/quit`、`/exit` | 退出 AtomCode（或连按 Ctrl+C） |
 
+> **AtomGit Issue**：`/issue` 已移除。执行 `/login` 后，直接用自然语言提出需求即可，例如“为这个 Bug 创建一个 AtomGit Issue”，AtomCode 会调用内置的 `atomgit_issue` 工具。读取 Issue 可直接执行；创建 Issue，以及新增、编辑或删除评论仍需权限确认。
+>
 > **插件命令**：除了上面的内置命令，插件还能注册自己的斜杠命令。例如安装官方频道插件后即可使用 `/wechat`（显示 AtomCode 微信用户群二维码）：
 >
 > ```text
@@ -522,8 +545,7 @@ atomcode/
     atomcode-review/        # 代码评审专业化
     atomcode-tuix/          # 终端 UI
     atomcode-cli/           # TUI 与 headless 入口
-    atomcode-daemon/        # HTTP/SSE/WebSocket 传输层
-    atomcode-core/          # 过渡期 session/plugin/live 兼容代码
+    atomcode-daemon/        # HTTP/SSE/WebSocket 传输层及历史 session importer
 ```
 
 coding 主调用链是 `CLI/TUI/daemon → CodingRuntime → kernel`。已经退役的 core agent
@@ -602,11 +624,11 @@ cargo run -p atomcode-daemon
 cargo test
 
 # 运行指定 crate 的测试
-cargo test -p atomcode-core
+cargo test -p atomcode-capabilities
 cargo test -p atomcode-tuix
 
 # 运行指定的用例
-cargo test -p atomcode-core test_name
+cargo test -p atomcode-capabilities test_name
 ```
 
 ### 常用命令
@@ -675,8 +697,8 @@ cargo install --path crates/atomcode-cli
 
 ### 从哪里上手
 
-- **新增工具** —— 在 `crates/atomcode-core/src/tool/` 下实现 `Tool` trait
-- **新增模型提供方** —— 在 `crates/atomcode-core/src/provider/` 下实现 `LlmProvider`
+- **新增工具** —— 在 `crates/atomcode-capabilities/src/tools/` 下实现 `Tool` trait
+- **新增模型提供方** —— 在 `crates/atomcode-capabilities/src/provider/` 下实现 `LlmProvider`
 - **改进 UI** —— 渲染相关代码在 `crates/atomcode-tuix/src/render/`
 - **修 Bug** —— 到 [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) 上挑一个
 

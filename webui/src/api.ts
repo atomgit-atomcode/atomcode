@@ -360,6 +360,16 @@ export async function renameSession(
   if (!resp.ok) throw new Error(`rename failed: ${resp.status}`);
 }
 
+export class DeleteSessionError extends Error {
+  readonly code?: string;
+
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = 'DeleteSessionError';
+    this.code = code;
+  }
+}
+
 export async function deleteSession(
   projectHash: string,
   sessionId: string,
@@ -368,7 +378,25 @@ export async function deleteSession(
     `/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}`,
     { method: 'DELETE', headers: authHeaders() },
   );
-  if (!resp.ok) throw new Error(`delete failed: ${resp.status}`);
+  if (!resp.ok) {
+    const payload: unknown = await resp.json().catch(() => undefined);
+    const errorValue =
+      payload && typeof payload === 'object' && 'error' in payload
+        ? (payload as { error: unknown }).error
+        : undefined;
+    const codeValue =
+      payload && typeof payload === 'object' && 'code' in payload
+        ? (payload as { code: unknown }).code
+        : undefined;
+    const detail =
+      typeof payload === 'string'
+        ? payload
+        : typeof errorValue === 'string'
+          ? errorValue
+          : undefined;
+    const code = typeof codeValue === 'string' ? codeValue : undefined;
+    throw new DeleteSessionError(detail || `delete failed: ${resp.status}`, code);
+  }
 }
 
 // --- Config types ---
@@ -748,6 +776,18 @@ export async function postLiveStop(): Promise<void> {
   if (!body.accepted) throw new Error('live runtime rejected the stop request');
 }
 
+/** Sync-mode manual compaction: dispatch a compaction against the shared live
+ *  runtime. `accepted:false` means no live runtime is bound (nothing to compact). */
+export async function postLiveCompact(): Promise<{ accepted: boolean }> {
+  const resp = await fetch('/live/compact', {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`live compact failed: ${resp.status}`);
+  const body = await resp.json() as { accepted?: boolean };
+  return { accepted: body.accepted === true };
+}
+
 /** Ask the bound native runtime to resume an existing session. */
 export async function postLiveSwitchSession(sessionId: string): Promise<void> {
   const resp = await fetch('/live/switch_session', {
@@ -762,15 +802,20 @@ export async function postLiveSwitchSession(sessionId: string): Promise<void> {
 
 /** Sync-mode model switch: notify the daemon immediately when the dropdown
  *  changes (not just on send), so the TUI header and other tabs follow. */
-export async function postLiveProvider(provider: string, sessionId?: string | null): Promise<void> {
+export async function postLiveProvider(
+  provider: string,
+  sessionId?: string | null,
+): Promise<{ ok: boolean; activeTurn: boolean; error?: string }> {
   const resp = await fetch('/live/provider', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ provider, ...(sessionId ? { session_id: sessionId } : {}) }),
   });
   if (!resp.ok) throw new Error(`switch live provider failed: ${resp.status}`);
-  const body = await resp.json() as { ok?: boolean; error?: string };
-  if (!body.ok) throw new Error(body.error ?? 'live runtime rejected the provider switch');
+  // A business rejection (e.g. active_turn) is NOT thrown — the caller reverts its
+  // optimistic selection and shows a notice. Only transport failures throw.
+  const body = await resp.json() as { ok?: boolean; active_turn?: boolean; error?: string };
+  return { ok: body.ok === true, activeTurn: body.active_turn === true, error: body.error };
 }
 
 // --- /command endpoint ---
@@ -780,7 +825,7 @@ export type CommandResult =
   | { kind: 'remember'; scope: 'global' | 'project' }
   | { kind: 'forget'; removed: string[] }
   | { kind: 'memory'; global: string[]; project: string[] }
-  | { kind: 'context'; system_tokens: number; sent_tokens: number; total_messages: number; tool_defs_tokens: number; cold_zone_tokens: number; ctx_window: number; ctx_name: string }
+  | { kind: 'context'; used_tokens: number; total_messages: number; ctx_window: number; utilization: number; ctx_name: string }
   | { kind: 'compact'; applied: boolean; removed_messages: number; before_tokens: number; after_tokens: number }
   | { kind: 'whoami'; logged_in: boolean; username?: string; name?: string; email?: string }
   | { kind: 'status'; logged_in: boolean; username?: string; provider: string; model: string; working_dir: string; config_path: string; text: string }
@@ -902,5 +947,9 @@ export async function postLiveUserInput(
     body: JSON.stringify(body),
   });
   if (!resp.ok) throw new Error(`answer live user input failed: ${resp.status}`);
-  return resp.json();
+  const result = await resp.json() as { accepted: boolean; error?: string };
+  if (!result.accepted) {
+    throw new Error(result.error ?? 'live runtime did not accept the user input answer');
+  }
+  return result;
 }

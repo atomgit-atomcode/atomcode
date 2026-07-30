@@ -310,9 +310,26 @@ impl LiveViewHub {
     }
 
     pub async fn submit_confirmed(&self, input: UserInput) -> Result<SubmitReceipt, HubError> {
+        let echo = input.clone();
+        self.submit_confirmed_with_echo(input, echo).await
+    }
+
+    /// Like [`Self::submit_confirmed`], but the view echo — what every subscribed
+    /// tab (and a synchronized TUI) DISPLAYS, and what late joiners replay — is
+    /// `echo_input`, DISTINCT from the `runtime_input` fed to the model.
+    ///
+    /// The webui image path needs this: it submits the VL-PREPROCESSED caption as
+    /// `runtime_input` (a text-only model 400s on the raw image bytes) while
+    /// echoing the user's ORIGINAL text + image, so the live view shows what the
+    /// user actually typed instead of the machine-generated caption overwriting it.
+    pub async fn submit_confirmed_with_echo(
+        &self,
+        runtime_input: UserInput,
+        echo_input: UserInput,
+    ) -> Result<SubmitReceipt, HubError> {
         let (binding, handle) = self.bound_handle()?;
         let receipt = handle
-            .submit(input.clone())
+            .submit(runtime_input)
             .await
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
         let receipt_generation = match receipt {
@@ -335,7 +352,7 @@ impl LiveViewHub {
             state.pending_requests.clear();
         }
         state.turn_active = true;
-        self.publish_view_locked(&mut state, LiveViewEvent::InputAccepted(input), true);
+        self.publish_view_locked(&mut state, LiveViewEvent::InputAccepted(echo_input), true);
         Ok(receipt)
     }
 
@@ -374,12 +391,44 @@ impl LiveViewHub {
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))
     }
 
+    /// Whether the bound runtime is mid-turn, parked awaiting approval, or already
+    /// reconfiguring. A provider reload in any of these states hard-kills the
+    /// in-flight turn (via `AgentCommand::Shutdown`) and drops its context — the
+    /// runtime respawns from the last on-disk snapshot, which predates the
+    /// interrupted turn. The provider-switch entry points refuse so the user stops
+    /// the turn first. Unbound → false (nothing to interrupt).
+    ///
+    /// This is a best-effort guard, not an atomic gate: the caller releases this
+    /// lock before it re-acquires state to dispatch, and the runtime processes a
+    /// concurrently-queued submit ahead of the reassemble, so a turn that starts
+    /// in that narrow window can still be caught. Closing it fully needs
+    /// runtime-level coordination (out of this fix's scope). The phase set mirrors
+    /// [`Self::bind_with_provider`]'s active-turn set so both refuse identically.
+    pub fn turn_in_progress(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.turn_active {
+            return true;
+        }
+        let Some(bound) = state.binding.as_ref() else {
+            return false;
+        };
+        matches!(
+            bound.control.status().phase,
+            RuntimePhase::InTurn | RuntimePhase::WaitingApproval | RuntimePhase::Reconfiguring
+        )
+    }
+
     pub async fn reload_provider(
         &self,
         expected: &LiveBinding,
         next: atomcode_coding::CodingAgentConfig,
         provider_fingerprint: String,
     ) -> Result<atomcode_coding::RuntimeGeneration, HubError> {
+        // Refuse to swap the provider while a turn is running: reassemble would
+        // hard-kill it and silently discard the interrupted turn's work.
+        if self.turn_in_progress() {
+            return Err(HubError::ActiveTurn);
+        }
         let handle = self.bound_handle_for(expected)?;
         let provider = next.provider_name.clone();
         let generation = handle
@@ -430,7 +479,9 @@ impl LiveViewHub {
     pub async fn reload_capabilities(&self) -> Result<atomcode_coding::SessionChanged, HubError> {
         let (binding, handle) = self.bound_handle()?;
         let changed = handle
-            .reload_capabilities()
+            .reload_capabilities_with_plugin_skills(Some(crate::gather_plugin_skill_dirs_for(
+                &binding.working_dir,
+            )))
             .await
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
         self.commit_changed_snapshot(&binding, &handle, &changed)
@@ -1254,6 +1305,32 @@ mod tests {
     }
 
     #[test]
+    fn turn_in_progress_reflects_runtime_phase_and_gates_provider_reload() {
+        let hub = LiveViewHub::new();
+        // Unbound: nothing to interrupt.
+        assert!(!hub.turn_in_progress());
+
+        let (control, _) = control();
+        hub.bind("session-1", PathBuf::from("/one"), snapshot("old"), control.clone())
+            .unwrap();
+        // Ready phase, no active turn → a provider reload is safe.
+        assert!(!hub.turn_in_progress());
+
+        // A running turn (InTurn phase) must gate the reload.
+        control.status.lock().unwrap().phase = RuntimePhase::InTurn;
+        assert!(hub.turn_in_progress());
+
+        // Parked awaiting approval also counts as in-flight.
+        control.status.lock().unwrap().phase = RuntimePhase::WaitingApproval;
+        assert!(hub.turn_in_progress());
+
+        // Already reconfiguring (e.g. a prior reload in flight): a second reload
+        // must also be refused — mirrors bind_with_provider's active set.
+        control.status.lock().unwrap().phase = RuntimePhase::Reconfiguring;
+        assert!(hub.turn_in_progress());
+    }
+
+    #[test]
     fn driver_commands_and_local_inputs_share_the_bound_runtime() {
         let hub = LiveViewHub::new();
         let (control, commands) = control();
@@ -1276,6 +1353,28 @@ mod tests {
                 if matches!(&observation.event, LiveViewEvent::InputAccepted(input)
                     if input.text == "typed in tui")
         ));
+    }
+
+    #[test]
+    fn dispatch_routes_manual_compact_to_bound_runtime() {
+        let hub = LiveViewHub::new();
+        let (control, commands) = control();
+        hub.bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
+            .unwrap();
+
+        hub.dispatch(DriverCommand::Compact(None)).unwrap();
+
+        assert!(matches!(
+            commands.lock().unwrap().as_slice(),
+            [DriverCommand::Compact(None)]
+        ));
+    }
+
+    #[test]
+    fn dispatch_compact_without_runtime_is_unbound() {
+        let hub = LiveViewHub::new();
+        let error = hub.dispatch(DriverCommand::Compact(None)).unwrap_err();
+        assert_eq!(error, HubError::Unbound);
     }
 
     #[test]

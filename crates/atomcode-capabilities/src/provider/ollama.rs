@@ -152,7 +152,17 @@ impl LlmProvider for OllamaProvider {
         // Snapshot the session id once; reused across the open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
-        let resp = open_stream(&client, &url, &body, &api_key, &session_id, &policy).await?;
+        let rate_limit_retry_owner = options.rate_limit_retry_owner;
+        let resp = open_stream(
+            &client,
+            &url,
+            &body,
+            &api_key,
+            &session_id,
+            &policy,
+            rate_limit_retry_owner,
+        )
+        .await?;
 
         let s = async_stream::stream! {
             // v1 parity: a body that dies BEFORE any event reaches the consumer is
@@ -188,7 +198,7 @@ impl LlmProvider for OllamaProvider {
                                 // Brief, esc-interruptible backoff before reopening so an
                                 // immediate retry does not slam a gateway resetting under load.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
-                                if let Ok(fresh) = open_stream(&client, &url, &body, &api_key, &session_id, &policy).await {
+                                if let Ok(fresh) = open_stream(&client, &url, &body, &api_key, &session_id, &policy, rate_limit_retry_owner).await {
                                     stream_attempt += 1;
                                     resp = fresh;
                                     continue 'reopen;
@@ -230,6 +240,7 @@ async fn open_stream(
     api_key: &str,
     session_id: &str,
     policy: &RetryPolicy,
+    rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     loop {
@@ -245,7 +256,9 @@ async fn open_stream(
             Ok(resp) => {
                 let code = resp.status().as_u16();
                 if !resp.status().is_success() {
-                    if retry::is_retryable_status(code) && attempt < policy.max_attempts {
+                    if retry::should_retry_open_status(code, rate_limit_retry_owner)
+                        && attempt < policy.max_attempts
+                    {
                         let wait = retry::parse_retry_after(resp.headers())
                             .unwrap_or_else(|| retry::compute_backoff(attempt, policy));
                         tokio::time::sleep(wait).await;

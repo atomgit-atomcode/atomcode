@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.2</span>
+    <span class="dhdr-ver">v5.0.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -90,7 +90,7 @@
           <tr><td><code>/bg</code></td><td>将当前会话放到后台并打开新的前台会话;子命令: <code>/bg list</code>、<code>/bg &lt;N&gt;</code>、<code>/bg drop &lt;N&gt;</code>、<code>/bg help</code>。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
           <tr><td><code>/background &lt;task&gt;</code></td><td>兼容入口:在一个 <code>/bg</code> 槽位中启动一次性后台任务(<a href="./sessions.html#bg">详解</a>)</td></tr>
           <tr><td><code>/rename &lt;新名字&gt;</code></td><td>重命名当前会话(影响 <code>/resume</code> 选择器里的显示名)</td></tr>
-          <tr><td><code>/provider</code></td><td>打开 provider 管理界面,增删改切换</td></tr>
+          <tr><td><code>/provider</code></td><td>管理供应商账号及其模型；支持预设供应商和自定义接口</td></tr>
           <tr><td><code>/model</code></td><td>设置默认模型 / provider，并切换当前会话；其他已打开会话不变</td></tr>
           <tr><td><code>/cd</code></td><td>切换工作目录并开启新建对话,并写回 <code>default_workdir</code>。也可以直接输入 <code>cd /path</code>(无需斜杠前缀)</td></tr>
         </tbody>
@@ -110,16 +110,21 @@
           <tr><td><code>/cost</code></td><td>当前会话的本地 token 花费 —— 适用于任意模型(含自接入模型);不支持 usage 报告的 API 会自动估算。与 <code>/usage</code> 不同,后者查询的是 CodingPlan 网关的套餐额度</td></tr>
           <tr><td><code>/context</code></td><td>显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用</td></tr>
           <tr><td><code>/compact</code></td><td>压缩历史消息,把早期对话压缩成摘要以腾出上下文预算</td></tr>
+          <tr><td><code>/rewind</code></td><td>选择历史提示，并回退对话、代码或两者；详见 <a href="./sessions.html">会话与撤销</a></td></tr>
           <tr><td><code>/clear</code></td><td>清空当前会话的消息(保留工作目录和模型)</td></tr>
           <tr><td><code>/init</code></td><td>扫描当前工作目录,生成 / 刷新 <code>.atomcode.md</code> 项目指令文件 — 内含 build / test 命令、技术栈摘要、目录结构等,后续每次启动都会作为系统提示注入</td></tr>
           <tr><td><code>/background &lt;任务&gt;</code></td><td>把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于"顺手让它去查一下 X"这类轻探索。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
           <tr><td><code>/worktree &lt;子命令&gt;</code></td><td>Git worktree 隔离:<code>create</code> 在新分支上拉一份独立 worktree、<code>list</code> 查看现有 worktree、<code>done</code> 把 worktree 改动 squash 回主分支、<code>cleanup</code> 清理已完成的 worktree</td></tr>
-          <tr><td><code>/issue</code></td><td>交互式向导:在当前 git 仓库对应的 AtomGit 仓库创建一个新 issue(需先 OAuth 登录,cwd 必须是 atomgit.com 仓库的 clone)</td></tr>
           <tr><td><code>/todo</code> · <code>/todo add &lt;任务&gt;</code> · <code>/todo clear</code></td><td>重新打印当前待办清单 —— 从会话记录里派生(定位最近一次 <code>todowrite</code> 工具调用并重渲染),带「进行中 / 已完成」状态标记。<code>/todo add &lt;任务&gt;</code> 确定性地追加一条任务(不走模型);<code>/todo clear</code> 清空清单。清单是无状态派生的,不额外落盘;模型执行长任务时会自己维护它,你也可以随时用此命令查看进度</td></tr>
           <tr><td><code>/copy</code></td><td>把上一条回复里的代码块复制到剪贴板:<code>/copy</code> 复制唯一代码块、<code>/copy N</code> 复制第 N 个、<code>/copy all</code> 复制全部代码块、<code>/copy msg</code> 复制整条回复的 markdown 原文</td></tr>
           <tr><td><code>/save</code></td><td>把当前会话导出成 markdown 文件:<code>/save</code> 用自动生成的文件名,<code>/save &lt;文件名&gt;</code> 指定文件名</td></tr>
         </tbody>
       </table>
+
+      <div class="callout callout-info">
+        <strong>AtomGit Issue 现在由内置工具处理</strong>
+        <p><code>/issue</code> 已移除。执行 <code>/login</code> 后，直接用自然语言提出需求即可，例如“为这个 Bug 创建一个 AtomGit Issue”。AtomCode 会选择内置的 <code>atomgit_issue</code> 工具，写操作仍需权限确认。详见<a href="./tools.html#atomgit">内置工具</a>。</p>
+      </div>
 
       <div class="callout callout-info">
         <strong>只读报告可在回合中运行</strong>

@@ -12,9 +12,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(test)]
 use std::sync::Barrier;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use atomcode_kernel::message::{Message, Role, SessionSnapshot, SNAPSHOT_VERSION};
 use serde::{de::IgnoredAny, Deserialize, Serialize};
@@ -33,6 +33,8 @@ pub const META_VERSION: u32 = 1;
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REWIND_TRANSACTION_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_META_BYTES;
+const INFLIGHT_SNAPSHOT_VERSION: u32 = 1;
 pub const MAX_LEGACY_SESSION_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_JSONL_BYTES: usize = 512 * 1024 * 1024;
@@ -217,6 +219,8 @@ pub enum CatalogPresence {
 pub struct CatalogEntry {
     pub id: String,
     pub name: String,
+    /// Root identity for an automatic busy-continue fork.
+    pub fork_root_id: Option<String>,
     pub project_bucket: String,
     pub working_dir: PathBuf,
     pub created_at_ms: i64,
@@ -314,6 +318,17 @@ pub struct ImportInfo {
     pub kind: ImportKind,
 }
 
+/// Durable lineage for an automatic fork created because `--continue` found
+/// its source session leased by another runtime.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForkInfo {
+    pub root_id: String,
+    pub parent_id: String,
+    pub forked_at_ms: i64,
+    pub base_message_count: u32,
+    pub base_turn_count: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     /// `.meta` SCHEMA VERSION — the forward-compat seam (`.snapshot` has
@@ -340,6 +355,10 @@ pub struct SessionMeta {
     /// empty; it is deliberately independent from `owner`.
     #[serde(default)]
     pub import_info: Option<ImportInfo>,
+    /// Automatic busy-continue fork provenance. This is deliberately separate
+    /// from `import_info`, which only describes legacy-format cutover.
+    #[serde(default)]
+    pub fork_info: Option<ForkInfo>,
     pub working_dir: String,
     /// epoch MILLISECONDS, UTC.
     pub created_at: i64,
@@ -353,6 +372,16 @@ pub struct SessionMeta {
     /// then they live here, where wall-clock `duration_ms` belongs anyway.)
     #[serde(default)]
     pub turn_stats: Vec<TurnStat>,
+    /// Provider usage without a live turn position: calls outside the primary
+    /// loop (subagents, review, LLM compaction) plus usage archived when
+    /// undo/compaction removes the corresponding turn divider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detached_model_usage: Vec<ModelUsageStat>,
+    /// Legacy usage moved out of turn stats when undo/compaction removes the
+    /// corresponding presentation turn. It remains billable but cannot be
+    /// attributed to a provider/model written by older metadata.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub detached_unattributed_tokens: u64,
 }
 
 impl SessionMeta {
@@ -368,12 +397,59 @@ impl SessionMeta {
             ai_named: false,
             owner: StorageOwner::Unconfirmed,
             import_info: None,
+            fork_info: None,
             working_dir: working_dir.into(),
             created_at: now_ms,
             updated_at: now_ms,
             turn_count: 0,
             message_count: 0,
             turn_stats: Vec::new(),
+            detached_model_usage: Vec::new(),
+            detached_unattributed_tokens: 0,
+        }
+    }
+
+    /// Remove turn stats selected by `predicate` while preserving their usage
+    /// in the position-independent cost ledger.
+    pub fn archive_turn_stats_where(
+        &mut self,
+        mut predicate: impl FnMut(&TurnStat) -> bool,
+    ) -> Vec<TurnStat> {
+        let mut retained = Vec::with_capacity(self.turn_stats.len());
+        let mut archived = Vec::new();
+        for turn in std::mem::take(&mut self.turn_stats) {
+            if !predicate(&turn) {
+                retained.push(turn);
+                continue;
+            }
+            if turn.model_usage.is_empty() {
+                self.detached_unattributed_tokens = self
+                    .detached_unattributed_tokens
+                    .saturating_add(u64::from(turn.total_tokens));
+            } else {
+                for usage in &turn.model_usage {
+                    merge_model_usage(&mut self.detached_model_usage, usage.clone());
+                }
+            }
+            archived.push(turn);
+        }
+        self.turn_stats = retained;
+        archived
+    }
+
+    /// Reverse only the cost-ledger contribution made by
+    /// [`archive_turn_stats_where`]. Concurrent detached usage remains intact.
+    pub fn remove_archived_turn_usage(&mut self, archived: &[TurnStat]) {
+        for turn in archived {
+            if turn.model_usage.is_empty() {
+                self.detached_unattributed_tokens = self
+                    .detached_unattributed_tokens
+                    .saturating_sub(u64::from(turn.total_tokens));
+            } else {
+                for usage in &turn.model_usage {
+                    subtract_model_usage(&mut self.detached_model_usage, usage);
+                }
+            }
         }
     }
 
@@ -454,6 +530,13 @@ pub struct LoadedSession {
     pub presentation: PresentationFile,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct InflightSnapshot {
+    version: u32,
+    replay_safe: bool,
+    pub(super) snapshot: SessionSnapshot,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum NativeImportCommitOutcome {
     Committed(SessionMeta),
@@ -517,10 +600,263 @@ pub struct TurnStat {
     /// Model context-window size paired with `used_tokens`.
     #[serde(default)]
     pub ctx_window: u32,
+    /// Per-model usage produced during this turn. Empty for metadata written
+    /// before model attribution was introduced; readers must keep that legacy
+    /// total under "unattributed" rather than assigning it to the active model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_usage: Vec<ModelUsageStat>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct TokenBreakdown {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub cached_input: u64,
+}
+
+impl TokenBreakdown {
+    pub fn total(self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cached_input)
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cached_input = self.cached_input.saturating_add(other.cached_input);
+    }
+
+    fn sub_assign(&mut self, other: Self) {
+        self.input = self.input.saturating_sub(other.input);
+        self.output = self.output.saturating_sub(other.output);
+        self.cached_input = self.cached_input.saturating_sub(other.cached_input);
+    }
+}
+
+/// Price snapshot in USD per million tokens. `None` on [`ModelUsageStat`]
+/// means unknown pricing; an all-zero snapshot means explicitly free.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ModelPricing {
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    #[serde(default)]
+    pub cached_input_per_million: f64,
+}
+
+impl ModelPricing {
+    pub fn estimate(self, tokens: TokenBreakdown) -> f64 {
+        (tokens.input as f64 * self.input_per_million
+            + tokens.output as f64 * self.output_per_million
+            + tokens.cached_input as f64 * self.cached_input_per_million)
+            / 1_000_000.0
+    }
+
+    pub fn is_free(self) -> bool {
+        self.input_per_million == 0.0
+            && self.output_per_million == 0.0
+            && self.cached_input_per_million == 0.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelUsageStat {
+    pub provider_id: String,
+    pub model_id: String,
+    pub tokens: TokenBreakdown,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
+}
+
+/// Session-scoped writer for model calls that run outside the primary agent
+/// lifecycle hooks. It uses the metadata lock for cross-task/process safety and
+/// deliberately does not mutate turn/message counters.
+#[derive(Clone)]
+pub struct DetachedUsageRecorder {
+    manager: Arc<SessionManager>,
+    session_id: String,
+    provider_id: String,
+    model_id: String,
+    pricing: Option<ModelPricing>,
+    persistence_status: Option<super::snapshot::SnapshotPersistenceStatus>,
+}
+
+impl DetachedUsageRecorder {
+    pub fn new(
+        manager: Arc<SessionManager>,
+        session_id: impl Into<String>,
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        pricing: Option<ModelPricing>,
+    ) -> Self {
+        Self {
+            manager,
+            session_id: session_id.into(),
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            pricing,
+            persistence_status: None,
+        }
+    }
+
+    pub fn with_persistence_status(
+        mut self,
+        status: super::snapshot::SnapshotPersistenceStatus,
+    ) -> Self {
+        self.persistence_status = Some(status);
+        self
+    }
+
+    pub fn record(&self, tokens: TokenBreakdown) -> SessionResult<()> {
+        if tokens.total() == 0 {
+            return Ok(());
+        }
+        let result = self.manager.update_meta(&self.session_id, |meta| {
+            merge_model_usage(
+                &mut meta.detached_model_usage,
+                ModelUsageStat {
+                    provider_id: self.provider_id.clone(),
+                    model_id: self.model_id.clone(),
+                    tokens,
+                    pricing: self.pricing,
+                },
+            );
+        });
+        if let Err(error) = &result {
+            if let Some(status) = &self.persistence_status {
+                status.report_cost_warning(format!(
+                    "model usage could not be persisted; /cost may be incomplete: {error}"
+                ));
+            }
+        }
+        result
+    }
+}
+
+fn merge_model_usage(records: &mut Vec<ModelUsageStat>, usage: ModelUsageStat) {
+    if let Some(existing) = records.iter_mut().find(|existing| {
+        existing.provider_id == usage.provider_id
+            && existing.model_id == usage.model_id
+            && existing.pricing == usage.pricing
+    }) {
+        existing.tokens.add_assign(usage.tokens);
+    } else {
+        records.push(usage);
+    }
+}
+
+fn subtract_model_usage(records: &mut Vec<ModelUsageStat>, usage: &ModelUsageStat) {
+    if let Some(existing) = records.iter_mut().find(|existing| {
+        existing.provider_id == usage.provider_id
+            && existing.model_id == usage.model_id
+            && existing.pricing == usage.pricing
+    }) {
+        existing.tokens.sub_assign(usage.tokens);
+    }
+    records.retain(|record| record.tokens.total() > 0);
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelCostSummary {
+    pub provider_id: String,
+    pub model_id: String,
+    pub tokens: TokenBreakdown,
+    /// `None` when any grouped record had unknown pricing.
+    pub estimated_cost_usd: Option<f64>,
+    pub explicitly_free: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionCostReport {
+    pub models: Vec<ModelCostSummary>,
+    pub unattributed_tokens: u64,
+    pub total_tokens: u64,
+    /// Sum of model estimates only when every attributed group has known
+    /// pricing and there is no unattributed legacy usage.
+    pub estimated_cost_usd: Option<f64>,
+}
+
+pub fn aggregate_session_cost(meta: &SessionMeta) -> SessionCostReport {
+    use std::collections::BTreeMap;
+
+    let mut grouped: BTreeMap<(String, String), (TokenBreakdown, Option<f64>, bool)> =
+        BTreeMap::new();
+    let mut unattributed_tokens = meta.detached_unattributed_tokens;
+
+    let mut add_usage = |usage: &ModelUsageStat| {
+        let entry = grouped
+            .entry((usage.provider_id.clone(), usage.model_id.clone()))
+            .or_insert((TokenBreakdown::default(), Some(0.0), true));
+        entry.0.add_assign(usage.tokens);
+        match (entry.1.as_mut(), usage.pricing) {
+            (Some(cost), Some(pricing)) => *cost += pricing.estimate(usage.tokens),
+            _ => entry.1 = None,
+        }
+        entry.2 &= usage.pricing.is_some_and(ModelPricing::is_free);
+    };
+
+    for turn in &meta.turn_stats {
+        if turn.model_usage.is_empty() {
+            unattributed_tokens = unattributed_tokens.saturating_add(u64::from(turn.total_tokens));
+            continue;
+        }
+        for usage in &turn.model_usage {
+            add_usage(usage);
+        }
+    }
+    for usage in &meta.detached_model_usage {
+        add_usage(usage);
+    }
+
+    let models: Vec<_> = grouped
+        .into_iter()
+        .map(
+            |((provider_id, model_id), (tokens, estimated_cost_usd, explicitly_free))| {
+                ModelCostSummary {
+                    provider_id,
+                    model_id,
+                    tokens,
+                    estimated_cost_usd,
+                    explicitly_free,
+                }
+            },
+        )
+        .collect();
+    let attributed_total = models.iter().fold(0_u64, |total, model| {
+        total.saturating_add(model.tokens.total())
+    });
+    let total_tokens = attributed_total.saturating_add(unattributed_tokens);
+    let estimated_cost_usd = if unattributed_tokens == 0
+        && models
+            .iter()
+            .all(|model| model.estimated_cost_usd.is_some())
+    {
+        Some(
+            models
+                .iter()
+                .filter_map(|model| model.estimated_cost_usd)
+                .sum(),
+        )
+    } else {
+        None
+    };
+    SessionCostReport {
+        models,
+        unattributed_tokens,
+        total_tokens,
+        estimated_cost_usd,
+    }
 }
 
 /// The per-project session store at `$ATOMCODE_HOME/sessions/<project_hash>/`.
@@ -678,6 +1014,11 @@ impl SessionManager {
     pub fn snapshot_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "snapshot")
     }
+    /// Directory under which per-session tool-output artifacts are stored.
+    /// Sibling of the snapshot: `<root>/<id>.artifacts/`.
+    pub fn artifacts_dir(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "artifacts")
+    }
     pub fn meta_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "meta")
     }
@@ -699,8 +1040,280 @@ impl SessionManager {
         self.path_for(id, "ui.json")
     }
 
+    fn rewind_path(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "rewind.json")
+    }
+
+    fn rewind_transaction_path(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "rewind.txn.json")
+    }
+
+    pub(crate) fn load_rewind_ledger(
+        &self,
+        id: &str,
+    ) -> SessionResult<super::rewind::RewindLedger> {
+        let path = self.rewind_path(id)?;
+        match read_regular_file_bounded(&path, "rewind ledger", MAX_META_BYTES) {
+            Ok(bytes) => {
+                let ledger: super::rewind::RewindLedger =
+                    serde_json::from_slice(&bytes).map_err(|source| {
+                        SessionStoreError::Corrupt {
+                            kind: "rewind ledger",
+                            message: format!("{}: {source}", path.display()),
+                        }
+                    })?;
+                ledger
+                    .validate()
+                    .map_err(|message| SessionStoreError::Corrupt {
+                        kind: "rewind ledger",
+                        message: format!("{}: {message}", path.display()),
+                    })?;
+                Ok(ledger)
+            }
+            Err(SessionStoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(super::rewind::RewindLedger {
+                    version: super::rewind::LEDGER_VERSION,
+                    points: Vec::new(),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn save_rewind_ledger(
+        &self,
+        id: &str,
+        ledger: &super::rewind::RewindLedger,
+    ) -> SessionResult<()> {
+        let bytes = serialize_bounded(ledger, "rewind ledger", MAX_META_BYTES)?;
+        atomic_write(&self.rewind_path(id)?, &bytes)
+    }
+
+    pub(crate) fn save_rewind_ledger_with_lease(
+        &self,
+        lease: &SessionLease,
+        ledger: &super::rewind::RewindLedger,
+    ) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        self.save_rewind_ledger(lease.id(), ledger)
+    }
+
+    pub(crate) fn load_rewind_transaction(
+        &self,
+        id: &str,
+    ) -> SessionResult<Option<super::rewind::RewindTransactionJournal>> {
+        let path = self.rewind_transaction_path(id)?;
+        match read_regular_file_bounded(&path, "rewind transaction", MAX_REWIND_TRANSACTION_BYTES) {
+            Ok(bytes) => {
+                let journal: super::rewind::RewindTransactionJournal =
+                    serde_json::from_slice(&bytes).map_err(|source| {
+                        SessionStoreError::Corrupt {
+                            kind: "rewind transaction",
+                            message: format!("{}: {source}", path.display()),
+                        }
+                    })?;
+                journal
+                    .validate()
+                    .map_err(|message| SessionStoreError::Corrupt {
+                        kind: "rewind transaction",
+                        message: format!("{}: {message}", path.display()),
+                    })?;
+                Ok(Some(journal))
+            }
+            Err(SessionStoreError::NotFound { .. }) => Ok(None),
+            Err(SessionStoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn save_rewind_transaction_with_lease(
+        &self,
+        lease: &SessionLease,
+        journal: &super::rewind::RewindTransactionJournal,
+    ) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        journal
+            .validate()
+            .map_err(|message| SessionStoreError::Corrupt {
+                kind: "rewind transaction",
+                message,
+            })?;
+        let bytes = serialize_bounded(journal, "rewind transaction", MAX_REWIND_TRANSACTION_BYTES)?;
+        atomic_write(&self.rewind_transaction_path(lease.id())?, &bytes)
+    }
+
+    pub(crate) fn clear_rewind_transaction_with_lease(
+        &self,
+        lease: &SessionLease,
+    ) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        let path = self.rewind_transaction_path(lease.id())?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_at(&path, error)),
+        }
+    }
+
     pub fn legacy_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "json")
+    }
+
+    /// Separate recovery checkpoint written after a user prompt is accepted.
+    /// It is never part of the authoritative native aggregate.
+    fn inflight_path(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "snapshot.inflight")
+    }
+
+    /// Save an inflight checkpoint. The independent file does not take the meta
+    /// lock; callers must only write states that are safe to replay.
+    pub(crate) fn save_inflight_snapshot(
+        &self,
+        id: &str,
+        snap: &SessionSnapshot,
+        replay_safe: bool,
+    ) -> SessionResult<()> {
+        validate_snapshot(snap)?;
+        let checkpoint = InflightSnapshot {
+            version: INFLIGHT_SNAPSHOT_VERSION,
+            replay_safe,
+            snapshot: snap.clone(),
+        };
+        let bytes = serialize_bounded(&checkpoint, "inflight snapshot", MAX_SNAPSHOT_BYTES)?;
+        // No meta lock — the inflight file is independent of the canonical
+        // snapshot/meta/presentation aggregate. Catalog readers may use only its
+        // validated existence as a visibility signal; its contents never replace
+        // canonical metadata in a list projection.
+        atomic_write(&self.inflight_path(id)?, &bytes)
+    }
+
+    pub(crate) fn save_inflight_snapshot_with_lease(
+        &self,
+        lease: &SessionLease,
+        snap: &SessionSnapshot,
+        replay_safe: bool,
+    ) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        self.save_inflight_snapshot(lease.id(), snap, replay_safe)
+    }
+
+    /// Load the auxiliary checkpoint without changing canonical load semantics.
+    pub(crate) fn load_inflight_snapshot(
+        &self,
+        id: &str,
+    ) -> SessionResult<Option<InflightSnapshot>> {
+        let path = self.inflight_path(id)?;
+        match read_regular_file_bounded(&path, "inflight snapshot", MAX_SNAPSHOT_BYTES) {
+            Ok(bytes) => {
+                let checkpoint: InflightSnapshot = deserialize(&bytes, "inflight snapshot")?;
+                if checkpoint.version != INFLIGHT_SNAPSHOT_VERSION {
+                    return Err(SessionStoreError::Corrupt {
+                        kind: "inflight snapshot",
+                        message: format!(
+                            "unsupported version {} (expected {})",
+                            checkpoint.version, INFLIGHT_SNAPSHOT_VERSION
+                        ),
+                    });
+                }
+                validate_snapshot(&checkpoint.snapshot)?;
+                Ok(Some(checkpoint))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Remove the inflight snapshot file. Called on a clean `turn_complete` so
+    /// the next resume doesn't see a stale inflight from a turn that finished
+    /// normally. Best-effort: a missing file is not an error.
+    pub(crate) fn clear_inflight_snapshot(&self, id: &str) {
+        if let Ok(path) = self.inflight_path(id) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    pub(crate) fn mark_inflight_not_replayable(&self, id: &str) -> SessionResult<()> {
+        let Some(mut checkpoint) = self.load_inflight_snapshot(id)? else {
+            return Ok(());
+        };
+        if checkpoint.replay_safe {
+            checkpoint.replay_safe = false;
+            let bytes = serialize_bounded(&checkpoint, "inflight snapshot", MAX_SNAPSHOT_BYTES)?;
+            atomic_write(&self.inflight_path(id)?, &bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `id` has a well-formed inflight checkpoint.
+    ///
+    /// This is a read-only driver/catalog projection seam. It does not imply the
+    /// checkpoint is replay-safe: once model processing starts, the checkpoint
+    /// remains useful evidence that a zero-count session has accepted work even
+    /// though automatic replay may be disabled.
+    pub fn has_valid_inflight_snapshot(&self, id: &str) -> bool {
+        matches!(self.load_inflight_snapshot(id), Ok(Some(_)))
+    }
+
+    /// Test-only raw existence check used by cleanup/failure-path assertions.
+    #[cfg(test)]
+    pub(crate) fn has_inflight_snapshot(&self, id: &str) -> bool {
+        self.inflight_path(id).map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// Load a native session for runtime resume and recover one accepted user
+    /// prompt when a prior process died before reaching `turn_complete`.
+    ///
+    /// Recovery requires the active runtime lease and only accepts an inflight
+    /// snapshot that is exactly the canonical message prefix plus one final user
+    /// message. This rejects stale checkpoints and incomplete assistant/tool
+    /// rounds. General readers continue to use [`Self::load_native_session`] and
+    /// always receive the committed native aggregate.
+    pub fn load_native_session_for_resume(
+        &self,
+        lease: &SessionLease,
+    ) -> SessionResult<(LoadedSession, Option<Message>)> {
+        self.validate_active_lease(lease)?;
+        let mut loaded = self.load_native_session(lease.id())?;
+        let inflight = match self.load_inflight_snapshot(lease.id()) {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => return Ok((loaded, None)),
+            Err(error) => {
+                eprintln!(
+                    "[SessionManager] ignoring unreadable inflight snapshot for {}: {error}",
+                    lease.id()
+                );
+                self.clear_inflight_snapshot(lease.id());
+                return Ok((loaded, None));
+            }
+        };
+        let canonical_len = loaded.snapshot.messages.len();
+        let recoverable = inflight.snapshot.messages.len() == canonical_len.saturating_add(1)
+            && inflight.snapshot.messages[..canonical_len] == loaded.snapshot.messages
+            && inflight.snapshot.messages.last().is_some_and(|message| {
+                message.role == atomcode_kernel::message::Role::User
+                    && !message.synthetic
+                    && message.internal_origin.is_none()
+                    && message.tool_calls.is_empty()
+            });
+        if recoverable {
+            if inflight.replay_safe {
+                Ok((loaded, inflight.snapshot.messages.last().cloned()))
+            } else {
+                loaded.snapshot = inflight.snapshot;
+                Ok((loaded, None))
+            }
+        } else {
+            // A stale or unsafe auxiliary checkpoint must not shadow committed
+            // state on future resumes.
+            self.clear_inflight_snapshot(lease.id());
+            Ok((loaded, None))
+        }
     }
 
     /// Read a historical core session under the same no-follow and size bounds as
@@ -1170,20 +1783,34 @@ impl SessionManager {
         now_ms: i64,
     ) -> SessionResult<(LoadedSession, SessionLease)> {
         let source = self.load_native_session(source_id)?;
+        self.reap_abandoned_forks(&source);
         let destination_lease = self.acquire_lease(destination_id)?;
         let source_name_was_placeholder =
             SessionMeta::name_needs_fallback(&source.meta.name, source_id);
+        let root_id = source
+            .meta
+            .fork_info
+            .as_ref()
+            .map(|fork| fork.root_id.clone())
+            .unwrap_or_else(|| source_id.to_string());
         let mut meta = source.meta.clone();
         meta.id = destination_id.to_string();
         meta.name = if source_name_was_placeholder {
             format!("session-{destination_id}")
         } else {
-            format!("{} (fork)", source.meta.name)
+            source.meta.name.clone()
         };
         meta.created_at = now_ms;
         meta.updated_at = now_ms;
         meta.owner = StorageOwner::Native;
         meta.import_info = None;
+        meta.fork_info = Some(ForkInfo {
+            root_id,
+            parent_id: source_id.to_string(),
+            forked_at_ms: now_ms,
+            base_message_count: source.meta.message_count,
+            base_turn_count: source.meta.turn_count,
+        });
         let forked = LoadedSession {
             meta,
             snapshot: source.snapshot,
@@ -1196,6 +1823,59 @@ impl SessionManager {
             &forked.meta,
         )?;
         Ok((forked, destination_lease))
+    }
+
+    /// Best-effort GC for automatic forks that were created but never used.
+    fn reap_abandoned_forks(&self, source: &LoadedSession) {
+        let root_id = source
+            .meta
+            .fork_info
+            .as_ref()
+            .map(|fork| fork.root_id.as_str())
+            .unwrap_or(source.meta.id.as_str());
+        for candidate in self.list() {
+            if candidate.id == source.meta.id || candidate.id == root_id {
+                continue;
+            }
+            let Some(lineage) = candidate.fork_info.as_ref() else {
+                continue;
+            };
+            if lineage.root_id != root_id
+                || candidate.message_count != lineage.base_message_count
+                || candidate.turn_count != lineage.base_turn_count
+                || candidate.updated_at != lineage.forked_at_ms
+            {
+                continue;
+            }
+            let Ok(lease) = self.acquire_lease(&candidate.id) else {
+                continue;
+            };
+            let Ok(loaded) = self.load_native_session(&candidate.id) else {
+                continue;
+            };
+            let Some(confirmed) = loaded.meta.fork_info.as_ref() else {
+                continue;
+            };
+            if confirmed != lineage
+                || loaded.meta.message_count != confirmed.base_message_count
+                || loaded.meta.turn_count != confirmed.base_turn_count
+                || loaded.meta.updated_at != confirmed.forked_at_ms
+                || !self.transcript_is_empty(&candidate.id)
+            {
+                continue;
+            }
+            let _ = self.delete(&lease);
+        }
+    }
+
+    fn transcript_is_empty(&self, id: &str) -> bool {
+        let Ok(path) = self.jsonl_path(id) else {
+            return false;
+        };
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata.file_type().is_file() && metadata.len() == 0,
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        }
     }
 
     /// Publish a prepared legacy import under the caller's active session lease.
@@ -1418,6 +2098,98 @@ impl SessionManager {
                 snapshot_bytes.as_deref(),
                 presentation,
                 presentation_bytes.as_deref(),
+                meta,
+                &meta_bytes,
+            )?;
+            Ok(NativeImportCommitOutcome::Committed(meta.clone()))
+        })
+    }
+
+    /// Replace a previously committed empty metadata-only import when every
+    /// native artifact still exactly matches the state inspected by the
+    /// compatibility importer. This is intentionally narrower than a general
+    /// native overwrite: only an empty aggregate with metadata-only provenance
+    /// may be replaced by a populated full import of the same legacy source.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_empty_metadata_only_import_if_unchanged(
+        &self,
+        lease: &SessionLease,
+        expected_meta: &SessionMeta,
+        expected_snapshot: &SessionSnapshot,
+        expected_presentation: &PresentationFile,
+        snapshot: &SessionSnapshot,
+        presentation: &PresentationFile,
+        meta: &SessionMeta,
+    ) -> SessionResult<NativeImportCommitOutcome> {
+        self.validate_lease(lease)?;
+        ensure_meta_id(lease.id(), expected_meta)?;
+        ensure_meta_id(lease.id(), meta)?;
+        let expected_import = expected_meta.import_info.as_ref();
+        let replacement_import = meta.import_info.as_ref();
+        let valid_recovery = expected_meta.owner == StorageOwner::Native
+            && expected_meta.message_count == 0
+            && expected_snapshot.messages.is_empty()
+            && expected_presentation.entries.is_empty()
+            && expected_import.is_some_and(|info| info.kind == ImportKind::MetadataOnly)
+            && meta.owner == StorageOwner::Native
+            && !snapshot.messages.is_empty()
+            && replacement_import.is_some_and(|info| {
+                info.kind == ImportKind::Full
+                    && expected_import.is_some_and(|expected| {
+                        expected.source_sha256 == info.source_sha256
+                            && expected.legacy_schema == info.legacy_schema
+                    })
+            });
+        if !valid_recovery {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session import recovery",
+                message: "recovery requires an empty metadata-only native aggregate and a \
+                          populated full import of the same legacy source"
+                    .into(),
+            });
+        }
+        validate_meta(expected_meta)?;
+        validate_snapshot(expected_snapshot)?;
+        expected_presentation.validate()?;
+        validate_meta(meta)?;
+        validate_snapshot(snapshot)?;
+        presentation.validate()?;
+        let snapshot_bytes = serialize_bounded(snapshot, "snapshot", MAX_SNAPSHOT_BYTES)?;
+        let presentation_bytes =
+            serialize_pretty_bounded(presentation, "presentation", MAX_PRESENTATION_BYTES)?;
+        let meta_bytes = serialize_pretty_bounded(meta, "session meta", MAX_META_BYTES)?;
+
+        self.with_meta_lock(lease.id(), || {
+            self.cleanup_import_staging(lease.id())?;
+            let Some(current_meta) = self.read_optional_meta_artifact(lease.id())? else {
+                return Err(SessionStoreError::NotFound {
+                    path: self.meta_path(lease.id())?,
+                });
+            };
+            let current_snapshot = self.read_optional_snapshot_artifact(lease.id())?;
+            let current_presentation = self.read_optional_presentation_artifact(lease.id())?;
+            if current_meta.0 != *expected_meta
+                || current_snapshot.as_ref().map(|(value, _)| value) != Some(expected_snapshot)
+                || current_presentation.as_ref().map(|(value, _)| value)
+                    != Some(expected_presentation)
+            {
+                return Ok(NativeImportCommitOutcome::Conflict {
+                    meta: current_meta.0,
+                    snapshot: current_snapshot.map(|(value, _)| value),
+                    presentation: current_presentation.map(|(value, _)| value),
+                });
+            }
+            self.publish_native_import_locked(
+                lease.id(),
+                Some(current_meta),
+                current_snapshot,
+                current_presentation,
+                None,
+                None,
+                Some(snapshot),
+                Some(&snapshot_bytes),
+                Some(presentation),
+                Some(&presentation_bytes),
                 meta,
                 &meta_bytes,
             )?;
@@ -1917,6 +2689,22 @@ impl SessionManager {
         scan_catalog_cached(sessions_root)
     }
 
+    /// Collapse automatic fork aggregates into one newest logical conversation
+    /// row per project. Exact-ID loading and the raw catalog remain unchanged.
+    pub fn collapse_fork_lineages(entries: &mut Vec<CatalogEntry>) {
+        entries.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then_with(|| a.project_bucket.cmp(&b.project_bucket))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let mut seen = BTreeSet::new();
+        entries.retain(|entry| {
+            let logical_id = entry.fork_root_id.as_deref().unwrap_or(&entry.id);
+            seen.insert((entry.project_bucket.clone(), logical_id.to_string()))
+        });
+    }
+
     pub fn scan_all() -> CatalogScan {
         Self::scan_catalog(&Self::sessions_root())
     }
@@ -1973,6 +2761,9 @@ impl SessionManager {
         self.validate_lease(lease)?;
         let targets = [
             self.snapshot_path(id)?,
+            self.inflight_path(id)?,
+            self.rewind_path(id)?,
+            self.rewind_transaction_path(id)?,
             self.meta_path(id)?,
             self.jsonl_path(id)?,
             self.presentation_path(id)?,
@@ -1987,6 +2778,9 @@ impl SessionManager {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(io_at(&p, e)),
             }
+        }
+        if let Ok(dir) = self.artifacts_dir(id) {
+            let _ = fs::remove_dir_all(&dir); // best-effort; absent dir is fine
         }
         Ok(())
     }
@@ -2143,7 +2937,10 @@ fn scan_catalog_cached(sessions_root: &Path) -> CatalogScan {
     catalog_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(sessions_root.to_path_buf(), CachedCatalog { sig, scan: arc });
+        .insert(
+            sessions_root.to_path_buf(),
+            CachedCatalog { sig, scan: arc },
+        );
     scan
 }
 
@@ -2253,7 +3050,9 @@ fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
             };
             let direct_sidecar_id = name
                 .strip_suffix(".snapshot")
-                .or_else(|| name.strip_suffix(".jsonl"));
+                .or_else(|| name.strip_suffix(".jsonl"))
+                .or_else(|| name.strip_suffix(".rewind.txn.json"))
+                .or_else(|| name.strip_suffix(".rewind.json"));
             if let Some(id) = direct_sidecar_id {
                 match file_entry.file_type() {
                     Ok(file_type) if file_type.is_file() => {}
@@ -2444,11 +3243,11 @@ fn migrate_sessions_from(legacy_root: &Path, target_root: &Path) -> SessionResul
         let parent = target.parent().expect("session target always has a bucket");
         fs::create_dir_all(parent).map_err(|error| io_at(parent, error))?;
         let mut input = File::open(source).map_err(|error| io_at(source, error))?;
-        let mut output = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(target)
-            .map_err(|error| io_at(target, error))?;
+        let mut output = OpenOptions::new();
+        output.create_new(true).write(true);
+        set_private_create_mode(&mut output);
+        let mut output = output.open(target).map_err(|error| io_at(target, error))?;
+        ensure_private_file_permissions(target, &output)?;
         io::copy(&mut input, &mut output).map_err(|error| io_at(target, error))?;
         output.sync_all().map_err(|error| io_at(target, error))?;
     }
@@ -2497,6 +3296,7 @@ fn catalog_entry(
     match (sources.native, sources.legacy) {
         (Some(native), legacy) => Some(CatalogEntry {
             id,
+            fork_root_id: native.fork_info.as_ref().map(|fork| fork.root_id.clone()),
             name: native.name,
             project_bucket,
             working_dir: PathBuf::from(native.working_dir),
@@ -2513,6 +3313,7 @@ fn catalog_entry(
         (None, Some(legacy)) => Some(CatalogEntry {
             id,
             name: legacy.name,
+            fork_root_id: None,
             project_bucket,
             working_dir: legacy.working_dir,
             created_at_ms: checked_legacy_millis(legacy.created_at).ok()?,
@@ -2713,6 +3514,28 @@ fn validate_meta(meta: &SessionMeta) -> SessionResult<()> {
             });
         }
     }
+    if let Some(fork) = &meta.fork_info {
+        if meta.owner != StorageOwner::Native {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session meta",
+                message: "fork_info requires owner=native".into(),
+            });
+        }
+        validate_session_id(&fork.root_id)?;
+        validate_session_id(&fork.parent_id)?;
+        if fork.root_id == meta.id || fork.parent_id == meta.id {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session meta",
+                message: "fork lineage cannot reference the fork itself".into(),
+            });
+        }
+        if fork.forked_at_ms < 0 {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session meta",
+                message: "forked_at_ms must be non-negative".into(),
+            });
+        }
+    }
     if meta.turn_stats.len() > MAX_META_TURN_STATS {
         return Err(SessionStoreError::TooLarge {
             kind: "meta turn stats",
@@ -2881,19 +3704,57 @@ fn open_read_file(path: &Path) -> SessionResult<File> {
 fn open_append_file(path: &Path) -> SessionResult<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
+    set_private_create_mode(&mut options);
     no_follow(&mut options);
     let file = options.open(path).map_err(|e| io_at(path, e))?;
     ensure_opened_regular(path, &file)?;
+    ensure_private_file_permissions(path, &file)?;
     Ok(file)
 }
 
 fn open_lock_file(path: &Path) -> SessionResult<File> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
+    set_private_create_mode(&mut options);
     no_follow(&mut options);
     let file = options.open(path).map_err(|e| io_at(path, e))?;
     ensure_opened_regular(path, &file)?;
+    ensure_private_file_permissions(path, &file)?;
     Ok(file)
+}
+
+fn set_private_create_mode(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
+}
+
+fn ensure_private_file_permissions(path: &Path, file: &File) -> SessionResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = file
+            .metadata()
+            .map_err(|error| io_at(path, error))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| io_at(path, error))?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        let _ = file;
+    }
+    Ok(())
 }
 
 fn ensure_opened_regular(path: &Path, file: &File) -> SessionResult<()> {
@@ -3028,11 +3889,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> SessionResult<()> {
         sequence
     ));
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp)
-            .map_err(|e| io_at(&tmp, e))?;
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        set_private_create_mode(&mut options);
+        let mut file = options.open(&tmp).map_err(|e| io_at(&tmp, e))?;
+        ensure_private_file_permissions(&tmp, &file)?;
         file.write_all(bytes).map_err(|e| io_at(&tmp, e))?;
         file.sync_all().map_err(|e| io_at(&tmp, e))?;
         fs::rename(&tmp, path).map_err(|e| io_at(path, e))?;
@@ -3289,6 +4150,7 @@ mod tests {
             errored: false,
             used_tokens: 1,
             ctx_window: 10,
+            model_usage: Vec::new(),
         };
         meta.turn_stats = vec![stat(0, 1), stat(1, 2), stat(2, 3)];
         mgr.write_meta(&meta).unwrap();
@@ -3488,8 +4350,10 @@ mod tests {
         assert_eq!(rewritten["turn_stats"][0]["turn_id"], 0);
         assert_eq!(meta.owner, StorageOwner::Unconfirmed);
         assert!(meta.import_info.is_none());
+        assert!(meta.fork_info.is_none());
         assert_eq!(rewritten["owner"], "unconfirmed");
         assert!(rewritten["import_info"].is_null());
+        assert!(rewritten["fork_info"].is_null());
     }
 
     #[test]
@@ -3609,13 +4473,23 @@ mod tests {
         assert_eq!(forked.snapshot, snapshot);
         assert_eq!(forked.presentation, presentation);
         assert_eq!(forked.meta.id, "destination");
-        assert_eq!(forked.meta.name, "working session (fork)");
+        assert_eq!(forked.meta.name, "working session");
         assert_eq!(forked.meta.working_dir, "/project");
         assert_eq!(forked.meta.created_at, 20);
         assert_eq!(forked.meta.updated_at, 20);
         assert_eq!(forked.meta.turn_count, 2);
         assert_eq!(forked.meta.message_count, 2);
         assert_eq!(forked.meta.import_info, None);
+        assert_eq!(
+            forked.meta.fork_info,
+            Some(ForkInfo {
+                root_id: "source".into(),
+                parent_id: "source".into(),
+                forked_at_ms: 20,
+                base_message_count: 2,
+                base_turn_count: 2,
+            })
+        );
         assert_eq!(mgr.load_native_session("source").unwrap().meta, source_meta);
         assert!(matches!(
             mgr.acquire_lease("source"),
@@ -3678,6 +4552,99 @@ mod tests {
             mgr.load_native_session("destination").unwrap().snapshot,
             destination_snapshot
         );
+    }
+
+    #[test]
+    fn fork_native_session_reaps_only_unused_unleased_forks_in_the_same_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let source_lease = mgr.acquire_lease("source").unwrap();
+        let snapshot = snap(&["source"]);
+        let presentation = PresentationFile::default();
+        let mut source_meta = SessionMeta::new("source", "/project", 10);
+        source_meta.owner = StorageOwner::Native;
+        source_meta.message_count = 1;
+        mgr.commit_native_import(
+            &source_lease,
+            Some(&snapshot),
+            Some(&presentation),
+            &source_meta,
+        )
+        .unwrap();
+
+        for (id, transcript) in [("unused", false), ("used", true)] {
+            let lease = mgr.acquire_lease(id).unwrap();
+            let mut meta = SessionMeta::new(id, "/project", 15);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            meta.fork_info = Some(ForkInfo {
+                root_id: "source".into(),
+                parent_id: "source".into(),
+                forked_at_ms: 15,
+                base_message_count: 1,
+                base_turn_count: 0,
+            });
+            mgr.commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+                .unwrap();
+            if transcript {
+                std::fs::write(mgr.jsonl_path(id).unwrap(), b"{\"turn\":1}\n").unwrap();
+            }
+            drop(lease);
+        }
+
+        let (_forked, _lease) = mgr
+            .fork_native_session("source", "destination", 20)
+            .unwrap();
+
+        assert!(!mgr.meta_path("unused").unwrap().exists());
+        assert!(!mgr.snapshot_path("unused").unwrap().exists());
+        assert!(mgr.lease_path("unused").unwrap().exists());
+        assert!(mgr.meta_lock_path("unused").unwrap().exists());
+        assert!(mgr.meta_path("used").unwrap().exists());
+    }
+
+    #[test]
+    fn catalog_collapse_keeps_newest_fork_but_raw_catalog_keeps_every_aggregate() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        let mgr = SessionManager::with_root(&bucket);
+        for (id, updated_at, fork_root_id) in [
+            ("root", 10, None),
+            ("fork-a", 20, Some("root")),
+            ("fork-b", 30, Some("root")),
+        ] {
+            let mut meta = SessionMeta::new(id, "/project", updated_at);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            meta.fork_info = fork_root_id.map(|root_id| ForkInfo {
+                root_id: root_id.into(),
+                parent_id: "root".into(),
+                forked_at_ms: updated_at,
+                base_message_count: 1,
+                base_turn_count: 0,
+            });
+            let lease = mgr.acquire_lease(id).unwrap();
+            mgr.commit_native_import(
+                &lease,
+                Some(&snap(&[id])),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        }
+
+        let raw = SessionManager::scan_catalog(root.path());
+        assert_eq!(raw.entries.len(), 3);
+        let mut visible = raw.entries.clone();
+        SessionManager::collapse_fork_lineages(&mut visible);
+        assert_eq!(
+            visible
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fork-b"]
+        );
+        assert!(mgr.load_native_session("fork-a").is_ok());
     }
 
     #[test]
@@ -3827,6 +4794,58 @@ mod tests {
                 presentation: Some(concurrent_presentation),
             }
         );
+        assert_eq!(native_artifact_bytes(&mgr, "s1"), before);
+    }
+
+    #[test]
+    fn empty_metadata_only_recovery_cas_preserves_concurrent_native_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let expected_snapshot = SessionSnapshot::new(Vec::new());
+        let expected_presentation = PresentationFile::default();
+        let mut expected_meta = SessionMeta::new("s1", "/p", 1);
+        expected_meta.owner = StorageOwner::Native;
+        expected_meta.import_info = Some(ImportInfo {
+            legacy_schema: "legacy".into(),
+            source_sha256: "a".repeat(64),
+            importer_version: 1,
+            kind: ImportKind::MetadataOnly,
+        });
+        mgr.commit_native_import(
+            &lease,
+            Some(&expected_snapshot),
+            Some(&expected_presentation),
+            &expected_meta,
+        )
+        .unwrap();
+        let concurrent_snapshot = snap(&["concurrent"]);
+        mgr.save_snapshot("s1", &concurrent_snapshot).unwrap();
+        let before = native_artifact_bytes(&mgr, "s1");
+        let desired_snapshot = snap(&["legacy"]);
+        let mut desired_meta = expected_meta.clone();
+        desired_meta.message_count = 1;
+        desired_meta.import_info.as_mut().unwrap().kind = ImportKind::Full;
+
+        let outcome = mgr
+            .recover_empty_metadata_only_import_if_unchanged(
+                &lease,
+                &expected_meta,
+                &expected_snapshot,
+                &expected_presentation,
+                &desired_snapshot,
+                &expected_presentation,
+                &desired_meta,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            NativeImportCommitOutcome::Conflict {
+                snapshot: Some(snapshot),
+                ..
+            } if snapshot == concurrent_snapshot
+        ));
         assert_eq!(native_artifact_bytes(&mgr, "s1"), before);
     }
 
@@ -4148,8 +5167,16 @@ mod tests {
         let second = SessionManager::scan_catalog(root.path());
         assert_eq!(first.entries.len(), 1);
         assert_eq!(
-            first.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
-            second.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            first
+                .entries
+                .iter()
+                .map(|e| e.id.clone())
+                .collect::<Vec<_>>(),
+            second
+                .entries
+                .iter()
+                .map(|e| e.id.clone())
+                .collect::<Vec<_>>(),
         );
 
         // Adding a session changes the fingerprint → the next scan reflects it
@@ -4229,6 +5256,51 @@ mod tests {
         assert_eq!(scan.latest().unwrap().id, "both");
         assert_eq!(scan.search_name("LEGACY").len(), 1);
         assert_eq!(scan.search_name("LEGACY")[0].id, "legacy");
+    }
+
+    #[test]
+    fn catalog_treats_rewind_json_files_as_native_sidecars_not_legacy_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        let manager = SessionManager::with_root(&bucket);
+        let id = "rewind-catalog";
+        manager
+            .write_meta(&SessionMeta::new(id, "/project", 1))
+            .unwrap();
+        manager
+            .save_rewind_ledger(
+                id,
+                &super::super::rewind::RewindLedger {
+                    version: super::super::rewind::LEDGER_VERSION,
+                    points: Vec::new(),
+                },
+            )
+            .unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        manager
+            .save_rewind_transaction_with_lease(
+                &lease,
+                &super::super::rewind::RewindTransactionJournal {
+                    version: super::super::rewind::TRANSACTION_VERSION,
+                    previous_points: Vec::new(),
+                    retained_points: Vec::new(),
+                    recovery_tree: None,
+                    restored_files: Vec::new(),
+                    target_snapshot: None,
+                    committed: false,
+                },
+            )
+            .unwrap();
+
+        let scan = SessionManager::scan_catalog(root.path());
+
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].id, id);
+        assert!(
+            scan.diagnostics.is_empty(),
+            "rewind sidecars must not be parsed as legacy session JSON: {:?}",
+            scan.diagnostics
+        );
     }
 
     #[test]
@@ -4348,11 +5420,25 @@ mod tests {
             .unwrap();
 
         let lease = mgr.acquire_lease("s1").unwrap();
+        mgr.save_rewind_transaction_with_lease(
+            &lease,
+            &super::super::rewind::RewindTransactionJournal {
+                version: super::super::rewind::TRANSACTION_VERSION,
+                previous_points: Vec::new(),
+                retained_points: Vec::new(),
+                recovery_tree: None,
+                restored_files: Vec::new(),
+                target_snapshot: None,
+                committed: false,
+            },
+        )
+        .unwrap();
         mgr.delete(&lease).unwrap();
         assert!(!mgr.meta_path("s1").unwrap().exists());
         assert!(!mgr.snapshot_path("s1").unwrap().exists());
         assert!(!mgr.jsonl_path("s1").unwrap().exists());
         assert!(!mgr.presentation_path("s1").unwrap().exists());
+        assert!(!mgr.rewind_transaction_path("s1").unwrap().exists());
         // Idempotent: deleting again is fine.
         mgr.delete(&lease).unwrap();
     }
@@ -4985,6 +6071,7 @@ mod tests {
                 errored: false,
                 used_tokens: 1,
                 ctx_window: 10,
+                model_usage: Vec::new(),
             },
             TurnStat {
                 after_message: 99,
@@ -4997,6 +6084,7 @@ mod tests {
                 errored: false,
                 used_tokens: 1,
                 ctx_window: 10,
+                model_usage: Vec::new(),
             },
         ];
         mgr.write_meta(&meta).unwrap();
@@ -5074,6 +6162,20 @@ mod tests {
         assert!(!mgr.snapshot_path("s1").unwrap().exists());
     }
 
+    #[test]
+    fn delete_removes_artifacts_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        mgr.save_snapshot("s1", &snap(&["keep"])).unwrap();
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let art = mgr.artifacts_dir("s1").unwrap();
+        std::fs::create_dir_all(&art).unwrap();
+        std::fs::write(art.join("deadbeefdeadbeef"), b"x").unwrap();
+        assert!(art.exists());
+        mgr.delete(&lease).unwrap();
+        assert!(!art.exists(), "artifacts dir removed with the session");
+    }
+
     #[cfg(unix)]
     #[test]
     fn active_lease_rejects_a_symlink_lock_file() {
@@ -5106,5 +6208,381 @@ mod tests {
             leftovers.is_empty(),
             "no .tmp must survive a successful write"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_writers_create_and_repair_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let atomic_path = dir.path().join("private.snapshot");
+        atomic_write(&atomic_path, b"first").unwrap();
+        assert_eq!(mode(&atomic_path), 0o600);
+        std::fs::set_permissions(&atomic_path, fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write(&atomic_path, b"second").unwrap();
+        assert_eq!(
+            mode(&atomic_path),
+            0o600,
+            "atomic replacement must tighten an existing session artifact"
+        );
+
+        let transcript_path = dir.path().join("private.jsonl");
+        drop(open_append_file(&transcript_path).unwrap());
+        assert_eq!(mode(&transcript_path), 0o600);
+        std::fs::set_permissions(&transcript_path, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_append_file(&transcript_path).unwrap());
+        assert_eq!(
+            mode(&transcript_path),
+            0o600,
+            "opening an existing transcript for append must tighten it before writing"
+        );
+
+        let lock_path = dir.path().join("private.lease");
+        drop(open_lock_file(&lock_path).unwrap());
+        assert_eq!(mode(&lock_path), 0o600);
+        std::fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_lock_file(&lock_path).unwrap());
+        assert_eq!(
+            mode(&lock_path),
+            0o600,
+            "opening an existing session lock must tighten it before use"
+        );
+    }
+
+    #[test]
+    fn session_cost_groups_by_provider_and_model_without_relabeling_legacy_usage() {
+        let mut meta = SessionMeta::new("cost", "/project", 1);
+        let stat = |turn_id, usage: Vec<ModelUsageStat>, legacy_total| TurnStat {
+            after_message: turn_id as usize * 2,
+            position_valid: true,
+            turn_id,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: legacy_total,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+            model_usage: usage,
+        };
+        let paid = Some(ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 3.0,
+            cached_input_per_million: 0.1,
+        });
+        meta.turn_stats.push(stat(
+            1,
+            vec![ModelUsageStat {
+                provider_id: "provider-a".into(),
+                model_id: "same-name".into(),
+                tokens: TokenBreakdown {
+                    input: 100,
+                    output: 20,
+                    cached_input: 50,
+                },
+                pricing: paid,
+            }],
+            170,
+        ));
+        meta.turn_stats.push(stat(
+            2,
+            vec![ModelUsageStat {
+                provider_id: "provider-b".into(),
+                model_id: "same-name".into(),
+                tokens: TokenBreakdown {
+                    input: 10,
+                    output: 0,
+                    cached_input: 0,
+                },
+                pricing: None,
+            }],
+            10,
+        ));
+        meta.turn_stats.push(stat(3, Vec::new(), 40));
+
+        let report = aggregate_session_cost(&meta);
+        assert_eq!(report.models.len(), 2);
+        assert_eq!(report.models[0].provider_id, "provider-a");
+        assert_eq!(report.models[0].tokens.total(), 170);
+        assert!(report.models[0].estimated_cost_usd.is_some());
+        assert_eq!(report.models[1].provider_id, "provider-b");
+        assert_eq!(report.models[1].tokens.total(), 10);
+        assert_eq!(report.models[1].estimated_cost_usd, None);
+        assert_eq!(report.unattributed_tokens, 40);
+        assert_eq!(report.total_tokens, 220);
+        assert_eq!(report.estimated_cost_usd, None);
+    }
+
+    #[test]
+    fn explicit_zero_pricing_is_distinct_from_unknown_pricing() {
+        let free = ModelPricing {
+            input_per_million: 0.0,
+            output_per_million: 0.0,
+            cached_input_per_million: 0.0,
+        };
+        let mut meta = SessionMeta::new("free", "/project", 1);
+        meta.turn_stats.push(TurnStat {
+            after_message: 2,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 12,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+            model_usage: vec![ModelUsageStat {
+                provider_id: "local".into(),
+                model_id: "free-model".into(),
+                tokens: TokenBreakdown {
+                    input: 10,
+                    output: 2,
+                    cached_input: 0,
+                },
+                pricing: Some(free),
+            }],
+        });
+
+        let report = aggregate_session_cost(&meta);
+        assert_eq!(report.models[0].estimated_cost_usd, Some(0.0));
+        assert!(report.models[0].explicitly_free);
+        assert_eq!(report.estimated_cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn detached_model_usage_is_aggregated_without_changing_turn_count() {
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.detached_model_usage.push(ModelUsageStat {
+            provider_id: "fast".into(),
+            model_id: "fast-model".into(),
+            tokens: TokenBreakdown {
+                input: 10,
+                output: 2,
+                cached_input: 3,
+            },
+            pricing: None,
+        });
+
+        let report = aggregate_session_cost(&meta);
+        assert_eq!(meta.turn_count, 0);
+        assert_eq!(report.total_tokens, 15);
+        assert_eq!(report.models.len(), 1);
+        assert_eq!(report.models[0].provider_id, "fast");
+        assert_eq!(report.models[0].tokens.total(), 15);
+    }
+
+    #[test]
+    fn archiving_turn_stats_preserves_attributed_and_legacy_cost() {
+        let mut meta = SessionMeta::new("archive", "/p", 1);
+        meta.turn_stats.push(TurnStat {
+            after_message: 2,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 12,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+            model_usage: vec![ModelUsageStat {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                tokens: TokenBreakdown {
+                    input: 10,
+                    output: 2,
+                    cached_input: 0,
+                },
+                pricing: None,
+            }],
+        });
+        meta.turn_stats.push(TurnStat {
+            after_message: 4,
+            position_valid: true,
+            turn_id: 2,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 7,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+            model_usage: Vec::new(),
+        });
+
+        let archived = meta.archive_turn_stats_where(|_| true);
+
+        assert_eq!(archived.len(), 2);
+        assert!(meta.turn_stats.is_empty());
+        assert_eq!(meta.detached_unattributed_tokens, 7);
+        let report = aggregate_session_cost(&meta);
+        assert_eq!(report.models[0].tokens.total(), 12);
+        assert_eq!(report.unattributed_tokens, 7);
+        assert_eq!(report.total_tokens, 19);
+
+        merge_model_usage(
+            &mut meta.detached_model_usage,
+            ModelUsageStat {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                tokens: TokenBreakdown {
+                    input: 1,
+                    output: 0,
+                    cached_input: 0,
+                },
+                pricing: None,
+            },
+        );
+        meta.detached_unattributed_tokens += 3;
+        meta.remove_archived_turn_usage(&archived);
+        let concurrent_only = aggregate_session_cost(&meta);
+        assert_eq!(concurrent_only.models[0].tokens.total(), 1);
+        assert_eq!(concurrent_only.unattributed_tokens, 3);
+        assert_eq!(concurrent_only.total_tokens, 4);
+    }
+
+    #[test]
+    fn resume_recovers_only_one_user_message_beyond_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let id = "recover-user-prompt";
+        let lease = mgr.acquire_lease(id).unwrap();
+        let canonical = snap(&["completed"]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&canonical),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let inflight = snap(&["completed", "accepted before crash"]);
+        mgr.save_inflight_snapshot(id, &inflight, true).unwrap();
+
+        assert_eq!(
+            mgr.load_native_session(id).unwrap().snapshot,
+            canonical,
+            "general native loads remain canonical"
+        );
+        assert_eq!(
+            mgr.load_native_session_for_resume(&lease).unwrap(),
+            (
+                LoadedSession {
+                    meta: mgr.read_meta(id).unwrap(),
+                    snapshot: canonical,
+                    presentation: PresentationFile::default(),
+                },
+                inflight.messages.last().cloned(),
+            ),
+            "the leased resume boundary returns canonical history plus a prompt to replay"
+        );
+    }
+
+    #[test]
+    fn resume_rejects_inflight_assistant_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let id = "reject-unsafe-inflight";
+        let lease = mgr.acquire_lease(id).unwrap();
+        let canonical = snap(&["completed"]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&canonical),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let unsafe_inflight = SessionSnapshot::new(vec![
+            Message::user("completed"),
+            Message::assistant("tool round not committed", Vec::new()),
+        ]);
+        mgr.save_inflight_snapshot(id, &unsafe_inflight, true)
+            .unwrap();
+
+        assert_eq!(
+            mgr.load_native_session_for_resume(&lease).unwrap(),
+            (
+                LoadedSession {
+                    meta: mgr.read_meta(id).unwrap(),
+                    snapshot: canonical,
+                    presentation: PresentationFile::default(),
+                },
+                None,
+            )
+        );
+        assert!(
+            !mgr.has_inflight_snapshot(id),
+            "unsafe checkpoints are cleared so they cannot shadow later resumes"
+        );
+    }
+
+    #[test]
+    fn resume_does_not_replay_after_model_processing_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let id = "recover-without-replay";
+        let lease = mgr.acquire_lease(id).unwrap();
+        let canonical = snap(&["completed"]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&canonical),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let inflight = snap(&["completed", "possibly executed"]);
+        mgr.save_inflight_snapshot_with_lease(&lease, &inflight, true)
+            .unwrap();
+        mgr.mark_inflight_not_replayable(id).unwrap();
+
+        let (loaded, pending) = mgr.load_native_session_for_resume(&lease).unwrap();
+
+        assert_eq!(loaded.snapshot, inflight);
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn delete_removes_the_inflight_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let id = "delete-inflight";
+        let lease = mgr.acquire_lease(id).unwrap();
+        let snapshot = snap(&["accepted"]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snapshot),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        mgr.save_inflight_snapshot_with_lease(&lease, &snapshot, true)
+            .unwrap();
+
+        mgr.delete(&lease).unwrap();
+
+        assert!(!mgr.has_inflight_snapshot(id));
+    }
+
+    #[test]
+    fn artifacts_dir_is_sibling_of_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let snap = mgr.snapshot_path("abc").unwrap();
+        let art = mgr.artifacts_dir("abc").unwrap();
+        assert_eq!(art, snap.with_extension("artifacts"));
     }
 }

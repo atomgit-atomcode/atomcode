@@ -257,10 +257,10 @@ body {
   position: relative;
 }
 
-/* Centered fixed-width message column (matches the input width). */
+/* Centered responsive message column (matches the input width; see --app-content-max-width). */
 .timeline-inner {
   width: 100%;
-  max-width: 760px;
+  max-width: var(--app-content-max-width);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -893,7 +893,7 @@ body {
 }
 .markdown-root th,
 .markdown-root td {
-  border: 1px solid var(--app-primary-border-color);
+  border: 1px solid var(--app-table-border);
   padding: 5px 10px;
   text-align: left;
   vertical-align: top;
@@ -915,10 +915,10 @@ body {
   background: var(--app-primary-background);
 }
 
-/* Centered fixed-width input column (input box + cwd breadcrumb below it). */
+/* Centered responsive input column (input box + cwd breadcrumb below it; see --app-content-max-width). */
 .input-wrap {
   width: 100%;
-  max-width: 760px;
+  max-width: var(--app-content-max-width);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -1014,6 +1014,25 @@ body {
   color: var(--app-secondary-foreground);
   font-size: 11px;
 }
+
+.input-footer-primary,
+.input-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.input-footer-primary { flex: 1; }
+.input-footer-actions { flex-shrink: 1; }
+.model-controls,
+.input-turn-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.model-controls { flex-shrink: 1; }
+.input-turn-controls { flex-shrink: 0; }
 
 .footer-hint { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .footer-spacer { flex: 1; }
@@ -2769,12 +2788,49 @@ body {
     padding: 12px 12px 6px;
   }
   .input-container {
-    padding: 6px 8px 8px;
+    padding: 6px 8px max(8px, env(safe-area-inset-bottom));
   }
 
   /* Tap targets */
   .ghost-btn { min-width: 34px; height: 34px; }
-  .btn-send, .btn-stop { width: 34px; height: 34px; }
+  .input-footer {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .input-footer-primary,
+  .input-footer-actions {
+    width: 100%;
+  }
+  .input-footer-actions {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 10px;
+  }
+  .input-footer-actions > .mode-selector {
+    max-width: 100%;
+  }
+  .input-footer-actions > .model-controls {
+    width: 100%;
+  }
+  .input-footer-actions .model-controls > .model-selector:not(.effort-selector) {
+    flex: 1 1 0;
+    max-width: none;
+  }
+  .input-footer-actions .model-controls > .model-selector:not(.effort-selector) .model-selector-trigger {
+    width: 100%;
+    max-width: none;
+  }
+  .input-footer-actions .model-selector-trigger,
+  .input-turn-controls > .btn-send,
+  .input-turn-controls > .btn-stop {
+    min-height: 44px;
+  }
+  .input-turn-controls > .btn-send,
+  .input-turn-controls > .btn-stop {
+    width: 44px;
+    height: 44px;
+  }
 
   /* Modals → bottom sheet */
   .modal-overlay {
@@ -2810,7 +2866,7 @@ body {
 
 .landing-inner {
   width: 100%;
-  max-width: 760px;
+  max-width: var(--app-content-max-width);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -2875,11 +2931,9 @@ body {
 }
 .landing-chip:hover { border-color: var(--app-brand); color: var(--app-brand); }
 
-/* 复用的输入框在落地态下居中、全宽（而非底部悬浮） */
+/* 复用的输入框在落地态下居中、全宽（而非底部悬浮）。
+   文本区沿用通用的两行初始高度，内容输入后仍由 textarea 自动增高。 */
 .landing-inner .input-box { width: 100%; }
-/* 落地页（新建对话）输入框默认更高 —— 约 4 行（line-height 1.5 → 6em 内容高），
-   更醒目、便于多行输入；会话内底部输入框仍维持 2 行。 */
-.landing-inner .message-input { min-height: 6em; }
 
 /* 建议胶囊行 */
 .landing-suggestions {

@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.2</span>
+    <span class="dhdr-ver">v5.0.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -101,7 +101,7 @@
         <tbody>
           <tr><td>Sidebar</td><td>Session history grouped by project, search sessions, start a new chat, rename / delete sessions; collapses to an icon rail (a drawer on mobile).</td></tr>
           <tr><td>Model selector</td><td>Switch provider / model right under the input box; same-named models are disambiguated with a provider tag.</td></tr>
-          <tr><td>Model config</td><td>Add / edit / delete providers in settings: name, type (openai / claude / ollama), model, Base URL, API key, context window, and set-as-default.</td></tr>
+          <tr><td>Model config</td><td>Manage provider accounts and multiple models under each account, including protocol, base URL, API key, context window, and the default model.</td></tr>
           <tr><td>Settings</td><td>Theme (light / dark), language (中 / EN), model config, and the remote-access entry.</td></tr>
           <tr><td>Image attachments</td><td>Paste or pick images to send with a message (2&nbsp;MB each); non-vision models fall back to VL; thumbnails show in history.</td></tr>
           <tr><td>Tool execution</td><td>Tool calls show their arguments and output inline, expandable line by line, both live and in history.</td></tr>
@@ -116,6 +116,8 @@
         <li>When you run <code>/webui</code>, the current TUI session is <strong>attached automatically</strong> — messages you send in the terminal appear in the browser, and vice versa.</li>
         <li>In <strong>another</strong> TUI, run <code>/sync</code> to attach to the running webui session (a <code>/webui</code> must already be running).</li>
         <li><code>/sync off</code> — leave sync and return to a standalone session.</li>
+        <li>Sync mode supports <code>/compact</code>. Model changes follow runtime confirmation and are not applied halfway through an active turn.</li>
+        <li>Uploaded images, the current working directory, and active sessions survive refreshes and view switches.</li>
       </ul>
       <p>This makes "start in the terminal, watch progress on a phone / tablet" — or several people watching the same agent session — possible.</p>
 

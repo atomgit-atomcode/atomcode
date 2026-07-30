@@ -17,9 +17,14 @@ use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
 
+use super::rewind::{
+    RewindLedger, RewindPoint, RewindTransactionJournal, WorkspaceRestorePlan, LEDGER_VERSION,
+    TRANSACTION_VERSION,
+};
 use super::{
-    now_ms, PresentationFile, SessionLease, SessionManager, SessionMeta, SessionStoreError,
-    TurnStat,
+    now_ms, ModelPricing, ModelUsageStat, PresentationFile, SessionLease, SessionManager,
+    SessionMeta, SessionStoreError, TokenBreakdown, TurnStat, WorkspaceCheckpoint,
+    WorkspaceCheckpointError, WorkspaceRestoreReceipt,
 };
 
 /// Per-turn accumulation (reset each turn): duration, round/tool counts, and the final
@@ -32,6 +37,7 @@ struct TurnAccum {
     total_tokens: u32,
     used_tokens: u32,
     ctx_window: u32,
+    tokens: TokenBreakdown,
 }
 
 /// One-shot signal from the persistence hook to its owning runtime. A normal
@@ -40,6 +46,7 @@ struct TurnAccum {
 #[derive(Clone, Default)]
 pub struct SnapshotPersistenceStatus {
     uncertain_commit: Arc<Mutex<Option<String>>>,
+    cost_warning: Arc<Mutex<Option<String>>>,
 }
 
 impl SnapshotPersistenceStatus {
@@ -57,6 +64,20 @@ impl SnapshotPersistenceStatus {
             .unwrap_or_else(|error| error.into_inner())
             .take()
     }
+
+    pub fn report_cost_warning(&self, message: impl Into<String>) {
+        *self
+            .cost_warning
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(message.into());
+    }
+
+    pub fn take_cost_warning(&self) -> Option<String> {
+        self.cost_warning
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
 }
 
 /// Saves `<id>.snapshot` (the compacted working set) + updates `<id>.meta` each turn.
@@ -67,6 +88,52 @@ pub struct SnapshotHook {
     lease: Option<SessionLease>,
     accum: Mutex<TurnAccum>,
     persistence_status: SnapshotPersistenceStatus,
+    attribution: Mutex<Option<ModelAttribution>>,
+    rewind: Mutex<RewindState>,
+}
+
+#[derive(Default)]
+struct RewindState {
+    checkpoint: Option<Arc<WorkspaceCheckpoint>>,
+    unavailable: Option<String>,
+    transaction_unavailable: Option<String>,
+    pending: Option<PendingRewindPoint>,
+    points: Vec<RewindPoint>,
+}
+
+struct PendingRewindPoint {
+    prompt_number: usize,
+    prompt_preview: String,
+    before_tree: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RewindTransactionReceipt {
+    session_id: String,
+    workspace: Option<WorkspaceRestoreReceipt>,
+    previous_points: Vec<RewindPoint>,
+    retained_points: Vec<RewindPoint>,
+    target_snapshot: Option<SessionSnapshot>,
+}
+
+impl RewindTransactionReceipt {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn restored_files(&self) -> &[String] {
+        self.workspace
+            .as_ref()
+            .map(|receipt| receipt.restored_files.as_slice())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone)]
+struct ModelAttribution {
+    provider_id: String,
+    model_id: String,
+    pricing: Option<ModelPricing>,
 }
 
 impl SnapshotHook {
@@ -75,19 +142,72 @@ impl SnapshotHook {
         session_id: impl Into<String>,
         working_dir: impl Into<String>,
     ) -> Self {
+        let session_id = session_id.into();
+        let working_dir = working_dir.into();
+        let (checkpoint, unavailable) =
+            match WorkspaceCheckpoint::for_session(std::path::Path::new(&working_dir), &session_id)
+            {
+                Ok(checkpoint) => (Some(Arc::new(checkpoint)), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+        let points = mgr
+            .load_rewind_ledger(&session_id)
+            .map(|ledger| ledger.points)
+            .unwrap_or_default();
         Self {
             mgr,
-            session_id: session_id.into(),
-            working_dir: working_dir.into(),
+            session_id,
+            working_dir,
             lease: None,
             accum: Mutex::new(TurnAccum::default()),
             persistence_status: SnapshotPersistenceStatus::default(),
+            attribution: Mutex::new(None),
+            rewind: Mutex::new(RewindState {
+                checkpoint,
+                unavailable,
+                points,
+                ..RewindState::default()
+            }),
         }
     }
 
     pub fn with_lease(mut self, lease: SessionLease) -> Self {
         self.lease = Some(lease);
+        self.recover_pending_rewind();
         self
+    }
+
+    pub fn with_model_attribution(
+        mut self,
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        pricing: Option<ModelPricing>,
+    ) -> Self {
+        self.attribution = Mutex::new(Some(ModelAttribution {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            pricing,
+        }));
+        self
+    }
+
+    /// Atomically replace the attribution used by subsequent turns. The coding
+    /// runtime calls this only after a replacement agent has assembled
+    /// successfully and the previous generation has stopped.
+    pub fn set_model_attribution(
+        &self,
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        pricing: Option<ModelPricing>,
+    ) {
+        *self
+            .attribution
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(ModelAttribution {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            pricing,
+        });
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, TurnAccum> {
@@ -96,6 +216,381 @@ impl SnapshotHook {
 
     pub fn persistence_status(&self) -> SnapshotPersistenceStatus {
         self.persistence_status.clone()
+    }
+
+    pub fn rewind_points(&self) -> Vec<RewindPoint> {
+        self.rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .points
+            .clone()
+    }
+
+    pub fn code_rewind_unavailable(&self) -> Option<String> {
+        self.rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .unavailable
+            .clone()
+    }
+
+    /// A failed durable-transaction recovery disables every Rewind scope, not
+    /// merely code restoration. Continuing could overwrite the journal needed
+    /// to recover the conversation/worktree pair.
+    pub fn rewind_transaction_unavailable(&self) -> Option<String> {
+        self.rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .transaction_unavailable
+            .clone()
+    }
+
+    pub fn restore_workspace(
+        &self,
+        point: &RewindPoint,
+    ) -> Result<WorkspaceRestoreReceipt, WorkspaceCheckpointError> {
+        let rewind = self
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let checkpoint = rewind.checkpoint.as_ref().ok_or_else(|| {
+            WorkspaceCheckpointError::Unsupported(
+                rewind
+                    .unavailable
+                    .clone()
+                    .unwrap_or_else(|| "code rewind is unavailable".into()),
+            )
+        })?;
+        let expected_current = rewind
+            .points
+            .last()
+            .map(|latest| latest.after_tree.as_str())
+            .unwrap_or(point.after_tree.as_str());
+        checkpoint.restore(&point.before_tree, expected_current)
+    }
+
+    pub fn compensate_workspace(
+        &self,
+        receipt: &WorkspaceRestoreReceipt,
+    ) -> Result<(), WorkspaceCheckpointError> {
+        let rewind = self
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let checkpoint = rewind.checkpoint.as_ref().ok_or_else(|| {
+            WorkspaceCheckpointError::Unsupported("code rewind is unavailable".into())
+        })?;
+        checkpoint.compensate(&receipt.recovery_tree, &receipt.restored_files)
+    }
+
+    /// Start a durable Rewind transaction. Recovery state is persisted before
+    /// either the worktree or point ledger is changed.
+    pub fn begin_rewind(
+        &self,
+        point: &RewindPoint,
+        restore_code: bool,
+        target_snapshot: Option<SessionSnapshot>,
+    ) -> Result<RewindTransactionReceipt, WorkspaceCheckpointError> {
+        let mut rewind = self
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(reason) = rewind.transaction_unavailable.as_ref() {
+            return Err(WorkspaceCheckpointError::Persistence(reason.clone()));
+        }
+        let previous = rewind.points.clone();
+        if !previous.iter().any(|candidate| candidate == point) {
+            return Err(WorkspaceCheckpointError::Persistence(format!(
+                "rewind point {} is no longer available",
+                point.turn_id
+            )));
+        }
+        let workspace_plan = if restore_code {
+            let checkpoint = rewind.checkpoint.as_ref().ok_or_else(|| {
+                WorkspaceCheckpointError::Unsupported(
+                    rewind
+                        .unavailable
+                        .clone()
+                        .unwrap_or_else(|| "code rewind is unavailable".into()),
+                )
+            })?;
+            let expected_current = previous
+                .last()
+                .map(|latest| latest.after_tree.as_str())
+                .unwrap_or(point.after_tree.as_str());
+            Some(checkpoint.prepare_restore(&point.before_tree, expected_current)?)
+        } else {
+            None
+        };
+        let retained = previous
+            .iter()
+            .filter(|candidate| candidate.turn_id < point.turn_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let journal = RewindTransactionJournal {
+            version: TRANSACTION_VERSION,
+            previous_points: previous.clone(),
+            retained_points: retained.clone(),
+            recovery_tree: workspace_plan
+                .as_ref()
+                .map(|plan| plan.recovery_tree.clone()),
+            restored_files: workspace_plan
+                .as_ref()
+                .map(|plan| plan.files.clone())
+                .unwrap_or_default(),
+            target_snapshot: target_snapshot.clone(),
+            committed: false,
+        };
+        self.save_rewind_transaction(&journal)?;
+        let workspace = match self.apply_workspace_plan(&rewind, workspace_plan.as_ref()) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if let Err(clear) = self.clear_rewind_transaction() {
+                    return Err(WorkspaceCheckpointError::Compensation {
+                        operation: error.to_string(),
+                        compensation: format!("could not clear recovery journal: {clear}"),
+                    });
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.replace_rewind_points_locked(&mut rewind, retained) {
+            let compensation = workspace
+                .as_ref()
+                .map(|receipt| {
+                    rewind
+                        .checkpoint
+                        .as_ref()
+                        .ok_or_else(|| {
+                            WorkspaceCheckpointError::Unsupported(
+                                "code rewind compensation lost its checkpoint".into(),
+                            )
+                        })?
+                        .compensate(&receipt.recovery_tree, &receipt.restored_files)
+                })
+                .transpose();
+            if let Err(compensation) = compensation {
+                return Err(WorkspaceCheckpointError::Compensation {
+                    operation: error.to_string(),
+                    compensation: compensation.to_string(),
+                });
+            }
+            if let Err(clear) = self.clear_rewind_transaction() {
+                return Err(WorkspaceCheckpointError::Compensation {
+                    operation: error.to_string(),
+                    compensation: format!("could not clear recovery journal: {clear}"),
+                });
+            }
+            return Err(error);
+        }
+        Ok(RewindTransactionReceipt {
+            session_id: self.session_id.clone(),
+            workspace,
+            previous_points: previous,
+            retained_points: journal.retained_points,
+            target_snapshot,
+        })
+    }
+
+    pub fn commit_rewind(
+        &self,
+        receipt: RewindTransactionReceipt,
+    ) -> Result<(), WorkspaceCheckpointError> {
+        self.validate_rewind_receipt(&receipt)?;
+        let journal = RewindTransactionJournal {
+            version: TRANSACTION_VERSION,
+            previous_points: receipt.previous_points,
+            retained_points: receipt.retained_points,
+            recovery_tree: receipt
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.recovery_tree.clone()),
+            restored_files: receipt
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.restored_files.clone())
+                .unwrap_or_default(),
+            target_snapshot: receipt.target_snapshot,
+            committed: true,
+        };
+        self.save_rewind_transaction(&journal)?;
+        self.clear_rewind_transaction()
+    }
+
+    pub fn compensate_rewind(
+        &self,
+        receipt: RewindTransactionReceipt,
+    ) -> Result<(), WorkspaceCheckpointError> {
+        self.validate_rewind_receipt(&receipt)?;
+        let mut rewind = self
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.replace_rewind_points_locked(&mut rewind, receipt.previous_points)?;
+        if let Some(workspace) = receipt.workspace.as_ref() {
+            let checkpoint = rewind.checkpoint.as_ref().ok_or_else(|| {
+                WorkspaceCheckpointError::Unsupported(
+                    "rewind compensation lost its workspace checkpoint".into(),
+                )
+            })?;
+            checkpoint.compensate(&workspace.recovery_tree, &workspace.restored_files)?;
+        }
+        self.clear_rewind_transaction()
+    }
+
+    /// Resolve an abandoned handle-side transaction from durable state. If the
+    /// canonical conversation already equals the target, the operation crossed
+    /// its commit point and must be finalized; otherwise restore its preimage.
+    pub fn recover_rewind(
+        &self,
+        receipt: RewindTransactionReceipt,
+    ) -> Result<(), WorkspaceCheckpointError> {
+        self.validate_rewind_receipt(&receipt)?;
+        let conversation_committed = receipt.target_snapshot.as_ref().is_some_and(|target| {
+            self.mgr
+                .load_snapshot(&self.session_id)
+                .is_ok_and(|snapshot| snapshot == *target)
+        });
+        if conversation_committed {
+            self.commit_rewind(receipt)
+        } else {
+            self.compensate_rewind(receipt)
+        }
+    }
+
+    fn validate_rewind_receipt(
+        &self,
+        receipt: &RewindTransactionReceipt,
+    ) -> Result<(), WorkspaceCheckpointError> {
+        if receipt.session_id == self.session_id {
+            Ok(())
+        } else {
+            Err(WorkspaceCheckpointError::Persistence(format!(
+                "rewind receipt belongs to session {}, not {}",
+                receipt.session_id, self.session_id
+            )))
+        }
+    }
+
+    fn replace_rewind_points_locked(
+        &self,
+        rewind: &mut RewindState,
+        points: Vec<RewindPoint>,
+    ) -> Result<(), WorkspaceCheckpointError> {
+        let previous = rewind.points.clone();
+        if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+            checkpoint.retain_points(&points)?;
+        }
+        let ledger = RewindLedger {
+            version: LEDGER_VERSION,
+            points: points.clone(),
+        };
+        let saved = match &self.lease {
+            Some(lease) => self.mgr.save_rewind_ledger_with_lease(lease, &ledger),
+            None => self.mgr.save_rewind_ledger(&self.session_id, &ledger),
+        };
+        if let Err(error) = saved {
+            if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+                if let Err(compensation) = checkpoint.retain_points(&previous) {
+                    return Err(WorkspaceCheckpointError::Compensation {
+                        operation: error.to_string(),
+                        compensation: compensation.to_string(),
+                    });
+                }
+            }
+            return Err(WorkspaceCheckpointError::Persistence(error.to_string()));
+        }
+        rewind.points = points;
+        Ok(())
+    }
+
+    fn apply_workspace_plan(
+        &self,
+        rewind: &RewindState,
+        plan: Option<&WorkspaceRestorePlan>,
+    ) -> Result<Option<WorkspaceRestoreReceipt>, WorkspaceCheckpointError> {
+        let Some(plan) = plan else {
+            return Ok(None);
+        };
+        let checkpoint = rewind.checkpoint.as_ref().ok_or_else(|| {
+            WorkspaceCheckpointError::Unsupported(
+                "code rewind lost its workspace checkpoint".into(),
+            )
+        })?;
+        checkpoint.apply_prepared_restore(plan).map(Some)
+    }
+
+    fn save_rewind_transaction(
+        &self,
+        journal: &RewindTransactionJournal,
+    ) -> Result<(), WorkspaceCheckpointError> {
+        let lease = self.lease.as_ref().ok_or_else(|| {
+            WorkspaceCheckpointError::Persistence(
+                "rewind transaction requires an active session lease".into(),
+            )
+        })?;
+        self.mgr
+            .save_rewind_transaction_with_lease(lease, journal)
+            .map_err(|error| WorkspaceCheckpointError::Persistence(error.to_string()))
+    }
+
+    fn clear_rewind_transaction(&self) -> Result<(), WorkspaceCheckpointError> {
+        let lease = self.lease.as_ref().ok_or_else(|| {
+            WorkspaceCheckpointError::Persistence(
+                "rewind transaction requires an active session lease".into(),
+            )
+        })?;
+        self.mgr
+            .clear_rewind_transaction_with_lease(lease)
+            .map_err(|error| WorkspaceCheckpointError::Persistence(error.to_string()))
+    }
+
+    fn recover_pending_rewind(&self) {
+        let journal = match self.mgr.load_rewind_transaction(&self.session_id) {
+            Ok(Some(journal)) => journal,
+            Ok(None) => return,
+            Err(error) => {
+                self.mark_rewind_unavailable(format!(
+                    "pending rewind transaction is unreadable: {error}"
+                ));
+                return;
+            }
+        };
+        let result = (|| {
+            let mut rewind = self
+                .rewind
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let conversation_committed = journal.target_snapshot.as_ref().is_some_and(|target| {
+                self.mgr
+                    .load_snapshot(&self.session_id)
+                    .is_ok_and(|snapshot| snapshot == *target)
+            });
+            if journal.committed || conversation_committed {
+                self.replace_rewind_points_locked(&mut rewind, journal.retained_points)?;
+            } else {
+                self.replace_rewind_points_locked(&mut rewind, journal.previous_points)?;
+                if let Some(tree) = journal.recovery_tree.as_deref() {
+                    let checkpoint = rewind.checkpoint.as_ref().ok_or_else(|| {
+                        WorkspaceCheckpointError::Unsupported(
+                            "pending rewind recovery has no workspace checkpoint".into(),
+                        )
+                    })?;
+                    checkpoint.compensate(tree, &journal.restored_files)?;
+                }
+            }
+            self.clear_rewind_transaction()
+        })();
+        if let Err(error) = result {
+            self.mark_rewind_unavailable(format!("pending rewind recovery failed: {error}"));
+        }
+    }
+
+    fn mark_rewind_unavailable(&self, reason: String) {
+        self.rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .transaction_unavailable = Some(reason);
     }
 
     fn record_persistence_error(&self, error: &SessionStoreError) {
@@ -132,19 +627,17 @@ fn reindex_compacted_sidecars(
             .count();
         let old_end = before.messages.len().saturating_sub(suffix);
         let new_end = after.messages.len().saturating_sub(suffix);
-        meta.turn_stats.retain_mut(|stat| {
-            if !stat.position_valid {
-                return true;
-            }
-            if stat.after_message > prefix && stat.after_message < old_end {
-                false
-            } else {
-                if stat.after_message >= old_end {
-                    stat.after_message = new_end + stat.after_message.saturating_sub(old_end);
-                }
-                true
-            }
+        let _ = meta.archive_turn_stats_where(|stat| {
+            stat.position_valid && stat.after_message > prefix && stat.after_message < old_end
         });
+        for stat in &mut meta.turn_stats {
+            if !stat.position_valid {
+                continue;
+            }
+            if stat.after_message >= old_end {
+                stat.after_message = new_end + stat.after_message.saturating_sub(old_end);
+            }
+        }
     }
     let surviving_turn_ids: std::collections::BTreeSet<_> = meta
         .turn_stats
@@ -190,6 +683,66 @@ impl LifecycleHooks for SnapshotHook {
         Ok(())
     }
 
+    /// Save the accepted user prompt after it has entered the conversation.
+    ///
+    /// Model responses are intentionally excluded: this hook runs before
+    /// requested tools execute, so persisting them could restore dangling tool
+    /// calls without their results.
+    async fn turn_start(&self, convo: &mut Conversation) {
+        let prompt_number = convo
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == atomcode_kernel::message::Role::User && !message.synthetic
+            })
+            .count();
+        let prompt_preview = convo
+            .messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == atomcode_kernel::message::Role::User && !message.synthetic
+            })
+            .map(|message| message.text.chars().take(120).collect())
+            .unwrap_or_default();
+        let checkpoint = self
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .checkpoint
+            .clone();
+        let before_tree = match checkpoint {
+            Some(checkpoint) => tokio::task::spawn_blocking(move || checkpoint.capture())
+                .await
+                .ok()
+                .and_then(Result::ok),
+            None => None,
+        };
+        {
+            let mut rewind = self
+                .rewind
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            rewind.pending = before_tree.map(|before_tree| PendingRewindPoint {
+                prompt_number,
+                prompt_preview,
+                before_tree,
+            });
+        }
+        let snapshot = SessionSnapshot::from_conversation(convo);
+        let result = match &self.lease {
+            Some(lease) => self
+                .mgr
+                .save_inflight_snapshot_with_lease(lease, &snapshot, true),
+            None => self
+                .mgr
+                .save_inflight_snapshot(&self.session_id, &snapshot, true),
+        };
+        if let Err(error) = result {
+            eprintln!("[SnapshotHook] inflight save at turn_start failed: {error}");
+        }
+    }
+
     /// Count this model round and retain the final request's usage/context figures.
     async fn on_model_response(&self, response: &mut Message) {
         let mut a = self.lock();
@@ -204,6 +757,24 @@ impl LifecycleHooks for SnapshotHook {
             a.total_tokens = meta.tokens.prompt.saturating_add(meta.tokens.completion);
             a.used_tokens = meta.used_tokens;
             a.ctx_window = meta.ctx_window;
+            // Provider prompt usage includes cached input for the adapters we
+            // support. Store mutually-exclusive buckets so aggregation and
+            // pricing never charge cached tokens twice.
+            a.tokens.input = a.tokens.input.saturating_add(u64::from(
+                meta.tokens.prompt.saturating_sub(meta.tokens.cached),
+            ));
+            a.tokens.output = a
+                .tokens
+                .output
+                .saturating_add(u64::from(meta.tokens.completion));
+            a.tokens.cached_input = a
+                .tokens
+                .cached_input
+                .saturating_add(u64::from(meta.tokens.cached));
+        }
+        drop(a);
+        if let Err(error) = self.mgr.mark_inflight_not_replayable(&self.session_id) {
+            eprintln!("[SnapshotHook] inflight phase update failed: {error}");
         }
     }
 
@@ -211,6 +782,32 @@ impl LifecycleHooks for SnapshotHook {
     /// session meta (bump turn/message counts, append this turn's stat, stamp updated_at).
     /// Both are best-effort — an IO failure must never panic or break the turn.
     async fn turn_complete(&self, convo: &Conversation, reason: &StopReason, ctx: &TurnCtx) {
+        let (pending, checkpoint) = {
+            let mut rewind = self
+                .rewind
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (rewind.pending.take(), rewind.checkpoint.clone())
+        };
+        let turn_id = ctx.turn_id;
+        let completed_rewind = match (pending, checkpoint) {
+            (Some(pending), Some(checkpoint)) => tokio::task::spawn_blocking(move || {
+                let after_tree = checkpoint.capture().ok()?;
+                let files = checkpoint.diff(&pending.before_tree, &after_tree).ok()?;
+                Some(RewindPoint {
+                    turn_id,
+                    prompt_number: pending.prompt_number,
+                    prompt_preview: pending.prompt_preview,
+                    before_tree: pending.before_tree,
+                    after_tree,
+                    files,
+                })
+            })
+            .await
+            .ok()
+            .flatten(),
+            _ => None,
+        };
         let mut snap = SessionSnapshot::from_conversation(convo);
         // `from_conversation` DERIVES the id high-water marks from stored metas; a
         // turn that died before any assistant message was stored is invisible to
@@ -219,7 +816,15 @@ impl LifecycleHooks for SnapshotHook {
         snap.turn_counter = snap.turn_counter.max(ctx.turn_id);
         snap.request_counter = snap.request_counter.max(ctx.request_id);
         let now = now_ms();
-        let (duration_ms, round_count, tool_call_count, total_tokens, used_tokens, ctx_window) = {
+        let (
+            duration_ms,
+            round_count,
+            tool_call_count,
+            total_tokens,
+            used_tokens,
+            ctx_window,
+            tokens,
+        ) = {
             let a = self.lock();
             (
                 (now - a.started_ms).max(0) as u64,
@@ -228,8 +833,26 @@ impl LifecycleHooks for SnapshotHook {
                 a.total_tokens,
                 a.used_tokens,
                 a.ctx_window,
+                a.tokens,
             )
         };
+        let attribution = self
+            .attribution
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let model_usage = attribution
+            .as_ref()
+            .filter(|_| tokens.total() > 0)
+            .map(|attribution| {
+                vec![ModelUsageStat {
+                    provider_id: attribution.provider_id.clone(),
+                    model_id: attribution.model_id.clone(),
+                    tokens,
+                    pricing: attribution.pricing,
+                }]
+            })
+            .unwrap_or_default();
 
         let msg_count = convo.messages.len();
         let update_meta = |meta: &mut SessionMeta| {
@@ -237,8 +860,12 @@ impl LifecycleHooks for SnapshotHook {
             meta.updated_at = now;
             meta.turn_count = meta.turn_count.saturating_add(1);
             meta.message_count = msg_count as u32;
-            meta.turn_stats
-                .retain(|s| s.turn_id != 0 || s.after_message <= msg_count);
+            // Only legacy position-only stats can be judged by message count.
+            // Native stats have stable turn ids and are reindexed exclusively by
+            // the explicit compaction/undo seams.
+            let _ = meta.archive_turn_stats_where(|stat| {
+                stat.turn_id == 0 && stat.position_valid && stat.after_message > msg_count
+            });
             meta.turn_stats.push(TurnStat {
                 after_message: msg_count,
                 position_valid: true,
@@ -250,6 +877,7 @@ impl LifecycleHooks for SnapshotHook {
                 errored: *reason != StopReason::Stopped,
                 used_tokens,
                 ctx_window,
+                model_usage,
             });
         };
         let result = if let Some(lease) = &self.lease {
@@ -264,6 +892,7 @@ impl LifecycleHooks for SnapshotHook {
         } else {
             if let Err(error) = self.mgr.save_snapshot(&self.session_id, &snap) {
                 eprintln!("[SnapshotHook] save_snapshot failed: {error}");
+                return;
             }
             let fresh = SessionMeta::new(&self.session_id, &self.working_dir, now);
             self.mgr
@@ -272,7 +901,46 @@ impl LifecycleHooks for SnapshotHook {
         if let Err(error) = result {
             self.record_persistence_error(&error);
             eprintln!("[SnapshotHook] update_meta failed: {error}");
+            // Preserve the accepted-prompt checkpoint until a later successful
+            // aggregate commit supersedes it.
+            return;
         }
+        if let Some(point) = completed_rewind {
+            let mut rewind = self
+                .rewind
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let previous_points = rewind.points.clone();
+            rewind.points.push(point);
+            const MAX_REWIND_POINTS: usize = 100;
+            if rewind.points.len() > MAX_REWIND_POINTS {
+                let excess = rewind.points.len() - MAX_REWIND_POINTS;
+                rewind.points.drain(..excess);
+            }
+            let ledger = RewindLedger {
+                version: LEDGER_VERSION,
+                points: rewind.points.clone(),
+            };
+            if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+                if let Err(error) = checkpoint.retain_points(&ledger.points) {
+                    eprintln!("[SnapshotHook] rewind refs update failed: {error}");
+                    rewind.points = previous_points;
+                    return;
+                }
+            }
+            let saved = match &self.lease {
+                Some(lease) => self.mgr.save_rewind_ledger_with_lease(lease, &ledger),
+                None => self.mgr.save_rewind_ledger(&self.session_id, &ledger),
+            };
+            if let Err(error) = saved {
+                eprintln!("[SnapshotHook] rewind ledger save failed: {error}");
+                if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+                    let _ = checkpoint.retain_points(&previous_points);
+                }
+                rewind.points = previous_points;
+            }
+        }
+        self.mgr.clear_inflight_snapshot(&self.session_id);
     }
 }
 
@@ -295,6 +963,186 @@ mod tests {
             c.push(Message::user(format!("m{i}")));
         }
         c
+    }
+
+    fn rewind_point(turn_id: u64, prompt_number: usize) -> RewindPoint {
+        RewindPoint {
+            turn_id,
+            prompt_number,
+            prompt_preview: format!("prompt {prompt_number}"),
+            before_tree: "a".repeat(40),
+            after_tree: "b".repeat(40),
+            files: Vec::new(),
+        }
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn pending_rewind_is_rolled_back_when_conversation_was_not_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::with_root(dir.path()));
+        let id = "rewind-crash-rollback";
+        let points = vec![rewind_point(1, 1), rewind_point(2, 2)];
+        manager
+            .save_rewind_ledger(
+                id,
+                &RewindLedger {
+                    version: LEDGER_VERSION,
+                    points: points.clone(),
+                },
+            )
+            .unwrap();
+        let original = SessionSnapshot::from_conversation(&convo_with(2));
+        manager.save_snapshot(id, &original).unwrap();
+
+        let lease = manager.acquire_lease(id).unwrap();
+        let hook = SnapshotHook::new(manager.clone(), id, "/not-a-git-worktree").with_lease(lease);
+        let target = SessionSnapshot::from_conversation(&convo_with(0));
+        let _receipt = hook.begin_rewind(&points[0], false, Some(target)).unwrap();
+        assert!(hook.rewind_points().is_empty());
+        drop(hook); // Simulate process death before conversation persistence.
+
+        let lease = manager.acquire_lease(id).unwrap();
+        let recovered =
+            SnapshotHook::new(manager.clone(), id, "/not-a-git-worktree").with_lease(lease);
+        assert_eq!(recovered.rewind_points(), points);
+        assert!(manager.load_rewind_transaction(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_rewind_is_committed_when_canonical_conversation_matches_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::with_root(dir.path()));
+        let id = "rewind-crash-commit";
+        let points = vec![rewind_point(1, 1), rewind_point(2, 2)];
+        manager
+            .save_rewind_ledger(
+                id,
+                &RewindLedger {
+                    version: LEDGER_VERSION,
+                    points: points.clone(),
+                },
+            )
+            .unwrap();
+        manager
+            .save_snapshot(id, &SessionSnapshot::from_conversation(&convo_with(2)))
+            .unwrap();
+
+        let lease = manager.acquire_lease(id).unwrap();
+        let hook = SnapshotHook::new(manager.clone(), id, "/not-a-git-worktree").with_lease(lease);
+        let target = SessionSnapshot::from_conversation(&convo_with(0));
+        let _receipt = hook
+            .begin_rewind(&points[0], false, Some(target.clone()))
+            .unwrap();
+        manager.save_snapshot(id, &target).unwrap();
+        drop(hook); // Simulate death after conversation commit, before finalization.
+
+        let lease = manager.acquire_lease(id).unwrap();
+        let recovered =
+            SnapshotHook::new(manager.clone(), id, "/not-a-git-worktree").with_lease(lease);
+        assert!(recovered.rewind_points().is_empty());
+        assert!(manager.load_rewind_transaction(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_code_rewind_restores_workspace_after_interrupted_transaction() {
+        let worktree = tempfile::tempdir().unwrap();
+        git(worktree.path(), &["init", "--quiet"]);
+        std::fs::write(worktree.path().join("tracked.txt"), "before\n").unwrap();
+        git(worktree.path(), &["add", "tracked.txt"]);
+        git(
+            worktree.path(),
+            &[
+                "-c",
+                "user.name=AtomCode",
+                "-c",
+                "user.email=atomcode@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ],
+        );
+        let store = tempfile::tempdir().unwrap();
+        let checkpoint =
+            Arc::new(WorkspaceCheckpoint::with_store(worktree.path(), store.path()).unwrap());
+        let before = checkpoint.capture().unwrap();
+        std::fs::write(worktree.path().join("tracked.txt"), "after\n").unwrap();
+        let after = checkpoint.capture().unwrap();
+        let point = RewindPoint {
+            before_tree: before,
+            after_tree: after,
+            files: vec![super::super::FileChangeSummary {
+                path: "tracked.txt".into(),
+                additions: 1,
+                deletions: 1,
+                binary: false,
+            }],
+            ..rewind_point(1, 1)
+        };
+
+        let session_store = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::with_root(session_store.path()));
+        manager
+            .save_rewind_ledger(
+                "rewind-code-crash",
+                &RewindLedger {
+                    version: LEDGER_VERSION,
+                    points: vec![point.clone()],
+                },
+            )
+            .unwrap();
+        let lease = manager.acquire_lease("rewind-code-crash").unwrap();
+        let hook = SnapshotHook::new(
+            manager.clone(),
+            "rewind-code-crash",
+            worktree.path().to_string_lossy(),
+        );
+        hook.rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .checkpoint = Some(checkpoint);
+        let hook = hook.with_lease(lease);
+        let _receipt = hook.begin_rewind(&point, true, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("tracked.txt")).unwrap(),
+            "before\n"
+        );
+        drop(hook);
+
+        let checkpoint =
+            Arc::new(WorkspaceCheckpoint::with_store(worktree.path(), store.path()).unwrap());
+        let lease = manager.acquire_lease("rewind-code-crash").unwrap();
+        let recovered = SnapshotHook::new(
+            manager.clone(),
+            "rewind-code-crash",
+            worktree.path().to_string_lossy(),
+        );
+        recovered
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .checkpoint = Some(checkpoint);
+        let recovered = recovered.with_lease(lease);
+
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("tracked.txt")).unwrap(),
+            "after\n"
+        );
+        assert_eq!(recovered.rewind_points(), vec![point]);
     }
 
     #[test]
@@ -334,6 +1182,7 @@ mod tests {
             errored: false,
             used_tokens: 1,
             ctx_window: 10,
+            model_usage: Vec::new(),
         };
         let mut meta = SessionMeta::new(id, "/p", 1);
         meta.owner = StorageOwner::Native;
@@ -375,6 +1224,7 @@ mod tests {
         assert_eq!(meta.turn_stats.len(), 2);
         assert_eq!(meta.turn_stats[0].after_message, 1);
         assert_eq!(meta.turn_stats[1].after_message, 3);
+        assert_eq!(meta.detached_unattributed_tokens, 1);
         let presentation = manager.read_presentation(id).unwrap();
         assert_eq!(presentation.entries.len(), 1);
         assert_eq!(presentation.entries[0].text, "keep");
@@ -418,6 +1268,7 @@ mod tests {
             errored: false,
             used_tokens: 1,
             ctx_window: 10,
+            model_usage: Vec::new(),
         };
         let mut meta = SessionMeta::new(id, "/p", 1);
         meta.owner = StorageOwner::Native;
@@ -578,7 +1429,16 @@ mod tests {
 
     #[tokio::test]
     async fn records_round_count_and_distinct_token_semantics() {
-        let (h, mgr, _d) = hook("s1a-stats");
+        let (base, mgr, _d) = hook("s1a-stats");
+        let h = base.with_model_attribution(
+            "provider-a",
+            "model-a",
+            Some(ModelPricing {
+                input_per_million: 1.0,
+                output_per_million: 2.0,
+                cached_input_per_million: 0.1,
+            }),
+        );
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp_with_usage(1, 100, 10, 800, 1_000))
             .await;
@@ -596,6 +1456,53 @@ mod tests {
         assert_eq!(stat["total_tokens"], 220);
         assert_eq!(stat["used_tokens"], 900);
         assert_eq!(stat["ctx_window"], 1_000);
+        assert_eq!(stat["model_usage"][0]["provider_id"], "provider-a");
+        assert_eq!(stat["model_usage"][0]["model_id"], "model-a");
+        assert_eq!(stat["model_usage"][0]["tokens"]["input"], 300);
+        assert_eq!(stat["model_usage"][0]["tokens"]["output"], 30);
+    }
+
+    #[tokio::test]
+    async fn model_attribution_can_switch_between_completed_turns() {
+        let (base, mgr, _d) = hook("s1a-model-switch");
+        let h = base.with_model_attribution("provider-a", "model-a", None);
+
+        h.user_prompt_submit(&mut "first".to_string())
+            .await
+            .unwrap();
+        h.on_model_response(&mut resp(0, 1)).await;
+        h.turn_complete(
+            &convo_with(1),
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: 1,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
+
+        h.set_model_attribution("provider-b", "model-b", None);
+        h.user_prompt_submit(&mut "second".to_string())
+            .await
+            .unwrap();
+        h.on_model_response(&mut resp(0, 2)).await;
+        h.turn_complete(
+            &convo_with(2),
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: 2,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
+
+        let report =
+            crate::session::aggregate_session_cost(&mgr.read_meta("s1a-model-switch").unwrap());
+        assert_eq!(report.models.len(), 2);
+        assert_eq!(report.models[0].provider_id, "provider-a");
+        assert_eq!(report.models[0].model_id, "model-a");
+        assert_eq!(report.models[1].provider_id, "provider-b");
+        assert_eq!(report.models[1].model_id, "model-b");
     }
 
     #[tokio::test]
@@ -682,7 +1589,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prunes_unconverted_legacy_stats_when_snapshot_shrinks() {
+    async fn snapshot_shrink_reindexes_and_keeps_unconverted_usage_stats() {
         let (h, mgr, _d) = hook("s1");
         // Turn 1: a 5-message snapshot → stat at after_message=5.
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
@@ -695,12 +1602,8 @@ mod tests {
         h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
             .await;
         let meta = mgr.read_meta("s1").unwrap();
-        assert!(
-            meta.turn_stats.iter().all(|s| s.after_message <= 2),
-            "stale stats (after_message > new len) must be pruned: {:?}",
-            meta.turn_stats
-        );
         assert_eq!(meta.turn_stats.len(), 1, "only the in-range stat remains");
+        assert_eq!(meta.detached_unattributed_tokens, 6);
     }
 
     #[tokio::test]
@@ -734,6 +1637,7 @@ mod tests {
         assert_eq!(stats.len(), 2);
         assert_eq!(stats[0].turn_id, 1);
         assert_eq!(stats[0].after_message, 5);
+        assert!(stats[0].position_valid);
         assert_eq!(stats[1].turn_id, 2);
     }
 
@@ -875,5 +1779,54 @@ mod tests {
         let presentation = mgr.read_presentation(id).unwrap();
         assert_eq!(presentation.entries.len(), 1);
         assert_eq!(presentation.entries[0].text, "concurrent append");
+    }
+
+    #[tokio::test]
+    async fn turn_start_checkpoints_the_accepted_user_prompt() {
+        let (hook, manager, _dir) = hook("inflight-prompt");
+        let mut conversation = convo_with(2);
+
+        hook.turn_start(&mut conversation).await;
+
+        assert_eq!(
+            manager
+                .load_inflight_snapshot("inflight-prompt")
+                .unwrap()
+                .unwrap()
+                .snapshot,
+            SessionSnapshot::from_conversation(&conversation)
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_turn_commit_clears_the_inflight_prompt() {
+        let (hook, manager, _dir) = hook("inflight-clear");
+        let mut conversation = convo_with(1);
+        hook.turn_start(&mut conversation).await;
+
+        hook.turn_complete(&conversation, &StopReason::Stopped, &TurnCtx::default())
+            .await;
+
+        assert!(!manager.has_inflight_snapshot("inflight-clear"));
+        assert_eq!(
+            manager.load_snapshot("inflight-clear").unwrap(),
+            SessionSnapshot::from_conversation(&conversation)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_unleased_snapshot_save_preserves_the_inflight_prompt() {
+        let (hook, manager, _dir) = hook("inflight-save-failure");
+        let mut conversation = convo_with(1);
+        hook.turn_start(&mut conversation).await;
+        std::fs::create_dir(manager.snapshot_path("inflight-save-failure").unwrap()).unwrap();
+
+        hook.turn_complete(&conversation, &StopReason::Stopped, &TurnCtx::default())
+            .await;
+
+        assert!(
+            manager.has_inflight_snapshot("inflight-save-failure"),
+            "the recovery checkpoint must survive a failed canonical save"
+        );
     }
 }

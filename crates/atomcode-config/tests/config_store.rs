@@ -21,6 +21,7 @@ fn provider(model: &str) -> ProviderConfig {
         skip_tls_verify: false,
         ephemeral: false,
         capable_model: None,
+        pricing: None,
     }
 }
 
@@ -169,7 +170,9 @@ model = "missing-type"
     std::fs::write(&path, content).unwrap();
     let store = ConfigStore::new(&path);
 
-    let snapshot = store.read().expect("runtime reads should isolate bad providers");
+    let snapshot = store
+        .read()
+        .expect("runtime reads should isolate bad providers");
     assert_eq!(snapshot.config.default_provider, "valid");
     assert!(snapshot.config.providers.contains_key("valid"));
     assert!(!snapshot.config.providers.contains_key("invalid"));

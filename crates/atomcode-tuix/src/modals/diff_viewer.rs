@@ -215,9 +215,7 @@ impl DiffViewer {
         // The Loading/Error/List panels fit their content instead of reserving a
         // fixed slab of screen; only the file-detail view keeps a tall fixed
         // height so a diff has room to scroll.
-        let fit = |rows: &[DiffPanelRow]| {
-            ((rows.len() + 4).min(screen_h as usize)).max(1) as u16
-        };
+        let fit = |rows: &[DiffPanelRow]| ((rows.len() + 4).min(screen_h as usize)).max(1) as u16;
         let (title, rows, footer, win_height): (DiffPanelRow, Vec<DiffPanelRow>, String, u16) =
             match &self.view {
                 View::Loading => {

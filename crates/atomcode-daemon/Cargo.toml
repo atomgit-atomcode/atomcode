@@ -12,17 +12,19 @@ path = "src/lib.rs"
 name = "atomcode-daemon"
 path = "src/main.rs"
 
+[features]
+default = []
+codingplan-crypto = ["atomcode-auth/codingplan-crypto"]
+
 [dependencies]
-atomcode-core = { path = "../atomcode-core" }
 atomcode-codingplan = { path = "../atomcode-codingplan" }
-# Config system (leaf crate, extracted from core) — used directly, not via the
-# transitional atomcode_core::config re-export shim.
+# Config system used directly by the daemon.
 atomcode-config = { path = "../atomcode-config" }
 atomcode-auth = { path = "../atomcode-auth" }
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["plugin"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["plugin", "mcp", "atomgit"] }
 # Unified native runtime used by daemon live/chat/session paths.
 atomcode-kernel = { path = "../atomcode-kernel" }
-atomcode-coding = { path = "../atomcode-coding" }
+atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 
 # HTTP

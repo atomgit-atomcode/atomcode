@@ -19,13 +19,15 @@ path = "src/lib.rs"
 [features]
 default = []
 distro-pm = ["atomcode-updater/distro-pm", "atomcode-tuix/distro-pm"]
+# Official-release signing is owned by the final binary. Keep the open-source
+# default unsigned while giving the release pipeline an explicit, core-free
+# feature entry point.
+codingplan-crypto = ["atomcode-auth/codingplan-crypto"]
 
 [dependencies]
 async-trait = "0.1"
-atomcode-core = { path = "../atomcode-core" }
 atomcode-codingplan = { path = "../atomcode-codingplan" }
-# Config system (leaf crate, extracted from core) — used directly, not via the
-# transitional atomcode_core::config re-export shim.
+# Config system used directly by the final binary.
 atomcode-config = { path = "../atomcode-config" }
 # Self-update mechanics (leaf crate, extracted from core).
 atomcode-updater = { path = "../atomcode-updater" }
@@ -39,10 +41,11 @@ atomcode-daemon = { path = "../atomcode-daemon" }
 agent-client-protocol = { workspace = true }
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit", "cc-hooks"] }
 atomcode-auth = { path = "../atomcode-auth" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }
 url = "2"

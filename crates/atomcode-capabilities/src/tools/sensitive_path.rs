@@ -41,6 +41,8 @@ const SENSITIVE_MARKERS: &[&str] = &[
     "/.config/gcloud",
     ".netrc",
     ".git-credentials",
+    "/.atomcode/auth.toml",
+    "/.atomcode/auth/",
     "/.docker/config",
     ".npmrc",
     ".pypirc",
@@ -72,7 +74,33 @@ pub fn references_sensitive_path(args: &str) -> bool {
     if env_dot_reference_is_sensitive(&a) {
         return true;
     }
-    SENSITIVE_MARKERS.iter().any(|m| a.contains(m))
+    if SENSITIVE_MARKERS.iter().any(|m| a.contains(m)) {
+        return true;
+    }
+    // Raw JSON doubles Windows path separators. Decode string values, normalize their
+    // separators, then apply the same path-shaped markers to the actual argument bytes.
+    // This avoids maintaining a fragile second marker list for JSON escaping.
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .is_some_and(|value| decoded_json_references_sensitive_path(&value))
+}
+
+fn decoded_json_references_sensitive_path(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => {
+            let normalized = value.to_ascii_lowercase().replace('\\', "/");
+            SENSITIVE_MARKERS
+                .iter()
+                .any(|marker| normalized.contains(marker))
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().any(decoded_json_references_sensitive_path)
+        }
+        serde_json::Value::Object(values) => {
+            values.values().any(decoded_json_references_sensitive_path)
+        }
+        _ => false,
+    }
 }
 
 /// Scan every `.env.<suffix>` occurrence in the lowercased args; return true if any suffix
@@ -174,6 +202,11 @@ pub fn path_is_sensitive(path: &Path) -> bool {
     }
 
     if let Some(home) = home_dir() {
+        if path == home.join(".atomcode").join("auth.toml")
+            || path.starts_with(home.join(".atomcode").join("auth"))
+        {
+            return true;
+        }
         for dir in SECRET_HOME_DIRS {
             if path.starts_with(home.join(dir)) {
                 return true;
@@ -292,6 +325,15 @@ mod tests {
             references_sensitive_path(r#"{"file_path":"/proj/.env.production"}"#),
             "real secret variant"
         );
+        assert!(references_sensitive_path(
+            r#"{"file_path":"/home/u/.atomcode/auth.toml"}"#
+        ));
+        assert!(references_sensitive_path(
+            r#"{"command":"cat ~/.atomcode/auth.toml"}"#
+        ));
+        assert!(references_sensitive_path(
+            r#"{"file_path":"C:\\Users\\u\\.atomcode\\auth.toml"}"#
+        ));
         // Placeholder templates (committed to VCS, no real secrets) → NOT flagged.
         assert!(
             !references_sensitive_path(r#"{"file_path":"/proj/.env.example"}"#),

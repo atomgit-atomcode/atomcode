@@ -77,6 +77,29 @@ test('live control APIs reject protocol-level failures', async () => {
   }
 });
 
+test('postLiveUserInput rejects an answer the runtime did not accept', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({ accepted: false }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } },
+  )) as typeof fetch;
+
+  try {
+    const { postLiveUserInput } = await import('./api.ts');
+    await assert.rejects(
+      () => postLiveUserInput({
+        request_id: 42,
+        declined: false,
+        selected: ['继续'],
+        text: null,
+      }),
+      /did not accept/i,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('collection APIs reject server error payloads instead of returning non-arrays', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(
@@ -88,6 +111,29 @@ test('collection APIs reject server error payloads instead of returning non-arra
     const { getModels, getProjects } = await import('./api.ts');
     await assert.rejects(() => getModels(), /list models failed: 500/);
     await assert.rejects(() => getProjects(), /list projects failed: 500/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('deleteSession surfaces the daemon conflict reason', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({
+      success: false,
+      error: 'This session is active. Switch to or create another session, then try again.',
+      code: 'SESSION_IN_USE',
+      retryable: false,
+    }),
+    { status: 409, headers: { 'Content-Type': 'application/json' } },
+  )) as typeof fetch;
+
+  try {
+    const { deleteSession, DeleteSessionError } = await import('./api.ts');
+    const error = await deleteSession('0123456789abcdef', 's1').catch((cause) => cause);
+    assert.ok(error instanceof DeleteSessionError);
+    assert.equal(error.code, 'SESSION_IN_USE');
+    assert.match(error.message, /session is active/i);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -1,24 +1,20 @@
-//! atomcode disk/TOML config system, extracted from the retiring `atomcode-core`.
+//! Atomcode disk/TOML config system.
 //!
 //! Leaf crate — depends only on `atomcode-telemetry` + serde/toml/anyhow, so every
-//! stack layer (drivers, bridge, coding, and core itself during the transition) can
-//! read `config.toml` without a dependency on `atomcode-core`. See
+//! stack layer can read `config.toml` without depending on a runtime/driver crate. See
 //! `docs/superpowers/plans/2026-07-11-extract-atomcode-config.md`.
 
-/// UI language selection (`Config.language`). Self-contained serde enum, moved here
-/// from `atomcode-core` so `Config` has no core dependency. `atomcode_core::locale`
-/// re-exports this during the transition.
+/// UI language selection (`Config.language`).
 pub mod locale;
 
-/// Localization message tables + `t()`/`Msg` (moved out of `atomcode-core`; it only
-/// needs `locale::Locale`). `atomcode_core::i18n` re-exports this during the transition.
+/// Localization message tables + `t()`/`Msg`.
 pub mod i18n;
 
 /// Vendored leaf helpers (home-dir resolution, vision heuristic) config needs.
 pub mod util;
 
-/// `[network.proxy]` config types + process-env proxy policy. The reqwest-applying
-/// runtime stays in `atomcode-core::proxy` (needs the HTTP stack) and re-exports these.
+/// `[network.proxy]` config types + process-env proxy policy. HTTP-owning crates
+/// apply this policy to their own reqwest builders.
 pub mod proxy;
 
 /// TLS-version policy for the explicit process-wide env ceiling and the
@@ -26,12 +22,12 @@ pub mod proxy;
 /// clients remain in their owning leaf/provider crates.
 pub mod tls;
 
-/// The `LspServerConfig` config type (`Config.lsp.servers`). The LSP runtime
-/// (`LspServerRegistry`, client, manager) stays in `atomcode-core::lsp` and re-exports it.
+/// The `LspServerConfig` config type (`Config.lsp.servers`). The LSP runtime is
+/// owned by `atomcode-capabilities::codeintel::lsp`.
 pub mod lsp_registry;
 
-/// The disk/TOML config system: [`Config`](config::Config) + all sub-configs +
-/// load/save/paths. `atomcode_core::config` re-exports this during the transition.
+/// The disk/TOML config system: [`Config`](config::Config) + all sub-configs,
+/// load/save and paths.
 pub mod config;
 
 /// Transactional, cross-process-safe access to `config.toml`.

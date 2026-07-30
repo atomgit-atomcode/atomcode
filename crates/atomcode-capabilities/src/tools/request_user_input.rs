@@ -1,8 +1,7 @@
 //! The `request_user_input` tool: the model poses ONE structured question
 //! (single / multiple / text); the turn pauses; the user answers in the driver UI;
 //! the answer returns as the tool result. Rides the generic kernel request/respond
-//! round-trip via `ToolContext::request`. Types are defined here (drivers import them);
-//! atomcode-core stays agnostic.
+//! round-trip via `ToolContext::request`. Types are defined here for drivers to import.
 
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};

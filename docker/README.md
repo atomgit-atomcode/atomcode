@@ -64,7 +64,7 @@ docker run --rm -it \
 然后构建 Docker 镜像：
 
 ```bash
-docker build -t atomcode-daemon:v5.0.2 -f docker/Dockerfile-Daemon .
+docker build -t atomcode-daemon:v5.0.3 -f docker/Dockerfile-Daemon .
 ```
 
 ### 推送到华为云 SWR
@@ -73,14 +73,14 @@ docker build -t atomcode-daemon:v5.0.2 -f docker/Dockerfile-Daemon .
 
 ```bash
 # 标记镜像
-docker tag atomcode-daemon:v5.0.2 swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v5.0.2
+docker tag atomcode-daemon:v5.0.3 swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v5.0.3
 
 # 使用 buildx 构建并推送（推荐）
-docker buildx build --provenance=false --platform linux/amd64 -t swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v5.0.2 --push -f docker/Dockerfile-Daemon .
+docker buildx build --provenance=false --platform linux/amd64 -t swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v5.0.3 --push -f docker/Dockerfile-Daemon .
 
 # 或者先构建再推送
-docker build --provenance=false -t swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v5.0.2 -f docker/Dockerfile-Daemon .
-docker push swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v5.0.2
+docker build --provenance=false -t swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v5.0.3 -f docker/Dockerfile-Daemon .
+docker push swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v5.0.3
 ```
 
 > **注意**: 如果不添加 `--provenance=false`，推送时会报错: `Invalid image, fail to parse 'manifest.json'`
@@ -92,7 +92,7 @@ docker push swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v5.0.2
 ```bash
 docker run -d --name atomcode-daemon \
   -p 13456:13456 \
-  atomcode-daemon:v5.0.2
+  atomcode-daemon:v5.0.3
 ```
 
 ### 挂载配置文件
@@ -101,7 +101,7 @@ docker run -d --name atomcode-daemon \
 docker run -d --name atomcode-daemon \
   -p 13456:13456 \
   -v /path/to/config.toml:/root/.atomcode/config.toml \
-  atomcode-daemon:v5.0.2
+  atomcode-daemon:v5.0.3
 ```
 
 ### 挂载项目目录
@@ -111,7 +111,7 @@ docker run -d --name atomcode-daemon \
   -p 13456:13456 \
   -v /path/to/config.toml:/root/.atomcode/config.toml \
   -v /path/to/project:/workspace \
-  atomcode-daemon:v5.0.2
+  atomcode-daemon:v5.0.3
 ```
 
 ### 传递环境变量
@@ -121,7 +121,7 @@ docker run -d --name atomcode-daemon \
   -p 13456:13456 \
   -e ANTHROPIC_API_KEY=your-api-key \
   -v $(pwd)/config.toml:/root/.atomcode/config.toml \
-  atomcode-daemon:v5.0.2
+  atomcode-daemon:v5.0.3
 ```
 
 ## 验证服务

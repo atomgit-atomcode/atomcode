@@ -1,11 +1,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use atomcode_core::conversation::message::ImagePart;
-use atomcode_core::conversation::ConversationSnapshot;
-use atomcode_core::stream::TokenUsage;
-use atomcode_core::tool::ToolCall;
 use atomcode_kernel::event::ToolBatchCall;
+use atomcode_kernel::message::{ImageContent, SessionSnapshot};
+use atomcode_kernel::stream::TokenUsage;
+use atomcode_kernel::tool::ToolCall;
 
 /// TUI-only presentation events. Runtime and live-session inputs are projected
 /// into this type at the driver boundary; it is not an engine protocol.
@@ -52,9 +51,16 @@ pub enum UiEvent {
         tool_name: String,
         reason: String,
         call: ToolCall,
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
     },
-    TokenUsage(TokenUsage),
+    TokenUsage {
+        /// Raw provider token breakdown used by session/cost counters.
+        tokens: TokenUsage,
+        /// Prompt occupancy of the most recent request, used by the footer.
+        used_tokens: usize,
+        /// Context cap paired with `used_tokens`.
+        ctx_window: usize,
+    },
     PhaseChange(UiAgentPhase),
     TurnComplete {
         duration: Duration,
@@ -62,13 +68,13 @@ pub enum UiEvent {
         turn_count: usize,
         tool_call_count: usize,
         stop_reason: UiTurnStopReason,
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
     },
     TurnCancelled {
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
     },
     ConversationTruncated {
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
         restored_prompt: String,
         target_n: usize,
         prompts_before: usize,
@@ -78,11 +84,11 @@ pub enum UiEvent {
         available: usize,
     },
     MessagesSync {
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
     },
     ConversationRestored {
         restore_id: u64,
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
     },
     ConversationRestoreFailed {
         restore_id: u64,
@@ -90,7 +96,7 @@ pub enum UiEvent {
     },
     Error {
         error: String,
-        snapshot: ConversationSnapshot,
+        snapshot: SessionSnapshot,
     },
     Warning(String),
     RateLimited {
@@ -102,7 +108,7 @@ pub enum UiEvent {
     },
     HookWarningHint(String),
     RestorePendingImages {
-        images: Vec<ImagePart>,
+        images: Vec<ImageContent>,
         markers: Vec<usize>,
     },
     VisionPreprocessSuccess {
@@ -130,6 +136,7 @@ pub enum UiEvent {
     },
     GoalUpdate {
         active: bool,
+        terminal: Option<atomcode_coding::GoalTerminal>,
         round: u32,
         elapsed_secs: u64,
         condition: String,
@@ -169,6 +176,7 @@ pub enum UiEvent {
     },
     Steered {
         count: usize,
+        inputs: Vec<atomcode_kernel::event::SteeredInput>,
     },
 }
 

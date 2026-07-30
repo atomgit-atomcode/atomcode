@@ -534,7 +534,7 @@ async fn real_user_steer_resets_the_consecutive_streak() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AgentEvent::Steered { count: 1 })),
+            .any(|event| matches!(event, AgentEvent::Steered { count: 1, .. })),
         "the injected real user prompt must have been folded in as steer"
     );
     assert!(

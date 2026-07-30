@@ -11,6 +11,11 @@ pub enum UiPhase {
     Streaming,
     Approval,
     UserInput,
+    /// Kernel-initiated round-cap checkpoint: the TUI shows a 2-option panel
+    /// ("继续 / 停止") and waits for the user to decide before the agent resumes
+    /// or stops.  Distinct from `UserInput` (model-initiated) so key handlers
+    /// and renderers can specialise without touching user-input paths.
+    RoundCap,
     Suspended,
 }
 
@@ -64,6 +69,19 @@ impl ApprovalPanel {
         let c = c.to_ascii_lowercase();
         self.options.iter().position(|o| o.accel == c)
     }
+}
+
+/// Flatten a bracketed paste for a single-line answer field. First run the
+/// crate's canonical [`scrub_controls`](crate::sanitize::scrub_controls) so full
+/// ANSI escape SEQUENCES (CSI/OSC, not just the lone ESC byte) are stripped —
+/// same sanitizer every other render/paste sink uses. `scrub_controls`
+/// deliberately preserves `\t` / `\n` / `\r`, so collapse those to spaces here:
+/// the answer renders on one footer row and must not embed line breaks.
+fn flatten_paste(text: &str) -> String {
+    crate::sanitize::scrub_controls(text)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// The active `request_user_input` prompt, shown as a footer panel while
@@ -223,6 +241,31 @@ impl UserInputPanel {
     /// Backspace on the "Other" row.
     pub fn pop_custom(&mut self) {
         self.custom_text.pop();
+    }
+    /// Insert pasted text into whichever free-text buffer the keyboard would
+    /// currently edit: the standalone `text` buffer (Text mode) or the "Other"
+    /// row's `custom_text` (single/multiple, only when the cursor is on that
+    /// row). Option/Submit rows have no free-text target, so paste is a no-op
+    /// there — mirroring the key path where non-digit chars are ignored.
+    /// Newlines/tabs are flattened to spaces because the answer renders on a
+    /// single footer row and must not embed control characters. A paste with no
+    /// printable content (e.g. a lone trailing newline from copying a whole
+    /// line) is dropped rather than inserted as a stray space — the keyboard
+    /// path can never produce that.
+    pub fn insert_paste(&mut self, text: &str) {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        let flattened = flatten_paste(text);
+        if flattened.trim().is_empty() {
+            return;
+        }
+        match self.mode {
+            UserInputMode::Text => self.text.push_str(&flattened),
+            UserInputMode::Single | UserInputMode::Multiple => {
+                if self.is_other_row() {
+                    self.custom_text.push_str(&flattened);
+                }
+            }
+        }
     }
     /// The chosen concrete-option labels for MULTIPLE mode (all checked
     /// concrete rows; the "Other" row is handled separately via `custom_text`).
@@ -461,6 +504,66 @@ mod user_input_custom_tests {
     }
 
     #[test]
+    fn paste_appends_to_text_mode_buffer() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Text, false));
+        p.text.push_str("ab");
+        p.insert_paste("cd");
+        assert_eq!(p.text, "abcd", "paste appends to the text-mode buffer");
+    }
+
+    #[test]
+    fn paste_appends_to_other_row_custom_text() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Single, true));
+        p.cursor = p.other_index(); // focus the "Other" free-text row
+        p.insert_paste("scope");
+        assert_eq!(
+            p.custom_text, "scope",
+            "on the Other row, paste feeds the custom-text buffer"
+        );
+    }
+
+    #[test]
+    fn paste_is_a_noop_on_a_concrete_option_row() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Single, true));
+        p.cursor = 0; // a concrete option — no free-text target, like typing
+        p.insert_paste("ignored");
+        assert!(p.text.is_empty() && p.custom_text.is_empty());
+    }
+
+    #[test]
+    fn paste_flattens_newlines_to_spaces() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Text, false));
+        p.insert_paste("a\r\nb\tc");
+        assert!(
+            !p.text.contains('\n') && !p.text.contains('\r') && !p.text.contains('\t'),
+            "single-line answer must not embed control chars: {:?}",
+            p.text
+        );
+        assert!(p.text.starts_with('a') && p.text.ends_with('c'));
+    }
+
+    #[test]
+    fn paste_strips_ansi_escape_sequences_not_just_the_esc_byte() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Text, false));
+        p.insert_paste("\x1b[31mred\x1b[0m");
+        assert_eq!(
+            p.text, "red",
+            "full CSI sequences are stripped, not left as literal `[31m`"
+        );
+    }
+
+    #[test]
+    fn paste_with_no_printable_content_is_dropped() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Text, false));
+        p.insert_paste("\r\n\t");
+        assert!(
+            p.text.is_empty(),
+            "a whitespace/newline-only paste must not insert a stray space: {:?}",
+            p.text
+        );
+    }
+
+    #[test]
     fn multiple_submit_index_and_checked_gate_on_custom() {
         let with = UserInputPanel::new(1, &req(UserInputMode::Multiple, true));
         assert_eq!(with.submit_index(), Some(3), "custom → other@2, submit@3");
@@ -549,10 +652,73 @@ mod user_input_batch_tests {
     }
 
     #[test]
+    fn paste_routes_to_the_current_batch_question() {
+        let mut st = UiState::new();
+        st.user_input_batch = Some(UserInputBatch::new(1, &[text_q("a"), text_q("b")]));
+        st.user_input_batch.as_mut().unwrap().next_question(); // focus question 1
+        st.insert_user_input_paste("pasted");
+        let b = st.user_input_batch.as_ref().unwrap();
+        assert_eq!(b.questions[0].text, "", "non-current question is untouched");
+        assert_eq!(b.questions[1].text, "pasted", "paste lands in current q");
+    }
+
+    #[test]
+    fn paste_on_the_submit_stop_is_a_noop() {
+        let mut st = UiState::new();
+        let mut batch = UserInputBatch::new(1, &[text_q("a")]);
+        while !batch.on_submit_stop() {
+            batch.next_question();
+        }
+        st.user_input_batch = Some(batch);
+        st.insert_user_input_paste("ignored"); // no question under the submit stop
+        assert_eq!(st.user_input_batch.as_ref().unwrap().questions[0].text, "");
+    }
+
+    #[test]
+    fn paste_routes_to_the_single_panel() {
+        let mut st = UiState::new();
+        st.user_input_panel = Some(UserInputPanel::new(9, &text_q("solo")));
+        st.insert_user_input_paste("value");
+        assert_eq!(st.user_input_panel.as_ref().unwrap().text, "value");
+    }
+
+    #[test]
     fn single_question_batch_is_not_multi() {
         let b = UserInputBatch::new(1, &[text_q("only")]);
         assert!(!b.is_multi());
         assert_eq!(b.submit_stop(), 1);
+    }
+}
+
+/// Round-cap checkpoint panel state (kernel-initiated; distinct from UserInputPanel
+/// which is model-initiated). Two fixed options: 0 = 继续, 1 = 停止.
+#[derive(Debug, Clone)]
+pub struct RoundCapPanel {
+    pub id: u64,
+    pub cap: u32,
+    /// Re-arm increment (rounds granted per "continue"); may differ from `cap`
+    /// after the first continuation, when `cap` has grown but the step stays.
+    pub base: u32,
+    pub cursor: usize, // 0=继续 1=停止
+}
+impl RoundCapPanel {
+    pub fn new(id: u64, cap: u32, base: u32) -> Self {
+        Self {
+            id,
+            cap,
+            base,
+            cursor: 0,
+        }
+    }
+    /// true = 继续
+    pub fn chosen_continue(&self) -> bool {
+        self.cursor == 0
+    }
+    pub fn move_up(&mut self) {
+        self.cursor = 0;
+    }
+    pub fn move_down(&mut self) {
+        self.cursor = 1;
     }
 }
 
@@ -664,8 +830,18 @@ pub struct ContextSnapshot {
 #[derive(Debug, Clone)]
 pub struct QueuedMessage {
     pub text: String,
-    pub images: Vec<atomcode_core::conversation::message::ImagePart>,
+    pub images: Vec<atomcode_kernel::message::ImageContent>,
     pub image_markers: Vec<usize>,
+}
+
+/// A message already sent to the kernel as an in-turn steer, retained by the
+/// TUI until `Steered` confirms delivery. The copy is also the recovery payload
+/// for Esc: cancellation clears the kernel steer buffer, so the TUI replays
+/// these messages as fresh turns after the authoritative cancel terminal.
+#[derive(Debug, Clone)]
+pub struct PendingSteer {
+    pub message: QueuedMessage,
+    pub display_text: String,
 }
 
 pub struct UiState {
@@ -691,12 +867,12 @@ pub struct UiState {
     /// spinner). If so, completion restores Idle; an auto-compaction runs
     /// mid-turn and leaves the phase to the turn's own lifecycle.
     pub compaction_forced_streaming: bool,
-    /// Latest live activity of a running `task` subagent fan-out (e.g.
-    /// `explore#4 · grep unwrap`), set from marker-prefixed progress chunks and
-    /// spliced into the spinner label in-place so a multi-minute fan-out isn't a
-    /// silent `Pondering…`. `None` when no subtask activity is current; cleared
-    /// when the `task` tool finishes and at every authoritative turn terminal.
+    /// Legacy single-row projection retained for compatibility with older
+    /// progress producers. New Task fan-outs use `active_subtasks`.
     pub subagent_activity: Option<String>,
+    /// Structured, fixed-footer projection of the currently-running Task
+    /// fan-out. Owned by the TUI driver and keyed by the parent tool call id.
+    pub active_subtasks: Option<crate::render::SubtaskProgress>,
     /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
     /// When false, `tick_spinner` and the spinner-label ellipsis fall
     /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
@@ -720,6 +896,11 @@ pub struct UiState {
     /// `/cost` and idle `/usage` leave it `None`. Cleared wherever
     /// `footer_command_output` is.
     pub footer_usage: Option<crate::modals::usage::UsageModal>,
+    /// Non-fatal startup/background notices that arrived while a turn owned the
+    /// body timeline. They are deduplicated and rendered only after the
+    /// authoritative turn terminal so unrelated maintenance output never lands
+    /// between tool rows.
+    pub(crate) deferred_background_notices: Vec<String>,
     /// Per-turn token tallies (reset at turn end). Feed the footer's billable
     /// token count + cache-hit annotation via [`turn_token_summary`]; kept
     /// separate from the session-cumulative `*_tokens` above.
@@ -767,6 +948,15 @@ pub struct UiState {
     /// to `None` when a CLEAN summary renders (`turn_summary_label`) so a reason
     /// from an error path that produced no summary can never fold into a later turn.
     pub last_turn_error: Option<String>,
+    /// True once this turn already rendered a visible line carrying the failure
+    /// cause (the red `UiLine::Error` line, or the muted rate-limit line). When
+    /// set, `turn_summary_label` renders a bare `✗ 已中断 · …` and does NOT fold
+    /// the reason again — the cause is already visible just above, so folding it
+    /// into the summary would duplicate it. When a future/edge error path sets
+    /// `last_turn_error` WITHOUT rendering such a line, this stays `false` and the
+    /// summary folds the reason as a fallback (the original "no cause visible"
+    /// bug). Reset each turn in `on_submit`; consumed in `turn_summary_label`.
+    pub turn_error_line_shown: bool,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
     /// While waiting on a tool approval, holds the `"Running {Tool}"`
@@ -789,6 +979,10 @@ pub struct UiState {
     /// `user_input_panel`). Set in the `Request` handler when the payload carries a
     /// `questions` array; cleared alongside `user_input_panel` on resolve.
     pub user_input_batch: Option<UserInputBatch>,
+    /// The active round-cap checkpoint panel. `None` when no checkpoint is pending.
+    /// Set in the `Request` handler when `kind == ROUND_CAP_CHECKPOINT_KIND`;
+    /// cleared alongside phase reset on resolve / turn-end / session reset.
+    pub round_cap_panel: Option<RoundCapPanel>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
     /// When the current turn started. Set by on_submit, cleared on
@@ -830,7 +1024,7 @@ pub struct UiState {
     /// Re-attached on `VisionPreprocessFailed` so the user can retry without
     /// re-pasting. Overwritten each image-carrying submit; only read on
     /// failure. Parallel vecs (aligned by index).
-    pub last_submitted_pasted_images: Vec<atomcode_core::conversation::message::ImagePart>,
+    pub last_submitted_pasted_images: Vec<atomcode_kernel::message::ImageContent>,
     pub last_submitted_pasted_markers: Vec<usize>,
     /// `/context` dispatched a `RefreshContextStats` command and is
     /// waiting for the resulting rich ContextStats event to render the
@@ -842,7 +1036,7 @@ pub struct UiState {
     pub pending_context_render: Option<bool>,
     /// Images pasted from clipboard (Ctrl+V) waiting to be sent with
     /// the next user message. Drained on submit.
-    pub pending_images: Vec<atomcode_core::conversation::message::ImagePart>,
+    pub pending_images: Vec<atomcode_kernel::message::ImageContent>,
     /// Parallel to `pending_images` — content fingerprint of each pasted
     /// image's raw RGBA bytes. Used by the right-aligned status hint to
     /// suppress `Image in clipboard · ctrl+v to paste` once the clipboard
@@ -954,15 +1148,10 @@ pub struct UiState {
     /// Any other event flushes this buffer with the usual `↻ goal round N`
     /// or `✓ done` label.
     pub pending_separator: Option<PendingSeparator>,
-    /// Mid-turn steers submitted but NOT YET folded into the turn by the kernel
-    /// — i.e. still waiting for the next model-request boundary. Incremented when
-    /// the TUI dispatches a steer (`on_steer_sent`), decremented when the kernel
-    /// confirms the fold (`AgentEvent::Steered { count }` → `on_steered`), and
-    /// cleared at turn end / new turn start. Surfaced in the footer as
-    /// `· N to fold` while non-zero, so it DRAINS to nothing once folded (it is a
-    /// pending indicator, not a cumulative tally). Mirrors codex's pending-steer
-    /// list / opencode's draining `N queued`.
-    pub steer_pending: usize,
+    /// Mid-turn messages waiting for the next model-request boundary. Keeping
+    /// the actual payload (not only a count) enables the Codex-style pending
+    /// panel and fail-safe Esc → cancel → submit-as-new-turn behavior.
+    pub pending_steers: std::collections::VecDeque<PendingSteer>,
     /// Whether the user has explicitly switched to Build mode via
     /// Tab/Shift+Tab or `/build`. When `false`, the status bar hides
     /// the `⏸ build` badge so the default startup state stays clean.
@@ -995,6 +1184,11 @@ pub struct PendingSeparator {
     /// limit). Lets the deferred flush render the ✗ "stopped" summary instead
     /// of a celebratory ✓ for an incomplete turn.
     pub errored: bool,
+    /// Snapshot of `UiState::turn_error_line_shown` at defer time. The deferred
+    /// flush can land AFTER a later turn's `on_submit` has reset the live flag,
+    /// so we capture it here to decide correctly whether the errored summary
+    /// should fold the cause or render bare (the cause was already shown above).
+    pub error_line_shown: bool,
     /// Cache-hit ratio over the turn's input, if the provider reported cached
     /// tokens. `None` ⇒ no annotation. Rendered as `· N% cached`.
     pub cached_pct: Option<u8>,
@@ -1049,6 +1243,7 @@ impl UiState {
             compacting: false,
             compaction_forced_streaming: false,
             subagent_activity: None,
+            active_subtasks: None,
             unicode_symbols,
             colors,
             total_tokens: 0,
@@ -1057,6 +1252,7 @@ impl UiState {
             cached_tokens: 0,
             footer_command_output: None,
             footer_usage: None,
+            deferred_background_notices: Vec::new(),
             turn_prompt_tokens: 0,
             turn_completion_tokens: 0,
             turn_cached_tokens: 0,
@@ -1066,11 +1262,13 @@ impl UiState {
             last_assistant_response: String::new(),
             response_finalized: false,
             last_turn_error: None,
+            turn_error_line_shown: false,
             prior_phase: None,
             prior_spinner_label: None,
             approval_panel: None,
             user_input_panel: None,
             user_input_batch: None,
+            round_cap_panel: None,
             thinking_idx: 0,
             turn_started_at: None,
             phase_started_at: None,
@@ -1105,7 +1303,7 @@ impl UiState {
             loop_round: 0,
             loop_started_at: None,
             pending_separator: None,
-            steer_pending: 0,
+            pending_steers: std::collections::VecDeque::new(),
             build_badge_visible: false,
         }
     }
@@ -1226,10 +1424,20 @@ impl UiState {
         self.post_compaction_used_tokens = Some(used_tokens);
     }
 
-    /// A provider usage event is authoritative and releases the temporary
-    /// post-compaction projection before its ContextStats companion arrives.
-    pub fn on_token_usage(&mut self) {
+    /// A provider usage event is authoritative: release the temporary
+    /// post-compaction projection and refresh the footer's live context gauge.
+    ///
+    /// `used_tokens` is the prompt occupancy of the most recent request, not
+    /// the cumulative billable token total.
+    pub fn on_token_usage(&mut self, used_tokens: usize, ctx_window: usize) {
         self.post_compaction_used_tokens = None;
+        let snap = self
+            .last_context
+            .get_or_insert_with(ContextSnapshot::default);
+        snap.sent_tokens = used_tokens;
+        if ctx_window > 0 {
+            snap.ctx_window = ctx_window;
+        }
     }
 
     /// Refresh the cached context window after a model switch.
@@ -1347,13 +1555,30 @@ impl UiState {
         // blank-turn notice on TurnComplete).
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
+        // Fresh turn: no failure cause has been shown yet, so a summary this turn
+        // won't wrongly suppress its reason based on a prior turn's error line.
+        self.turn_error_line_shown = false;
         self.turn_output_chars = 0;
         // Seed the stall clock so the first silent stretch is measured from submit,
         // not a stale stamp from the previous turn (which would flash the warning).
         self.last_stream_activity = Some(now);
         // Belt-and-suspenders: a fresh turn always starts with zero steers, even
         // if the previous turn ended abnormally and never fired on_turn_complete.
-        self.steer_pending = 0;
+        self.pending_steers.clear();
+    }
+
+    pub(crate) fn defer_background_notice(&mut self, notice: String) {
+        if !self
+            .deferred_background_notices
+            .iter()
+            .any(|existing| existing == &notice)
+        {
+            self.deferred_background_notices.push(notice);
+        }
+    }
+
+    pub(crate) fn take_background_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.deferred_background_notices)
     }
 
     /// The runtime rejected the turn before accepting it. Keep the UI idle and
@@ -1388,12 +1613,14 @@ impl UiState {
         // Same discipline for the subagent fan-out activity: no turn-end path may
         // leave a stale `explore#4 · …` pinned onto the next turn's spinner.
         self.subagent_activity = None;
+        self.active_subtasks = None;
         // Safety clear: if a turn ends without resolving an approval (e.g. error
         // path or session switch), ensure the panel is not left stale.
         self.approval_panel = None;
         self.user_input_panel = None;
         self.user_input_batch = None;
-        self.steer_pending = 0;
+        self.pending_steers.clear();
+        self.round_cap_panel = None;
         // The interactive `/usage` tab panel is streaming-only. Drop it (but keep
         // the rendered text) so its tab keys can't bleed into idle or across into
         // the next streaming turn; a fresh `/usage` re-arms it.
@@ -1414,10 +1641,12 @@ impl UiState {
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
+        self.active_subtasks = None;
         self.approval_panel = None;
         self.user_input_panel = None;
         self.user_input_batch = None;
-        self.steer_pending = 0;
+        self.pending_steers.clear();
+        self.round_cap_panel = None;
         // Streaming-only `/usage` tab panel — drop it on cancel too (mirrors
         // on_turn_complete); the rendered text stays until Esc.
         self.footer_usage = None;
@@ -1436,19 +1665,36 @@ impl UiState {
     pub fn on_session_replaced(&mut self) {
         self.footer_command_output = None;
         self.footer_usage = None;
+        self.subagent_activity = None;
+        self.active_subtasks = None;
     }
 
     /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting
     /// to fold into the running turn at the next model-request boundary.
-    pub fn on_steer_sent(&mut self) {
-        self.steer_pending += 1;
+    pub fn on_steer_sent(&mut self, pending: PendingSteer) {
+        self.pending_steers.push_back(pending);
     }
 
-    /// The kernel confirmed it folded `count` steered prompt(s) into the turn
-    /// (`AgentEvent::Steered`). Drain the pending count; `saturating_sub` so a
-    /// steer folded from another client (no local `on_steer_sent`) can't underflow.
-    pub fn on_steered(&mut self, count: usize) {
-        self.steer_pending = self.steer_pending.saturating_sub(count);
+    /// The kernel confirmed one or more steered prompts. Return locally-owned
+    /// payloads whose content matches the authoritative folded inputs.
+    pub fn on_steered(
+        &mut self,
+        inputs: &[atomcode_kernel::event::SteeredInput],
+    ) -> Vec<PendingSteer> {
+        let mut confirmed = Vec::new();
+        for input in inputs {
+            let matches_front = self.pending_steers.front().is_some_and(|pending| {
+                pending.message.text == input.text && pending.message.images == input.images
+            });
+            if matches_front {
+                confirmed.push(
+                    self.pending_steers
+                        .pop_front()
+                        .expect("front was checked above"),
+                );
+            }
+        }
+        confirmed
     }
 
     /// Record a diagnostic error observation without ending the turn locally.
@@ -1632,6 +1878,29 @@ impl UiState {
     pub fn on_user_input_resolved(&mut self) {
         self.user_input_panel = None;
         self.user_input_batch = None;
+        self.round_cap_panel = None;
+        self.phase = UiPhase::Streaming;
+    }
+
+    /// Route a bracketed paste into the active `request_user_input` prompt:
+    /// the current question of a batch, or the single panel. No-op when neither
+    /// is present or the current answer target has no free-text field. Mirrors
+    /// how key events reach these panels via `handle_user_input_key`.
+    pub fn insert_user_input_paste(&mut self, text: &str) {
+        if let Some(batch) = self.user_input_batch.as_mut() {
+            if let Some(panel) = batch.questions.get_mut(batch.current) {
+                panel.insert_paste(text);
+            }
+        } else if let Some(panel) = self.user_input_panel.as_mut() {
+            panel.insert_paste(text);
+        }
+    }
+
+    /// Clear the round-cap checkpoint panel and resume streaming.
+    /// Does NOT touch `user_input_panel` / `user_input_batch` — this is
+    /// semantically a round-cap resolution only.
+    pub fn on_round_cap_resolved(&mut self) {
+        self.round_cap_panel = None;
         self.phase = UiPhase::Streaming;
     }
 
@@ -1854,11 +2123,23 @@ mod tests {
     fn real_usage_releases_post_compaction_projection() {
         let mut s = UiState::new();
         s.on_compaction_committed(12_000);
-        s.on_token_usage();
-        s.on_context_stats(0, 14_000, 0, 0, 8, 128_000, "engine-v2", "");
+        s.on_token_usage(14_000, 128_000);
 
         assert_eq!(s.last_context.as_ref().unwrap().sent_tokens, 14_000);
+        assert_eq!(s.last_context.as_ref().unwrap().ctx_window, 128_000);
         assert!(s.post_compaction_used_tokens.is_none());
+    }
+
+    #[test]
+    fn live_usage_refreshes_footer_context_gauge() {
+        let mut s = UiState::new();
+        s.on_model_window_changed(1_000_000);
+
+        s.on_token_usage(58_200, 1_000_000);
+
+        let snap = s.last_context.as_ref().expect("live context gauge");
+        assert_eq!(snap.sent_tokens, 58_200);
+        assert_eq!(snap.ctx_window, 1_000_000);
     }
 
     #[test]
@@ -2088,6 +2369,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn turn_terminal_clears_transient_subtask_panel() {
+        for terminal in [UiState::on_turn_complete, UiState::on_turn_cancelled] {
+            let mut state = UiState::new();
+            state.active_subtasks = Some(crate::render::SubtaskProgress {
+                call_id: "call-task".into(),
+                completed: 0,
+                total: 1,
+                items: vec![],
+            });
+
+            terminal(&mut state);
+
+            assert!(
+                state.active_subtasks.is_none(),
+                "a Task panel must never survive its owning turn"
+            );
+        }
+    }
+
     /// Regression for the cross-turn `[Image #N]` ambiguity: the marker
     /// counter must NOT reset when `pending_images` drains on submit —
     /// otherwise turn 1's first paste and turn 2's first paste would
@@ -2110,7 +2411,7 @@ mod tests {
         s.session_image_count += 1;
         let n1 = s.session_image_count;
         s.pending_images
-            .push(atomcode_core::conversation::message::ImagePart {
+            .push(atomcode_kernel::message::ImageContent {
                 media_type: "image/png".into(),
                 data: "AAAA".into(),
             });
@@ -2495,7 +2796,7 @@ mod tests {
     fn queued_message_carries_images() {
         let q = QueuedMessage {
             text: "hi".into(),
-            images: vec![atomcode_core::conversation::message::ImagePart {
+            images: vec![atomcode_kernel::message::ImageContent {
                 media_type: "image/png".into(),
                 data: "AAAA".into(),
             }],
@@ -2743,41 +3044,96 @@ mod tests {
     }
 
     #[test]
-    fn steer_pending_counts_unfolded_and_drains_on_fold() {
+    fn pending_steers_retain_payload_and_drain_on_fold() {
+        fn pending(text: &str) -> PendingSteer {
+            PendingSteer {
+                message: QueuedMessage {
+                    text: text.to_owned(),
+                    images: Vec::new(),
+                    image_markers: Vec::new(),
+                },
+                display_text: text.to_owned(),
+            }
+        }
+
         let mut st = UiState::new();
-        st.on_steer_sent();
-        st.on_steer_sent();
+        st.on_steer_sent(pending("one"));
+        st.on_steer_sent(pending("two"));
         assert_eq!(
-            st.steer_pending, 2,
-            "two steers dispatched, none folded yet"
+            st.pending_steers
+                .iter()
+                .map(|pending| pending.display_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"],
+            "payload and display order survive until kernel confirmation"
         );
-        st.on_steered(1); // kernel confirms one fold
-        assert_eq!(st.steer_pending, 1, "drains as folds are confirmed");
-        st.on_steered(1);
+        let confirmed = st.on_steered(&[atomcode_kernel::event::SteeredInput {
+            text: "one".into(),
+            images: Vec::new(),
+        }]); // kernel confirms one fold
         assert_eq!(
-            st.steer_pending, 0,
-            "back to zero once all folded — a draining indicator"
+            confirmed
+                .iter()
+                .map(|pending| pending.message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one"],
+            "only confirmed local payloads are returned for transcript projection"
         );
-        st.on_steered(3); // spurious / cross-client fold never underflows
-        assert_eq!(st.steer_pending, 0, "saturating: never goes negative");
+        assert_eq!(
+            st.pending_steers.front().map(|p| p.display_text.as_str()),
+            Some("two"),
+            "drains from the front as folds are confirmed"
+        );
+        assert!(
+            st.on_steered(&[atomcode_kernel::event::SteeredInput {
+                text: "remote".into(),
+                images: Vec::new(),
+            }])
+            .is_empty(),
+            "a different client's fold cannot consume the local queue front"
+        );
+        assert_eq!(
+            st.pending_steers.front().map(|p| p.display_text.as_str()),
+            Some("two")
+        );
+        assert_eq!(
+            st.on_steered(&[atomcode_kernel::event::SteeredInput {
+                text: "two".into(),
+                images: Vec::new(),
+            }])[0]
+                .message
+                .text,
+            "two"
+        );
+        assert!(st.pending_steers.is_empty());
+        assert!(
+            st.on_steered(&[atomcode_kernel::event::SteeredInput {
+                text: "remote".into(),
+                images: Vec::new(),
+            }])
+            .is_empty(),
+            "spurious / cross-client fold cannot fabricate a local echo"
+        );
+        assert!(st.pending_steers.is_empty());
         // Every turn-end path clears it, parity with the other per-turn counters.
-        st.on_steer_sent();
+        st.on_steer_sent(pending("complete"));
         st.on_turn_complete();
-        assert_eq!(st.steer_pending, 0, "cleared at turn end");
-        st.on_steer_sent();
+        assert!(st.pending_steers.is_empty(), "cleared at turn end");
+        st.on_steer_sent(pending("cancel"));
         st.on_turn_cancelled();
-        assert_eq!(st.steer_pending, 0, "cleared on cancel");
-        st.on_steer_sent();
+        assert!(st.pending_steers.is_empty(), "cleared on cancel");
+        st.on_steer_sent(pending("diagnostic"));
         st.on_error();
         assert_eq!(
-            st.steer_pending, 1,
+            st.pending_steers.len(),
+            1,
             "a diagnostic error must not clean up a still-active turn"
         );
         st.on_turn_complete();
-        assert_eq!(st.steer_pending, 0, "cleared by the terminal");
-        st.on_steer_sent();
+        assert!(st.pending_steers.is_empty(), "cleared by the terminal");
+        st.on_steer_sent(pending("fresh"));
         st.on_submit();
-        assert_eq!(st.steer_pending, 0, "a fresh turn starts at 0");
+        assert!(st.pending_steers.is_empty(), "a fresh turn starts empty");
     }
 
     #[test]
@@ -2789,5 +3145,35 @@ mod tests {
 
         assert_eq!(st.phase, UiPhase::Idle);
         assert!(st.last_submitted_message.is_none());
+    }
+
+    #[test]
+    fn round_cap_panel_toggle_and_choice() {
+        let mut p = crate::state::RoundCapPanel::new(7, 200, 200);
+        assert!(p.chosen_continue());
+        p.move_down();
+        assert!(!p.chosen_continue());
+        p.move_up();
+        assert!(p.chosen_continue());
+    }
+
+    #[test]
+    fn on_round_cap_resolved_clears_panel_and_resumes_streaming() {
+        let mut s = UiState::new();
+        s.round_cap_panel = Some(crate::state::RoundCapPanel::new(9, 200, 200));
+        s.phase = UiPhase::RoundCap;
+        // Verify user_input_panel is untouched — resolving round-cap must
+        // not clobber a concurrent (or future) user-input panel.
+        s.on_round_cap_resolved();
+        assert!(s.round_cap_panel.is_none(), "panel cleared on resolve");
+        assert_eq!(s.phase, UiPhase::Streaming, "phase resumes to Streaming");
+        assert!(
+            s.user_input_panel.is_none(),
+            "user_input_panel was not set and must stay None"
+        );
+        assert!(
+            s.user_input_batch.is_none(),
+            "user_input_batch must not be touched"
+        );
     }
 }

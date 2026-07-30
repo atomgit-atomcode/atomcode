@@ -1,10 +1,7 @@
-use atomcode_core::conversation::message::{
-    ImagePart, Message as CoreMessage, MessageContent, Role as CoreRole,
+use atomcode_kernel::message::{
+    ImageContent, Message as KernelMessage, Role as KernelRole, LEGACY_COLD_SUMMARY_ORIGIN,
+    LEGACY_COLD_SUMMARY_PREFIX,
 };
-use atomcode_core::conversation::{
-    ConversationSnapshot, LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
-};
-use atomcode_kernel::message::{ImageContent, Message as KernelMessage, Role as KernelRole};
 use serde::{Deserialize, Serialize};
 
 use atomcode_capabilities::session::manager::{NativeImportCommitOutcome, META_VERSION};
@@ -70,6 +67,86 @@ impl From<atomcode_capabilities::session::LoadedSession> for CatalogSessionView 
 pub const IMPORTER_VERSION: u32 = 4;
 pub const LEGACY_SCHEMA: &str = "core-session-json";
 
+// ---------------------------------------------------------------------------
+// Frozen DTOs — self-contained read model for the retired core session JSON.
+// Every serde attribute mirrors the retired core conversation message shape
+// exactly so that existing <id>.json files round-trip without deserialization
+// loss.
+// ---------------------------------------------------------------------------
+
+/// Verbatim copy of core `ToolCall` serde shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Verbatim copy of core `ThinkingBlock` serde shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyThinkingBlock {
+    text: String,
+    signature: String,
+}
+
+/// Verbatim copy of core `MessageContent` serde shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyContent {
+    Text(String),
+    AssistantWithToolCalls {
+        text: Option<String>,
+        tool_calls: Vec<LegacyToolCall>,
+        #[serde(default)]
+        reasoning_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        thinking_blocks: Vec<LegacyThinkingBlock>,
+    },
+    ToolResult(LegacyToolResult),
+    ToolResultRef(LegacyToolResultRef),
+    MultiPart {
+        text: Option<String>,
+        images: Vec<LegacyImagePart>,
+    },
+}
+
+/// Verbatim copy of core `ToolResult` serde shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyToolResult {
+    call_id: String,
+    output: String,
+    success: bool,
+}
+
+/// Verbatim copy of core `ToolResultRef` serde shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyToolResultRef {
+    call_id: String,
+    hash: String,
+    summary: String,
+    byte_size: usize,
+    success: bool,
+}
+
+/// Verbatim copy of core `ImagePart` serde shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyImagePart {
+    media_type: String,
+    data: String,
+}
+
+/// Frozen message DTO: mirrors core `Message` serde shape verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyMessage {
+    role: String,
+    content: LegacyContent,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    synthetic: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    internal_origin: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+
 /// Frozen reader for the retired core session JSON schema. Keeping this DTO
 /// private prevents legacy persistence fields from leaking back into drivers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,7 +156,7 @@ struct LegacySession {
     working_dir: std::path::PathBuf,
     created_at: u64,
     updated_at: u64,
-    messages: Vec<CoreMessage>,
+    messages: Vec<LegacyMessage>,
     #[serde(default)]
     display_messages: Vec<LegacyDisplayMessage>,
     #[serde(default)]
@@ -92,25 +169,17 @@ struct LegacySession {
     turn_stats: Vec<LegacyTurnStat>,
 }
 
-impl LegacySession {
-    fn to_conversation_snapshot(&self) -> ConversationSnapshot {
-        ConversationSnapshot {
-            messages: self.messages.clone(),
-            cold_summaries: self.cold_summaries.clone(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LegacyDisplayMessage {
     after_message: usize,
-    message: CoreMessage,
+    message: LegacyMessage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LegacyTurnStat {
     after_message: usize,
-    turn_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_count: Option<usize>,
     tool_call_count: usize,
     duration_ms: u64,
     total_tokens: usize,
@@ -136,6 +205,13 @@ pub enum ImportDiagnostic {
     RepairedLegacyTurnBoundaries {
         dropped_turn_stats: usize,
     },
+    DefaultedLegacyTurnCounts {
+        repaired_turn_stats: usize,
+    },
+    RepairedLegacyTurnStats {
+        dropped_turn_stats: usize,
+        defaulted_turn_counts: usize,
+    },
     RepairedMetadataOnlySidecars {
         repaired_turn_stats: usize,
         removed_presentation_entries: usize,
@@ -150,6 +226,30 @@ fn report_import_diagnostic(session_id: &str, diagnostic: Option<ImportDiagnosti
                 session_id,
                 dropped_turn_stats,
                 "repaired malformed legacy turn boundaries during import"
+            );
+        }
+        Some(ImportDiagnostic::DefaultedLegacyTurnCounts {
+            repaired_turn_stats,
+        }) => {
+            tracing::warn!(
+                session_id,
+                repaired_turn_stats,
+                "defaulted missing legacy turn_count fields during import"
+            );
+        }
+        Some(ImportDiagnostic::RepairedLegacyTurnStats {
+            dropped_turn_stats,
+            defaulted_turn_counts,
+        }) => {
+            tracing::warn!(
+                session_id,
+                dropped_turn_stats,
+                "repaired malformed legacy turn boundaries during import"
+            );
+            tracing::warn!(
+                session_id,
+                repaired_turn_stats = defaulted_turn_counts,
+                "defaulted missing legacy turn_count fields during import"
             );
         }
         Some(ImportDiagnostic::RepairedMetadataOnlySidecars {
@@ -188,39 +288,35 @@ pub struct ImportOutcome {
     pub presentation: PresentationFile,
 }
 
-pub fn image_to_kernel(image: &ImagePart) -> ImageContent {
+fn legacy_image_to_kernel(image: &LegacyImagePart) -> ImageContent {
     ImageContent {
         media_type: image.media_type.clone(),
         data: image.data.clone(),
     }
 }
 
-fn role_to_kernel(role: &CoreRole) -> KernelRole {
+fn legacy_role_to_kernel(role: &str) -> KernelRole {
     match role {
-        CoreRole::System => KernelRole::System,
-        CoreRole::User => KernelRole::User,
-        CoreRole::Assistant => KernelRole::Assistant,
-        CoreRole::Tool => KernelRole::Tool,
+        "System" => KernelRole::System,
+        "User" => KernelRole::User,
+        "Assistant" => KernelRole::Assistant,
+        "Tool" => KernelRole::Tool,
+        // Unrecognised roles fall back to User; validate_tool_pairing will
+        // catch structural issues in the message sequence.
+        _ => KernelRole::User,
     }
 }
 
-fn role_to_core(role: &KernelRole) -> CoreRole {
-    match role {
-        KernelRole::System => CoreRole::System,
-        KernelRole::User => CoreRole::User,
-        KernelRole::Assistant => CoreRole::Assistant,
-        KernelRole::Tool => CoreRole::Tool,
-    }
-}
-
-pub fn message_to_kernel(message: &CoreMessage) -> KernelMessage {
+/// Convert a frozen legacy DTO message to a kernel message without going
+/// through core::conversation types.
+fn legacy_message_to_kernel(message: &LegacyMessage) -> KernelMessage {
     let mut converted = match &message.content {
-        MessageContent::Text(text) => {
+        LegacyContent::Text(text) => {
             let mut converted = KernelMessage::user(text.clone());
-            converted.role = role_to_kernel(&message.role);
+            converted.role = legacy_role_to_kernel(&message.role);
             converted
         }
-        MessageContent::AssistantWithToolCalls {
+        LegacyContent::AssistantWithToolCalls {
             text,
             tool_calls,
             reasoning_content,
@@ -250,19 +346,19 @@ pub fn message_to_kernel(message: &CoreMessage) -> KernelMessage {
                 .collect();
             converted
         }
-        MessageContent::ToolResult(result) => KernelMessage::tool_result(
+        LegacyContent::ToolResult(result) => KernelMessage::tool_result(
             result.call_id.clone(),
             result.output.clone(),
             !result.success,
         ),
-        MessageContent::ToolResultRef(result) => KernelMessage::tool_result(
+        LegacyContent::ToolResultRef(result) => KernelMessage::tool_result(
             result.call_id.clone(),
             result.summary.clone(),
             !result.success,
         ),
-        MessageContent::MultiPart { text, images } => KernelMessage::user_with_images(
+        LegacyContent::MultiPart { text, images } => KernelMessage::user_with_images(
             text.clone().unwrap_or_default(),
-            images.iter().map(image_to_kernel).collect(),
+            images.iter().map(legacy_image_to_kernel).collect(),
         ),
     };
     converted.synthetic = message.synthetic;
@@ -270,78 +366,11 @@ pub fn message_to_kernel(message: &CoreMessage) -> KernelMessage {
     converted
 }
 
-pub(crate) fn message_to_core(message: &KernelMessage) -> CoreMessage {
-    let content = if message.role == KernelRole::Tool {
-        MessageContent::ToolResult(atomcode_core::tool::ToolResult {
-            call_id: message.tool_call_id.clone().unwrap_or_default(),
-            output: message.text.clone(),
-            success: !message.is_error,
-        })
-    } else if !message.tool_calls.is_empty() {
-        MessageContent::AssistantWithToolCalls {
-            text: (!message.text.is_empty()).then(|| message.text.clone()),
-            tool_calls: message
-                .tool_calls
-                .iter()
-                .map(|call| atomcode_core::tool::ToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                })
-                .collect(),
-            reasoning_content: message.reasoning.clone(),
-            thinking_blocks: message
-                .reasoning_blocks
-                .iter()
-                .map(
-                    |block| atomcode_core::conversation::message::ThinkingBlock {
-                        text: block.text.clone(),
-                        signature: block.opaque.clone().unwrap_or_default(),
-                    },
-                )
-                .collect(),
-        }
-    } else if !message.images.is_empty() {
-        MessageContent::MultiPart {
-            text: (!message.text.is_empty()).then(|| message.text.clone()),
-            images: message
-                .images
-                .iter()
-                .map(|image| ImagePart {
-                    media_type: image.media_type.clone(),
-                    data: image.data.clone(),
-                })
-                .collect(),
-        }
-    } else {
-        MessageContent::Text(message.text.clone())
-    };
-    CoreMessage {
-        role: role_to_core(&message.role),
-        content,
-        synthetic: message.synthetic,
-        internal_origin: message.internal_origin.clone(),
-    }
-}
-
-pub fn snapshot_to_kernel(
-    snapshot: &ConversationSnapshot,
-) -> atomcode_kernel::message::SessionSnapshot {
-    let mut messages = Vec::with_capacity(snapshot.messages.len() + snapshot.cold_summaries.len());
-    for summary in &snapshot.cold_summaries {
-        let mut message = KernelMessage::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}{summary}"));
-        message.synthetic = true;
-        message.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
-        messages.push(message);
-    }
-    messages.extend(snapshot.messages.iter().map(message_to_kernel));
-    atomcode_kernel::message::SessionSnapshot::new(messages)
-}
-
 struct NormalizedLegacyTurns {
     boundaries: Vec<LegacyTurnBoundary>,
     turn_stats: Vec<TurnStat>,
     dropped_turn_stats: usize,
+    defaulted_turn_counts: usize,
 }
 
 fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedLegacyTurns> {
@@ -349,6 +378,7 @@ fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedL
     let mut turn_stats = Vec::with_capacity(session.turn_stats.len());
     let mut previous_after = 0usize;
     let mut dropped_turn_stats = 0usize;
+    let mut defaulted_turn_counts = 0usize;
 
     for stat in &session.turn_stats {
         if stat.after_message > session.messages.len()
@@ -357,6 +387,9 @@ fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedL
         {
             dropped_turn_stats += 1;
             continue;
+        }
+        if stat.turn_count.is_none() {
+            defaulted_turn_counts += 1;
         }
 
         let turn_id = u64::try_from(turn_stats.len())?
@@ -370,13 +403,14 @@ fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedL
             after_message: stat.after_message,
             position_valid: true,
             turn_id,
-            round_count: checked_u32(stat.turn_count, "turn_count")?,
+            round_count: checked_u32(stat.turn_count.unwrap_or_default(), "turn_count")?,
             tool_call_count: checked_u32(stat.tool_call_count, "tool_call_count")?,
             duration_ms: stat.duration_ms,
             total_tokens: checked_u32(stat.total_tokens, "total_tokens")?,
             errored: stat.errored,
             used_tokens: checked_u32(stat.used_tokens, "used_tokens")?,
             ctx_window: checked_u32(stat.ctx_window, "ctx_window")?,
+            model_usage: Vec::new(),
         });
         previous_after = stat.after_message;
     }
@@ -388,6 +422,7 @@ fn normalize_legacy_turns(session: &LegacySession) -> anyhow::Result<NormalizedL
         boundaries,
         turn_stats,
         dropped_turn_stats,
+        defaulted_turn_counts,
     })
 }
 
@@ -442,16 +477,16 @@ fn convert_legacy_session_with_diagnostic(
                 if display.after_message > session.messages.len() {
                     anyhow::bail!("legacy presentation position is outside the message history")
                 }
-                let role = match display.message.role {
-                    CoreRole::User => PresentationRole::User,
-                    CoreRole::Assistant => PresentationRole::Assistant,
-                    ref role => {
+                let role = match display.message.role.as_str() {
+                    "User" => PresentationRole::User,
+                    "Assistant" => PresentationRole::Assistant,
+                    role => {
                         anyhow::bail!(
                             "legacy presentation role {role:?} is not supported by schema v1"
                         )
                     }
                 };
-                let MessageContent::Text(text) = &display.message.content else {
+                let LegacyContent::Text(text) = &display.message.content else {
                     anyhow::bail!("legacy presentation content is not plain text")
                 };
                 Ok(PresentationEntry {
@@ -467,7 +502,19 @@ fn convert_legacy_session_with_diagnostic(
             .collect::<anyhow::Result<Vec<_>>>()?,
     };
 
-    let mut snapshot = snapshot_to_kernel(&session.to_conversation_snapshot());
+    // Build the kernel snapshot from frozen DTOs directly, without going through
+    // core::conversation types. Cold summaries are prepended as synthetic messages
+    // (mirrors snapshot_to_kernel's historical behaviour exactly).
+    let mut snapshot_messages =
+        Vec::with_capacity(session.cold_summaries.len() + session.messages.len());
+    for summary in &session.cold_summaries {
+        let mut msg = KernelMessage::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}{summary}"));
+        msg.synthetic = true;
+        msg.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
+        snapshot_messages.push(msg);
+    }
+    snapshot_messages.extend(session.messages.iter().map(legacy_message_to_kernel));
+    let mut snapshot = atomcode_kernel::message::SessionSnapshot::new(snapshot_messages);
     validate_tool_pairing(&snapshot.messages)?;
     // Imported presentation anchors consume stable historical turn ids. Seed the
     // kernel above them so the first resumed turn cannot reuse an imported id.
@@ -483,20 +530,35 @@ fn convert_legacy_session_with_diagnostic(
         ai_named: session.ai_named,
         owner: StorageOwner::Legacy,
         import_info: None,
+        fork_info: None,
         working_dir,
         created_at,
         updated_at,
         turn_count: checked_u32(normalized_turns.turn_stats.len(), "turn_stats")?,
         message_count: checked_u32(session.messages.len(), "messages")?,
         turn_stats: normalized_turns.turn_stats,
+        detached_model_usage: Vec::new(),
+        detached_unattributed_tokens: 0,
     };
     meta.auto_name_from_messages(&snapshot.messages);
 
-    let diagnostic = (normalized_turns.dropped_turn_stats > 0).then_some(
-        ImportDiagnostic::RepairedLegacyTurnBoundaries {
-            dropped_turn_stats: normalized_turns.dropped_turn_stats,
-        },
-    );
+    let diagnostic =
+        if normalized_turns.dropped_turn_stats > 0 && normalized_turns.defaulted_turn_counts > 0 {
+            Some(ImportDiagnostic::RepairedLegacyTurnStats {
+                dropped_turn_stats: normalized_turns.dropped_turn_stats,
+                defaulted_turn_counts: normalized_turns.defaulted_turn_counts,
+            })
+        } else if normalized_turns.dropped_turn_stats > 0 {
+            Some(ImportDiagnostic::RepairedLegacyTurnBoundaries {
+                dropped_turn_stats: normalized_turns.dropped_turn_stats,
+            })
+        } else if normalized_turns.defaulted_turn_counts > 0 {
+            Some(ImportDiagnostic::DefaultedLegacyTurnCounts {
+                repaired_turn_stats: normalized_turns.defaulted_turn_counts,
+            })
+        } else {
+            None
+        };
 
     Ok((
         ConvertedLegacySession {
@@ -725,6 +787,78 @@ fn converge_session_with_retries(
         let expected_meta = meta.clone();
         let expected_snapshot = snapshot.clone();
         let expected_presentation = presentation.clone();
+        if let Some(bytes) = legacy_bytes.as_deref() {
+            let recoverable_empty_import = meta.message_count == 0
+                && snapshot.messages.is_empty()
+                && presentation.entries.is_empty()
+                && meta.import_info.as_ref().is_some_and(|info| {
+                    info.kind == ImportKind::MetadataOnly && info.source_sha256 == sha256_hex(bytes)
+                });
+            if recoverable_empty_import {
+                let legacy: LegacySession = serde_json::from_slice(bytes)
+                    .map_err(|error| anyhow::anyhow!("invalid legacy session {id:?}: {error}"))?;
+                if legacy.id != id {
+                    anyhow::bail!(
+                        "legacy filename id {id:?} does not match stored id {:?}",
+                        legacy.id
+                    )
+                }
+                let (converted, diagnostic) = convert_legacy_session_with_diagnostic(&legacy)?;
+                if !converted.snapshot.messages.is_empty() {
+                    let mut recovered_meta = converted.meta;
+                    recovered_meta.auto_name_from_messages(&converted.snapshot.messages);
+                    if meta.user_renamed || meta.ai_named {
+                        recovered_meta.name = meta.name.clone();
+                        recovered_meta.user_renamed = meta.user_renamed;
+                        recovered_meta.ai_named = meta.ai_named;
+                    }
+                    recovered_meta.updated_at = recovered_meta.updated_at.max(meta.updated_at);
+                    recovered_meta.message_count = u32::try_from(converted.snapshot.messages.len())
+                        .map_err(|_| {
+                            anyhow::anyhow!("native snapshot message count exceeds u32")
+                        })?;
+                    recovered_meta.owner = StorageOwner::Native;
+                    recovered_meta.import_info = Some(ImportInfo {
+                        legacy_schema: LEGACY_SCHEMA.into(),
+                        source_sha256: sha256_hex(bytes),
+                        importer_version: IMPORTER_VERSION,
+                        kind: ImportKind::Full,
+                    });
+                    match manager.recover_empty_metadata_only_import_if_unchanged(
+                        lease,
+                        &expected_meta,
+                        &expected_snapshot,
+                        &expected_presentation,
+                        &converted.snapshot,
+                        &converted.presentation,
+                        &recovered_meta,
+                    )? {
+                        NativeImportCommitOutcome::Committed(meta) => {
+                            report_import_diagnostic(id, diagnostic);
+                            return Ok(ImportOutcome {
+                                status: ImportStatus::ImportedFull,
+                                diagnostic,
+                                snapshot: converted.snapshot,
+                                meta,
+                                presentation: converted.presentation,
+                            });
+                        }
+                        NativeImportCommitOutcome::Conflict { .. } => {
+                            if remaining_retries == 0 {
+                                anyhow::bail!(
+                                    "session {id:?} changed repeatedly during empty import recovery; retry"
+                                )
+                            }
+                            return converge_session_with_retries(
+                                manager,
+                                lease,
+                                remaining_retries - 1,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let mut diagnostic = match (legacy_bytes.as_deref(), meta.import_info.as_ref()) {
             (Some(bytes), Some(info)) if sha256_hex(bytes) != info.source_sha256 => {
                 Some(ImportDiagnostic::LegacyChangedAfterCutover)
@@ -827,7 +961,17 @@ fn converge_session_with_retries(
         )
     }
     let (converted, diagnostic) = convert_legacy_session_with_diagnostic(&legacy)?;
-    let preserve_native_snapshot = existing_snapshot.is_some() && !force_legacy;
+    let empty_unconfirmed_stub = existing_meta
+        .as_ref()
+        .is_some_and(|meta| meta.owner == StorageOwner::Unconfirmed && meta.message_count == 0)
+        && existing_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.messages.is_empty())
+        && existing_presentation
+            .as_ref()
+            .is_some_and(|presentation| presentation.entries.is_empty());
+    let preserve_native_snapshot =
+        existing_snapshot.is_some() && !force_legacy && !empty_unconfirmed_stub;
     if preserve_native_snapshot {
         let meta = existing_meta.ok_or_else(|| {
             anyhow::anyhow!("session {id:?} has a native snapshot without ownership metadata")
@@ -923,6 +1067,7 @@ fn catalog_for_project_in_root(
                 || working_dirs_equivalent(&entry.working_dir, working_dir)
         })
         .collect();
+    SessionManager::collapse_fork_lineages(&mut entries);
     repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
     Ok(entries)
 }
@@ -985,10 +1130,7 @@ pub fn prepare_catalog_session_resume_in_project(
 pub fn prepare_catalog_session_resume_any_project(
     id: &str,
 ) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
-    prepare_catalog_session_resume_any_project_in_root(
-        &SessionManager::sessions_root(),
-        id,
-    )
+    prepare_catalog_session_resume_any_project_in_root(&SessionManager::sessions_root(), id)
 }
 
 pub(crate) fn prepare_catalog_session_resume_any_project_in_root(
@@ -997,11 +1139,7 @@ pub(crate) fn prepare_catalog_session_resume_any_project_in_root(
 ) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
     let scan = SessionManager::scan_catalog(sessions_root);
     report_catalog_diagnostics(&scan.diagnostics);
-    let Some(entry) = scan
-        .entries
-        .iter()
-        .find(|entry| entry.id == id)
-    else {
+    let Some(entry) = scan.entries.iter().find(|entry| entry.id == id) else {
         reject_matching_catalog_diagnostic(&scan.diagnostics, id)?;
         return Ok(None);
     };
@@ -1218,7 +1356,6 @@ pub fn delete_catalog_project_in_project(project_bucket: &str) -> anyhow::Result
     Ok(())
 }
 
-
 /// Append UI-only text without ever inserting it into the runtime snapshot. Native
 /// sessions use the stable turn-anchored presentation sidecar; legacy sessions keep
 /// their historical JSON representation until S4b performs cutover.
@@ -1240,7 +1377,7 @@ pub fn append_catalog_presentation_in_project(
 pub fn persist_pre_runtime_terminal(
     working_dir: &std::path::Path,
     id: &str,
-    snapshot: &ConversationSnapshot,
+    snapshot: &atomcode_kernel::message::SessionSnapshot,
 ) -> anyhow::Result<()> {
     let manager = SessionManager::for_project(working_dir);
     let lease = manager.acquire_lease(id)?;
@@ -1251,7 +1388,7 @@ pub fn persist_pre_runtime_terminal(
     ]
     .iter()
     .any(|path| path.exists());
-    let mut native_snapshot = snapshot_to_kernel(snapshot);
+    let mut native_snapshot = snapshot.clone();
     if has_existing {
         let outcome = converge_session(&manager, &lease)?;
         native_snapshot.turn_counter = native_snapshot
@@ -1320,6 +1457,23 @@ fn delete_catalog_session_in_root(
     validate_project_bucket(project_bucket)?;
     let manager = SessionManager::with_root(sessions_root.join(project_bucket));
     let lease = manager.acquire_lease(id)?;
+    let targets = [
+        manager.snapshot_path(id)?,
+        manager.meta_path(id)?,
+        manager.jsonl_path(id)?,
+        manager.presentation_path(id)?,
+        manager.legacy_path(id)?,
+    ];
+    let mut found = false;
+    for path in &targets {
+        found |= path.try_exists()?;
+    }
+    if !found {
+        return Err(SessionStoreError::NotFound {
+            path: manager.meta_path(id)?,
+        }
+        .into());
+    }
     manager.delete(&lease)?;
     Ok(())
 }
@@ -1614,45 +1768,40 @@ fn validate_tool_pairing(messages: &[KernelMessage]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn snapshot_to_core(
-    snapshot: &atomcode_kernel::message::SessionSnapshot,
-) -> ConversationSnapshot {
-    let mut messages = Vec::with_capacity(snapshot.messages.len());
-    let mut cold_summaries = Vec::new();
-    for message in &snapshot.messages {
-        if message.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN) {
-            if let Some(summary) = message.text.strip_prefix(LEGACY_COLD_SUMMARY_PREFIX) {
-                cold_summaries.push(summary.to_string());
-                continue;
-            }
-        }
-        messages.push(message_to_core(message));
-    }
-    ConversationSnapshot {
-        messages,
-        cold_summaries,
-    }
-}
-
-pub fn usage_to_core(
-    usage: &atomcode_kernel::stream::TokenUsage,
-) -> atomcode_core::stream::TokenUsage {
-    atomcode_core::stream::TokenUsage {
-        prompt_tokens: usage.prompt as usize,
-        completion_tokens: usage.completion as usize,
-        cached_tokens: usage.cached as usize,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Inline fixture used by the DTO-decoupling characterization test.
+    /// Covers: AssistantWithToolCalls (tool_calls + reasoning_content + thinking_blocks),
+    /// ToolResult, ToolResultRef, MultiPart (with image), cold_summaries, display_messages,
+    /// turn_stats, user_renamed:true, seconds-level created_at/updated_at.
+    const LEGACY_JSON: &str = include_str!("../tests/fixtures/session/legacy_full.json");
+
     fn full_legacy_session() -> LegacySession {
-        serde_json::from_str(include_str!(
-            "../../atomcode-core/tests/fixtures/session/legacy_full.json"
-        ))
-        .expect("full legacy session fixture must parse")
+        serde_json::from_str(LEGACY_JSON).expect("full legacy session fixture must parse")
+    }
+
+    /// Characterization (baseline) test: locks the current importer output so that
+    /// the DTO decoupling in Steps 4-5 is proven to be a pure type substitution.
+    #[test]
+    fn legacy_import_is_stable_across_dto_decoupling() {
+        let session: LegacySession = serde_json::from_str(LEGACY_JSON).unwrap();
+        let out = convert_legacy_session(&session).expect("fixture must convert");
+
+        // kernel snapshot: 2 cold-summary synthetics + 7 real messages = 9
+        assert_eq!(out.snapshot.messages.len(), 9);
+        // cold-summary synthetic messages carry the legacy origin marker
+        assert!(out
+            .snapshot
+            .messages
+            .iter()
+            .any(|m| { m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN) }));
+        // meta: naming flags and seconds → milliseconds timestamp conversion
+        assert_eq!(out.meta.user_renamed, true);
+        assert_eq!(out.meta.created_at, session.created_at as i64 * 1000);
+        // presentation: the fixture has 2 display_messages
+        assert_eq!(out.presentation.entries.len(), 2);
     }
 
     #[test]
@@ -1748,9 +1897,44 @@ mod tests {
     }
 
     #[test]
+    fn prepared_resume_accepts_missing_legacy_turn_count() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = "4444444444444444";
+        let mut legacy = full_legacy_session();
+        legacy.turn_stats[1].turn_count = None;
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        std::fs::create_dir_all(manager.root()).unwrap();
+        std::fs::write(
+            manager.legacy_path(&legacy.id).unwrap(),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let prepared =
+            prepare_catalog_session_resume_in_project_root(root.path(), bucket, &legacy.id)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(prepared.view.meta.owner, StorageOwner::Native);
+        assert!(!prepared.view.snapshot.messages.is_empty());
+        assert_eq!(prepared.view.meta.turn_stats.len(), 2);
+        assert_eq!(prepared.view.meta.turn_stats[1].round_count, 0);
+    }
+
+    #[test]
     fn full_legacy_fixture_converts_to_expected_kernel_snapshot() {
         let session = full_legacy_session();
-        let snapshot = snapshot_to_kernel(&session.to_conversation_snapshot());
+        // Build the kernel snapshot via the frozen-DTO path (mirrors what
+        // convert_legacy_session does internally after the DTO decoupling).
+        let mut msgs = Vec::new();
+        for s in &session.cold_summaries {
+            let mut m = KernelMessage::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}{s}"));
+            m.synthetic = true;
+            m.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
+            msgs.push(m);
+        }
+        msgs.extend(session.messages.iter().map(legacy_message_to_kernel));
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(msgs);
 
         assert_eq!(snapshot.version, atomcode_kernel::message::SNAPSHOT_VERSION);
         assert_eq!(snapshot.messages.len(), 9);
@@ -1856,7 +2040,7 @@ mod tests {
     #[test]
     fn minimal_legacy_fixture_uses_additive_defaults() {
         let session: LegacySession = serde_json::from_str(include_str!(
-            "../../atomcode-core/tests/fixtures/session/legacy_minimal.json"
+            "../tests/fixtures/session/legacy_minimal.json"
         ))
         .expect("minimal legacy session fixture must parse");
         let converted = convert_legacy_session(&session).expect("fixture must convert");
@@ -1874,7 +2058,12 @@ mod tests {
     #[test]
     fn importer_rejects_dangling_legacy_tool_call() {
         let mut session = full_legacy_session();
-        session.messages[3] = CoreMessage::new(CoreRole::User, "interrupt");
+        session.messages[3] = LegacyMessage {
+            role: "User".to_string(),
+            content: LegacyContent::Text("interrupt".to_string()),
+            synthetic: false,
+            internal_origin: None,
+        };
 
         let error = convert_legacy_session(&session).unwrap_err();
         assert!(error.to_string().contains("tool pairing"), "{error:#}");
@@ -1890,7 +2079,7 @@ mod tests {
         let id = session.id.as_str();
         std::fs::write(
             manager.legacy_path(id).unwrap(),
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json"),
+            include_bytes!("../tests/fixtures/session/legacy_full.json"),
         )
         .unwrap();
         let lease = manager.acquire_lease(id).unwrap();
@@ -1949,7 +2138,7 @@ mod tests {
             .unwrap();
         std::fs::write(
             manager.legacy_path(id).unwrap(),
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json"),
+            include_bytes!("../tests/fixtures/session/legacy_full.json"),
         )
         .unwrap();
         let lease = manager.acquire_lease(id).unwrap();
@@ -1975,11 +2164,101 @@ mod tests {
     }
 
     #[test]
+    fn empty_unconfirmed_native_stub_is_replaced_by_populated_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
+        let empty_snapshot = atomcode_kernel::message::SessionSnapshot::new(Vec::new());
+        let empty_presentation = PresentationFile::default();
+        manager.save_snapshot(&legacy.id, &empty_snapshot).unwrap();
+        manager
+            .write_presentation(&legacy.id, &empty_presentation)
+            .unwrap();
+        manager
+            .write_meta(&SessionMeta::new(&legacy.id, "/native", 7))
+            .unwrap();
+        std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
+        let lease = manager.acquire_lease(&legacy.id).unwrap();
+
+        let imported = converge_session(&manager, &lease).unwrap();
+
+        assert_eq!(imported.status, ImportStatus::ImportedFull);
+        assert!(!imported.snapshot.messages.is_empty());
+        assert_eq!(
+            manager.load_native_session(&legacy.id).unwrap().snapshot,
+            imported.snapshot
+        );
+    }
+
+    #[test]
+    fn empty_metadata_only_native_stub_recovers_from_matching_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
+        let empty_snapshot = atomcode_kernel::message::SessionSnapshot::new(Vec::new());
+        let empty_presentation = PresentationFile::default();
+        let mut poisoned_meta = SessionMeta::new(&legacy.id, "/native", 7);
+        poisoned_meta.owner = StorageOwner::Native;
+        poisoned_meta.import_info = Some(ImportInfo {
+            legacy_schema: LEGACY_SCHEMA.into(),
+            source_sha256: sha256_hex(legacy_bytes),
+            importer_version: IMPORTER_VERSION,
+            kind: ImportKind::MetadataOnly,
+        });
+        manager.save_snapshot(&legacy.id, &empty_snapshot).unwrap();
+        manager
+            .write_presentation(&legacy.id, &empty_presentation)
+            .unwrap();
+        manager.write_meta(&poisoned_meta).unwrap();
+        std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
+        let lease = manager.acquire_lease(&legacy.id).unwrap();
+
+        let recovered = converge_session(&manager, &lease).unwrap();
+
+        assert_eq!(recovered.status, ImportStatus::ImportedFull);
+        assert!(!recovered.snapshot.messages.is_empty());
+        assert_eq!(
+            recovered.meta.import_info.as_ref().map(|info| &info.kind),
+            Some(&ImportKind::Full)
+        );
+        assert_eq!(
+            manager.load_native_session(&legacy.id).unwrap().snapshot,
+            recovered.snapshot
+        );
+    }
+
+    #[test]
+    fn empty_native_session_without_matching_import_provenance_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
+        let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
+        let empty_snapshot = atomcode_kernel::message::SessionSnapshot::new(Vec::new());
+        let empty_presentation = PresentationFile::default();
+        let mut native_meta = SessionMeta::new(&legacy.id, "/native", 7);
+        native_meta.owner = StorageOwner::Native;
+        manager.save_snapshot(&legacy.id, &empty_snapshot).unwrap();
+        manager
+            .write_presentation(&legacy.id, &empty_presentation)
+            .unwrap();
+        manager.write_meta(&native_meta).unwrap();
+        std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
+        let lease = manager.acquire_lease(&legacy.id).unwrap();
+
+        let loaded = converge_session(&manager, &lease).unwrap();
+
+        assert_eq!(loaded.status, ImportStatus::AlreadyNative);
+        assert!(loaded.snapshot.messages.is_empty());
+        assert_eq!(manager.read_meta(&legacy.id).unwrap(), native_meta);
+    }
+
+    #[test]
     fn full_legacy_import_replaces_an_orphan_presentation_from_an_incomplete_native_state() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let expected = convert_legacy_session(&legacy).unwrap().presentation;
         let orphan = PresentationFile {
@@ -2009,8 +2288,7 @@ mod tests {
     fn metadata_only_import_preserves_an_existing_native_presentation() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let native_snapshot =
             atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
@@ -2056,8 +2334,7 @@ mod tests {
     fn metadata_only_import_recomputes_after_full_state_cas_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let (converted, diagnostic) = convert_legacy_session_with_diagnostic(&legacy).unwrap();
         let mut stale_snapshot =
@@ -2119,8 +2396,7 @@ mod tests {
     fn metadata_only_import_preserves_native_stats_after_legacy_zero_id_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let (converted, diagnostic) = convert_legacy_session_with_diagnostic(&legacy).unwrap();
         let mut snapshot =
@@ -2167,8 +2443,7 @@ mod tests {
     fn snapshot_and_legacy_without_meta_is_ambiguous_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let native_snapshot =
             atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
@@ -2190,8 +2465,7 @@ mod tests {
     fn full_legacy_import_preserves_unconfirmed_user_rename() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let unconfirmed = SessionMeta::new(&legacy.id, "/native", 1);
         manager.write_meta(&unconfirmed).unwrap();
@@ -2214,8 +2488,7 @@ mod tests {
     fn pre_intent_full_import_residue_without_meta_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
@@ -2246,8 +2519,7 @@ mod tests {
     fn legacy_import_intent_recovers_interrupted_full_import() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
@@ -2279,8 +2551,7 @@ mod tests {
     fn legacy_import_intent_replaces_corrupt_interrupted_sidecars() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         std::fs::write(manager.legacy_path(&legacy.id).unwrap(), legacy_bytes).unwrap();
@@ -2318,8 +2589,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let mut converted = convert_legacy_session(&legacy).unwrap();
         rebase_converted_turn_ids(&mut converted, 5).unwrap();
@@ -2350,6 +2620,7 @@ mod tests {
             errored: false,
             used_tokens: 1,
             ctx_window: 128,
+            model_usage: Vec::new(),
         });
         let native_presentation = PresentationEntry {
             anchor: DisplayAnchor::AfterTurn {
@@ -2427,8 +2698,7 @@ mod tests {
 
     #[test]
     fn importer_v2_metadata_only_sidecars_upgrade_without_changing_presentation() {
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2469,8 +2739,7 @@ mod tests {
 
     #[test]
     fn importer_v3_is_reaudited_without_changing_presentation() {
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2513,8 +2782,7 @@ mod tests {
     fn importer_v3_disk_upgrade_changes_only_metadata_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let id = legacy.id.as_str();
@@ -2573,8 +2841,7 @@ mod tests {
 
     #[test]
     fn importer_v2_with_imported_anchor_is_unresolved_and_non_destructive() {
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2605,8 +2872,7 @@ mod tests {
 
     #[test]
     fn metadata_only_sidecar_repair_requires_a_strict_stats_prefix() {
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2630,6 +2896,7 @@ mod tests {
                 errored: false,
                 used_tokens: 1,
                 ctx_window: 128,
+                model_usage: Vec::new(),
             },
         );
         let original_meta = meta.clone();
@@ -2647,8 +2914,7 @@ mod tests {
 
     #[test]
     fn importer_v1_requires_coordinate_domain_evidence() {
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2675,8 +2941,7 @@ mod tests {
 
     #[test]
     fn importer_v1_exact_native_prefix_without_native_suffix_is_unresolved() {
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2702,8 +2967,7 @@ mod tests {
 
     #[test]
     fn metadata_only_sidecar_repair_is_non_destructive_when_presentation_origin_is_ambiguous() {
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let mut meta = converted.meta;
@@ -2737,8 +3001,7 @@ mod tests {
 
     #[test]
     fn metadata_only_sidecar_repair_rejects_tail_using_an_imported_turn() {
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let imported_turn_id = converted.meta.turn_stats.last().unwrap().turn_id;
@@ -2774,8 +3037,7 @@ mod tests {
 
     #[test]
     fn metadata_only_sidecar_repair_does_not_delete_matching_native_sidecars() {
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         let legacy: LegacySession = serde_json::from_slice(legacy_bytes).unwrap();
         let converted = convert_legacy_session(&legacy).unwrap();
         let native_message_count = converted.snapshot.messages.len();
@@ -2861,7 +3123,7 @@ mod tests {
         let path = manager.legacy_path(id).unwrap();
         std::fs::write(
             &path,
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json"),
+            include_bytes!("../tests/fixtures/session/legacy_full.json"),
         )
         .unwrap();
         let lease = manager.acquire_lease(id).unwrap();
@@ -2890,7 +3152,7 @@ mod tests {
         manager.write_meta(&meta).unwrap();
         std::fs::write(
             manager.legacy_path(id).unwrap(),
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json"),
+            include_bytes!("../tests/fixtures/session/legacy_full.json"),
         )
         .unwrap();
         let lease = manager.acquire_lease(id).unwrap();
@@ -3019,6 +3281,7 @@ mod tests {
         let entry = CatalogEntry {
             id: id.into(),
             name: meta.name.clone(),
+            fork_root_id: None,
             project_bucket: bucket.into(),
             working_dir: "/project".into(),
             created_at_ms: meta.created_at,
@@ -3119,6 +3382,7 @@ mod tests {
         let entry = CatalogEntry {
             id: id.into(),
             name: meta.name.clone(),
+            fork_root_id: None,
             project_bucket: bucket.into(),
             working_dir: "/project".into(),
             created_at_ms: 1,
@@ -3159,6 +3423,7 @@ mod tests {
         let entry = CatalogEntry {
             id: id.into(),
             name: meta.name,
+            fork_root_id: None,
             project_bucket: bucket.into(),
             working_dir: "/project".into(),
             created_at_ms: 1,
@@ -3338,6 +3603,7 @@ mod tests {
         let entry = CatalogEntry {
             id: id.into(),
             name: meta.name.clone(),
+            fork_root_id: None,
             project_bucket: bucket.into(),
             working_dir: "/project".into(),
             created_at_ms: 1,
@@ -3372,12 +3638,13 @@ mod tests {
         let id = session.id.as_str();
         std::fs::write(
             project.join(format!("{id}.json")),
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json"),
+            include_bytes!("../tests/fixtures/session/legacy_full.json"),
         )
         .unwrap();
         let entry = CatalogEntry {
             id: id.into(),
             name: session.name.clone(),
+            fork_root_id: None,
             project_bucket: bucket.into(),
             working_dir: session.working_dir.clone(),
             created_at_ms: session.created_at as i64 * 1_000,
@@ -3407,12 +3674,12 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let session = full_legacy_session();
         let id = session.id.as_str();
-        let legacy_bytes =
-            include_bytes!("../../atomcode-core/tests/fixtures/session/legacy_full.json");
+        let legacy_bytes = include_bytes!("../tests/fixtures/session/legacy_full.json");
         std::fs::write(project.join(format!("{id}.json")), legacy_bytes).unwrap();
         let entry = CatalogEntry {
             id: id.into(),
             name: session.name.clone(),
+            fork_root_id: None,
             project_bucket: bucket.into(),
             working_dir: session.working_dir.clone(),
             created_at_ms: session.created_at as i64 * 1_000,
@@ -3436,7 +3703,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_uses_active_lease_and_cleans_every_session_artifact_idempotently() {
+    fn delete_uses_active_lease_cleans_every_artifact_and_reports_missing() {
         let dir = tempfile::tempdir().unwrap();
         let bucket = "0123456789abcdef";
         let id = "delete-all";
@@ -3459,7 +3726,6 @@ mod tests {
         drop(active);
 
         delete_catalog_session_in_root(dir.path(), bucket, id).unwrap();
-        delete_catalog_session_in_root(dir.path(), bucket, id).unwrap();
         for path in [
             manager.snapshot_path(id).unwrap(),
             manager.meta_path(id).unwrap(),
@@ -3469,6 +3735,11 @@ mod tests {
         ] {
             assert!(!path.exists(), "{} was not deleted", path.display());
         }
+        let missing = delete_catalog_session_in_root(dir.path(), bucket, id).unwrap_err();
+        assert!(matches!(
+            missing.downcast_ref::<SessionStoreError>(),
+            Some(SessionStoreError::NotFound { .. })
+        ));
     }
 
     #[test]
@@ -3503,6 +3774,7 @@ mod tests {
             errored: false,
             used_tokens: 1,
             ctx_window: 10,
+            model_usage: Vec::new(),
         });
         let lease = manager.acquire_lease(id).unwrap();
         manager
@@ -3531,23 +3803,5 @@ mod tests {
             DisplayAnchor::AfterTurn { turn_id: 7 }
         );
         assert_eq!(presentation.entries[0].text, "local note");
-    }
-
-    #[test]
-    fn kernel_round_trip_characterizes_legacy_ref_summary_loss() {
-        let session = full_legacy_session();
-        let kernel = snapshot_to_kernel(&session.to_conversation_snapshot());
-        let round_trip = snapshot_to_core(&kernel);
-
-        assert_eq!(round_trip.cold_summaries, session.cold_summaries);
-        assert_eq!(round_trip.messages.len(), session.messages.len());
-        match &round_trip.messages[5].content {
-            MessageContent::ToolResult(result) => {
-                assert_eq!(result.call_id, "call-ref");
-                assert_eq!(result.output, "cached failure summary");
-                assert!(!result.success);
-            }
-            other => panic!("legacy ref currently returns as inline summary, got {other:?}"),
-        }
     }
 }

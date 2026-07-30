@@ -1,27 +1,38 @@
 // crates/atomcode-cli/src/vision.rs
 //
-// Bridges the coding runtime's `ImagePreprocessor` seam (a `core`-free trait)
-// to `atomcode_core::vision_preprocessor::maybe_preprocess`.
+// Bridges the coding runtime's `ImagePreprocessor` seam to the kernel-native
+// `atomcode_coding::vision::run_vl_caption`. The CLI owns building the VL
+// provider (via `derive_tier_config` + the coding provider factory) from the
+// configured `vision_preprocessor_provider`; the parity-critical streaming /
+// outcome lives in coding. No `atomcode-core` dependency.
 //
-// Why this exists: `atomcode-coding` deliberately has no `atomcode-core`
-// dependency, so it can't call `maybe_preprocess` itself. It instead exposes
-// the `ImagePreprocessor` hook (like `provider_factory`), and the CLI — which
-// DOES have `core` — injects this implementation. Restores the TUI's VL
-// image recognition that was dropped when the legacy `atomcode-bridge` (which
-// did this in its turn handler) was retired.
+// Restores the TUI's VL image recognition that was dropped when the legacy
+// `atomcode-bridge` (which did this in its turn handler) was retired.
 
-use atomcode_coding::{ImageContent, ImagePreprocessor, UserInput, VisionNotice};
+use atomcode_coding::vision::{run_vl_caption, should_skip, vl_model_display, PreprocessOutcome};
+use atomcode_coding::{
+    derive_tier_config, CodingAgentConfig, CodingProviderFactory, ImageContent, ImagePreprocessor,
+    UserInput, VisionNotice,
+};
 use atomcode_config::config::Config;
-use atomcode_core::conversation::message::ImagePart;
-use atomcode_core::provider::create_provider;
-use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
+use std::sync::Arc;
 
-/// VL preprocessing for the local TUI runtime. When the active (main) model
-/// can't accept images, converts them to a text description via the configured
-/// VL provider and clears the images; a vision-capable model passes through
-/// unchanged. Any failure to load config / build the provider degrades to
-/// sending the original `(text, images)` rather than blocking the turn.
-pub struct VlImagePreprocessor;
+/// VL preprocessing for the local TUI runtime. Carries the provider factory and
+/// a base agent config (the runtime's main config) so it can build a one-off VL
+/// provider from `config.vision_preprocessor_provider`. When the active (main)
+/// model can't accept images, converts them to a text description and clears the
+/// images; a vision-capable model passes through unchanged. Any failure to load
+/// config / resolve / build degrades to sending the original `(text, images)`.
+pub struct VlImagePreprocessor {
+    factory: Arc<dyn CodingProviderFactory>,
+    base: CodingAgentConfig,
+}
+
+impl VlImagePreprocessor {
+    pub fn new(factory: Arc<dyn CodingProviderFactory>, base: CodingAgentConfig) -> Self {
+        Self { factory, base }
+    }
+}
 
 #[async_trait::async_trait]
 impl ImagePreprocessor for VlImagePreprocessor {
@@ -32,55 +43,65 @@ impl ImagePreprocessor for VlImagePreprocessor {
         active_model: String,
         session_id: Option<String>,
     ) -> (UserInput, Option<VisionNotice>) {
-        if images.is_empty() {
+        // Short-circuit: no images, or the main model already accepts images.
+        if should_skip(&active_model, !images.is_empty()) {
             return (UserInput { text, images }, None);
         }
         let config = match Config::load(&Config::default_path()) {
             Ok(c) => c,
             Err(_) => return (UserInput { text, images }, None),
         };
-        // Build the ACTIVE provider — the one whose model matches the runtime's
-        // resolved turn model (`active_model`), so a `--provider` / `/model`
-        // selection is honoured and the vision-capability check inside
-        // `maybe_preprocess` is made against the real main model rather than a
-        // stale `default_provider`. Fall back to the default if no config entry
-        // carries that model (e.g. an ephemeral provider).
-        let pc = match config
-            .providers
-            .values()
-            .find(|pc| pc.model == active_model)
-            .or_else(|| config.providers.get(&config.default_provider))
-            .cloned()
-        {
-            Some(pc) => pc,
-            None => return (UserInput { text, images }, None),
+        // Nothing configured (None or empty) ⇒ pass through unchanged (Skipped).
+        let Some(vl_name) = config
+            .vision_preprocessor_provider
+            .clone()
+            .filter(|s| !s.is_empty())
+        else {
+            return (UserInput { text, images }, None);
         };
-        // `create_provider` can do blocking auth I/O (token read + refresh over
-        // the network); run it off the async owner task so a slow auth host
-        // can't stall the runtime loop — same treatment `maybe_preprocess`
-        // gives the VL provider build.
-        let active = match tokio::task::spawn_blocking(move || create_provider(&pc)).await {
+        // Resolve through the boundary so a new-schema / folded-CodingPlan VL
+        // selection (no longer in `config.providers`) still resolves. Absent ⇒
+        // Failed (mirror the retired core `maybe_preprocess`): fold the failure
+        // marker + clear the images so raw bytes never reach a text-only model.
+        let Some(vl_pc) = config.provider_config_for_selection(&vl_name) else {
+            return apply_outcome(
+                text,
+                images,
+                PreprocessOutcome::Failed {
+                    reason: format!("VL provider '{vl_name}' not found in config"),
+                },
+            );
+        };
+        let vl_model = vl_model_display(&vl_pc.model).to_string();
+        // Assemble the VL agent config from the base + the VL provider entry
+        // (the same primitive subagent tier-routing uses), then build the
+        // provider. `build` may block on auth I/O (token read + refresh over the
+        // network); run it off the async owner task so a slow auth host can't
+        // stall the runtime loop. `session_id` is bound at build so the one-off
+        // VL call rides the same upstream account/replica as the main turn.
+        let vl_cfg = derive_tier_config(&self.base, &vl_name, &vl_pc);
+        let factory = self.factory.clone();
+        let sid = session_id.filter(|s| !s.is_empty());
+        let built =
+            tokio::task::spawn_blocking(move || factory.build(&vl_cfg, sid.as_deref())).await;
+        let provider = match built {
             Ok(Ok(p)) => p,
-            _ => return (UserInput { text, images }, None),
+            _ => {
+                return apply_outcome(
+                    text,
+                    images,
+                    PreprocessOutcome::Failed {
+                        reason: format!("VL provider '{vl_name}' build failed"),
+                    },
+                );
+            }
         };
-        // Forward the conversation's session id onto the one-off VL call so a
-        // gateway pins it to the same upstream account/replica as the main turn.
-        if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
-            active.set_session_id(&sid);
-        }
-        let parts: Vec<ImagePart> = images
-            .iter()
-            .map(|i| ImagePart {
-                media_type: i.media_type.clone(),
-                data: i.data.clone(),
-            })
-            .collect();
-        let outcome = maybe_preprocess(&config, active.as_ref(), &text, &parts).await;
+        let outcome = run_vl_caption(provider, vl_model, &text, &images).await;
         apply_outcome(text, images, outcome)
     }
 }
 
-/// Map a `maybe_preprocess` outcome to `(UserInput, notice)`. Pure (no I/O) so
+/// Map a `run_vl_caption` outcome to `(UserInput, notice)`. Pure (no I/O) so
 /// the wrapping/`char_count` logic is unit-testable without a live VL provider.
 ///
 /// `Skipped` (vision model) passes through with images kept; `Replaced`/`Failed`

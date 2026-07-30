@@ -7,17 +7,16 @@ CODING 特化层。它把中性内核（[`atomcode_kernel`]）+ 能力层
 
 ---
 
-## 依赖现状：L2 已脱离 atomcode-core
+## 依赖现状：core-free L2
 
-`atomcode-coding` 的生产依赖中已经没有 `atomcode-core`。模型能力判断由
+`atomcode-core` 已从 workspace 删除。`atomcode-coding` 的模型能力判断由
 `atomcode-capabilities` 提供；限流逻辑只依赖可注入的 `RateLimitWindowSource`，具体
 CodingPlan 客户端由 CLI/daemon 等 host adapter 实现；plugin hook 同样通过
 `PluginHookSource` 注入。
 
 直接依赖的 workspace crate 是 `atomcode-kernel`、`atomcode-capabilities`、
-`atomcode-config`、`atomcode-telemetry` 和 `atomcode-review`。CLI、TUI、daemon 仍可能
-为了历史 session、plugin、live transport 等非引擎职责依赖 `atomcode-core`，但这不再
-形成 `atomcode-coding → atomcode-core` 的依赖边。
+`atomcode-config`、`atomcode-telemetry` 和 `atomcode-review`。CLI、TUI、daemon 使用
+kernel/coding 中立类型；历史 session 仅由 daemon 私有 DTO 单向导入。
 
 ---
 

@@ -86,8 +86,8 @@ pub enum Msg<'a> {
         reason: &'a str,
     },
     CpAddedProviders {
-        count: usize,
-        plural_s: &'a str,
+        accounts: usize,
+        models: usize,
     },
     /// Locked-model row. `name` is expected to be pre-decorated with
     /// U+0336 combining strikethrough by the caller (see
@@ -242,12 +242,29 @@ pub enum Msg<'a> {
         hint: &'a str,
     },
     StatusInstructionFilesHeader,
+    StatusInstructionScopeGlobal,
+    StatusInstructionScopeProject,
+    StatusInstructionScopeUser,
     StatusInstructionPresent {
         path: &'a str,
         label: &'a str,
+        scope: &'a str,
     },
     StatusInstructionMissing {
+        path: &'a str,
         label: &'a str,
+        scope: &'a str,
+    },
+    StatusMemoryFilesHeader,
+    StatusMemoryScopeGlobal,
+    StatusMemoryScopeProject,
+    StatusMemoryPresent {
+        path: &'a str,
+        scope: &'a str,
+    },
+    StatusMemoryMissing {
+        path: &'a str,
+        scope: &'a str,
     },
 
     // ── Help / commands ──
@@ -289,7 +306,6 @@ pub enum Msg<'a> {
     },
     ProviderAdded {
         name: &'a str,
-        model: &'a str,
     },
     ProviderUpdated {
         name: &'a str,
@@ -321,6 +337,11 @@ pub enum Msg<'a> {
         current: usize,
     },
     ProviderContextWindowInvalid,
+    ProviderStepPricing,
+    ProviderStepPricingWithHint {
+        current: &'a str,
+    },
+    ProviderPricingInvalid,
     ProviderNameEmpty,
     ProviderBaseUrlEmpty,
     ProviderUnknownType,
@@ -337,7 +358,48 @@ pub enum Msg<'a> {
         current: usize,
         total: usize,
     },
-
+    // ── Provider panel ──
+    ProviderPanelTabAccounts,
+    ProviderPanelTabModels,
+    ProviderPanelEmptyAccounts,
+    ProviderPanelNoMatchingAccounts,
+    ProviderPanelEmptyModels,
+    ProviderPanelNoMatchingModels,
+    ProviderPanelLegacyBadge,
+    ProviderPanelDefaultBadge,
+    ProviderPanelModelCount {
+        count: usize,
+    },
+    ProviderPanelAccountsHint,
+    ProviderPanelModelsHint,
+    ProviderPanelFilteredModelsHint {
+        account: &'a str,
+    },
+    ProviderPanelModelSaved {
+        model: &'a str,
+    },
+    ProviderPanelAddTitle,
+    ProviderPanelEditAccountTitle {
+        account: &'a str,
+    },
+    ProviderPanelAddModelTitle,
+    ProviderPanelEditModelTitle,
+    ProviderPanelFieldVendor,
+    ProviderPanelFieldAccount,
+    ProviderPanelFieldBaseUrl,
+    ProviderPanelFieldApiKey,
+    ProviderPanelFieldModel,
+    ProviderPanelFieldWindow,
+    ProviderPanelFieldMakeDefault,
+    ProviderPanelSwitchHint,
+    ProviderPanelEnvHint {
+        env: &'a str,
+    },
+    ProviderPanelDefaultValue,
+    ProviderPanelKeepOriginal,
+    ProviderPanelProviderFormHint,
+    ProviderPanelAccountFormHint,
+    ProviderPanelModelFormHint,
     // ── Model picker ──
     ModelSwitched {
         provider: &'a str,
@@ -560,10 +622,16 @@ pub enum Msg<'a> {
     CmdNoProviders,
     CmdSessionListLoading,
     CmdNoSessions,
-    CmdUnknownCommand { name: &'a str },
+    CmdUnknownCommand {
+        name: &'a str,
+    },
     /// /cmd with args: required but no arguments supplied.
-    CmdCustomArgRequired { name: &'a str },
-    CmdLoginFailed { error: &'a str },
+    CmdCustomArgRequired {
+        name: &'a str,
+    },
+    CmdLoginFailed {
+        error: &'a str,
+    },
     CmdLogoutDone,
     CmdLogoutFailed {
         error: &'a str,
@@ -594,6 +662,7 @@ pub enum Msg<'a> {
     CmdCheckingUpdate,
     CmdNoActiveProvider,
     CmdProviderUnavailable,
+    CmdProviderUnsupportedBuild,
     CmdProviderReloading,
     SubmitHeldUntilProviderReady,
     SubmitHeldUntilLogin,
@@ -659,6 +728,17 @@ pub enum Msg<'a> {
         total: usize,
         cost: &'a str,
     },
+    CostTokenReport {
+        prompt: usize,
+        completion: usize,
+        cached: usize,
+        cache_rate: usize,
+        total: usize,
+    },
+    CostFree,
+    CostUnattributed {
+        tokens: u64,
+    },
 
     // ── /usage command ──
     /// Shown when the user runs /usage but has no stored CodingPlan auth.
@@ -716,6 +796,9 @@ pub enum Msg<'a> {
     SkillsAvailable,
     SkillUnknown {
         name: &'a str,
+    },
+    SkillsLoaded {
+        names: &'a str,
     },
 
     // ── /mcp ──
@@ -1459,6 +1542,15 @@ pub enum Msg<'a> {
         model: &'a str,
     },
 
+    /// Like `ModelNoImageSupport`, but a `vision_preprocessor_provider` IS
+    /// configured — it just doesn't resolve (typo'd / removed name). Names the
+    /// offending value so the user fixes the name instead of thinking they
+    /// never set it. `model` = current model; `provider` = unresolvable value.
+    VisionPreprocessorUnresolvable {
+        model: &'a str,
+        provider: &'a str,
+    },
+
     // ── --dangerously-skip-permissions / -y ──
     /// Scrollback warning banner when --dangerously-skip-permissions is active
     /// in TUI mode. Includes leading "⚠ " and trailing "\n".
@@ -1493,9 +1585,13 @@ pub enum Msg<'a> {
     /// ("Enter to run…") takes over once a command is typed.
     ShellModeHint,
 
-    /// Echo label appended to the `↳` line when a mid-turn submit on the async
-    /// kernel path is steered into the running turn instead of queued locally.
-    SteerFoldedHint,
+    /// Header for the transient list of mid-turn messages waiting for the next
+    /// model/tool boundary. Also documents the Esc interrupt-and-send action.
+    PendingMessagesTitle,
+    /// Runtime termination prevented Esc-held messages from being replayed.
+    PendingMessagesNotSent {
+        count: usize,
+    },
 
     /// Startup hint shown on terminals where Kitty CSI-u keyboard
     /// disambiguation isn't available, telling the user the

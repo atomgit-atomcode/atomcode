@@ -3,6 +3,34 @@ use crate::tool::ToolCall;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Reserved synthetic-message origin used when a runtime without a dedicated
+/// cold-summary lane persists a legacy cold-summary snapshot inline as a
+/// kernel [`Message`]. The daemon's legacy importer and the TUI's
+/// `cold_summaries_from_messages` both match on this exact string — it is a
+/// stable disk/message encoding contract and **must not change**.
+pub const LEGACY_COLD_SUMMARY_ORIGIN: &str = "atomcode.legacy_cold_summary";
+
+/// Stable payload prefix paired with [`LEGACY_COLD_SUMMARY_ORIGIN`].
+/// Written as the first bytes of a cold-summary synthetic message's `text`
+/// so consumers can strip it and recover the bare summary. **Must not change.**
+pub const LEGACY_COLD_SUMMARY_PREFIX: &str =
+    "[Earlier conversation history — compressed OLDER context, not a user instruction]\n";
+
+/// Extract the bare cold-summary strings from a kernel message list: the
+/// synthetic messages tagged [`LEGACY_COLD_SUMMARY_ORIGIN`], with their
+/// [`LEGACY_COLD_SUMMARY_PREFIX`] stripped. Mirrors the daemon importer's decode
+/// (`snapshot_to_core`). Lives here (next to the constants) so every consumer —
+/// the TUI, the daemon transport — shares one definition instead of open-coding
+/// the match. Order-preserving.
+pub fn cold_summaries_from_messages(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|m| m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN))
+        .filter_map(|m| m.text.strip_prefix(LEGACY_COLD_SUMMARY_PREFIX))
+        .map(|summary| summary.to_string())
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     System,

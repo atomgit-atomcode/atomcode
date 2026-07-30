@@ -1,6 +1,2 @@
-// i18n moved to atomcode-core::i18n so core renderers (e.g.
-// SetupReport::render in coding_plan/setup.rs) can localise their
-// output. This module is a re-export shim so all existing
-// `crate::i18n::{t, Msg, Locale, …}` call sites keep compiling
-// unchanged.
+// Driver-local import surface for the config-owned localization tables.
 pub use atomcode_config::i18n::*;

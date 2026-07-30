@@ -35,9 +35,12 @@ const DEFAULT_CHILD_MAX_ROUNDS: u32 = 200;
 
 pub mod approval;
 pub mod ast_grep;
+pub mod output_artifact;
 /// AtomGit REST tools (repo / pr / issue). Opt-in `atomgit` feature.
 #[cfg(feature = "atomgit")]
 pub mod atomgit;
+#[cfg(feature = "atomgit")]
+pub mod atomgit_bash_gate;
 pub mod bash;
 pub mod bash_workspace_gate;
 pub mod cd;
@@ -75,14 +78,17 @@ pub use crate::atomgit::{
     AtomgitClient, AtomgitConfig, LiveTokenProvider, StaticTokenProvider, TokenProvider,
 };
 pub use approval::{
-    request_approval_decision, ApprovalMiddleware, ApprovalRequest, ApprovalResponse,
-    InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
+    parse_permission_decision, request_approval_decision, ApprovalMiddleware, ApprovalRequest,
+    ApprovalResponse, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
 pub use ast_grep::AstGrepTool;
+pub use output_artifact::{artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES};
 #[cfg(feature = "atomgit")]
 pub use atomgit::{
     atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, AtomgitPrTool, AtomgitRepoTool,
 };
+#[cfg(feature = "atomgit")]
+pub use atomgit_bash_gate::AtomgitBashGate;
 pub use bash::{normalize_command_for_grant, run_shell, BashTool, ShellExit, ShellOutcome};
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;
@@ -131,6 +137,7 @@ pub fn coding_tool_names() -> &'static [&'static str] {
             "search_replace",
             "ast_grep",
             "todowrite",
+            "fetch_output",
             "memory",
             "request_user_input",
         ];
@@ -149,6 +156,7 @@ pub fn coding_tool_names() -> &'static [&'static str] {
             "search_replace",
             "ast_grep",
             "todowrite",
+            "fetch_output",
             "request_user_input",
         ];
     }
@@ -495,11 +503,17 @@ mod tests {
             names.contains(&"request_user_input"),
             "coding_tool_names() must include 'request_user_input'"
         );
+        // "fetch_output" is always in coding_tool_names() — mount() drops it when the
+        // session-gated FetchOutputTool is not registered; the name itself is unconditional.
+        assert!(
+            names.contains(&"fetch_output"),
+            "coding_tool_names() must include 'fetch_output'"
+        );
         // No stale or duplicate names beyond EXPECTED_TOOL_NAMES + the gated extras.
         #[cfg(feature = "memory")]
-        let extras: &[&str] = &["memory", "request_user_input"];
+        let extras: &[&str] = &["memory", "request_user_input", "fetch_output"];
         #[cfg(not(feature = "memory"))]
-        let extras: &[&str] = &["request_user_input"];
+        let extras: &[&str] = &["request_user_input", "fetch_output"];
         let expected_full: Vec<&str> = EXPECTED_TOOL_NAMES
             .iter()
             .copied()
@@ -511,7 +525,7 @@ mod tests {
         sorted_expected.sort();
         assert_eq!(
             sorted_names, sorted_expected,
-            "coding_tool_names() must match EXPECTED_TOOL_NAMES + memory + request_user_input"
+            "coding_tool_names() must match EXPECTED_TOOL_NAMES + memory + request_user_input + fetch_output"
         );
     }
 

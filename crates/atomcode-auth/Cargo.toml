@@ -12,6 +12,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 tracing = "0.1"
+fs2 = "0.4"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 uuid = { version = "1", features = ["v4"] }
 thiserror = "1"
@@ -33,6 +34,11 @@ libc = "0.2"
 # the sign-in URL in the default browser without a console flash. `Win32_Foundation` is
 # required for the `HWND`/`HINSTANCE` types in ShellExecuteW's signature.
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+# Windows: enable reqwest's native-tls backend (SChannel). Some networks RST the
+# rustls TLS fingerprint at the connection layer (os error 10054) while SChannel
+# (browser/curl-native) passes; making SChannel the default on Windows dodges it.
+# Feature-unions with the base `rustls-tls`; keeps `default-features = false`.
+reqwest = { version = "0.12", features = ["native-tls"], default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

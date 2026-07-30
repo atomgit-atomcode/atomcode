@@ -1492,6 +1492,8 @@ mod tests {
             .on_rate_limit(&RateLimitHint {
                 http_status: Some(429),
                 retry_after_secs: None,
+                terminal: false,
+                attempt: 1,
             })
             .await;
         assert_eq!(got, Some(RateLimitDecision::WaitAndRetry { secs: 7 }));

@@ -274,10 +274,10 @@ impl Tool for ReadFileTool {
             if line.chars().count() > MAX_LINE_LEN {
                 let head: String = line.chars().take(MAX_LINE_LEN).collect();
                 out.push_str(&format!(
-                    "{n:>6}\t{head}... (line truncated to {MAX_LINE_LEN} chars)\n"
+                    "{n}\t{head}... (line truncated to {MAX_LINE_LEN} chars)\n"
                 ));
             } else {
-                out.push_str(&format!("{n:>6}\t{line}\n"));
+                out.push_str(&format!("{n}\t{line}\n"));
             }
         }
         if start > 1 || end_idx < total {
@@ -434,8 +434,8 @@ mod tests {
             .execute(r#"{"file_path":"a.txt"}"#, &ctx(d.path()))
             .await;
         assert!(!r.is_error);
-        assert!(r.content.contains("     1\tfirst"), "{}", r.content);
-        assert!(r.content.contains("     3\tthird"), "{}", r.content);
+        assert!(r.content.contains("1\tfirst"), "{}", r.content);
+        assert!(r.content.contains("3\tthird"), "{}", r.content);
     }
 
     #[tokio::test]
@@ -508,8 +508,8 @@ mod tests {
                 &ctx(d.path()),
             )
             .await;
-        assert!(r.content.contains("     2\tl2"), "{}", r.content);
-        assert!(r.content.contains("     3\tl3"), "{}", r.content);
+        assert!(r.content.contains("2\tl2"), "{}", r.content);
+        assert!(r.content.contains("3\tl3"), "{}", r.content);
         assert!(!r.content.contains("\tl1"), "{}", r.content);
         assert!(!r.content.contains("\tl4"), "{}", r.content);
         assert!(
@@ -603,8 +603,8 @@ mod tests {
             )
             .await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("     2\tl2"), "{}", r.content);
-        assert!(r.content.contains("     3\tl3"), "{}", r.content);
+        assert!(r.content.contains("2\tl2"), "{}", r.content);
+        assert!(r.content.contains("3\tl3"), "{}", r.content);
         assert!(!r.content.contains("\tl4"), "{}", r.content);
     }
 
@@ -655,7 +655,7 @@ mod tests {
             "offset/limit must bypass skeleton: {}",
             r.content
         );
-        assert!(r.content.contains("     1\tfn f"), "{}", r.content);
+        assert!(r.content.contains("1\tfn f"), "{}", r.content);
     }
 
     #[cfg(feature = "codeintel")]

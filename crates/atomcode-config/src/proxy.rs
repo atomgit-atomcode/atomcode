@@ -1,9 +1,8 @@
 //! Proxy configuration types + process-env policy (`[network.proxy]`).
 //!
-//! The reqwest-applying runtime (`apply_async_proxy_policy` /
-//! `apply_blocking_proxy_policy`) stays in `atomcode-core` (it needs the HTTP stack);
-//! this leaf crate holds only the config types + std/toml env logic they read.
-//! `atomcode_core::proxy` re-exports everything here so old paths keep resolving.
+//! This reqwest-free leaf owns config types and std/toml environment policy.
+//! Crates that own HTTP clients apply the resulting process policy to their own
+//! reqwest builders.
 
 use std::env;
 use std::path::PathBuf;
@@ -180,7 +179,7 @@ pub fn install_from_default_path_or_default() {
 }
 
 /// Ensure the process proxy env has been initialized from disk once. Public so the
-/// reqwest-applying policy fns in `atomcode-core` can call it before building clients.
+/// HTTP-owning crates can call it before building clients.
 pub fn ensure_runtime_initialized() {
     if env::var_os(MODE_ENV).is_none() {
         install_from_default_path_or_default();

@@ -7,6 +7,65 @@ use std::time::Duration;
 use atomcode_config::locale::Locale;
 use atomcode_kernel::agent::ToolLoopPolicy;
 
+/// Resolve the immutable price snapshot for one runtime generation.
+///
+/// Explicit config (including CodingPlan's all-zero entitlement price) wins.
+/// models.dev is only a best-effort fallback for an exact provider/model or
+/// official API URL/model match.
+pub fn resolve_provider_pricing(
+    provider_name: &str,
+    provider: &atomcode_config::config::provider::ProviderConfig,
+) -> Option<atomcode_capabilities::session::ModelPricing> {
+    let pricing = provider
+        .pricing
+        .and_then(|pricing| pricing.validated())
+        .map(|pricing| atomcode_capabilities::provider::CatalogPricing {
+            input_per_million: pricing.input_per_million,
+            output_per_million: pricing.output_per_million,
+            cached_input_per_million: pricing.cached_input_per_million,
+        })
+        .or_else(|| {
+            atomcode_capabilities::provider::resolve_models_dev_pricing(
+                provider_name,
+                provider.base_url.as_deref().unwrap_or_default(),
+                &provider.model,
+            )
+        })?;
+    Some(atomcode_capabilities::session::ModelPricing {
+        input_per_million: pricing.input_per_million,
+        output_per_million: pricing.output_per_million,
+        cached_input_per_million: pricing.cached_input_per_million,
+    })
+}
+
+/// Pricing for an already-resolved model selection — the new resolution path
+/// (design §14.1/§14.5). Mirrors [`resolve_provider_pricing`] but reads the
+/// flattened [`ResolvedModelConfig`] instead of a raw `ProviderConfig`.
+pub fn resolve_resolved_pricing(
+    resolved: &atomcode_config::config::provider::ResolvedModelConfig,
+) -> Option<atomcode_capabilities::session::ModelPricing> {
+    let pricing = resolved
+        .pricing
+        .and_then(|pricing| pricing.validated())
+        .map(|pricing| atomcode_capabilities::provider::CatalogPricing {
+            input_per_million: pricing.input_per_million,
+            output_per_million: pricing.output_per_million,
+            cached_input_per_million: pricing.cached_input_per_million,
+        })
+        .or_else(|| {
+            atomcode_capabilities::provider::resolve_models_dev_pricing(
+                &resolved.selection_id,
+                resolved.base_url.as_deref().unwrap_or_default(),
+                &resolved.model,
+            )
+        })?;
+    Some(atomcode_capabilities::session::ModelPricing {
+        input_per_million: pricing.input_per_million,
+        output_per_million: pricing.output_per_million,
+        cached_input_per_million: pricing.cached_input_per_million,
+    })
+}
+
 /// Everything [`build_coding_agent`](crate::build_coding_agent) needs: provider
 /// credentials, the working directory the tools are scoped to, and liveness bounds.
 ///
@@ -49,6 +108,12 @@ pub struct CodingAgentConfig {
     /// It is deliberately generous, produces an explicit incomplete terminal, and may be
     /// overridden with `ATOMCODE_TURN_MAX_ROUNDS`.
     pub max_rounds: u32,
+    /// When true, the kernel turns the `max_rounds` cap into an interactive
+    /// checkpoint (see AgentBuilder). Default false; only the TUI driver sets it.
+    pub round_cap_checkpoint: bool,
+    /// Immutable price snapshot for this runtime generation. `None` means the
+    /// configured model's price is unknown.
+    pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
     /// Exact no-progress loop policy. `None` disables it for explicitly intentional
     /// identical repetition. Defaults to 3/4 and is configurable through
     /// `ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD` / `ATOMCODE_TOOL_LOOP_STOP_THRESHOLD`;
@@ -156,7 +221,15 @@ pub struct CodingRuntimeConfig {
     pub user_agent: Option<String>,
     pub skip_tls_verify: bool,
     pub loop_max_rounds: u32,
+    pub turn_max_rounds: u32,
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
+    /// When true, a `max_rounds` hit becomes an interactive continue/stop
+    /// checkpoint (the kernel sends a `ROUND_CAP_CHECKPOINT_KIND` Request)
+    /// instead of a hard error. Only the TUI implements the picker, so this
+    /// must stay `false` for headless / ACP / daemon runtimes (there is no
+    /// requester to answer the Request → the kernel fail-closes to a stop).
+    pub round_cap_checkpoint: bool,
+    pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
 }
 
 impl CodingRuntimeConfig {
@@ -168,59 +241,66 @@ impl CodingRuntimeConfig {
         dangerously_skip_permissions: bool,
         interactive: bool,
     ) -> Self {
-        let requested_provider = provider_override
+        // Resolve through the single boundary (design §14.1). The override is a
+        // model-selection id (a legacy provider name still resolves via
+        // projection); without one, the active `default_model`/`default_provider`
+        // selection is used. Fall back to the first catalog model so a missing or
+        // invalid selection still starts something — parity with the old
+        // `providers.keys().min()` fallback. For a legacy config the resolved
+        // `selection_id` equals the old provider key, so every field below is
+        // byte-identical to the previous `providers.get(name)` extraction.
+        let requested = provider_override
             .filter(|name| !name.is_empty())
-            .unwrap_or(&config.default_provider);
-        let provider_name = if config.providers.contains_key(requested_provider) {
-            requested_provider.to_string()
-        } else {
-            config.providers.keys().min().cloned().unwrap_or_default()
-        };
-        let provider = config.providers.get(&provider_name);
+            .map(str::to_string)
+            .unwrap_or_else(|| config.effective_model_selection().unwrap_or_default());
+        let resolved = config.resolve_model(Some(&requested)).ok().or_else(|| {
+            let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+            ids.sort();
+            ids.into_iter()
+                .find_map(|id| config.resolve_model(Some(&id)).ok())
+        });
+        let pricing = resolved.as_ref().and_then(resolve_resolved_pricing);
+        let r = resolved.as_ref();
         Self {
-            api_key: provider
-                .and_then(|provider| provider.resolved_api_key())
-                .unwrap_or_default(),
-            base_url: provider
-                .and_then(|provider| provider.base_url.clone())
-                .unwrap_or_default(),
-            model: provider
-                .map(|provider| provider.model.clone())
-                .unwrap_or_default(),
+            api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
+            base_url: r.and_then(|r| r.base_url.clone()).unwrap_or_default(),
+            model: r.map(|r| r.model.clone()).unwrap_or_default(),
             preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
                 None,
                 config.language,
             )),
-            provider_name,
+            provider_name: r.map(|r| r.selection_id.clone()).unwrap_or_default(),
             working_dir: working_dir.to_path_buf(),
-            context_window: provider
-                .map(|provider| provider.context_window as u32)
-                .unwrap_or(128_000),
-            max_tokens: provider
-                .and_then(|provider| provider.max_tokens)
-                .map(|value| value as u32),
+            context_window: r.map(|r| r.context_window as u32).unwrap_or(128_000),
+            max_tokens: r.and_then(|r| r.max_tokens).map(|value| value as u32),
             mcp: true,
             telemetry,
-            reasoning_history: provider.and_then(|provider| provider.reasoning_history.clone()),
-            reasoning_effort: provider.and_then(|provider| provider.reasoning_effort.clone()),
-            provider_type: provider
-                .map(|provider| provider.provider_type.clone())
+            reasoning_history: r.and_then(|r| r.reasoning_history.clone()),
+            reasoning_effort: r.and_then(|r| r.reasoning_effort.clone()),
+            provider_type: r
+                .map(|r| r.provider_type.clone())
                 .unwrap_or_else(|| "openai".into()),
-            thinking_enabled: provider.and_then(|provider| provider.thinking_enabled),
-            thinking_type: provider.and_then(|provider| provider.thinking_type.clone()),
-            thinking_keep: provider.and_then(|provider| provider.thinking_keep.clone()),
+            thinking_enabled: r.and_then(|r| r.thinking_enabled),
+            thinking_type: r.and_then(|r| r.thinking_type.clone()),
+            thinking_keep: r.and_then(|r| r.thinking_keep.clone()),
             dangerously_skip_permissions,
             interactive,
             keep_interrupted_context: config.keep_interrupted_context,
-            user_agent: provider.and_then(|provider| provider.user_agent.clone()),
-            skip_tls_verify: provider
-                .map(|provider| provider.skip_tls_verify)
-                .unwrap_or(false),
+            user_agent: r.and_then(|r| r.user_agent.clone()),
+            skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
             loop_max_rounds: resolve_loop_max_rounds(
                 config.loop_config.max_rounds,
                 std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
             ),
+            turn_max_rounds: resolve_turn_max_rounds(
+                config.coding.max_rounds,
+                std::env::var("ATOMCODE_TURN_MAX_ROUNDS").ok().as_deref(),
+            ),
             subagent_config: Some(Arc::new(config.clone())),
+            // Default off; only the interactive TUI opts in (see the CLI's
+            // TUI spawn sites and `event_loop::reload_runtime_provider_from`).
+            round_cap_checkpoint: false,
+            pricing,
         }
     }
 
@@ -248,11 +328,14 @@ impl CodingRuntimeConfig {
         config.user_agent = self.user_agent.clone();
         config.skip_tls_verify = self.skip_tls_verify;
         config.loop_max_rounds = self.loop_max_rounds;
+        config.max_rounds = self.turn_max_rounds;
         config.subagent_config = self.subagent_config.clone();
         if self.interactive {
             config.request_timeout = None;
         }
         config.keep_interrupted_context = self.keep_interrupted_context;
+        config.round_cap_checkpoint = self.round_cap_checkpoint;
+        config.pricing = self.pricing;
         config
     }
 }
@@ -262,6 +345,7 @@ pub fn apply_provider_config(
     provider: &atomcode_config::config::provider::ProviderConfig,
 ) {
     config.model = provider.model.clone();
+    config.pricing = resolve_provider_pricing(&config.provider_name, provider);
     if let Some(base_url) = &provider.base_url {
         config.base_url = base_url.clone();
     }
@@ -306,6 +390,7 @@ struct TierInner {
     /// otherwise forces the strong-tier subtasks to run serially). Survives `reset` (a `/model`
     /// swap changes the tier model, not the conversation identity).
     session_id: Option<String>,
+    usage_recorder: Option<atomcode_capabilities::session::DetachedUsageRecorder>,
 }
 
 pub struct TierProvider {
@@ -319,6 +404,7 @@ impl TierProvider {
                 thunk,
                 cache: None,
                 session_id: None,
+                usage_recorder: None,
             }),
         })
     }
@@ -332,7 +418,14 @@ impl TierProvider {
         if let Some(cached) = &g.cache {
             return cached.clone();
         }
-        let built = (g.thunk)();
+        let mut built = (g.thunk)();
+        if let Some(recorder) = g.usage_recorder.clone() {
+            if let Some(provider) = built.take() {
+                built = Some(Arc::new(
+                    atomcode_capabilities::session::UsageRecordingProvider::new(provider, recorder),
+                ));
+            }
+        }
         // Bind the parent session id onto the freshly-built provider so subtask children carry
         // the main conversation's `x-atomcode-session-id` (one gateway window ⇒ concurrent OK).
         if let (Some(sid), Some(p)) = (&g.session_id, &built) {
@@ -340,6 +433,17 @@ impl TierProvider {
         }
         g.cache = Some(built.clone());
         built
+    }
+
+    pub fn set_usage_recorder(
+        &self,
+        recorder: atomcode_capabilities::session::DetachedUsageRecorder,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        g.usage_recorder = Some(recorder);
+        // A model/provider reload may change attribution. Rebuild lazily so a
+        // cached provider can never keep writing under the previous identity.
+        g.cache = None;
     }
 
     /// Record the parent conversation's session id, to be bound onto the tier provider when
@@ -444,6 +548,17 @@ pub fn resolve_loop_max_rounds(configured: u32, env: Option<&str>) -> u32 {
         .unwrap_or(configured)
 }
 
+/// Resolve the per-turn round cap.
+///
+/// Env `ATOMCODE_TURN_MAX_ROUNDS` (if a valid u32) takes priority over the
+/// TOML `[coding] max_rounds` value. `0` is preserved (means unbounded).
+/// Non-parseable env values fall back to the TOML-configured value.
+/// Same shape as `resolve_loop_max_rounds`.
+pub fn resolve_turn_max_rounds(configured: u32, env: Option<&str>) -> u32 {
+    env.and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(configured)
+}
+
 impl CodingAgentConfig {
     /// Construct with the required fields and sane defaults for the rest.
     pub fn new(
@@ -465,6 +580,8 @@ impl CodingAgentConfig {
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
+            round_cap_checkpoint: false,
+            pricing: None,
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
             goal_max_duration_secs: default_goal_max_duration_secs(),
@@ -518,6 +635,110 @@ mod tests {
             runtime.agent_config().preferred_language,
             Some(Locale::ZhCn)
         );
+    }
+
+    #[test]
+    fn from_config_resolves_a_legacy_provider_unchanged() {
+        let source: atomcode_config::config::Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "MyDS",
+            "providers": {
+                "MyDS": {
+                    "type": "openai",
+                    "base_url": "https://api.deepseek.com/v1",
+                    "api_key": "sk-legacy",
+                    "model": "deepseek-chat",
+                    "context_window": 128000
+                }
+            }
+        }))
+        .unwrap();
+        let rt = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(rt.provider_name, "MyDS");
+        assert_eq!(rt.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(rt.api_key, "sk-legacy");
+        assert_eq!(rt.model, "deepseek-chat");
+        assert_eq!(rt.context_window, 128000);
+        assert_eq!(rt.provider_type, "openai");
+    }
+
+    #[test]
+    fn from_config_builds_a_new_schema_model_profile() {
+        // One account, and a model profile selected by its `<account>/<model>` id
+        // — the "one provider, multiple models" capability, resolved at the
+        // runtime build seam without any legacy `[providers.*]`.
+        let source: atomcode_config::config::Config = serde_json::from_value(serde_json::json!({
+            "default_model": "acc/coder",
+            "provider_accounts": { "acc": { "provider": "deepseek", "api_key": "sk-acc" } },
+            "models": {
+                "acc/coder": { "account": "acc", "model": "deepseek-coder", "context_window": 131072 },
+                "acc/chat": { "account": "acc", "model": "deepseek-chat", "context_window": 131072 }
+            }
+        }))
+        .unwrap();
+        // Default selection (acc/coder).
+        let rt = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(rt.provider_name, "acc/coder");
+        assert_eq!(rt.model, "deepseek-coder");
+        assert_eq!(rt.base_url, "https://api.deepseek.com/v1"); // preset default
+        assert_eq!(rt.api_key, "sk-acc"); // shared account credential
+        assert_eq!(rt.context_window, 131072);
+        // The second model on the SAME account, selected by id — no duplicated
+        // connection settings.
+        let rt2 = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            Some("acc/chat"),
+            None,
+            false,
+            true,
+        );
+        assert_eq!(rt2.model, "deepseek-chat");
+        assert_eq!(rt2.api_key, "sk-acc");
+        assert_eq!(rt2.base_url, "https://api.deepseek.com/v1");
+    }
+
+    #[test]
+    fn explicit_provider_pricing_wins_without_a_catalog() {
+        let provider: atomcode_config::config::provider::ProviderConfig =
+            serde_json::from_value(serde_json::json!({
+                "type": "openai",
+                "model": "custom-model",
+                "base_url": "https://custom-proxy.example/v1",
+                "system_prompt": null,
+                "pricing": {
+                    "input_per_million": 1.25,
+                    "output_per_million": 2.5,
+                    "cached_input_per_million": 0.5
+                }
+            }))
+            .unwrap();
+
+        let pricing = resolve_provider_pricing("deepseek", &provider).unwrap();
+        assert_eq!(pricing.input_per_million, 1.25);
+        assert_eq!(pricing.output_per_million, 2.5);
+        assert_eq!(pricing.cached_input_per_million, 0.5);
+    }
+
+    #[test]
+    fn turn_max_rounds_env_overrides_toml() {
+        assert_eq!(resolve_turn_max_rounds(200, Some("500")), 500);
+        assert_eq!(resolve_turn_max_rounds(200, Some("0")), 0); // 0 关闭保留
+        assert_eq!(resolve_turn_max_rounds(300, Some("bad")), 300); // 非法回退 TOML
+        assert_eq!(resolve_turn_max_rounds(300, None), 300);
     }
 
     #[test]

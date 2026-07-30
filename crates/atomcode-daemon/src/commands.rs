@@ -1,77 +1,26 @@
 //! `POST /command`: 无状态斜杠命令执行器（对已持久化会话/记忆施加一次性变更）。
 use axum::{extract::State, response::IntoResponse, Json};
-use futures::StreamExt;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::AppState;
+#[cfg(test)]
+use atomcode_capabilities::session::SessionMeta as NativeSessionMeta;
 use atomcode_capabilities::session::{
     LoadedSession, SessionLease as NativeSessionLease, SessionManager as NativeSessionManager,
-    SessionMeta as NativeSessionMeta, SessionStoreError,
+    SessionStoreError,
 };
 use atomcode_config::config::memory::MemoryStore;
-use atomcode_core::conversation::Conversation;
 
-struct KernelSummaryProvider {
-    inner: Arc<dyn atomcode_core::provider::LlmProvider>,
-    context_window: u32,
-}
-
-#[async_trait::async_trait]
-impl atomcode_kernel::provider::LlmProvider for KernelSummaryProvider {
-    fn model_name(&self) -> &str {
-        self.inner.model_name()
-    }
-
-    fn context_window(&self) -> u32 {
-        self.context_window
-    }
-
-    async fn chat_stream(
-        &self,
-        messages: &[atomcode_kernel::message::Message],
-        _tools: &[atomcode_kernel::tool::ToolDef],
-        _options: &atomcode_kernel::provider::ChatOptions,
-    ) -> Result<
-        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
-        atomcode_kernel::stream::ProviderError,
-    > {
-        let messages: Vec<_> = messages
-            .iter()
-            .map(crate::legacy_convert::message_to_core)
-            .collect();
-        let stream = self.inner.chat_stream(&messages, None).map_err(|error| {
-            atomcode_kernel::stream::ProviderError {
-                message: error.to_string(),
-                ..Default::default()
-            }
-        })?;
-        Ok(stream
-            .filter_map(|event| async move {
-                use atomcode_core::stream::StreamEvent as Core;
-                use atomcode_kernel::stream::{ProviderError, StreamEvent as Kernel, TokenUsage};
-                match event {
-                    Ok(Core::Delta(text)) => Some(Kernel::TextDelta(text)),
-                    Ok(Core::Reasoning(text)) => Some(Kernel::Reasoning(text)),
-                    Ok(Core::Usage(usage)) => Some(Kernel::Usage(TokenUsage {
-                        prompt: usage.prompt_tokens as u32,
-                        completion: usage.completion_tokens as u32,
-                        cached: usage.cached_tokens as u32,
-                    })),
-                    Ok(Core::Done { truncated }) => Some(Kernel::Done { truncated }),
-                    Ok(Core::Error(message)) => Some(Kernel::Error(ProviderError {
-                        message: message.to_string(),
-                        ..Default::default()
-                    })),
-                    Err(error) => Some(Kernel::Error(ProviderError {
-                        message: error.to_string(),
-                        ..Default::default()
-                    })),
-                    _ => None,
-                }
-            })
-            .boxed())
-    }
+#[derive(serde::Serialize)]
+pub(crate) struct CostModelResult {
+    provider: String,
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    estimated_cost_usd: Option<f64>,
+    free: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -106,12 +55,10 @@ pub(crate) enum CommandResult {
         project: Vec<String>,
     },
     Context {
-        system_tokens: usize,
-        sent_tokens: usize,
+        used_tokens: usize,
         total_messages: usize,
-        tool_defs_tokens: usize,
-        cold_zone_tokens: usize,
         ctx_window: usize,
+        utilization: f32,
         ctx_name: String,
     },
     Compact {
@@ -145,6 +92,9 @@ pub(crate) enum CommandResult {
     Cost {
         total_tokens: usize,
         turn_count: usize,
+        models: Vec<CostModelResult>,
+        unattributed_tokens: u64,
+        estimated_cost_usd: Option<f64>,
     },
     Todo {
         items: Vec<TodoItemJson>,
@@ -299,20 +249,19 @@ fn commit_native_compaction(
                 new_end,
             } = mutation
             {
-                meta.turn_stats.retain_mut(|stat| {
-                    if !stat.position_valid {
-                        return true;
-                    }
-                    if stat.after_message > old_start && stat.after_message < old_end {
-                        false
-                    } else {
-                        if stat.after_message >= old_end {
-                            stat.after_message =
-                                new_end + stat.after_message.saturating_sub(old_end);
-                        }
-                        true
-                    }
+                let _ = meta.archive_turn_stats_where(|stat| {
+                    stat.position_valid
+                        && stat.after_message > old_start
+                        && stat.after_message < old_end
                 });
+                for stat in &mut meta.turn_stats {
+                    if !stat.position_valid {
+                        continue;
+                    }
+                    if stat.after_message >= old_end {
+                        stat.after_message = new_end + stat.after_message.saturating_sub(old_end);
+                    }
+                }
             }
             let surviving_turn_ids: std::collections::BTreeSet<_> = meta
                 .turn_stats
@@ -337,31 +286,35 @@ fn commit_native_compaction(
 }
 
 async fn exec_native_compact(
-    state: &AppState,
-    working_dir: &std::path::Path,
     provider_name: Option<&str>,
     arg: &str,
     session: NativeCommandSession,
+    working_dir: &std::path::Path,
+    telemetry: Arc<atomcode_telemetry::Telemetry>,
 ) -> anyhow::Result<CommandResult> {
     let config =
         atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())?;
-    let selected_provider = provider_name.unwrap_or(&config.default_provider);
-    let context_window = config
-        .providers
-        .get(selected_provider)
-        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", selected_provider))?
-        .context_window as u32;
-    let parts = crate::live_api::build_turn_parts(
-        working_dir,
-        provider_name,
-        &state.mcp_cache,
-        state.telemetry.clone(),
-    )
-    .await?;
-    let provider = Arc::new(KernelSummaryProvider {
-        inner: parts.provider,
-        context_window,
-    });
+    let resolved = crate::live_api::resolve_provider_name(&config, provider_name);
+    // Validate the provider up front for a clean error (the old core path did
+    // `providers.get(...).ok_or("Provider not found")`); without this a missing
+    // key surfaces as a murkier build/network failure deeper in.
+    if !config.selection_exists(&resolved) {
+        anyhow::bail!("Provider '{resolved}' not found");
+    }
+
+    // Build the summarizing provider via the SAME native chain `/chat` uses
+    // (chat_runtime_config → coding_config_from_runtime → coding_provider_factory().build),
+    // yielding a kernel-native `LlmProvider` directly — no core provider, no adapter.
+    // `build` may do blocking auth I/O (gateway token), so run it off the async runtime.
+    let coding_cfg = crate::kernel_runtime::coding_config_from_runtime(
+        &crate::live_api::chat_runtime_config(&config, &resolved, working_dir, telemetry),
+    );
+    let factory = crate::runtime_host::coding_provider_factory();
+    let provider = tokio::task::spawn_blocking(move || factory.build(&coding_cfg, None))
+        .await
+        .map_err(|e| anyhow::anyhow!("provider build task panicked: {e}"))?
+        .map_err(|e| anyhow::anyhow!("provider construction failed: {e}"))?;
+
     let compacted = atomcode_coding::runtime::compact_snapshot(
         session.loaded.snapshot.messages.clone(),
         provider,
@@ -391,8 +344,23 @@ fn exec_undo(
     exec_native_undo(native, arg)
 }
 
+/// The session's current context size for `/context`: the prompt tokens the
+/// provider reported on the most recent assistant turn (`meta.used_tokens`), or
+/// 0 before any assistant turn. Mirrors kernel `Conversation::last_pressure`'s
+/// used-tokens read, but works directly off a persisted snapshot so `/context`
+/// reflects what the live (native) turn actually sent — no parallel tool assembly.
+pub(crate) fn snapshot_used_tokens(messages: &[atomcode_kernel::message::Message]) -> u32 {
+    use atomcode_kernel::message::Role;
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant)
+        .and_then(|m| m.meta.as_ref())
+        .map(|meta| meta.used_tokens)
+        .unwrap_or(0)
+}
+
 async fn exec_context(
-    state: &AppState,
     working_dir: &std::path::Path,
     project_hash: Option<&str>,
     session_id: Option<&str>,
@@ -400,26 +368,29 @@ async fn exec_context(
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for context"))?;
     let session = load_command_session_view(working_dir, project_hash, sid)?;
-    let parts = crate::live_api::build_turn_parts(
-        working_dir,
-        provider,
-        &state.mcp_cache,
-        state.telemetry.clone(),
-    )
-    .await?;
-    let conv =
-        Conversation::from_snapshot(crate::legacy_convert::snapshot_to_core(&session.snapshot));
-    let (msgs, _) = parts.ctx.build_messages(&conv, &parts.system_prompt, "");
-    let s = atomcode_core::ctx::compute_rich_context_stats(&conv, &msgs, &parts.tools, &*parts.ctx)
-        .await;
+    // Report the SAME context the live (native) turn tracks: the prompt tokens the
+    // provider reported on the last assistant turn, projected onto the CURRENT
+    // provider window. No parallel core tool-assembly (which diverged from the
+    // native turn's actual tools/prompt and produced misleading per-zone numbers).
+    let config =
+        atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())?;
+    let resolved = crate::live_api::resolve_provider_name(&config, provider);
+    let provider_config = config
+        .provider_config_for_selection(&resolved)
+        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved))?;
+    let ctx_window = provider_config.context_window as u32;
+    let used_tokens = snapshot_used_tokens(&session.snapshot.messages);
+    let utilization = if ctx_window > 0 {
+        used_tokens as f32 / ctx_window as f32
+    } else {
+        0.0
+    };
     Ok(CommandResult::Context {
-        system_tokens: s.system_tokens,
-        sent_tokens: s.sent_tokens,
-        total_messages: s.total_messages,
-        tool_defs_tokens: s.tool_defs_tokens,
-        cold_zone_tokens: s.cold_zone_tokens,
-        ctx_window: s.ctx_window,
-        ctx_name: s.ctx_name,
+        used_tokens: used_tokens as usize,
+        total_messages: session.snapshot.messages.len(),
+        ctx_window: ctx_window as usize,
+        utilization,
+        ctx_name: provider_config.model.clone(),
     })
 }
 
@@ -468,17 +439,17 @@ fn exec_memory(working_dir: &Path) -> anyhow::Result<CommandResult> {
 }
 
 async fn exec_compact(
-    state: &AppState,
     working_dir: &std::path::Path,
     project_hash: Option<&str>,
     session_id: Option<&str>,
     provider: Option<&str>,
     arg: &str,
+    telemetry: Arc<atomcode_telemetry::Telemetry>,
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for compact"))?;
     let native = load_native_command_session(working_dir, project_hash, sid)?
         .ok_or_else(|| anyhow::anyhow!("session {sid:?} not found"))?;
-    exec_native_compact(state, working_dir, provider, arg, native).await
+    exec_native_compact(provider, arg, native, working_dir, telemetry).await
 }
 
 fn exec_whoami() -> anyhow::Result<CommandResult> {
@@ -522,20 +493,56 @@ fn exec_diff(working_dir: &std::path::Path) -> anyhow::Result<CommandResult> {
     Ok(CommandResult::Diff { stat })
 }
 
-fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
-    use atomcode_config::config::instructions::LayeredInstructions;
+fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
+    use atomcode_config::config::instructions::{InstructionLevel, LayeredInstructions};
     use atomcode_config::i18n::{t, Msg};
     let instructions = LayeredInstructions::load(working_dir);
     let mut out = t(Msg::StatusInstructionFilesHeader).into_owned();
-    for (level, path) in instructions.status_lines() {
-        match path {
-            Some(p) => out.push_str(&t(Msg::StatusInstructionPresent {
-                path: &p.display().to_string(),
-                label: level.label(),
-            })),
-            None => out.push_str(&t(Msg::StatusInstructionMissing {
-                label: level.label(),
-            })),
+    for line in instructions.status_lines(working_dir) {
+        let scope = t(match line.level {
+            InstructionLevel::Global => Msg::StatusInstructionScopeGlobal,
+            InstructionLevel::Project => Msg::StatusInstructionScopeProject,
+            InstructionLevel::User => Msg::StatusInstructionScopeUser,
+        });
+        let path = line.path.display().to_string();
+        if line.found {
+            out.push_str(&t(Msg::StatusInstructionPresent {
+                path: &path,
+                label: line.level.label(),
+                scope: &scope,
+            }));
+        } else {
+            out.push_str(&t(Msg::StatusInstructionMissing {
+                path: &path,
+                label: line.level.label(),
+                scope: &scope,
+            }));
+        }
+    }
+    out.push('\n');
+    out.push_str(&t(Msg::StatusMemoryFilesHeader));
+    for (scope_msg, store) in [
+        (
+            Msg::StatusMemoryScopeGlobal,
+            atomcode_config::config::memory::MemoryStore::global(),
+        ),
+        (
+            Msg::StatusMemoryScopeProject,
+            atomcode_config::config::memory::MemoryStore::project(working_dir),
+        ),
+    ] {
+        let scope = t(scope_msg);
+        let path = store.path().display().to_string();
+        if store.path().is_file() {
+            out.push_str(&t(Msg::StatusMemoryPresent {
+                path: &path,
+                scope: &scope,
+            }));
+        } else {
+            out.push_str(&t(Msg::StatusMemoryMissing {
+                path: &path,
+                scope: &scope,
+            }));
         }
     }
     out
@@ -675,8 +682,8 @@ fn exec_status(
         .unwrap_or_default();
     let model = config
         .as_ref()
-        .and_then(|c| c.providers.get(&provider_name))
-        .map(|p| p.model.clone())
+        .and_then(|c| c.provider_config_for_selection(&provider_name))
+        .map(|p| p.model)
         .unwrap_or_default();
     let auth = atomcode_auth::get_stored_auth();
 
@@ -697,7 +704,7 @@ fn exec_status(
         &body,
         &render_codingplan_status_for_status_cmd(),
         &proxy_line,
-        &render_instruction_status_block(working_dir),
+        &render_context_file_status_block(working_dir),
     );
 
     Ok(CommandResult::Status {
@@ -718,22 +725,26 @@ fn exec_cost(
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for cost"))?;
     let session = load_command_session_view(working_dir, project_hash, sid)?;
-    let (total_tokens, turn_count) = session_cost(&session.meta);
+    let report = atomcode_capabilities::session::aggregate_session_cost(&session.meta);
     Ok(CommandResult::Cost {
-        total_tokens,
-        turn_count,
+        total_tokens: report.total_tokens as usize,
+        turn_count: session.meta.turn_stats.len(),
+        models: report
+            .models
+            .into_iter()
+            .map(|model| CostModelResult {
+                provider: model.provider_id,
+                model: model.model_id,
+                input_tokens: model.tokens.input,
+                output_tokens: model.tokens.output,
+                cached_tokens: model.tokens.cached_input,
+                estimated_cost_usd: model.estimated_cost_usd,
+                free: model.explicitly_free,
+            })
+            .collect(),
+        unattributed_tokens: report.unattributed_tokens,
+        estimated_cost_usd: report.estimated_cost_usd,
     })
-}
-
-fn session_cost(meta: &NativeSessionMeta) -> (usize, usize) {
-    // TurnStat.total_tokens stores the per-turn token count (reset to 0 at turn start,
-    // accumulated during the turn, saved at TurnComplete). Summing gives session total.
-    let total_tokens = meta
-        .turn_stats
-        .iter()
-        .map(|t| t.total_tokens as usize)
-        .sum();
-    (total_tokens, meta.turn_stats.len())
 }
 
 fn exec_todo(
@@ -802,7 +813,6 @@ pub(crate) async fn run_command(
         "memory" => exec_memory(&working_dir),
         "context" => {
             exec_context(
-                &state,
                 &working_dir,
                 req.project_hash.as_deref(),
                 req.session_id.as_deref(),
@@ -812,12 +822,12 @@ pub(crate) async fn run_command(
         }
         "compact" => {
             exec_compact(
-                &state,
                 &working_dir,
                 req.project_hash.as_deref(),
                 req.session_id.as_deref(),
                 req.provider.as_deref(),
                 &req.arg,
+                state.telemetry.clone(),
             )
             .await
         }
@@ -853,6 +863,38 @@ mod tests {
     use atomcode_config::config::memory::MemoryStore;
 
     #[test]
+    fn context_file_status_shows_instruction_and_memory_paths() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("AGENTS.md"), "project instructions").unwrap();
+        let project_memory = MemoryStore::project(project.path());
+        std::fs::create_dir_all(project_memory.path().parent().unwrap()).unwrap();
+        std::fs::write(project_memory.path(), "- remembered fact\n").unwrap();
+        let status = render_context_file_status_block(project.path());
+        assert!(status.contains(&project.path().join("AGENTS.md").display().to_string()));
+        assert!(status.contains(&project_memory.path().display().to_string()));
+        assert!(status.contains("(PROJECT)") || status.contains("（PROJECT）"));
+    }
+
+    #[test]
+    fn snapshot_used_tokens_reads_latest_assistant_meta() {
+        use atomcode_kernel::message::{Message, MessageMeta};
+
+        // No assistant turn yet → zero.
+        assert_eq!(snapshot_used_tokens(&[Message::user("hi")]), 0);
+
+        // The most recent assistant meta's recorded prompt tokens win.
+        let mut a = Message::assistant("ans", Vec::new());
+        a.meta = Some(MessageMeta {
+            ctx_window: 128_000,
+            used_tokens: 40_000,
+            utilization: 0.3125,
+            ..Default::default()
+        });
+        let msgs = vec![Message::user("hi"), a];
+        assert_eq!(snapshot_used_tokens(&msgs), 40_000);
+    }
+
+    #[test]
     fn native_undo_preserves_updates_after_session_load() {
         use atomcode_capabilities::session::{
             DisplayAnchor, PresentationEntry, PresentationRole, TurnStat,
@@ -884,6 +926,7 @@ mod tests {
                 errored: false,
                 used_tokens: 1,
                 ctx_window: 10,
+                model_usage: Vec::new(),
             },
             TurnStat {
                 after_message: 2,
@@ -896,6 +939,7 @@ mod tests {
                 errored: false,
                 used_tokens: 1,
                 ctx_window: 10,
+                model_usage: Vec::new(),
             },
             TurnStat {
                 after_message: 4,
@@ -908,6 +952,7 @@ mod tests {
                 errored: false,
                 used_tokens: 1,
                 ctx_window: 10,
+                model_usage: Vec::new(),
             },
         ];
         manager.write_meta(&meta).unwrap();
@@ -1006,6 +1051,7 @@ mod tests {
             errored: false,
             used_tokens: 1,
             ctx_window: 10,
+            model_usage: Vec::new(),
         };
         let mut meta = NativeSessionMeta::new(id, "/p", 1);
         meta.owner = StorageOwner::Native;
@@ -1075,6 +1121,7 @@ mod tests {
         assert_eq!(meta.turn_count, 2);
         assert_eq!(meta.turn_stats[0].after_message, 1);
         assert_eq!(meta.turn_stats[1].after_message, 3);
+        assert_eq!(meta.detached_unattributed_tokens, 1);
         assert_eq!(meta.name, "renamed after load");
         assert!(meta.user_renamed);
         let presentation = manager.read_presentation(id).unwrap();
@@ -1135,6 +1182,7 @@ mod tests {
             errored: false,
             used_tokens: 0,
             ctx_window: 0,
+            model_usage: Vec::new(),
         });
         meta.turn_stats.push(TurnStat {
             after_message: 4,
@@ -1147,8 +1195,11 @@ mod tests {
             errored: false,
             used_tokens: 0,
             ctx_window: 0,
+            model_usage: Vec::new(),
         });
-        assert_eq!(session_cost(&meta), (350, 2));
+        let report = atomcode_capabilities::session::aggregate_session_cost(&meta);
+        assert_eq!(report.total_tokens, 350);
+        assert_eq!(report.unattributed_tokens, 350);
     }
 
     #[test]

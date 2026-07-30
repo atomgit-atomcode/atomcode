@@ -383,6 +383,249 @@ async fn timeout_reason() {
     );
 }
 
+// ── round-cap checkpoint (round_cap_checkpoint = true) ───────────────────────
+
+/// Build a MockProvider that always calls the "echo" tool — so a max_rounds fuse
+/// will always trip. Provides `n` scripted tool-calling rounds (mirroring the
+/// `max_rounds_stop_reason` test's scaffolding).
+fn scripted_tool_rounds(n: usize) -> Arc<MockProvider> {
+    let mut turns = Vec::new();
+    for i in 0..n {
+        turns.push(vec![
+            StreamEvent::ToolCall(tool_call(&format!("c{i}"), "echo", "{\"text\":\"x\"}")),
+            StreamEvent::Done { truncated: false },
+        ]);
+    }
+    Arc::new(MockProvider::new(turns))
+}
+
+/// A ToolRegistry with the echo tool mounted (required so tool calls resolve).
+fn echo_tools() -> atomcode_kernel::tool::MountedTools {
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EchoTool));
+    reg.mount(&["echo"])
+}
+
+#[tokio::test]
+async fn round_cap_checkpoint_continue_rearms_then_stop() {
+    // Cap = 2; 5 scripted tool-calling rounds. At round 3 (> cap 2) the first
+    // checkpoint fires: we answer continue → cap grows to 4. At round 5 (> cap 4)
+    // the second checkpoint fires: we answer stop → MaxRounds.
+    let provider = scripted_tool_rounds(5);
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(echo_tools())
+        .max_rounds(2)
+        .round_cap_checkpoint(true)
+        .build()
+        .spawn();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
+
+    let mut checkpoints = 0;
+    let mut stop = None;
+    let outcome = tokio::time::timeout(OUTER_GUARD, async {
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Request { id, kind, .. }
+                    if kind == atomcode_kernel::ROUND_CAP_CHECKPOINT_KIND =>
+                {
+                    checkpoints += 1;
+                    let cont = checkpoints == 1; // first → continue, second → stop
+                    handle
+                        .commands
+                        .send(AgentCommand::Respond {
+                            id,
+                            value: serde_json::json!({ "continue": cont }),
+                        })
+                        .unwrap();
+                }
+                AgentEvent::TurnComplete { reason } => {
+                    stop = Some(reason);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    outcome.expect("round_cap_checkpoint_continue_rearms_then_stop must not hang");
+    assert_eq!(
+        checkpoints, 2,
+        "continue must re-arm to trigger a second checkpoint"
+    );
+    assert!(
+        matches!(stop, Some(StopReason::MaxRounds)),
+        "stop on second checkpoint must be MaxRounds; got {stop:?}"
+    );
+}
+
+#[tokio::test]
+async fn round_cap_checkpoint_null_response_stops_fail_closed() {
+    let provider = scripted_tool_rounds(5);
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(echo_tools())
+        .max_rounds(2)
+        .round_cap_checkpoint(true)
+        .build()
+        .spawn();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
+
+    let mut stop = None;
+    let outcome = tokio::time::timeout(OUTER_GUARD, async {
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Request { id, kind, .. }
+                    if kind == atomcode_kernel::ROUND_CAP_CHECKPOINT_KIND =>
+                {
+                    // Driver answers Null (simulates unattended / timed-out driver)
+                    handle
+                        .commands
+                        .send(AgentCommand::Respond {
+                            id,
+                            value: serde_json::Value::Null,
+                        })
+                        .unwrap();
+                }
+                AgentEvent::TurnComplete { reason } => {
+                    stop = Some(reason);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    outcome.expect("round_cap_checkpoint_null_response_stops_fail_closed must not hang");
+    assert!(
+        matches!(stop, Some(StopReason::MaxRounds)),
+        "Null response → fail-closed stop must be MaxRounds; got {stop:?}"
+    );
+}
+
+#[tokio::test]
+async fn round_cap_checkpoint_cancel_stops_as_cancelled() {
+    // Cancelling AT the checkpoint (rather than answering stop) must terminate
+    // the turn as Cancelled, not MaxRounds: `Cancel` resolves the pending
+    // Request to Null so `continue` reads false, but the in-scope cancel token
+    // is set, so `run_turn` funnels through the cancel path. Also asserts no
+    // hang (the Cancel must actually terminate the turn).
+    let provider = scripted_tool_rounds(5);
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(echo_tools())
+        .max_rounds(2)
+        .round_cap_checkpoint(true)
+        .build()
+        .spawn();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
+
+    let mut saw_cancelled_event = false;
+    let mut stop = None;
+    let outcome = tokio::time::timeout(OUTER_GUARD, async {
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Request { kind, .. }
+                    if kind == atomcode_kernel::ROUND_CAP_CHECKPOINT_KIND =>
+                {
+                    // Cancel instead of Respond: the user aborted at the prompt.
+                    handle.commands.send(AgentCommand::Cancel).unwrap();
+                }
+                AgentEvent::Cancelled => {
+                    saw_cancelled_event = true;
+                }
+                AgentEvent::TurnComplete { reason } => {
+                    stop = Some(reason);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    outcome.expect("round_cap_checkpoint_cancel_stops_as_cancelled must not hang");
+    assert!(
+        matches!(stop, Some(StopReason::Cancelled)),
+        "cancel at checkpoint must end the turn as Cancelled; got {stop:?}"
+    );
+    assert!(
+        saw_cancelled_event,
+        "cancel path must emit AgentEvent::Cancelled"
+    );
+}
+
+#[tokio::test]
+async fn round_cap_checkpoint_off_keeps_hard_error() {
+    // Default (round_cap_checkpoint = false): hitting the cap still emits a red
+    // Error AND finishes MaxRounds AND never emits the checkpoint Request.
+    let provider = scripted_tool_rounds(5);
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(echo_tools())
+        .max_rounds(2) // round_cap_checkpoint defaults to false
+        .build()
+        .spawn();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
+
+    let mut saw_error = false;
+    let mut requests = 0usize;
+    let mut stop = None;
+    let outcome = tokio::time::timeout(OUTER_GUARD, async {
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Request { kind, .. }
+                    if kind == atomcode_kernel::ROUND_CAP_CHECKPOINT_KIND =>
+                {
+                    requests += 1;
+                }
+                AgentEvent::Error { message, .. } if message.contains("max rounds") => {
+                    saw_error = true;
+                }
+                AgentEvent::TurnComplete { reason } => {
+                    stop = Some(reason);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    outcome.expect("round_cap_checkpoint_off_keeps_hard_error must not hang");
+    assert_eq!(requests, 0, "checkpoint must never be emitted when off");
+    assert!(
+        saw_error,
+        "hard Error must still be emitted when checkpoint is off"
+    );
+    assert!(
+        matches!(stop, Some(StopReason::MaxRounds)),
+        "stop must be MaxRounds when checkpoint is off; got {stop:?}"
+    );
+}
+
 // ── A rejected prompt ends with StopReason::PromptRejected ────────────────────
 #[tokio::test]
 async fn prompt_rejected_reason() {

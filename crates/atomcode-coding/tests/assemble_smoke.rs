@@ -50,6 +50,42 @@ async fn assembles_and_runs_a_tool_end_to_end() {
     );
 }
 
+#[cfg(feature = "atomgit")]
+#[tokio::test]
+async fn assembled_agent_rejects_raw_atomgit_api_bash() {
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "raw-atomgit".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({
+                    "command": "curl -X POST https://api.atomgit.com/api/v5/user/repos"
+                })
+                .to_string(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("used the typed tool path instead".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+    let cfg = CodingAgentConfig::new("k", "http://localhost:0", "mock-model", ".");
+
+    let outcome = build_coding_agent_with(&cfg, provider)
+        .run_to_completion("create an AtomGit repository", AutoRespond::AllowAll)
+        .await;
+
+    assert_eq!(outcome.tool_results.len(), 1);
+    assert!(
+        outcome.tool_results[0]
+            .content
+            .contains("raw AtomGit API calls through bash are disabled"),
+        "unexpected blocked result: {:?}",
+        outcome.tool_results[0]
+    );
+}
+
 fn list_round(id: &str, path: &str) -> Vec<StreamEvent> {
     vec![
         StreamEvent::ToolCall(ToolCall {

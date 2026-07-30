@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.0.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.0.3-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -184,6 +184,30 @@ npm install -g @atomgit.com/atomcode
 # Install using Homebrew
 brew install --cask atomcode
 ```
+
+### Shell Completion
+
+AtomCode can generate completion scripts for Bash, Zsh, Fish, PowerShell, and
+Elvish. For example:
+
+```bash
+# Bash (current session)
+source <(atomcode completion bash)
+
+# Zsh (persistent)
+mkdir -p ~/.zfunc
+atomcode completion zsh > ~/.zfunc/_atomcode
+# Also add `fpath=(~/.zfunc $fpath)` before `compinit` in ~/.zshrc.
+
+# Fish (persistent)
+mkdir -p ~/.config/fish/completions
+atomcode completion fish > ~/.config/fish/completions/atomcode.fish
+```
+
+For PowerShell, run `atomcode completion powershell | Out-String |
+Invoke-Expression`. Run `atomcode completion --help` for the complete shell
+list. This affects command-line completion only and does not change the TUI's
+`Tab` mode switching.
 
 ### Requirements
 
@@ -438,12 +462,16 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/setup` | First run: install the recommended skill and run it |
 | `/welcome` | Re-run the onboarding wizard |
 | `/language` | Switch display and default Git commit-message language |
-| `/issue` | Report a bug / request a feature (interactive wizard) |
 | `/guide <question>` | Ask atomcode-guide how to use AtomCode |
 | `/keys` | Show keyboard shortcuts |
 | `/help` | Show commands & shortcuts |
 | `/quit`, `/exit` | Exit AtomCode (or Ctrl+C ×2) |
 
+> **AtomGit Issues.** `/issue` has been removed. After `/login`, ask in natural
+> language—for example, “Create an AtomGit issue for this bug”—and AtomCode uses
+> its built-in `atomgit_issue` tool. Reading issues is automatic; creating an
+> issue or adding, editing, or deleting comments still requires approval.
+>
 > **Plugin commands.** Beyond the built-ins above, plugins can register their own slash commands. For example, install the official channel plugin to get `/wechat` (shows the AtomCode WeChat community group QR code):
 >
 > ```text
@@ -527,8 +555,7 @@ atomcode/
     atomcode-review/        # Review specialization
     atomcode-tuix/          # Terminal UI
     atomcode-cli/           # TUI and headless entry point
-    atomcode-daemon/        # HTTP/SSE/WebSocket transport
-    atomcode-core/          # Transitional session/plugin/live compatibility code
+    atomcode-daemon/        # HTTP/SSE/WebSocket transport + legacy session importer
 ```
 
 The coding path is `CLI/TUI/daemon → CodingRuntime → kernel`. The retired core
@@ -607,11 +634,11 @@ cargo run -p atomcode-daemon
 cargo test
 
 # Run tests for a specific crate
-cargo test -p atomcode-core
+cargo test -p atomcode-capabilities
 cargo test -p atomcode-tuix
 
 # Run a specific test
-cargo test -p atomcode-core test_name
+cargo test -p atomcode-capabilities test_name
 ```
 
 ### Useful Commands
@@ -680,8 +707,8 @@ Contributions are welcome! AtomCode is in active development.
 
 ### Where to Start
 
-- **Add a new tool** — implement the `Tool` trait in `crates/atomcode-core/src/tool/`
-- **Add a new provider** — implement `LlmProvider` in `crates/atomcode-core/src/provider/`
+- **Add a new tool** — implement the `Tool` trait in `crates/atomcode-capabilities/src/tools/`
+- **Add a new provider** — implement `LlmProvider` in `crates/atomcode-capabilities/src/provider/`
 - **Improve the UI** — rendering lives in `crates/atomcode-tuix/src/render/`
 - **Fix bugs** — check [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) for open bugs
 

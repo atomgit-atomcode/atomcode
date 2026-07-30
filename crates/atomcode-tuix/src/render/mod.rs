@@ -549,6 +549,9 @@ pub struct ModeBadge {
 pub struct StatusLine {
     pub model: String,
     pub cwd: String, // HOME replaced with "~"
+    /// Messages submitted during the active turn but not yet accepted at a
+    /// model/tool boundary. Rendered as a transient panel above the composer.
+    pub pending_messages: Vec<String>,
     /// Current recalled input-history position, shown on the input box's
     /// top rule only while Up/Down navigation is active.
     pub history: Option<HistoryPosition>,
@@ -556,7 +559,8 @@ pub struct StatusLine {
     /// footer panel directly below the input box. It never enters scrollback.
     pub command_output: Option<String>,
     /// Tokens currently in the model's context (last turn's `sent_tokens`).
-    /// Pre-first-turn this is 0; the renderer hides the field then.
+    /// Pre-first-turn this is 0; when `ctx_window` is known the renderer shows
+    /// zero usage against that window.
     pub ctx_used: usize,
     /// Provider's context window (cap). 0 when not yet known — renderer
     /// falls back to a bare "12.3k tok" display in that case.
@@ -595,6 +599,9 @@ pub struct StatusLine {
     /// conversations that never used todowrite). Carries raw fields; the
     /// renderer owns glyph/width/terminal-safety (mirrors GoalStatus).
     pub todo: Option<TodoProgress>,
+    /// Active `task` fan-out, rendered as a fixed panel above the input. While
+    /// present it takes the expanded top-panel slot and TodoWrite collapses.
+    pub subtasks: Option<SubtaskProgress>,
     /// When the approval panel is active (user must confirm/deny a tool call),
     /// this carries its current state for the dedicated footer approval panel
     /// (rendered above the todo panel). `None` ⇒ no approval pending, panel
@@ -605,6 +612,12 @@ pub struct StatusLine {
     /// two are mutually exclusive). `None` ⇒ no question pending, panel omitted.
     /// Mirrors `approval` — the renderer owns glyph/width/terminal-safety.
     pub user_input: Option<UserInputPanelView>,
+    /// When the round-cap checkpoint is active (the agent reached its configured
+    /// max-rounds limit and is asking the user whether to continue), this carries
+    /// the panel view for the dedicated footer picker. Rendered in the same slot
+    /// as `approval` / `user_input` (all three are mutually exclusive; the priority
+    /// order is: approval > user_input > round_cap_panel). `None` ⇒ no checkpoint.
+    pub round_cap_panel: Option<UserInputPanelView>,
     /// When an autonomous `/goal` loop is active, this carries its live status
     /// for the DEDICATED footer goal row (its own full-width line above the
     /// status row). `None` ⇒ no goal running, row omitted. Previously this was
@@ -682,6 +695,42 @@ pub struct UserInputBatchMeta {
     pub on_submit: bool,
 }
 
+/// Build a [`UserInputPanelView`] for the round-cap checkpoint panel (style B:
+/// Single picker, two options with descriptions, no free-text "Other" row).
+///
+/// `cap` is the configured round limit (displayed in both the question and the
+/// continue option description). `cursor` is the currently highlighted row
+/// (0 = "继续", 1 = "停止"). `stats` is a pre-formatted elapsed/token string
+/// (e.g. "2h0m0s · 305.00K tokens") — appended to the question when non-empty.
+pub fn round_cap_view(cap: u32, base: u32, cursor: usize, stats: &str) -> UserInputPanelView {
+    use atomcode_capabilities::tools::request_user_input::UserInputMode;
+    let question = if stats.is_empty() {
+        format!("已运行 {cap} 轮，继续吗？")
+    } else {
+        format!("已运行 {cap} 轮（{stats}），继续吗？")
+    };
+    UserInputPanelView {
+        header: "轮次上限".to_string(),
+        question,
+        mode: UserInputMode::Single,
+        options: vec![
+            // `base` (the re-arm step), not `cap`: after a continuation `cap` has
+            // grown but only `base` more rounds are granted before the next prompt.
+            (
+                "继续".to_string(),
+                Some(format!("再跑 {base} 轮后重新确认")),
+            ),
+            ("停止".to_string(), Some("结束本回合".to_string())),
+        ],
+        cursor,
+        checked: vec![],
+        text: String::new(),
+        custom_text: String::new(),
+        custom: false,
+        batch: None,
+    }
+}
+
 /// Progress of the active todo list, rendered as the multi-line footer todo
 /// panel. The renderer collapses the list to fit (`todo_panel_rows`) and
 /// width-truncates item content; the `completed`/`in_progress`/`total` counts
@@ -704,6 +753,39 @@ pub struct TodoProgress {
     /// todo panel. `current`/`completed`/`in_progress`/`total` are retained as
     /// pre-computed conveniences for the header + hide-when-all-done filter.
     pub items: Vec<(atomcode_capabilities::tools::todo::TodoStatus, String)>,
+}
+
+/// Fixed footer projection for one in-flight `task` fan-out. This is a TUI
+/// presentation type: the kernel continues to expose generic tool-progress
+/// strings, while the event loop folds the known Task contract into these
+/// stable child rows.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SubtaskProgress {
+    /// Parent tool call whose terminal event owns removal of this panel.
+    pub call_id: String,
+    pub completed: usize,
+    pub total: usize,
+    pub items: Vec<SubtaskItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtaskItem {
+    pub label: String,
+    pub description: String,
+    pub model: String,
+    pub activity: String,
+    pub started_at: Option<std::time::Instant>,
+    pub output_tokens: u64,
+    pub status: SubtaskStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubtaskStatus {
+    #[default]
+    Pending,
+    Running,
+    Completed,
+    Failed,
 }
 
 /// Live status of an active autonomous `/goal` loop, rendered on the dedicated

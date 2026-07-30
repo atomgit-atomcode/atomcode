@@ -8,29 +8,22 @@
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
 
+use atomcode_capabilities::mcp::McpRegistry;
+use atomcode_capabilities::tools::PermissionDecision;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_config::config::Config;
-use atomcode_core::conversation::message::ImagePart;
-use atomcode_core::conversation::{Conversation, ConversationSnapshot};
-use atomcode_core::lsp::manager::build_lsp_manager;
-use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
-use atomcode_core::provider;
-use atomcode_core::tool::diagnostics::DiagnosticsTool;
-use atomcode_core::tool::PermissionDecision;
-use atomcode_core::tool::{ToolContext, ToolRegistry};
+use atomcode_kernel::message::{ImageContent, Message as KernelMessage, SessionSnapshot};
 use atomcode_telemetry::Telemetry;
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use std::sync::OnceLock;
 
 pub(crate) use crate::approval_mode::ApprovalMode;
-use crate::CachedMcpRegistry;
 
 pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
     match mode {
@@ -39,7 +32,7 @@ pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecisi
         // (for example bash or a sensitive path), so missing responders must
         // fail closed.
         ApprovalMode::AcceptEdits | ApprovalMode::Plan => PermissionDecision::Deny,
-        ApprovalMode::Build | ApprovalMode::Auto => PermissionDecision::Allow,
+        ApprovalMode::Build | ApprovalMode::Auto => PermissionDecision::AllowOnce,
     }
 }
 
@@ -75,7 +68,7 @@ fn live_current_working_dir(fallback: &Path) -> std::path::PathBuf {
 }
 
 struct AuthoritativeTerminal {
-    snapshot: ConversationSnapshot,
+    snapshot: SessionSnapshot,
 }
 
 /// 设置 live 视图审批模式；已绑定 runtime 的调用方另行下发 `SetMode`。
@@ -180,208 +173,41 @@ fn live_current_provider() -> String {
         .unwrap_or_default()
 }
 
-/// All components needed to run one agent turn.
-pub(crate) struct TurnParts {
-    pub provider: Arc<dyn atomcode_core::provider::LlmProvider>,
-    pub tools: Arc<ToolRegistry>,
-    pub ctx: Arc<dyn atomcode_core::ctx::CtxBuilder>,
-    pub system_prompt: String,
-}
-
-pub(crate) fn commit_mcp_cache_miss(
-    cache: &mut HashMap<PathBuf, CachedMcpRegistry>,
-    working_dir: PathBuf,
-    candidate: Arc<McpRegistry>,
-) -> Arc<McpRegistry> {
-    if let Some(current) = cache.get_mut(&working_dir) {
-        current.last_used = std::time::Instant::now();
-        return current.registry.clone();
-    }
-    if cache.len() >= crate::MCP_CACHE_MAX {
-        if let Some(oldest_key) = cache
-            .iter()
-            .min_by_key(|(_, value)| value.last_used)
-            .map(|(key, _)| key.clone())
-        {
-            cache.remove(&oldest_key);
-        }
-    }
-    cache.insert(
-        working_dir,
-        CachedMcpRegistry {
-            registry: candidate.clone(),
-            last_used: std::time::Instant::now(),
-        },
-    );
-    candidate
-}
-
-/// 独立构造 turn 组件（与 process_chat_request 等价，但不复用其代码）。
-/// `provider_name` 为 None 时用 config.default_provider。
-pub(crate) async fn build_turn_parts(
-    working_dir: &Path,
-    provider_name: Option<&str>,
-    mcp_cache: &Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
-    telemetry: Arc<Telemetry>,
-) -> anyhow::Result<TurnParts> {
-    use atomcode_core::tool::{
-        bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
-        read::ReadFileTool, search_replace::SearchReplaceTool, todo::TodoTool,
-        web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteFileTool,
-    };
-
-    // Load config
-    let config_path = Config::default_path();
-    let config = Config::load(&config_path)?;
-
-    // Determine provider
-    let resolved_provider_name = provider_name
+/// Resolve the effective provider key: an explicit `provider_name` override wins,
+/// otherwise the config's `default_provider`. Shared by the `/compact` and
+/// `/context` commands so both select the same model for the same input.
+pub(crate) fn resolve_provider_name(config: &Config, provider_name: Option<&str>) -> String {
+    provider_name
         .map(|s| s.to_string())
-        .unwrap_or_else(|| config.default_provider.clone());
-    let provider_config = config
-        .providers
-        .get(&resolved_provider_name)
-        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved_provider_name))?;
-
-    // Create provider instance. `create_provider` may do blocking auth I/O
-    // (OAuth token refresh) — run it off the async runtime so a slow/unreachable
-    // auth host can't block a worker thread.
-    let provider = {
-        let cfg = provider_config.clone();
-        tokio::task::spawn_blocking(move || provider::create_provider(&cfg))
-            .await
-            .map_err(|e| anyhow::anyhow!("provider construction task panicked: {e}"))??
-    };
-
-    // Build tool context — use "live" as session-id label
-    let mut tool_context =
-        ToolContext::with_telemetry(working_dir.to_path_buf(), "live", telemetry);
-
-    let mut tool_registry = ToolRegistry::new();
-
-    tool_registry.register_sync(Box::new(ReadFileTool));
-    tool_registry.register_sync(Box::new(WriteFileTool));
-    tool_registry.register_sync(Box::new(EditFileTool));
-    tool_registry.register_sync(Box::new(BashTool));
-    tool_registry.register_sync(Box::new(GrepTool));
-    tool_registry.register_sync(Box::new(GlobTool));
-    tool_registry.register_sync(Box::new(ListDirTool));
-    if !atomcode_config::config::offline::is_offline_active() {
-        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
-        tool_registry.register_sync(Box::new(WebFetchTool));
-    }
-    tool_registry.register_sync(Box::new(SearchReplaceTool));
-    tool_registry.register_sync(Box::new(TodoTool::new()));
-
-    // Load skills and register use_skill tool
-    let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
-    skill_registry.reload(working_dir);
-    let has_skills = !skill_registry.is_empty();
-    let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
-    if has_skills {
-        tool_registry.register_sync(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
-            registry: skill_registry.clone(),
-        }));
-    }
-
-    // Register MCP tools using per-project cache (same pattern as process_chat_request)
-    let working_dir_buf = working_dir.to_path_buf();
-    let mcp_registry: Arc<McpRegistry> = {
-        let cache = mcp_cache.read().await;
-        if let Some(cached) = cache.get(&working_dir_buf) {
-            cached.registry.clone()
-        } else {
-            drop(cache);
-            // Cache miss — create new registry for this project
-            let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir_buf));
-            new_registry
-                .wait_for_initial_connections(Duration::from_secs(5))
-                .await;
-            // Store only if another reload/cache-miss did not win while the
-            // connection attempt was in flight.
-            let mut cache = mcp_cache.write().await;
-            commit_mcp_cache_miss(&mut cache, working_dir_buf.clone(), new_registry)
-        }
-    };
-    // Update last_used timestamp
-    {
-        let mut cache = mcp_cache.write().await;
-        if let Some(entry) = cache.get_mut(&working_dir_buf) {
-            entry.last_used = std::time::Instant::now();
-        }
-    }
-    let mcp_tools = mcp_registry.list_all_tools().await;
-    if !mcp_tools.is_empty() {
-        register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
-    }
-
-    // Build LSP manager from config and inject into ToolContext.
-    let lsp_manager = build_lsp_manager(&config.lsp, working_dir);
-    if lsp_manager.is_some() {
-        tool_registry.register_sync(Box::new(DiagnosticsTool));
-    }
-    tool_context.lsp = lsp_manager;
-
-    // Build ctx for the RESOLVED provider (not default) so context-window /
-    // truncation matches the model actually being called when a non-default
-    // provider is selected. (process_chat_request uses default here; build_turn_parts
-    // exposes provider_name explicitly, so we calibrate ctx to it.)
-    let ctx = match config.providers.get(&resolved_provider_name) {
-        Some(pc) => atomcode_core::ctx::for_provider(pc),
-        None => {
-            atomcode_core::ctx::for_provider(&atomcode_config::config::provider::ProviderConfig {
-                provider_type: String::new(),
-                api_key: None,
-                model: String::new(),
-                base_url: None,
-                system_prompt: None,
-                user_agent: None,
-                context_window: 128_000,
-                max_tokens: None,
-                thinking_type: None,
-                thinking_keep: None,
-                reasoning_history: None,
-                reasoning_effort: None,
-                thinking_enabled: None,
-                thinking_budget: None,
-                skip_tls_verify: false,
-                ephemeral: true,
-                capable_model: None,
-            })
-        }
-    };
-
-    // Build system prompt
-    let system_prompt =
-        crate::build_api_system_prompt(&working_dir_buf, &config, provider_config, &skill_registry);
-
-    Ok(TurnParts {
-        provider: provider.into(),
-        tools: Arc::new(tool_registry),
-        ctx,
-        system_prompt,
-    })
+        // Prefer the canonical selection (`default_model` then legacy
+        // `default_provider`) so a new-schema default resolves correctly.
+        .or_else(|| config.effective_model_selection())
+        .unwrap_or_default()
 }
 
 // ============================================================================
-fn extract_user_input(
-    m: &atomcode_core::conversation::message::Message,
-) -> (String, Vec<ImagePart>) {
-    use atomcode_core::conversation::message::MessageContent;
-    match &m.content {
-        MessageContent::Text(t) => (t.clone(), Vec::new()),
-        MessageContent::MultiPart { text, images } => {
-            (text.clone().unwrap_or_default(), images.clone())
-        }
-        _ => (String::new(), Vec::new()),
+/// Split a kernel user message into (text, images). Non-user messages yield empty.
+fn extract_user_input(m: &KernelMessage) -> (String, Vec<ImageContent>) {
+    use atomcode_kernel::message::Role;
+    if m.role == Role::User {
+        (m.text.clone(), m.images.clone())
+    } else {
+        (String::new(), Vec::new())
     }
 }
 
+/// Re-attach the VL-stripped originals onto the terminal snapshot. The runtime
+/// strips image bytes from the caption it sends a text-only model, so the
+/// authoritative terminal messages come back image-less; match each real user
+/// turn (in order, skipping synthetics/system) to its `turn_base` twin and copy
+/// the original text+images back so the persisted/display conversation keeps the
+/// thumbnail. Operates directly on kernel messages (image bytes live in
+/// `Message::images`, not a MultiPart wrapper).
 fn restore_images_from_turn_base(
-    mut messages: Vec<atomcode_core::conversation::message::Message>,
-    turn_base: &[atomcode_core::conversation::message::Message],
-) -> Vec<atomcode_core::conversation::message::Message> {
-    use atomcode_core::conversation::message::{MessageContent, Role};
+    mut messages: Vec<KernelMessage>,
+    turn_base: &[KernelMessage],
+) -> Vec<KernelMessage> {
+    use atomcode_kernel::message::Role;
 
     let final_user_indexes: Vec<usize> = messages
         .iter()
@@ -397,63 +223,38 @@ fn restore_images_from_turn_base(
         let Some(idx) = final_user_indexes.next() else {
             continue;
         };
-        let MessageContent::MultiPart {
-            text: original_text,
-            images,
-        } = &original.content
-        else {
-            continue;
-        };
-        if images.is_empty() {
+        if original.images.is_empty() {
             continue;
         }
 
         let Some(final_message) = messages.get_mut(idx) else {
             continue;
         };
-
-        match &mut final_message.content {
-            MessageContent::MultiPart {
-                text: final_text,
-                images: final_images,
-            } if final_images.is_empty() => {
-                if original_text.is_some() {
-                    *final_text = original_text.clone();
-                }
-                *final_images = images.clone();
-            }
-            MessageContent::Text(text) => {
-                final_message.content = MessageContent::MultiPart {
-                    text: original_text.clone().or_else(|| Some(std::mem::take(text))),
-                    images: images.clone(),
-                };
-            }
-            MessageContent::MultiPart { .. } => {}
-            _ => {
-                if let Some(text) = original_text.clone() {
-                    final_message.content = MessageContent::MultiPart {
-                        text: Some(text),
-                        images: images.clone(),
-                    };
-                }
-            }
+        // Only restore when the terminal message lost its images (the common
+        // VL-strip case); if it already carries images leave it untouched.
+        if !final_message.images.is_empty() {
+            continue;
         }
+        if !original.text.is_empty() {
+            final_message.text = original.text.clone();
+        }
+        final_message.images = original.images.clone();
     }
 
     messages
 }
 
 fn install_authoritative_terminal_snapshot(
-    conversation: &mut Conversation,
-    mut snapshot: ConversationSnapshot,
-    turn_base: &[atomcode_core::conversation::message::Message],
+    buffer: &mut Vec<KernelMessage>,
+    mut snapshot: SessionSnapshot,
+    turn_base: &[KernelMessage],
 ) {
     snapshot.messages = restore_images_from_turn_base(snapshot.messages, turn_base);
-    *conversation = Conversation::from_snapshot(snapshot);
+    *buffer = snapshot.messages;
 }
 fn committed_compaction_snapshot(
     event: &CodingRuntimeEvent,
-) -> Result<Option<atomcode_core::conversation::ConversationSnapshot>, &'static str> {
+) -> Result<Option<SessionSnapshot>, &'static str> {
     let CodingRuntimeEvent::CompactionFinished {
         completion: CompactionCompletion::Completed(outcome),
     } = event
@@ -467,7 +268,7 @@ fn committed_compaction_snapshot(
         .committed_snapshot
         .as_deref()
         .ok_or("compact completed without a resumable session snapshot")?;
-    Ok(Some(crate::legacy_convert::snapshot_to_core(snapshot)))
+    Ok(Some(snapshot.clone()))
 }
 
 /// Derive the native runtime config for a `/chat` request.
@@ -477,7 +278,10 @@ pub(crate) fn chat_runtime_config(
     working_dir: &Path,
     telemetry: Arc<Telemetry>,
 ) -> atomcode_coding::CodingRuntimeConfig {
-    let p = config.providers.get(provider_name);
+    // Resolve through the boundary so a new-schema / folded-CodingPlan selection
+    // (which no longer lives in `config.providers`) still builds a runtime.
+    let resolved = config.provider_config_for_selection(provider_name);
+    let p = resolved.as_ref();
     atomcode_coding::CodingRuntimeConfig {
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
@@ -513,7 +317,18 @@ pub(crate) fn chat_runtime_config(
             config.loop_config.max_rounds,
             std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
         ),
+        // Turn-level round cap. Reuse the canonical resolver (env > TOML) instead
+        // of re-implementing the parse — same pattern as loop_max_rounds above.
+        turn_max_rounds: atomcode_coding::resolve_turn_max_rounds(
+            config.coding.max_rounds,
+            std::env::var("ATOMCODE_TURN_MAX_ROUNDS").ok().as_deref(),
+        ),
         subagent_config: Some(Arc::new(config.clone())),
+        // Daemon path has no TUI checkpoint picker; keep the hard round-cap.
+        round_cap_checkpoint: false,
+        pricing: p.and_then(|provider| {
+            atomcode_coding::resolve_provider_pricing(provider_name, provider)
+        }),
     }
 }
 
@@ -536,7 +351,7 @@ fn send_chat_runtime_error(
 /// snapshot is written back to `conv` so the caller persists the completed turn.
 pub(crate) async fn run_chat_turn_v2(
     session_id: String,
-    conv: Arc<Mutex<Conversation>>,
+    conv: Arc<Mutex<Vec<KernelMessage>>>,
     runtime_event_tx: mpsc::UnboundedSender<CodingRuntimeEvent>,
     cancel: CancellationToken,
     runtime_cfg: atomcode_coding::CodingRuntimeConfig,
@@ -547,24 +362,23 @@ pub(crate) async fn run_chat_turn_v2(
     use atomcode_coding::{CodingRuntime, TurnCompletion};
 
     // Split the just-submitted user input from the persisted prefix before runtime
-    // startup. The prefix is imported/initialized under the target session's lease.
+    // startup. The buffer already holds kernel messages (cold summaries inline as
+    // synthetic messages), so the prefix IS a `SessionSnapshot` of the remaining
+    // messages — no core round-trip. The prefix is imported/initialized under the
+    // target session's lease.
     let (prefix, user_text, user_images, turn_base) = {
         let c = conv.lock().await;
-        let turn_base = c.messages.clone();
-        let mut msgs = c.messages.clone();
+        let turn_base = c.clone();
+        let mut msgs = c.clone();
         let last = msgs.pop();
         let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
-        (
-            ConversationSnapshot {
-                messages: msgs,
-                cold_summaries: c.cold_summaries.clone(),
-            },
-            text,
-            images,
-            turn_base,
-        )
+        (SessionSnapshot::new(msgs), text, images, turn_base)
     };
-    let prefix = crate::legacy_convert::snapshot_to_kernel(&prefix);
+    // Stash the ORIGINAL image to the display-only sidecar BEFORE it is stripped from the
+    // model conversation below (`user_images = Vec::new()`), so a reloading client refills
+    // the thumbnail from the sidecar. The /chat path previously skipped this, so the image
+    // was lost after refresh for anyone loading the session fresh from disk. Mirrors /live.
+    stash_vl_display_images(&runtime_cfg.working_dir, &session_id, &user_text, &user_images);
     let naming_session_id = session_id.clone();
     let naming_project_bucket =
         atomcode_capabilities::session::SessionManager::project_hash(&runtime_cfg.working_dir);
@@ -591,8 +405,7 @@ pub(crate) async fn run_chat_turn_v2(
     } = runtime;
     // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
     // （非视觉模型的 provider adapter 会因原图而报 400 错误）
-    let user_images = if user_text.contains("[图片内容（由") || user_text.contains("[图片识别失败]")
-    {
+    let user_images = if text_carries_vl_caption(&user_text) {
         Vec::new()
     } else {
         user_images
@@ -603,10 +416,7 @@ pub(crate) async fn run_chat_turn_v2(
     }
     let input = atomcode_coding::UserInput {
         text: user_text,
-        images: user_images
-            .iter()
-            .map(crate::legacy_convert::image_to_kernel)
-            .collect(),
+        images: user_images,
     };
     if let Err(error) = handle.submit(input).await {
         send_chat_runtime_error(&runtime_event_tx, format!("发送用户消息失败：{error}"));
@@ -652,7 +462,7 @@ pub(crate) async fn run_chat_turn_v2(
                     },
                 };
                 let response = match decision {
-                    PermissionDecision::Allow => ApprovalResponse::allow(),
+                    PermissionDecision::AllowOnce => ApprovalResponse::allow(),
                     PermissionDecision::AllowAlways => ApprovalResponse::allow_always(),
                     _ => ApprovalResponse::deny(),
                 };
@@ -673,7 +483,7 @@ pub(crate) async fn run_chat_turn_v2(
                 };
                 let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(completion));
                 break Some(AuthoritativeTerminal {
-                    snapshot: crate::legacy_convert::snapshot_to_core(snapshot.as_ref()),
+                    snapshot: snapshot.as_ref().clone(),
                 });
             }
             event @ CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
@@ -692,9 +502,10 @@ pub(crate) async fn run_chat_turn_v2(
                     }
                 };
                 if let Some(snapshot) = compact_snapshot {
-                    let mut conversation = conv.lock().await;
-                    conversation.messages = snapshot.messages;
-                    conversation.cold_summaries.clear();
+                    // Cold summaries live inline as synthetic messages in the kernel
+                    // snapshot, so replacing the buffer wholesale carries them.
+                    let mut buffer = conv.lock().await;
+                    *buffer = snapshot.messages;
                 }
                 let _ = runtime_event_tx.send(event);
             }
@@ -1199,13 +1010,22 @@ pub(crate) async fn live_stream(
     };
     let project_hash = crate::hash_path(&snapshot_wd);
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
+    let mut snapshot_messages: Vec<crate::MessageInfo> = join
+        .snapshot
+        .messages
+        .iter()
+        .map(crate::MessageInfo::from_kernel)
+        .collect();
+    // Re-attach display-only images (VL-preprocessed originals) so a refresh — which
+    // rebuilds from the kernel snapshot (image stripped) — shows the thumbnail, not the
+    // "missing image" placeholder. Same sidecar the HTTP session-load path reads.
+    crate::attach_display_images(
+        &mut snapshot_messages,
+        &snapshot_wd,
+        &join.binding.session_id,
+    );
     let _ = tx.send(LiveWireEvent::Snapshot {
-        messages: join
-            .snapshot
-            .messages
-            .iter()
-            .map(crate::MessageInfo::from_kernel)
-            .collect(),
+        messages: snapshot_messages,
         session_id: join.binding.session_id.clone(),
         session_name,
         project_hash,
@@ -1248,7 +1068,7 @@ pub(crate) async fn live_stream(
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|w| {
         let json = serde_json::to_string(&w).unwrap_or_else(|error| {
-            atomcode_core::ctrace!(
+            crate::ctrace!(
                 "LIVE",
                 "live_stream: serde_json serialization failed: {error}"
             );
@@ -1289,12 +1109,55 @@ pub(crate) struct LiveMessageReq {
 /// already contains either the VL description or an explicit failure marker.
 pub(crate) async fn preprocess_image_caption(
     config: &Config,
-    active: &dyn atomcode_core::provider::LlmProvider,
+    active_model: &str,
+    working_dir: &std::path::Path,
+    telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    session_id: Option<&str>,
     message: &str,
-    images: &[ImagePart],
+    images: &[ImageContent],
 ) -> String {
-    use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
-    match maybe_preprocess(config, active, message, images).await {
+    use atomcode_coding::vision::{
+        run_vl_caption, should_skip, vl_model_display, PreprocessOutcome,
+    };
+    // Short-circuit: no images, or the main model already accepts images.
+    if should_skip(active_model, !images.is_empty()) {
+        return message.to_string();
+    }
+    // Nothing configured (None or empty) ⇒ pass through unchanged (Skipped).
+    let Some(vl_name) = config
+        .vision_preprocessor_provider
+        .clone()
+        .filter(|s| !s.is_empty())
+    else {
+        return message.to_string();
+    };
+    // Configured but absent from `config.providers` ⇒ Failed (mirror the retired
+    // core `maybe_preprocess`): fold the failure marker so the caller strips the
+    // images — otherwise raw image bytes reach a text-only model (HTTP 400).
+    let Some(vl_pc) = config.provider_config_for_selection(&vl_name) else {
+        return fold_vl_failure(message);
+    };
+    let vl_model = vl_model_display(&vl_pc.model).to_string();
+    // Build the one-off VL provider via the daemon's native chain (the SAME
+    // chain `/chat` and `/compact` use), yielding a kernel-native provider —
+    // no core provider. `build` may block on auth I/O (gateway token) → run it
+    // off the async runtime. `session_id` is bound at build so the VL call
+    // rides the same upstream account/replica as the main turn.
+    let coding_cfg = crate::kernel_runtime::coding_config_from_runtime(&chat_runtime_config(
+        config,
+        &vl_name,
+        working_dir,
+        telemetry,
+    ));
+    let factory = crate::runtime_host::coding_provider_factory();
+    let sid = session_id.filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let provider =
+        match tokio::task::spawn_blocking(move || factory.build(&coding_cfg, sid.as_deref())).await
+        {
+            Ok(Ok(p)) => p,
+            _ => return fold_vl_failure(message),
+        };
+    match run_vl_caption(provider, vl_model, message, images).await {
         PreprocessOutcome::Skipped => message.to_string(),
         PreprocessOutcome::Replaced { text, vl_model } => {
             if message.trim().is_empty() {
@@ -1303,14 +1166,61 @@ pub(crate) async fn preprocess_image_caption(
                 format!("{message}\n\n[图片内容（由 {vl_model} 识别）]\n{text}")
             }
         }
-        PreprocessOutcome::Failed { .. } => {
-            if message.trim().is_empty() {
-                "[图片识别失败]".to_string()
-            } else {
-                format!("{message}\n\n[图片识别失败]")
-            }
-        }
+        PreprocessOutcome::Failed { .. } => fold_vl_failure(message),
     }
+}
+
+/// Fold the `[图片识别失败]` marker into a caption (VL build/stream failure). The
+/// marker string is byte-identical to the CLI `apply_outcome` failure path so
+/// `text_carries_vl_caption` + tuix `split_live_inputs` pair images correctly.
+fn fold_vl_failure(message: &str) -> String {
+    if message.trim().is_empty() {
+        "[图片识别失败]".to_string()
+    } else {
+        format!("{message}\n\n[图片识别失败]")
+    }
+}
+
+/// Whether `text` is a VL-preprocessed caption produced by [`preprocess_image_caption`]
+/// (image described, or recognition failed) rather than the user's own words. The two
+/// markers are the canonical signal the daemon uses to decide the raw image must NOT
+/// reach a text-only model. Centralized so the runtime-strip and the webui-echo split
+/// agree on one definition instead of open-coding the marker strings at each site.
+fn text_carries_vl_caption(text: &str) -> bool {
+    text.contains("[图片内容（由") || text.contains("[图片识别失败]")
+}
+
+/// Stash a VL-preprocessed submission's ORIGINAL images into the session's display-only
+/// sidecar so another client (or a page refresh) re-attaches the thumbnail. No-op unless
+/// the runtime text carries a VL caption — i.e. the image was stripped from the model
+/// conversation, leaving the persisted snapshot image-less — AND at least one image exists.
+/// Both the `/live` and `/chat` VL-strip paths call this; the `/chat` path previously
+/// skipped it, so reloading clients (other users) saw only the "missing image" placeholder.
+fn stash_vl_display_images(
+    working_dir: &std::path::Path,
+    session_id: &str,
+    runtime_text: &str,
+    original_images: &[ImageContent],
+) {
+    if !text_carries_vl_caption(runtime_text) || original_images.is_empty() {
+        return;
+    }
+    // Ensure the project sessions dir exists: `append_display_images` is best-effort and
+    // never creates it, and on `/chat` a brand-new session's first turn can reach here
+    // before any snapshot save has created the dir — without this the sidecar write would
+    // silently fail and the image would still be lost after refresh.
+    let _ = std::fs::create_dir_all(
+        atomcode_capabilities::session::SessionManager::for_project(working_dir).root(),
+    );
+    let display: Vec<crate::ImageData> = original_images
+        .iter()
+        .map(|image| crate::ImageData {
+            media_type: image.media_type.clone(),
+            data: image.data.clone(),
+            missing: false,
+        })
+        .collect();
+    crate::append_display_images(working_dir, session_id, display);
 }
 
 /// 对 live 输入做视觉预处理：主模型不支持视觉时，用 VL 模型把图片转文字拼进 caption
@@ -1320,9 +1230,11 @@ pub(crate) async fn preprocess_image_caption(
 /// 仅用其模型名判定是否原生支持视觉。
 async fn preprocess_live_caption(
     message: &str,
-    images: &[ImagePart],
+    images: &[ImageContent],
     provider_name: Option<&str>,
     session_id: Option<&str>,
+    working_dir: &std::path::Path,
+    telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
 ) -> String {
     if images.is_empty() {
         return message.to_string();
@@ -1331,21 +1243,23 @@ async fn preprocess_live_caption(
         Ok(c) => c,
         Err(_) => return message.to_string(),
     };
-    let name = provider_name
-        .map(str::to_string)
-        .unwrap_or_else(|| config.default_provider.clone());
-    let active = match config.providers.get(&name).map(provider::create_provider) {
-        Some(Ok(p)) => p,
-        _ => return message.to_string(),
+    // The main model name is what decides vision-capability (`should_skip`); the
+    // one-off VL request rides `session_id` onto the same upstream account.
+    let name = resolve_provider_name(&config, provider_name);
+    let active_model = match config.provider_config_for_selection(&name) {
+        Some(pc) => pc.model.clone(),
+        None => return message.to_string(),
     };
-    // Bind the conversation's session id onto this (throwaway) active provider so
-    // `maybe_preprocess` forwards it onto the one-off VL request as
-    // `x-atomcode-session-id` — otherwise the webui/live vision call is the
-    // session-less second request of the turn. Empty ⇒ header omitted.
-    if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
-        active.set_session_id(sid);
-    }
-    preprocess_image_caption(&config, &*active, message, images).await
+    preprocess_image_caption(
+        &config,
+        &active_model,
+        working_dir,
+        telemetry,
+        session_id,
+        message,
+        images,
+    )
+    .await
 }
 
 pub(crate) async fn live_message(
@@ -1385,7 +1299,7 @@ pub(crate) async fn live_message(
                 }));
             }
         };
-        if !config.providers.contains_key(&requested_provider) {
+        if !config.selection_exists(&requested_provider) {
             return Json(serde_json::json!({
                 "accepted": false,
                 "error": format!("provider {requested_provider:?} not found"),
@@ -1415,47 +1329,82 @@ pub(crate) async fn live_message(
                 crate::native_live::reload_provider(&join.binding, next, requested_fingerprint)
                     .await
             {
+                // Same active-turn flag as /live/provider so the client can tell the
+                // user to stop the turn rather than showing a raw error.
+                let active_turn = matches!(error, crate::live_hub::HubError::ActiveTurn);
                 return Json(serde_json::json!({
                     "accepted": false,
+                    "active_turn": active_turn,
                     "error": format!("provider reload rejected: {error:?}"),
                 }));
             }
         }
         provider_name = requested_provider;
     }
-    let original_images: Vec<ImagePart> = req
+    let original_images: Vec<ImageContent> = req
         .images
         .into_iter()
-        .map(|image| ImagePart {
+        .map(|image| ImageContent {
             media_type: image.media_type,
             data: image.data,
         })
         .collect();
-    let text = preprocess_live_caption(
+    let runtime_text = preprocess_live_caption(
         &req.message,
         &original_images,
         Some(&provider_name),
         Some(&join.binding.session_id),
+        &join.binding.working_dir,
+        state.telemetry.clone(),
     )
     .await;
-    let images = if text != req.message {
-        Vec::new()
-    } else {
-        original_images
-            .into_iter()
-            .map(|image| atomcode_kernel::message::ImageContent {
-                media_type: image.media_type,
-                data: image.data,
-            })
-            .collect()
-    };
-    match crate::native_live::submit_confirmed(atomcode_coding::UserInput { text, images }).await {
+    // VL preprocessing produced a caption ⇒ the runtime strips the image from the
+    // conversation (it must never re-enter model context — see estimate_tokens). Stash the
+    // originals in the display-only sidecar so a page refresh re-attaches the thumbnail.
+    stash_vl_display_images(
+        &join.binding.working_dir,
+        &join.binding.session_id,
+        &runtime_text,
+        &original_images,
+    );
+    let (runtime_input, echo_input) = split_live_inputs(req.message, original_images, runtime_text);
+    match crate::native_live::submit_confirmed_with_echo(runtime_input, echo_input).await {
         Ok(_) => Json(serde_json::json!({ "accepted": true })),
         Err(error) => Json(serde_json::json!({
             "accepted": false,
             "error": format!("live submit rejected: {error:?}"),
         })),
     }
+}
+
+/// Split a submitted live message into the input fed to the model (`runtime`) vs the
+/// input echoed to the live view (`echo`). BOTH keep the user's original image: the
+/// runtime conversation must carry it so the image PERSISTS and reappears after a page
+/// refresh (previously the sync path stripped it here, so the saved session had no
+/// image). The raw bytes never reach a text-only model anyway — the provider adapter
+/// degrades images at the wire when the model lacks vision (openai_compat
+/// `supports_vision`). The two inputs differ only in TEXT: the runtime gets the VL
+/// caption (the image description the text model needs) while the echo keeps the
+/// user's ORIGINAL words, so the machine caption never overwrites what the user typed.
+///
+/// NOTE: relies on the active adapter degrading images for a non-vision model. That
+/// holds for the default openai_compat providers; a non-degrading adapter (ollama with
+/// a text-only model) would need its own `supports_vision` gate — tracked separately.
+fn split_live_inputs(
+    message: String,
+    original_images: Vec<atomcode_kernel::message::ImageContent>,
+    runtime_text: String,
+) -> (atomcode_coding::UserInput, atomcode_coding::UserInput) {
+    (
+        atomcode_coding::UserInput {
+            text: runtime_text,
+            images: original_images.clone(),
+        },
+        atomcode_coding::UserInput {
+            text: message,
+            images: original_images,
+        },
+    )
 }
 
 /// POST /live/stop — cancel the turn shared by the TUI and synchronized webui tabs.
@@ -1516,7 +1465,7 @@ pub(crate) async fn live_provider(
             }));
         }
     };
-    if !config.providers.contains_key(&req.provider) {
+    if !config.selection_exists(&req.provider) {
         return Json(serde_json::json!({
             "ok": false,
             "error": format!("provider {:?} not found", req.provider),
@@ -1580,6 +1529,14 @@ pub(crate) async fn live_provider(
     .await
     {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
+        // A turn is running: reassembling the provider would hard-kill it and drop
+        // the interrupted turn's context. Surface a distinct flag so the client can
+        // revert its optimistic selection and tell the user to stop the turn first.
+        Err(crate::live_hub::HubError::ActiveTurn) => Json(serde_json::json!({
+            "ok": false,
+            "active_turn": true,
+            "error": "a turn is running; stop it before switching the model",
+        })),
         Err(error) => Json(serde_json::json!({
             "ok": false,
             "error": format!("provider reload rejected: {error:?}"),
@@ -1687,13 +1644,18 @@ pub(crate) async fn live_reasoning_effort(
     let commit = match store.update(|config| {
         target = requested
             .clone()
-            .unwrap_or_else(|| config.default_provider.clone());
-        let Some(provider) = config.providers.get_mut(&target) else {
+            .or_else(|| config.effective_model_selection())
+            .unwrap_or_default();
+        // Schema-aware write: new-schema models live in `[models.*]`, legacy in
+        // `[providers.*]`.
+        let found = config.update_selection_reasoning(&target, |r| {
+            previous_effort = r.reasoning_effort.clone();
+            *r.reasoning_effort = effort.clone();
+        });
+        if !found {
             provider_missing = true;
             anyhow::bail!("provider {target:?} not found");
-        };
-        previous_effort = provider.reasoning_effort.clone();
-        provider.reasoning_effort = effort;
+        }
         Ok(())
     }) {
         Ok(commit) => commit,
@@ -1739,11 +1701,14 @@ pub(crate) async fn live_reasoning_effort(
             Err(error) => Err(crate::live_hub::HubError::RuntimeRejected(error)),
         };
         if let Err(error) = reload_result {
+            // Roll back the persisted effort (the reload that would apply it was
+            // refused). Surface the same active_turn flag as /live/provider.
+            let active_turn = matches!(error, crate::live_hub::HubError::ActiveTurn);
             let rollback_error =
                 match store.update_if_revision(&commit.snapshot.revision, |config| {
-                    if let Some(provider) = config.providers.get_mut(&target) {
-                        provider.reasoning_effort = previous_effort;
-                    }
+                    config.update_selection_reasoning(&target, |r| {
+                        *r.reasoning_effort = previous_effort.clone();
+                    });
                     Ok(())
                 }) {
                     Ok(Some(_)) | Ok(None) => None,
@@ -1751,6 +1716,7 @@ pub(crate) async fn live_reasoning_effort(
                 };
             return Json(serde_json::json!({
                 "ok": false,
+                "active_turn": active_turn,
                 "error": match rollback_error {
                     Some(rollback) => format!(
                         "provider reload rejected: {error:?}; config rollback failed: {rollback}"
@@ -1777,33 +1743,35 @@ pub(crate) struct LivePermissionReq {
 /// request. The hub correlates the response with the pending native request.
 ///
 /// Decision mapping mirrors /chat/permission:
-///   "allow"        → PermissionDecision::Allow
+///   "allow"        → PermissionDecision::AllowOnce
 ///   "always_allow" → PermissionDecision::AllowAlways (persisted for the session)
 ///   anything else  → PermissionDecision::Deny
 pub(crate) async fn live_permission(
     State(state): State<AppState>,
     Json(req): Json<LivePermissionReq>,
 ) -> impl IntoResponse {
-    use atomcode_core::tool::{parse_permission_decision, PermissionDecision};
+    use atomcode_capabilities::tools::{parse_permission_decision, PermissionDecision};
     let decision = if req.decision == "allow_persist" {
         if let Some(full) = req.tool_name.as_deref() {
             let reg = state.mcp_registry.read().await.clone();
             if let Some((server, tool)) = reg.split_tool_name(full).await {
                 let project_dir = state.project.read().await.working_dir.clone();
-                if let Err(e) =
-                    atomcode_core::mcp::config::add_auto_approved_tool(&project_dir, &server, &tool)
-                {
+                if let Err(e) = atomcode_capabilities::mcp::config::add_auto_approved_tool(
+                    &project_dir,
+                    &server,
+                    &tool,
+                ) {
                     tracing::warn!("[permission] persist autoApprove failed: {e}");
                 }
                 reg.mark_tool_auto_approved(full);
             }
         }
-        PermissionDecision::Allow
+        PermissionDecision::AllowOnce
     } else {
         parse_permission_decision(&req.decision)
     };
     let response = match decision {
-        PermissionDecision::Allow => atomcode_capabilities::tools::ApprovalResponse::allow(),
+        PermissionDecision::AllowOnce => atomcode_capabilities::tools::ApprovalResponse::allow(),
         PermissionDecision::AllowAlways => {
             atomcode_capabilities::tools::ApprovalResponse::allow_always()
         }
@@ -1853,10 +1821,13 @@ pub(crate) async fn live_user_input(
             "text": req.text,
         }),
     };
-    let ok = crate::native_live::respond_confirmed(req.request_id, value)
-        .await
-        .is_ok();
-    axum::Json(serde_json::json!({ "accepted": ok }))
+    match crate::native_live::respond_confirmed(req.request_id, value).await {
+        Ok(()) => axum::Json(serde_json::json!({ "accepted": true })),
+        Err(error) => axum::Json(serde_json::json!({
+            "accepted": false,
+            "error": format!("user input request was not accepted: {error:?}"),
+        })),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1886,6 +1857,16 @@ pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResp
     Json(serde_json::json!({ "cancelled": cancelled }))
 }
 
+/// POST /live/compact —— webui/手机端在 sync 模式请求对共享实时运行时执行一次
+/// 手动压缩。派发 `DriverCommand::Compact(None)` 到 live hub；压缩结果经既有的
+/// `NativeLiveWireProjector`（CompactionFinished → Warning）回流到各视图。
+/// 返回 `{"accepted": bool}`：false 表示当前没有绑定的实时运行时（无可压缩对象）。
+pub(crate) async fn live_compact(State(_state): State<AppState>) -> impl IntoResponse {
+    let accepted =
+        crate::native_live::dispatch(atomcode_coding::DriverCommand::Compact(None)).is_ok();
+    Json(serde_json::json!({ "accepted": accepted }))
+}
+
 /// POST /live/mcp/trust — Trust the current project so its `.mcp.json` servers
 /// are allowed to connect on the next turn. Rebuilds the serving MCP registry
 /// so newly-allowed servers start connecting immediately.
@@ -1895,7 +1876,7 @@ pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResp
 pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoResponse {
     let fallback = { state.project.read().await.working_dir.clone() };
     let working_dir = live_current_working_dir(&fallback);
-    match atomcode_core::mcp::trust::trust_project(&working_dir) {
+    match atomcode_capabilities::mcp::trust::trust_project(&working_dir) {
         Ok(()) => {
             let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir));
             crate::replace_project_mcp_registry(&state, &working_dir, new_registry).await;
@@ -1924,7 +1905,136 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::conversation::message::Message;
+    use atomcode_kernel::message::Message;
+
+    fn img(tag: &str) -> atomcode_kernel::message::ImageContent {
+        atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: tag.into(),
+        }
+    }
+
+    // A reloaded VL-stripped user message renders as a "missing image" placeholder
+    // (see MessageInfo::from_kernel). Other clients only recover the thumbnail if the
+    // ORIGINAL bytes were stashed to the display-only sidecar during the turn.
+    fn missing_user_msg() -> crate::MessageInfo {
+        crate::MessageInfo {
+            role: "user".into(),
+            content: "识别一下".into(),
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: Some(vec![crate::ImageData {
+                media_type: "image/png".into(),
+                data: String::new(),
+                missing: true,
+            }]),
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn vl_stripped_image_survives_reload_via_display_sidecar() {
+        // Repro of "image lost after refresh for other users": on a VL-strip turn the
+        // persisted user message is image-less, so the ORIGINAL image MUST be stashed to
+        // the display-only sidecar for a fresh reload to refill it. The /live path did
+        // this; the /chat path did NOT — both now share `stash_vl_display_images`.
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        let sid = "sess-vl-reload";
+        // NOTE: the sessions dir is deliberately NOT pre-created — stash_vl_display_images
+        // must create it itself (a brand-new session's first /chat turn reaches the stash
+        // before any snapshot save has made the dir).
+
+        // BUG: no sidecar written → a fresh reload keeps the "missing" placeholder.
+        let mut before = vec![missing_user_msg()];
+        crate::attach_display_images(&mut before, wd, sid);
+        assert!(
+            before[0].images.as_ref().unwrap()[0].missing,
+            "no sidecar → other clients still see the missing placeholder"
+        );
+
+        // FIX: the shared helper stashes the original bytes (VL caption + image present).
+        stash_vl_display_images(
+            wd,
+            sid,
+            "识别一下\n\n[图片内容（由 vl 识别）]\na cat",
+            &[img("REAL-BYTES")],
+        );
+
+        let mut after = vec![missing_user_msg()];
+        crate::attach_display_images(&mut after, wd, sid);
+        let refilled = &after[0].images.as_ref().unwrap()[0];
+        assert!(!refilled.missing, "sidecar present → placeholder refilled");
+        assert_eq!(refilled.data, "REAL-BYTES");
+
+        // Gating: no VL caption OR no image → nothing stashed (don't pollute the sidecar).
+        let sid2 = "sess-no-vl";
+        stash_vl_display_images(wd, sid2, "plain text, no caption", &[img("X")]);
+        stash_vl_display_images(wd, sid2, "[图片内容（由 vl 识别）] no image", &[]);
+        let mut plain = vec![missing_user_msg()];
+        crate::attach_display_images(&mut plain, wd, sid2);
+        assert!(
+            plain[0].images.as_ref().unwrap()[0].missing,
+            "no VL caption / no image → nothing stashed → stays missing"
+        );
+    }
+
+    #[test]
+    fn split_live_inputs_keeps_image_in_runtime_for_persistence_when_vl_preprocessed() {
+        // A text-only model preprocessed the image into a caption. The RUNTIME gets the
+        // caption text BUT keeps the original image so it persists (survives a refresh);
+        // the adapter degrades the image at the wire for the text-only model. The ECHO
+        // keeps the user's ORIGINAL text + image so the caption never overwrites the
+        // user's message. (Fixes: image gone after refresh + caption-overwrite.)
+        let (runtime, echo) = split_live_inputs(
+            "look at this".into(),
+            vec![img("orig-bytes")],
+            "look at this\n\n[图片内容（由 vl 识别）]\na chart".into(),
+        );
+        assert_eq!(
+            runtime.text,
+            "look at this\n\n[图片内容（由 vl 识别）]\na chart"
+        );
+        assert_eq!(
+            runtime.images,
+            vec![img("orig-bytes")],
+            "runtime conversation must KEEP the image so it persists across a refresh"
+        );
+        assert_eq!(
+            echo.text, "look at this",
+            "display must show the user's original text"
+        );
+        assert_eq!(
+            echo.images,
+            vec![img("orig-bytes")],
+            "display must keep the image"
+        );
+    }
+
+    #[test]
+    fn split_live_inputs_keeps_image_for_vision_model_when_not_preprocessed() {
+        // A vision model needs no caption: runtime_text == message, so the raw image
+        // flows to BOTH the model and the echo unchanged.
+        let (runtime, echo) = split_live_inputs("hi".into(), vec![img("orig-bytes")], "hi".into());
+        assert_eq!(runtime.text, "hi");
+        assert_eq!(runtime.images, vec![img("orig-bytes")]);
+        assert_eq!(echo.text, "hi");
+        assert_eq!(echo.images, vec![img("orig-bytes")]);
+    }
+
+    #[test]
+    fn resolve_provider_name_prefers_override_then_default() {
+        let mut config = Config::default();
+        config.default_provider = "default-prov".to_string();
+
+        // Explicit override wins.
+        assert_eq!(resolve_provider_name(&config, Some("chosen")), "chosen");
+        // No override → falls back to the config default.
+        assert_eq!(resolve_provider_name(&config, None), "default-prov");
+    }
 
     /// Trust round-trip at the daemon layer: trust_project → is_project_trusted → partition_by_trust
     /// clears blocked list.  Uses ATOMCODE_MCP_TRUST_STORE as the test seam so we never touch the
@@ -1932,8 +2042,12 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn mcp_trust_round_trip_clears_blocked() {
-        use atomcode_core::mcp::config::{McpConfigSource, McpServerConfig, McpTransportConfig};
-        use atomcode_core::mcp::trust::{is_project_trusted, partition_by_trust, trust_project};
+        use atomcode_capabilities::mcp::config::{
+            McpConfigSource, McpServerConfig, McpTransportConfig,
+        };
+        use atomcode_capabilities::mcp::trust::{
+            is_project_trusted, partition_by_trust, trust_project,
+        };
 
         let store_dir = tempfile::tempdir().unwrap();
         // SAFETY: test seam; serial attribute prevents concurrent mutation.
@@ -1993,22 +2107,22 @@ mod tests {
 
     #[test]
     fn real_empty_terminal_snapshot_clears_the_conversation() {
-        let mut conversation = Conversation::from_messages_and_cold_summaries(
-            vec![Message::new(
-                atomcode_core::conversation::message::Role::User,
-                "cancelled prompt",
-            )],
-            vec!["stale summary".into()],
-        );
+        // Seed the buffer with a cold-summary synthetic (kernel encoding) + a real
+        // user message; an empty authoritative terminal must wipe BOTH — inline cold
+        // summaries are just messages now, so nothing survives an empty snapshot.
+        let mut cold = Message::user(format!(
+            "{}stale summary",
+            atomcode_kernel::message::LEGACY_COLD_SUMMARY_PREFIX
+        ));
+        cold.synthetic = true;
+        cold.internal_origin =
+            Some(atomcode_kernel::message::LEGACY_COLD_SUMMARY_ORIGIN.to_string());
+        let mut buffer = vec![cold, Message::user("cancelled prompt")];
 
-        install_authoritative_terminal_snapshot(
-            &mut conversation,
-            ConversationSnapshot::default(),
-            &[],
-        );
+        install_authoritative_terminal_snapshot(&mut buffer, SessionSnapshot::new(Vec::new()), &[]);
 
-        assert!(conversation.messages.is_empty());
-        assert!(conversation.cold_summaries.is_empty());
+        assert!(buffer.is_empty());
+        assert!(atomcode_kernel::message::cold_summaries_from_messages(&buffer).is_empty());
     }
 
     /// The webui `/live/mode` body + `mode`/`snapshot` SSE events serialize the
@@ -2045,11 +2159,11 @@ mod tests {
         ));
         assert!(matches!(
             fallback_approval_decision(ApprovalMode::Build),
-            PermissionDecision::Allow
+            PermissionDecision::AllowOnce
         ));
         assert!(matches!(
             fallback_approval_decision(ApprovalMode::Auto),
-            PermissionDecision::Allow
+            PermissionDecision::AllowOnce
         ));
     }
 
@@ -2195,148 +2309,90 @@ mod tests {
     }
 
     // 回归：无图时视觉预处理是直通的——caption 原样返回，不触碰 config/网络。
-    // （有图的 VL 路径依赖真实 config/provider，覆盖在 vision_preprocessor 的单测里。）
+    // （有图的 VL 流式路径覆盖在 atomcode_coding::vision::run_vl_caption 的单测里。）
     #[tokio::test]
     async fn preprocess_live_caption_is_passthrough_without_images() {
-        let out = preprocess_live_caption("看下这个图片", &[], None, None).await;
+        // Disabled telemetry + throwaway dir: empty images short-circuit BEFORE
+        // any provider build, so neither is exercised — just needed to type-check.
+        let telemetry = atomcode_telemetry::Telemetry::init(
+            atomcode_telemetry::config::ResolvedConfig {
+                state: atomcode_telemetry::config::TelemetryState::Disabled("test"),
+                endpoint: String::new(),
+                atomcode_dir: std::env::temp_dir(),
+            },
+            "test".into(),
+        );
+        let out = preprocess_live_caption(
+            "看下这个图片",
+            &[],
+            None,
+            None,
+            &std::env::temp_dir(),
+            telemetry,
+        )
+        .await;
         assert_eq!(out, "看下这个图片");
     }
 
     #[test]
     fn restore_images_from_turn_base_preserves_history_user_display_payload() {
-        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
-
-        let original_user = Message {
-            role: Role::User,
-            content: MessageContent::MultiPart {
-                text: Some("识别图片内容".into()),
-                images: vec![ImagePart {
-                    media_type: "image/png".into(),
-                    data: "aW1hZ2U=".into(),
-                }],
-            },
-            synthetic: false,
-            internal_origin: None,
-        };
-        let final_user = Message::new(
-            Role::User,
-            "识别图片内容\n\n[图片内容（由 vl-provider 识别）]\n一张图片",
-        );
+        let original_user = Message::user_with_images("识别图片内容", vec![img("aW1hZ2U=")]);
+        let final_user =
+            Message::user("识别图片内容\n\n[图片内容（由 vl-provider 识别）]\n一张图片");
 
         let messages = restore_images_from_turn_base(vec![final_user], &[original_user]);
 
-        assert!(matches!(
-            &messages[0].content,
-            MessageContent::MultiPart { text, images }
-                if text.as_deref() == Some("识别图片内容")
-                    && images.len() == 1
-                    && images[0].data == "aW1hZ2U="
-        ));
+        assert_eq!(messages[0].text, "识别图片内容");
+        assert_eq!(messages[0].images.len(), 1);
+        assert_eq!(messages[0].images[0].data, "aW1hZ2U=");
     }
 
     #[test]
     fn restore_images_from_turn_base_matches_user_turns_when_final_snapshot_has_system_prefix() {
-        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
-
-        let original_user = Message {
-            role: Role::User,
-            content: MessageContent::MultiPart {
-                text: Some("分析".into()),
-                images: vec![ImagePart {
-                    media_type: "image/png".into(),
-                    data: "aW1hZ2U=".into(),
-                }],
-            },
-            synthetic: false,
-            internal_origin: None,
-        };
+        let original_user = Message::user_with_images("分析", vec![img("aW1hZ2U=")]);
         let final_messages = vec![
-            Message::new(Role::System, "session context"),
-            Message::new(Role::System, "memory"),
-            Message::new(
-                Role::User,
-                "分析\n\n[图片内容（由 vl-provider 识别）]\n一张图片",
-            ),
-            Message::new(Role::Assistant, "done"),
+            Message::system("session context"),
+            Message::system("memory"),
+            Message::user("分析\n\n[图片内容（由 vl-provider 识别）]\n一张图片"),
+            Message::assistant("done", Vec::new()),
         ];
 
         let messages = restore_images_from_turn_base(final_messages, &[original_user]);
 
-        assert!(matches!(
-            &messages[2].content,
-            MessageContent::MultiPart { text, images }
-                if text.as_deref() == Some("分析")
-                    && images.len() == 1
-                    && images[0].data == "aW1hZ2U="
-        ));
+        assert_eq!(messages[2].text, "分析");
+        assert_eq!(messages[2].images.len(), 1);
+        assert_eq!(messages[2].images[0].data, "aW1hZ2U=");
     }
 
     #[test]
     fn restore_images_from_turn_base_keeps_user_turn_ordinal_with_prior_text_user() {
-        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
-
-        let prior_user = Message::new(Role::User, "上一轮问题");
-        let image_user = Message {
-            role: Role::User,
-            content: MessageContent::MultiPart {
-                text: Some("分析".into()),
-                images: vec![ImagePart {
-                    media_type: "image/png".into(),
-                    data: "aW1hZ2U=".into(),
-                }],
-            },
-            synthetic: false,
-            internal_origin: None,
-        };
+        let prior_user = Message::user("上一轮问题");
+        let image_user = Message::user_with_images("分析", vec![img("aW1hZ2U=")]);
         let final_messages = vec![
-            Message::new(Role::System, "session context"),
-            Message::new(Role::User, "上一轮问题"),
-            Message::new(Role::Assistant, "上一轮回答"),
-            Message::new(
-                Role::User,
-                "分析\n\n[图片内容（由 vl-provider 识别）]\n一张图片",
-            ),
-            Message::new(Role::Assistant, "done"),
+            Message::system("session context"),
+            Message::user("上一轮问题"),
+            Message::assistant("上一轮回答", Vec::new()),
+            Message::user("分析\n\n[图片内容（由 vl-provider 识别）]\n一张图片"),
+            Message::assistant("done", Vec::new()),
         ];
 
         let messages = restore_images_from_turn_base(final_messages, &[prior_user, image_user]);
 
-        assert!(matches!(
-            &messages[1].content,
-            MessageContent::Text(text) if text == "上一轮问题"
-        ));
-        assert!(matches!(
-            &messages[3].content,
-            MessageContent::MultiPart { text, images }
-                if text.as_deref() == Some("分析")
-                    && images.len() == 1
-                    && images[0].data == "aW1hZ2U="
-        ));
+        // The prior text-only user turn stays untouched (no images restored onto it).
+        assert_eq!(messages[1].text, "上一轮问题");
+        assert!(messages[1].images.is_empty());
+        assert_eq!(messages[3].text, "分析");
+        assert_eq!(messages[3].images.len(), 1);
+        assert_eq!(messages[3].images[0].data, "aW1hZ2U=");
     }
 
     #[test]
     fn restore_images_from_turn_base_ignores_synthetic_user_ordinals() {
-        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
-
-        let image_user = Message {
-            role: Role::User,
-            content: MessageContent::MultiPart {
-                text: Some("分析图片".into()),
-                images: vec![ImagePart {
-                    media_type: "image/png".into(),
-                    data: "aW1hZ2U=".into(),
-                }],
-            },
-            synthetic: false,
-            internal_origin: None,
-        };
+        let image_user = Message::user_with_images("分析图片", vec![img("aW1hZ2U=")]);
         let final_messages = vec![
             Message::synthetic_user("[Auto-read from error: src/main.rs]\nfn main() {}"),
-            Message::new(
-                Role::User,
-                "分析图片\n\n[图片内容（由 vl-provider 识别）]\n一张图片",
-            ),
-            Message::new(Role::Assistant, "done"),
+            Message::user("分析图片\n\n[图片内容（由 vl-provider 识别）]\n一张图片"),
+            Message::assistant("done", Vec::new()),
         ];
 
         let messages = restore_images_from_turn_base(
@@ -2347,18 +2403,14 @@ mod tests {
             ],
         );
 
+        // The synthetic user is skipped (not counted as a real user ordinal), so
+        // its text is untouched and it never receives restored images.
         assert!(messages[0].synthetic);
-        assert!(matches!(
-            &messages[0].content,
-            MessageContent::Text(text) if text.contains("Auto-read")
-        ));
-        assert!(matches!(
-            &messages[1].content,
-            MessageContent::MultiPart { text, images }
-                if text.as_deref() == Some("分析图片")
-                    && images.len() == 1
-                    && images[0].data == "aW1hZ2U="
-        ));
+        assert!(messages[0].text.contains("Auto-read"));
+        assert!(messages[0].images.is_empty());
+        assert_eq!(messages[1].text, "分析图片");
+        assert_eq!(messages[1].images.len(), 1);
+        assert_eq!(messages[1].images[0].data, "aW1hZ2U=");
     }
 
     #[test]
@@ -2532,7 +2584,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_compaction_event_exposes_exact_core_mirror_messages() {
+    fn committed_compaction_event_exposes_exact_kernel_snapshot_messages() {
         use atomcode_coding::runtime::{CompactionCompletion, CompactionOutcome};
         use atomcode_kernel::message::{CompactTrigger, Message, SessionSnapshot};
 
@@ -2559,8 +2611,11 @@ mod tests {
             .expect("committed snapshot");
         assert_eq!(snapshot.messages.len(), 1);
         assert!(snapshot.messages[0].synthetic);
-        assert_eq!(snapshot.messages[0].text(), Some("after compact"));
-        assert!(snapshot.cold_summaries.is_empty());
+        assert_eq!(snapshot.messages[0].text, "after compact");
+        // Cold summaries live inline as synthetic messages; none tagged here.
+        assert!(
+            atomcode_kernel::message::cold_summaries_from_messages(&snapshot.messages).is_empty()
+        );
     }
 
     #[test]
@@ -2583,7 +2638,8 @@ mod tests {
         meta2.owner = atomcode_capabilities::session::StorageOwner::Native;
         let snap2 = SessionSnapshot::new(vec![]);
         let pres2 = atomcode_capabilities::session::PresentationFile::default();
-        mgr2.commit_native_import(&lease2, Some(&snap2), Some(&pres2), &meta2).unwrap();
+        mgr2.commit_native_import(&lease2, Some(&snap2), Some(&pres2), &meta2)
+            .unwrap();
         drop(lease2);
 
         // Searching explicitly in proj1 bucket fails
@@ -2591,14 +2647,16 @@ mod tests {
             root.path(),
             &bucket1,
             "session-in-proj2",
-        ).unwrap();
+        )
+        .unwrap();
         assert!(res1.is_none());
 
         // Searching across any project finds it in proj2 bucket
         let res2 = crate::legacy_convert::prepare_catalog_session_resume_any_project_in_root(
             root.path(),
             "session-in-proj2",
-        ).unwrap();
+        )
+        .unwrap();
         assert!(res2.is_some());
         let prepared = res2.unwrap();
         assert_eq!(prepared.project_bucket, bucket2);

@@ -1088,15 +1088,92 @@ fn urlencoding_decode(s: &str) -> String {
     result
 }
 
-/// Refresh the access token using the stored refresh_token via Platform Broker.
-/// Returns updated AuthInfo with new tokens, and saves it to disk.
+/// Refresh the currently-stored auth via Platform Broker and save it to disk.
+///
+/// `auth.access_token` is used only to detect a concurrent refresh: another
+/// window may already have rotated the token, in which case the newer stored
+/// credential is returned without a second broker call. An in-memory `AuthInfo`
+/// that was never persisted is therefore NOT refreshed in isolation. Account
+/// identity is not enforced here — see [`recover_auth_after_unauthorized`] for
+/// the account-checked recovery entry point.
 pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
+    refresh_auth_if_current(&auth.access_token, None)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("No refresh_token available — please /login again")]
+struct MissingRefreshToken;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Token refresh failed ({status}): {body}")]
+struct RefreshHttpStatus {
+    status: u16,
+    body: String,
+}
+
+/// The broker returned a success status but a body we couldn't parse. This is
+/// deterministic (retrying re-parses the same bytes), so recovery treats it as a
+/// re-authentication prompt rather than a transient decode failure that would
+/// retry-loop forever against a bad response.
+#[derive(Debug, thiserror::Error)]
+#[error("Unexpected broker response — please /login again")]
+struct UnexpectedBrokerResponse;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthRecoveryFailureKind {
+    Transient,
+    ReauthenticationRequired,
+    Local,
+}
+
+/// Preserve the distinction used by provider recovery: transport/server
+/// failures may succeed on a later OPEN retry; rejected refresh credentials
+/// require `/login`; filesystem/account consistency errors are local failures.
+pub fn classify_auth_recovery_error(error: &anyhow::Error) -> AuthRecoveryFailureKind {
+    for cause in error.chain() {
+        if cause.downcast_ref::<MissingRefreshToken>().is_some() {
+            return AuthRecoveryFailureKind::ReauthenticationRequired;
+        }
+        if cause.downcast_ref::<UnexpectedBrokerResponse>().is_some() {
+            return AuthRecoveryFailureKind::ReauthenticationRequired;
+        }
+        if let Some(status) = cause.downcast_ref::<RefreshHttpStatus>() {
+            // Intentionally broader than the OPEN loop's `retry::is_retryable_status`
+            // set: recovery only answers "retry vs re-login", so every 5xx is
+            // transient and every other rejecting status maps to a `/login` prompt
+            // rather than an opaque local error (a relocated broker returning 404,
+            // a proxy 511, etc.). This deliberately does NOT mirror the retry
+            // module — the two answer different questions, so no sync is required.
+            return if matches!(status.status, 408 | 425 | 429) || status.status >= 500 {
+                AuthRecoveryFailureKind::Transient
+            } else if status.status >= 400 {
+                AuthRecoveryFailureKind::ReauthenticationRequired
+            } else {
+                AuthRecoveryFailureKind::Local
+            };
+        }
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>() {
+            if request.is_timeout()
+                || request.is_connect()
+                || request.is_request()
+                || request.is_body()
+                || request.is_decode()
+            {
+                return AuthRecoveryFailureKind::Transient;
+            }
+        }
+    }
+    AuthRecoveryFailureKind::Local
+}
+
+/// Caller must hold `auth-refresh.lock`.
+fn refresh_access_token_unlocked(auth: &AuthInfo) -> Result<AuthInfo> {
     let auth = auth.clone();
     std::thread::spawn(move || {
         let refresh_token = auth
             .refresh_token
             .as_deref()
-            .context("No refresh_token available — please /login again")?;
+            .ok_or_else(|| anyhow::Error::new(MissingRefreshToken))?;
 
         let client = blocking_client()?;
 
@@ -1110,11 +1187,10 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
-            anyhow::bail!(
-                "Token refresh failed ({}): {} — please /login again",
-                status,
-                body
-            );
+            return Err(anyhow::Error::new(RefreshHttpStatus {
+                status: status.as_u16(),
+                body,
+            }));
         }
 
         #[derive(Deserialize)]
@@ -1126,8 +1202,15 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
             user: Option<PlatformUserInfo>,
         }
 
-        let broker_resp: BrokerResponse =
-            response.json().context("Failed to parse broker response")?;
+        // Read the body as text first so a mid-body transport failure surfaces as
+        // a (transient) reqwest error, while a fully-received but unparseable 2xx
+        // body becomes a terminal error — not a retryable decode error that would
+        // loop against a deterministically-bad response.
+        let body_text = response
+            .text()
+            .context("Failed to read broker response body")?;
+        let broker_resp: BrokerResponse = serde_json::from_str(&body_text)
+            .map_err(|_| anyhow::Error::new(UnexpectedBrokerResponse))?;
 
         // Pre-1970 wall clock would otherwise panic on `unwrap` and lose
         // the refresh result. Falling back to 0 forces the next token
@@ -1159,11 +1242,57 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
                 .unwrap_or_else(|| auth.user.clone()),
         };
 
-        save_auth(&new_auth)?;
+        save_auth_unlocked(&new_auth)?;
         Ok(new_auth)
     })
     .join()
     .map_err(|_| anyhow::anyhow!("refresh_access_token thread panicked"))?
+}
+
+/// Recover from a server-side 401 for a token that the local expiry clock still
+/// considered valid.
+///
+/// The lock is cross-process because refresh tokens may rotate: multiple AtomCode
+/// windows must not consume the same refresh token concurrently. After acquiring
+/// it, reload `auth.toml`; another process may already have refreshed, in which
+/// case the newer credential is returned without another authority call.
+pub fn recover_auth_after_unauthorized(
+    rejected_access_token: &str,
+    expected_user_id: &str,
+) -> Result<ValidAuthSession> {
+    let auth = refresh_auth_if_current(rejected_access_token, Some(expected_user_id))?;
+    if auth.access_token.trim().is_empty() || auth.user.id.trim().is_empty() {
+        anyhow::bail!("Invalid auth.toml — please use /login first");
+    }
+    Ok(ValidAuthSession {
+        access_token: auth.access_token,
+        user_id: auth.user.id,
+    })
+}
+
+/// Serialize refresh-token consumption across threads and processes. The
+/// rejected/current token is compared again after taking the lock so a waiter
+/// observes credentials refreshed by the winner instead of refreshing twice.
+fn refresh_auth_if_current(
+    rejected_access_token: &str,
+    expected_user_id: Option<&str>,
+) -> Result<AuthInfo> {
+    with_auth_lock(|| {
+        let auth = get_stored_auth().context("Not logged in — please use /login first")?;
+        // Only the account-checked recovery entry point enforces identity. The
+        // proactive-refresh path passes `None`: it just needs any currently-valid
+        // stored token, so a concurrent login as a different account should be
+        // adopted, not turned into a spurious "Login account changed" hard failure.
+        if let Some(expected) = expected_user_id {
+            if auth.user.id != expected {
+                anyhow::bail!("Login account changed — please retry the request");
+            }
+        }
+        if auth.access_token != rejected_access_token {
+            return Ok(auth);
+        }
+        refresh_access_token_unlocked(&auth)
+    })
 }
 
 fn get_valid_auth_info() -> Result<AuthInfo> {
@@ -1182,17 +1311,18 @@ fn get_valid_auth_info() -> Result<AuthInfo> {
         let expires_at = auth.created_at + expires_in;
 
         if now >= expires_at - 300 {
-            // Token expired or about to expire — try refresh
-            match refresh_access_token(&auth) {
+            // Token expired or about to expire — serialize refresh-token
+            // consumption and re-check auth.toml after taking the lock.
+            match refresh_auth_if_current(&auth.access_token, None) {
                 Ok(new_auth) => return Ok(new_auth),
                 Err(e) => anyhow::bail!("Token expired and refresh failed: {}", e),
             }
         }
     } else if auth.created_at == 0 {
         // Legacy auth.toml without created_at — no way to know if expired,
-        // try refresh if refresh_token is available, otherwise use as-is
+        // try refresh if refresh_token is available, otherwise use as-is.
         if auth.refresh_token.is_some() {
-            if let Ok(new_auth) = refresh_access_token(&auth) {
+            if let Ok(new_auth) = refresh_auth_if_current(&auth.access_token, None) {
                 return Ok(new_auth);
             }
         }
@@ -1236,10 +1366,18 @@ pub fn get_valid_token() -> Result<String> {
 /// both are success from the user's perspective ("you're logged out").
 pub fn logout() -> Result<()> {
     let auth_path = auth_file_path();
-    if auth_path.exists() {
-        std::fs::remove_file(&auth_path).context("Failed to remove auth file")?;
+    // Absent file ⇒ already logged out. Return before touching the lock so a
+    // never-logged-in user's /logout stays a pure no-op — no directory or lock
+    // file created, and no failure on a read-only HOME.
+    if !auth_path.exists() {
+        return Ok(());
     }
-    Ok(())
+    with_auth_lock(|| {
+        if auth_path.exists() {
+            std::fs::remove_file(&auth_path).context("Failed to remove auth file")?;
+        }
+        Ok(())
+    })
 }
 
 /// Get stored auth info
@@ -1255,19 +1393,53 @@ pub fn get_stored_auth() -> Option<AuthInfo> {
 
 /// Save auth info to file
 pub fn save_auth(auth: &AuthInfo) -> Result<()> {
-    let auth_path = auth_file_path();
+    with_auth_lock(|| save_auth_unlocked(auth))
+}
 
-    // Ensure parent directory exists
-    if let Some(parent) = auth_path.parent() {
-        std::fs::create_dir_all(parent).context("Failed to create auth directory")?;
-        // Set directory permissions to 0o700 (owner only) on Unix
-        #[cfg(unix)]
+/// Execute one authentication-store transaction. Every writer uses this seam so
+/// a refresh response cannot overwrite a concurrent login/logout from another
+/// thread or process.
+fn with_auth_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let auth_path = auth_file_path();
+    let parent = auth_path
+        .parent()
+        .context("Invalid auth file path — please use /login again")?;
+    std::fs::create_dir_all(parent).context("Failed to create auth directory")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Best-effort: a directory we can write to but can't chmod (unusual
+        // mounts, or a dir owned by another user) must not block login / refresh /
+        // logout. The file itself is still written 0600 by write_auth_file_secure.
+        if let Err(error) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            tracing::warn!(%error, "failed to tighten auth directory permissions");
         }
     }
+    with_auth_lock_file(&parent.join("auth-refresh.lock"), operation)
+}
 
+fn with_auth_lock_file<T>(
+    lock_path: &std::path::Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    use fs2::FileExt;
+    use std::fs::OpenOptions;
+
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .context("Failed to open auth refresh lock")?;
+    lock.lock_exclusive()
+        .context("Failed to acquire auth refresh lock")?;
+    operation()
+}
+
+/// Caller must hold `auth-refresh.lock`.
+fn save_auth_unlocked(auth: &AuthInfo) -> Result<()> {
+    let auth_path = auth_file_path();
     let content = toml::to_string_pretty(auth).context("Failed to serialize auth info")?;
     super::write_auth_file_secure(&auth_path, &content).context("Failed to write auth file")?;
 
@@ -1360,6 +1532,97 @@ fn parse_pasted_callback(input: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_recovery_failure_classifies_statuses_and_local_errors() {
+        let transient = anyhow::Error::new(RefreshHttpStatus {
+            status: 503,
+            body: "unavailable".to_string(),
+        });
+        assert_eq!(
+            classify_auth_recovery_error(&transient),
+            AuthRecoveryFailureKind::Transient
+        );
+
+        let rejected = anyhow::Error::new(RefreshHttpStatus {
+            status: 401,
+            body: "invalid refresh token".to_string(),
+        });
+        assert_eq!(
+            classify_auth_recovery_error(&rejected),
+            AuthRecoveryFailureKind::ReauthenticationRequired
+        );
+
+        // An unlisted 5xx (e.g. 501/505) is still transient; an unlisted 4xx
+        // (e.g. a relocated broker returning 404) prompts re-login instead of
+        // falling through to an opaque local error.
+        let unlisted_server = anyhow::Error::new(RefreshHttpStatus {
+            status: 501,
+            body: "not implemented".to_string(),
+        });
+        assert_eq!(
+            classify_auth_recovery_error(&unlisted_server),
+            AuthRecoveryFailureKind::Transient
+        );
+        let unlisted_client = anyhow::Error::new(RefreshHttpStatus {
+            status: 404,
+            body: "not found".to_string(),
+        });
+        assert_eq!(
+            classify_auth_recovery_error(&unlisted_client),
+            AuthRecoveryFailureKind::ReauthenticationRequired
+        );
+
+        // A successful-but-unparseable broker body is deterministic → re-login,
+        // not a retryable decode failure.
+        let unparseable = anyhow::Error::new(UnexpectedBrokerResponse);
+        assert_eq!(
+            classify_auth_recovery_error(&unparseable),
+            AuthRecoveryFailureKind::ReauthenticationRequired
+        );
+
+        let local = anyhow::anyhow!("failed to persist auth.toml");
+        assert_eq!(
+            classify_auth_recovery_error(&local),
+            AuthRecoveryFailureKind::Local
+        );
+    }
+
+    #[test]
+    fn auth_store_lock_serializes_concurrent_writers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("auth-refresh.lock");
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let lock_path = lock_path.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                with_auth_lock_file(&lock_path, || {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn strip_force_login_removes_trailing_param() {

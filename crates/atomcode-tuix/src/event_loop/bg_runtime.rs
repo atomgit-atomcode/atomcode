@@ -4,7 +4,6 @@ use super::ui_event::UiEvent as AgentEvent;
 use crate::session::Session;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_config::i18n::{t, Msg};
-use atomcode_daemon::legacy_convert::snapshot_to_core;
 
 use super::RuntimeEndpoint;
 
@@ -783,7 +782,7 @@ impl BgRuntimeManager {
             RuntimeEventPayload::Native(CodingRuntimeEvent::Request(request)) => {
                 if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
                     if let Some(snapshot) = request.snapshot.as_deref() {
-                        super::apply_session_snapshot(&mut bg.session, snapshot_to_core(snapshot));
+                        super::apply_session_snapshot(&mut bg.session, snapshot.clone());
                         bg.summary = session_summary(&bg.session);
                         retain_session_replay_events(&mut bg.buffered_events);
                     }
@@ -802,7 +801,7 @@ impl BgRuntimeManager {
                             retain_session_replay_events(&mut bg.buffered_events);
                             super::apply_session_snapshot(
                                 &mut bg.session,
-                                snapshot_to_core(snapshot.as_ref()),
+                                snapshot.as_ref().clone(),
                             );
                             bg.summary = session_summary(&bg.session);
                             bg.state = background_state_for_stop_reason(reason);
@@ -840,8 +839,7 @@ impl BgRuntimeManager {
                     if let CompactionCompletion::Completed(outcome) = &completion {
                         if outcome.committed {
                             if let Some(snapshot) = outcome.committed_snapshot.as_deref() {
-                                let core_snapshot = snapshot_to_core(snapshot);
-                                super::apply_session_snapshot(&mut bg.session, core_snapshot);
+                                super::apply_session_snapshot(&mut bg.session, snapshot.clone());
                                 // The background CodingRuntime owns native persistence.
                             } else {
                                 failed = true;
@@ -1151,10 +1149,7 @@ mod tests {
     #[test]
     fn background_turn_complete_updates_slot_to_done_and_messages() {
         use crate::event_loop::ui_event::UiTurnStopReason as TurnStopReason;
-        use atomcode_core::conversation::{
-            message::{Message, Role},
-            ConversationSnapshot,
-        };
+        use atomcode_kernel::message::{Message, SessionSnapshot};
 
         let mut slots = BackgroundSlots::new(16);
         let mut session = Session::default_session(PathBuf::from("/tmp/project"));
@@ -1171,10 +1166,7 @@ mod tests {
                 turn_count: 1,
                 tool_call_count: 0,
                 stop_reason: TurnStopReason::Natural,
-                snapshot: ConversationSnapshot {
-                    messages: vec![Message::new(Role::User, "task")],
-                    cold_summaries: Vec::new(),
-                },
+                snapshot: SessionSnapshot::new(vec![Message::user("task")]),
             },
         );
 
@@ -1201,7 +1193,7 @@ mod tests {
                 turn_count: 1,
                 tool_call_count: 0,
                 stop_reason: TurnStopReason::TurnLimit,
-                snapshot: Default::default(),
+                snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
             },
         );
 
@@ -1222,7 +1214,7 @@ mod tests {
             1,
             &AgentEvent::Error {
                 error: "provider diagnostic".into(),
-                snapshot: Default::default(),
+                snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
             },
         );
 
@@ -1263,7 +1255,7 @@ mod tests {
         let slot = &manager.backgrounds.slots[0];
         assert_eq!(slot.state, RuntimeState::Done);
         assert_eq!(slot.session.messages.len(), 1);
-        assert_eq!(slot.session.messages[0].text(), Some("native result"));
+        assert_eq!(slot.session.messages[0].text.as_str(), "native result");
     }
 
     #[test]
@@ -1311,8 +1303,8 @@ mod tests {
         }));
         assert_eq!(resumed.resumed_session.messages.len(), 1);
         assert_eq!(
-            resumed.resumed_session.messages[0].text(),
-            Some("approve this")
+            resumed.resumed_session.messages[0].text.as_str(),
+            "approve this"
         );
     }
 
@@ -1809,7 +1801,7 @@ mod tests {
 
         assert_eq!(loaded.id, id);
         assert_eq!(loaded.name, "second");
-        assert_eq!(loaded.messages[0].text(), Some("second"));
+        assert_eq!(loaded.messages[0].text.as_str(), "second");
     }
 
     #[test]
@@ -1960,7 +1952,7 @@ mod tests {
 
         let messages = &manager.backgrounds.slots[0].session.messages;
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].text(), Some("after compact"));
+        assert_eq!(messages[0].text.as_str(), "after compact");
         assert_eq!(
             manager.backgrounds().list_rows()[0].state,
             RuntimeState::Idle

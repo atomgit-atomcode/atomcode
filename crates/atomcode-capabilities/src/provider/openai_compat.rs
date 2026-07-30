@@ -17,7 +17,7 @@
 
 use super::reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
 use super::retry::{self, RetryPolicy};
-use super::sign::RequestSigner;
+use super::sign::{RequestSigner, RequestSigningError};
 use async_trait::async_trait;
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider, ReasoningEffort, ToolChoice};
@@ -259,7 +259,11 @@ fn build_http_client_inner(
     // and SSL_CERT_FILE on top, additively and best-effort. This is the DEFAULT
     // v2 provider path. Mirrors `core::provider::add_trusted_roots` — kept
     // crate-local because capabilities does not depend on core.
-    if trust_os_roots {
+    // Skip the rustls root-layering on Windows: the native-tls (SChannel) default backend
+    // trusts the Windows system store natively, and re-feeding certs through native-tls's
+    // parser risks rejecting one rustls accepted. Runtime `cfg!` keeps the fn referenced
+    // (no dead_code) while compiling the call out on Windows.
+    if trust_os_roots && !cfg!(target_os = "windows") {
         builder = add_trusted_roots(builder);
     }
     if skip_tls_verify {
@@ -459,6 +463,7 @@ impl LlmProvider for OpenAiCompatProvider {
         // the initial open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = match open_stream(
             &client,
             &url,
@@ -467,6 +472,7 @@ impl LlmProvider for OpenAiCompatProvider {
             &api_key,
             &session_id,
             &policy,
+            rate_limit_retry_owner,
         )
         .await
         {
@@ -533,9 +539,14 @@ impl LlmProvider for OpenAiCompatProvider {
                                 // A body that died mid-read on a half-closed pooled socket
                                 // is the canonical poisoned-pool trigger. Rebuild BEFORE the
                                 // reopen so its FIRST attempt gets a fresh (empty) pool instead
-                                // of re-grabbing the dead socket. Only for the transient-transport
-                                // class — a logical/decode failure isn't cured by a new pool.
-                                if retry::chain_has_transient_io(&e) {
+                                // of re-grabbing the dead socket. Both the transient-transport
+                                // class and a TLS record-corruption alert (BadRecordMac/DecryptError)
+                                // poison the pool this way; a logical/decode failure isn't cured by a
+                                // new pool. (The reopened `open_stream` additionally escalates to
+                                // managed TLS-1.2 on its first OPEN-path corruption.)
+                                if retry::chain_has_transient_io(&e)
+                                    || retry::chain_has_tls_corruption(&e)
+                                {
                                     if let Err(rebuild_error) = client.rebuild(
                                         atomcode_config::tls::should_cap_url(&url),
                                     ) {
@@ -544,7 +555,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                     }
                                 }
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy).await
+                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
@@ -580,6 +591,19 @@ impl LlmProvider for OpenAiCompatProvider {
     }
 }
 
+/// The uniform "your session expired, re-run `/login`" terminal error surfaced
+/// when auth recovery cannot refresh the rejected credential (both the "refresh
+/// rejected" and the "a second 401 after recovery" paths).
+fn authentication_expired_error(code: u16) -> ProviderError {
+    ProviderError {
+        retryable: false,
+        message: atomcode_config::i18n::t(atomcode_config::i18n::Msg::ChatAuthExpired).into_owned(),
+        http_status: Some(code),
+        code: Some("authentication_expired".to_string()),
+        ..Default::default()
+    }
+}
+
 /// Open one chat/completions stream, retrying the OPEN (transient status /
 /// transport) per `policy`. Builds the request fresh each attempt so a signer
 /// (if any) re-auths with a new nonce/timestamp. Returns the live `Response` on
@@ -593,9 +617,11 @@ async fn open_stream(
     api_key: &str,
     session_id: &str,
     policy: &RetryPolicy,
+    rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     let mut tls12_probe = false;
+    let mut auth_recovery_attempted = false;
     loop {
         // Take the CURRENT client each attempt: a transport-error retry below
         // rebuilds it, so the retried attempt gets a fresh (empty) pool.
@@ -604,7 +630,7 @@ async fn open_stream(
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body_bytes.to_vec());
-        match signer {
+        let signed_auth = match signer {
             Some(signer) => {
                 let auth = signer.sign(body_bytes).map_err(|error| ProviderError {
                     retryable: false,
@@ -613,12 +639,16 @@ async fn open_stream(
                     ..Default::default()
                 })?;
                 req = req.bearer_auth(auth.bearer.as_deref().unwrap_or(api_key));
-                for (name, value) in auth.headers {
-                    req = req.header(name, value);
+                for (name, value) in &auth.headers {
+                    req = req.header(name.as_str(), value.as_str());
                 }
+                Some(auth)
             }
-            None => req = req.bearer_auth(api_key),
-        }
+            None => {
+                req = req.bearer_auth(api_key);
+                None
+            }
+        };
         // Stable session id → lets the forwarding gateway pin this conversation to
         // one upstream for prefix-cache affinity. Empty ⇒ omitted (sub-agent/summary).
         if !session_id.is_empty() {
@@ -633,7 +663,50 @@ async fn open_stream(
                 }
                 let code = resp.status().as_u16();
                 if !resp.status().is_success() {
-                    if retry::is_retryable_status(code) && attempt < policy.max_attempts {
+                    if code == reqwest::StatusCode::UNAUTHORIZED.as_u16() {
+                        if let (Some(signer), Some(rejected)) = (signer, signed_auth.as_ref()) {
+                            if !auth_recovery_attempted {
+                                auth_recovery_attempted = true;
+                                match signer.recover_unauthorized(rejected).await {
+                                    Ok(true) => {
+                                        let _ = resp.bytes().await;
+                                        continue;
+                                    }
+                                    Ok(false) => {}
+                                    Err(RequestSigningError::ReauthenticationRequired(_)) => {
+                                        let _ = resp.bytes().await;
+                                        return Err(authentication_expired_error(code));
+                                    }
+                                    Err(RequestSigningError::RecoveryTransient(message)) => {
+                                        let _ = resp.bytes().await;
+                                        return Err(ProviderError {
+                                            retryable: true,
+                                            message,
+                                            code: Some(
+                                                "authentication_refresh_transient".to_string(),
+                                            ),
+                                            ..Default::default()
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = resp.bytes().await;
+                                        return Err(ProviderError {
+                                            retryable: false,
+                                            message: error.to_string(),
+                                            code: Some(error.code().to_string()),
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+                            } else {
+                                let _ = resp.bytes().await;
+                                return Err(authentication_expired_error(code));
+                            }
+                        }
+                    }
+                    if retry::should_retry_open_status(code, rate_limit_retry_owner)
+                        && attempt < policy.max_attempts
+                    {
                         let wait = retry::parse_retry_after(resp.headers())
                             .unwrap_or_else(|| retry::compute_backoff(attempt, policy));
                         tokio::time::sleep(wait).await;
@@ -663,24 +736,50 @@ async fn open_stream(
             }
             Err(e) => {
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
-                    // A managed-endpoint connect failure is eligible for one
-                    // TLS-1.2 probe. The latch is set only after that probe gets
-                    // an HTTP response; unrelated endpoints never auto-downgrade.
-                    let try_tls12 =
-                        atomcode_config::tls::should_try_fallback(url, was_capped, e.is_connect());
+                    let tls_corruption = retry::chain_has_tls_corruption(&e);
+                    // A managed-endpoint TLS-1.2 probe is warranted by either a
+                    // connect failure (a TLS-1.3-hostile middlebox resetting the
+                    // handshake) OR a post-handshake record corruption
+                    // (BadRecordMac/DecryptError) — both curable by a 1.2 cap.
+                    // The corruption trigger needs no is_connect: it lands AFTER
+                    // the handshake. We escalate on the FIRST corruption rather
+                    // than a repeat — a MAC failure is active record corruption (a
+                    // stale pooled socket surfaces as ConnectionReset via
+                    // chain_has_transient_io, NOT a MAC failure), and tls.rs
+                    // already treats 1.2 as the known-good ceiling for these
+                    // managed endpoints, so there's nothing to gain by burning an
+                    // attempt on 1.3 first and escalating immediately stays robust
+                    // regardless of max_attempts. The latch is set only after the
+                    // probe gets an HTTP response; unrelated endpoints never
+                    // auto-downgrade. rebuild(true) applies BOTH a fresh pool and
+                    // the 1.2 cap, curing the stale-session and hostile-middlebox
+                    // flavors at once.
+                    let try_tls12 = atomcode_config::tls::should_try_fallback(
+                        url,
+                        was_capped,
+                        e.is_connect() || tls_corruption,
+                    );
                     let wait = retry::compute_backoff(attempt, policy);
                     tokio::time::sleep(wait).await;
-                    // Rebuild the client ONLY for the half-open-reuse class (a stale
-                    // pooled socket surfaces as ConnectionReset/EOF/TimedOut in the
-                    // chain) — that's the class a fresh pool actually cures. A plain
-                    // connect-refused / DNS / slow-gateway retry is NOT fixed by a new
-                    // pool, so rebuilding there would only churn a healthy pool (extra
-                    // TLS handshakes) and re-read proxy env on every attempt. Safe on
-                    // the OPEN path: no bytes consumed; a rebuild failure keeps the old
-                    // client. Rebuild failures are returned explicitly.
-                    if try_tls12 || retry::chain_has_transient_io(&e) {
-                        client.rebuild(try_tls12 || was_capped)?;
-                        tls12_probe = try_tls12;
+                    // Rebuild the client for the classes a fresh pool actually
+                    // cures: the half-open-reuse class (a stale pooled socket
+                    // surfaces as ConnectionReset/EOF/TimedOut) and TLS record
+                    // corruption (a desynced/mangled pooled TLS session). A plain
+                    // connect-refused / DNS / slow-gateway retry is NOT fixed by a
+                    // new pool, so rebuilding there would only churn a healthy pool
+                    // (extra TLS handshakes) and re-read proxy env on every attempt.
+                    // Safe on the OPEN path: no bytes consumed; a rebuild failure
+                    // keeps the old client and is returned explicitly.
+                    if try_tls12 || retry::chain_has_transient_io(&e) || tls_corruption {
+                        // `capped` = is the REBUILT client at a TLS-1.2 ceiling.
+                        // Carry it into `tls12_probe` (not bare `try_tls12`) so the
+                        // flag stays sticky while the client remains capped: if a
+                        // follow-up corruption retry keeps the 1.2 cap without
+                        // re-triggering `try_tls12`, a later success must still
+                        // latch the working downgrade for future clients.
+                        let capped = try_tls12 || was_capped;
+                        client.rebuild(capped)?;
+                        tls12_probe = capped;
                     }
                     attempt += 1;
                     continue;
@@ -890,7 +989,9 @@ fn build_request_body(
     Value::Object(body)
 }
 
-fn reason_effort_applicable(model: &str) -> bool {
+/// Whether a model accepts a top-level `reasoning_effort` control. Exposed so a UI
+/// (the TUI effort hint) and the request-body gate can never diverge.
+pub fn reason_effort_applicable(model: &str) -> bool {
     // Only DeepSeek-V4 takes a top-level `reasoning_effort`; others reject/ignore it.
     model.to_ascii_lowercase().contains("deepseek-v4")
 }
@@ -1397,6 +1498,224 @@ struct PromptTokensDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{RequestSigningError, SignedAuth};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct RecoveringSigner {
+        generation: AtomicUsize,
+        recoveries: AtomicUsize,
+    }
+
+    #[derive(Clone, Copy)]
+    enum RecoveryFailure {
+        Transient,
+        ReauthenticationRequired,
+        Local,
+    }
+
+    struct FailingRecoverySigner(RecoveryFailure);
+
+    #[async_trait]
+    impl RequestSigner for FailingRecoverySigner {
+        fn sign(&self, _body: &[u8]) -> Result<SignedAuth, RequestSigningError> {
+            Ok(SignedAuth {
+                bearer: Some("rejected-token".to_string()),
+                ..Default::default()
+            })
+        }
+
+        async fn recover_unauthorized(
+            &self,
+            _rejected: &SignedAuth,
+        ) -> Result<bool, RequestSigningError> {
+            Err(match self.0 {
+                RecoveryFailure::Transient => {
+                    RequestSigningError::RecoveryTransient("broker unavailable".to_string())
+                }
+                RecoveryFailure::ReauthenticationRequired => {
+                    RequestSigningError::ReauthenticationRequired("refresh rejected".to_string())
+                }
+                RecoveryFailure::Local => {
+                    RequestSigningError::SigningFailed("auth store unavailable".to_string())
+                }
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RequestSigner for RecoveringSigner {
+        fn sign(&self, _body: &[u8]) -> Result<SignedAuth, RequestSigningError> {
+            Ok(SignedAuth {
+                bearer: Some(format!("token-{}", self.generation.load(Ordering::SeqCst))),
+                ..Default::default()
+            })
+        }
+
+        async fn recover_unauthorized(
+            &self,
+            rejected: &SignedAuth,
+        ) -> Result<bool, RequestSigningError> {
+            assert_eq!(rejected.bearer.as_deref(), Some("token-0"));
+            self.recoveries.fetch_add(1, Ordering::SeqCst);
+            self.generation.store(1, Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn refreshable_signer_recovers_one_401_and_resigns_retry() {
+        let server = MockServer::start().await;
+        let responses = std::sync::Arc::new(AtomicUsize::new(0));
+        let sequence = responses.clone();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if sequence.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(401).set_body_string("expired")
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: [DONE]\n\n")
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let signer = std::sync::Arc::new(RecoveringSigner {
+            generation: AtomicUsize::new(0),
+            recoveries: AtomicUsize::new(0),
+        });
+        let mut cfg =
+            OpenAiCompatConfig::new("unused", format!("{}/v1", server.uri()), "test-model");
+        cfg.request_signer = Some(signer.clone());
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .expect("401 recovery should reopen the request");
+        let events: Vec<_> = stream.collect().await;
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done { .. })));
+        assert_eq!(signer.recoveries.load(Ordering::SeqCst), 1);
+
+        let requests = server.received_requests().await.unwrap();
+        let authorization: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                request.headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(authorization, ["Bearer token-0", "Bearer token-1"]);
+    }
+
+    #[tokio::test]
+    async fn refreshable_signer_stops_after_second_401() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let signer = std::sync::Arc::new(RecoveringSigner {
+            generation: AtomicUsize::new(0),
+            recoveries: AtomicUsize::new(0),
+        });
+        let mut cfg =
+            OpenAiCompatConfig::new("unused", format!("{}/v1", server.uri()), "test-model");
+        cfg.request_signer = Some(signer.clone());
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+
+        let error = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .err()
+            .expect("a second 401 must terminate recovery");
+        assert_eq!(error.http_status, Some(401));
+        assert_eq!(error.code.as_deref(), Some("authentication_expired"));
+        assert!(error.message.contains("/login"));
+        assert_eq!(signer.recoveries.load(Ordering::SeqCst), 1);
+    }
+
+    async fn recovery_failure(kind: RecoveryFailure) -> ProviderError {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut cfg =
+            OpenAiCompatConfig::new("unused", format!("{}/v1", server.uri()), "test-model");
+        cfg.request_signer = Some(std::sync::Arc::new(FailingRecoverySigner(kind)));
+        OpenAiCompatProvider::new(cfg)
+            .unwrap()
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .err()
+            .expect("recovery failure must terminate this OPEN")
+    }
+
+    #[tokio::test]
+    async fn recovery_failure_preserves_transient_permanent_and_local_semantics() {
+        let transient = recovery_failure(RecoveryFailure::Transient).await;
+        assert!(transient.retryable);
+        assert_eq!(
+            transient.code.as_deref(),
+            Some("authentication_refresh_transient")
+        );
+        assert!(transient.message.contains("broker unavailable"));
+
+        let permanent = recovery_failure(RecoveryFailure::ReauthenticationRequired).await;
+        assert!(!permanent.retryable);
+        assert_eq!(permanent.code.as_deref(), Some("authentication_expired"));
+        assert!(permanent.message.contains("/login"));
+
+        let local = recovery_failure(RecoveryFailure::Local).await;
+        assert!(!local.retryable);
+        assert_eq!(local.code.as_deref(), Some("request_signing_failed"));
+        assert!(local.message.contains("auth store unavailable"));
+    }
+
+    async fn open_429_request_count(
+        owner: atomcode_kernel::provider::RateLimitRetryOwner,
+    ) -> usize {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let mut cfg = OpenAiCompatConfig::new("test", format!("{}/v1", server.uri()), "test-model");
+        cfg.retry = RetryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        };
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+        let mut options = ChatOptions::default();
+        options.rate_limit_retry_owner = owner;
+        let result = provider.chat_stream(&[], &[], &options).await;
+        assert!(matches!(result, Err(e) if e.http_status == Some(429)));
+        server.received_requests().await.unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn per_call_owner_controls_real_429_open_retries() {
+        use atomcode_kernel::provider::RateLimitRetryOwner::{Kernel, Provider};
+
+        assert_eq!(open_429_request_count(Provider).await, 2);
+        assert_eq!(open_429_request_count(Kernel).await, 1);
+    }
 
     // Classification lock for every supported vision naming rule plus a
     // representative text-only negative.
@@ -1800,6 +2119,7 @@ mod tests {
             max_tokens: None,
             temperature: Some(0.5),
             tool_choice: ToolChoice::Required,
+            rate_limit_retry_owner: Default::default(),
         };
         let tools = vec![ToolDef {
             name: "read".into(),

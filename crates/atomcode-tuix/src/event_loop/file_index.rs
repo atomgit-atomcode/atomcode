@@ -13,8 +13,8 @@ use ignore::WalkBuilder;
 
 /// Well-known agent/CLI config directories that must appear in the `@`
 /// index even when `.gitignore` excludes them. These are exactly the dirs
-/// atomcode already treats as skill/command sources (see
-/// `atomcode_core::skill` and `standard_skill_dirs`), and users routinely
+/// atomcode already treats as skill/command sources (see the skills registry
+/// and `standard_skill_dirs`), and users routinely
 /// gitignore them while still wanting to `@`-reference the skills/config
 /// inside. The general gitignore filter — which keeps `node_modules/`,
 /// `target/`, build output, etc. out of the popup — stays intact for

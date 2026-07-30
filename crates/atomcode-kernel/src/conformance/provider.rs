@@ -108,6 +108,7 @@ pub async fn check(provider: Arc<dyn LlmProvider>) -> ConformanceReport {
         max_tokens: Some(256),
         temperature: Some(0.2),
         tool_choice: ToolChoice::Required,
+        rate_limit_retry_owner: Default::default(),
     };
     let opts_fut = async { provider.chat_stream(&messages, &tools, &loud).await };
     match with_timeout(DEFAULT_CHECK_TIMEOUT, catch_async(opts_fut)).await {

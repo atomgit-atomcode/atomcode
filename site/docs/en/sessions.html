@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.2</span>
+    <span class="dhdr-ver">v5.0.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -159,6 +159,12 @@
         <strong>Where the boundary is</strong>
         <p><code>/undo</code> rewinds conversation memory <em>only</em> — it does <strong>not</strong> restore files on disk. If the AI edited code during those turns, those changes stay in your working tree; use <code>/diff</code> to review and revert them manually, or rely on git. You can't <code>/undo</code> while a turn is in flight — press Esc to cancel it first.</p>
       </div>
+
+      <h2>Safe rollback with <code>/rewind</code></h2>
+      <p><code>/rewind</code> lists recent user prompts and lets you choose the scope: conversation only, code only, or both conversation and code. Code rollback requires a Git worktree and is confirmed before it runs. For a simple one-turn conversation rollback, <code>/undo</code> remains the lighter option.</p>
+
+      <h2>Recovery after an interrupted exit</h2>
+      <p>AtomCode saves temporary progress while a turn is running. After a terminal crash or network interruption, <code>/resume</code> attempts to restore the last user prompt, generated response, and tool-call progress instead of falling back to the previous completed turn. Pending permissions and questions are never auto-approved.</p>
 
       <h2>Inspecting and trimming cost</h2>
       <pre><code>/cost</code></pre>

@@ -1,5 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+/// Optional local estimate in USD per million tokens. Absence means pricing is
+/// unknown; an explicitly configured all-zero value means the model is free.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ProviderPricing {
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    #[serde(default)]
+    pub cached_input_per_million: f64,
+}
+
+impl ProviderPricing {
+    pub fn validated(self) -> Option<Self> {
+        [
+            self.input_per_million,
+            self.output_per_million,
+            self.cached_input_per_million,
+        ]
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
+        .then_some(self)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     #[serde(rename = "type")]
@@ -77,6 +100,158 @@ pub struct ProviderConfig {
     /// tier; fewer than 2 (or a non-participating host) ⇒ the subagent uses the current model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capable_model: Option<i64>,
+    /// Optional price snapshot used for local `/cost` estimates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ProviderPricing>,
+}
+
+/// A provider *account*: a reusable connection + credential identity (new schema,
+/// design §3.2). `provider` references a preset id (see
+/// [`super::provider_preset`]) or a custom-compatible preset. One account can
+/// back many [`ModelProfileConfig`]s, so two models from the same vendor no
+/// longer duplicate `type` / `base_url` / `api_key`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAccountConfig {
+    /// Preset id or custom protocol preset (`openai-compatible` /
+    /// `anthropic-compatible`).
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Overrides the preset's default base URL. Required for custom-compatible
+    /// providers (which have no preset default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_tls_verify: bool,
+    /// Enterprise/self-hosted control-plane URL for OAuth-style providers
+    /// (reserved; unused until an OAuth adapter lands).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enterprise_url: Option<String>,
+    /// Runtime-only account (e.g. OAuth `/login`); never persisted to disk.
+    #[serde(skip)]
+    pub ephemeral: bool,
+}
+
+/// A model *profile*: a selectable model plus its model-specific behavior (new
+/// schema, design §3.3). `account` references a [`ProviderAccountConfig`]; the
+/// profile owns only per-model limits, so an account can expose several models.
+/// The recommended selection-id key is `<account>/<model-or-alias>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfileConfig {
+    pub account: String,
+    /// Wire model name sent to the provider (kept separate from the selection id
+    /// so aliases / deployment names are supported).
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Optional per-model system-prompt override (carried through resolution,
+    /// design §14.5). Projected from a legacy provider's `system_prompt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default = "default_context_window")]
+    pub context_window: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+    /// Per-model capability rank for the `task` subagent's strong/weak routing
+    /// (design §14.2). Higher = more capable; unset ⇒ does not participate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capable_model: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_keep: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_history: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ProviderPricing>,
+}
+
+/// One flattened, immutable resolution of a model selection (design §3.4). This
+/// is the single value provider construction consumes — accounts, presets,
+/// legacy entries, and environment variables are all resolved away by
+/// [`super::Config::resolve_model`]. Carries everything a provider adapter needs
+/// (including the per-model dynamic `base_url` and `system_prompt`, §14.5) but
+/// owns no runtime state. Never serialized; `Debug` redacts the api key.
+#[derive(Clone)]
+pub struct ResolvedModelConfig {
+    pub selection_id: String,
+    pub account_id: String,
+    /// Preset id (or custom protocol id) the account referenced.
+    pub provider_id: String,
+    /// Wire protocol string the provider factory dispatches on.
+    pub provider_type: String,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub model: String,
+    pub context_window: usize,
+    pub max_tokens: Option<usize>,
+    pub system_prompt: Option<String>,
+    pub user_agent: Option<String>,
+    pub skip_tls_verify: bool,
+    pub thinking_type: Option<String>,
+    pub thinking_keep: Option<String>,
+    pub reasoning_history: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub thinking_enabled: Option<bool>,
+    pub thinking_budget: Option<u32>,
+    pub capable_model: Option<i64>,
+    pub pricing: Option<ProviderPricing>,
+}
+
+impl std::fmt::Debug for ResolvedModelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedModelConfig")
+            .field("selection_id", &self.selection_id)
+            .field("account_id", &self.account_id)
+            .field("provider_id", &self.provider_id)
+            .field("provider_type", &self.provider_type)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("model", &self.model)
+            .field("context_window", &self.context_window)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvedModelConfig {
+    /// Reconstruct a legacy-shaped [`ProviderConfig`] from this resolution.
+    /// Lets consumers that still key off `config.providers` (the daemon live
+    /// runtime, the TUI `/think`/`/effort` readers) accept a new-schema or
+    /// folded-CodingPlan selection without a full schema migration. `ephemeral`
+    /// is always `false` — a resolved selection is a persisted/projected model,
+    /// never a runtime-only provider handle.
+    pub fn to_provider_config(&self) -> ProviderConfig {
+        ProviderConfig {
+            provider_type: self.provider_type.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            system_prompt: self.system_prompt.clone(),
+            user_agent: self.user_agent.clone(),
+            context_window: self.context_window,
+            max_tokens: self.max_tokens,
+            thinking_type: self.thinking_type.clone(),
+            thinking_keep: self.thinking_keep.clone(),
+            reasoning_history: self.reasoning_history.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            thinking_enabled: self.thinking_enabled,
+            thinking_budget: self.thinking_budget,
+            skip_tls_verify: self.skip_tls_verify,
+            ephemeral: false,
+            capable_model: self.capable_model,
+            pricing: self.pricing,
+        }
+    }
 }
 
 impl ProviderConfig {
@@ -224,6 +399,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pricing_is_optional_and_explicit_zero_means_free() {
+        let unknown: ProviderConfig = toml::from_str(
+            r#"
+type = "openai"
+model = "custom"
+base_url = "https://example.test/v1"
+"#,
+        )
+        .unwrap();
+        assert_eq!(unknown.pricing, None);
+
+        let free: ProviderConfig = toml::from_str(
+            r#"
+type = "openai"
+model = "custom"
+base_url = "https://example.test/v1"
+[pricing]
+input_per_million = 0
+output_per_million = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            free.pricing,
+            Some(ProviderPricing {
+                input_per_million: 0.0,
+                output_per_million: 0.0,
+                cached_input_per_million: 0.0,
+            })
+        );
+        assert!(ProviderPricing {
+            input_per_million: -1.0,
+            output_per_million: 0.0,
+            cached_input_per_million: 0.0,
+        }
+        .validated()
+        .is_none());
+    }
+
+    #[test]
     fn accepts_images_false_for_text_only_model() {
         // Regression for the user's GLM-5.1 case: heuristic rejects
         // text-only models so the TUI's Ctrl+V handler refuses image
@@ -324,6 +539,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            pricing: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -352,6 +568,7 @@ mod tests {
             skip_tls_verify: true,
             ephemeral: false,
             capable_model: None,
+            pricing: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -377,6 +594,7 @@ mod tests {
         assert!(s.contains("capable_model = 1"), "set rank must serialize");
         let none_cfg = ProviderConfig {
             capable_model: None,
+            pricing: None,
             ..cfg
         };
         let s2 = toml::to_string(&none_cfg).expect("serialize");
@@ -427,6 +645,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            pricing: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-from-env-var".to_string()));
@@ -454,6 +673,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            pricing: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-custom-123".to_string()));
@@ -481,6 +701,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            pricing: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-openai-std".to_string()));

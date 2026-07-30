@@ -8,9 +8,7 @@ default = []
 distro-pm = ["atomcode-updater/distro-pm"]
 
 [dependencies]
-# Config/locale systems (leaf crate, extracted from core) — used directly, not via
-# the transitional atomcode_core::{config,locale} re-export shims. (proxy stays on
-# atomcode-core: its module keeps the reqwest-applying policy fns.)
+# Config and locale systems are owned by the leaf config crate.
 atomcode-config = { path = "../atomcode-config" }
 # Self-update mechanics (leaf crate, extracted from core).
 atomcode-updater = { path = "../atomcode-updater" }
@@ -18,7 +16,6 @@ atomcode-updater = { path = "../atomcode-updater" }
 # server + password modal via that path.
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools", "memory", "notify", "setup", "plugin", "mcp"] }
 atomcode-auth = { path = "../atomcode-auth" }
-atomcode-core = { path = "../atomcode-core" }
 atomcode-codingplan = { path = "../atomcode-codingplan" }
 # INIT_PROMPT: LLM-driven /init submits this constant as a user turn so the
 # coding agent explores the repo and writes AGENTS.md via its tools.

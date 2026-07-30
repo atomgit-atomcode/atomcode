@@ -15,12 +15,13 @@ use serde::{Deserialize, Serialize};
 /// knob onto whatever its backend speaks (e.g. `reasoning_effort` → OpenAI's
 /// `reasoning_effort` string vs Anthropic's thinking `budget_tokens`), and a given
 /// adapter MAY IGNORE any option it does not support. The kernel never interprets
-/// these — it only forwards them.
+/// these model knobs — it only forwards them. The runtime-only retry owner below
+/// is a lifecycle sideband and is deliberately excluded from serialization.
 ///
 /// `ChatOptions::default()` is a NEUTRAL request: every tunable is `None` and
 /// `tool_choice` is `ToolChoice::Auto` — i.e. "no opinion", the model decides. An
-/// adapter receiving the default should behave exactly as it did before this slot
-/// existed.
+/// adapter receiving the default uses provider-owned retry behavior, which also
+/// preserves direct consumers that do not have a kernel turn lifecycle.
 ///
 /// PREFIX-CACHE: these are a SIDEBAND request parameter, NOT part of the messages
 /// or tool block. They do NOT enter the conversation history bytes, so they never
@@ -39,6 +40,21 @@ pub struct ChatOptions {
     /// Whether/how the model must use tools this call. `Auto` (default) = no
     /// opinion — the model decides.
     pub tool_choice: ToolChoice,
+    /// Which layer owns HTTP 429 retries for this call. Direct provider
+    /// consumers keep the provider default; the kernel turn loop overrides this
+    /// so waits remain cancellable and visible.
+    #[serde(skip)]
+    pub rate_limit_retry_owner: RateLimitRetryOwner,
+}
+
+/// Per-call ownership of HTTP 429 retry policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RateLimitRetryOwner {
+    /// The provider adapter may retry a 429 within its bounded OPEN retry loop.
+    #[default]
+    Provider,
+    /// Surface the first 429 so the kernel can apply lifecycle-aware policy.
+    Kernel,
 }
 
 /// NEUTRAL reasoning/thinking effort level. The provider adapter maps it onto the
@@ -180,10 +196,22 @@ mod tests {
             max_tokens: Some(1000),
             temperature: Some(0.2),
             tool_choice: ToolChoice::Required,
+            rate_limit_retry_owner: RateLimitRetryOwner::Provider,
         };
         let back: ChatOptions =
             serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
         assert_eq!(full, back, "populated ChatOptions must serde round-trip");
+
+        let mut runtime = full;
+        runtime.rate_limit_retry_owner = RateLimitRetryOwner::Kernel;
+        let json = serde_json::to_string(&runtime).unwrap();
+        assert!(!json.contains("rate_limit_retry_owner"));
+        let back: ChatOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.rate_limit_retry_owner,
+            RateLimitRetryOwner::Provider,
+            "runtime retry ownership must not leak into persisted/wire options"
+        );
     }
 
     #[test]

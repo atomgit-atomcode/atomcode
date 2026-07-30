@@ -10,12 +10,12 @@
 #                        else ~/.local/bin). On HarmonyOS as non-root, default is ~/.local/bin.
 # IMPORTANT: when changing install paths, the PATH-rc edit format, or filenames here,
 # also update scripts/uninstall.sh AND
-# crates/atomcode-core/src/uninstall/paths.rs. The CI parity test guards
+# crates/atomcode-cli/src/uninstall/paths.rs. The CI parity test guards
 # the manifest, but binary path / rc-edit format are not checked.
 set -eu
 
 # Fallback version used only when ATOMCODE_VERSION is unset and the API lookup fails.
-DEFAULT_VERSION="v5.0.2"
+DEFAULT_VERSION="v5.0.3"
 REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 REPO_LATEST_API="https://api.atomgit.com/api/v5/repos/atomgit_atomcode/atomcode/releases/latest"
 

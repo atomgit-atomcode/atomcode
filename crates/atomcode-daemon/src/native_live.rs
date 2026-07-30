@@ -54,6 +54,12 @@ pub fn register_embedded_runtime(
     *EMBEDDED_BINDING
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some(binding.clone());
+    // Seed the daemon's project state to the shared TUI's working dir so the webui footer
+    // + session list match it. A no-op if the server hasn't started yet (DAEMON_PROJECT is
+    // None) — that case is covered by `init_project_state` reading the embedded binding at
+    // startup; this call handles an ALREADY-running (persistent) daemon, where the embed
+    // happens after init. `/cd` keeps it current afterward via the same `live_set_working_dir`.
+    crate::live_set_working_dir(binding.working_dir.clone());
     Ok(binding)
 }
 
@@ -133,6 +139,19 @@ pub async fn submit_confirmed(
     hub().submit_confirmed(input).await
 }
 
+/// Submit `runtime_input` to the model while echoing `echo_input` to the live view
+/// (see [`crate::live_hub::LiveViewHub::submit_confirmed_with_echo`]). Used by the
+/// webui image path so the VL caption feeds the model but the user's original
+/// message + image is what displays.
+pub async fn submit_confirmed_with_echo(
+    runtime_input: UserInput,
+    echo_input: UserInput,
+) -> Result<atomcode_coding::SubmitReceipt, HubError> {
+    hub()
+        .submit_confirmed_with_echo(runtime_input, echo_input)
+        .await
+}
+
 pub fn accept_local_input(input: UserInput) -> Result<(), HubError> {
     hub().accept_local_input(input)
 }
@@ -194,7 +213,7 @@ pub fn provider_fingerprint(
 ) -> Result<String, String> {
     use sha2::{Digest, Sha256};
 
-    if !config.providers.contains_key(provider_name) {
+    if !config.selection_exists(provider_name) {
         return Err(format!("provider {provider_name:?} not found"));
     }
     let mut normalized = config.clone();
@@ -229,9 +248,7 @@ pub async fn resume_session(
         _ => crate::legacy_convert::prepare_catalog_session_resume_any_project(&session_id)
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?
             .ok_or_else(|| {
-                HubError::RuntimeRejected(format!(
-                    "session {session_id:?} not found in catalog"
-                ))
+                HubError::RuntimeRejected(format!("session {session_id:?} not found in catalog"))
             })?,
     };
     let target_dir = PathBuf::from(&prepared.view.meta.working_dir);
@@ -300,6 +317,19 @@ fn load_snapshot(working_dir: &Path, session_id: &str) -> Result<SessionSnapshot
         .ok_or_else(|| format!("session {session_id:?} not found"))
 }
 
+async fn bind_after_mcp_ready<T, E>(
+    readiness: impl std::future::Future<Output = Result<(), E>>,
+    bind: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String>
+where
+    E: std::fmt::Debug,
+{
+    readiness
+        .await
+        .map_err(|error| format!("MCP readiness wait failed: {error:?}"))?;
+    bind()
+}
+
 pub async fn ensure_headless_runtime(
     working_dir: PathBuf,
     telemetry: Arc<Telemetry>,
@@ -351,7 +381,7 @@ pub async fn ensure_headless_runtime(
     let config =
         atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())
             .map_err(|error| error.to_string())?;
-    if !config.providers.contains_key(&provider_name) {
+    if !config.selection_exists(&provider_name) {
         return Err(format!("provider {provider_name:?} not found"));
     }
     let provider_fingerprint = provider_fingerprint(&config, &provider_name)?;
@@ -387,19 +417,33 @@ pub async fn ensure_headless_runtime(
         .set_mode(mode)
         .await
         .map_err(|error| format!("failed to set live mode: {error}"))?;
+
+    // Wait for initial MCP tools to be published to the mounted kernel catalog
+    // before the first turn. Without this, a headless
+    // runtime created by `atomcode.exe webui` (which has no pre-existing
+    // CodingRuntime from the TUI) would start its first turn before background
+    // MCP connections complete, making MCP tools invisible to the agent even
+    // though `/mcp/status` shows them as connected.
+    // Timeout prevents a stalled MCP server from blocking the first message.
     let session_id = session
         .map(|session| session.id)
         .ok_or_else(|| "live runtime started without a persistent session".to_string())?;
-    let binding = hub()
-        .bind_with_provider(
-            session_id.clone(),
-            working_dir.clone(),
-            provider_name,
-            provider_fingerprint,
-            initial_snapshot,
-            Arc::new(handle.clone()),
-        )
-        .map_err(|error| format!("live hub bind failed: {error:?}"))?;
+    let binding = bind_after_mcp_ready(
+        handle.wait_mcp_ready(atomcode_capabilities::mcp::CONNECT_TIMEOUT),
+        || {
+            hub()
+                .bind_with_provider(
+                    session_id.clone(),
+                    working_dir.clone(),
+                    provider_name,
+                    provider_fingerprint,
+                    initial_snapshot,
+                    Arc::new(handle.clone()),
+                )
+                .map_err(|error| format!("live hub bind failed: {error:?}"))
+        },
+    )
+    .await?;
     let event_binding = binding.clone();
     let event_handle = handle.clone();
     tokio::spawn(async move {
@@ -445,4 +489,47 @@ pub async fn ensure_headless_runtime(
     *owner = Some(HeadlessRuntime { binding, handle });
     drop(owner);
     join().map_err(|error| format!("live hub join failed: {error:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_after_mcp_ready;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn headless_bind_waits_for_mcp_catalog_readiness() {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel::<()>();
+        let bound = Arc::new(AtomicBool::new(false));
+        let bound_in_task = Arc::clone(&bound);
+
+        let bind_task = tokio::spawn(async move {
+            bind_after_mcp_ready(
+                async move {
+                    waiting_tx.send(()).unwrap();
+                    ready_rx.await.expect("readiness sender must stay alive");
+                    Ok::<(), &'static str>(())
+                },
+                || {
+                    bound_in_task.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        waiting_rx.await.unwrap();
+        assert!(
+            !bound.load(Ordering::Acquire),
+            "the live hub must remain unbound while MCP tools are unpublished"
+        );
+
+        ready_tx.send(()).unwrap();
+        bind_task.await.unwrap().unwrap();
+        assert!(
+            bound.load(Ordering::Acquire),
+            "the live hub should bind after MCP tools reach the catalog"
+        );
+    }
 }

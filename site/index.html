@@ -644,7 +644,7 @@
   <a class="hdr-logo" href="#top">
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span data-scramble>AtomCode</span>
-    <span class="ver" id="verBadge" title="当前版本">v5.0.2</span>
+    <span class="ver" id="verBadge" title="当前版本">v5.0.3</span>
   </a>
   <nav class="hdr-nav" id="hdrNav">
     <a href="#features" data-section="features" data-i18n="nav.features">功能</a>
@@ -824,10 +824,10 @@
     <article class="feat">
       <div class="icon">⎇</div>
       <h3 data-i18n="feat.atomgit.t">AtomGit 原生集成</h3>
-      <p data-i18n="feat.atomgit.d">AtomGit OAuth 一键登录、终端内 /issue 创建 Issue、企业微信扫码登录 —— 与开源生态无缝对接。</p>
+      <p data-i18n="feat.atomgit.d">AtomGit OAuth 一键登录、内置工具管理 Issue / PR / 仓库、企业微信扫码登录 —— 与开源生态无缝对接。</p>
       <div class="demo">
         <div class="gitcmd">
-          <div class="l1">› /issue create "auth callback 404"</div>
+          <div class="l1">› 为 auth callback 404 创建一个 AtomGit Issue</div>
           <div class="l2">✓ atomgit.com/.../atomcode/issues/124</div>
         </div>
       </div>
@@ -1108,7 +1108,7 @@
           <div class="wiz-body">
             <div class="wiz-step active" data-step="1">
               <div class="tt" data-i18n="wiz.s1.tt">第 1/3 步 · 欢迎</div>
-              <div class="qq" data-i18n="wiz.s1.qq">版本 v5.0.2 · 在终端里运行的 AI 编程代理</div>
+              <div class="qq" data-i18n="wiz.s1.qq">版本 v5.0.3 · 在终端里运行的 AI 编程代理</div>
               <ul class="intro-list">
                 <li data-i18n="wiz.s1.b1">多步骤 agent loop · 内置代码图工具</li>
                 <li data-i18n="wiz.s1.b2">兼容所有 OpenAI 风格 API</li>
@@ -1165,7 +1165,7 @@ try{
   else LANG=(navigator.language||'').toLowerCase().startsWith('zh')?'zh':'en';
 }catch(e){}
 
-const VERSION='v5.0.2';
+const VERSION='v5.0.3';
 
 const T={
   'nav.features':{zh:'功能',en:'Features'},
@@ -1231,8 +1231,8 @@ const T={
                    en:'Ctrl+V paste, Finder drag, iTerm2 path auto-detect — when the main model lacks vision, falls back to VL preprocessor (OCR + describe).'},
   'feat.images.demo':{zh:'📎 <b>Ctrl + V</b> 粘贴截图  ·  或拖入图片',en:'📎 <b>Ctrl + V</b> paste screenshot · or drop an image'},
   'feat.atomgit.t':{zh:'AtomGit 原生集成',en:'AtomGit Native Integration'},
-  'feat.atomgit.d':{zh:'AtomGit OAuth 一键登录、终端内 /issue 创建 Issue、企业微信扫码登录 —— 与开源生态无缝对接。',
-                    en:'AtomGit OAuth login, terminal /issue, WeCom QR login — seamless with the open-source ecosystem.'},
+  'feat.atomgit.d':{zh:'AtomGit OAuth 一键登录、内置工具管理 Issue / PR / 仓库、企业微信扫码登录 —— 与开源生态无缝对接。',
+                    en:'AtomGit OAuth login, built-in Issue / PR / repository tools, and WeCom QR login — seamless with the open-source ecosystem.'},
   'feat.eco.t':{zh:'Skills + Plugin 生态',en:'Skills + Plugin Ecosystem'},
   'feat.eco.d':{zh:'Skills 写你自己的斜杠命令；/plugin install <git-repo> 一键拿别人的命令、hook、skill —— 与 Claude Code 生态兼容。',
                 en:'Write your own slash commands as Skills; /plugin install <git-repo> grabs packs of commands, hooks, skills — Claude Code ecosystem compatible.'},
@@ -1467,7 +1467,7 @@ const FEAT=[
   {cat:'model',     catL:{zh:'模型',en:'Model'},   f:{zh:'本地模型 (Ollama)',en:'Local model (Ollama)'},  a:{zh:'✓ 已支持',en:'✓ Supported'},   c:{zh:'✗ 不支持',en:'✗ Not supported'}, win:'a'},
   {cat:'tools',     catL:{zh:'工具',en:'Tools'},   f:{zh:'代码图谱工具',en:'Code graph tools'}, a:{zh:'✓ 8 个内置',en:'✓ 8 built-in'},   c:{zh:'基础文本检索',en:'Basic text search'}, win:'a'},
   {cat:'tools',     catL:{zh:'工具',en:'Tools'},   f:{zh:'/undo 一键回滚',en:'/undo one-click rollback'}, a:{zh:'✓ 已支持',en:'✓ Supported'}, c:{zh:'手动 git',en:'Manual git'}, win:'a'},
-  {cat:'integration',catL:{zh:'集成',en:'Integration'}, f:{zh:'AtomGit 原生集成',en:'AtomGit native integration'}, a:{zh:'✓ OAuth + /issue',en:'✓ OAuth + /issue'}, c:{zh:'✗ 不支持',en:'✗ Not supported'}, win:'a'},
+  {cat:'integration',catL:{zh:'集成',en:'Integration'}, f:{zh:'AtomGit 原生集成',en:'AtomGit native integration'}, a:{zh:'✓ OAuth + 内置 AtomGit 工具',en:'✓ OAuth + built-in AtomGit tools'}, c:{zh:'✗ 不支持',en:'✗ Not supported'}, win:'a'},
   {cat:'tools',     catL:{zh:'工具',en:'Tools'},   f:{zh:'MCP 支持',en:'MCP support'},      a:{zh:'✓ 已支持',en:'✓ Supported'},     c:{zh:'✓ 已支持',en:'✓ Supported'},  win:'='},
   {cat:'tools',     catL:{zh:'工具',en:'Tools'},   f:{zh:'视觉 / 截图',en:'Vision / screenshot'}, a:{zh:'✓ 已支持',en:'✓ Supported'},  c:{zh:'✓ 已支持',en:'✓ Supported'},  win:'='},
   {cat:'price',     catL:{zh:'价格',en:'Price'},   f:{zh:'费用',en:'Pricing'},              a:{zh:'CodingPlan 限免 · 自带 API',en:'CodingPlan free tier · BYO API'}, c:{zh:'订阅 + API',en:'Subscription + API'}, win:'a'},

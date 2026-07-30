@@ -153,6 +153,13 @@ struct ReviewArgs {
     /// callers reviewing huge repos (e.g. a kernel on NFS) set e.g. `--graph-max-files 8000`.
     #[arg(long)]
     graph_max_files: Option<u32>,
+    /// Load skill tools (`use_skill` / `list_skills`) from this directory. Repeatable
+    /// (LOW→HIGH priority; later dirs override earlier on name collision). Each dir is
+    /// scanned for `SKILL.md` (directory skill with bundled `scripts/` / `references/`)
+    /// or single `<name>.md` files. Omit ⇒ NO skill tools mounted (bare-CLI behavior);
+    /// only some deployments / repos opt into skills.
+    #[arg(long = "skill-dir", value_name = "DIR")]
+    skill_dirs: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -333,6 +340,16 @@ async fn review(args: ReviewArgs) -> Result<()> {
     if let Some(n) = args.graph_max_files {
         cfg.graph_max_indexed_files = n as usize;
     }
+    // Skills: opt-in via --skill-dir (empty ⇒ no skill tools, bare-CLI behavior).
+    // Canonicalize each dir so SKILL.md's `${CLAUDE_SKILL_DIR}` resolves absolute.
+    cfg.skill_dirs = args
+        .skill_dirs
+        .iter()
+        .map(|d| {
+            d.canonicalize()
+                .with_context(|| format!("--skill-dir not found: {}", d.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     // Full system-prompt override (flag text > file/stdin). None ⇒ built-in reviewer persona.
     cfg.persona =
         resolve_system_prompt(args.system_prompt.clone(), args.system_prompt_file.clone())?;

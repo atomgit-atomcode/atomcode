@@ -216,10 +216,8 @@ const TRUNCATION_RESUME_NUDGE: &str =
      where you left off, writing the remaining content INCREMENTALLY to a file (append the \
      next section with edit_file) rather than re-emitting it all in one response.";
 
-// "·" here mirrors atomcode-core's `provider::REASONING_PLACEHOLDER`. kernel is a
-// standalone crate with no dependency on atomcode-core (deliberate: core is the
-// retiring v1 stack), so the value is duplicated rather than imported. If that
-// placeholder ever changes, update this literal too.
+// Provider adapters can emit these placeholder strings when no usable reasoning
+// was captured. Keep the neutral kernel cleanup list aligned with adapter output.
 const REASONING_FILLER_MARKERS: &[&str] = &[
     "·",
     "(no reasoning detected)",
@@ -228,10 +226,8 @@ const REASONING_FILLER_MARKERS: &[&str] = &[
     "no reasoning recorded",
 ];
 
-// KEEP IN SYNC WITH crates/atomcode-core/src/turn/runner.rs `strip_reasoning_filler`
-// (and its `strip_dsml_parameter_fragments` / `strip_leading_parameter_tail` helpers).
-// These are intentionally duplicated because kernel takes no dependency on core;
-// any bugfix here must be applied to the core copy as well.
+// Keep the DSML cleanup helpers below together: they form the kernel's single
+// normalization path for provider reasoning filler.
 fn strip_reasoning_filler(reasoning: &str) -> String {
     let (mut cleaned, mut changed) = strip_dsml_parameter_fragments(reasoning);
     for marker in REASONING_FILLER_MARKERS {
@@ -359,6 +355,35 @@ fn rate_limit_server_message(e: &crate::stream::ProviderError) -> Option<String>
         .unwrap_or(e.message.as_str())
         .trim();
     (!detail.is_empty()).then(|| detail.to_string())
+}
+
+/// Distinguish account/billing exhaustion from transient RPM/TPM throttling.
+/// Keep this allow-list narrow: unknown 429s remain retryable.
+fn is_terminal_rate_limit(e: &crate::stream::ProviderError) -> bool {
+    let code = e.code.as_deref().unwrap_or_default().to_ascii_lowercase();
+    if matches!(
+        code.as_str(),
+        "insufficient_quota"
+            | "billing_hard_limit_reached"
+            | "payment_required"
+            | "insufficient_balance"
+            | "1113"
+    ) {
+        return true;
+    }
+    let message = e.message.to_ascii_lowercase();
+    [
+        "insufficient quota",
+        "insufficient balance",
+        "billing hard limit",
+        "payment required",
+        "credit balance",
+        "余额不足",
+        "无可用资源包",
+        "请充值",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 /// Build the user-facing message shown when the empty-response retry budget is
@@ -564,9 +589,23 @@ fn tool_call_dedup_key(call: &ToolCall) -> (String, String) {
     (call.name.clone(), canonicalize_tool_args(&call.arguments))
 }
 
-// KEEP IN SYNC WITH atomcode-core/src/turn/tool_args.rs. The kernel deliberately
-// has no dependency on the retiring core stack, but both execution paths must
-// agree on tool-call identity while the migration is in progress.
+/// Number of DISTINCT tool calls in `calls` by kernel identity (`name` +
+/// canonicalized arguments) — the exact count the tool loop uses to decide
+/// whether a step ran as a parallel batch (`>= 2` ⇒ a batch is emitted).
+///
+/// Exposed so the TUI's `/resume` replay groups exactly the steps that were
+/// batched live: gating on the raw `tool_calls.len()` would over-group a step
+/// whose duplicate calls the kernel collapsed to one (no batch was ever shown).
+pub fn distinct_tool_call_count(calls: &[ToolCall]) -> usize {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    calls
+        .iter()
+        .filter(|c| seen.insert(tool_call_dedup_key(c)))
+        .count()
+}
+
+// Canonicalization is owned by the kernel tool loop so every assembled agent uses
+// the same tool-call identity rules.
 fn canonicalize_tool_args(arguments: &str) -> String {
     match serde_json::from_str(arguments) {
         Ok(value) => serde_json::to_string(&sort_json_object_keys(value))
@@ -805,6 +844,8 @@ pub struct Agent {
     /// history (backfilled to stay API-valid) instead of rolling back. Default
     /// `false` = CANCEL = UNDO. See `AgentBuilder::keep_interrupted_context`.
     keep_interrupted_context: bool,
+    /// See `AgentBuilder::round_cap_checkpoint`.
+    round_cap_checkpoint: bool,
 }
 
 impl Agent {
@@ -873,6 +914,7 @@ impl Agent {
             request_counter: AtomicU64::new(request_seed),
             clock: self.clock,
             keep_interrupted_context: self.keep_interrupted_context,
+            round_cap_checkpoint: self.round_cap_checkpoint,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle {
@@ -988,6 +1030,8 @@ struct RunningAgent {
     clock: Arc<dyn Clock>,
     /// See `Agent::keep_interrupted_context`.
     keep_interrupted_context: bool,
+    /// See `AgentBuilder::round_cap_checkpoint`.
+    round_cap_checkpoint: bool,
 }
 
 impl RunningAgent {
@@ -1400,7 +1444,10 @@ impl RunningAgent {
                     // boundary to fold the prompt into the CURRENT turn's next request
                     // (rather than running it as a separate turn afterward).
                     Some(AgentCommand::SendMessage { text, images }) => {
-                        steer.lock().unwrap_or_else(|e| e.into_inner()).push_back(SteerInput { text, images });
+                        steer.lock().unwrap_or_else(|e| e.into_inner()).push_back(SteerInput {
+                            text,
+                            images,
+                        });
                     }
                     // A Compact mid-turn is QUEUED, not executed: compacting inside a
                     // running turn would reopen the within-turn cache break (and
@@ -1639,6 +1686,9 @@ impl RunningAgent {
         let mut last_round_sig: Option<String> = None;
         let mut repeat_rounds: u32 = 0;
         let mut repeat_nudged = false;
+        // Re-armable round cap: on each checkpoint "continue" this grows by the base
+        // `max_rounds`, giving a CONSTANT interval between confirmations.
+        let mut round_cap = self.max_rounds;
         loop {
             round += 1;
             // Mint this request's id AND build this round's TurnCtx UP FRONT — before
@@ -1659,17 +1709,59 @@ impl RunningAgent {
                 context_window: ctx_window,
                 used_tokens,
             };
-            // Hard cap (safety fuse): stop before exceeding max_rounds.
-            if let Some(max) = self.max_rounds {
-                if round > max {
-                    self.rt.emit(AgentEvent::Error {
-                        message: format!("max rounds ({max}) reached"),
-                        http_status: None,
-                        code: None,
-                    });
-                    self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
-                        .await;
-                    return;
+            // Hard cap (safety fuse). With `round_cap_checkpoint`, this becomes an
+            // interactive checkpoint instead of a hard error.
+            if let Some(cap) = round_cap {
+                if round > cap {
+                    if self.round_cap_checkpoint {
+                        let resp = self
+                            .rt
+                            .request(
+                                crate::event::ROUND_CAP_CHECKPOINT_KIND,
+                                serde_json::json!({
+                                    "round": round - 1,
+                                    "cap": cap,
+                                    // Re-arm increment, so the driver can say "N more
+                                    // rounds" accurately after a continuation (cap grows
+                                    // but the granted step stays this base).
+                                    "base": self.max_rounds.unwrap_or(cap),
+                                }),
+                            )
+                            .await;
+                        let cont = resp
+                            .get("continue")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        if cont {
+                            // Re-arm by the configured base (guaranteed Some here).
+                            let base = self.max_rounds.unwrap_or(cap);
+                            round_cap = Some(cap.saturating_add(base));
+                            // fall through: this round (== cap+1 <= new cap) proceeds.
+                        } else if cancel.is_cancelled() {
+                            // The `false` came from a Cancel that resolved the
+                            // pending Request to Null (not an explicit "stop").
+                            // Terminate through the canonical cancel funnel so the
+                            // turn ends as Cancelled — matching every other
+                            // mid-turn cancel arm — not MaxRounds.
+                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            return;
+                        } else {
+                            // Explicit stop (Esc / picker) OR fail-closed default
+                            // (no requester / timeout): the round cap is the reason.
+                            self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                                .await;
+                            return;
+                        }
+                    } else {
+                        self.rt.emit(AgentEvent::Error {
+                            message: format!("max rounds ({cap}) reached"),
+                            http_status: None,
+                            code: None,
+                        });
+                        self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                            .await;
+                        return;
+                    }
                 }
             }
             let start = self.clock.now_millis();
@@ -1691,10 +1783,18 @@ impl RunningAgent {
                 repeat_rounds = 0;
                 repeat_nudged = false;
                 let n = steered.len();
-                for s in steered {
-                    convo.push(Message::user_with_images(s.text, s.images));
+                let mut inputs = Vec::with_capacity(n);
+                for input in steered {
+                    convo.push(Message::user_with_images(
+                        input.text.clone(),
+                        input.images.clone(),
+                    ));
+                    inputs.push(crate::event::SteeredInput {
+                        text: input.text,
+                        images: input.images,
+                    });
                 }
-                self.rt.emit(AgentEvent::Steered { count: n });
+                self.rt.emit(AgentEvent::Steered { count: n, inputs });
             }
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
@@ -1776,8 +1876,10 @@ impl RunningAgent {
             // pre_request projection, pre chat_stream): telemetry/datalog/cache-RCA
             // sees the exact bytes about to hit the provider. It gets `&` — it
             // cannot mutate the wire (mutation is pre_request's job above).
+            let mut request_options = self.chat_options.clone();
+            request_options.rate_limit_retry_owner = crate::provider::RateLimitRetryOwner::Kernel;
             self.hooks
-                .on_request(&messages, &defs, &self.chat_options, &turn_ctx)
+                .on_request(&messages, &defs, &request_options, &turn_ctx)
                 .await;
             // A failed OPEN cleanly fails the turn — no bogus assistant message,
             // no empty-success illusion. The session-level `chat_options` (the
@@ -1798,13 +1900,12 @@ impl RunningAgent {
                     self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                     return;
                 }
-                opened = self.provider.chat_stream(&messages, &defs, &self.chat_options) => opened,
+                opened = self.provider.chat_stream(&messages, &defs, &request_options) => opened,
             };
             let mut stream = match opened {
                 Ok(s) => {
                     overflow_attempt = 0; // a successful open resets the per-round counter
                     provider_retry = 0; // ditto for the transient-failure budget
-                    rate_limit_waits = 0; // window reopened — reset the livelock fuse
                     s
                 }
                 // HARD OVERFLOW recovery (OFF the normal path): the prompt exceeded the
@@ -1840,13 +1941,18 @@ impl RunningAgent {
                     let hint = crate::hook::RateLimitHint {
                         http_status: e.http_status,
                         retry_after_secs: effective_retry_after(&e),
+                        terminal: is_terminal_rate_limit(&e),
+                        attempt: rate_limit_waits.saturating_add(1),
                     };
                     let server_message = rate_limit_server_message(&e);
-                    let decision = self
-                        .hooks
-                        .on_rate_limit(&hint)
-                        .await
-                        .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
+                    let decision = if hint.terminal {
+                        crate::hook::RateLimitDecision::from_hint(&hint)
+                    } else {
+                        self.hooks
+                            .on_rate_limit(&hint)
+                            .await
+                            .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint))
+                    };
                     match decision {
                         crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
                             rate_limit_waits += 1;
@@ -2170,12 +2276,71 @@ impl RunningAgent {
                         let hint = crate::hook::RateLimitHint {
                             http_status: e.http_status,
                             retry_after_secs: effective_retry_after(&e),
+                            terminal: is_terminal_rate_limit(&e),
+                            attempt: rate_limit_waits.saturating_add(1),
                         };
                         let server_message = rate_limit_server_message(&e);
-                        let decision =
-                            self.hooks.on_rate_limit(&hint).await.unwrap_or_else(|| {
-                                crate::hook::RateLimitDecision::from_hint(&hint)
+                        let decision = if hint.terminal {
+                            crate::hook::RateLimitDecision::from_hint(&hint)
+                        } else {
+                            self.hooks
+                                .on_rate_limit(&hint)
+                                .await
+                                .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint))
+                        };
+                        // Once any model content has reached the driver, replaying the
+                        // request can duplicate text/reasoning/tool calls that cannot be
+                        // retracted from the live UI. Keep the clean RateLimited terminal,
+                        // but do not auto-retry this partially-consumed stream. A 429 before
+                        // the first content event remains safe to retry below.
+                        if saw_stream_content {
+                            // Persist exactly what the driver has already rendered;
+                            // otherwise snapshot/resume would lose visible output.
+                            let partial_reasoning = strip_reasoning_filler(&reasoning);
+                            if !assistant_text.is_empty()
+                                || !partial_reasoning.is_empty()
+                                || !pending_calls.is_empty()
+                            {
+                                let mut partial = crate::message::Message::assistant(
+                                    assistant_text.clone(),
+                                    pending_calls.clone(),
+                                );
+                                if suppress_internal_stream {
+                                    partial.internal_origin = Some("verify_cadence".to_string());
+                                    partial.text.clear();
+                                    partial.reasoning = None;
+                                    partial.reasoning_blocks.clear();
+                                } else {
+                                    partial.reasoning = if partial_reasoning.is_empty() {
+                                        None
+                                    } else {
+                                        Some(partial_reasoning)
+                                    };
+                                    partial.reasoning_blocks = reasoning_blocks.clone();
+                                }
+                                convo.push(partial);
+                            }
+                            let (reset_at_display, reset_label, secs_until_reset) = match decision {
+                                crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
+                                    (String::new(), String::new(), Some(secs))
+                                }
+                                crate::hook::RateLimitDecision::Pause {
+                                    reset_at_display,
+                                    reset_label,
+                                    secs_until_reset,
+                                } => (reset_at_display, reset_label, secs_until_reset),
+                            };
+                            self.rt.emit(AgentEvent::RateLimited {
+                                reset_at_display,
+                                reset_label,
+                                secs_until_reset,
+                                auto_resuming: false,
+                                server_message,
                             });
+                            self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
+                                .await;
+                            return;
+                        }
                         match decision {
                             crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
                                 rate_limit_waits += 1;
@@ -2207,44 +2372,6 @@ impl RunningAgent {
                                         return;
                                     }
                                     _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
-                                }
-                                // I-1: Commit any accumulated partial content (text, reasoning,
-                                // tool calls) to the conversation BEFORE re-issuing the round.
-                                // Without this the re-issued round presents the same bare user
-                                // prompt to the model, which then re-generates from scratch and
-                                // emits duplicate TextDelta events (the partial stream already
-                                // in the UI is irrecoverable — gateways usually reject at the
-                                // header layer so true mid-stream 429s are rare). With the
-                                // partial message committed, a well-behaved model continues from
-                                // the committed text rather than restarting. Known residual
-                                // limitation: already-emitted TextDelta events cannot be
-                                // recalled from the UI — if the model re-generates identical
-                                // content the user will see it twice. Full rollback would
-                                // require a streaming-rewind mechanism beyond this scope.
-                                let partial_reasoning = strip_reasoning_filler(&reasoning);
-                                if !assistant_text.is_empty()
-                                    || !partial_reasoning.is_empty()
-                                    || !pending_calls.is_empty()
-                                {
-                                    let mut partial = crate::message::Message::assistant(
-                                        assistant_text.clone(),
-                                        pending_calls.clone(),
-                                    );
-                                    if suppress_internal_stream {
-                                        partial.internal_origin =
-                                            Some("verify_cadence".to_string());
-                                        partial.text.clear();
-                                        partial.reasoning = None;
-                                        partial.reasoning_blocks.clear();
-                                    } else {
-                                        partial.reasoning = if partial_reasoning.is_empty() {
-                                            None
-                                        } else {
-                                            Some(partial_reasoning)
-                                        };
-                                        partial.reasoning_blocks = reasoning_blocks.clone();
-                                    }
-                                    convo.push(partial);
                                 }
                                 provider_retry = 0; // 429 must not consume the generic transient-retry budget
                                 retry_this_round = true;
@@ -2300,6 +2427,11 @@ impl RunningAgent {
                 round -= 1;
                 continue;
             }
+            // The stream reached a natural end rather than another 429, so this
+            // rate-limit incident has recovered. Do not reset merely because HTTP
+            // OPEN returned 200: some gateways report throttling as the first SSE
+            // error event, and resetting there would disable the five-wait fuse.
+            rate_limit_waits = 0;
             // The stream reached its natural end this round (no timeout, no 429
             // retry) — refill the reconnect budget so a LATER round's stall gets a
             // fresh MAX_STREAM_RETRIES.
@@ -3214,6 +3346,12 @@ pub struct AgentBuilder {
     clock: Arc<dyn Clock>,
     /// See `Agent::keep_interrupted_context`. Default `false`.
     keep_interrupted_context: bool,
+    /// When true, the `max_rounds` fuse becomes an interactive CHECKPOINT: instead
+    /// of `emit(Error)+MaxRounds`, it round-trips the driver (kind
+    /// `ROUND_CAP_CHECKPOINT_KIND`) and only stops on a non-continue answer. Default
+    /// `false` → today's hard-stop (so a driver that doesn't implement the kind can
+    /// never park). Only a driver that renders the checkpoint sets this true.
+    round_cap_checkpoint: bool,
 }
 
 impl Default for AgentBuilder {
@@ -3267,6 +3405,7 @@ impl Default for AgentBuilder {
             clock: Arc::new(SystemClock::new()),
             // NEUTRAL default: preserve OFF → CANCEL = UNDO (current behavior).
             keep_interrupted_context: false,
+            round_cap_checkpoint: false,
         }
     }
 }
@@ -3309,6 +3448,11 @@ impl AgentBuilder {
     /// Hard cap on LLM rounds per turn (safety fuse; None = unlimited).
     pub fn max_rounds(mut self, n: u32) -> Self {
         self.max_rounds = Some(n);
+        self
+    }
+    /// See `AgentBuilder.round_cap_checkpoint`. Default false.
+    pub fn round_cap_checkpoint(mut self, on: bool) -> Self {
+        self.round_cap_checkpoint = on;
         self
     }
     /// Enable conservative exact tool-loop detection for this live session.
@@ -3541,13 +3685,14 @@ impl AgentBuilder {
             session_id: self.session_id,
             clock: self.clock,
             keep_interrupted_context: self.keep_interrupted_context,
+            round_cap_checkpoint: self.round_cap_checkpoint,
         }
     }
 }
 
 #[cfg(test)]
 mod effective_retry_after_tests {
-    use super::effective_retry_after;
+    use super::{effective_retry_after, is_terminal_rate_limit};
     use crate::stream::ProviderError;
 
     fn err(message: &str, retry_after_secs: Option<u64>) -> ProviderError {
@@ -3592,6 +3737,23 @@ mod effective_retry_after_tests {
             effective_retry_after(&err("429 Too Many Requests", None)),
             None
         );
+    }
+
+    #[test]
+    fn billing_and_balance_429s_are_terminal_but_rpm_is_not() {
+        for (code, message) in [
+            (Some("insufficient_quota"), "quota unavailable"),
+            (None, "账户余额不足，请充值"),
+            (Some("billing_hard_limit_reached"), "limit"),
+        ] {
+            let mut e = err(message, None);
+            e.code = code.map(str::to_string);
+            assert!(is_terminal_rate_limit(&e), "{e:?}");
+        }
+
+        let mut rpm = err("requests per minute exceeded; retry later", None);
+        rpm.code = Some("rate_limit_exceeded".into());
+        assert!(!is_terminal_rate_limit(&rpm));
     }
 }
 
@@ -4259,7 +4421,7 @@ mod steer_buffer_tests {
     }
 
     /// Injecting one steer during round 1 must emit exactly one
-    /// `AgentEvent::Steered { count: 1 }` before the turn completes.
+    /// `AgentEvent::Steered { count: 1, .. }` before the turn completes.
     #[tokio::test]
     async fn steer_emits_a_steered_event_with_count() {
         let deferred_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentCommand>>>> =
@@ -4301,16 +4463,23 @@ mod steer_buffer_tests {
                 images: vec![],
             })
             .unwrap();
-        let mut steered_total = 0usize;
+        let mut steered_inputs = Vec::new();
         while let Some(ev) = handle.events.recv().await {
             match ev {
-                AgentEvent::Steered { count } => steered_total += count,
+                AgentEvent::Steered { count, inputs } => {
+                    assert_eq!(count, inputs.len());
+                    steered_inputs.extend(inputs);
+                }
                 AgentEvent::TurnComplete { .. } => break,
                 _ => {}
             }
         }
         assert_eq!(
-            steered_total, 1,
+            steered_inputs,
+            vec![crate::event::SteeredInput {
+                text: "STEER-COUNT".into(),
+                images: Vec::new(),
+            }],
             "one folded prompt → Steered {{ count: 1 }}"
         );
     }

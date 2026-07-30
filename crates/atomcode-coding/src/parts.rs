@@ -34,9 +34,9 @@ use atomcode_capabilities::skills::{
     register_skill_tools, standard_skill_dirs, SkillCatalogHook, SkillRegistry,
 };
 use atomcode_capabilities::tools::{
-    register_coding_tools_with_vision, ApprovalMiddleware, BashWorkspaceGate,
-    OpenFileWorkspaceGate, ReadFileTool, SensitivePathGate, WebFetchTool, WebSearchTool,
-    WriteApprovalGate,
+    register_coding_tools_with_vision, ApprovalMiddleware, ArtifactMiddleware, ArtifactStore,
+    BashWorkspaceGate, FetchOutputTool, OpenFileWorkspaceGate, ReadFileTool, SensitivePathGate,
+    RepairToolArgsMiddleware, WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::checkpoint::CompactionCheckpoint;
@@ -86,9 +86,9 @@ pub struct PrepareOptions {
     /// Plugin-contributed skill directories, each paired with its namespace
     /// (the plugin manifest's `name`). Loaded AFTER `skill_dirs` so plugin
     /// skills are registered as `<namespace>:<skill-name>` — same convention
-    /// the slash-menu's `core::SkillRegistry::reload` uses. Empty = no
-    /// plugin skills (the L1 `capabilities::SkillRegistry::load` cannot reach
-    /// the core plugin loader by design — driver feeds these in).
+    /// the slash menu uses. Empty = no plugin skills. The registry remains
+    /// source-neutral; the driver discovers installed-plugin directories and
+    /// feeds them in.
     pub plugin_skill_dirs: Vec<(PathBuf, String)>,
     /// Connect MCP servers from `<working_dir>/.mcp.json` (+ global config).
     pub mcp: bool,
@@ -133,6 +133,9 @@ pub struct SessionBinding {
     pub(crate) lease: SessionLease,
     /// Canonical snapshot on resume/external binding; `None` on fresh.
     pub resume: Option<SessionSnapshot>,
+    /// Accepted user input recovered from an interrupted turn. It is replayed
+    /// through the normal runtime submit path after an agent becomes available.
+    pub(crate) pending_resume_prompt: Option<Message>,
     /// Fresh metadata prepared in memory but not yet catalog-visible. CodingRuntime
     /// publishes it only after the complete candidate graph has assembled.
     staged_fresh: Option<SessionMeta>,
@@ -176,6 +179,9 @@ pub struct CodingParts {
     /// The same session snapshot writer used by `SnapshotHook`, exposed through
     /// the kernel's manual-compaction checkpoint seam.
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
+    /// Concrete handle retained so provider-only reassembly can update the
+    /// per-turn cost attribution without rebuilding session-owned hooks.
+    snapshot_hook: Option<Arc<SnapshotHook>>,
     snapshot_persistence_status: Option<SnapshotPersistenceStatus>,
     pub session: Option<SessionBinding>,
     /// Runtime-owned resume for sessionless drivers during an in-process reassembly.
@@ -235,8 +241,8 @@ pub async fn prepare(cfg: &CodingAgentConfig, opts: PrepareOptions) -> io::Resul
 }
 
 /// Like [`prepare`], plus `plugin_cc_hooks` — CC hooks contributed INLINE by installed
-/// plugins, which the DRIVER resolves (the plugin loader lives in `atomcode-core`, which
-/// neither this crate nor L1 may depend on) and threads in here. They are merged with the
+/// plugins, which the DRIVER resolves through `atomcode-capabilities::plugin` and
+/// threads in here. They are merged with the
 /// user/project `hooks.json` into the one [`CCExternalHooks`] runner. Drivers without a
 /// plugin system (or with none installed) pass an empty vec and get the same result as
 /// [`prepare`].
@@ -276,6 +282,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             .iter()
             .map(|s| s.to_string()),
     );
+
+    #[cfg(feature = "atomgit")]
+    crate::assemble::register_atomgit_capabilities(&mut registry, &mut names)
+        .map_err(|error| io::Error::other(format!("AtomGit tool setup failed: {error}")))?;
 
     if opts.web && !atomcode_config::config::offline::is_offline_active() {
         registry.register(Arc::new(WebFetchTool));
@@ -396,18 +406,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 })
             };
 
-            // `[subagent]` config knobs (max_concurrent / timeout_secs) with the
-            // `ATOMCODE_SUBAGENT_TIMEOUT` env overriding the timeout. `subagent_config` carries
-            // the full registry (also used for tier routing); its absence (CLI/test paths)
-            // falls back to the shipped defaults via `SubAgentConfig::default()`.
+            // `[subagent]` live knobs. `timeout_secs` remains parse-only compatibility:
+            // a productive child is never cancelled for total wall-clock age.
             let subagent_cfg = cfg
                 .subagent_config
                 .as_ref()
                 .map(|c| c.subagent.clone())
                 .unwrap_or_default();
-            let (max_concurrent, subtask_timeout, max_rounds) = subagent_runtime_knobs(
+            let (max_concurrent, max_rounds) = subagent_runtime_knobs(
                 &subagent_cfg,
-                std::env::var("ATOMCODE_SUBAGENT_TIMEOUT").ok().as_deref(),
                 std::env::var("ATOMCODE_SUBAGENT_MAX_ROUNDS")
                     .ok()
                     .as_deref(),
@@ -420,7 +427,6 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                     make_worker_tools,
                 )
                 .with_max_concurrent(max_concurrent)
-                .with_subtask_timeout(subtask_timeout)
                 .with_max_rounds(max_rounds)
                 .with_tool_loop_policy(cfg.tool_loop_policy),
             ));
@@ -497,6 +503,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 manager,
                 lease,
                 resume: None,
+                pending_resume_prompt: None,
                 staged_fresh: stage_fresh.then_some(meta),
             })
         }
@@ -506,7 +513,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             // Resume is a native-only boundary. Legacy/unconfirmed data must first
             // converge through a driver importer; accepting a lone snapshot here
             // would bypass ownership and manufacture an incomplete native session.
-            let loaded = manager.load_native_session(id).map_err(io::Error::from)?;
+            let (loaded, pending_resume_prompt) = manager
+                .load_native_session_for_resume(&lease)
+                .map_err(io::Error::from)?;
             // A version-mismatched snapshot must FAIL here, not fall through to the
             // kernel's empty-start seam — that would silently fresh-start under the
             // SAME session id and corrupt on-disk state.
@@ -516,6 +525,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 manager,
                 lease,
                 resume: Some(loaded.snapshot),
+                pending_resume_prompt,
                 staged_fresh: None,
             })
         }
@@ -538,6 +548,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 manager,
                 lease,
                 resume: Some(loaded.snapshot),
+                pending_resume_prompt: None,
                 staged_fresh: None,
             })
         }
@@ -568,6 +579,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     //    keep it last: any earlier hook's continuation outranks the cadence nudge.
     let mut hooks: Vec<Arc<dyn LifecycleHooks>> = Vec::new();
     let mut compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>> = None;
+    let mut snapshot_hook_handle = None;
     let mut snapshot_persistence_status = None;
     // Env / project-instructions / git context — unconditional (v1 parity: always present).
     hooks.push(Arc::new(SessionContextHook::new(&cfg.working_dir)));
@@ -583,10 +595,14 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     hooks.push(Arc::new(SkillCatalogHook::new(skill_catalog)));
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
-        let snapshot_hook =
-            Arc::new(SnapshotHook::new(b.manager.clone(), &b.id, &wd).with_lease(b.lease.clone()));
+        let snapshot_hook = Arc::new(
+            SnapshotHook::new(b.manager.clone(), &b.id, &wd)
+                .with_lease(b.lease.clone())
+                .with_model_attribution(&cfg.provider_name, &cfg.model, cfg.pricing),
+        );
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
         compaction_checkpoint = Some(snapshot_hook.clone());
+        snapshot_hook_handle = Some(snapshot_hook.clone());
         hooks.push(snapshot_hook);
         hooks.push(Arc::new(TranscriptHook::new(b.manager.clone(), &b.id)));
     }
@@ -696,6 +712,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         approval: Arc::new(ApprovalMiddleware::in_memory()),
         hooks,
         compaction_checkpoint,
+        snapshot_hook: snapshot_hook_handle,
         snapshot_persistence_status,
         session,
         runtime_resume: None,
@@ -754,8 +771,18 @@ impl CodingParts {
             .and_then(SnapshotPersistenceStatus::take_uncertain_commit)
     }
 
+    pub(crate) fn take_cost_persistence_warning(&self) -> Option<String> {
+        self.snapshot_persistence_status
+            .as_ref()
+            .and_then(SnapshotPersistenceStatus::take_cost_warning)
+    }
+
     pub(crate) fn snapshot_persistence_status(&self) -> Option<SnapshotPersistenceStatus> {
         self.snapshot_persistence_status.clone()
+    }
+
+    pub(crate) fn snapshot_hook(&self) -> Option<Arc<SnapshotHook>> {
+        self.snapshot_hook.clone()
     }
 
     #[cfg(test)]
@@ -1125,16 +1152,35 @@ pub fn assemble(
     // on_model_response), so without this their token spend is invisible. The host loop's
     // PRIMARY provider stays bare below: the TelemetryHook already meters it, and wrapping
     // it too would double-count. `None` ⇒ telemetry off ⇒ the bare provider (zero overhead).
+    let out_of_loop_provider: Arc<dyn LlmProvider> = match &parts.session {
+        Some(session) => {
+            let mut recorder = atomcode_capabilities::session::DetachedUsageRecorder::new(
+                session.manager.clone(),
+                &session.id,
+                &cfg.provider_name,
+                &cfg.model,
+                cfg.pricing,
+            );
+            if let Some(status) = parts.snapshot_persistence_status() {
+                recorder = recorder.with_persistence_status(status);
+            }
+            Arc::new(atomcode_capabilities::session::UsageRecordingProvider::new(
+                provider.clone(),
+                recorder,
+            ))
+        }
+        None => provider.clone(),
+    };
     let metered_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
         Some(tel) => Arc::new(crate::telemetry::MeteredProvider::new(
-            provider.clone(),
+            out_of_loop_provider.clone(),
             tel.clone(),
             cfg.provider_type.as_str(),
             &cfg.base_url,
             &cfg.model,
             parts.session.as_ref().map(|b| b.id.as_str()),
         )),
-        None => provider.clone(),
+        None => out_of_loop_provider.clone(),
     };
 
     // Fill the `code_review` tool's provider slot (the tool was built in `prepare` before
@@ -1149,7 +1195,7 @@ pub fn assemble(
         let review_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
             Some(tel) => Arc::new(
                 crate::telemetry::MeteredProvider::new(
-                    provider.clone(),
+                    out_of_loop_provider.clone(),
                     tel.clone(),
                     cfg.provider_type.as_str(),
                     &cfg.base_url,
@@ -1158,7 +1204,7 @@ pub fn assemble(
                 )
                 .with_surface("code_review"),
             ),
-            None => provider.clone(),
+            None => out_of_loop_provider.clone(),
         };
         if let Ok(mut g) = slot.write() {
             *g = Some(review_provider);
@@ -1169,7 +1215,7 @@ pub fn assemble(
         let sub_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
             Some(tel) => Arc::new(
                 crate::telemetry::MeteredProvider::new(
-                    provider.clone(),
+                    out_of_loop_provider.clone(),
                     tel.clone(),
                     cfg.provider_type.as_str(),
                     &cfg.base_url,
@@ -1178,7 +1224,7 @@ pub fn assemble(
                 )
                 .with_surface("subagent"),
             ),
-            None => provider.clone(),
+            None => out_of_loop_provider.clone(),
         };
         if let Ok(mut g) = slot.write() {
             *g = Some(sub_provider);
@@ -1188,6 +1234,22 @@ pub fn assemble(
     // Tier-2 overflow summary uses the same metered provider so its summary LLM call is
     // likewise counted.
     let summary_provider = metered_provider;
+
+    // When a session is present, wire the artifact store: register the fetch_output tool
+    // so the model can retrieve large outputs, and prepare the middleware that intercepts
+    // oversized tool results and spills them to disk.  No session → no artifact I/O.
+    let artifact_store: Option<Arc<ArtifactStore>> =
+        parts.session.as_ref().and_then(|b| {
+            b.manager.artifacts_dir(&b.id).ok().map(|dir| {
+                Arc::new(ArtifactStore::new(dir))
+            })
+        });
+    if let Some(store) = &artifact_store {
+        parts
+            .registry
+            .register(Arc::new(FetchOutputTool::new(store.clone())));
+    }
+
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())
@@ -1196,13 +1258,12 @@ pub fn assemble(
             cfg.preferred_language,
             crate::persona::todo_switch_enabled(),
             crate::persona::request_user_input_switch_enabled(),
-        ));
-    // Tool telemetry registers FIRST. It is observation-only — it never rewrites args
-    // or blocks — so its position does not affect the approve-what-runs contract (an
-    // ARG-REWRITING gate, e.g. CC PreToolUse `updatedInput`, must instead sit BEFORE
-    // approval so the user approves the POST-rewrite bytes — see the CC hooks block
-    // below). Going first means its `before` always stamps the call, so a tool that
-    // approval then DENIES is still recorded (the after-chain runs for every middleware).
+        ))
+        // Repair model-produced arguments before any observer or policy gate reads them.
+        // Approval must inspect the same bytes that the tool executes.
+        .middleware(Arc::new(RepairToolArgsMiddleware));
+    // Tool telemetry is the first observation middleware. It never rewrites or blocks.
+    // Its `before` always stamps the call, including a call that approval later denies.
     if let Some(tel) = &cfg.telemetry {
         builder = builder.middleware(Arc::new(crate::telemetry::ToolTelemetryMiddleware::new(
             tel.clone(),
@@ -1258,6 +1319,14 @@ pub fn assemble(
         .middleware(Arc::new(SensitivePathGate::with_store(
             parts.sensitive_path_grants.clone(),
         )));
+    #[cfg(feature = "atomgit")]
+    {
+        // Typed AtomGit tools are the only supported API path: they keep credentials
+        // outside model-visible arguments and retain action-aware approval semantics.
+        builder = builder.middleware(Arc::new(
+            atomcode_capabilities::tools::AtomgitBashGate::new(),
+        ));
+    }
     // CC external hooks (PreToolUse gate). Runs AFTER the hard PlanMode/SensitivePath gates
     // (which must stay un-bypassable by a hook `allow`) but BEFORE every auto-approve
     // convenience gate — OpenFileWorkspaceGate and especially WriteApprovalGate, which
@@ -1332,6 +1401,7 @@ pub fn assemble(
     if cfg.max_rounds != 0 {
         builder = builder.max_rounds(cfg.max_rounds);
     }
+    builder = builder.round_cap_checkpoint(cfg.round_cap_checkpoint);
     // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
     // answered (interactive — a present human must not be auto-denied). The kernel defaults
     // to unbounded when `.request_timeout` is never set, so None = park.
@@ -1357,6 +1427,38 @@ pub fn assemble(
         if let Some(cell) = &cfg.subagent_capable_provider {
             cell.set_session_id(&b.id);
         }
+        if let Some(registry) = cfg.subagent_config.as_deref() {
+            if let Some((fast_key, capable_key)) =
+                crate::subagent_tiers::resolve_tier_keys(registry, &cfg.model)
+            {
+                let install_recorder = |cell: &Arc<crate::config::TierProvider>, key: &str| {
+                    // `key` is a model-selection id (design §14.2); resolve it the
+                    // same way the tier provider was built so usage attribution
+                    // (model name + pricing) matches.
+                    if let Ok(resolved) = registry.resolve_model(Some(key)) {
+                        let pricing = crate::resolve_resolved_pricing(&resolved);
+                        let mut recorder =
+                            atomcode_capabilities::session::DetachedUsageRecorder::new(
+                                b.manager.clone(),
+                                &b.id,
+                                key,
+                                &resolved.model,
+                                pricing,
+                            );
+                        if let Some(status) = parts.snapshot_persistence_status() {
+                            recorder = recorder.with_persistence_status(status);
+                        }
+                        cell.set_usage_recorder(recorder);
+                    }
+                };
+                if let Some(cell) = &cfg.subagent_fast_provider {
+                    install_recorder(cell, &fast_key);
+                }
+                if let Some(cell) = &cfg.subagent_capable_provider {
+                    install_recorder(cell, &capable_key);
+                }
+            }
+        }
         if let Some(snap) = &b.resume {
             builder = builder.resume(snap.clone());
         }
@@ -1376,7 +1478,20 @@ pub fn assemble(
             atomcode_capabilities::tools::GitPushLabelMiddleware::new(cfg.working_dir.clone()),
         ));
     }
-    Ok(builder.build())
+    // Artifact spill middleware: intercepts oversized tool results and saves them to disk so
+    // the conversation only carries a preview + handle. Only wired when a session is present
+    // (no session = no on-disk store; the fetch_output tool is not registered either).
+    if let Some(store) = artifact_store {
+        builder = builder.middleware(Arc::new(ArtifactMiddleware::new(store)));
+    }
+    let agent = builder.build();
+    // Commit model attribution only after every fallible assembly step has
+    // succeeded. ReassembleProvider stops the old agent before entering here,
+    // so no accepted turn can observe a half-switched attribution.
+    if let Some(snapshot_hook) = &parts.snapshot_hook {
+        snapshot_hook.set_model_attribution(&cfg.provider_name, &cfg.model, cfg.pricing);
+    }
+    Ok(agent)
 }
 
 const ATOMCODE_PERSONA_PREFIX: &str =
@@ -1486,35 +1601,16 @@ pub fn subagent_enabled_from_env(var: Option<&str>) -> bool {
     }
 }
 
-/// Resolve the `task` subagent tool's runtime knobs from the `[subagent]` config section,
-/// with the `ATOMCODE_SUBAGENT_TIMEOUT` env var OVERRIDING the config `timeout_secs` base
-/// (mirroring how `ATOMCODE_SUBAGENT` / `ATOMCODE_TODO` env switches override their config).
-/// Returns `(max_concurrent, per_subtask_timeout, per_subtask_max_rounds)`. `0` rounds
-/// intentionally means unbounded and does not alter the separately inherited exact policy.
-///
-/// Footgun guards (a misconfigured section must not wedge the tool): at least 1 worker, and
-/// at least 30s per subtask. `timeout_env` unset / empty / non-numeric / `0` falls back to the
-/// config base. `SubAgentConfig::default()` yields `(3, 900s)` — the values the tool shipped
-/// with before it read config, so wiring config is not a silent behavior change.
+/// Resolve the live `task` subagent knobs. The legacy `timeout_secs` field is deliberately
+/// ignored: child liveness is owned by provider idle timeouts, the round cap, and cancellation.
 pub fn subagent_runtime_knobs(
     cfg: &atomcode_config::config::SubAgentConfig,
-    timeout_env: Option<&str>,
     max_rounds_env: Option<&str>,
-) -> (usize, std::time::Duration, u32) {
-    const MIN_TIMEOUT_SECS: u64 = 30;
-    let timeout_secs = timeout_env
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .unwrap_or(cfg.timeout_secs)
-        .max(MIN_TIMEOUT_SECS);
+) -> (usize, u32) {
     let max_rounds = max_rounds_env
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(cfg.max_rounds);
-    (
-        cfg.max_concurrent.max(1),
-        std::time::Duration::from_secs(timeout_secs),
-        max_rounds,
-    )
+    (cfg.max_concurrent.max(1), max_rounds)
 }
 
 #[cfg(test)]
@@ -1572,77 +1668,25 @@ mod tests {
     }
 
     #[test]
-    fn subagent_runtime_knobs_env_overrides_config_timeout() {
+    fn subagent_runtime_knobs_ignore_legacy_timeout_and_floor_concurrency() {
         use super::subagent_runtime_knobs;
         use atomcode_config::config::SubAgentConfig;
-        use std::time::Duration;
         let cfg = SubAgentConfig {
-            max_concurrent: 5,
-            timeout_secs: 600,
-            ..SubAgentConfig::default()
-        };
-        // env unset → the config `[subagent]` values drive both knobs.
-        let (mc, to, rounds) = subagent_runtime_knobs(&cfg, None, None);
-        assert_eq!(mc, 5);
-        assert_eq!(to, Duration::from_secs(600));
-        assert_eq!(rounds, 200);
-        // env set → overrides ONLY the timeout; max_concurrent still comes from config.
-        let (mc, to, rounds) = subagent_runtime_knobs(&cfg, Some("  1200 "), None);
-        assert_eq!(mc, 5, "env timeout override must not touch max_concurrent");
-        assert_eq!(to, Duration::from_secs(1200));
-        assert_eq!(rounds, 200, "env timeout must not touch max_rounds");
-        // env empty / non-numeric / 0 → fall back to the config timeout base.
-        assert_eq!(
-            subagent_runtime_knobs(&cfg, Some(""), None).1,
-            Duration::from_secs(600)
-        );
-        assert_eq!(
-            subagent_runtime_knobs(&cfg, Some("abc"), None).1,
-            Duration::from_secs(600)
-        );
-        assert_eq!(
-            subagent_runtime_knobs(&cfg, Some("0"), None).1,
-            Duration::from_secs(600)
-        );
-    }
-
-    #[test]
-    fn subagent_runtime_knobs_apply_footgun_floors() {
-        use super::subagent_runtime_knobs;
-        use atomcode_config::config::SubAgentConfig;
-        use std::time::Duration;
-        // A misconfigured config (0 workers / a tiny timeout) must be floored so it can't
-        // wedge the tool: at least 1 worker, at least 30s per subtask.
-        let tiny = SubAgentConfig {
             max_concurrent: 0,
             timeout_secs: 5,
             ..SubAgentConfig::default()
         };
-        let (mc, to, _) = subagent_runtime_knobs(&tiny, None, None);
-        assert_eq!(mc, 1, "max_concurrent floored to 1");
-        assert_eq!(to, Duration::from_secs(30), "config timeout floored to 30s");
-        // An env override below the floor is floored too.
-        assert_eq!(
-            subagent_runtime_knobs(&SubAgentConfig::default(), Some("5"), None).1,
-            Duration::from_secs(30)
-        );
+        let (mc, rounds) = subagent_runtime_knobs(&cfg, None);
+        assert_eq!(mc, 1, "max_concurrent is still floored to one");
+        assert_eq!(rounds, 200);
     }
 
     #[test]
-    fn subagent_runtime_knobs_default_config_preserves_shipped_defaults() {
+    fn subagent_runtime_knobs_default_config_preserves_live_defaults() {
         use super::subagent_runtime_knobs;
         use atomcode_config::config::SubAgentConfig;
-        use std::time::Duration;
-        // Wiring config must NOT silently change the shipped `task` defaults for opt-in users:
-        // default config still yields 3 concurrent workers and a 900s (15 min) per-subtask
-        // timeout — the same values the tool used before it read config.
-        let (mc, to, rounds) = subagent_runtime_knobs(&SubAgentConfig::default(), None, None);
+        let (mc, rounds) = subagent_runtime_knobs(&SubAgentConfig::default(), None);
         assert_eq!(mc, 3, "default max_concurrent unchanged");
-        assert_eq!(
-            to,
-            Duration::from_secs(900),
-            "default per-subtask timeout unchanged"
-        );
         assert_eq!(rounds, 200, "default child round high-water unchanged");
     }
 
@@ -1654,14 +1698,14 @@ mod tests {
             max_rounds: 350,
             ..SubAgentConfig::default()
         };
-        assert_eq!(subagent_runtime_knobs(&cfg, None, None).2, 350);
-        assert_eq!(subagent_runtime_knobs(&cfg, None, Some(" 500 ")).2, 500);
+        assert_eq!(subagent_runtime_knobs(&cfg, None).1, 350);
+        assert_eq!(subagent_runtime_knobs(&cfg, Some(" 500 ")).1, 500);
         assert_eq!(
-            subagent_runtime_knobs(&cfg, None, Some("0")).2,
+            subagent_runtime_knobs(&cfg, Some("0")).1,
             0,
             "zero is an intentional unbounded override"
         );
-        assert_eq!(subagent_runtime_knobs(&cfg, None, Some("bad")).2, 350);
+        assert_eq!(subagent_runtime_knobs(&cfg, Some("bad")).1, 350);
     }
 
     #[test]
@@ -1917,6 +1961,22 @@ mod tests {
             web: false,
             review: false,
             rate_limit_source: None,
+        }
+    }
+
+    #[cfg(feature = "atomgit")]
+    #[tokio::test]
+    async fn production_prepare_exposes_atomgit_tools() {
+        let project = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let names = parts.selected_tool_names();
+
+        for expected in ["atomgit_repo", "atomgit_pr", "atomgit_issue"] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "production tool catalog must expose {expected}: {names:?}"
+            );
         }
     }
 
@@ -2451,6 +2511,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn snapshot_cost_attribution_tracks_model_swapped_at_assemble() {
+        use atomcode_kernel::agent::AutoRespond;
+
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut cfg = CodingAgentConfig::new("k", "http://localhost", "model-a", project.path());
+        cfg.provider_name = "provider-a".into();
+
+        let mut opts = io_free_opts();
+        opts.session = SessionMode::Fresh;
+        let mut parts = prepare(&cfg, opts).await.unwrap();
+        let binding = parts.session.as_ref().unwrap();
+        let manager = binding.manager.clone();
+        let session_id = binding.id.clone();
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+        let first = assemble(&mut parts, &cfg, provider.clone()).unwrap();
+        parts.publish_staged_session().unwrap();
+        let _ = first
+            .run_to_completion("first", AutoRespond::AllowAll)
+            .await;
+
+        cfg.provider_name = "provider-b".into();
+        cfg.model = "model-b".into();
+        let second = assemble(&mut parts, &cfg, provider).unwrap();
+        let _ = second
+            .run_to_completion("second", AutoRespond::AllowAll)
+            .await;
+
+        let report = atomcode_capabilities::session::aggregate_session_cost(
+            &manager.read_meta(&session_id).unwrap(),
+        );
+        assert_eq!(report.models.len(), 2);
+        assert_eq!(report.models[0].provider_id, "provider-a");
+        assert_eq!(report.models[0].model_id, "model-a");
+        assert_eq!(report.models[1].provider_id, "provider-b");
+        assert_eq!(report.models[1].model_id, "model-b");
+    }
+
     /// Helper: run `prepare` with `opts.web = web_enabled` (all other optional capabilities
     /// OFF so the call is I/O-free) and return the registered tool names.
     async fn tool_names_for_test(web_enabled: bool) -> Vec<String> {
@@ -2508,5 +2610,119 @@ mod tests {
         );
 
         reset_offline_verdict_for_test();
+    }
+
+    /// Unit-test the artifact wiring as `assemble` would build it:
+    /// big tool result → preview+handle stored → fetch_output retrieves full bytes.
+    #[tokio::test]
+    async fn artifact_wiring_store_middleware_and_fetch_roundtrip() {
+        use atomcode_capabilities::tools::{ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES};
+        use atomcode_kernel::middleware::ToolMiddleware;
+        use atomcode_kernel::tool::{ToolContext, ToolResult};
+        use atomcode_kernel::tool::Tool as _;
+        use tokio_util::sync::CancellationToken;
+
+        let artifacts_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(ArtifactStore::new(artifacts_tmp.path()));
+        let mw = ArtifactMiddleware::new(store.clone());
+        let fetch = FetchOutputTool::new(store.clone());
+
+        // (a) a big result gets spilled and the content is replaced with a preview+handle
+        let big = "Z".repeat(THRESHOLD_BYTES + 1);
+        let mut result = ToolResult {
+            call_id: "t1".into(),
+            content: big.clone(),
+            is_error: false,
+            images: vec![],
+        };
+        mw.after(&mut result).await;
+        assert!(
+            result.content.len() < big.len(),
+            "middleware must shorten the content"
+        );
+        assert!(
+            result.content.contains("fetch_output"),
+            "middleware must embed fetch_output hint"
+        );
+
+        // (b) artifact file exists on disk
+        let id = atomcode_capabilities::tools::artifact_id(big.as_bytes());
+        let artifact_path = artifacts_tmp.path().join(&id);
+        assert!(
+            artifact_path.exists(),
+            "artifact file must be present at {artifact_path:?}"
+        );
+
+        // (c) fetch_output retrieves the full bytes
+        let ctx = ToolContext {
+            working_dir: artifacts_tmp.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let fetch_result = fetch
+            .execute(
+                &format!(
+                    "{{\"artifact_id\":\"{id}\",\"offset\":0,\"limit\":{}}}",
+                    big.len()
+                ),
+                &ctx,
+            )
+            .await;
+        assert!(
+            !fetch_result.is_error,
+            "fetch_output must succeed: {}",
+            fetch_result.content
+        );
+        assert!(
+            fetch_result.content.starts_with('Z'),
+            "fetched bytes must start with the original content"
+        );
+    }
+
+    /// When no session is present, fetch_output must NOT appear in the assembled tools.
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn no_session_means_no_fetch_output_tool() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        // Disabled session: no artifact store, so fetch_output must not be mounted.
+        let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
+        // After assemble(), parts.mounted_tools is populated by the mount() call inside.
+        let mounted = parts
+            .mounted_tools
+            .as_ref()
+            .expect("mounted_tools must be set after assemble");
+        assert!(
+            mounted.get("fetch_output").is_none(),
+            "fetch_output must not be mounted when no session is present"
+        );
+    }
+
+    /// When a session IS present, fetch_output must appear in the assembled tools.
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_presence_mounts_fetch_output_tool() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let mut opts = io_free_opts();
+        opts.session = SessionMode::Fresh;
+        let mut parts = prepare(&cfg, opts).await.unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
+        let mounted = parts
+            .mounted_tools
+            .as_ref()
+            .expect("mounted_tools must be set after assemble");
+        assert!(
+            mounted.get("fetch_output").is_some(),
+            "fetch_output must be mounted when a session is present"
+        );
     }
 }

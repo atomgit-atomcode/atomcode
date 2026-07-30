@@ -46,8 +46,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ✓ {} 生效\n", plan).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
             format!("  × CodingPlan {} 套餐配置失败 — {}\n", tier, reason).into(),
-        Msg::CpAddedProviders { count, plural_s: _ } =>
-            format!("  ✓ 已添加 {} 个 Provider：\n", count).into(),
+        Msg::CpAddedProviders { accounts, models } =>
+            format!("  ✓ 已添加 {} 个账号 · {} 个模型：\n", accounts, models).into(),
         Msg::CpLocked { name } =>
             // SGR 31 / 39 = 标准红前景 + 默认色重置。用标准色（不
             // 是亮色）让终端按当前主题映射 —— Solarized / Dracula /
@@ -56,7 +56,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             // 但 `× … （需要升级成 Pro 以上套餐）` 文本本身仍能传达含义。
             format!("      \x1b[31m× {}  （需要升级成 Pro 以上套餐）\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
-            format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
+            format!("      • {}  ·  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  （默认）".into(),
         Msg::CpVisionAuto { kind } =>
             format!("  ✓ 视觉预处理器 → {}  （自动检测）\n", kind).into(),
@@ -161,10 +161,20 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ⚠ {}\n", hint).into(),
         Msg::StatusInstructionFilesHeader =>
             "  指令文件：\n".into(),
-        Msg::StatusInstructionPresent { path, label } =>
-            format!("    ✓ {} ({})\n", path, label).into(),
-        Msg::StatusInstructionMissing { label } =>
-            format!("    × {} — 未找到\n", label).into(),
+        Msg::StatusInstructionScopeGlobal => "用户全局".into(),
+        Msg::StatusInstructionScopeProject => "项目共享".into(),
+        Msg::StatusInstructionScopeUser => "用户项目覆盖".into(),
+        Msg::StatusInstructionPresent { path, label, scope } =>
+            format!("    ✓ {scope}（{label}）：{path}\n").into(),
+        Msg::StatusInstructionMissing { path, label, scope } =>
+            format!("    × {scope}（{label}）：{path} — 未找到\n").into(),
+        Msg::StatusMemoryFilesHeader => "  记忆文件：\n".into(),
+        Msg::StatusMemoryScopeGlobal => "用户全局".into(),
+        Msg::StatusMemoryScopeProject => "项目记忆".into(),
+        Msg::StatusMemoryPresent { path, scope } =>
+            format!("    ✓ {scope}：{path}\n").into(),
+        Msg::StatusMemoryMissing { path, scope } =>
+            format!("    × {scope}：{path} — 未找到\n").into(),
 
         // ── 帮助 ──
         Msg::HelpAvailableCommands =>
@@ -196,6 +206,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     鼠标拖选 + Ctrl+C                复制（atomcode 不接管鼠标）
 
   ── 会话 ──
+    F2 / Shift+F2                    下一个 / 上一个模型
     Ctrl+C                           取消当前轮 / 关闭弹层
     Esc Esc                          撤销上一轮
     Ctrl+D                           退出 atomcode
@@ -249,8 +260,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDeleteKept => "（已保留）".into(),
         Msg::ProviderDefaultSet { name } =>
             format!("默认已设为 {name}。").into(),
-        Msg::ProviderAdded { name, model } =>
-            format!("已添加 Provider \"{name}\"，并切换到 {name} · {model}。").into(),
+        Msg::ProviderAdded { name } =>
+            format!("已添加账号 \"{name}\"。已进入其模型列表，按 Ctrl+A 添加模型。").into(),
         Msg::ProviderUpdated { name } =>
             format!("已更新 \"{name}\"。").into(),
         Msg::ProviderStepName => "Provider 名称？".into(),
@@ -277,6 +288,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("上下文窗口？[{current}] tokens（留空保持不变；如 128000 / 256000 / 512000 / 1000000，或 128k / 1m）").into(),
         Msg::ProviderContextWindowInvalid =>
             "上下文窗口必须是正整数 tokens，例如 128000 或 128k。".into(),
+        Msg::ProviderStepPricing =>
+            "每百万 token 价格（美元）？输入,输出,缓存输入（留空=未知/保持；输入 clear 可清除；如 2.5,10,0.25；免费填 0,0,0）".into(),
+        Msg::ProviderStepPricingWithHint { current } =>
+            format!("每百万 token 价格（美元）？[{current}]（留空保持；输入 clear 可清除）").into(),
+        Msg::ProviderPricingInvalid =>
+            "价格必须是三个有限且非负的数字：输入,输出,缓存输入。".into(),
         Msg::ProviderNameEmpty => "名称不能为空。".into(),
         Msg::ProviderBaseUrlEmpty => "Base URL 不能为空。".into(),
         Msg::ProviderUnknownType =>
@@ -292,6 +309,46 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepProgress { current, total } =>
             format!("（{current}/{total}）").into(),
 
+        // ── Provider 面板 ──
+        Msg::ProviderPanelTabAccounts => "账号".into(),
+        Msg::ProviderPanelTabModels => "模型".into(),
+        Msg::ProviderPanelEmptyAccounts =>
+            "（尚无 Provider 账号 — 按 Ctrl+A 添加）".into(),
+        Msg::ProviderPanelNoMatchingAccounts => "（无匹配的 Provider 账号）".into(),
+        Msg::ProviderPanelEmptyModels =>
+            "（尚无模型 — 按 Ctrl+A 添加）".into(),
+        Msg::ProviderPanelNoMatchingModels => "（无匹配的模型）".into(),
+        Msg::ProviderPanelLegacyBadge => "旧".into(),
+        Msg::ProviderPanelDefaultBadge => "默认".into(),
+        Msg::ProviderPanelModelCount { count } => format!("{count} 个模型").into(),
+        Msg::ProviderPanelAccountsHint =>
+            "筛选 · ↑↓选择 · ↵模型 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
+        Msg::ProviderPanelModelsHint =>
+            "筛选 · ↑↓选择 · ↵默认 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
+        Msg::ProviderPanelFilteredModelsHint { account } =>
+            format!("〔{account}〕· ↑↓选择 · ↵默认 · Ctrl+A加模型 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab全部 · Esc关闭").into(),
+        Msg::ProviderPanelModelSaved { model } => format!("已保存模型“{model}”。").into(),
+        Msg::ProviderPanelAddTitle => "【添加 Provider 账号】".into(),
+        Msg::ProviderPanelEditAccountTitle { account } =>
+            format!("【编辑账号 {account}】").into(),
+        Msg::ProviderPanelAddModelTitle => "【添加模型】".into(),
+        Msg::ProviderPanelEditModelTitle => "【编辑模型】".into(),
+        Msg::ProviderPanelFieldVendor => "厂商".into(),
+        Msg::ProviderPanelFieldAccount => "账号".into(),
+        Msg::ProviderPanelFieldBaseUrl => "Base URL".into(),
+        Msg::ProviderPanelFieldApiKey => "API 密钥".into(),
+        Msg::ProviderPanelFieldModel => "模型".into(),
+        Msg::ProviderPanelFieldWindow => "上下文窗口".into(),
+        Msg::ProviderPanelFieldMakeDefault => "设为默认".into(),
+        Msg::ProviderPanelSwitchHint => "←→ 切换".into(),
+        Msg::ProviderPanelEnvHint { env } => format!("留空使用 ${env}").into(),
+        Msg::ProviderPanelDefaultValue => "默认".into(),
+        Msg::ProviderPanelKeepOriginal => "留空保留原值".into(),
+        Msg::ProviderPanelProviderFormHint =>
+            "Tab 下一项  ←→ 切厂商  空格 勾选  ↵ 保存  Esc 返回".into(),
+        Msg::ProviderPanelAccountFormHint => "Tab 切换  ↵ 保存  Esc 返回".into(),
+        Msg::ProviderPanelModelFormHint =>
+            "Tab 下一项  ←→ 切账号  空格 勾选  ↵ 保存  Esc 返回".into(),
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
             format!("  当前会话已切换到 {provider} · {model}\n").into(),
@@ -488,6 +545,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "未配置活跃的 Provider。使用 /provider 添加一个。".into(),
         Msg::CmdProviderUnavailable =>
             "Provider 当前不可用。请使用 /login 登录，或用 /provider 配置。".into(),
+        Msg::CmdProviderUnsupportedBuild =>
+            "当前构建不支持 AtomGit 官方网关。请安装官方版本，或使用 /provider 切换其他 Provider。".into(),
         Msg::CmdProviderReloading =>
             "正在切换 Provider/模型，请等待切换完成后再发送。".into(),
         Msg::SubmitHeldUntilProviderReady =>
@@ -542,6 +601,14 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
                 "  提示 Token：       {}\n  补全 Token：       {}\n  缓存 Token：       {}（{}% 命中率）\n  Token 总计：       {}\n  预估费用：         {}\n",
                 prompt, completion, cached, cache_rate, total, cost
             ).into(),
+        Msg::CostTokenReport { prompt, completion, cached, cache_rate, total } =>
+            format!(
+                "  提示 Token：       {}\n  补全 Token：       {}\n  缓存 Token：       {}（{}% 命中率）\n  Token 总计：       {}\n",
+                prompt, completion, cached, cache_rate, total
+            ).into(),
+        Msg::CostFree => "免费".into(),
+        Msg::CostUnattributed { tokens } =>
+            format!("历史未归属用量\n  Token 总计：       {}", tokens).into(),
 
         // ── /think ──
         Msg::ThinkStatus { status, budget, provider } =>
@@ -597,6 +664,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  可用技能：\n".into(),
         Msg::SkillUnknown { name } =>
             format!("未知技能：{}（输入 /skills 查看列表）", name).into(),
+        Msg::SkillsLoaded { names } =>
+            format!("  已加载 skills：{}\n", names).into(),
 
         // ── /mcp ──
         Msg::McpReloading { count } =>
@@ -1091,6 +1160,13 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             model
         )
         .into(),
+        Msg::VisionPreprocessorUnresolvable { model, provider } => format!(
+            "当前模型 \"{}\" 不支持图片输入；已配置的 vision_preprocessor_provider \"{}\" \
+             无法解析（请检查名称是否与配置中的 provider/model 一致）。\
+             请修正该名称，或用 /model 切换到支持视觉的模型。",
+            model, provider
+        )
+        .into(),
         // ── --dangerously-skip-permissions / -y ──
         Msg::BypassWarningBanner =>
             "\u{26a0} --dangerously-skip-permissions 已启用：所有工具调用将自动批准（无权限提示）\n".into(),
@@ -1103,10 +1179,13 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "[warning] 正在以管理员权限运行 — 模型可能可以访问系统文件。".into(),
 
         Msg::CtrlCAgainToExit => "  （再次按 Ctrl+C 退出）\n".into(),
-        Msg::EscAgainToUndo => "  （再次按 Esc 撤销上一轮）\n".into(),
+        Msg::EscAgainToUndo => "  （再次按 Esc 打开回退选择）\n".into(),
         Msg::BashInputHint => "回车执行 bash 命令".into(),
         Msg::ShellModeHint => "! 进入 shell 模式".into(),
-        Msg::SteerFoldedHint => "将并入当前回合".into(),
+        Msg::PendingMessagesTitle =>
+            "将在下一次工具调用后提交的消息（按 Esc 中断并立即发送）".into(),
+        Msg::PendingMessagesNotSent { count } =>
+            format!("运行时已停止，{count} 条待处理消息未发送").into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} 多行输入：在行尾加 `\\` 再按 Enter。\n    \
             所有终端均可用。（Shift / Alt / Ctrl + Enter 在部分终端也支持，\n    \

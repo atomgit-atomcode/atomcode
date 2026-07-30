@@ -51,8 +51,7 @@ fn format_version(v: (u64, u64, u64)) -> String {
 
 /// Apply the process proxy policy to an async reqwest builder. Self-contained
 /// over the config leaf's proxy env machinery — mirrors the identical per-layer
-/// helpers in `atomcode-capabilities`/`atomcode-telemetry`, so the TUI needs no
-/// `atomcode-core` proxy dependency.
+/// helpers in `atomcode-capabilities`/`atomcode-telemetry`.
 fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     atomcode_config::proxy::ensure_runtime_initialized();
     let builder = if std::env::var(atomcode_config::proxy::MODE_ENV)
@@ -77,7 +76,7 @@ fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientB
 pub async fn check_latest(current: &str) -> Option<String> {
     let client = apply_async_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(5))
-        .user_agent(atomcode_core::ATOMCODE_USER_AGENT)
+        .user_agent(atomcode_auth::ATOMCODE_USER_AGENT)
         .build()
         .ok()?;
     let resp = client.get(MANIFEST_URL).send().await.ok()?;
@@ -118,8 +117,8 @@ mod tests {
     #[test]
     fn newer_major_version_returns_some() {
         assert_eq!(
-            parse_and_compare("v4.15.3", &manifest_body("v5.0.2")),
-            Some("v5.0.2".to_string())
+            parse_and_compare("v4.15.3", &manifest_body("v5.0.3")),
+            Some("v5.0.3".to_string())
         );
     }
 

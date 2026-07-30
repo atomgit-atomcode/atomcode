@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.2</span>
+    <span class="dhdr-ver">v5.0.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -104,7 +104,7 @@
       <p>格式是普通 Markdown,每行一条 <code>- </code> 开头的列表项。可以用 <code>/remember</code> 也可以直接手编辑——AtomCode 在下一轮会重新读取。<strong>非 <code>- </code> 开头的行会被忽略</strong>,所以可以加注释、空行、标题分组,记忆条目本身不受影响。</p>
 
       <h2>模型怎么"用"这些记忆</h2>
-      <p>每次发请求时,AtomCode 会把<strong>全局 + 项目记忆合并</strong>注入到系统提示里(<code>crates/atomcode-core/src/agent/prompt.rs:64</code>),格式如下:</p>
+      <p>会话启动时,AtomCode 会通过 coding runtime 的 memory hook 合并<strong>全局 + 项目记忆</strong>(<code>crates/atomcode-coding/src/parts.rs</code>),格式如下:</p>
       <pre><code>=== MEMORY ===
 The user has asked you to remember these facts and preferences:
 

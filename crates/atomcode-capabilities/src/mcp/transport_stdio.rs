@@ -44,6 +44,35 @@ pub struct StdioClient {
     /// in-flight requests can lead to response mix-ups or one caller
     /// consuming the other's response, causing timeouts.
     request_lock: Arc<Mutex<()>>,
+    /// Keeps an operation's request, recovery decision, and optional retry in
+    /// one critical section. Without this, a request from the failed generation
+    /// can overlap the replacement process's initialize handshake.
+    operation_lock: Arc<Mutex<()>>,
+    /// Serializes teardown + respawn. Concurrent callers that observe the same
+    /// dead pipe share one reconnect instead of spawning duplicate servers.
+    reconnect_lock: Arc<Mutex<()>>,
+    /// Advances after every successful initialize handshake. A waiter compares
+    /// its failed generation after taking `reconnect_lock` to detect that another
+    /// caller already repaired the connection.
+    connection_generation: AtomicU64,
+}
+
+#[derive(Debug)]
+struct StdioConnectionClosed(&'static str);
+
+impl std::fmt::Display for StdioConnectionClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for StdioConnectionClosed {}
+
+#[derive(Debug)]
+struct RequestAttemptError {
+    error: anyhow::Error,
+    generation: u64,
+    request_may_have_been_sent: bool,
 }
 
 impl StdioClient {
@@ -68,6 +97,9 @@ impl StdioClient {
             reader: Arc::new(Mutex::new(None)),
             preread_line: Arc::new(Mutex::new(None)),
             request_lock: Arc::new(Mutex::new(())),
+            operation_lock: Arc::new(Mutex::new(())),
+            reconnect_lock: Arc::new(Mutex::new(())),
+            connection_generation: AtomicU64::new(0),
         }
     }
 
@@ -130,8 +162,12 @@ impl StdioClient {
         &self,
         method: &str,
         params: Option<serde_json::Value>,
-    ) -> Result<serde_json::Value> {
+    ) -> std::result::Result<serde_json::Value, RequestAttemptError> {
         let _req_guard = self.request_lock.lock().await;
+        // Record the generation only after entering the serialized request
+        // section. A caller may have waited here while another caller replaced
+        // the process.
+        let generation = self.connection_generation.load(Ordering::SeqCst);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         // IMPORTANT: omit `params` when it's None.
@@ -158,12 +194,34 @@ impl StdioClient {
         // Write request (NDJSON).
         {
             let mut stdin = self.stdin.lock().await;
-            let stdin = stdin.as_mut().context("MCP server not connected (stdin)")?;
+            let stdin = stdin.as_mut().ok_or_else(|| RequestAttemptError {
+                error: anyhow::Error::new(StdioConnectionClosed("MCP stdin closed")),
+                generation,
+                request_may_have_been_sent: false,
+            })?;
 
-            let mut body = serde_json::to_vec(&request)?;
+            let mut body = serde_json::to_vec(&request).map_err(|error| RequestAttemptError {
+                error: error.into(),
+                generation,
+                request_may_have_been_sent: false,
+            })?;
             body.push(b'\n');
-            stdin.write_all(&body).await?;
-            stdin.flush().await?;
+            // Once write_all starts, a failure can still mean that a partial or
+            // complete request reached the server. Treat the outcome as unknown
+            // so side-effecting tools are never replayed automatically.
+            stdin
+                .write_all(&body)
+                .await
+                .map_err(|error| RequestAttemptError {
+                    error: error.into(),
+                    generation,
+                    request_may_have_been_sent: true,
+                })?;
+            stdin.flush().await.map_err(|error| RequestAttemptError {
+                error: error.into(),
+                generation,
+                request_may_have_been_sent: true,
+            })?;
         }
 
         // Read response with timeout
@@ -174,31 +232,38 @@ impl StdioClient {
                     "MCP request {} timed out after {}ms",
                     method, self.timeout_ms
                 )
-            })??;
+            })
+            .map_err(|error| RequestAttemptError {
+                error,
+                generation,
+                request_may_have_been_sent: true,
+            })?
+            .map_err(|error| RequestAttemptError {
+                error,
+                generation,
+                request_may_have_been_sent: true,
+            })?;
 
         if let Some(error) = result.error {
-            bail!("MCP error {} (code {}): {}", error.message, error.code, "");
+            return Err(RequestAttemptError {
+                error: anyhow::anyhow!("MCP error {} (code {})", error.message, error.code),
+                generation,
+                request_may_have_been_sent: true,
+            });
         }
 
-        result
-            .result
-            .ok_or_else(|| anyhow::anyhow!("MCP response missing result"))
+        result.result.ok_or_else(|| RequestAttemptError {
+            error: anyhow::anyhow!("MCP response missing result"),
+            generation,
+            request_may_have_been_sent: true,
+        })
     }
-}
 
-#[async_trait]
-impl McpClient for StdioClient {
-    async fn initialize(&mut self) -> Result<InitializeResult> {
-        let mut status = self.status.lock().await;
-        *status = ServerStatus::Connecting;
-        drop(status);
-
+    async fn initialize_connection(&self) -> Result<InitializeResult> {
+        *self.status.lock().await = ServerStatus::Connecting;
         self.start().await?;
-
-        // Drain any startup messages before JSON-RPC begins
         self.drain_startup_messages().await?;
 
-        // Send initialize request
         let params = serde_json::json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
@@ -209,34 +274,144 @@ impl McpClient for StdioClient {
                 "version": env!("CARGO_PKG_VERSION")
             }
         });
+        let result: InitializeResult = serde_json::from_value(
+            self.send_request("initialize", Some(params))
+                .await
+                .map_err(|attempt| attempt.error)?,
+        )
+        .context("Failed to parse initialize result")?;
 
-        let result: InitializeResult =
-            serde_json::from_value(self.send_request("initialize", Some(params)).await?)
-                .context("Failed to parse initialize result")?;
-
-        // Send initialized notification
         {
             let mut stdin = self.stdin.lock().await;
-            if let Some(stdin) = stdin.as_mut() {
-                let notification = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized"
-                });
-                let mut body = serde_json::to_vec(&notification)?;
-                body.push(b'\n');
-                stdin.write_all(&body).await?;
-                stdin.flush().await?;
-            }
+            let stdin = stdin.as_mut().ok_or_else(|| {
+                anyhow::Error::new(StdioConnectionClosed(
+                    "MCP stdin closed before initialized notification",
+                ))
+            })?;
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            });
+            let mut body = serde_json::to_vec(&notification)?;
+            body.push(b'\n');
+            stdin.write_all(&body).await?;
+            stdin.flush().await?;
         }
 
-        let mut status = self.status.lock().await;
-        *status = ServerStatus::Connected;
-
+        *self.status.lock().await = ServerStatus::Connected;
+        self.connection_generation.fetch_add(1, Ordering::SeqCst);
         Ok(result)
     }
 
+    async fn clear_transport(&self) {
+        self.stdin.lock().await.take();
+        self.reader.lock().await.take();
+        self.preread_line.lock().await.take();
+        if let Some(mut child) = self.process.lock().await.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+
+    async fn mark_failed(&self, message: String) {
+        *self.status.lock().await = ServerStatus::Failed(message);
+        self.clear_transport().await;
+    }
+
+    async fn reconnect_after_failure(
+        &self,
+        failed_generation: u64,
+        first_error: &anyhow::Error,
+    ) -> Result<()> {
+        let _reconnect = self.reconnect_lock.lock().await;
+        if self.connection_generation.load(Ordering::SeqCst) != failed_generation
+            && matches!(&*self.status.lock().await, ServerStatus::Connected)
+        {
+            return Ok(());
+        }
+
+        self.mark_failed(format!("stdio connection lost: {first_error:#}"))
+            .await;
+        if let Err(error) = self.initialize_connection().await {
+            self.mark_failed(format!("stdio reconnect failed: {error:#}"))
+                .await;
+            return Err(error).context("MCP stdio reconnect failed");
+        }
+        Ok(())
+    }
+
+    async fn mark_failed_if_generation_current(&self, failed_generation: u64, message: String) {
+        let _reconnect = self.reconnect_lock.lock().await;
+        if self.connection_generation.load(Ordering::SeqCst) == failed_generation {
+            self.mark_failed(message).await;
+        }
+    }
+
+    async fn send_request_with_reconnect(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        retry_after_send: bool,
+    ) -> Result<serde_json::Value> {
+        let _operation = self.operation_lock.lock().await;
+        match self.send_request(method, params.clone()).await {
+            Ok(value) => Ok(value),
+            Err(attempt) if is_reconnectable_stdio_error(&attempt.error) => {
+                if let Err(reconnect_error) = self
+                    .reconnect_after_failure(attempt.generation, &attempt.error)
+                    .await
+                {
+                    if attempt.request_may_have_been_sent && !retry_after_send {
+                        return Err(reconnect_error).context(
+                            "MCP tool execution result is unknown and the stdio connection \
+                             could not be recovered",
+                        );
+                    }
+                    return Err(reconnect_error);
+                }
+                if attempt.request_may_have_been_sent && !retry_after_send {
+                    return Err(attempt.error).context(
+                        "MCP connection recovered, but tool execution result is unknown; \
+                         request was not replayed to avoid duplicate side effects",
+                    );
+                }
+                match self.send_request(method, params).await {
+                    Ok(value) => Ok(value),
+                    Err(retry) => {
+                        if is_reconnectable_stdio_error(&retry.error) {
+                            self.mark_failed_if_generation_current(
+                                retry.generation,
+                                format!("stdio connection lost after reconnect: {:#}", retry.error),
+                            )
+                            .await;
+                        }
+                        Err(retry.error).context("MCP request failed after one stdio reconnect")
+                    }
+                }
+            }
+            Err(attempt) => Err(attempt.error),
+        }
+    }
+}
+
+#[async_trait]
+impl McpClient for StdioClient {
+    async fn initialize(&mut self) -> Result<InitializeResult> {
+        let _reconnect = self.reconnect_lock.lock().await;
+        match self.initialize_connection().await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.mark_failed(format!("stdio initialize failed: {error:#}"))
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
     async fn list_tools(&self) -> Result<ListToolsResult> {
-        let result = self.send_request("tools/list", None).await?;
+        let result = self
+            .send_request_with_reconnect("tools/list", None, true)
+            .await?;
         serde_json::from_value(result).context("Failed to parse tools/list result")
     }
 
@@ -250,7 +425,9 @@ impl McpClient for StdioClient {
             "arguments": arguments
         });
 
-        let result = self.send_request("tools/call", Some(params)).await?;
+        let result = self
+            .send_request_with_reconnect("tools/call", Some(params), false)
+            .await?;
         serde_json::from_value(result).context("Failed to parse tools/call result")
     }
 
@@ -259,6 +436,23 @@ impl McpClient for StdioClient {
     }
 
     fn status(&self) -> ServerStatus {
+        if let Ok(mut process) = self.process.try_lock() {
+            if let Some(child) = process.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(exit)) => {
+                        return ServerStatus::Failed(format!(
+                            "stdio process exited unexpectedly: {exit}"
+                        ));
+                    }
+                    Err(error) => {
+                        return ServerStatus::Failed(format!(
+                            "failed to inspect stdio process: {error}"
+                        ));
+                    }
+                    Ok(None) => {}
+                }
+            }
+        }
         self.status
             .try_lock()
             .map(|s| s.clone())
@@ -272,7 +466,7 @@ impl StdioClient {
         let mut reader = self.reader.lock().await;
         let reader = reader
             .as_mut()
-            .context("MCP server not connected (reader)")?;
+            .ok_or_else(|| anyhow::Error::new(StdioConnectionClosed("MCP stdout closed")))?;
 
         let mut skipped_lines = 0;
         loop {
@@ -284,7 +478,9 @@ impl StdioClient {
                     buf.clear();
                     let n = reader.read_line(&mut buf).await?;
                     if n == 0 {
-                        bail!("MCP server closed connection");
+                        return Err(anyhow::Error::new(StdioConnectionClosed(
+                            "MCP server closed stdout",
+                        )));
                     }
                     if !buf.trim().is_empty() {
                         break;
@@ -370,6 +566,31 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix_lower: &'static str) -> Option<&'a str
     Some(&s[p.len()..])
 }
 
+fn is_reconnectable_stdio_error(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+
+    error.chain().any(|cause| {
+        if cause.downcast_ref::<StdioConnectionClosed>().is_some()
+            || cause
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some()
+        {
+            return true;
+        }
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::NotConnected
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::TimedOut
+            )
+        })
+    })
+}
+
 async fn read_content_length_message(
     reader: &mut BufReader<ChildStdout>,
     mut line: String,
@@ -386,7 +607,9 @@ async fn read_content_length_message(
         line.clear();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
-            bail!("MCP server closed connection while reading headers");
+            return Err(anyhow::Error::new(StdioConnectionClosed(
+                "MCP server closed stdout while reading headers",
+            )));
         }
     }
 

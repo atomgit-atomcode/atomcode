@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 
 mod telemetry_cmd;
 mod vision;
@@ -286,7 +287,6 @@ fn scan_config_language() -> Option<atomcode_tuix::i18n::Locale> {
 /// respects the current locale (set by scan_argv_for_lang above).
 fn build_i18n_command() -> clap::Command {
     use atomcode_tuix::i18n::{t, Msg};
-    use clap::CommandFactory;
 
     let cmd = Cli::command();
 
@@ -384,6 +384,7 @@ fn should_try_sync_upgrade() -> bool {
                 | "uninstall"
                 | "mcp"
                 | "telemetry"
+                | "completion"
                 | "--version"
                 | "-V"
                 | "--help"
@@ -623,7 +624,7 @@ struct Cli {
     lang: Option<String>,
 
     /// Path to config file
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
     config: Option<PathBuf>,
 
     /// FIRST-RUN ONLY: seed the user's config from this file when they don't yet
@@ -634,11 +635,11 @@ struct Cli {
     /// binary): point this at that file via the launcher. Env: `ATOMCODE_SEED_CONFIG`.
     /// No-op when the user already has a config, so it's safe to always pass.
     /// Env `ATOMCODE_SEED_CONFIG` is honored as a fallback when the flag is absent.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     seed_config: Option<PathBuf>,
 
     /// Working directory (defaults to current directory)
-    #[arg(long, short = 'C')]
+    #[arg(long, short = 'C', value_hint = clap::ValueHint::DirPath)]
     dir: Option<PathBuf>,
 
     /// Prompt to run in headless (non-interactive) mode. If omitted, launches the TUI.
@@ -647,7 +648,12 @@ struct Cli {
 
     /// Read the prompt from a file (alternative to -p). Useful for long prompts
     /// that would exceed ARG_MAX or whose trailing newlines matter.
-    #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "prompt",
+        value_hint = clap::ValueHint::FilePath
+    )]
     prompt_file: Option<std::path::PathBuf>,
 
     /// Show tool calls, token usage, and turn summary on stderr (headless mode only).
@@ -765,6 +771,8 @@ enum Commands {
     /// Manage hooks (list, test, enable/disable)
     #[command(subcommand)]
     Hooks(HookCommands),
+    /// Generate a shell completion script on stdout.
+    Completion(CompletionCommand),
     /// Internal: askpass helper invoked by sudo/ssh via SUDO_ASKPASS / SSH_ASKPASS.
     /// Not intended for direct user invocation.
     #[command(name = "__askpass", hide = true)]
@@ -780,6 +788,108 @@ enum Commands {
     /// the ACP client's `session/new` request.
     #[command(hide = true)]
     Acp,
+}
+
+#[derive(clap::Args)]
+struct CompletionCommand {
+    /// Shell to generate completions for.
+    #[arg(value_enum, default_value_t = Shell::Bash)]
+    shell: Shell,
+}
+
+/// Parse and serve `atomcode completion [SHELL]` before normal startup.
+///
+/// `Cli::try_parse` is intentionally used instead of hand-parsing argv so
+/// global options and clap validation retain their canonical semantics. We
+/// only surface a parse error early when argv contains the completion
+/// subcommand token; every other invocation falls through to the existing
+/// localized parse path.
+fn try_print_shell_completion() -> bool {
+    if !is_completion_invocation(std::env::args_os().skip(1)) {
+        return false;
+    }
+
+    match Cli::try_parse() {
+        Ok(Cli {
+            command: Some(Commands::Completion(command)),
+            ..
+        }) => {
+            print_shell_completion(command.shell, &mut std::io::stdout());
+            true
+        }
+        Ok(_) => false,
+        Err(error) => error.exit(),
+    }
+}
+
+fn is_completion_invocation(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else {
+            return false;
+        };
+        match arg {
+            // `--` ends root option parsing; anything after it is input, not
+            // AtomCode's completion subcommand.
+            "--" => return false,
+            // Root flags that do not consume a value.
+            "-c"
+            | "--continue"
+            | "-v"
+            | "--verbose"
+            | "--dev"
+            | "--no-telemetry"
+            | "-y"
+            | "--dangerously-skip-permissions" => {}
+            // Root options that consume the following argv item.
+            "--provider" | "--model" | "--lang" | "--config" | "--seed-config" | "-C" | "--dir"
+            | "-p" | "--prompt" | "--prompt-file" => {
+                if args.next().is_none() {
+                    return false;
+                }
+            }
+            // Long options may carry their value after `=`.
+            value
+                if [
+                    "--provider=",
+                    "--model=",
+                    "--lang=",
+                    "--config=",
+                    "--seed-config=",
+                    "--dir=",
+                    "--prompt=",
+                    "--prompt-file=",
+                ]
+                .iter()
+                .any(|prefix| value.starts_with(prefix)) => {}
+            // The first root positional token is the subcommand.
+            value if !value.starts_with('-') => return value == "completion",
+            // Unknown/combined options belong to the canonical parser.
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn completion_command() -> clap::Command {
+    let source = Cli::command();
+    let visible_subcommands = source
+        .get_subcommands()
+        .filter(|command| !command.is_hide_set())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    clap::Command::new("atomcode")
+        .version(VERSION)
+        .about("AI coding assistant in your terminal")
+        .args(source.get_arguments().cloned())
+        .groups(source.get_groups().cloned())
+        .subcommands(visible_subcommands)
+}
+
+fn print_shell_completion(shell: Shell, out: &mut dyn Write) {
+    let mut command = completion_command();
+    clap_complete::generate(shell, &mut command, "atomcode", out);
 }
 
 /// Subcommands for hooks management
@@ -857,7 +967,7 @@ enum McpCli {
         #[arg(long)]
         global: bool,
         /// Directory for project `.mcp.json` (defaults to current directory)
-        #[arg(short = 'C', long)]
+        #[arg(short = 'C', long, value_hint = clap::ValueHint::DirPath)]
         dir: Option<PathBuf>,
     },
     /// Add GitHub's remote MCP server using OAuth.
@@ -869,7 +979,7 @@ enum McpCli {
         #[arg(long)]
         global: bool,
         /// Directory for project `.mcp.json` (defaults to current directory)
-        #[arg(short = 'C', long)]
+        #[arg(short = 'C', long, value_hint = clap::ValueHint::DirPath)]
         dir: Option<PathBuf>,
     },
     /// Complete OAuth login for a remote MCP server.
@@ -929,6 +1039,14 @@ const UPGRADED_FROM_ENV: &str = "ATOMCODE_UPGRADED_FROM";
 const INTERNAL_PREPARE_UPGRADE_ENV: &str = "ATOMCODE_INTERNAL_PREPARE_UPGRADE";
 
 fn main() {
+    // Completion generation must be a pure, fast CLI operation: no helper
+    // thread, Tokio runtime, log file, config read, telemetry, or updater.
+    // Shells may invoke completion helpers frequently, so even best-effort
+    // startup work here would turn Tab into network/filesystem activity.
+    if try_print_shell_completion() {
+        return;
+    }
+
     // Run the entire program on a thread with a large, explicit stack.
     // Rust gives the *main* OS thread the platform-default stack — on
     // Windows that's only ~1 MB (vs 8 MB on Linux/macOS). The TUI event
@@ -1392,6 +1510,9 @@ async fn run() -> Result<i32> {
                     cli.model.as_deref(),
                 );
                 let working_dir = resolve_working_dir(cli.dir.clone());
+                if !atomcode_config::config::offline::is_offline_active() {
+                    atomcode_capabilities::provider::ensure_models_dev_catalog().await;
+                }
                 let runtime_cfg = runtime_config_from(
                     &config,
                     &working_dir,
@@ -1553,6 +1674,9 @@ async fn run() -> Result<i32> {
     // config, so the `tool_registry`/`tool_context` assembled above are no longer
     // wired to an agent loop; they remain constructed (unchanged lifetime) pending
     // a follow-up cleanup.
+    if !atomcode_config::config::offline::is_offline_active() {
+        atomcode_capabilities::provider::ensure_models_dev_catalog().await;
+    }
     let runtime_cfg = runtime_config_from(
         &config,
         &working_dir,
@@ -1566,17 +1690,16 @@ async fn run() -> Result<i32> {
     let model_name = runtime_cfg.model.clone();
     let provider_bootstrap = if is_headless {
         atomcode_coding::ProviderBootstrap::Required
-    } else if config.providers.is_empty() {
-        atomcode_coding::ProviderBootstrap::Unavailable(
-            atomcode_coding::ProviderUnavailableReason::NotConfigured,
-        )
     } else {
-        atomcode_coding::ProviderBootstrap::RecoverAuthentication
+        interactive_provider_bootstrap(&runtime_cfg)
     };
     let (native_runtime, native_coding_cfg, continued_session) = spawn_native_cli_runtime(
         &runtime_cfg,
         resume_session_id,
         provider_bootstrap,
+        !is_headless,
+        // TUI-only: the interactive checkpoint replaces the hard round-cap
+        // error. Headless (`-p`) keeps the fail-closed hard error (no picker).
         !is_headless,
     )
     .await?;
@@ -1631,18 +1754,21 @@ async fn run() -> Result<i32> {
             move |config: &atomcode_config::config::Config,
                   working_dir: &std::path::Path,
                   session: &atomcode_tuix::session::Session| {
-                spawn_deferred_tui_runtime(
-                    runtime_config_from(
-                        config,
-                        working_dir,
-                        None,
-                        Some(tel.clone()),
-                        skip_perms,
-                        // In-TUI re-spawns (/session, /bg, /resume) are always interactive.
-                        true,
-                    ),
-                    session,
-                )
+                let mut runtime_cfg = runtime_config_from(
+                    config,
+                    working_dir,
+                    None,
+                    Some(tel.clone()),
+                    skip_perms,
+                    // In-TUI re-spawns (/session, /bg, /resume) are always interactive.
+                    true,
+                );
+                // TUI-only: a `max_rounds` hit becomes the interactive
+                // continue/stop checkpoint (the render arm lives in the TUI
+                // event loop). `spawn_deferred_tui_runtime` is only ever the
+                // in-TUI respawn factory, so this is never a headless path.
+                runtime_cfg.round_cap_checkpoint = true;
+                spawn_deferred_tui_runtime(runtime_cfg, session)
             },
         )
     };
@@ -1823,14 +1949,21 @@ fn spawn_deferred_tui_runtime(
     session: &atomcode_tuix::session::Session,
 ) -> atomcode_tuix::SpawnedRuntime {
     let session_id = session.id.as_str().to_string();
-    let snapshot =
-        atomcode_daemon::legacy_convert::snapshot_to_kernel(&session.to_conversation_snapshot());
+    let snapshot = session.to_conversation_snapshot();
+    // Base agent config for the VL preprocessor's one-off provider builds,
+    // derived from this runtime's config before `cfg` is moved into the spawn.
+    let vl_base = cfg.agent_config();
     let (native_control, mut events, runtime_state) =
         atomcode_daemon::spawn_native_runtime_for_session_deferred_with_preprocessor(
             cfg,
             session_id.clone(),
             snapshot,
-            Some(std::sync::Arc::new(crate::vision::VlImagePreprocessor)),
+            Some(std::sync::Arc::new(
+                crate::vision::VlImagePreprocessor::new(
+                    atomcode_daemon::coding_provider_factory(),
+                    vl_base,
+                ),
+            )),
         );
     let control = atomcode_tuix::RuntimeControl::deferred(native_control, runtime_state);
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2041,15 +2174,29 @@ fn apply_cli_runtime_overrides(
     model_override: Option<&str>,
 ) {
     let provider_name = provider_override
-        .unwrap_or(&config.default_provider)
-        .to_string();
-    let Some(provider) = config.providers.get_mut(&provider_name) else {
-        return;
-    };
+        .map(str::to_string)
+        // Fall back to the canonical active selection (new-schema `default_model`
+        // then legacy `default_provider`), not `default_provider` alone.
+        .or_else(|| config.effective_model_selection())
+        .unwrap_or_default();
+    // Route the optional `--model` override to whichever schema holds the
+    // selection (legacy `[providers.*]` or new-schema `[models.*]`); bail if the
+    // selection is unknown so `--provider bogus` is a no-op as before.
     if let Some(model) = model_override {
-        provider.model = model.to_string();
+        if let Some(p) = config.providers.get_mut(&provider_name) {
+            p.model = model.to_string();
+        } else if let Some(m) = config.models.get_mut(&provider_name) {
+            m.model = model.to_string();
+        } else {
+            return;
+        }
+    } else if !config.selection_exists(&provider_name) {
+        return;
     }
     if provider_override.is_some() {
+        // `default_model` is canonical (`effective_model_selection` prefers it);
+        // sync the legacy field too so a new-schema override takes effect.
+        config.default_model = Some(provider_name.clone());
         config.default_provider = provider_name;
     }
 }
@@ -2084,17 +2231,41 @@ fn runtime_config_from(
     runtime
 }
 
+/// Select the interactive startup mode through the same unified provider/model
+/// resolution result that will be assembled by the runtime.
+///
+/// Inspecting the raw config here would either see only the legacy schema or
+/// repeat resolution with subtly different fallback behavior. `runtime_cfg`
+/// already owns the exact resolved provider/model for this spawn.
+fn interactive_provider_bootstrap(
+    runtime_cfg: &atomcode_coding::CodingRuntimeConfig,
+) -> atomcode_coding::ProviderBootstrap {
+    if !runtime_cfg.model.is_empty() {
+        atomcode_coding::ProviderBootstrap::RecoverAuthentication
+    } else {
+        atomcode_coding::ProviderBootstrap::Unavailable(
+            atomcode_coding::ProviderUnavailableReason::NotConfigured,
+        )
+    }
+}
+
 async fn spawn_native_cli_runtime(
     cfg: &atomcode_coding::CodingRuntimeConfig,
     resume_session_id: Option<String>,
     bootstrap: atomcode_coding::ProviderBootstrap,
     fork_on_session_in_use: bool,
+    // TUI-only opt-in: turn a `max_rounds` hit into the interactive
+    // continue/stop checkpoint. The checkpoint render arm lives in the TUI
+    // event loop, so headless (`-p`) callers pass `false` — otherwise the
+    // kernel would emit a checkpoint Request with no requester and fail-closed.
+    round_cap_checkpoint: bool,
 ) -> anyhow::Result<(
     atomcode_coding::CodingRuntime,
     atomcode_coding::CodingAgentConfig,
     Option<ContinuedCliSession>,
 )> {
-    let agent = cfg.agent_config();
+    let mut agent = cfg.agent_config();
+    agent.round_cap_checkpoint = round_cap_checkpoint;
     let (session, imported_lease, continued_session) = match resume_session_id {
         Some(id) => {
             let manager =
@@ -2134,7 +2305,7 @@ async fn spawn_native_cli_runtime(
     };
     let prepare = atomcode_coding::PrepareOptions {
         session,
-        plugin_skill_dirs: atomcode_daemon::gather_plugin_skill_dirs(),
+        plugin_skill_dirs: atomcode_daemon::gather_plugin_skill_dirs_for(&cfg.working_dir),
         mcp: cfg.mcp,
         rate_limit_source: Some(atomcode_daemon::coding_plan_rate_limit_source()),
         ..atomcode_coding::PrepareOptions::default()
@@ -2147,7 +2318,12 @@ async fn spawn_native_cli_runtime(
         // Restore the TUI's VL image recognition (dropped when the legacy
         // bridge was retired): convert images to text for non-vision models
         // inside the async turn, so it never blocks the UI. See `vision`.
-        image_preprocessor: Some(std::sync::Arc::new(crate::vision::VlImagePreprocessor)),
+        image_preprocessor: Some(std::sync::Arc::new(
+            crate::vision::VlImagePreprocessor::new(
+                atomcode_daemon::coding_provider_factory(),
+                agent.clone(),
+            ),
+        )),
     };
     let runtime = match imported_lease {
         Some(lease) => {
@@ -2646,6 +2822,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         Commands::Acp => {
             unreachable!("Acp is handled inline in run() before handle_command")
         }
+        Commands::Completion(_) => {
+            unreachable!("completion is handled before runtime startup")
+        }
         Commands::Hooks(subcmd) => handle_hooks(subcmd).await,
         Commands::Askpass { .. } => {
             unreachable!("__askpass is handled early in run() before handle_command")
@@ -2653,111 +2832,71 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
     }
 }
 
-/// Handle hooks subcommands
+/// Handle hooks subcommands.
+///
+/// Reports and tests the CC-compatible external hooks the LIVE runtime actually
+/// runs (`atomcode_capabilities::cc_hooks`: `$ATOMCODE_HOME/hooks.json` +
+/// `<project>/.hooks.json`). The legacy v1 engine (TOML script / webhook / built-in
+/// hooks) no longer fires at runtime, so it is intentionally not surfaced here.
 async fn handle_hooks(cmd: HookCommands) -> Result<()> {
+    use atomcode_capabilities::cc_hooks::{
+        global_hooks_path, load_hooks_config, project_hooks_path, run_hook_for_test, HookEvent,
+    };
     HEADLESS_MODE.store(true, Ordering::Relaxed);
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+
+    // CC hook event → its display / payload name.
+    fn event_name(e: HookEvent) -> &'static str {
+        match e {
+            HookEvent::PreToolUse => "PreToolUse",
+            HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::SessionStart => "SessionStart",
+            HookEvent::SessionEnd => "SessionEnd",
+            HookEvent::UserPromptSubmit => "UserPromptSubmit",
+        }
+    }
+
+    // Display the EXACT files cc_hooks loads — via cc_hooks' own resolver, not
+    // `Config::config_dir()` (which is sudo-aware and would diverge from what the
+    // hook loader actually reads under `sudo`, turning the diagnostic into a lie).
+    let project_hooks = project_hooks_path(&cwd);
+    let print_paths = || {
+        match global_hooks_path() {
+            Some(g) => {
+                let mark = if g.exists() { "✓" } else { "✗" };
+                println!("  {} Global:   {}", mark, g.display());
+            }
+            None => println!("  ✗ Global:   (no home directory)"),
+        }
+        let p = if project_hooks.exists() { "✓" } else { "✗" };
+        println!("  {} Project:  {}", p, project_hooks.display());
+    };
 
     match cmd {
         HookCommands::List => {
-            let mut engine = atomcode_core::hook::HookEngine::new();
-            engine.load_all(&std::env::current_dir().unwrap_or_default());
-
-            let stats = engine.stats();
-            let total = stats.pre_tool_hooks
-                + stats.post_tool_hooks
-                + stats.post_turn_hooks
-                + stats.system_prompt_hooks
-                + stats.on_session_start_hooks
-                + stats.on_session_end_hooks
-                + stats.on_error_hooks
-                + stats.on_user_prompt_submit_hooks
-                + stats.on_tool_call_start_hooks
-                + stats.on_model_response_hooks
-                + stats.on_turn_start_hooks
-                + stats.on_turn_complete_hooks;
-
+            let hooks = load_hooks_config(&cwd);
             println!("\nLoaded Hooks:");
             println!("─────────────────────────────────────────────");
-
-            if total == 0 {
+            if hooks.is_empty() {
                 println!("  (No hooks loaded)");
             } else {
-                println!("  {:<30} {:>5}", "Type", "Count");
-                println!("  {:<30} {:>5}", "─".repeat(30), "─".repeat(5));
-
-                if stats.pre_tool_hooks > 0 {
-                    println!("  {:<30} {:>5}", "PreToolExecution", stats.pre_tool_hooks);
+                let mut by_event: std::collections::BTreeMap<&str, usize> =
+                    std::collections::BTreeMap::new();
+                for h in &hooks {
+                    *by_event.entry(event_name(h.event)).or_insert(0) += 1;
                 }
-                if stats.post_tool_hooks > 0 {
-                    println!("  {:<30} {:>5}", "PostToolExecution", stats.post_tool_hooks);
+                println!("  {:<20} {:>5}", "Event", "Count");
+                println!("  {:<20} {:>5}", "─".repeat(20), "─".repeat(5));
+                for (ev, n) in &by_event {
+                    println!("  {:<20} {:>5}", ev, n);
                 }
-                if stats.on_tool_call_start_hooks > 0 {
-                    println!(
-                        "  {:<30} {:>5}",
-                        "OnToolCallStart", stats.on_tool_call_start_hooks
-                    );
-                }
-                if stats.post_turn_hooks > 0 {
-                    println!("  {:<30} {:>5}", "PostTurn (legacy)", stats.post_turn_hooks);
-                }
-                if stats.on_model_response_hooks > 0 {
-                    println!(
-                        "  {:<30} {:>5}",
-                        "OnModelResponse", stats.on_model_response_hooks
-                    );
-                }
-                if stats.on_session_start_hooks > 0 {
-                    println!(
-                        "  {:<30} {:>5}",
-                        "OnSessionStart", stats.on_session_start_hooks
-                    );
-                }
-                if stats.on_session_end_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnSessionEnd", stats.on_session_end_hooks);
-                }
-                if stats.on_error_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnError", stats.on_error_hooks);
-                }
-                if stats.system_prompt_hooks > 0 {
-                    println!("  {:<30} {:>5}", "SystemPrompt", stats.system_prompt_hooks);
-                }
-                if stats.on_user_prompt_submit_hooks > 0 {
-                    println!(
-                        "  {:<30} {:>5}",
-                        "UserPromptSubmit", stats.on_user_prompt_submit_hooks
-                    );
-                }
-                if stats.on_turn_start_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnTurnStart", stats.on_turn_start_hooks);
-                }
-                if stats.on_turn_complete_hooks > 0 {
-                    println!(
-                        "  {:<30} {:>5}",
-                        "OnTurnComplete", stats.on_turn_complete_hooks
-                    );
-                }
-
-                println!("  {:<30} {:>5}", "─".repeat(30), "─".repeat(5));
-                println!("  {:<30} {:>5}", "Total", total);
+                println!("  {:<20} {:>5}", "─".repeat(20), "─".repeat(5));
+                println!("  {:<20} {:>5}", "Total", hooks.len());
             }
-
-            println!();
-
-            // 显示 hooks 目录
-            println!("Hook Directories:");
+            println!("\nHook Config Files:");
             println!("─────────────────────────────────────────────");
-            if let Some(home) = dirs::home_dir() {
-                let global_dir = home.join(".atomcode").join("hooks");
-                let exists = if global_dir.exists() { "✓" } else { "✗" };
-                println!("  {} Global:   {}", exists, global_dir.display());
-            }
-
-            if let Ok(cwd) = std::env::current_dir() {
-                let project_dir = cwd.join(".atomcode").join("hooks");
-                let exists = if project_dir.exists() { "✓" } else { "✗" };
-                println!("  {} Project:  {}", exists, project_dir.display());
-            }
-
+            print_paths();
             println!();
 
             let untrusted: Vec<_> =
@@ -2778,419 +2917,110 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                 }
                 println!();
             }
-
             Ok(())
         }
         HookCommands::Test { name } => {
-            use atomcode_core::hook::config_loader::load_script_hooks_with_names;
-            use atomcode_core::hook::json_config::load_hooks_config_with_names;
-            use atomcode_core::hook::{HookConfig, HookContext, HookCtx, HookEvent};
-            use serde_json::json;
-            use std::process::Stdio;
-            use std::time::Instant;
-            use tokio::io::AsyncWriteExt;
-            use tokio::time::timeout;
-
-            let cwd = std::env::current_dir().unwrap_or_default();
-            let json_hooks = load_hooks_config_with_names(&cwd);
-            let script_hooks = load_script_hooks_with_names(&cwd);
-
-            // Try JSON hooks first
-            let json_match = json_hooks.iter().find(|(n, _)| n == &name);
-            // Then TOML script hooks
-            let script_match = script_hooks.iter().find(|(n, _)| n == &name);
-
-            enum TestedHook<'a> {
-                Json(&'a String, &'a HookConfig),
-                Script(
-                    &'a String,
-                    &'a atomcode_core::hook::script_runner::ScriptHookConfig,
-                ),
-            }
-
-            let tested = json_match
-                .map(|(n, h)| TestedHook::Json(n, h))
-                .or_else(|| script_match.map(|(n, h)| TestedHook::Script(n, h)));
-
-            match tested {
+            let hooks = load_hooks_config(&cwd);
+            // cc_hooks hooks carry no name — match by event name or a command substring.
+            let found = hooks.iter().find(|h| {
+                event_name(h.event).eq_ignore_ascii_case(&name) || h.command.contains(&name)
+            });
+            match found {
                 None => {
-                    // ── Not found in either source ────────────────
-                    println!("❌ Hook '{}' not found.", name);
-
-                    let has_json = !json_hooks.is_empty();
-                    let has_script = !script_hooks.is_empty();
-
-                    // Check for built-in / webhook hooks via the engine
-                    let mut engine = atomcode_core::hook::HookEngine::new();
-                    engine.load_all(&cwd);
-                    let engine_names = engine.list_hook_names();
-                    let other_names: Vec<&String> = engine_names
-                        .iter()
-                        .filter(|n| {
-                            // ShellCommandHook.name() == command field (engine.rs:568),
-                            // so match against both JSON key AND command string
-                            !json_hooks
-                                .iter()
-                                .any(|(jn, jh)| jn == *n || &jh.command == *n)
-                                && !script_hooks.iter().any(|(sn, _)| sn == *n)
-                        })
-                        .collect();
-                    let has_other = !other_names.is_empty();
-
-                    if !has_json && !has_script && !has_other {
-                        println!("\n  (No hooks loaded. Check your configuration files.)");
+                    println!("❌ No hook matching '{}' found.", name);
+                    if hooks.is_empty() {
+                        println!("\n  (No hooks loaded. Check hooks.json / .hooks.json.)");
                     } else {
-                        if has_json {
-                            println!("\nAvailable JSON hooks:");
-                            for (n, h) in &json_hooks {
-                                let event_str: String = serde_json::to_value(&h.event)
-                                    .and_then(|v| Ok(v.as_str().unwrap_or("?").to_string()))
-                                    .unwrap_or_else(|_| "?".into());
-                                println!(
-                                    "  🔹 {:<28} (event: {}, command: {})",
-                                    n, event_str, h.command
-                                );
-                            }
-                        }
-                        if has_script {
-                            println!("\nAvailable TOML script hooks:");
-                            for (n, h) in &script_hooks {
-                                println!(
-                                    "  🔹 {:<28} (event: {}, script: {})",
-                                    n,
-                                    h.trigger,
-                                    h.script.display()
-                                );
-                            }
-                        }
-                        if has_other {
-                            println!(
-                                "\n  Other loaded hooks (built-in/webhook, not testable via CLI):"
-                            );
-                            for n in &other_names {
-                                println!("  ⚡ {}", n);
-                            }
+                        println!("\nAvailable hooks (test by event name or a command substring):");
+                        for h in &hooks {
+                            println!("  🔹 {:<16} {}", event_name(h.event), h.command);
                         }
                     }
                 }
-                Some(TestedHook::Json(hook_name, hook)) => {
-                    // ── JSON hook test (existing logic) ──────────
-                    let event_str: String = serde_json::to_value(&hook.event)
-                        .and_then(|v| Ok(v.as_str().unwrap_or("?").to_string()))
-                        .unwrap_or_else(|_| "?".into());
-
-                    let is_tool_event =
-                        matches!(&hook.event, HookEvent::PreToolUse | HookEvent::PostToolUse);
-
-                    let ctx = if is_tool_event {
-                        HookContext {
-                            event: event_str.clone(),
-                            tool_name: Some("bash".into()),
-                            tool_args: Some(json!({"command": "echo hello"})),
-                            tool_result: None,
-                            tool_success: None,
-                            session_id: "test-session-0000".into(),
-                            working_dir: cwd.display().to_string(),
-                        }
-                    } else {
-                        HookContext {
-                            event: event_str.clone(),
-                            tool_name: None,
-                            tool_args: None,
-                            tool_result: None,
-                            tool_success: None,
-                            session_id: "test-session-0000".into(),
-                            working_dir: cwd.display().to_string(),
-                        }
-                    };
-
-                    // ── Show hook info ───────────────────────────────
-                    println!("\n🔧 Testing Hook: {} (JSON)", hook_name);
-                    println!("  Event:     {}", event_str);
+                Some(hook) => {
+                    println!("\n🔧 Testing Hook ({})", event_name(hook.event));
                     println!("  Command:   {}", hook.command);
                     println!("  Timeout:   {} ms", hook.timeout_ms);
                     if let Some(ref m) = hook.matcher {
                         println!("  Matcher:   {}", m);
                     }
-                    if let Some(ref root) = hook.plugin_root {
-                        println!("  Plugin:    {}", root.display());
-                    }
                     println!();
-
-                    // ── Build the command ────────────────────────────
-                    let ctx_json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
-
-                    let mut cmd =
-                        atomcode_capabilities::process_utils::shell_command(&hook.command);
-                    cmd.env("ATOMCODE_HOOK_EVENT", &event_str)
-                        .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
-                        .kill_on_drop(true);
-
-                    if let Some(ref name) = ctx.tool_name {
-                        cmd.env("ATOMCODE_TOOL_NAME", name);
-                    }
-
-                    if let Some(ref root) = hook.plugin_root {
-                        let s = root.as_os_str();
-                        cmd.env("CLAUDE_PLUGIN_ROOT", s);
-                        cmd.env("ATOMCODE_PLUGIN_ROOT", s);
-                    }
-
-                    atomcode_capabilities::process_utils::suppress_console_window(&mut cmd);
-
-                    // ── Run with timeout ─────────────────────────────
-                    let start = Instant::now();
-                    let timeout_dur = std::time::Duration::from_millis(hook.timeout_ms);
-
-                    match timeout(timeout_dur, cmd.output()).await {
-                        Ok(Ok(output)) => {
-                            let elapsed = start.elapsed();
-                            let stdout = String::from_utf8_lossy(&output.stdout);
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-
-                            let status_str = match output.status.code() {
-                                Some(code) => format!("exit code {}", code),
-                                None => "terminated by signal".into(),
+                    // CC stdin payload — event-shaped to MATCH what the live runtime pipes
+                    // (see cc_hooks lifecycle methods): only tool events carry tool fields,
+                    // PostToolUse carries `tool_response`, UserPromptSubmit carries `prompt`.
+                    let sid = "test-session-0000";
+                    let cwd_s = cwd.display().to_string();
+                    let payload = match hook.event {
+                        HookEvent::PreToolUse => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "PreToolUse", "cwd": cwd_s,
+                            "tool_name": "bash", "tool_input": { "command": "echo hello" },
+                        }),
+                        HookEvent::PostToolUse => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "PostToolUse", "cwd": cwd_s,
+                            "tool_name": "bash", "tool_response": "hello\n",
+                        }),
+                        HookEvent::UserPromptSubmit => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "UserPromptSubmit",
+                            "cwd": cwd_s, "prompt": "test prompt",
+                        }),
+                        HookEvent::SessionStart => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "SessionStart", "cwd": cwd_s,
+                        }),
+                        HookEvent::SessionEnd => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "SessionEnd", "cwd": cwd_s,
+                        }),
+                    };
+                    let start = std::time::Instant::now();
+                    match run_hook_for_test(hook, &payload).await {
+                        Some(out) => {
+                            println!("📋 Result:");
+                            println!("  Duration:  {:?}", start.elapsed());
+                            // CC exit-code contract: 0 = ok, 2 = DELIBERATE block (not a
+                            // failure), other/signal = the hook broke.
+                            let (label, detail) = match out.exit_code {
+                                Some(0) => ("✅ SUCCESS", "exit code 0".to_string()),
+                                Some(2) => (
+                                    "⛔ BLOCK",
+                                    "exit code 2 — hook requested a block (CC contract)"
+                                        .to_string(),
+                                ),
+                                Some(c) => ("❌ FAILURE", format!("exit code {}", c)),
+                                None => ("❌ FAILURE", "terminated by signal".to_string()),
                             };
-
-                            println!("📋 Result:");
-                            println!("  Duration:  {:?}", elapsed);
-                            println!(
-                                "  Status:    {} ({})",
-                                if output.status.success() {
-                                    "✅ SUCCESS"
-                                } else {
-                                    "❌ FAILURE"
-                                },
-                                status_str
-                            );
-
-                            if !stdout.is_empty() {
+                            println!("  Status:    {} ({})", label, detail);
+                            if !out.stdout.is_empty() {
                                 println!("  ── stdout ──");
-                                for line in stdout.trim_end().lines() {
-                                    println!("  │ {}", line);
+                                for l in out.stdout.trim_end().lines() {
+                                    println!("  │ {}", l);
                                 }
                             }
-                            if !stderr.is_empty() {
+                            if !out.stderr.is_empty() {
                                 println!("  ── stderr ──");
-                                for line in stderr.trim_end().lines() {
-                                    println!("  │ {}", line);
+                                for l in out.stderr.trim_end().lines() {
+                                    println!("  │ {}", l);
                                 }
                             }
-
-                            if output.status.success() {
-                                println!("\n  ✅ Hook '{}' executed successfully.", hook_name);
-                            } else {
-                                println!(
-                                    "\n  ⚠️  Hook '{}' exited with non-zero status.",
-                                    hook_name
-                                );
-                            }
                         }
-                        Ok(Err(e)) => {
-                            let elapsed = start.elapsed();
+                        None => {
                             println!("📋 Result:");
-                            println!("  Duration:  {:?}", elapsed);
-                            println!("  ❌ ERROR:  failed to spawn hook: {}", e);
-                        }
-                        Err(_) => {
-                            println!("📋 Result:");
-                            println!("  ⏱ TIMEOUT after {} ms", hook.timeout_ms);
-                            println!("  The hook command was killed because it exceeded the configured timeout.");
-                        }
-                    }
-                }
-                Some(TestedHook::Script(hook_name, hook)) => {
-                    // ── TOML script hook test (aligned with script_runner.rs production) ──
-                    let trigger_display = match hook.trigger.as_str() {
-                        "pre_tool" | "pre_tool_execution" => "pre_tool_use",
-                        "post_tool" | "post_tool_execution" => "post_tool_use",
-                        other => other,
-                    };
-
-                    let is_tool_event = matches!(
-                        hook.trigger.as_str(),
-                        "pre_tool" | "pre_tool_execution" | "post_tool" | "post_tool_execution"
-                    );
-
-                    // Build HookCtx (matching script_runner.rs PreToolExecutionHook.on_pre_execute)
-                    let ctx = if is_tool_event {
-                        HookCtx::new(
-                            "bash".into(),
-                            r#"{"command":"echo hello"}"#.into(),
-                            cwd.display().to_string(),
-                        )
-                        .with_session("test-session-0000".into())
-                        .with_turn(0)
-                    } else {
-                        HookCtx::new("".into(), "".into(), cwd.display().to_string())
-                            .with_session("test-session-0000".into())
-                            .with_turn(0)
-                    };
-
-                    // ── Show hook info ───────────────────────────────
-                    println!("\n🔧 Testing Hook: {} (TOML script)", hook_name);
-                    println!("  Event:     {}", trigger_display);
-                    println!("  Script:    {}", hook.script.display());
-                    println!("  Type:      {}", hook.script_type);
-                    println!("  Timeout:   {} ms", hook.timeout_secs * 1000);
-                    if !hook.description.is_empty() {
-                        println!("  Description: {}", hook.description);
-                    }
-                    println!();
-
-                    // ── Build the command (matching script_runner.rs:68-78) ──
-                    let script_path = &hook.script;
-                    if !script_path.exists() {
-                        println!("❌ Script not found: {}", script_path.display());
-                        return Ok(());
-                    }
-
-                    let (cmd, args) = match hook.script_type.as_str() {
-                        "python" => ("python", vec![script_path.to_string_lossy().to_string()]),
-                        "shell" | "bash" => {
-                            if cfg!(windows) {
-                                (
-                                    "cmd",
-                                    vec![
-                                        "/C".to_string(),
-                                        script_path.to_string_lossy().to_string(),
-                                    ],
-                                )
-                            } else {
-                                ("sh", vec![script_path.to_string_lossy().to_string()])
-                            }
-                        }
-                        _ => {
-                            println!("❌ Unsupported script type: {}", hook.script_type);
-                            return Ok(());
-                        }
-                    };
-
-                    let ctx_json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
-
-                    let mut cmd_builder = tokio::process::Command::new(cmd);
-                    cmd_builder
-                        .args(&args)
-                        .kill_on_drop(true)
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped());
-
-                    atomcode_capabilities::process_utils::suppress_console_window(&mut cmd_builder);
-
-                    // ── Run with timeout (matching script_runner.rs:80-109) ──
-                    let start = Instant::now();
-                    let timeout_dur = std::time::Duration::from_millis(hook.timeout_secs * 1000);
-
-                    let run = async {
-                        let mut child = cmd_builder
-                            .spawn()
-                            .map_err(|e| format!("Failed to spawn script: {}", e))?;
-
-                        // Write HookCtx JSON to stdin (matching script_runner.rs:94-98)
-                        if let Some(mut stdin) = child.stdin.take() {
-                            stdin
-                                .write_all(ctx_json.as_bytes())
-                                .await
-                                .map_err(|e| format!("Failed to write to script stdin: {}", e))?;
-                        }
-
-                        child
-                            .wait_with_output()
-                            .await
-                            .map_err(|e| format!("Failed to wait for script: {}", e))
-                    };
-
-                    match timeout(timeout_dur, run).await {
-                        Ok(Ok(output)) => {
-                            let elapsed = start.elapsed();
-                            let stdout = String::from_utf8_lossy(&output.stdout);
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-
-                            let status_str = match output.status.code() {
-                                Some(code) => format!("exit code {}", code),
-                                None => "terminated by signal".into(),
-                            };
-
-                            println!("📋 Result:");
-                            println!("  Duration:  {:?}", elapsed);
                             println!(
-                                "  Status:    {} ({})",
-                                if output.status.success() {
-                                    "✅ SUCCESS"
-                                } else {
-                                    "❌ FAILURE"
-                                },
-                                status_str
+                                "  ❌ Hook did not complete: it timed out (>{} ms) or failed to spawn.",
+                                hook.timeout_ms
                             );
-
-                            if !stdout.is_empty() {
-                                println!("  ── stdout ──");
-                                for line in stdout.trim_end().lines() {
-                                    println!("  │ {}", line);
-                                }
-                            }
-                            if !stderr.is_empty() {
-                                println!("  ── stderr ──");
-                                for line in stderr.trim_end().lines() {
-                                    println!("  │ {}", line);
-                                }
-                            }
-
-                            if output.status.success() {
-                                println!("\n  ✅ Hook '{}' executed successfully.", hook_name);
-                            } else {
-                                println!(
-                                    "\n  ⚠️  Hook '{}' exited with non-zero status.",
-                                    hook_name
-                                );
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            let elapsed = start.elapsed();
-                            println!("📋 Result:");
-                            println!("  Duration:  {:?}", elapsed);
-                            println!("  ❌ ERROR:  {}", e);
-                        }
-                        Err(_) => {
-                            println!("📋 Result:");
-                            println!("  ⏱ TIMEOUT after {} ms", hook.timeout_secs * 1000);
-                            println!("  The hook command was killed because it exceeded the configured timeout.");
                         }
                     }
                 }
             }
-
             Ok(())
         }
         HookCommands::Paths => {
-            println!("\nHook Configuration Paths:");
+            println!("\nHook Configuration Files:");
             println!("─────────────────────────────────────────────");
-
-            if let Some(home) = dirs::home_dir() {
-                let global_config = home.join(".atomcode").join("hooks").join("hooks.toml");
-                let exists = if global_config.exists() { "✓" } else { "✗" };
-                println!("  {} Global config:   {}", exists, global_config.display());
-            }
-
-            if let Ok(cwd) = std::env::current_dir() {
-                let project_config = cwd.join(".atomcode").join("hooks").join("hooks.toml");
-                let exists = if project_config.exists() {
-                    "✓"
-                } else {
-                    "✗"
-                };
-                println!("  {} Project config:  {}", exists, project_config.display());
-            }
-
+            print_paths();
             println!("\nDocumentation:");
             println!("─────────────────────────────────────────────");
             println!("  docs/hooks.md - Hook usage guide");
-            println!("  docs/hook-timing-complete.md - Complete timing list");
-            println!("  docs/hook-expansion-summary.md - Expansion summary");
             println!();
-
             Ok(())
         }
     }
@@ -3781,10 +3611,83 @@ mod tests {
     use super::{
         apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
-        headless_completion_notify_reason, merge_startup_notices, resolve_working_dir,
-        runtime_config_from, should_fork_busy_continue, truncate_log_line, DEFAULT_LOG_DIRECTIVES,
+        headless_completion_notify_reason, is_completion_invocation, merge_startup_notices,
+        interactive_provider_bootstrap, print_shell_completion, resolve_working_dir,
+        runtime_config_from,
+        should_fork_busy_continue, truncate_log_line, Cli, Commands, DEFAULT_LOG_DIRECTIVES,
     };
+    use clap::Parser;
+    use clap_complete::Shell;
     use std::path::PathBuf;
+
+    #[test]
+    fn completion_subcommand_defaults_to_bash_and_accepts_all_supported_shells() {
+        let default = Cli::try_parse_from(["atomcode", "completion"]).unwrap();
+        assert!(matches!(
+            default.command,
+            Some(Commands::Completion(command)) if command.shell == Shell::Bash
+        ));
+
+        for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+            let parsed = Cli::try_parse_from(["atomcode", "completion", shell]).unwrap();
+            assert!(matches!(parsed.command, Some(Commands::Completion(_))));
+        }
+    }
+
+    #[test]
+    fn completion_scripts_cover_all_supported_shells() {
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let mut output = Vec::new();
+            print_shell_completion(shell, &mut output);
+            let script = String::from_utf8(output).unwrap();
+            assert!(!script.is_empty(), "{shell:?} script should not be empty");
+            assert!(
+                script.contains("atomcode"),
+                "{shell:?} script should target atomcode"
+            );
+            assert!(
+                script.contains("completion"),
+                "{shell:?} script should include the completion command"
+            );
+            assert!(
+                !script.contains("__askpass"),
+                "{shell:?} script should not expose the internal askpass helper"
+            );
+            assert!(
+                !script.contains("codingplan"),
+                "{shell:?} script should not expose deprecated hidden aliases"
+            );
+            assert!(
+                !script.contains("acp"),
+                "{shell:?} script should not expose internal protocol commands"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_early_exit_only_matches_the_root_subcommand() {
+        let invocation =
+            |args: &[&str]| is_completion_invocation(args.iter().map(std::ffi::OsString::from));
+
+        assert!(invocation(&["completion", "zsh"]));
+        assert!(invocation(&["--no-telemetry", "completion", "fish"]));
+        assert!(invocation(&[
+            "--config",
+            "/tmp/config.toml",
+            "completion",
+            "bash"
+        ]));
+        assert!(!invocation(&["--provider", "completion"]));
+        assert!(!invocation(&["-p", "completion"]));
+        assert!(!invocation(&["mcp", "add", "completion", "server"]));
+        assert!(!invocation(&["--", "completion"]));
+    }
 
     #[test]
     fn log_path_is_logs_subdir_of_config_dir() {
@@ -3897,6 +3800,120 @@ mod tests {
         assert_eq!(ov.provider_name, "direct");
         assert_eq!(ov.api_key, "sk-direct");
         assert_eq!(ov.reasoning_history.as_deref(), Some("exclude"));
+    }
+
+    #[test]
+    fn interactive_restart_recovers_new_schema_provider() {
+        let config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_model = "taotoken/glm_for_coding"
+
+                [provider_accounts.taotoken]
+                provider = "openai"
+                base_url = "https://example.test/v1"
+                api_key = "test"
+
+                [models."taotoken/glm_for_coding"]
+                account = "taotoken"
+                model = "glm_for_coding"
+                context_window = 131072
+            "#,
+        )
+        .unwrap();
+        let runtime_cfg =
+            runtime_config_from(&config, std::path::Path::new("/tmp"), None, None, false, true);
+
+        assert!(config.providers.is_empty(), "legacy table stays empty");
+        assert_eq!(
+            interactive_provider_bootstrap(&runtime_cfg),
+            atomcode_coding::ProviderBootstrap::RecoverAuthentication
+        );
+        let empty_runtime_cfg = runtime_config_from(
+            &atomcode_config::config::Config::default(),
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(
+            interactive_provider_bootstrap(&empty_runtime_cfg),
+            atomcode_coding::ProviderBootstrap::Unavailable(
+                atomcode_coding::ProviderUnavailableReason::NotConfigured
+            )
+        );
+    }
+
+    #[test]
+    fn interactive_bootstrap_uses_runtime_fallback_resolution() {
+        let config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_model = "broken"
+
+                [provider_accounts.missing]
+                provider = "openai"
+
+                [models.broken]
+                account = "unknown"
+                model = "broken-model"
+                context_window = 131072
+
+                [provider_accounts.usable]
+                provider = "openai"
+                base_url = "https://example.test/v1"
+                api_key = "test"
+
+                [models.usable]
+                account = "usable"
+                model = "fallback-model"
+                context_window = 131072
+            "#,
+        )
+        .unwrap();
+        let runtime_cfg =
+            runtime_config_from(&config, std::path::Path::new("/tmp"), None, None, false, true);
+
+        assert_eq!(runtime_cfg.model, "fallback-model");
+        assert_eq!(
+            interactive_provider_bootstrap(&runtime_cfg),
+            atomcode_coding::ProviderBootstrap::RecoverAuthentication
+        );
+    }
+
+    #[test]
+    fn round_cap_checkpoint_default_off_and_propagates_to_agent_config() {
+        // Guard against C1 regression: the interactive checkpoint is TUI-only,
+        // opted in at the TUI spawn sites by flipping `round_cap_checkpoint` on
+        // the runtime config. A direct test of the async CLI factory
+        // (`spawn_native_cli_runtime`/`spawn_deferred_tui_runtime`) isn't
+        // feasible here — both need a live runtime + provider bootstrap — so we
+        // pin the propagation seam those sites rely on: the field defaults off
+        // and `agent_config()` copies it through to the kernel-facing config.
+        let toml_str = r#"
+            default_provider = "p"
+            [providers.p]
+            type = "openai"
+            model = "m"
+            api_key = "k"
+            base_url = "https://example.test/v1"
+        "#;
+        let config: atomcode_config::config::Config = toml::from_str(toml_str).unwrap();
+        let wd = PathBuf::from("/tmp/x");
+
+        // Default (headless / ACP / daemon behavior): checkpoint stays off.
+        let mut cfg = runtime_config_from(&config, &wd, None, None, false, true);
+        assert!(!cfg.round_cap_checkpoint, "defaults off");
+        assert!(
+            !cfg.agent_config().round_cap_checkpoint,
+            "off config yields off agent"
+        );
+
+        // TUI opt-in: the flag flows through agent_config() to the kernel.
+        cfg.round_cap_checkpoint = true;
+        assert!(
+            cfg.agent_config().round_cap_checkpoint,
+            "TUI opt-in reaches the agent config"
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ if (-not $Invite) {
 }
 
 # Fallback version used only when $env:ATOMCODE_VERSION is unset and the API lookup fails.
-$DefaultVersion = "v5.0.2"
+$DefaultVersion = "v5.0.3"
 $RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 $RepoLatestApi = "https://api.atomgit.com/api/v5/repos/atomgit_atomcode/atomcode/releases/latest"
 

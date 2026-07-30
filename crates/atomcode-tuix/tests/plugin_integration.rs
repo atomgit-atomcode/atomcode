@@ -73,23 +73,23 @@ fn add_install_reload_flow() {
         .unwrap();
 
     let url = format!("file://{}", repo.display());
-    atomcode_core::plugin::marketplace::add_marketplace(&url).unwrap();
-    atomcode_core::plugin::installer::install(
+    atomcode_capabilities::plugin::marketplace::add_marketplace(&url).unwrap();
+    atomcode_capabilities::plugin::installer::install(
         "e2e",
         "e2e",
-        atomcode_core::plugin::InstallScope::User,
+        atomcode_capabilities::plugin::InstallScope::User,
     )
     .unwrap();
 
-    // Verify SkillRegistry sees `e2e:sk`.
+    // Verify SkillRegistry sees `e2e:sk`. Load standard dirs then installed-plugin
+    // skill dirs — the two layers the retired `core::skill::reload` combined.
     let working = tempfile::tempdir().unwrap();
-    let mut reg = atomcode_core::skill::SkillRegistry::new();
-    reg.reload(working.path());
+    let mut reg = atomcode_capabilities::skills::SkillRegistry::new();
+    atomcode_capabilities::plugin::loader::reload_skill_registry(&mut reg, working.path());
     assert!(reg.get("e2e:sk").is_some(), "missing skill e2e:sk");
 
-    // Verify CustomCommandRegistry sees `e2e:c`. The registry moved to
-    // atomcode-tuix (refactor: driver-only modules out of core); the plugin
-    // install + skill reload it exercises still live in atomcode_core.
+    // Verify the TUI-owned CustomCommandRegistry sees `e2e:c`; plugin install
+    // and skill discovery are provided by atomcode-capabilities.
     let creg = atomcode_tuix::custom_commands::CustomCommandRegistry::load(working.path());
     assert!(creg.get("e2e:c").is_some(), "missing command e2e:c");
 }

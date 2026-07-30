@@ -1,12 +1,30 @@
 use std::path::PathBuf;
 
 use atomcode_capabilities::session::{DisplayAnchor, PresentationRole};
-use atomcode_core::conversation::message::{Message, Role};
-use atomcode_core::conversation::ConversationSnapshot;
+use atomcode_kernel::message::{
+    Message, Role, SessionSnapshot, LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
+};
+
+/// Extract legacy cold-summary strings from a kernel message set. Now a
+/// re-export of the shared kernel definition (relocated there so the daemon
+/// transport shares it) — see [`atomcode_kernel::message::cold_summaries_from_messages`].
+pub use atomcode_kernel::message::cold_summaries_from_messages;
+
+/// Build a kernel text message with an explicit role (kernel has role-specific
+/// constructors but no generic `new(role, text)`).
+fn message_with_role(role: Role, text: impl Into<String>) -> Message {
+    let mut message = Message::user(text);
+    message.role = role;
+    message
+}
 
 #[derive(Debug, Clone)]
 pub struct DisplayMessage {
     pub after_message: usize,
+    /// Presentation-only projection: built from a `PresentationEntry`, which is
+    /// pure `{anchor, role, text}` (no tool_calls/images). Renderers never read
+    /// tool_calls/images off display messages, so a synthesized text-only
+    /// `Message::new(role, text)` is sufficient (see `from_catalog_view`).
     pub message: Message,
 }
 
@@ -118,7 +136,26 @@ impl TuiSession {
     pub fn from_catalog_view(
         view: atomcode_daemon::legacy_convert::CatalogSessionView,
     ) -> anyhow::Result<Self> {
-        let snapshot = atomcode_daemon::legacy_convert::snapshot_to_core(&view.snapshot);
+        // `view.snapshot` is already kernel (its messages carry the cold-summary
+        // synthetics inline). Split those synthetics out into `cold_summaries`
+        // and keep only the real messages in `messages`, exactly as the old
+        // `snapshot_to_core` did — so renderers iterating `messages` never see a
+        // cold-summary synthetic (behavioural parity).
+        let cold_summaries = cold_summaries_from_messages(&view.snapshot.messages);
+        let messages: Vec<Message> = view
+            .snapshot
+            .messages
+            .iter()
+            .filter(|m| {
+                // Mirror the authority (legacy_convert.rs::snapshot_to_core): a
+                // message is only consumed as a cold-summary if it is BOTH
+                // origin-tagged AND its text successfully strips the prefix.
+                // If origin matches but prefix does not, keep it as a real message.
+                !(m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
+                    && m.text.starts_with(LEGACY_COLD_SUMMARY_PREFIX))
+            })
+            .cloned()
+            .collect();
         let mut display_messages = Vec::with_capacity(view.presentation.entries.len());
         for entry in view.presentation.entries {
             let after_message = match entry.anchor {
@@ -139,7 +176,7 @@ impl TuiSession {
             };
             display_messages.push(DisplayMessage {
                 after_message,
-                message: Message::new(role, entry.text),
+                message: message_with_role(role, entry.text),
             });
         }
         Ok(Self {
@@ -148,9 +185,9 @@ impl TuiSession {
             working_dir: PathBuf::from(view.meta.working_dir),
             created_at: view.meta.created_at,
             updated_at: view.meta.updated_at,
-            messages: snapshot.messages,
+            messages,
             display_messages,
-            cold_summaries: snapshot.cold_summaries,
+            cold_summaries,
             user_renamed: view.meta.user_renamed,
             ai_named: view.meta.ai_named,
             turn_stats: view.meta.turn_stats.into_iter().map(Into::into).collect(),
@@ -163,16 +200,38 @@ impl TuiSession {
         self.touch();
     }
 
-    pub fn to_conversation_snapshot(&self) -> ConversationSnapshot {
-        ConversationSnapshot {
-            messages: self.messages.clone(),
-            cold_summaries: self.cold_summaries.clone(),
+    /// Re-materialise a kernel snapshot from the split model: cold summaries are
+    /// re-prepended as synthetic `Role::User` messages tagged with the legacy
+    /// origin (mirrors `legacy_convert.rs::snapshot_to_kernel`), so the runtime
+    /// sees the same message set it persisted.
+    pub fn to_conversation_snapshot(&self) -> SessionSnapshot {
+        let mut messages = Vec::with_capacity(self.cold_summaries.len() + self.messages.len());
+        for summary in &self.cold_summaries {
+            let mut message = Message::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}{summary}"));
+            message.synthetic = true;
+            message.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
+            messages.push(message);
         }
+        messages.extend(self.messages.iter().cloned());
+        SessionSnapshot::new(messages)
     }
 
-    pub fn update_from_conversation_snapshot(&mut self, snapshot: ConversationSnapshot) {
-        self.messages = snapshot.messages;
-        self.cold_summaries = snapshot.cold_summaries;
+    /// Ingest a kernel snapshot, splitting cold-summary synthetics back out into
+    /// `cold_summaries` and keeping only real messages in `messages` (mirrors the
+    /// old `snapshot_to_core` split). Renderers never see the synthetics.
+    pub fn update_from_conversation_snapshot(&mut self, snapshot: SessionSnapshot) {
+        self.cold_summaries = cold_summaries_from_messages(&snapshot.messages);
+        self.messages = snapshot
+            .messages
+            .into_iter()
+            .filter(|m| {
+                // Mirror the authority (legacy_convert.rs::snapshot_to_core): only
+                // drop a message as a cold-summary if it is BOTH origin-tagged AND
+                // the text successfully strips the prefix.
+                !(m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
+                    && m.text.starts_with(LEGACY_COLD_SUMMARY_PREFIX))
+            })
+            .collect();
     }
 
     pub fn retain_turn_stats_after_undo(&mut self, message_count: usize) {
@@ -195,10 +254,54 @@ mod tests {
     use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
 
     #[test]
+    fn cold_summaries_extracted_from_synthetic_messages() {
+        let mut m = Message::user(format!("{}old summary", LEGACY_COLD_SUMMARY_PREFIX));
+        m.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
+        let msgs = vec![Message::user("hi"), m];
+        assert_eq!(
+            cold_summaries_from_messages(&msgs),
+            vec!["old summary".to_string()]
+        );
+    }
+
+    #[test]
+    fn snapshot_round_trip_splits_and_reprepends_cold_summaries() {
+        // Ingest a kernel snapshot with an inline cold-summary synthetic: the
+        // summary lands in `cold_summaries`, the real messages in `messages`
+        // (mirrors the old core split). Re-emitting must re-prepend the synthetic
+        // so the runtime sees the same set (mirrors snapshot_to_kernel).
+        use atomcode_kernel::message::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
+        let mut cold = Message::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}older context"));
+        cold.synthetic = true;
+        cold.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
+        let incoming = SessionSnapshot::new(vec![cold, Message::user("recent")]);
+
+        let mut session = Session::new(PathBuf::from("/tmp/project"));
+        session.update_from_conversation_snapshot(incoming);
+
+        assert_eq!(session.cold_summaries, vec!["older context"]);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].text, "recent");
+
+        let out = session.to_conversation_snapshot();
+        assert_eq!(out.messages.len(), 2);
+        assert_eq!(
+            out.messages[0].internal_origin.as_deref(),
+            Some(LEGACY_COLD_SUMMARY_ORIGIN)
+        );
+        assert_eq!(
+            out.messages[0].text,
+            format!("{LEGACY_COLD_SUMMARY_PREFIX}older context")
+        );
+        assert_eq!(out.messages[1].text, "recent");
+    }
+
+    #[test]
     fn catalog_projection_preserves_exact_project_bucket() {
         let entry = CatalogEntry {
             id: "same-id".into(),
             name: "selected".into(),
+            fork_root_id: None,
             project_bucket: "0123456789abcdef".into(),
             working_dir: PathBuf::from("/project"),
             created_at_ms: 1,

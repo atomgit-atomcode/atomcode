@@ -17,6 +17,9 @@ pub struct Skill {
     /// Tools the specialization MAY auto-approve while this skill is active (metadata;
     /// the L1 capability does not enforce it — that's an L2 approval-policy concern).
     pub allowed_tools: Vec<String>,
+    /// If false (`user-invocable: false` in frontmatter), hidden from the `/` menu;
+    /// the model can still auto-invoke it. Absent → true.
+    pub user_invocable: bool,
     /// Directory containing the skill file (for `${CLAUDE_SKILL_DIR}`).
     pub skill_dir: PathBuf,
     pub source_path: PathBuf,
@@ -53,6 +56,51 @@ impl Skill {
             result = format!("{}\n\nARGUMENTS: {}", result.trim_end(), arguments);
         }
         expand_shell_injections(&result)
+    }
+
+    /// [`expand`](Self::expand) plus, for directory-style skills, a `<system-reminder>`
+    /// naming the skill's install directory (so bundled `scripts/`/`references/` resolve
+    /// correctly). Mirrors core `Skill::expand_for_injection`.
+    pub fn expand_for_injection(&self, arguments: &str, session_id: &str) -> String {
+        let body = self.expand(arguments, session_id);
+        match self.bundled_resource_note() {
+            Some(note) => format!("{note}\n\n{body}"),
+            None => body,
+        }
+    }
+
+    /// A `<system-reminder>` naming the skill's install directory, emitted only for
+    /// directory-style skills (source file literally `SKILL.md`) — those own a dedicated
+    /// folder that can bundle `scripts/`/`references/`. Single-file `.md` skills share a
+    /// skills folder, so the note would point at the wrong (shared) directory.
+    fn bundled_resource_note(&self) -> Option<String> {
+        if self.source_path.file_name().and_then(|n| n.to_str()) != Some("SKILL.md") {
+            return None;
+        }
+        let dir = display_skill_dir(&self.skill_dir.to_string_lossy(), cfg!(windows));
+        Some(format!(
+            "<system-reminder>\n\
+             This skill is installed at: {dir}\n\
+             Any files it references (e.g. `scripts/…`, `references/…`, templates) live \
+             UNDER that directory, NOT the current working directory. Resolve every \
+             relative path in this skill against the skill directory above — for a \
+             bundled script, run it by its absolute path under that directory. Do not \
+             search the project / working directory for these files.\n\
+             </system-reminder>"
+        ))
+    }
+}
+
+/// Format a skill directory for the base-dir note (see `bundled_resource_note`). On
+/// Windows, convert `\` → `/` so the path works uniformly across read_file/Python/Git
+/// Bash (a raw backslash path breaks when bash treats `\U`/`\s` as escapes). Windows
+/// separators are always `\` and filenames can't contain `\`, so the replace is lossless.
+/// On Unix, `\` is a legal filename char, so leave it. Note-text only — never used for IO.
+fn display_skill_dir(raw: &str, is_windows: bool) -> String {
+    if is_windows {
+        raw.replace('\\', "/")
+    } else {
+        raw.to_string()
     }
 }
 
@@ -145,11 +193,24 @@ fn run_shell_command(cmd: &str) -> String {
 
 // ── Frontmatter + parsing ────────────────────────────────────────────────────
 
-#[derive(Default)]
 struct Frontmatter {
     name: Option<String>,
     description: String,
     allowed_tools: Vec<String>,
+    /// If false (`user-invocable: false`), hidden from the `/` menu — the model can
+    /// still auto-invoke. Absent → true.
+    user_invocable: bool,
+}
+
+impl Default for Frontmatter {
+    fn default() -> Self {
+        Self {
+            name: None,
+            description: String::new(),
+            allowed_tools: Vec::new(),
+            user_invocable: true,
+        }
+    }
 }
 
 fn fm_value(s: &str) -> String {
@@ -183,6 +244,9 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
+        } else if let Some(v) = line.strip_prefix("user-invocable:") {
+            // Mirror core: only the literal `false` hides it; anything else stays true.
+            fm.user_invocable = v.trim() != "false";
         }
     }
     (fm, body.to_string())
@@ -311,6 +375,7 @@ fn build_skill(
         description,
         template,
         allowed_tools: fm.allowed_tools,
+        user_invocable: fm.user_invocable,
         skill_dir: skill_dir.to_path_buf(),
         source_path: source.to_path_buf(),
     })
@@ -326,9 +391,20 @@ mod tests {
             description: String::new(),
             template: template.into(),
             allowed_tools: vec![],
+            user_invocable: true,
             skill_dir: PathBuf::from("/sk"),
             source_path: PathBuf::from("/sk/SKILL.md"),
         }
+    }
+
+    #[test]
+    fn frontmatter_parses_user_invocable() {
+        // `user-invocable: false` hides a skill from the `/` menu; anything else
+        // (incl. absent) defaults to true. Mirrors core skill.rs parsing.
+        let (fm, _) = parse_frontmatter("---\nname: x\nuser-invocable: false\n---\nbody");
+        assert!(!fm.user_invocable);
+        let (fm2, _) = parse_frontmatter("---\nname: x\n---\nbody");
+        assert!(fm2.user_invocable, "absent → default true");
     }
 
     #[test]

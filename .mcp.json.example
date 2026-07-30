@@ -33,7 +33,7 @@
       "args": ["run", "--release", "--bin", "mcp-test-server", "--manifest-path", "."],
       "disabled": true
       // 启用前改为 false，并把 manifest-path 指到正确 Cargo.toml（如本仓库
-      // crates/atomcode-core/Cargo.toml），否则从错误目录执行会找不到包。
+      // crates/atomcode-capabilities/Cargo.toml），否则从错误目录执行会找不到包。
       //
       // 常用可选（与 command 同级，按需取消注释；不要尾逗号）：
       // "env": { "KEY": "value" },

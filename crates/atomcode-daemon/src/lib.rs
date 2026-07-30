@@ -39,6 +39,11 @@ mod login_state;
 mod login_state_tests;
 pub mod native_live;
 mod runtime_host;
+/// File-sink diagnostic trace (`ctrace!` macro), enabled via `ATOMCODE_TUIX_LOG`.
+/// Moved here from the retired `atomcode-core` (daemon is its only consumer;
+/// `atomcode_tuix::trace` keeps its own copy targeting the same append file).
+#[macro_use]
+pub mod trace;
 pub use kernel_runtime::{
     spawn_native_runtime_for_session_deferred,
     spawn_native_runtime_for_session_deferred_with_preprocessor, start_native_runtime,
@@ -46,7 +51,7 @@ pub use kernel_runtime::{
 };
 pub use runtime_host::{
     coding_plan_rate_limit_source, coding_provider_factory, gather_plugin_skill_dirs,
-    installed_plugin_hook_source,
+    gather_plugin_skill_dirs_for, installed_plugin_hook_source,
 };
 pub(crate) mod live_api;
 pub use live_api::live_set_mode;
@@ -78,12 +83,10 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use atomcode_auth as auth;
-use atomcode_capabilities::session::SessionManager as NativeSessionManager;
+use atomcode_capabilities::mcp::McpRegistry;
+use atomcode_capabilities::session::{SessionManager as NativeSessionManager, SessionStoreError};
 use atomcode_coding::CodingRuntimeEvent;
 use atomcode_config::config::Config;
-use atomcode_core::conversation::Conversation;
-use atomcode_core::mcp::McpRegistry;
-use atomcode_core::provider;
 use atomcode_telemetry::detect_repo_origin;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
@@ -137,6 +140,7 @@ pub(crate) struct ProviderInfo {
     pub reasoning_effort: Option<String>,
     pub skip_tls_verify: bool,
     pub ephemeral: bool,
+    pub pricing: Option<atomcode_config::config::provider::ProviderPricing>,
 }
 
 /// Login attempts stay addressable while a blocking poll is in flight. Per-record
@@ -456,6 +460,15 @@ impl ActiveChatRegistry {
             .is_some_and(|operation| operation.stopped)
     }
 
+    async fn session_id(&self, operation_id: &str) -> Option<String> {
+        self.inner
+            .read()
+            .await
+            .operations
+            .get(operation_id)
+            .and_then(|operation| operation.session_id.clone())
+    }
+
     /// Remove only the exact operation that finished. A late cleanup from an
     /// older generation can never erase a replacement operation's aliases.
     async fn complete(&self, operation_id: &str) -> bool {
@@ -523,7 +536,6 @@ impl Drop for SseConnectionGuard {
 /// Combined app state for Axum
 #[derive(Clone)]
 pub struct AppState {
-    pub sessions: SessionStore,
     pub project: ProjectStateStore,
     /// Admitted background chat operations and their session/request aliases.
     active_chats: ActiveChatRegistry,
@@ -645,8 +657,15 @@ fn init_project_state(override_dir: Option<PathBuf>) -> ProjectState {
     let config_default = Config::load(&Config::default_path())
         .ok()
         .and_then(|c| c.default_workdir.map(PathBuf::from));
+    // A TUI sharing its runtime via `/webui` / `/sync` registered its embedded binding in
+    // THIS (in-process) daemon BEFORE the server started. Its working dir is the user's
+    // ACTUAL directory, unlike the caller's `current_dir()` override (just where the
+    // process launched). Prefer it so the webui footer + session list seed from the TUI's
+    // project instead of the process cwd. `/cd` keeps `state.project` current afterward via
+    // `live_set_working_dir`, so the read path (GET /project) stays authoritative.
+    let embedded_dir = crate::native_live::embedded_binding().map(|binding| binding.working_dir);
     let path = normalize_working_dir_case(resolve_initial_working_dir(
-        override_dir,
+        embedded_dir.or(override_dir),
         config_default,
         default_working_dir(),
     ));
@@ -726,7 +745,7 @@ pub struct MessageInfo {
 }
 
 /// Serializable image payload returned in session history.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageData {
     pub media_type: String,
     pub data: String,
@@ -751,144 +770,6 @@ fn strip_vision_marker(raw: &str) -> (String, bool) {
     {
         Some(i) => (raw[..i].trim_end().to_string(), true),
         None => (raw.to_string(), false),
-    }
-}
-
-fn restore_submitted_user_images_before_save(
-    messages: &mut [atomcode_core::conversation::message::Message],
-    submitted_text: &str,
-    submitted_images: &[atomcode_core::conversation::message::ImagePart],
-) {
-    if submitted_images.is_empty() {
-        return;
-    }
-
-    let Some(idx) = messages.iter().rposition(|msg| {
-        matches!(msg.role, atomcode_core::conversation::message::Role::User) && !msg.synthetic
-    }) else {
-        return;
-    };
-
-    messages[idx].content = atomcode_core::conversation::message::MessageContent::MultiPart {
-        text: if submitted_text.is_empty() {
-            None
-        } else {
-            Some(submitted_text.to_string())
-        },
-        images: submitted_images.to_vec(),
-    };
-}
-
-impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
-    fn from(msg: &atomcode_core::conversation::message::Message) -> Self {
-        let role = match msg.role {
-            atomcode_core::conversation::message::Role::System => "system",
-            atomcode_core::conversation::message::Role::User => "user",
-            atomcode_core::conversation::message::Role::Assistant => "assistant",
-            atomcode_core::conversation::message::Role::Tool => "tool",
-        };
-
-        let (content, tool_calls, tool_result, artifacts) = match &msg.content {
-            atomcode_core::conversation::message::MessageContent::Text(s) => {
-                // No artifacts from plain text messages (code blocks not extracted)
-                (s.clone(), None, None, None)
-            }
-            atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
-                text,
-                tool_calls,
-                ..
-            } => {
-                let calls: Vec<ToolCallInfo> = tool_calls
-                    .iter()
-                    .map(|tc| ToolCallInfo {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        arguments: tc.arguments.clone(),
-                        display: format_tool_args(&tc.name, &tc.arguments),
-                    })
-                    .collect();
-
-                // Extract artifacts from tool calls (e.g., write_file for HTML)
-                let artifacts = extract_artifacts_from_tool_calls(tool_calls);
-                (
-                    text.clone().unwrap_or_default(),
-                    Some(calls),
-                    None,
-                    artifacts,
-                )
-            }
-            atomcode_core::conversation::message::MessageContent::ToolResult(r) => {
-                let lines = r.output.lines().count();
-                let first_line = r.output.lines().next().unwrap_or("");
-                let summary = if first_line.len() > 100 {
-                    format!("{}...", first_line.chars().take(97).collect::<String>())
-                } else {
-                    first_line.to_string()
-                };
-                (
-                    r.output.clone(),
-                    None,
-                    Some(ToolResultInfo {
-                        call_id: r.call_id.clone(),
-                        success: r.success,
-                        summary,
-                        line_count: lines,
-                    }),
-                    None,
-                )
-            }
-            atomcode_core::conversation::message::MessageContent::ToolResultRef(r) => {
-                (r.summary.clone(), None, None, None)
-            }
-            atomcode_core::conversation::message::MessageContent::MultiPart { text, .. } => {
-                // 图片走下面的 images 字段渲染缩略图；文本里若拼接了 VL 识别结果
-                // （[图片内容（由 … 识别）] / [图片识别失败]，仅用于喂给非视觉模型），
-                // 展示时剥离，只保留用户原始输入，避免历史里出现一大段识别文字。
-                let raw = text.clone().unwrap_or_default();
-                let (display, _) = strip_vision_marker(&raw);
-                (display, None, None, None)
-            }
-        };
-        let mut content = content;
-
-        // 提取 MultiPart 的图片，供 webui 历史渲染缩略图。
-        let mut images =
-            match &msg.content {
-                atomcode_core::conversation::message::MessageContent::MultiPart {
-                    images, ..
-                } if !images.is_empty() => Some(
-                    images
-                        .iter()
-                        .map(|i| ImageData {
-                            media_type: i.media_type.clone(),
-                            data: i.data.clone(),
-                            missing: false,
-                        })
-                        .collect(),
-                ),
-                _ => None,
-            };
-        if matches!(msg.role, atomcode_core::conversation::message::Role::User) {
-            let (display, had_vision_marker) = strip_vision_marker(&content);
-            if had_vision_marker {
-                content = display;
-                if images.is_none() {
-                    images = Some(vec![ImageData::missing_placeholder()]);
-                }
-            }
-        }
-
-        Self {
-            role: role.to_string(),
-            content,
-            synthetic: msg.synthetic,
-            internal_origin: msg.internal_origin.clone(),
-            tool_calls,
-            tool_result,
-            artifacts,
-            images,
-            created_at: None,
-        }
     }
 }
 
@@ -964,17 +845,6 @@ impl MessageInfo {
             created_at: None,
         }
     }
-}
-
-/// Extract artifacts from tool calls (e.g., write_file creating HTML files)
-fn extract_artifacts_from_tool_calls(
-    tool_calls: &[atomcode_core::tool::ToolCall],
-) -> Option<Vec<ArtifactInfo>> {
-    extract_artifacts_from_call_fields(
-        tool_calls
-            .iter()
-            .map(|call| (call.name.as_str(), call.arguments.as_str())),
-    )
 }
 
 fn extract_artifacts_from_call_fields<'a>(
@@ -1508,6 +1378,56 @@ fn catalog_entry_with_project(
     }
 }
 
+fn active_catalog_location(
+    entries: &[atomcode_capabilities::session::CatalogEntry],
+) -> Option<atomcode_capabilities::session::CatalogLocation> {
+    let binding = crate::native_live::binding().ok()?;
+    resolve_active_catalog_location(entries, &binding.session_id, &binding.working_dir)
+}
+
+fn resolve_active_catalog_location(
+    entries: &[atomcode_capabilities::session::CatalogEntry],
+    session_id: &str,
+    working_dir: &std::path::Path,
+) -> Option<atomcode_capabilities::session::CatalogLocation> {
+    let working_dir_key = atomcode_capabilities::pathnorm::path_case_key(working_dir);
+    let mut matches = entries.iter().filter(|entry| {
+        entry.id == session_id
+            && atomcode_capabilities::pathnorm::path_case_key(&entry.working_dir) == working_dir_key
+    });
+    let entry = matches.next()?;
+    // A logical working directory is not a physical catalog identity: resumed
+    // and imported sessions may live in a historical bucket. Fail closed on an
+    // ambiguous duplicate instead of manufacturing a bucket from the cwd.
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(atomcode_capabilities::session::CatalogLocation {
+        id: entry.id.clone(),
+        project_bucket: entry.project_bucket.clone(),
+    })
+}
+
+fn catalog_entry_is_visible(
+    sessions_root: &std::path::Path,
+    entry: &atomcode_capabilities::session::CatalogEntry,
+    active: Option<&atomcode_capabilities::session::CatalogLocation>,
+) -> bool {
+    if entry.message_count > 0 {
+        return true;
+    }
+    if active.is_some_and(|location| {
+        location.id == entry.id && location.project_bucket == entry.project_bucket
+    }) {
+        return true;
+    }
+    if entry.presence == atomcode_capabilities::session::CatalogPresence::LegacyOnly {
+        return false;
+    }
+    NativeSessionManager::with_root(sessions_root.join(&entry.project_bucket))
+        .has_valid_inflight_snapshot(&entry.id)
+}
+
 static SESSION_CATALOG_IO: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// Run bulk catalog scans off the async runtime and serialize them so queued
@@ -1531,18 +1451,29 @@ where
 
 /// List sessions for a project
 fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionSummary>> {
-    list_sessions_in_root(&NativeSessionManager::sessions_root(), project_hash)
+    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root())?;
+    let active = active_catalog_location(&scan.entries);
+    list_sessions_in_root(
+        &NativeSessionManager::sessions_root(),
+        project_hash,
+        active.as_ref(),
+    )
 }
 
 fn list_sessions_in_root(
     sessions_root: &std::path::Path,
     project_hash: &str,
+    active: Option<&atomcode_capabilities::session::CatalogLocation>,
 ) -> std::io::Result<Vec<SessionSummary>> {
     let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
         .entries
         .into_iter()
-        .filter(|entry| entry.project_bucket == project_hash && entry.message_count > 0)
+        .filter(|entry| {
+            entry.project_bucket == project_hash
+                && catalog_entry_is_visible(sessions_root, entry, active)
+        })
         .collect();
+    NativeSessionManager::collapse_fork_lineages(&mut entries);
     crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
     Ok(entries
         .iter()
@@ -1552,17 +1483,21 @@ fn list_sessions_in_root(
 
 /// List all sessions across all projects
 fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
-    list_all_sessions_in_root(&NativeSessionManager::sessions_root())
+    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root())?;
+    let active = active_catalog_location(&scan.entries);
+    list_all_sessions_in_root(&NativeSessionManager::sessions_root(), active.as_ref())
 }
 
 fn list_all_sessions_in_root(
     sessions_root: &std::path::Path,
+    active: Option<&atomcode_capabilities::session::CatalogLocation>,
 ) -> std::io::Result<Vec<SessionMetaWithProject>> {
     let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
         .entries
         .into_iter()
-        .filter(|entry| entry.message_count > 0)
+        .filter(|entry| catalog_entry_is_visible(sessions_root, entry, active))
         .collect();
+    NativeSessionManager::collapse_fork_lineages(&mut entries);
     // Bound snapshot hydration to the same newest-50 surface the API returns.
     entries.truncate(50);
     crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
@@ -2008,6 +1943,89 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
     }
 }
 
+/// Display-only image sidecar: the ORIGINAL images of VL-preprocessed user messages.
+///
+/// When the active model lacks vision, the runtime's VL seam strips the image from the
+/// conversation (only the text caption reaches the model + the persisted snapshot). The
+/// image must NOT go back into the conversation — the kernel counts every stored image as
+/// ~1600 tokens (`Message::estimate_tokens`) and the adapter would re-send it — so we
+/// stash the originals HERE, out of band, and re-attach them for DISPLAY only on load.
+/// Ordered: one entry per VL-preprocessed submission, matched to the VL-marker user
+/// messages in order (each such submission produces exactly one).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ImageSidecar {
+    #[serde(default)]
+    pub sets: Vec<Vec<ImageData>>,
+}
+
+fn image_sidecar_path(working_dir: &std::path::Path, session_id: &str) -> PathBuf {
+    atomcode_capabilities::session::SessionManager::for_project(working_dir)
+        .root()
+        .join(format!("{session_id}.images.json"))
+}
+
+/// Append a VL-preprocessed message's ORIGINAL images to the session's display-only
+/// sidecar. Best-effort: a failure just means the image later shows as the "missing"
+/// placeholder — it never blocks the turn and never touches the model context.
+pub(crate) fn append_display_images(
+    working_dir: &std::path::Path,
+    session_id: &str,
+    images: Vec<ImageData>,
+) {
+    if images.is_empty() {
+        return;
+    }
+    let path = image_sidecar_path(working_dir, session_id);
+    let mut sidecar: ImageSidecar = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    sidecar.sets.push(images);
+    if let Ok(bytes) = serde_json::to_vec(&sidecar) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+/// Re-attach display-only sidecar images to the VL-preprocessed user messages that
+/// currently render the "missing image" placeholder, IN ORDER. Real (vision-model)
+/// images and non-user messages are left untouched.
+pub(crate) fn attach_display_images(
+    messages: &mut [MessageInfo],
+    working_dir: &std::path::Path,
+    session_id: &str,
+) {
+    let sets = std::fs::read(image_sidecar_path(working_dir, session_id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ImageSidecar>(&bytes).ok())
+        .map(|sidecar| sidecar.sets)
+        .unwrap_or_default();
+    attach_image_sets(messages, sets);
+}
+
+/// Pure matcher (see [`attach_display_images`]): replace each VL-marker user message's
+/// "missing image" placeholder with the next sidecar image set, IN ORDER. Real images and
+/// non-user messages are left untouched.
+fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
+    if sets.is_empty() {
+        return;
+    }
+    let mut next = sets.into_iter();
+    for message in messages.iter_mut() {
+        let is_missing_placeholder = message.role == "user"
+            && message
+                .images
+                .as_ref()
+                .is_some_and(|imgs| imgs.iter().any(|img| img.missing));
+        if is_missing_placeholder {
+            if let Some(images) = next.next() {
+                if !images.is_empty() {
+                    message.images = Some(images);
+                }
+            }
+        }
+    }
+}
+
 fn merge_catalog_session_messages_for_display(
     session: &crate::legacy_convert::CatalogSessionView,
 ) -> anyhow::Result<Vec<MessageInfo>> {
@@ -2019,7 +2037,7 @@ fn merge_catalog_session_messages_for_display(
         .iter()
         .filter(|message| {
             message.internal_origin.as_deref()
-                != Some(atomcode_core::conversation::LEGACY_COLD_SUMMARY_ORIGIN)
+                != Some(atomcode_kernel::message::LEGACY_COLD_SUMMARY_ORIGIN)
         })
         .collect();
     let mut presentation = std::collections::BTreeMap::<usize, Vec<_>>::new();
@@ -2086,6 +2104,13 @@ fn merge_catalog_session_messages_for_display(
             });
         }
     }
+    // Re-attach display-only images (VL-preprocessed originals) stashed out of band, so a
+    // reloaded session shows the thumbnail instead of the "missing image" placeholder.
+    attach_display_images(
+        &mut messages,
+        std::path::Path::new(&session.meta.working_dir),
+        &session.meta.id,
+    );
     Ok(messages)
 }
 
@@ -2283,10 +2308,61 @@ async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse 
     }
 }
 
-/// Delete a session file
-fn delete_session_file(project_hash: &str, session_id: &str) -> std::io::Result<()> {
+/// Delete one inactive session aggregate.
+///
+/// Keep the typed storage error in the anyhow chain: the HTTP boundary must
+/// distinguish an active lease (`409`) from missing data (`404`) and an
+/// unexpected storage failure (`500`). Flattening everything into
+/// `io::Error::other` made that distinction impossible.
+fn delete_session_file(project_hash: &str, session_id: &str) -> anyhow::Result<()> {
     crate::legacy_convert::delete_catalog_session_in_project(project_hash, session_id)
-        .map_err(std::io::Error::other)
+}
+
+fn valid_project_bucket(project_bucket: &str) -> bool {
+    project_bucket.len() == 16 && project_bucket.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn delete_session_api_error(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> (StatusCode, Json<ApiError>) {
+    (
+        status,
+        Json(ApiError {
+            success: false,
+            error: message.to_string(),
+            code: Some(code.to_string()),
+            retryable: Some(false),
+        }),
+    )
+}
+
+fn classify_delete_session_error(error: &anyhow::Error) -> (StatusCode, Json<ApiError>) {
+    match error.downcast_ref::<SessionStoreError>() {
+        Some(SessionStoreError::SessionInUse { .. }) => delete_session_api_error(
+            StatusCode::CONFLICT,
+            "SESSION_IN_USE",
+            "This session is active. Switch to or create another session, then try again.",
+        ),
+        Some(SessionStoreError::NotFound { .. }) => delete_session_api_error(
+            StatusCode::NOT_FOUND,
+            "SESSION_NOT_FOUND",
+            "The session was not found.",
+        ),
+        Some(SessionStoreError::InvalidId { .. } | SessionStoreError::AmbiguousId { .. }) => {
+            delete_session_api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_SESSION",
+                "The session identifier is invalid.",
+            )
+        }
+        _ => delete_session_api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DELETE_FAILED",
+            "Failed to delete the session. Check the AtomCode logs for details.",
+        ),
+    }
 }
 
 /// DELETE /projects/:hash/sessions/:id - Delete a session
@@ -2298,6 +2374,15 @@ async fn delete_session(
     let session_uuid = uuid::Uuid::parse_str(&id).ok();
     let state_clone = state.clone();
     daemon_scope(&state, session_uuid, client_mode, || async move {
+        if !valid_project_bucket(&hash) {
+            tracing::warn!(project_bucket = %hash, "rejected invalid session delete request");
+            return delete_session_api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_SESSION",
+                "The project or session identifier is invalid.",
+            )
+            .into_response();
+        }
         match delete_session_file(&hash, &id) {
             Ok(()) => {
                 state_clone.telemetry.track(Event::UseCommand {
@@ -2310,8 +2395,16 @@ async fn delete_session(
                 (StatusCode::OK, Json(msg)).into_response()
             }
             Err(e) => {
-                let msg = format!("Failed to delete session: {}", e);
-                (StatusCode::NOT_FOUND, Json(msg)).into_response()
+                let response = classify_delete_session_error(&e);
+                if response.0 == StatusCode::INTERNAL_SERVER_ERROR {
+                    tracing::error!(
+                        project_bucket = %hash,
+                        session_id = %id,
+                        error = ?e,
+                        "failed to delete session"
+                    );
+                }
+                response.into_response()
             }
         }
     })
@@ -2386,7 +2479,32 @@ pub struct ModelInfo {
     pub reasoning_effort: Option<String>,
 }
 
-/// GET /models - List all available models from configured providers
+/// Build the `/models` list from the UNIFIED model catalog (`logical_models`)
+/// so folded CodingPlan / new-schema `[models.*]` models — which no longer live
+/// in `config.providers` — appear in the webui + VSCode model pickers, matching
+/// `/config` (`config_response`) and `/providers` (`get_providers`). The old
+/// body iterated only `config.providers` and so silently dropped them.
+fn models_from_config(config: &Config) -> Vec<ModelInfo> {
+    let default_selection = config.effective_model_selection().unwrap_or_default();
+    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+    ids.sort();
+    ids.iter()
+        .filter_map(|id| {
+            config.provider_config_for_selection(id).map(|p| ModelInfo {
+                provider: id.clone(),
+                model: p.model.clone(),
+                provider_type: p.provider_type.clone(),
+                is_default: id == &default_selection,
+                effort_applicable: atomcode_capabilities::provider::reason_effort_applicable(
+                    &p.model,
+                ),
+                reasoning_effort: p.reasoning_effort.clone(),
+            })
+        })
+        .collect()
+}
+
+/// GET /models - List all selectable models from the unified catalog.
 async fn get_models() -> impl IntoResponse {
     let config_path = Config::default_path();
     let config = match Config::load(&config_path) {
@@ -2400,21 +2518,26 @@ async fn get_models() -> impl IntoResponse {
         }
     };
 
-    let models: Vec<ModelInfo> = config
-        .providers
-        .iter()
-        .map(|(name, p)| ModelInfo {
-            provider: name.clone(),
-            model: p.model.clone(),
-            provider_type: p.provider_type.clone(),
-            is_default: name == &config.default_provider,
-            effort_applicable:
-                atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(&p.model),
-            reasoning_effort: p.reasoning_effort.clone(),
-        })
-        .collect();
+    (StatusCode::OK, Json(models_from_config(&config))).into_response()
+}
 
-    (StatusCode::OK, Json(models)).into_response()
+/// Resolve the model selection used by `/chat` through the unified config boundary.
+///
+/// New-schema CodingPlan models live in `[models.*]` and therefore are not present in
+/// the legacy `config.providers` map. Keep the selection id intact for the runtime while
+/// projecting the flattened provider config needed by image preprocessing and runtime
+/// metadata.
+fn resolve_chat_provider(
+    config: &Config,
+    requested: Option<String>,
+) -> anyhow::Result<(String, atomcode_config::config::provider::ProviderConfig)> {
+    let selection = requested
+        .or_else(|| config.effective_model_selection())
+        .ok_or_else(|| anyhow::anyhow!("no model selected"))?;
+    let provider = config
+        .provider_config_for_selection(&selection)
+        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", selection))?;
+    Ok((selection, provider))
 }
 
 // ============== Streaming Chat API ==============
@@ -3370,9 +3493,6 @@ impl ChatRuntimeProjector {
     }
 }
 
-/// Global chat sessions store (in-memory for now)
-type SessionStore = Arc<RwLock<std::collections::HashMap<String, Conversation>>>;
-
 /// POST /chat - Stream chat response with SSE
 async fn chat_stream(
     State(state): State<AppState>,
@@ -3448,30 +3568,40 @@ async fn chat_stream(
         ..CurrentContext::current()
     };
 
-    // Spawn the chat processing task
-    tokio::spawn(async move {
-        CurrentContext::scope(ctx_for_task, || async move {
-            let cleanup_operation_id = operation_id.clone();
-            if let Err(e) = process_chat_request(
-                req,
-                tx.clone(),
-                cancel_token,
-                operation_id,
-                active_chats.clone(),
-                mcp_cache,
-                telemetry,
-                pending_permissions,
-                interactive_permission,
-            )
-            .await
-            {
-                let _ = tx.send(ChatEvent::Error {
-                    message: e.to_string(),
-                });
-            }
+    let chat_session_id = session_uuid.map(|u| u.to_string()).unwrap_or_default();
+    let cleanup_op = operation_id.clone();
+    let cleanup_chats = active_chats.clone();
+    let inner_event_tx = tx.clone();
+    let terminal_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let inner_terminal_sent = terminal_sent.clone();
 
-            active_chats.complete(&cleanup_operation_id).await;
-        })
+    tokio::spawn(async move {
+        let inner = tokio::spawn(async move {
+            CurrentContext::scope(ctx_for_task, || async move {
+                process_chat_request(
+                    req,
+                    inner_event_tx,
+                    cancel_token,
+                    operation_id,
+                    active_chats,
+                    mcp_cache,
+                    telemetry,
+                    pending_permissions,
+                    interactive_permission,
+                    inner_terminal_sent,
+                )
+                .await
+            })
+            .await
+        });
+        finalize_chat_task(
+            inner,
+            &tx,
+            &cleanup_chats,
+            &cleanup_op,
+            &chat_session_id,
+            &terminal_sent,
+        )
         .await;
     });
 
@@ -3504,6 +3634,51 @@ async fn chat_stream(
         .into_response()
 }
 
+/// Await the inner chat task, translating its outcome into SSE events and
+/// always calling `active_chats.complete()` afterwards — even on panic.
+async fn finalize_chat_task(
+    inner: tokio::task::JoinHandle<anyhow::Result<()>>,
+    event_tx: &mpsc::UnboundedSender<ChatEvent>,
+    cleanup_chats: &ActiveChatRegistry,
+    cleanup_operation_id: &str,
+    requested_session_id: &str,
+    terminal_sent: &std::sync::atomic::AtomicBool,
+) {
+    match inner.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let _ = event_tx.send(ChatEvent::Error {
+                message: e.to_string(),
+            });
+        }
+        Err(join_error) => {
+            tracing::error!(
+                operation_id = cleanup_operation_id,
+                error = %join_error,
+                cancelled = join_error.is_cancelled(),
+                "chat task failed"
+            );
+            let _ = event_tx.send(ChatEvent::Error {
+                message: "chat task failed".into(),
+            });
+            if !terminal_sent.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let session_id = cleanup_chats
+                    .session_id(cleanup_operation_id)
+                    .await
+                    .unwrap_or_else(|| requested_session_id.to_string());
+                let _ = event_tx.send(ChatEvent::Done {
+                    tokens: 0,
+                    tool_calls: 0,
+                    session_id,
+                    stop_reason: Some("internal_error".into()),
+                    message: Some("chat task failed".into()),
+                });
+            }
+        }
+    }
+    cleanup_chats.complete(cleanup_operation_id).await;
+}
+
 /// Process a chat request and stream events
 async fn process_chat_request(
     req: ChatRequest,
@@ -3517,31 +3692,21 @@ async fn process_chat_request(
     telemetry: Arc<Telemetry>,
     pending_permissions: permission_bridge::PermissionResponders,
     interactive_permission: bool,
+    terminal_sent: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let approval_mode = effective_chat_approval_mode(req.approval_mode);
     // Load config
     let config = atomcode_config::ConfigStore::default_store().read()?.config;
     atomcode_config::proxy::apply_process_proxy_config(&config.network.proxy);
 
-    // Determine provider
-    let provider_name = req
-        .provider
-        .unwrap_or_else(|| config.default_provider.clone());
-    let provider_config = config
-        .providers
-        .get(&provider_name)
-        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_name))?;
-    // Pre-flight: validate the selected provider config up front so a bad
-    // provider surfaces a clean error here rather than deep in the runtime. The
-    // runtime builds its own provider for the actual turn.
-    // `create_provider` may do blocking auth I/O (OAuth token refresh) — run it
-    // off the async runtime so a slow/unreachable auth host can't block a worker.
-    let active_provider = {
-        let cfg = provider_config.clone();
-        tokio::task::spawn_blocking(move || provider::create_provider(&cfg))
-            .await
-            .map_err(|e| anyhow::anyhow!("provider construction task panicked: {e}"))??
-    };
+    // Determine the unified model selection. CodingPlan/new-schema selections live in
+    // `[models.*]`, not the retired per-model `[providers.*]` projection.
+    let (provider_name, provider_config) = resolve_chat_provider(&config, req.provider)?;
+    // The provider config's existence is validated above; the native runtime
+    // builds (and validates) its own kernel provider for the actual turn and
+    // surfaces a clean error there. No core-provider preflight is needed — the
+    // VL preprocessor builds its own session-bound provider (see
+    // `preprocess_image_caption`), so nothing here consumes `core::provider`.
     let _ = event_tx.send(ChatEvent::RuntimeInfo {
         provider: provider_name.clone(),
         model: provider_config.model.clone(),
@@ -3552,7 +3717,7 @@ async fn process_chat_request(
         .working_dir
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    let (session_id, initial_snapshot) = if let Some(ref session_id_str) = req.session_id {
+    let (session_id, initial_messages) = if let Some(ref session_id_str) = req.session_id {
         let project_bucket = NativeSessionManager::project_hash(&working_dir);
         let session = crate::legacy_convert::load_catalog_session_view_in_project(
             &project_bucket,
@@ -3563,20 +3728,13 @@ async fn process_chat_request(
                 "session {session_id_str:?} not found in project bucket {project_bucket}"
             )
         })?;
-        (
-            session.meta.id,
-            crate::legacy_convert::snapshot_to_core(&session.snapshot),
-        )
+        (session.meta.id, session.snapshot.messages)
     } else {
-        (uuid::Uuid::new_v4().to_string(), Default::default())
+        (uuid::Uuid::new_v4().to_string(), Vec::new())
     };
     active_chats
         .bind_session(&operation_id, &session_id)
         .await?;
-
-    // Bind the persisted conversation id to the one-off active provider used by the
-    // VL preprocessor, preserving the same gateway affinity as the main chat turn.
-    active_provider.set_session_id(&session_id);
 
     // Key used to route interactive permission decisions back to this turn's
     // decider. We use the *actual* session id (not req.session_id, which may be
@@ -3585,48 +3743,40 @@ async fn process_chat_request(
     // `permission_request` SSE event use this same key.
     let perm_session_key = session_id.clone();
 
-    // The core conversation is retained only as the current live transport adapter;
-    // persisted history was loaded from the native/kernel session view above.
-    let conversation = Arc::new(tokio::sync::Mutex::new(Conversation::from_snapshot(
-        initial_snapshot,
-    )));
+    // The kernel-native buffer is the live transport (cold summaries inline as
+    // synthetic messages); persisted history was loaded from the native session view
+    // above. The native runtime owns turn boundaries — no daemon-side turn tracker.
+    let conversation = Arc::new(tokio::sync::Mutex::new(initial_messages));
     // Keep the original images in the persisted/display conversation, but preprocess the
     // runtime caption first when the active model is text-only. `run_chat_turn_v2` detects
     // the marker and omits the already-described image bytes from the kernel input.
     {
-        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
+        use atomcode_kernel::message::{ImageContent, Message};
 
-        let images: Vec<ImagePart> = req
+        let images: Vec<ImageContent> = req
             .images
             .iter()
-            .map(|i| ImagePart {
+            .map(|i| ImageContent {
                 media_type: i.media_type.clone(),
                 data: i.data.clone(),
             })
             .collect();
-        let runtime_text =
-            live_api::preprocess_image_caption(&config, &*active_provider, &req.message, &images)
-                .await;
+        let runtime_text = live_api::preprocess_image_caption(
+            &config,
+            &provider_config.model,
+            &working_dir,
+            telemetry.clone(),
+            Some(&session_id),
+            &req.message,
+            &images,
+        )
+        .await;
 
         let mut conv = conversation.lock().await;
         if images.is_empty() {
-            conv.add_user_message(&runtime_text);
+            conv.push(Message::user(runtime_text));
         } else {
-            let idx = conv.messages.len();
-            conv.messages.push(Message {
-                role: Role::User,
-                content: MessageContent::MultiPart {
-                    text: if runtime_text.is_empty() {
-                        None
-                    } else {
-                        Some(runtime_text)
-                    },
-                    images,
-                },
-                synthetic: false,
-                internal_origin: None,
-            });
-            conv.turn_tracker.on_user_message(idx);
+            conv.push(Message::user_with_images(runtime_text, images));
         }
     }
     // Interactive approval bridged over HTTP: interactive local clients (WebUI,
@@ -3649,10 +3799,11 @@ async fn process_chat_request(
         // conversation should still be resumable via /resume.
         {
             let conv = conversation.lock().await;
+            let snapshot = atomcode_kernel::message::SessionSnapshot::new(conv.clone());
             if let Err(e) = crate::legacy_convert::persist_pre_runtime_terminal(
                 &working_dir,
                 &session_id,
-                &conv.snapshot(),
+                &snapshot,
             ) {
                 eprintln!("Warning: Failed to save native session after early stop: {e}");
             }
@@ -3681,7 +3832,8 @@ async fn process_chat_request(
         // Interactive approval: route /chat/permission decisions to the native runtime
         // request waiting for this turn.
         let perm_rx = if registered_permission_responder {
-            let (tx, rx) = mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
+            let (tx, rx) =
+                mpsc::unbounded_channel::<atomcode_capabilities::tools::PermissionDecision>();
             pending_permissions.register(perm_session_key.clone(), tx);
             Some(rx)
         } else {
@@ -3710,6 +3862,9 @@ async fn process_chat_request(
     let mut projector = ChatRuntimeProjector::default();
     while let Some(event) = runtime_event_rx.recv().await {
         for chat_event in projector.project_runtime(event, &perm_session_key) {
+            if matches!(chat_event, ChatEvent::Done { .. }) {
+                terminal_sent.store(true, std::sync::atomic::Ordering::Release);
+            }
             let _ = event_tx.send(chat_event);
         }
     }
@@ -3725,36 +3880,12 @@ async fn process_chat_request(
         });
     }
 
-    // Save session after conversation completes.
-    // If the session was stopped mid-turn, clean up the partial conversation
-    // and save it so the user can /resume from this point — same behaviour as
-    // the TUI (persist_current_session on TurnCancelled).
-    let was_stopped = active_chats.was_stopped(&operation_id).await;
-
-    {
-        let mut conv = conversation.lock().await;
-        if was_stopped
-            && (projector.terminal_reason == Some(atomcode_kernel::event::StopReason::Cancelled)
-                || !projector.terminal_seen)
-        {
-            conv.cancel_current_turn();
-        }
-        let submitted_images: Vec<atomcode_core::conversation::message::ImagePart> = req
-            .images
-            .iter()
-            .map(|i| atomcode_core::conversation::message::ImagePart {
-                media_type: i.media_type.clone(),
-                data: i.data.clone(),
-            })
-            .collect();
-        restore_submitted_user_images_before_save(
-            &mut conv.messages,
-            &req.message,
-            &submitted_images,
-        );
-    }
-    // The native SnapshotHook owns terminal persistence. The core projection above
-    // exists only to shape the HTTP response and must never be written back.
+    // The native runtime owns turn boundaries, mid-turn cancel cleanup
+    // (`backfill_cancelled_tool_results`), and terminal persistence via its
+    // SnapshotHook + the authoritative terminal snapshot written back into the
+    // kernel buffer. The daemon buffer is a display/transport projection only and is
+    // never written back here, so no post-turn cancel bookkeeping or image restore is
+    // needed — the kernel terminal snapshot is authoritative.
 
     // Turn finished (the forwarding loop above exits when runtime_event_rx closes).
     // Drop the permission
@@ -3772,122 +3903,6 @@ async fn process_chat_request(
 /// full rules). The only omission is plan mode (not applicable in API mode).
 ///
 /// This function is self-contained — it does NOT touch any TUI code path.
-pub(crate) fn build_api_system_prompt(
-    working_dir: &PathBuf,
-    config: &Config,
-    provider_config: &atomcode_config::config::provider::ProviderConfig,
-    skill_registry: &Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
-) -> String {
-    // Respect user's custom system_prompt override (same as TUI).
-    let rules = if let Some(custom) = provider_config.system_prompt.as_deref() {
-        custom.to_string()
-    } else {
-        atomcode_config::config::prompt_sections::build_rules().to_string()
-    };
-
-    // Environment metadata
-    let shell = if cfg!(target_os = "windows") {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
-    } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
-    };
-    let env_info = format!("Platform: {} | Shell: {}", std::env::consts::OS, shell);
-
-    // Identity: inject model name so the model correctly identifies itself.
-    let model_display = &provider_config.model;
-
-    // Assemble prompt: identity + env → rules LAST (recency effect).
-    let mut prompt = format!(
-        "You are AtomCode. When asked who you are, say you are AtomCode \
-         (an AI coding agent by AtomGit) running the {} model. \
-         Never claim to be another product.\n\
-         Working directory: {wd}\n\
-         All file paths in tool calls must be absolute, resolved under {wd}. \
-         Verify file existence before editing.\n{env_info}\n",
-        model_display,
-        wd = working_dir.display(),
-        env_info = env_info,
-    );
-
-    // Git commit attribution (Co-Authored-By trailer).
-    prompt.push_str(&format!(
-        "\n=== GIT COMMITS ===\n\
-         {}\n\
-         When you create a git commit on the user's behalf, end the commit \
-         message with this trailer (preceded by a blank line):\n\
-         \n\
-         Co-Authored-By: AtomCode ({}) <noreply@atomgit.com>\n\
-         \n\
-         Use a HEREDOC for `git commit -m` so the trailer's blank line is \
-         preserved verbatim. Skip this trailer for `git commit --amend` \
-         and `git revert` (those operate on existing commits whose \
-         attribution shouldn't change).\n",
-        atomcode_coding::commit_language_guidance(Some(
-            atomcode_config::i18n::resolve_initial_locale(None, config.language),
-        )),
-        model_display
-    ));
-
-    // Layered instructions (global → project → user).
-    // Pure file reads, no side effects, < 1ms.
-    let instructions =
-        atomcode_config::config::instructions::LayeredInstructions::load(working_dir);
-    let merged_instructions = instructions.merged();
-    if !merged_instructions.is_empty() {
-        prompt.push_str(&format!("\n{}\n", merged_instructions));
-    }
-
-    // Persistent memory (global + project).
-    // Pure file reads, no side effects.
-    {
-        use atomcode_config::config::memory::MemoryStore;
-        let project_name = working_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "project".to_string());
-        let global = MemoryStore::global();
-        let project = MemoryStore::project(working_dir);
-        let memory_block = MemoryStore::merged_for_prompt(&global, &project, &project_name);
-        if !memory_block.is_empty() {
-            prompt.push_str(&format!("\n{}\n", memory_block));
-        }
-    }
-
-    // Available skills — budget-gated, source-ranked catalog (verbatim-aligned with
-    // the coding path's SkillCatalogHook). Replaces the old inline full-dump injection
-    // that emitted every skill's full description and drowned high-value process skills.
-    if let Ok(registry) = skill_registry.read() {
-        if let Some(catalog) = registry.render_catalog() {
-            prompt.push('\n');
-            prompt.push_str(&catalog);
-            prompt.push('\n');
-        }
-    }
-
-    // Git snapshot (branch / HEAD / status).
-    // Blocking I/O (~30ms) — acceptable per chat request since this runs once
-    // at prompt construction time, not on a hot path.
-    let env_snapshot = atomcode_core::ctx::EnvSnapshot::capture(working_dir);
-    prompt.push_str(&env_snapshot.as_prompt_section());
-
-    // RULES GO LAST — recency effect ensures the model remembers these.
-    prompt.push_str(&format!(
-        "\n=== RULES (follow these strictly) ===\n{rules}\n"
-    ));
-
-    // Platform-specific rules (Windows path conventions, etc.)
-    let platform = atomcode_config::config::platform_rules();
-    if !platform.is_empty() {
-        prompt.push_str(platform);
-        prompt.push('\n');
-    }
-
-    if atomcode_config::config::offline::is_offline_active() {
-        prompt.push_str(&atomcode_coding::persona::offline_environment_block());
-    }
-
-    prompt
-}
 
 /// Request to stop a chat session
 #[derive(Debug, Deserialize)]
@@ -3970,15 +3985,17 @@ async fn chat_permission(
     State(state): State<AppState>,
     Json(req): Json<PermissionDecisionRequest>,
 ) -> impl IntoResponse {
-    use atomcode_core::tool::{parse_permission_decision, PermissionDecision};
+    use atomcode_capabilities::tools::{parse_permission_decision, PermissionDecision};
     if req.decision == "allow_persist" {
         if let Some(full) = req.tool_name.as_deref() {
             let reg = state.mcp_registry.read().await.clone();
             if let Some((server, tool)) = reg.split_tool_name(full).await {
                 let project_dir = state.project.read().await.working_dir.clone();
-                if let Err(e) =
-                    atomcode_core::mcp::config::add_auto_approved_tool(&project_dir, &server, &tool)
-                {
+                if let Err(e) = atomcode_capabilities::mcp::config::add_auto_approved_tool(
+                    &project_dir,
+                    &server,
+                    &tool,
+                ) {
                     tracing::warn!("[permission] persist autoApprove failed: {e}");
                 }
                 reg.mark_tool_auto_approved(full);
@@ -3986,7 +4003,7 @@ async fn chat_permission(
         }
         let ok = state
             .pending_permissions
-            .deliver(&req.session_id, PermissionDecision::Allow);
+            .deliver(&req.session_id, PermissionDecision::AllowOnce);
         return Json(serde_json::json!({ "success": ok }));
     }
     let decision = parse_permission_decision(&req.decision);
@@ -4028,15 +4045,15 @@ struct McpStatusResponse {
 /// empty list. A status the registry already knows (Connected / Failed /
 /// Disconnected) always wins over the synthetic `Connecting`.
 fn merge_configured_mcp_statuses(
-    statuses: Vec<(String, atomcode_core::mcp::ServerStatus)>,
+    statuses: Vec<(String, atomcode_capabilities::mcp::ServerStatus)>,
     configured_names: &[String],
-) -> Vec<(String, atomcode_core::mcp::ServerStatus)> {
-    let mut by_name: std::collections::BTreeMap<String, atomcode_core::mcp::ServerStatus> =
+) -> Vec<(String, atomcode_capabilities::mcp::ServerStatus)> {
+    let mut by_name: std::collections::BTreeMap<String, atomcode_capabilities::mcp::ServerStatus> =
         statuses.into_iter().collect();
     for name in configured_names {
         by_name
             .entry(name.clone())
-            .or_insert(atomcode_core::mcp::ServerStatus::Connecting);
+            .or_insert(atomcode_capabilities::mcp::ServerStatus::Connecting);
     }
     by_name.into_iter().collect()
 }
@@ -4060,15 +4077,15 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
 
     let statuses = registry.server_statuses().await;
 
-    let all_cfgs = atomcode_core::mcp::load_mcp_config(&working_dir).unwrap_or_default();
+    let all_cfgs = atomcode_capabilities::mcp::load_mcp_config(&working_dir).unwrap_or_default();
 
     // Trust / blocked enrichment: compute blocked FIRST so we can exclude them from the
     // "connecting" synthetic entries below. Blocked (untrusted-project) servers are withheld
     // — they never connect — so they must NOT appear as "connecting" in the status list while
     // simultaneously appearing in `blocked[]` (a contradiction the webui rendered).
-    let trusted = atomcode_core::mcp::trust::is_project_trusted(&working_dir);
+    let trusted = atomcode_capabilities::mcp::trust::is_project_trusted(&working_dir);
     let blocked: Vec<String> =
-        atomcode_core::mcp::trust::partition_by_trust(all_cfgs.clone(), &working_dir)
+        atomcode_capabilities::mcp::trust::partition_by_trust(all_cfgs.clone(), &working_dir)
             .blocked
             .into_iter()
             .map(|c| c.name)
@@ -4088,15 +4105,37 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
 
     // Fetch the tool list once (was previously re-fetched per connected server).
     let tools = registry.list_all_tools().await;
+    let servers = build_mcp_server_rows(statuses, &tools);
+    Json(McpStatusResponse {
+        servers,
+        trusted,
+        blocked,
+    })
+}
+
+/// Build the `/mcp` status server rows from raw registry statuses.
+///
+/// Blocked (untrusted-project) servers are surfaced ONLY via the response's
+/// `blocked[]` list — never as a server row. The capabilities `McpRegistry`
+/// reports withheld servers as `ServerStatus::BlockedUntrusted` (core's enum had
+/// no such variant), so without this skip they would render twice: once as a
+/// "blocked" status row here and once in the blocked banner.
+fn build_mcp_server_rows(
+    statuses: Vec<(String, atomcode_capabilities::mcp::ServerStatus)>,
+    tools: &[atomcode_capabilities::mcp::McpToolInfo],
+) -> Vec<McpServerStatus> {
+    use atomcode_capabilities::mcp::ServerStatus;
     let mut servers = Vec::new();
     for (name, status) in statuses {
         let (status_str, error) = match &status {
-            atomcode_core::mcp::ServerStatus::Connecting => ("connecting".to_string(), None),
-            atomcode_core::mcp::ServerStatus::Connected => ("connected".to_string(), None),
-            atomcode_core::mcp::ServerStatus::Failed(e) => ("error".to_string(), Some(e.clone())),
-            atomcode_core::mcp::ServerStatus::Disconnected => ("disconnected".to_string(), None),
+            ServerStatus::Connecting => ("connecting".to_string(), None),
+            ServerStatus::Connected => ("connected".to_string(), None),
+            ServerStatus::Failed(e) => ("error".to_string(), Some(e.clone())),
+            ServerStatus::Disconnected => ("disconnected".to_string(), None),
+            // Withheld: represented in `blocked[]` only, never as a server row.
+            ServerStatus::BlockedUntrusted => continue,
         };
-        let tool_count = if matches!(status, atomcode_core::mcp::ServerStatus::Connected) {
+        let tool_count = if matches!(status, ServerStatus::Connected) {
             Some(tools.iter().filter(|t| t.server_name == name).count())
         } else {
             None
@@ -4108,11 +4147,7 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
             error,
         });
     }
-    Json(McpStatusResponse {
-        servers,
-        trusted,
-        blocked,
-    })
+    servers
 }
 
 /// Replace the daemon fallback registry and invalidate the per-project cache
@@ -4825,8 +4860,11 @@ pub struct SkillInfo {
 /// GET /skills - List user-invocable skills for the current project.
 async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
-    let mut registry = atomcode_core::skill::SkillRegistry::new();
-    registry.reload(&working_dir);
+    // Standard home/project skill dirs, then installed-plugin skill dirs.
+    // Keep this composition in the plugin integration layer so the shared
+    // SkillRegistry remains independent of plugin storage.
+    let mut registry = atomcode_capabilities::skills::SkillRegistry::new();
+    atomcode_capabilities::plugin::loader::reload_skill_registry(&mut registry, &working_dir);
     let skills: Vec<SkillInfo> = registry
         .user_invocable()
         .map(|s| SkillInfo {
@@ -5013,6 +5051,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
 
     // Seed the offline verdict + note ONCE from config + env, before any tool/telemetry assembly.
     atomcode_config::config::offline::seed_offline_from_config(startup_config.as_ref());
+    if !atomcode_config::config::offline::is_offline_active() {
+        // Best-effort metadata; failure leaves `/cost` token-only and never
+        // prevents daemon/provider startup.
+        atomcode_capabilities::provider::ensure_models_dev_catalog().await;
+    }
 
     // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
     let resolved = resolve(
@@ -5072,7 +5115,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     *DAEMON_PROJECT.lock().unwrap() = Some(project_store.clone());
 
     let state = AppState {
-        sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
         project: project_store,
         active_chats: ActiveChatRegistry::default(),
         mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
@@ -5156,6 +5198,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/provider", post(live_api::live_provider))
         .route("/live/mode", post(live_api::live_mode))
         .route("/live/cancel", post(live_api::live_cancel))
+        .route("/live/compact", post(live_api::live_compact))
         .route("/live/command", post(live_api::live_command))
         .route("/live/mcp/trust", post(live_api::live_mcp_trust))
         .route("/command", post(commands::run_command))
@@ -5399,6 +5442,178 @@ mod fs_list_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn chat_resolves_new_schema_model_selection() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "AtomGit-deepseek-v4-flash",
+            "provider_accounts": {
+                "AtomGit": {
+                    "provider": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1"
+                }
+            },
+            "models": {
+                "AtomGit-deepseek-v4-flash": {
+                    "account": "AtomGit",
+                    "model": "deepseek-v4-flash",
+                    "context_window": 128000
+                }
+            }
+        }))
+        .unwrap();
+
+        let (selection, provider) =
+            resolve_chat_provider(&config, Some("AtomGit-deepseek-v4-flash".into())).unwrap();
+        assert_eq!(selection, "AtomGit-deepseek-v4-flash");
+        assert_eq!(provider.model, "deepseek-v4-flash");
+        assert_eq!(provider.provider_type, "openai");
+    }
+
+    #[test]
+    fn chat_defaults_to_effective_model_selection() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "stale-legacy-default",
+            "default_model": "AtomGit-GLM-5.2",
+            "provider_accounts": {
+                "AtomGit": {
+                    "provider": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1"
+                }
+            },
+            "models": {
+                "AtomGit-GLM-5.2": {
+                    "account": "AtomGit",
+                    "model": "GLM-5.2",
+                    "context_window": 128000
+                }
+            }
+        }))
+        .unwrap();
+
+        let (selection, provider) = resolve_chat_provider(&config, None).unwrap();
+        assert_eq!(selection, "AtomGit-GLM-5.2");
+        assert_eq!(provider.model, "GLM-5.2");
+    }
+
+    #[test]
+    fn chat_still_resolves_legacy_provider() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "claude",
+            "providers": {
+                "claude": {
+                    "type": "claude",
+                    "model": "claude-opus-4-7"
+                }
+            }
+        }))
+        .unwrap();
+
+        let (selection, provider) = resolve_chat_provider(&config, None).unwrap();
+        assert_eq!(selection, "claude");
+        assert_eq!(provider.model, "claude-opus-4-7");
+        assert_eq!(provider.provider_type, "claude");
+    }
+
+    #[test]
+    fn chat_rejects_unknown_selection() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "claude",
+            "providers": {
+                "claude": {
+                    "type": "claude",
+                    "model": "claude-opus-4-7"
+                }
+            }
+        }))
+        .unwrap();
+
+        let error = resolve_chat_provider(&config, Some("missing".into())).unwrap_err();
+        assert_eq!(error.to_string(), "Provider 'missing' not found");
+    }
+
+    #[test]
+    fn models_endpoint_lists_new_schema_and_folded_codingplan_models() {
+        // Selectable models living ONLY in the new schema (models/provider_accounts),
+        // NOT in [providers.*] — the `/models` endpoint used to iterate only
+        // `config.providers` and silently dropped these from the webui picker.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "AtomGit-GLM-5.2",
+            "provider_accounts": { "AtomGit": { "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1" } },
+            "models": {
+                "AtomGit-GLM-5.2": { "account": "AtomGit", "model": "GLM-5.2", "context_window": 128000 },
+                "AtomGit-Qwen": { "account": "AtomGit", "model": "Qwen", "context_window": 128000 }
+            }
+        }))
+        .unwrap();
+
+        let models = models_from_config(&config);
+        let ids: Vec<&str> = models.iter().map(|m| m.provider.as_str()).collect();
+        assert!(ids.contains(&"AtomGit-GLM-5.2"), "new-schema model listed: {ids:?}");
+        assert!(ids.contains(&"AtomGit-Qwen"), "{ids:?}");
+        let glm = models.iter().find(|m| m.provider == "AtomGit-GLM-5.2").unwrap();
+        assert!(glm.is_default, "effective selection is the default");
+        assert_eq!(glm.model, "GLM-5.2");
+    }
+
+    #[test]
+    fn models_endpoint_still_lists_legacy_providers() {
+        // No models lost: a pure old-schema config ([providers.*]) is unchanged.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "claude",
+            "providers": {
+                "claude": { "type": "claude", "model": "claude-opus-4-7" },
+                "glm": { "type": "openai", "model": "z-ai/glm-5" }
+            }
+        }))
+        .unwrap();
+
+        let models = models_from_config(&config);
+        let ids: Vec<&str> = models.iter().map(|m| m.provider.as_str()).collect();
+        assert!(ids.contains(&"claude") && ids.contains(&"glm"), "{ids:?}");
+        assert!(
+            models.iter().find(|m| m.provider == "claude").unwrap().is_default,
+            "default_provider maps to the default selection"
+        );
+    }
+
+    #[test]
+    fn delete_session_errors_preserve_storage_semantics() {
+        assert!(valid_project_bucket("0123456789abcdef"));
+        assert!(!valid_project_bucket("../outside"));
+
+        let active = anyhow::Error::new(SessionStoreError::SessionInUse {
+            id: "active".to_string(),
+            path: PathBuf::from("active.lease"),
+        });
+        let (status, Json(body)) = classify_delete_session_error(&active);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code.as_deref(), Some("SESSION_IN_USE"));
+        assert!(!body.error.contains("active.lease"));
+
+        let missing = anyhow::Error::new(SessionStoreError::NotFound {
+            path: PathBuf::from("missing.meta"),
+        });
+        let (status, Json(body)) = classify_delete_session_error(&missing);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.code.as_deref(), Some("SESSION_NOT_FOUND"));
+        assert!(!body.error.contains("missing.meta"));
+
+        let invalid = anyhow::Error::new(SessionStoreError::InvalidId {
+            id: "../outside".to_string(),
+            reason: "path separators are forbidden",
+        });
+        let (status, Json(body)) = classify_delete_session_error(&invalid);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("INVALID_SESSION"));
+        assert!(!body.error.contains("../outside"));
+
+        let unexpected = anyhow::anyhow!("unexpected storage failure");
+        let (status, Json(body)) = classify_delete_session_error(&unexpected);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.code.as_deref(), Some("DELETE_FAILED"));
+        assert!(!body.error.contains("unexpected storage failure"));
+    }
+
     struct ScopedChatHome {
         _lock: std::sync::MutexGuard<'static, ()>,
         previous: Option<std::ffi::OsString>,
@@ -5445,7 +5660,6 @@ mod tests {
         let working_dir = home._dir.path().to_path_buf();
         let (shutdown_tx, _) = watch::channel(false);
         AppState {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             project: Arc::new(RwLock::new(ProjectState {
                 working_dir: working_dir.clone(),
                 previous_dir: None,
@@ -5501,32 +5715,6 @@ mod tests {
         assert!(Arc::ptr_eq(&cached, &replacement));
         let current = state.mcp_registry.read().await;
         assert!(Arc::ptr_eq(&*current, &replacement));
-    }
-
-    #[test]
-    fn concurrent_mcp_cache_miss_cannot_overwrite_a_reload_replacement() {
-        let working_dir = PathBuf::from("/project");
-        let replacement = Arc::new(McpRegistry::new());
-        let stale_candidate = Arc::new(McpRegistry::new());
-        let mut cache = HashMap::from([(
-            working_dir.clone(),
-            CachedMcpRegistry {
-                registry: replacement.clone(),
-                last_used: std::time::Instant::now(),
-            },
-        )]);
-
-        let selected = crate::live_api::commit_mcp_cache_miss(
-            &mut cache,
-            working_dir.clone(),
-            stale_candidate,
-        );
-
-        assert!(Arc::ptr_eq(&selected, &replacement));
-        assert!(Arc::ptr_eq(
-            &cache.get(&working_dir).unwrap().registry,
-            &replacement
-        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5630,6 +5818,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_panic_cleanup_removes_operation_and_allows_resubmit() {
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats.admit(Some("session-1"), None).await.unwrap();
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let cleanup_chats = active_chats.clone();
+        let cleanup_op = admission.operation_id.clone();
+        active_chats
+            .bind_session(&cleanup_op, "canonical-session")
+            .await
+            .unwrap();
+        let terminal_sent = std::sync::atomic::AtomicBool::new(false);
+
+        let inner = tokio::spawn(async move {
+            panic!("simulated secret panic payload");
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        });
+        finalize_chat_task(
+            inner,
+            &event_tx,
+            &cleanup_chats,
+            &cleanup_op,
+            "session-1",
+            &terminal_sent,
+        )
+        .await;
+
+        let events: Vec<_> = (0..10).filter_map(|_| event_rx.try_recv().ok()).collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Error { message } if message == "chat task failed")),
+            "panic must produce a redacted Error event"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ChatEvent::Done { session_id, .. } if session_id == "canonical-session"
+            )),
+            "panic must produce a Done event with the canonical session id"
+        );
+
+        assert!(
+            !active_chats
+                .active_session_ids()
+                .await
+                .iter()
+                .any(|s| s == "session-1"),
+            "panic cleanup must remove the active-chat record"
+        );
+
+        let second = active_chats.admit(Some("session-1"), None).await;
+        assert!(
+            second.is_ok(),
+            "same session must be able to submit again after panic cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_panic_cleanup_preserves_task_local_context() {
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats.admit(Some("session-1"), None).await.unwrap();
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let cleanup_chats = active_chats.clone();
+        let cleanup_op = admission.operation_id.clone();
+        let terminal_sent = std::sync::atomic::AtomicBool::new(false);
+
+        let session_id = uuid::Uuid::new_v4();
+        let ctx = CurrentContext {
+            mode: Some(atomcode_telemetry::SessionMode::Headless),
+            repo_origin: None,
+            session_id: Some(session_id),
+            ..CurrentContext::current()
+        };
+
+        let inner = tokio::spawn(async move {
+            CurrentContext::scope(ctx, || async move {
+                let current = CurrentContext::current();
+                assert!(current.mode.is_some(), "mode must propagate across spawn");
+                assert_eq!(current.session_id, Some(session_id));
+                Ok(())
+            })
+            .await
+        });
+        finalize_chat_task(
+            inner,
+            &event_tx,
+            &cleanup_chats,
+            &cleanup_op,
+            "session-1",
+            &terminal_sent,
+        )
+        .await;
+
+        let events: Vec<_> = (0..10).filter_map(|_| event_rx.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|e| matches!(e, ChatEvent::Error { .. })),
+            "successful task with task-local context must not produce an Error"
+        );
+
+        assert!(
+            !active_chats
+                .active_session_ids()
+                .await
+                .iter()
+                .any(|s| s == "session-1"),
+            "cleanup must run after successful task"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_panic_after_terminal_does_not_emit_a_second_done() {
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats.admit(Some("session-1"), None).await.unwrap();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let terminal_sent = std::sync::atomic::AtomicBool::new(true);
+
+        let inner = tokio::spawn(async move {
+            panic!("panic after terminal");
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        });
+        finalize_chat_task(
+            inner,
+            &event_tx,
+            &active_chats,
+            &admission.operation_id,
+            "session-1",
+            &terminal_sent,
+        )
+        .await;
+
+        let events: Vec<_> = (0..10).filter_map(|_| event_rx.try_recv().ok()).collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Error { .. })),
+            "the supervisor must still report the panic"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Done { .. })),
+            "the supervisor must not emit a second terminal"
+        );
+        assert!(active_chats.active_session_ids().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn stop_accepts_both_session_and_request_aliases() {
         let registry = ActiveChatRegistry::default();
         let by_request = registry
@@ -5700,6 +6039,7 @@ mod tests {
             chat_test_telemetry(&home),
             permission_bridge::PermissionResponders::new(),
             false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -5815,6 +6155,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            pricing: None,
         }
     }
 
@@ -5824,7 +6165,7 @@ mod tests {
     // 补成 connecting，让面板在连接窗口里就有东西显示，而不是空列表。
     #[test]
     fn merge_surfaces_configured_servers_as_connecting() {
-        use atomcode_core::mcp::ServerStatus;
+        use atomcode_capabilities::mcp::ServerStatus;
         let statuses = vec![
             ("connected-srv".to_string(), ServerStatus::Connected),
             (
@@ -5859,7 +6200,7 @@ mod tests {
 
     #[test]
     fn merge_keeps_registry_status_over_synthetic_connecting() {
-        use atomcode_core::mcp::ServerStatus;
+        use atomcode_capabilities::mcp::ServerStatus;
         // A server already known as Failed/Connected must NOT be downgraded to the
         // synthetic Connecting just because it's also in the config file.
         let merged = merge_configured_mcp_statuses(
@@ -5872,11 +6213,28 @@ mod tests {
 
     #[test]
     fn merge_no_config_is_identity() {
-        use atomcode_core::mcp::ServerStatus;
+        use atomcode_capabilities::mcp::ServerStatus;
         let merged =
             merge_configured_mcp_statuses(vec![("s".to_string(), ServerStatus::Connected)], &[]);
         assert_eq!(merged.len(), 1);
         assert!(matches!(merged[0].1, ServerStatus::Connected));
+    }
+
+    #[test]
+    fn blocked_untrusted_servers_are_excluded_from_server_rows() {
+        use atomcode_capabilities::mcp::ServerStatus;
+        // A withheld (untrusted-project) server is reported via the response's
+        // `blocked[]` list, NOT as a server row — otherwise the webui renders it
+        // twice (once as a "blocked" status row, once in the blocked banner).
+        let rows = build_mcp_server_rows(
+            vec![
+                ("ok".to_string(), ServerStatus::Connected),
+                ("evil".to_string(), ServerStatus::BlockedUntrusted),
+            ],
+            &[],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "ok");
     }
 
     // 回归：daemon 解析工作目录→物理会话桶名的 hash 必须与 native 会话存储命名目录
@@ -5965,7 +6323,7 @@ mod tests {
             .unwrap();
         drop(lease);
 
-        let sessions = list_sessions_in_root(tmp.path(), project_bucket).unwrap();
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, None).unwrap();
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "修复 VS Code 历史标题");
@@ -5973,6 +6331,96 @@ mod tests {
             manager.read_meta(session_id).unwrap().name,
             "修复 VS Code 历史标题"
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_listing_keeps_a_zero_count_session_with_valid_inflight_work() {
+        use atomcode_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, SnapshotHook, StorageOwner,
+        };
+        use atomcode_kernel::hook::LifecycleHooks;
+        use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let session_id = "running-first-turn";
+        let manager =
+            std::sync::Arc::new(SessionManager::with_root(tmp.path().join(project_bucket)));
+        let lease = manager.acquire_lease(session_id).unwrap();
+        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&SessionSnapshot::new(Vec::new())),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+
+        let hook = SnapshotHook::new(manager.clone(), session_id, "/project").with_lease(lease);
+        let mut conversation = Conversation::default();
+        conversation.push(Message::user("正在执行的首轮任务"));
+        hook.turn_start(&mut conversation).await;
+
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, None).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_id);
+        assert_eq!(
+            sessions[0].message_count, 0,
+            "catalog meta remains canonical until turn completion"
+        );
+    }
+
+    #[test]
+    fn daemon_listing_exposes_only_the_active_empty_session() {
+        use atomcode_capabilities::session::{CatalogLocation, SessionManager, SessionMeta};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let manager = SessionManager::with_root(tmp.path().join(project_bucket));
+        for id in ["active-empty", "unused-empty"] {
+            manager
+                .write_meta(&SessionMeta::new(id, "/project", 1))
+                .unwrap();
+        }
+        let active = CatalogLocation {
+            id: "active-empty".into(),
+            project_bucket: project_bucket.into(),
+        };
+
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, Some(&active)).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "active-empty");
+    }
+
+    #[test]
+    fn active_catalog_identity_uses_the_physical_historical_bucket() {
+        use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
+
+        let working_dir = std::path::PathBuf::from("/project/current-name");
+        let historical_bucket = "0123456789abcdef";
+        assert_ne!(
+            historical_bucket,
+            atomcode_capabilities::session::SessionManager::project_hash(&working_dir)
+        );
+        let entry = CatalogEntry {
+            id: "resumed-session".into(),
+            name: "resumed".into(),
+            fork_root_id: None,
+            project_bucket: historical_bucket.into(),
+            working_dir: working_dir.clone(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            message_count: 0,
+            turn_count: 0,
+            presence: CatalogPresence::NativeOnly,
+        };
+
+        let location =
+            resolve_active_catalog_location(&[entry], "resumed-session", &working_dir).unwrap();
+
+        assert_eq!(location.project_bucket, historical_bucket);
     }
 
     #[test]
@@ -6002,7 +6450,7 @@ mod tests {
             .unwrap();
         drop(lease);
 
-        let global = list_all_sessions_in_root(tmp.path()).unwrap();
+        let global = list_all_sessions_in_root(tmp.path(), None).unwrap();
         let search = search_sessions_by_name_in_root(tmp.path(), "可搜索").unwrap();
 
         assert_eq!(global.len(), 1);
@@ -6017,10 +6465,9 @@ mod tests {
         let project_bucket = "0123456789abcdef";
         let project = tmp.path().join(project_bucket);
         std::fs::create_dir_all(&project).unwrap();
-        let mut legacy: serde_json::Value = serde_json::from_slice(include_bytes!(
-            "../../atomcode-core/tests/fixtures/session/legacy_full.json"
-        ))
-        .unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/session/legacy_full.json"))
+                .unwrap();
         let session_id = legacy["id"].as_str().unwrap().to_string();
         legacy["name"] = serde_json::Value::String(format!("session-{session_id}"));
         legacy["user_renamed"] = serde_json::Value::Bool(false);
@@ -6031,7 +6478,7 @@ mod tests {
         )
         .unwrap();
 
-        let sessions = list_sessions_in_root(tmp.path(), project_bucket).unwrap();
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, None).unwrap();
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "inspect this image");
@@ -6054,7 +6501,7 @@ mod tests {
             manager.write_meta(&meta).unwrap();
         }
 
-        let sessions = list_all_sessions_in_root(tmp.path()).unwrap();
+        let sessions = list_all_sessions_in_root(tmp.path(), None).unwrap();
 
         assert_eq!(sessions.len(), 50);
         assert_eq!(sessions[0].meta.id, "history-50");
@@ -6245,6 +6692,7 @@ mod tests {
             telemetry,
             permission_bridge::PermissionResponders::new(),
             false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .expect("chat request succeeds");
@@ -6296,14 +6744,13 @@ mod tests {
 
     #[test]
     fn message_info_user_text_with_vl_marker_renders_missing_image_placeholder() {
-        use atomcode_core::conversation::message::{Message, Role};
+        use atomcode_kernel::message::Message;
 
-        let msg = Message::new(
-            Role::User,
+        let msg = Message::user(
             "识别图片内容\n\n[图片内容（由 AtomGit-Qwen-Qwen3-VL-8B-Instruct 识别）]\n这是一张图片",
         );
 
-        let info = MessageInfo::from(&msg);
+        let info = MessageInfo::from_kernel(&msg);
 
         assert_eq!(info.content, "识别图片内容");
         assert!(matches!(
@@ -6314,10 +6761,10 @@ mod tests {
 
     #[test]
     fn message_info_preserves_synthetic_user_flag() {
-        use atomcode_core::conversation::message::Message;
+        use atomcode_kernel::message::Message;
 
         let msg = Message::synthetic_user("internal reminder");
-        let info = MessageInfo::from(&msg);
+        let info = MessageInfo::from_kernel(&msg);
 
         assert_eq!(info.role, "user");
         assert!(
@@ -6328,41 +6775,13 @@ mod tests {
 
     #[test]
     fn message_info_preserves_internal_origin() {
-        use atomcode_core::conversation::message::{Message, Role};
+        use atomcode_kernel::message::Message;
 
-        let mut msg = Message::new(Role::Assistant, "hidden");
+        let mut msg = Message::assistant("hidden", Vec::new());
         msg.internal_origin = Some("verify_cadence".to_string());
-        let info = MessageInfo::from(&msg);
+        let info = MessageInfo::from_kernel(&msg);
 
         assert_eq!(info.internal_origin.as_deref(), Some("verify_cadence"));
-    }
-
-    #[test]
-    fn restore_submitted_user_images_before_save_repairs_text_only_snapshot() {
-        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
-
-        let mut messages = vec![
-            Message::new(Role::System, "session context"),
-            Message::new(
-                Role::User,
-                "分析图片内容\n\n[图片内容（由 vl-provider 识别）]\n图片描述",
-            ),
-            Message::new(Role::Assistant, "done"),
-        ];
-        let images = vec![ImagePart {
-            media_type: "image/png".into(),
-            data: "aW1hZ2U=".into(),
-        }];
-
-        restore_submitted_user_images_before_save(&mut messages, "分析图片内容", &images);
-
-        assert!(matches!(
-            &messages[1].content,
-            MessageContent::MultiPart { text, images }
-                if text.as_deref() == Some("分析图片内容")
-                    && images.len() == 1
-                    && images[0].data == "aW1hZ2U="
-        ));
     }
 
     #[test]
@@ -6495,6 +6914,71 @@ mod tests {
             PathBuf::from("/x"),
         );
         assert_eq!(resolved, here);
+    }
+
+    #[test]
+    fn initial_workdir_prefers_shared_tui_over_process_cwd() {
+        // A shared TUI runtime's dir (registered before the server starts) wins over the
+        // caller's process-cwd override, so the webui project state (footer + session
+        // list) seeds from the user's actual TUI directory. Both must exist for
+        // resolve_initial_working_dir to accept them, so use real dirs.
+        let embedded = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let process_cwd = std::env::temp_dir();
+        // Mirrors init_project_state's precedence: embedded.or(override).
+        let resolved = resolve_initial_working_dir(
+            Some(embedded.clone()).or(Some(process_cwd.clone())),
+            None,
+            PathBuf::from("/x"),
+        );
+        assert_eq!(resolved, embedded);
+    }
+
+    #[test]
+    fn attach_image_sets_replaces_placeholders_in_order_only() {
+        fn msg(role: &str, images: Option<Vec<ImageData>>) -> MessageInfo {
+            MessageInfo {
+                role: role.into(),
+                content: String::new(),
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images,
+                created_at: None,
+            }
+        }
+        let real = |tag: &str| ImageData {
+            media_type: "image/png".into(),
+            data: tag.into(),
+            missing: false,
+        };
+        // Two VL-preprocessed user messages (placeholders), an assistant, and a real
+        // (vision-model) image message that must NOT be touched.
+        let mut messages = vec![
+            msg("user", Some(vec![ImageData::missing_placeholder()])),
+            msg("assistant", None),
+            msg("user", Some(vec![ImageData::missing_placeholder()])),
+            msg("user", Some(vec![real("keep-me")])),
+        ];
+        attach_image_sets(&mut messages, vec![vec![real("A")], vec![real("B")]]);
+
+        assert_eq!(
+            messages[0].images.as_ref().unwrap()[0].data,
+            "A",
+            "1st placeholder → 1st set"
+        );
+        assert!(messages[1].images.is_none(), "assistant untouched");
+        assert_eq!(
+            messages[2].images.as_ref().unwrap()[0].data,
+            "B",
+            "2nd placeholder → 2nd set"
+        );
+        assert_eq!(
+            messages[3].images.as_ref().unwrap()[0].data,
+            "keep-me",
+            "a real image is never overwritten"
+        );
     }
 
     #[test]
@@ -6701,85 +7185,5 @@ mod channel_mode_tests {
         assert!(approval_mode_requires_responder(ApprovalMode::AcceptEdits));
         assert!(!approval_mode_requires_responder(ApprovalMode::Auto));
         assert!(!approval_mode_requires_responder(ApprovalMode::Plan));
-    }
-
-    // ---- Offline parity: build_api_system_prompt must emit OFFLINE ENVIRONMENT ----
-
-    fn minimal_build_api_system_prompt_fixture() -> (
-        PathBuf,
-        atomcode_config::config::Config,
-        atomcode_config::config::provider::ProviderConfig,
-        Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
-    ) {
-        let working_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let config = atomcode_config::config::Config::default();
-        let provider_config = atomcode_config::config::provider::ProviderConfig {
-            provider_type: "openai".to_string(),
-            api_key: None,
-            model: "test-model".to_string(),
-            base_url: None,
-            system_prompt: None,
-            user_agent: None,
-            context_window: 128000,
-            max_tokens: None,
-            thinking_type: None,
-            thinking_keep: None,
-            reasoning_history: None,
-            reasoning_effort: None,
-            thinking_enabled: None,
-            thinking_budget: None,
-            skip_tls_verify: false,
-            ephemeral: false,
-            capable_model: None,
-        };
-        let mut registry = atomcode_core::skill::SkillRegistry::new();
-        registry.reload(&working_dir);
-        let skill_registry = Arc::new(std::sync::RwLock::new(registry));
-        (working_dir, config, provider_config, skill_registry)
-    }
-
-    #[test]
-    #[serial_test::serial(offline_verdict)]
-    fn build_api_system_prompt_emits_offline_block_when_offline() {
-        use atomcode_config::config::offline::{
-            reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
-        };
-        reset_offline_verdict_for_test();
-        seed_offline_verdict(OfflineMode::On, None);
-        let (wd, cfg, pcfg, sr) = minimal_build_api_system_prompt_fixture();
-        let prompt = build_api_system_prompt(&wd, &cfg, &pcfg, &sr);
-        assert!(
-            prompt.contains("## OFFLINE ENVIRONMENT:"),
-            "daemon prompt must carry the offline block when offline: {prompt}"
-        );
-        reset_offline_verdict_for_test();
-    }
-
-    #[test]
-    #[serial_test::serial(offline_verdict)]
-    fn build_api_system_prompt_omits_offline_block_when_online() {
-        use atomcode_config::config::offline::{
-            reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
-        };
-        reset_offline_verdict_for_test();
-        seed_offline_verdict(OfflineMode::Off, None);
-        let (wd, cfg, pcfg, sr) = minimal_build_api_system_prompt_fixture();
-        let prompt = build_api_system_prompt(&wd, &cfg, &pcfg, &sr);
-        assert!(
-            !prompt.contains("## OFFLINE ENVIRONMENT:"),
-            "daemon prompt must NOT carry the offline block when online: {prompt}"
-        );
-        reset_offline_verdict_for_test();
-    }
-
-    #[test]
-    fn build_api_system_prompt_uses_configured_commit_language() {
-        let (wd, mut cfg, pcfg, sr) = minimal_build_api_system_prompt_fixture();
-        cfg.language = Some(atomcode_config::locale::Locale::ZhCn);
-
-        let prompt = build_api_system_prompt(&wd, &cfg, &pcfg, &sr);
-
-        assert!(prompt.contains("subject and body in Simplified Chinese"));
-        assert!(prompt.contains("Conventional Commit types/scopes"));
     }
 }

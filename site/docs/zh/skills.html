@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.2</span>
+    <span class="dhdr-ver">v5.0.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -140,6 +140,7 @@ description: 发布一个新的 release tag,更新 changelog,并打包
 
       <h3>通过 <code>$</code> 菜单</h3>
       <p>在输入框行首打一个 <code>$</code>,会弹出一个 skills 菜单(和 <code>/skills</code> 列出的是同一批可调用技能);继续输入可过滤,<code>Tab</code> 补全高亮项的名字,提交 <code>$&lt;name&gt; [参数]</code> 即调用该 skill。它和斜杠命令是两套并行入口:<code>/</code> 走斜杠命令补全,<code>$</code> 专门用来挑 skill,后面还能直接带参数,例如 <code>$brainstorming 帮我想登录方案</code>。</p>
+      <p>v5.0.3 的 <code>/skills</code> 支持用多个名称或片段一次选择多个 Skill，并会回显实际加载结果。新安装的 Skill 也会自动刷新，通常不需要重启 AtomCode。</p>
 
       <h3>模型自动触发</h3>
       <p>模型可以主动调用 <code>use_skill</code> 工具,把一个与任务相关的 skill 作为子流程运行。比如你说"帮我发布新版本",即便不显式打 <code>/release</code>,模型也可能自动选择调用这个 skill。</p>

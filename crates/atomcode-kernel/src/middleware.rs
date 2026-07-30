@@ -11,11 +11,15 @@ use std::sync::Arc;
 /// ORDERING IS LOAD-BEARING. Middlewares run in REGISTRATION ORDER: the `before`
 /// chain forward (the first-registered runs first; the first to `Err` blocks and
 /// stops the chain), then the `after` chain (also in registration order). This is
-/// a documented contract, not an accident of iteration. Concretely: an approval
-/// middleware that round-trips the user MUST be registered BEFORE a redaction
-/// middleware that rewrites the call's args — otherwise the user approves bytes
-/// different from what actually executes. Register the user-facing / gating
-/// middleware first, arg-rewriting / transforming middleware after.
+/// a documented contract, not an accident of iteration. Any normalization or
+/// repair that changes the arguments which will execute MUST run before every
+/// observer, policy gate, and user approval, so all of them inspect the exact
+/// bytes the tool receives. A middleware that returns [`BeforeOutcome::Allow`]
+/// short-circuits the remaining `before` chain, so execution-affecting argument
+/// rewrites must also precede every middleware that can return `Allow`.
+///
+/// Display-only redaction is different: it must never mutate the executable
+/// [`ToolCall`]. Apply it only to a separate presentation payload or result.
 ///
 /// # PANIC CONTRACT (must-not-panic)
 ///

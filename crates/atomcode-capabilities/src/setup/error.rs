@@ -1,4 +1,4 @@
-//! Public error type. thiserror because atomcode-core is library code.
+//! Public setup error type shared by setup callers.
 
 use thiserror::Error;
 

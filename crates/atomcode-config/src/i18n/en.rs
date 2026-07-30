@@ -46,8 +46,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ✓ {} active\n", plan).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
             format!("  × CodingPlan {} tier setup failed — {}\n", tier, reason).into(),
-        Msg::CpAddedProviders { count, plural_s } =>
-            format!("  ✓ Added {} provider{}:\n", count, plural_s).into(),
+        Msg::CpAddedProviders { accounts, models } =>
+            format!(
+                "  ✓ Added {} account{} · {} model{}:\n",
+                accounts,
+                if accounts == 1 { "" } else { "s" },
+                models,
+                if models == 1 { "" } else { "s" }
+            )
+            .into(),
         Msg::CpLocked { name } =>
             // SGR 31 = standard red foreground, SGR 39 = reset to
             // default fg. Standard (not bright) so the terminal's
@@ -60,7 +67,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             // the meaning, just without the colour.
             format!("      \x1b[31m× {}  (requires Pro plan or higher)\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
-            format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
+            format!("      • {}  ·  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  (default)".into(),
         Msg::CpVisionAuto { kind } =>
             format!("  ✓ Vision preprocessor → {}  (auto-detected)\n", kind).into(),
@@ -169,10 +176,20 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ⚠ {}\n", hint).into(),
         Msg::StatusInstructionFilesHeader =>
             "  Instruction files:\n".into(),
-        Msg::StatusInstructionPresent { path, label } =>
-            format!("    ✓ {} ({})\n", path, label).into(),
-        Msg::StatusInstructionMissing { label } =>
-            format!("    × {} — not found\n", label).into(),
+        Msg::StatusInstructionScopeGlobal => "User global".into(),
+        Msg::StatusInstructionScopeProject => "Project shared".into(),
+        Msg::StatusInstructionScopeUser => "User project override".into(),
+        Msg::StatusInstructionPresent { path, label, scope } =>
+            format!("    ✓ {scope} ({label}): {path}\n").into(),
+        Msg::StatusInstructionMissing { path, label, scope } =>
+            format!("    × {scope} ({label}): {path} — not found\n").into(),
+        Msg::StatusMemoryFilesHeader => "  Memory files:\n".into(),
+        Msg::StatusMemoryScopeGlobal => "User global".into(),
+        Msg::StatusMemoryScopeProject => "Project memory".into(),
+        Msg::StatusMemoryPresent { path, scope } =>
+            format!("    ✓ {scope}: {path}\n").into(),
+        Msg::StatusMemoryMissing { path, scope } =>
+            format!("    × {scope}: {path} — not found\n").into(),
 
         // ── Help ──
         Msg::HelpAvailableCommands =>
@@ -205,6 +222,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Drag + Ctrl+C                    Copy text (atomcode does not capture the mouse)
 
   ── Session ──
+    F2 / Shift+F2                    Next / previous model
     Ctrl+C                           Cancel current turn / dismiss modal
     Esc Esc                          Undo the previous turn
     Ctrl+D                           Exit AtomCode
@@ -260,8 +278,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDeleteKept => "(kept)".into(),
         Msg::ProviderDefaultSet { name } =>
             format!("Default set to {name}.").into(),
-        Msg::ProviderAdded { name, model } =>
-            format!("Added provider \"{name}\" and switched to {name} · {model}.").into(),
+        Msg::ProviderAdded { name } =>
+            format!("Added account \"{name}\". Opened its model list; press Ctrl+A to add a model.").into(),
         Msg::ProviderUpdated { name } =>
             format!("Updated \"{name}\".").into(),
         Msg::ProviderStepName => "Provider name?".into(),
@@ -288,6 +306,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Context window? [{current}] tokens (blank to keep; e.g. 128000 / 256000 / 512000 / 1000000, or 128k / 1m)").into(),
         Msg::ProviderContextWindowInvalid =>
             "Context window must be a positive number of tokens, e.g. 128000 or 128k.".into(),
+        Msg::ProviderStepPricing =>
+            "Pricing USD per 1M tokens? input,output,cached-input (blank = unknown/keep; `clear` removes; e.g. 2.5,10,0.25; free = 0,0,0)".into(),
+        Msg::ProviderStepPricingWithHint { current } =>
+            format!("Pricing USD per 1M tokens? [{current}] (blank to keep; `clear` removes)").into(),
+        Msg::ProviderPricingInvalid =>
+            "Pricing must be three finite non-negative numbers: input,output,cached-input.".into(),
         Msg::ProviderNameEmpty => "Name cannot be empty.".into(),
         Msg::ProviderBaseUrlEmpty => "Base URL cannot be empty.".into(),
         Msg::ProviderUnknownType =>
@@ -303,6 +327,47 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepProgress { current, total } =>
             format!("({current}/{total})").into(),
 
+        // ── Provider panel ──
+        Msg::ProviderPanelTabAccounts => "Accounts".into(),
+        Msg::ProviderPanelTabModels => "Models".into(),
+        Msg::ProviderPanelEmptyAccounts =>
+            "(No provider accounts yet — press Ctrl+A to add one)".into(),
+        Msg::ProviderPanelNoMatchingAccounts => "(No matching provider accounts)".into(),
+        Msg::ProviderPanelEmptyModels =>
+            "(No models yet — press Ctrl+A to add one)".into(),
+        Msg::ProviderPanelNoMatchingModels => "(No matching models)".into(),
+        Msg::ProviderPanelLegacyBadge => "legacy".into(),
+        Msg::ProviderPanelDefaultBadge => "default".into(),
+        Msg::ProviderPanelModelCount { count } =>
+            format!("{count} model{}", if count == 1 { "" } else { "s" }).into(),
+        Msg::ProviderPanelAccountsHint =>
+            "Filter · ↑↓ select · ↵ models · Ctrl+A add · Ctrl+E edit · Ctrl+Dx2 delete · Tab switch · Esc close".into(),
+        Msg::ProviderPanelModelsHint =>
+            "Filter · ↑↓ select · ↵ default · Ctrl+A add · Ctrl+E edit · Ctrl+Dx2 delete · Tab switch · Esc close".into(),
+        Msg::ProviderPanelFilteredModelsHint { account } =>
+            format!("[{account}] · ↑↓ select · ↵ default · Ctrl+A add model · Ctrl+E edit · Ctrl+Dx2 delete · Tab all · Esc close").into(),
+        Msg::ProviderPanelModelSaved { model } => format!("Saved model \"{model}\".").into(),
+        Msg::ProviderPanelAddTitle => "[Add provider account]".into(),
+        Msg::ProviderPanelEditAccountTitle { account } =>
+            format!("[Edit account {account}]").into(),
+        Msg::ProviderPanelAddModelTitle => "[Add model]".into(),
+        Msg::ProviderPanelEditModelTitle => "[Edit model]".into(),
+        Msg::ProviderPanelFieldVendor => "Provider".into(),
+        Msg::ProviderPanelFieldAccount => "Account".into(),
+        Msg::ProviderPanelFieldBaseUrl => "Base URL".into(),
+        Msg::ProviderPanelFieldApiKey => "API key".into(),
+        Msg::ProviderPanelFieldModel => "Model".into(),
+        Msg::ProviderPanelFieldWindow => "Context window".into(),
+        Msg::ProviderPanelFieldMakeDefault => "Set as default".into(),
+        Msg::ProviderPanelSwitchHint => "←→ to switch".into(),
+        Msg::ProviderPanelEnvHint { env } => format!("blank uses ${env}").into(),
+        Msg::ProviderPanelDefaultValue => "default".into(),
+        Msg::ProviderPanelKeepOriginal => "blank keeps current value".into(),
+        Msg::ProviderPanelProviderFormHint =>
+            "Tab Next  ←→ Switch provider  Space Toggle  ↵ Save  Esc Back".into(),
+        Msg::ProviderPanelAccountFormHint => "Tab Switch  ↵ Save  Esc Back".into(),
+        Msg::ProviderPanelModelFormHint =>
+            "Tab Next  ←→ Switch account  Space Toggle  ↵ Save  Esc Back".into(),
         // ── Model picker ──
         Msg::ModelSwitched { provider, model } =>
             format!("  Switched to {provider} · {model} for this session\n").into(),
@@ -504,6 +569,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "No active provider configured. Use /provider to add one.".into(),
         Msg::CmdProviderUnavailable =>
             "Provider is unavailable. Use /login to sign in or /provider to configure one.".into(),
+        Msg::CmdProviderUnsupportedBuild =>
+            "This build cannot access the AtomGit gateway. Install an official build or use /provider to switch providers.".into(),
         Msg::CmdProviderReloading =>
             "Provider/model is switching. Send after the switch completes.".into(),
         Msg::SubmitHeldUntilProviderReady =>
@@ -558,6 +625,14 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
                 "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n  Estimated cost:    {}\n",
                 prompt, completion, cached, cache_rate, total, cost
             ).into(),
+        Msg::CostTokenReport { prompt, completion, cached, cache_rate, total } =>
+            format!(
+                "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n",
+                prompt, completion, cached, cache_rate, total
+            ).into(),
+        Msg::CostFree => "free".into(),
+        Msg::CostUnattributed { tokens } =>
+            format!("Unattributed legacy usage\n  Total tokens:      {}", tokens).into(),
 
         // ── /think ──
         Msg::ThinkStatus { status, budget, provider } =>
@@ -613,6 +688,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Available skills:\n".into(),
         Msg::SkillUnknown { name } =>
             format!("Unknown skill: {} (try /skills to list)", name).into(),
+        Msg::SkillsLoaded { names } =>
+            format!("  Loaded skills: {}\n", names).into(),
 
         // ── /mcp ──
         Msg::McpReloading { count } =>
@@ -1117,6 +1194,14 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             model
         )
         .into(),
+        Msg::VisionPreprocessorUnresolvable { model, provider } => format!(
+            "Current model \"{}\" does not support image input; the configured \
+             vision_preprocessor_provider \"{}\" does not resolve (check the name \
+             matches a provider/model in your config). Fix the name, or use \
+             /model to switch to a vision-capable model.",
+            model, provider
+        )
+        .into(),
         // ── --dangerously-skip-permissions / -y ──
         Msg::BypassWarningBanner =>
             "\u{26a0} --dangerously-skip-permissions is active: all tool calls are auto-approved (no permission prompts)\n".into(),
@@ -1129,10 +1214,13 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "[warning] Running with Administrator privileges — model may have access to system files.".into(),
 
         Msg::CtrlCAgainToExit => "  (press Ctrl+C again to exit)\n".into(),
-        Msg::EscAgainToUndo => "  (press Esc again to undo last turn)\n".into(),
+        Msg::EscAgainToUndo => "  (press Esc again to open Rewind)\n".into(),
         Msg::BashInputHint => "Enter to run as a bash command".into(),
         Msg::ShellModeHint => "! for shell mode".into(),
-        Msg::SteerFoldedHint => "will fold into current turn".into(),
+        Msg::PendingMessagesTitle =>
+            "Messages to be submitted after next tool call (press esc to interrupt and send immediately)".into(),
+        Msg::PendingMessagesNotSent { count } =>
+            format!("{count} pending message(s) were not sent because the runtime stopped").into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} Multi-line input: end the line with `\\` then press Enter.\n    \
             Works in every terminal. (Shift / Alt / Ctrl + Enter may also work\n    \

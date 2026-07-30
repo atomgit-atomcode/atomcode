@@ -1,7 +1,5 @@
-//! The `LspServerConfig` config type (`[lsp.servers.<ext>]`). Moved here from
-//! `atomcode_core::lsp::registry` so `Config.lsp.servers` needs no core dependency;
-//! the LSP *runtime* (`LspServerRegistry`, client, manager) stays in core and
-//! re-exports this type.
+//! The `LspServerConfig` config type (`[lsp.servers.<ext>]`). The LSP runtime is
+//! owned by `atomcode-capabilities::codeintel::lsp`.
 
 use serde::{Deserialize, Serialize};
 

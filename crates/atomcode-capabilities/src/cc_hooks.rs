@@ -184,13 +184,27 @@ fn atomcode_home() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".atomcode"))
 }
 
+/// The GLOBAL hooks file `load_hooks_config` reads
+/// (`$ATOMCODE_HOME`/`~/.atomcode` + `/hooks.json`), or `None` when no home resolves.
+/// Exposed so diagnostics (`atomcode hooks paths`/`list`) show EXACTLY the file that is
+/// loaded — which under `sudo` is NOT the sudo-aware `Config::config_dir()` this module
+/// deliberately does not use.
+pub fn global_hooks_path() -> Option<PathBuf> {
+    atomcode_home().map(|h| h.join("hooks.json"))
+}
+
+/// The PROJECT hooks file `load_hooks_config` reads (`<root>/.hooks.json`).
+pub fn project_hooks_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(".hooks.json")
+}
+
 /// Load user (`$ATOMCODE_HOME/hooks.json`) + project (`<root>/.hooks.json`) hooks.
 pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
     let mut out = Vec::new();
-    if let Some(home) = atomcode_home() {
-        out.extend(load_hooks_file(&home.join("hooks.json")));
+    if let Some(p) = global_hooks_path() {
+        out.extend(load_hooks_file(&p));
     }
-    out.extend(load_hooks_file(&project_dir.join(".hooks.json")));
+    out.extend(load_hooks_file(&project_hooks_path(project_dir)));
     out
 }
 
@@ -312,6 +326,29 @@ async fn run_command_hook(
     (tokio::time::timeout(Duration::from_millis(hook.timeout_ms), fut).await)
         .ok()
         .flatten()
+}
+
+/// Output of a diagnostic single-hook run (`atomcode hooks test`).
+#[derive(Debug, Clone)]
+pub struct HookRunOutput {
+    /// Process exit status; `None` if the hook was killed by a signal.
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Run ONE hook for diagnostics, piping `payload` to its stdin (the CC
+/// `json.load(sys.stdin)` contract) and honoring the hook's timeout. Reuses the
+/// SAME executor the live middleware uses, so `atomcode hooks test` observes exactly
+/// what a real turn would run. Returns `None` if the hook timed out or failed to spawn.
+pub async fn run_hook_for_test(hook: &HookConfig, payload: &Value) -> Option<HookRunOutput> {
+    run_command_hook(hook, &payload.to_string())
+        .await
+        .map(|(exit_code, stdout, stderr)| HookRunOutput {
+            exit_code,
+            stdout,
+            stderr,
+        })
 }
 
 /// CC's exit-code contract: exit **2** (and only 2) requests a BLOCK — stop the tool
@@ -966,6 +1003,24 @@ mod tests {
         };
         let out = cc.before(&mut call, &tool, &rt).await;
         assert!(out.is_deny(), "CC deny must block: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn run_hook_for_test_captures_exit_and_stdout() {
+        // Diagnostic single-hook runner (`atomcode hooks test`): pipes a payload,
+        // captures exit code + stdout.
+        let hook = HookConfig {
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            command: "echo hooktest-ok".into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let out = run_hook_for_test(&hook, &serde_json::json!({"hook_event_name": "PreToolUse"}))
+            .await
+            .expect("hook ran");
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.stdout.contains("hooktest-ok"), "stdout: {}", out.stdout);
     }
 
     #[tokio::test]

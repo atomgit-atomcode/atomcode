@@ -39,6 +39,8 @@ use super::client::{is_auth_expired, Client};
 use super::types::RateLimitWindow;
 use super::types::{ModelEntry, PlanType, StatusResponse};
 use atomcode_auth as auth;
+// Single source of truth for the CodingPlan provider-name predicate.
+use atomcode_config::config::is_codingplan_provider_name;
 use atomcode_config::config::provider::ProviderConfig;
 use atomcode_config::config::Config;
 
@@ -86,10 +88,12 @@ fn codingplan_llm_base_url() -> String {
 /// Provider type for the AtomGit LLM gateway (it's OpenAI-compatible).
 const PROVIDER_TYPE: &str = "openai";
 
-/// Context window for each coding-plan provider. The models endpoint
-/// doesn't currently return a per-model window, so we apply the same
-/// 64k value that the legacy `/login` flow hard-coded.
-const CONTEXT_WINDOW: usize = 64_000;
+/// Minimum context window enforced for every CodingPlan model, regardless of the
+/// server-declared (or omitted) value. The AtomGit gateway reports a
+/// conservative 64k for several models; we floor at 128k so the client doesn't
+/// compact/refuse long turns the gateway can actually serve. A larger server
+/// window (e.g. Claude's 200k) is kept as-is.
+const MIN_CONTEXT_WINDOW: usize = 128_000;
 
 /// Prefix used for every coding-plan-managed provider name.
 const PROVIDER_PREFIX: &str = "AtomGit";
@@ -279,9 +283,27 @@ impl SetupReport {
         // failure line is just noise. Same for the status row below.
         match &self.models {
             StepResult::Ok(info) => {
-                let count = info.provider_names.len();
-                let plural_s = if count == 1 { "" } else { "s" };
-                out.push_str(&t(Msg::CpAddedProviders { count, plural_s }));
+                let model_count = info.provider_names.len();
+                // Distinct folded accounts across the registered models (usually
+                // 1 = AtomGit; 2 when the plan mixes openai + claude wire models).
+                let account_count = info
+                    .display_names
+                    .iter()
+                    .map(|name| {
+                        let wire = info
+                            .all_models
+                            .iter()
+                            .find(|m| &m.display_model_name == name)
+                            .and_then(|m| m.provider_type.as_deref())
+                            .unwrap_or("openai");
+                        atomcode_config::config::codingplan_group_account_id(wire)
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                out.push_str(&t(Msg::CpAddedProviders {
+                    accounts: account_count,
+                    models: model_count,
+                }));
                 // Build a quick lookup of which display names made it
                 // into the registered provider list — anything in
                 // `all_models` but NOT in this set is locked behind
@@ -314,6 +336,30 @@ impl SetupReport {
                     }));
                 }
                 let default_suffix_cow = t(Msg::CpDefaultSuffix);
+                // Label each row by its (folded) account rather than the internal
+                // per-model key, so the report reads as "account · model" and
+                // matches the account+model schema `/login` now persists.
+                let account_for = |model_name: &str| -> &'static str {
+                    let wire = info
+                        .all_models
+                        .iter()
+                        .find(|m| m.display_model_name == model_name)
+                        .and_then(|m| m.provider_type.as_deref())
+                        .unwrap_or("openai");
+                    atomcode_config::config::codingplan_group_account_id(wire)
+                };
+                // Map a registered selection key (e.g. `AtomGit-Qwen-…`) to the
+                // friendly `account · model` label; fall back to the raw key for
+                // a user-supplied value that isn't in this run's list.
+                let friendly = |key: &str| -> String {
+                    match info.provider_names.iter().position(|p| p == key) {
+                        Some(i) => {
+                            let model = &info.display_names[i];
+                            format!("{} · {}", account_for(model), model)
+                        }
+                        None => key.to_string(),
+                    }
+                };
                 for (pname, model) in info.provider_names.iter().zip(info.display_names.iter()) {
                     let suffix = if pname == &info.default_provider {
                         default_suffix_cow.as_ref()
@@ -321,7 +367,7 @@ impl SetupReport {
                         ""
                     };
                     out.push_str(&t(Msg::CpProviderRow {
-                        provider: pname,
+                        provider: account_for(model),
                         model,
                         default_suffix: suffix,
                     }));
@@ -329,10 +375,12 @@ impl SetupReport {
                 // Vision-preprocessor outcome line.
                 match &info.vision_preprocessor {
                     VisionPreprocessorOutcome::AutoSet(k) => {
-                        out.push_str(&t(Msg::CpVisionAuto { kind: k }));
+                        let label = friendly(k);
+                        out.push_str(&t(Msg::CpVisionAuto { kind: &label }));
                     }
                     VisionPreprocessorOutcome::UserSupplied(k) => {
-                        out.push_str(&t(Msg::CpVisionUserSupplied { kind: k }));
+                        let label = friendly(k);
+                        out.push_str(&t(Msg::CpVisionUserSupplied { kind: &label }));
                     }
                     VisionPreprocessorOutcome::Cleared => {
                         out.push_str(&t(Msg::CpVisionCleared));
@@ -913,11 +961,13 @@ fn step_models_and_register(
         );
     }
 
-    let previous_default = config.default_provider.clone();
+    // Use the canonical active selection (default_model → default_provider) so a
+    // new-schema default is preserved and the report marks the right model.
+    let previous_default = config.effective_model_selection().unwrap_or_default();
     let previous_model = config
-        .providers
+        .logical_models()
         .get(&previous_default)
-        .map(|provider| provider.model.clone());
+        .map(|m| m.model.clone());
 
     // Wipe any stale AtomGit* entries so we don't accumulate old names.
     let stale: Vec<String> = config
@@ -1038,11 +1088,11 @@ pub fn merge_successful_config(
     let StepResult::Ok(models) = &report.models else {
         anyhow::bail!("CodingPlan model refresh did not complete");
     };
-    let previous_default = latest.default_provider.clone();
+    let previous_default = latest.effective_model_selection().unwrap_or_default();
     let previous_model = latest
-        .providers
+        .logical_models()
         .get(&previous_default)
-        .map(|provider| provider.model.clone());
+        .map(|m| m.model.clone());
 
     latest
         .providers
@@ -1069,7 +1119,80 @@ pub fn merge_successful_config(
     if !custom_vision {
         latest.vision_preprocessor_provider = prepared.vision_preprocessor_provider.clone();
     }
+    // Materialize the flat CodingPlan providers onto disk in the new
+    // account+model schema (one account per wire format).
+    persist_codingplan_as_new_schema(latest);
     Ok(())
+}
+
+/// Move the just-merged flat `AtomGit*` providers out of `[providers.*]` and
+/// into the new `provider_accounts` + `models` schema, grouped by wire format
+/// (openai → `AtomGit`, claude → `AtomGit-anthropic`).
+///
+/// The grouping is delegated to [`Config::logical_accounts`] /
+/// [`Config::logical_models`] — the same read-only projection the UI already
+/// shows — so the persisted shape is byte-identical to the projection and a
+/// re-login is a no-op transition (model ids stay the legacy provider keys, so
+/// the active selection never resets). Idempotent: prior new-schema CodingPlan
+/// entries are dropped and rewritten each run.
+fn persist_codingplan_as_new_schema(config: &mut Config) {
+    if !config
+        .providers
+        .keys()
+        .any(|k| is_codingplan_provider_name(k))
+    {
+        return;
+    }
+    // Drop any prior new-schema CodingPlan entries FIRST, so the freshly-merged
+    // flat providers are the sole (authoritative) source for the projection.
+    // Otherwise `logical_models`' new-schema precedence would mask updated
+    // server data (context_window, capability rank, dropped models) on re-login.
+    config
+        .provider_accounts
+        .retain(|k, _| !is_codingplan_provider_name(k));
+    config.models.retain(|k, _| !is_codingplan_provider_name(k));
+    // Now snapshot the folded projection — only the flat providers contribute.
+    let accounts: Vec<(String, _)> = config
+        .logical_accounts()
+        .into_iter()
+        .filter(|(id, _)| is_codingplan_provider_name(id))
+        .collect();
+    let models: Vec<(String, _)> = config
+        .logical_models()
+        .into_iter()
+        .filter(|(_, m)| is_codingplan_provider_name(&m.account))
+        .collect();
+
+    config
+        .providers
+        .retain(|k, _| !is_codingplan_provider_name(k));
+    for (id, a) in accounts {
+        config.provider_accounts.insert(id, a);
+    }
+    for (id, m) in models {
+        config.models.insert(id, m);
+    }
+
+    // Promote the active selection to the canonical `default_model`, but never
+    // clobber a still-valid non-CodingPlan choice the user made themselves.
+    let default_model_valid = config
+        .default_model
+        .as_deref()
+        .is_some_and(|m| config.logical_models().contains_key(m));
+    if !default_model_valid && is_codingplan_provider_name(&config.default_provider) {
+        config.default_model = Some(config.default_provider.clone());
+    }
+    // Keep the legacy `default_provider` in lock-step with the canonical
+    // `default_model` so the two never disagree — otherwise the login report and
+    // legacy readers show one model while `effective_model_selection` resolves
+    // another (e.g. report says glm-5.1-fallback but the runtime runs deepseek).
+    // Only sync a VALID default_model, so a stale one can't clobber an otherwise
+    // valid legacy `default_provider`.
+    if let Some(dm) = config.default_model.clone() {
+        if config.logical_models().contains_key(&dm) {
+            config.default_provider = dm;
+        }
+    }
 }
 
 fn step_status() -> (StepResult<StatusResponse>, bool) {
@@ -1170,18 +1293,11 @@ fn sanitize_model_for_name(model: &str) -> String {
     model.replace('/', "-")
 }
 
-/// Match `AtomGit` OR `AtomGit-<anything>` — the set of config keys
-/// owned by the coding-plan flow. Used to wipe stale entries before
-/// re-populating from the fresh model list.
-fn is_codingplan_provider_name(name: &str) -> bool {
-    name == PROVIDER_PREFIX || name.starts_with(&format!("{}-", PROVIDER_PREFIX))
-}
-
 /// Build a ProviderConfig from a model-list entry. The server's
 /// per-model fields take precedence; missing fields fall back to the
-/// historical fallbacks ([`codingplan_llm_base_url`] / `PROVIDER_TYPE`
-/// / `CONTEXT_WINDOW`) so older `models-v2` payloads without the new
-/// columns continue to work without code changes.
+/// historical fallbacks ([`codingplan_llm_base_url`] / `PROVIDER_TYPE`), and the
+/// context window is floored at [`MIN_CONTEXT_WINDOW`], so older `models-v2`
+/// payloads without the new columns continue to work without code changes.
 ///
 /// `api_key` stays `None` regardless — `create_provider()` loads the
 /// OAuth token at runtime via `auth.toml` so we never persist it into
@@ -1207,10 +1323,14 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         // `context_window: 0` from a misconfigured row would degrade
         // every request to a zero-token window; treat that as
         // "missing" and fall back rather than ship a broken provider.
+        // Floored at `MIN_CONTEXT_WINDOW` so conservative gateway values
+        // (e.g. 64k) don't needlessly cap long turns; a larger server
+        // window is kept as-is.
         context_window: entry
             .context_window
             .filter(|n| *n > 0)
-            .unwrap_or(CONTEXT_WINDOW),
+            .unwrap_or(0)
+            .max(MIN_CONTEXT_WINDOW),
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
@@ -1223,6 +1343,13 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         // Server-driven capability rank for subagent strong/weak routing (None ⇒ not
         // participating). Threaded verbatim so re-ranking models needs no client release.
         capable_model: entry.capable_model,
+        // CodingPlan models are covered by the plan entitlement rather than
+        // locally metered API billing.
+        pricing: Some(atomcode_config::config::provider::ProviderPricing {
+            input_per_million: 0.0,
+            output_per_million: 0.0,
+            cached_input_per_million: 0.0,
+        }),
     }
 }
 
@@ -1232,7 +1359,7 @@ mod tests {
     /// Build a `ModelEntry` for tests that only care about the
     /// model name and want every other field to take its fallback
     /// (`base_url` → [`codingplan_llm_base_url`], `provider_type` →
-    /// `PROVIDER_TYPE`, `context_window` → `CONTEXT_WINDOW`,
+    /// `PROVIDER_TYPE`, `context_window` → [`MIN_CONTEXT_WINDOW`] floor,
     /// `plan_available: true`).
     /// Lets the bulk of the test suite stay short while the
     /// per-field-override behaviour gets its own dedicated tests
@@ -1400,12 +1527,30 @@ mod tests {
             p.base_url.as_deref(),
             Some(codingplan_llm_base_url().as_str())
         );
-        assert_eq!(p.context_window, 64_000);
+        // Missing window → fallback, floored at MIN_CONTEXT_WINDOW.
+        assert_eq!(p.context_window, 128_000);
         assert!(
             p.api_key.is_none(),
             "token loaded at runtime from auth.toml"
         );
         assert!(!p.ephemeral);
+    }
+
+    #[test]
+    fn build_provider_floors_conservative_server_window() {
+        // The gateway reports a conservative 64k for several models; we floor
+        // at 128k so long turns aren't needlessly capped.
+        let e = super::super::types::ModelEntry {
+            context_window: Some(64_000),
+            ..entry("GLM-5.2")
+        };
+        assert_eq!(build_codingplan_provider(&e).context_window, 128_000);
+        // A larger server window is kept as-is (never shrunk).
+        let big = super::super::types::ModelEntry {
+            context_window: Some(200_000),
+            ..entry("claude")
+        };
+        assert_eq!(build_codingplan_provider(&big).context_window, 200_000);
     }
 
     #[test]
@@ -1451,7 +1596,8 @@ mod tests {
             p.base_url.as_deref(),
             Some(codingplan_llm_base_url().as_str())
         );
-        assert_eq!(p.context_window, 64_000);
+        // Zero treated as missing → fallback, floored at MIN_CONTEXT_WINDOW.
+        assert_eq!(p.context_window, 128_000);
     }
 
     #[test]
@@ -2125,19 +2271,23 @@ mod tests {
                 ],
                 default_provider: "AtomGit-moonshotai-Kimi-K2-Instruct".into(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
-                all_models: vec![],
+                all_models: vec![
+                    entry("moonshotai/Kimi-K2-Instruct"),
+                    super::super::types::ModelEntry {
+                        provider_type: Some("claude".into()),
+                        ..entry("anthropic/claude-3.5-sonnet")
+                    },
+                    entry("openai/gpt-5"),
+                ],
             }),
             status: StepResult::Err("status endpoint 500".into()),
             auth_expired: false,
         };
         let out = report.render();
-        assert!(out.contains("Added 3 providers"));
-        assert!(out.contains(
-            "AtomGit-moonshotai-Kimi-K2-Instruct  →  moonshotai/Kimi-K2-Instruct  (default)"
-        ));
-        assert!(
-            out.contains("AtomGit-anthropic-claude-3.5-sonnet  →  anthropic/claude-3.5-sonnet\n")
-        );
+        // Two folded accounts (openai=AtomGit, claude=AtomGit-anthropic), 3 models.
+        assert!(out.contains("Added 2 accounts · 3 models"));
+        assert!(out.contains("AtomGit  ·  moonshotai/Kimi-K2-Instruct  (default)"));
+        assert!(out.contains("AtomGit-anthropic  ·  anthropic/claude-3.5-sonnet\n"));
         assert!(
             !out.contains("anthropic/claude-3.5-sonnet  (default)"),
             "only first is default"
@@ -2433,7 +2583,102 @@ mod tests {
 
         assert_eq!(latest.default_provider, "custom");
         assert!(latest.providers.contains_key("custom"));
-        assert!(latest.providers.contains_key("AtomGit"));
+        // AtomGit is now persisted in the new account+model schema, not as a
+        // flat `[providers.*]` entry (single model → bare `AtomGit` id).
+        assert!(latest.provider_accounts.contains_key("AtomGit"));
+        assert!(latest.models.contains_key("AtomGit"));
+        assert!(!latest.providers.contains_key("AtomGit"));
+        // The user's concurrent non-CodingPlan default is untouched.
+        assert_eq!(latest.default_model, None);
+    }
+
+    #[test]
+    fn persist_folds_flat_codingplan_into_grouped_new_schema() {
+        let mut cfg = blank_config();
+        cfg.providers.insert(
+            "AtomGit-GLM-5.2".into(),
+            build_codingplan_provider(&entry("GLM-5.2")),
+        );
+        cfg.providers.insert(
+            "AtomGit-Qwen".into(),
+            build_codingplan_provider(&entry("Qwen")),
+        );
+        // A claude-wire model must land in its own account (an account carries
+        // exactly one wire format).
+        let claude_entry = super::super::types::ModelEntry {
+            provider_type: Some("claude".into()),
+            ..entry("anthropic/claude-3.5")
+        };
+        cfg.providers.insert(
+            "AtomGit-anthropic-claude-3.5".into(),
+            build_codingplan_provider(&claude_entry),
+        );
+        cfg.default_provider = "AtomGit-GLM-5.2".into();
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        // Two openai models collapse into one account; claude gets its own.
+        assert!(cfg.provider_accounts.contains_key("AtomGit"));
+        assert!(cfg.provider_accounts.contains_key("AtomGit-anthropic"));
+        assert_eq!(cfg.provider_accounts["AtomGit"].provider, "openai");
+        assert_eq!(
+            cfg.provider_accounts["AtomGit-anthropic"].provider,
+            "anthropic"
+        );
+        // Model ids stay = legacy provider keys; only the parent account folds.
+        assert_eq!(cfg.models["AtomGit-GLM-5.2"].account, "AtomGit");
+        assert_eq!(cfg.models["AtomGit-Qwen"].account, "AtomGit");
+        assert_eq!(
+            cfg.models["AtomGit-anthropic-claude-3.5"].account,
+            "AtomGit-anthropic"
+        );
+        // Flat providers are gone.
+        assert!(!cfg.providers.keys().any(|k| is_codingplan_provider_name(k)));
+        // The active selection is promoted to the canonical default_model.
+        assert_eq!(cfg.default_model.as_deref(), Some("AtomGit-GLM-5.2"));
+        // And it still resolves through the single boundary.
+        assert_eq!(cfg.resolve_model(None).unwrap().model, "GLM-5.2");
+    }
+
+    #[test]
+    fn persist_relogin_refreshes_stale_new_schema_entries() {
+        // Simulate a re-login: config already holds last run's new-schema
+        // entry (stale window), and merge has just re-inserted the fresh flat
+        // provider with an updated window + a dropped sibling model.
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        cfg.models.insert(
+            "AtomGit-GLM-5.2".into(),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "GLM-5.2", "context_window": 64000
+            }))
+            .unwrap(),
+        );
+        cfg.models.insert(
+            "AtomGit-Dropped".into(),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "Dropped", "context_window": 8000
+            }))
+            .unwrap(),
+        );
+        // Fresh flat provider from this login: GLM window bumped to 200k, and
+        // no "Dropped" model this time.
+        let mut fresh = build_codingplan_provider(&entry("GLM-5.2"));
+        fresh.context_window = 200_000;
+        cfg.providers.insert("AtomGit-GLM-5.2".into(), fresh);
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        // Fresh data wins; the dropped model is gone.
+        assert_eq!(cfg.models["AtomGit-GLM-5.2"].context_window, 200_000);
+        assert!(!cfg.models.contains_key("AtomGit-Dropped"));
+        assert!(!cfg.providers.contains_key("AtomGit-GLM-5.2"));
     }
 
     #[test]
@@ -2556,8 +2801,9 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
+        // Friendly account · model label, not the internal selection key.
         assert!(
-            out.contains("Vision preprocessor → AtomGit-Qwen-Qwen3-VL-32B-Instruct"),
+            out.contains("Vision preprocessor → AtomGit · Qwen/Qwen3-VL-32B-Instruct"),
             "render must include the auto-detected line: {out}",
         );
         assert!(out.contains("(auto-detected)"));
@@ -2878,7 +3124,7 @@ mod tests {
             !out.contains("locked model"),
             "no separate locked-model section expected:\n{out}"
         );
-        let added_idx = out.find("Added 1 provider").expect("Added header");
+        let added_idx = out.find("Added 1 account").expect("Added header");
         let locked_idx = out.find("max/super-secret").expect("locked model line");
         let avail_idx = out.find("lite/foo").expect("available model line");
         assert!(

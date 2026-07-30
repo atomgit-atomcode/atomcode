@@ -512,6 +512,9 @@ impl LlmProvider for MeteredProvider {
     fn context_window(&self) -> u32 {
         self.inner.context_window()
     }
+    fn bind_session_id(&self, session_id: &str) {
+        self.inner.bind_session_id(session_id);
+    }
     async fn chat_stream(
         &self,
         messages: &[Message],

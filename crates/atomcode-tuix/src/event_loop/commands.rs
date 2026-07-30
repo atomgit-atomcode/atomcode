@@ -30,8 +30,7 @@ use crate::custom_commands::ArgsRequirement;
 use crate::i18n::{t, Msg};
 use crate::modals::usage::{UsageData, UsageModal};
 use crate::modals::{
-    DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProviderWizard,
-    ProxyPicker, SessionPicker,
+    DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProxyPicker,
 };
 use crate::render::{Renderer, UiLine};
 use crate::session::{Session, SessionId};
@@ -51,6 +50,7 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
         crate::state::UiPhase::Streaming
             | crate::state::UiPhase::Approval
             | crate::state::UiPhase::UserInput
+            | crate::state::UiPhase::RoundCap
     ) {
         bg_runtime::RuntimeState::Running
     } else {
@@ -186,6 +186,7 @@ fn foreground_turn_replay_events(state: &UiState) -> Vec<bg_runtime::RuntimeEven
         crate::state::UiPhase::Streaming
             | crate::state::UiPhase::Approval
             | crate::state::UiPhase::UserInput
+            | crate::state::UiPhase::RoundCap
     ) {
         return Vec::new();
     }
@@ -352,7 +353,7 @@ mod bg_live_guard_tests {
                 turn_count: 0,
                 tool_call_count: 0,
                 stop_reason: crate::event_loop::ui_event::UiTurnStopReason::Natural,
-                snapshot: Default::default(),
+                snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
             },
         )]);
         let mut replay_queue = std::collections::VecDeque::new();
@@ -450,19 +451,52 @@ pub(super) fn active_session_project_bucket(working_dir: &std::path::Path) -> St
 /// by `/status`, factored out so `/init` can also display it after
 /// writing `.atomcode.md` (so users see the new file appear under
 /// PROJECT immediately, rather than trusting the success message).
-fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
-    use atomcode_config::config::instructions::LayeredInstructions;
+fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
+    use atomcode_config::config::instructions::{InstructionLevel, LayeredInstructions};
     let instructions = LayeredInstructions::load(working_dir);
     let mut out = t(Msg::StatusInstructionFilesHeader).into_owned();
-    for (level, path) in instructions.status_lines() {
-        match path {
-            Some(p) => out.push_str(&t(Msg::StatusInstructionPresent {
-                path: &p.display().to_string(),
-                label: level.label(),
-            })),
-            None => out.push_str(&t(Msg::StatusInstructionMissing {
-                label: level.label(),
-            })),
+    for line in instructions.status_lines(working_dir) {
+        let scope = t(match line.level {
+            InstructionLevel::Global => Msg::StatusInstructionScopeGlobal,
+            InstructionLevel::Project => Msg::StatusInstructionScopeProject,
+            InstructionLevel::User => Msg::StatusInstructionScopeUser,
+        });
+        let path = line.path.display().to_string();
+        if line.found {
+            out.push_str(&t(Msg::StatusInstructionPresent {
+                path: &path,
+                label: line.level.label(),
+                scope: &scope,
+            }));
+        } else {
+            out.push_str(&t(Msg::StatusInstructionMissing {
+                path: &path,
+                label: line.level.label(),
+                scope: &scope,
+            }));
+        }
+    }
+    out.push('\n');
+    out.push_str(&t(Msg::StatusMemoryFilesHeader));
+    for (scope_msg, store) in [
+        (Msg::StatusMemoryScopeGlobal, MemoryStore::global()),
+        (
+            Msg::StatusMemoryScopeProject,
+            MemoryStore::project(working_dir),
+        ),
+    ] {
+        let scope = t(scope_msg);
+        let path = store.path().display().to_string();
+        if store.path().is_file() {
+            out.push_str(&t(Msg::StatusMemoryPresent {
+                path: &path,
+                scope: &scope,
+            }));
+        } else {
+            out.push_str(&t(Msg::StatusMemoryMissing {
+                path: &path,
+                scope: &scope,
+            }));
         }
     }
     out
@@ -474,9 +508,7 @@ pub(crate) fn attach_live_runtime(
     mode: AgentMode,
     renderer: &mut dyn Renderer,
 ) -> Result<(), String> {
-    let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
-        &ctx.current_session.to_conversation_snapshot(),
-    );
+    let snapshot = ctx.current_session.to_conversation_snapshot();
     let provider_fingerprint = atomcode_daemon::native_live::provider_fingerprint(
         &ctx.config,
         &ctx.config.default_provider,
@@ -525,11 +557,17 @@ pub(crate) fn attach_live_runtime(
                 if let atomcode_daemon::live_hub::LiveViewEvent::InputAccepted(input) =
                     observation.event
                 {
+                    // Re-attach `[Image #N]` markers dropped by the text-only echo:
+                    // a webui submit keeps images separate (`input.images`) with no
+                    // inline markers, so without this the synchronized TUI echoes an
+                    // image-bearing message with an empty attachment row (the empty
+                    // box under the user text).
+                    let echo = super::echo_text_with_image_markers(input.text, input.images.len());
                     if event_tx
                         .send(super::bg_runtime::RuntimeEvent {
                             runtime_id,
                             event: super::bg_runtime::RuntimeEventPayload::Ui(
-                                super::ui_event::UiEvent::UserEcho(input.text),
+                                super::ui_event::UiEvent::UserEcho(echo),
                             ),
                         })
                         .is_err()
@@ -1632,7 +1670,7 @@ fn execute_slash_command_impl(
             reset_to_new_session(ctx, state, renderer);
         }
         "model" => {
-            if ctx.config.providers.is_empty() {
+            if !crate::modals::model_picker::has_selectable_models(&ctx.config) {
                 renderer.render(UiLine::CommandOutput(t(Msg::CmdNoProviders).into_owned()));
                 renderer.flush();
             } else {
@@ -1737,11 +1775,7 @@ fn execute_slash_command_impl(
             }
         }
         "provider" => {
-            *active_modal = Some(Box::new(ProviderWizard::MainMenu { selected: 0 }));
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::ProviderWizardHeader).into_owned(),
-            ));
-            renderer.flush();
+            *active_modal = Some(Box::new(crate::modals::ProviderPanel::open()));
         }
         "proxy" => {
             *active_modal = Some(Box::new(ProxyPicker::open(&ctx.config)));
@@ -1770,8 +1804,7 @@ fn execute_slash_command_impl(
                 // error text folds into the same snapshot so a failed diff still
                 // reports below the input box.
                 state.footer_usage = None;
-                state.footer_command_output =
-                    Some(build_diff_stat_text(ctx).unwrap_or_else(|e| e));
+                state.footer_command_output = Some(build_diff_stat_text(ctx).unwrap_or_else(|e| e));
             } else if ctx.is_plain_renderer || !matches!(state.phase, crate::state::UiPhase::Idle) {
                 match build_diff_stat_text(ctx) {
                     Ok(text) => renderer.render(UiLine::CommandOutput(text)),
@@ -1819,14 +1852,7 @@ fn execute_slash_command_impl(
             }
         }
         "cost" => {
-            // Local session token cost (any model, incl. self-integrated) — as
-            // opposed to `/usage`, which queries the CodingPlan gateway only.
-            let text = build_cost_text(
-                &ctx.model_name,
-                state.prompt_tokens,
-                state.completion_tokens,
-                state.cached_tokens,
-            );
+            let text = build_session_cost_text(ctx, state);
             if matches!(state.phase, crate::state::UiPhase::Streaming) {
                 // `/cost` is a static report — drop any live `/usage` panel so
                 // tab keys don't steer a report that's no longer on screen.
@@ -3093,8 +3119,8 @@ fn execute_slash_command_impl(
         }
         "think" => {
             let sub = arg.trim().to_ascii_lowercase();
-            let provider_name = ctx.config.default_provider.clone();
-            let provider = ctx.config.providers.get(&provider_name);
+            let provider_name = ctx.config.effective_model_selection().unwrap_or_default();
+            let provider = ctx.config.provider_config_for_selection(&provider_name);
             match provider {
                 None => {
                     renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
@@ -3118,11 +3144,9 @@ fn execute_slash_command_impl(
                     } else if sub == "on" {
                         let budget = p.thinking_budget.unwrap_or(10_000);
                         let mut desired = ctx.config.clone();
-                        desired
-                            .providers
-                            .get_mut(&provider_name)
-                            .unwrap()
-                            .thinking_enabled = Some(true);
+                        desired.update_selection_reasoning(&provider_name, |r| {
+                            *r.thinking_enabled = Some(true)
+                        });
                         save_and_reload(
                             ctx,
                             desired,
@@ -3132,11 +3156,9 @@ fn execute_slash_command_impl(
                         );
                     } else if sub == "off" {
                         let mut desired = ctx.config.clone();
-                        desired
-                            .providers
-                            .get_mut(&provider_name)
-                            .unwrap()
-                            .thinking_enabled = Some(false);
+                        desired.update_selection_reasoning(&provider_name, |r| {
+                            *r.thinking_enabled = Some(false)
+                        });
                         save_and_reload(
                             ctx,
                             desired,
@@ -3149,11 +3171,9 @@ fn execute_slash_command_impl(
                         match num_str.parse::<u32>() {
                             Ok(n) if n >= 1024 => {
                                 let mut desired = ctx.config.clone();
-                                desired
-                                    .providers
-                                    .get_mut(&provider_name)
-                                    .unwrap()
-                                    .thinking_budget = Some(n);
+                                desired.update_selection_reasoning(&provider_name, |r| {
+                                    *r.thinking_budget = Some(n)
+                                });
                                 save_and_reload(
                                     ctx,
                                     desired,
@@ -3184,7 +3204,7 @@ fn execute_slash_command_impl(
         }
         "effort" => {
             let sub = arg.trim().to_ascii_lowercase();
-            let provider_name = ctx.config.default_provider.clone();
+            let provider_name = ctx.config.effective_model_selection().unwrap_or_default();
             let applicable = crate::event_loop::reasoning_effort_applicable_on_provider(ctx);
             if !applicable {
                 renderer.render(UiLine::CommandOutput(
@@ -3193,7 +3213,7 @@ fn execute_slash_command_impl(
                 renderer.flush();
                 return Ok(());
             }
-            let provider = ctx.config.providers.get(&provider_name);
+            let provider = ctx.config.provider_config_for_selection(&provider_name);
             match provider {
                 None => {
                     renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
@@ -3209,11 +3229,9 @@ fn execute_slash_command_impl(
                         renderer.flush();
                     } else if sub == "high" || sub == "max" {
                         let mut desired = ctx.config.clone();
-                        desired
-                            .providers
-                            .get_mut(&provider_name)
-                            .unwrap()
-                            .reasoning_effort = Some(sub.to_string());
+                        desired.update_selection_reasoning(&provider_name, |r| {
+                            *r.reasoning_effort = Some(sub.to_string())
+                        });
                         crate::event_loop::save_and_reload(
                             ctx,
                             desired,
@@ -3223,11 +3241,9 @@ fn execute_slash_command_impl(
                         );
                     } else if sub == "off" {
                         let mut desired = ctx.config.clone();
-                        desired
-                            .providers
-                            .get_mut(&provider_name)
-                            .unwrap()
-                            .reasoning_effort = None;
+                        desired.update_selection_reasoning(&provider_name, |r| {
+                            *r.reasoning_effort = None
+                        });
                         crate::event_loop::save_and_reload(
                             ctx,
                             desired,
@@ -3466,22 +3482,55 @@ fn execute_slash_command_impl(
                 }
                 renderer.flush();
             } else {
-                let mut parts = arg_trim.splitn(2, char::is_whitespace);
-                let skill_name = parts.next().unwrap_or("");
-                let skill_args = parts.next().unwrap_or("").trim_start();
-                // Pass the bare name straight through — `SkillRegistry::get`
-                // falls back to a unique `:name` suffix match, which resolves
-                // both loose skills (`skills:foo`) and plugin-contributed
-                // skills (`<plugin>:foo`) without us needing to guess the
-                // prefix here. A user-typed qualified name (`foo:bar`) still
-                // works because exact match runs first.
-                if let Some(rendered) = expand_skill(ctx, skill_name, skill_args) {
-                    submit_agent_turn(ctx, state, rendered);
-                } else {
+                // 贪婪多 skill 解析：前缀是一串已知 skill 名，其余是任务描述，
+                // 任务描述会传给每个 skill（保留 $ARGUMENTS 占位符语义）。单个
+                // skill（无第二个 skill 词）解析结果与旧 splitn(2) 一致，零回归。
+                // Returns the skill's canonical identity (`s.name`, the unique
+                // normalized registry key) so `split_skill_names` dedups by
+                // identity — two spellings of the same skill inject it once.
+                let resolve = |name: &str| {
+                    ctx.skill_registry.read().ok().and_then(|r| {
+                        r.get(name)
+                            .filter(|s| s.user_invocable)
+                            .map(|s| s.name.clone())
+                    })
+                };
+                let (skills, skill_args) = split_skill_names(arg_trim, resolve);
+                if skills.is_empty() {
+                    // 首词不是 skill —— 沿用旧的 unknown 报错，指名第一个词。
+                    let first = arg_trim.split_whitespace().next().unwrap_or("");
                     renderer.render(UiLine::Error(
-                        t(Msg::SkillUnknown { name: skill_name }).into_owned(),
+                        t(Msg::SkillUnknown { name: first }).into_owned(),
                     ));
                     renderer.flush();
+                } else {
+                    // 按顺序展开每个 skill；expand_skill 可能因竞态返回 None。
+                    let blocks: Vec<String> = skills
+                        .iter()
+                        .filter_map(|name| expand_skill(ctx, name.as_str(), &skill_args))
+                        .collect();
+                    if blocks.is_empty() {
+                        renderer.render(UiLine::Error(
+                            t(Msg::SkillUnknown {
+                                name: skills[0].as_str(),
+                            })
+                            .into_owned(),
+                        ));
+                        renderer.flush();
+                    } else {
+                        // 回显已加载 skill：第二个及以后的 skill 名若打错字会静默
+                        // 落进任务描述，这行让用户一眼看出"只加载了 N 个"。
+                        let names = skills.join(" · ");
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::SkillsLoaded {
+                                names: names.as_str(),
+                            })
+                            .into_owned(),
+                        ));
+                        renderer.flush();
+                        let rendered = blocks.join("\n\n---\n\n");
+                        submit_agent_turn(ctx, state, rendered);
+                    }
                 }
             }
         }
@@ -3641,17 +3690,41 @@ fn execute_slash_command_impl(
                                 .to_string(),
                             ),
                         });
-                        render_custom_command_error(
-                            renderer,
-                            &CustomDispatch::NotFound,
-                            other,
-                        );
+                        render_custom_command_error(renderer, &CustomDispatch::NotFound, other);
                     }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// 贪婪切分 `/skills` 参数：从左到右扫 whitespace 分词，`resolve(token)` 返回该
+/// token 对应 skill 的**规范身份**（`Some(canonical)`）时收入列表，否则停止。去重
+/// 按规范身份而非原始拼写——两个拼写不同但解析到同一 skill 的 token（大小写、后缀
+/// 简写等）只注入一次。列表里存用户原始拼写（回显更友好），展开时 `expand_skill`
+/// 会再归一化。遇到第一个非 skill 的 token，它及其之后的内容（按原串偏移，保留原
+/// 空白）作为任务描述返回。单个 skill（后面无第二个 skill 词）等价于旧 `splitn(2)`。
+fn split_skill_names(arg: &str, resolve: impl Fn(&str) -> Option<String>) -> (Vec<String>, String) {
+    let mut skills: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let mut rest = arg.trim_start();
+    loop {
+        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let token = &rest[..token_end];
+        if token.is_empty() {
+            break;
+        }
+        let Some(canonical) = resolve(token) else {
+            break;
+        };
+        if !seen.iter().any(|c| c == &canonical) {
+            seen.push(canonical);
+            skills.push(token.to_string());
+        }
+        rest = rest[token_end..].trim_start();
+    }
+    (skills, rest.to_string())
 }
 
 /// Decision returned by [`decide_custom_command`] for the `other` arm of
@@ -4828,7 +4901,7 @@ pub(super) fn build_status_text(ctx: &LoopCtx, proxy: Option<&str>) -> String {
         &body,
         &render_codingplan_status_for_status_cmd(),
         proxy,
-        &render_instruction_status_block(&ctx.working_dir),
+        &render_context_file_status_block(&ctx.working_dir),
     )
 }
 
@@ -4937,27 +5010,198 @@ fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Mod
 /// `/cost` 的用量报告文本：本会话累计 token × 模型价目表。与 `/usage`（只查
 /// CodingPlan 网关）不同，这是本地统计，任何模型（含自接入）都能出数。TUI arm
 /// 与手机远程执行共用。
-pub(crate) fn build_cost_text(
-    model: &str,
-    prompt: usize,
-    completion: usize,
-    cached: usize,
+pub(crate) fn build_cost_report_text(
+    mut report: atomcode_capabilities::session::SessionCostReport,
+    config: &atomcode_config::config::Config,
+    current_provider: &str,
+    current_model: &str,
+    current_pricing: Option<atomcode_capabilities::session::ModelPricing>,
 ) -> String {
-    // Reuse the tested cache-% helper (clamps a degenerate cached>prompt to 100%).
-    let (_billable, cache_pct) = crate::state::turn_token_summary(prompt, completion, cached);
-    let cache_rate = cache_pct.unwrap_or(0) as usize;
-    let total = prompt + completion;
-    let cost = crate::pricing::calculate_cost(model, prompt, completion, cached);
-    let cost_str = crate::pricing::format_cost(cost);
-    t(Msg::CostReport {
-        prompt,
-        completion,
-        cached,
-        cache_rate,
-        total,
-        cost: &cost_str,
-    })
-    .into_owned()
+    if !report
+        .models
+        .iter()
+        .any(|item| item.provider_id == current_provider && item.model_id == current_model)
+    {
+        report
+            .models
+            .push(atomcode_capabilities::session::ModelCostSummary {
+                provider_id: current_provider.to_string(),
+                model_id: current_model.to_string(),
+                tokens: Default::default(),
+                estimated_cost_usd: current_pricing.map(|_| 0.0),
+                explicitly_free: current_pricing.is_some_and(|pricing| pricing.is_free()),
+            });
+    }
+
+    // Resolve a selection id to its account for a friendly `account · model`
+    // header (folded CodingPlan models share one `AtomGit` account); fall back to
+    // the raw id when it isn't in the catalog (e.g. a since-removed provider).
+    let catalog = config.logical_models();
+    let account_of = |pid: &str| -> String {
+        catalog
+            .get(pid)
+            .map(|m| m.account.clone())
+            .unwrap_or_else(|| pid.to_string())
+    };
+    let mut sections = Vec::new();
+    for item in report.models {
+        let prompt = item.tokens.input.saturating_add(item.tokens.cached_input) as usize;
+        let completion = item.tokens.output as usize;
+        let cached = item.tokens.cached_input as usize;
+        let cache_rate = if prompt == 0 {
+            0
+        } else {
+            cached.saturating_mul(100) / prompt
+        };
+        let total = prompt.saturating_add(completion);
+        let body = if item.explicitly_free {
+            let cost = t(Msg::CostFree);
+            t(Msg::CostReport {
+                prompt,
+                completion,
+                cached,
+                cache_rate,
+                total,
+                cost: &cost,
+            })
+        } else if let Some(estimated) = item.estimated_cost_usd {
+            let cost = crate::pricing::format_cost(estimated);
+            t(Msg::CostReport {
+                prompt,
+                completion,
+                cached,
+                cache_rate,
+                total,
+                cost: &cost,
+            })
+        } else {
+            t(Msg::CostTokenReport {
+                prompt,
+                completion,
+                cached,
+                cache_rate,
+                total,
+            })
+        };
+        sections.push(format!(
+            "{} · {}\n{}",
+            account_of(&item.provider_id),
+            item.model_id,
+            body
+        ));
+    }
+    if report.unattributed_tokens > 0 {
+        sections.push(
+            t(Msg::CostUnattributed {
+                tokens: report.unattributed_tokens,
+            })
+            .into_owned(),
+        );
+    }
+    sections.join("\n\n")
+}
+
+fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
+    // The CURRENT-turn row must pair the ACTIVE selection with the active model.
+    // Use the resolved selection id (matches `ctx.model_name`), not the possibly
+    // stale legacy `default_provider` — otherwise the row mislabels e.g.
+    // "agnes-ai · GLM-5.2".
+    let provider = ctx.config.effective_model_selection().unwrap_or_default();
+    let pricing = ctx
+        .config
+        .provider_config_for_selection(&provider)
+        .and_then(|config| atomcode_coding::resolve_provider_pricing(&provider, &config));
+    let manager = session_manager_for_cost(
+        ctx.current_session_project_bucket.as_deref(),
+        &ctx.current_session.working_dir,
+    );
+    let mut report = match manager.read_meta(&ctx.current_session.id) {
+        Ok(meta) => atomcode_capabilities::session::aggregate_session_cost(&meta),
+        Err(_) => {
+            // Never relabel older in-memory totals as the current model when
+            // native metadata is unavailable. Only the active turn below has
+            // a trustworthy current-generation identity.
+            let session_total = state.prompt_tokens.saturating_add(state.completion_tokens) as u64;
+            let live_total = state
+                .turn_prompt_tokens
+                .saturating_add(state.turn_completion_tokens) as u64;
+            let unattributed_tokens = session_total.saturating_sub(live_total);
+            atomcode_capabilities::session::SessionCostReport {
+                models: Vec::new(),
+                unattributed_tokens,
+                total_tokens: unattributed_tokens,
+                estimated_cost_usd: None,
+            }
+        }
+    };
+    let live_tokens = atomcode_capabilities::session::TokenBreakdown {
+        input: state
+            .turn_prompt_tokens
+            .saturating_sub(state.turn_cached_tokens) as u64,
+        output: state.turn_completion_tokens as u64,
+        cached_input: state.turn_cached_tokens as u64,
+    };
+    if live_tokens.total() > 0 {
+        if let Some(model) = report
+            .models
+            .iter_mut()
+            .find(|item| item.provider_id == provider && item.model_id == ctx.model_name)
+        {
+            model.tokens.input = model.tokens.input.saturating_add(live_tokens.input);
+            model.tokens.output = model.tokens.output.saturating_add(live_tokens.output);
+            model.tokens.cached_input = model
+                .tokens
+                .cached_input
+                .saturating_add(live_tokens.cached_input);
+            match (model.estimated_cost_usd.as_mut(), pricing) {
+                (Some(cost), Some(price)) => *cost += price.estimate(live_tokens),
+                _ => model.estimated_cost_usd = None,
+            }
+            model.explicitly_free &= pricing.is_some_and(|price| price.is_free());
+        } else {
+            report
+                .models
+                .push(atomcode_capabilities::session::ModelCostSummary {
+                    provider_id: provider.to_string(),
+                    model_id: ctx.model_name.clone(),
+                    tokens: live_tokens,
+                    estimated_cost_usd: pricing.map(|price| price.estimate(live_tokens)),
+                    explicitly_free: pricing.is_some_and(|price| price.is_free()),
+                });
+        }
+        report.total_tokens = report.total_tokens.saturating_add(live_tokens.total());
+        report.estimated_cost_usd = None;
+    }
+    build_cost_report_text(report, &ctx.config, &provider, &ctx.model_name, pricing)
+}
+
+fn session_manager_for_cost(
+    project_bucket: Option<&str>,
+    working_dir: &std::path::Path,
+) -> atomcode_capabilities::session::SessionManager {
+    project_bucket
+        .filter(|bucket| bucket.len() == 16 && bucket.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(|bucket| {
+            atomcode_capabilities::session::SessionManager::with_root(
+                atomcode_capabilities::session::SessionManager::sessions_root().join(bucket),
+            )
+        })
+        .unwrap_or_else(|| atomcode_capabilities::session::SessionManager::for_project(working_dir))
+}
+
+#[cfg(test)]
+mod cost_session_location_tests {
+    use super::session_manager_for_cost;
+
+    #[test]
+    fn authoritative_catalog_bucket_wins_over_working_dir_hash() {
+        let bucket = "0123456789abcdef";
+        let manager = session_manager_for_cost(Some(bucket), std::path::Path::new("/different"));
+        assert_eq!(
+            manager.root(),
+            atomcode_capabilities::session::SessionManager::sessions_root().join(bucket)
+        );
+    }
 }
 
 /// 手机端可远程触发的**只读信息类**命令白名单。返回 None = 不允许远程执行
@@ -4970,12 +5214,7 @@ pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> O
         .as_str()
     {
         "status" => Some(build_status_text(ctx, None)),
-        "cost" => Some(build_cost_text(
-            &ctx.model_name,
-            state.prompt_tokens,
-            state.completion_tokens,
-            state.cached_tokens,
-        )),
+        "cost" => Some(build_session_cost_text(ctx, state)),
         "whoami" => Some(build_whoami_text()),
         "diff" => Some(build_diff_stat_text(ctx).unwrap_or_else(|e| e)),
         _ => None,
@@ -5453,14 +5692,12 @@ fn default_save_filename() -> String {
 
 /// Render the session's exportable turns as a markdown transcript. Pure /
 /// side-effect-free so it can be unit-tested independently of file I/O.
-fn render_save_markdown(
-    messages: &[atomcode_core::conversation::message::Message],
-) -> Option<String> {
-    use atomcode_core::conversation::message::Role;
+fn render_save_markdown(messages: &[atomcode_kernel::message::Message]) -> Option<String> {
+    use atomcode_kernel::message::Role;
     let turns: Vec<(&Role, &str)> = messages
         .iter()
         .filter(|m| !m.synthetic && matches!(m.role, Role::User | Role::Assistant))
-        .filter_map(|m| m.text().map(|t| (&m.role, t)))
+        .map(|m| (&m.role, m.text.as_str()))
         .filter(|(_, t)| !t.trim().is_empty())
         .collect();
     if turns.is_empty() {
@@ -5487,7 +5724,7 @@ fn render_save_markdown(
 /// a bare name or relative path resolves against `working_dir`;
 /// an absolute path is used as-is. Existing files are overwritten.
 fn resolve_save_in(
-    messages: &[atomcode_core::conversation::message::Message],
+    messages: &[atomcode_kernel::message::Message],
     arg: &str,
     working_dir: &std::path::Path,
 ) -> SaveOutcome {
@@ -6445,37 +6682,22 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
 /// The synthetic `todowrite`-empty call + its tool result. Appended to the
 /// conversation, they make `reduce_todos`/`derive_current_todos` fold the list to
 /// `[]` (the empty list is the last plan), while keeping the transcript's
-/// call/result pairing valid for the next request. Core (session) message model.
-fn todo_clear_messages(id: String) -> Vec<atomcode_core::conversation::message::Message> {
-    use atomcode_core::conversation::message::{Message, MessageContent, Role};
-    use atomcode_core::tool::{ToolCall, ToolResult};
-    vec![
-        Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: id.clone(),
-                    name: "todowrite".to_string(),
-                    arguments: r#"{"todos":[]}"#.to_string(),
-                }],
-                reasoning_content: None,
-                thinking_blocks: Vec::new(),
-            },
-            synthetic: false,
-            internal_origin: Some("todo_clear".to_string()),
-        },
-        Message {
-            role: Role::Tool,
-            content: MessageContent::ToolResult(ToolResult {
-                call_id: id,
-                output: "0 tasks".to_string(),
-                success: true,
-            }),
-            synthetic: false,
-            internal_origin: Some("todo_clear".to_string()),
-        },
-    ]
+/// call/result pairing valid for the next request. Kernel (session) message model.
+fn todo_clear_messages(id: String) -> Vec<atomcode_kernel::message::Message> {
+    use atomcode_kernel::message::Message;
+    use atomcode_kernel::tool::ToolCall;
+    let mut call = Message::assistant(
+        "",
+        vec![ToolCall {
+            id: id.clone(),
+            name: "todowrite".to_string(),
+            arguments: r#"{"todos":[]}"#.to_string(),
+        }],
+    );
+    call.internal_origin = Some("todo_clear".to_string());
+    let mut result = Message::tool_result(id, "0 tasks", false);
+    result.internal_origin = Some("todo_clear".to_string());
+    vec![call, result]
 }
 
 /// Synthetic tool-call pair for `/todo add <content>`: an incremental
@@ -6483,40 +6705,22 @@ fn todo_clear_messages(id: String) -> Vec<atomcode_core::conversation::message::
 /// [`todo_clear_messages`]; the `content` is JSON-encoded via `serde_json` so
 /// quotes/newlines in the user's text can't break the args. Folds through the
 /// canonical `reduce_todos` as a new pending task appended at the end.
-fn todo_add_messages(
-    id: String,
-    content: &str,
-) -> Vec<atomcode_core::conversation::message::Message> {
-    use atomcode_core::conversation::message::{Message, MessageContent, Role};
-    use atomcode_core::tool::{ToolCall, ToolResult};
+fn todo_add_messages(id: String, content: &str) -> Vec<atomcode_kernel::message::Message> {
+    use atomcode_kernel::message::Message;
+    use atomcode_kernel::tool::ToolCall;
     let args = serde_json::json!({ "action": "add", "content": content }).to_string();
-    vec![
-        Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: id.clone(),
-                    name: "todowrite".to_string(),
-                    arguments: args,
-                }],
-                reasoning_content: None,
-                thinking_blocks: Vec::new(),
-            },
-            synthetic: false,
-            internal_origin: Some("todo_add".to_string()),
-        },
-        Message {
-            role: Role::Tool,
-            content: MessageContent::ToolResult(ToolResult {
-                call_id: id,
-                output: format!("Added task: {content}"),
-                success: true,
-            }),
-            synthetic: false,
-            internal_origin: Some("todo_add".to_string()),
-        },
-    ]
+    let mut call = Message::assistant(
+        "",
+        vec![ToolCall {
+            id: id.clone(),
+            name: "todowrite".to_string(),
+            arguments: args,
+        }],
+    );
+    call.internal_origin = Some("todo_add".to_string());
+    let mut result = Message::tool_result(id, format!("Added task: {content}"), false);
+    result.internal_origin = Some("todo_add".to_string());
+    vec![call, result]
 }
 
 /// Append a synthetic todo-mutation message `pair` to the conversation and reseed
@@ -6531,13 +6735,13 @@ fn todo_add_messages(
 fn reseed_todo_conversation(
     ctx: &mut LoopCtx,
     state: &mut UiState,
-    pair: Vec<atomcode_core::conversation::message::Message>,
+    pair: Vec<atomcode_kernel::message::Message>,
 ) {
     let mut snapshot = ctx.current_session.to_conversation_snapshot();
     snapshot.messages.extend(pair);
     ctx.runtime
         .dispatch(atomcode_coding::DriverCommand::RestoreSnapshot(
-            atomcode_daemon::legacy_convert::snapshot_to_kernel(&snapshot),
+            snapshot.clone(),
         ))
         .ok();
     ctx.current_session
@@ -6571,20 +6775,20 @@ fn clear_todos(ctx: &mut LoopCtx, state: &mut UiState) {
 ///
 /// Pure function — no I/O, no side effects.  Easy to unit-test in isolation.
 pub(crate) fn format_todo_command(
-    messages: &[atomcode_core::conversation::message::Message],
+    messages: &[atomcode_kernel::message::Message],
     unicode: bool,
 ) -> String {
-    use atomcode_core::conversation::message::MessageContent;
     // Fold the FULL transcript via the canonical `reduce_todos` (baseline = last full-list plan;
     // then apply every `{action}` update after it), so `/todo` shows the CURRENT statuses — not
     // just the initial plan. Shape-based, matching the merged `todowrite` tool + the live panel.
+    // kernel `Message.tool_calls` is a flat field, so no content-variant match.
     let calls: Vec<(&str, &str)> = messages
         .iter()
-        .filter_map(|m| match &m.content {
-            MessageContent::AssistantWithToolCalls { tool_calls, .. } => Some(tool_calls),
-            _ => None,
+        .flat_map(|m| {
+            m.tool_calls
+                .iter()
+                .map(|c| (c.name.as_str(), c.arguments.as_str()))
         })
-        .flat_map(|tcs| tcs.iter().map(|c| (c.name.as_str(), c.arguments.as_str())))
         .collect();
     let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
     if todos.is_empty() {
@@ -6709,8 +6913,16 @@ mod save_tests {
         default_save_filename, expand_tilde_path, render_save_markdown, resolve_save_in,
         SaveOutcome,
     };
-    use atomcode_core::conversation::message::{Message, Role};
+    use atomcode_kernel::message::{Message, Role};
     use std::path::{Path, PathBuf};
+
+    /// Build a kernel text message with an explicit role (kernel has no generic
+    /// `new(role, text)`).
+    fn msg(role: Role, text: &str) -> Message {
+        let mut m = Message::user(text);
+        m.role = role;
+        m
+    }
 
     #[test]
     fn expand_tilde_path_maps_home_prefix() {
@@ -6743,7 +6955,7 @@ mod save_tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("config.py");
         std::fs::write(&target, "SECRET = 1\n").unwrap();
-        let msgs = vec![Message::new(Role::User, "hi")];
+        let msgs = vec![msg(Role::User, "hi")];
         match resolve_save_in(&msgs, target.to_str().unwrap(), dir.path()) {
             SaveOutcome::RefuseOverwrite(p) => assert!(p.contains("config.py"), "{p}"),
             other => panic!("expected RefuseOverwrite, got {other:?}"),
@@ -6755,7 +6967,7 @@ mod save_tests {
     #[test]
     fn save_overwrites_existing_markdown_and_allows_new_nonmd() {
         let dir = tempfile::tempdir().unwrap();
-        let msgs = vec![Message::new(Role::User, "hi")];
+        let msgs = vec![msg(Role::User, "hi")];
         // Existing .md → overwrite is fine (re-export).
         let md = dir.path().join("report.md");
         std::fs::write(&md, "old").unwrap();
@@ -6777,13 +6989,13 @@ mod save_tests {
     fn conv(msgs: &[(&str, &str)]) -> Vec<Message> {
         msgs.iter()
             .map(|(role, text)| {
-                Message::new(
+                msg(
                     match *role {
                         "user" => Role::User,
                         "assistant" => Role::Assistant,
                         _ => Role::System,
                     },
-                    *text,
+                    text,
                 )
             })
             .collect()
@@ -6800,7 +7012,7 @@ mod save_tests {
 
     #[test]
     fn save_empty_history_when_only_tool_messages() {
-        let msgs = vec![Message::new(Role::Tool, "tool output")];
+        let msgs = vec![msg(Role::Tool, "tool output")];
         assert!(matches!(
             resolve_save_in(&msgs, "", Path::new(".")),
             SaveOutcome::EmptyHistory
@@ -6838,10 +7050,10 @@ mod save_tests {
     #[test]
     fn save_render_skips_synthetic_and_tool_messages() {
         let msgs = vec![
-            Message::new(Role::User, "real prompt"),
+            msg(Role::User, "real prompt"),
             Message::synthetic_user("synthetic injection"),
-            Message::new(Role::Tool, "tool noise"),
-            Message::new(Role::Assistant, "reply"),
+            msg(Role::Tool, "tool noise"),
+            msg(Role::Assistant, "reply"),
         ];
         let md = render_save_markdown(&msgs).expect("renders");
         assert!(md.contains("## User\nreal prompt"));
@@ -6853,7 +7065,7 @@ mod save_tests {
     #[test]
     fn save_render_returns_none_for_empty() {
         assert!(render_save_markdown(&[]).is_none());
-        assert!(render_save_markdown(&[Message::new(Role::Tool, "x")]).is_none());
+        assert!(render_save_markdown(&[msg(Role::Tool, "x")]).is_none());
     }
 
     #[test]
@@ -6990,6 +7202,27 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_file_status_shows_instruction_and_memory_paths() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("AGENTS.md"), "project instructions").unwrap();
+        let project_memory = MemoryStore::project(project.path());
+        std::fs::create_dir_all(project_memory.path().parent().unwrap()).unwrap();
+        std::fs::write(project_memory.path(), "- remembered fact\n").unwrap();
+        let status = render_context_file_status_block(project.path());
+        assert!(status.contains(&project.path().join("AGENTS.md").display().to_string()));
+        assert!(status.contains(&project_memory.path().display().to_string()));
+        assert!(status.contains("(PROJECT)") || status.contains("（PROJECT）"));
+        assert!(
+            status.contains("Instruction files") || status.contains("指令文件"),
+            "instruction section should be visible: {status}"
+        );
+        assert!(
+            status.contains("Memory files") || status.contains("记忆文件"),
+            "memory section should be visible: {status}"
+        );
+    }
 
     #[test]
     fn streaming_usage_snapshot_composes_plan_and_window_lines() {
@@ -7514,18 +7747,32 @@ mod memory_command_tests {
 
 #[cfg(test)]
 mod todo_command_tests {
-    use super::{decide_custom_command, format_todo_command, render_custom_command_error, CustomDispatch};
+    use super::{
+        decide_custom_command, format_todo_command, render_custom_command_error, CustomDispatch,
+    };
     use crate::custom_commands::ArgsRequirement;
     use crate::render::{Renderer, UiLine};
     use atomcode_config::i18n::{t, Msg};
-    use atomcode_core::conversation::message::{Message, MessageContent, Role};
-    use atomcode_core::tool::ToolCall;
+    use atomcode_kernel::message::{Message, Role};
+    use atomcode_kernel::tool::ToolCall;
     use std::path::PathBuf;
+
+    /// Kernel text message with an explicit role.
+    fn msg(role: Role, text: &str) -> Message {
+        let mut m = Message::user(text);
+        m.role = role;
+        m
+    }
+
+    /// Assistant message carrying `tool_calls` (kernel flat field).
+    fn tool_call_msg(calls: Vec<ToolCall>) -> Message {
+        Message::assistant("", calls)
+    }
 
     #[test]
     fn todo_command_text_with_and_without_list() {
         // No todowrite calls → "no list" message (i18n'd).
-        let empty = vec![Message::new(Role::User, "hi")];
+        let empty = vec![msg(Role::User, "hi")];
         let no_list = t(Msg::TodoNoList).into_owned();
         assert!(
             format_todo_command(&empty, false).contains(&no_list),
@@ -7533,21 +7780,11 @@ mod todo_command_tests {
         );
 
         // A todowrite call with one pending item → list output.
-        let with = vec![Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: "1".into(),
-                    name: "todowrite".into(),
-                    arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
-                }],
-                reasoning_content: None,
-                thinking_blocks: vec![],
-            },
-            synthetic: false,
-            internal_origin: None,
-        }];
+        let with = vec![tool_call_msg(vec![ToolCall {
+            id: "1".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+        }])];
         let out = format_todo_command(&with, false);
         assert!(
             out.contains("[ ] do x"),
@@ -7647,21 +7884,11 @@ mod todo_command_tests {
         // A live plan, then the `/todo clear` synthetic pair appended, must
         // derive to an empty list → `/todo` shows the "no list" message. This
         // is what makes cancelled/stale tasks stop reappearing.
-        let mut msgs = vec![Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: "1".into(),
-                    name: "todowrite".into(),
-                    arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
-                }],
-                reasoning_content: None,
-                thinking_blocks: vec![],
-            },
-            synthetic: false,
-            internal_origin: None,
-        }];
+        let mut msgs = vec![tool_call_msg(vec![ToolCall {
+            id: "1".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+        }])];
         assert!(format_todo_command(&msgs, false).contains("[ ] do x"));
         msgs.extend(super::todo_clear_messages("todo-clear-1".to_string()));
         let no_list = t(Msg::TodoNoList).into_owned();
@@ -7699,21 +7926,11 @@ mod todo_command_tests {
     fn todo_add_pair_appends_a_task_keeping_existing() {
         // A live plan, then the `/todo add` synthetic pair appended, must fold to
         // the ORIGINAL task plus the new one at the end — existing tasks untouched.
-        let mut msgs = vec![Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: "1".into(),
-                    name: "todowrite".into(),
-                    arguments: r#"{"todos":[{"content":"do x","status":"in_progress"}]}"#.into(),
-                }],
-                reasoning_content: None,
-                thinking_blocks: vec![],
-            },
-            synthetic: false,
-            internal_origin: None,
-        }];
+        let mut msgs = vec![tool_call_msg(vec![ToolCall {
+            id: "1".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"do x","status":"in_progress"}]}"#.into(),
+        }])];
         msgs.extend(super::todo_add_messages(
             "todo-add-1".to_string(),
             "ship it",
@@ -7752,28 +7969,18 @@ mod todo_command_tests {
     fn todo_command_applies_incremental_updates_after_the_plan() {
         // Merge regression: `/todo` folds via `reduce_todos`, so a `{action:update}` after the
         // plan is reflected — not just the initial (pending) plan.
-        let msgs = vec![Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![
-                    ToolCall {
-                        id: "1".into(),
-                        name: "todowrite".into(),
-                        arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
-                    },
-                    ToolCall {
-                        id: "2".into(),
-                        name: "todowrite".into(),
-                        arguments: r#"{"action":"update","id":1,"status":"completed"}"#.into(),
-                    },
-                ],
-                reasoning_content: None,
-                thinking_blocks: vec![],
+        let msgs = vec![tool_call_msg(vec![
+            ToolCall {
+                id: "1".into(),
+                name: "todowrite".into(),
+                arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
             },
-            synthetic: false,
-            internal_origin: None,
-        }];
+            ToolCall {
+                id: "2".into(),
+                name: "todowrite".into(),
+                arguments: r#"{"action":"update","id":1,"status":"completed"}"#.into(),
+            },
+        ])];
         let out = format_todo_command(&msgs, false);
         assert!(out.contains("do x"), "task shown: {out}");
         assert!(
@@ -7901,10 +8108,7 @@ mod todo_command_tests {
                 msg, &rendered,
                 "Reject must render the CmdCustomArgRequired i18n message"
             ),
-            other => panic!(
-                "Reject must render UiLine::Error, got {:?}",
-                other
-            ),
+            other => panic!("Reject must render UiLine::Error, got {:?}", other),
         }
         assert_eq!(
             rec.flushed, 1,
@@ -7925,7 +8129,11 @@ mod todo_command_tests {
         // Submit no-op arm (which would silently swallow unknown commands
         // with zero user-visible feedback).
         let mut rec = RecRenderer::default();
-        render_custom_command_error(&mut rec, &CustomDispatch::Submit("review foo".into()), "myreview");
+        render_custom_command_error(
+            &mut rec,
+            &CustomDispatch::Submit("review foo".into()),
+            "myreview",
+        );
         assert!(
             rec.lines.is_empty(),
             "Submit must not render any error line, got {:?}",
@@ -7946,10 +8154,7 @@ mod todo_command_tests {
                 msg, &expected,
                 "NotFound must render the CmdUnknownCommand i18n message"
             ),
-            other => panic!(
-                "NotFound must render UiLine::Error, got {:?}",
-                other
-            ),
+            other => panic!("NotFound must render UiLine::Error, got {:?}", other),
         }
         assert_eq!(
             rec.flushed, 1,
@@ -8028,8 +8233,7 @@ mod todo_command_tests {
         }
         render_custom_command_error(&mut rec, &decision, "myreview");
         assert!(
-            rec
-                .lines
+            rec.lines
                 .iter()
                 .all(|line| !matches!(line, UiLine::Error(_))),
             "Submit must not render any Error line, got {:?}",
@@ -8044,18 +8248,39 @@ mod todo_command_tests {
     }
 
     #[test]
-    fn build_cost_text_reports_tokens_cost_and_nonzero_for_self_integrated() {
-        use crate::event_loop::commands::build_cost_text;
-        // Distinct values so substring asserts don't cross-match.
-        let out = build_cost_text("my-self-hosted-llm-v9", 1234, 567, 89);
-        assert!(out.contains("1234"), "prompt tokens shown");
-        assert!(out.contains("567"), "completion tokens shown");
-        assert!(out.contains("89"), "cached tokens shown");
-        assert!(out.contains('$'), "a cost figure is rendered");
-        assert!(
-            !out.contains("$0.0000"),
-            "self-integrated/unknown model must not price to $0"
+    fn cost_report_keeps_models_separate_and_hides_unknown_price() {
+        use crate::event_loop::commands::build_cost_report_text;
+        use atomcode_capabilities::session::{ModelCostSummary, SessionCostReport, TokenBreakdown};
+        let out = build_cost_report_text(
+            SessionCostReport {
+                models: vec![ModelCostSummary {
+                    provider_id: "provider-a".into(),
+                    model_id: "model-a".into(),
+                    tokens: TokenBreakdown {
+                        input: 1234,
+                        output: 567,
+                        cached_input: 89,
+                    },
+                    estimated_cost_usd: None,
+                    explicitly_free: false,
+                }],
+                unattributed_tokens: 0,
+                total_tokens: 1890,
+                estimated_cost_usd: None,
+            },
+            &atomcode_config::config::Config::default(),
+            "provider-b",
+            "model-b",
+            None,
         );
+        // Unknown ids (not in the catalog) fall back to the raw id; separator is `·`.
+        assert!(out.contains("provider-a · model-a"));
+        assert!(out.contains("provider-b · model-b"));
+        assert!(out.contains("1323"));
+        assert!(out.contains("567"));
+        assert!(out.contains("89"));
+        assert!(!out.contains("Estimated cost"));
+        assert!(!out.contains("unknown"));
     }
 }
 
@@ -8106,5 +8331,81 @@ mod mcp_subcommand_tests {
         assert!(parse_mcp_subcommand("").is_none());
         assert!(parse_mcp_subcommand("status").is_none());
         assert!(parse_mcp_subcommand("foobar").is_none());
+    }
+}
+
+#[cfg(test)]
+mod split_skill_names_tests {
+    use super::split_skill_names;
+
+    /// 测试用假解析器：返回 skill 的规范身份（小写）。镜像真实 `SkillRegistry::get`
+    /// 的大小写不敏感解析——`resolve("BrainStorming")` 与 `resolve("brainstorming")`
+    /// 返回同一规范名，所以去重按规范身份而非原始拼写。
+    fn resolve(name: &str) -> Option<String> {
+        let canonical = name.to_ascii_lowercase();
+        matches!(
+            canonical.as_str(),
+            "adapt-agent" | "skill-creator" | "brainstorming" | "a"
+        )
+        .then_some(canonical)
+    }
+
+    #[test]
+    fn multiple_skills_then_task() {
+        let (skills, task) = split_skill_names("adapt-agent skill-creator 路径在哪", resolve);
+        assert_eq!(skills, vec!["adapt-agent", "skill-creator"]);
+        assert_eq!(task, "路径在哪");
+    }
+
+    #[test]
+    fn single_skill_with_task_unchanged() {
+        let (skills, task) = split_skill_names("brainstorming 做个登录页", resolve);
+        assert_eq!(skills, vec!["brainstorming"]);
+        assert_eq!(task, "做个登录页");
+    }
+
+    #[test]
+    fn single_skill_no_task_unchanged() {
+        let (skills, task) = split_skill_names("brainstorming", resolve);
+        assert_eq!(skills, vec!["brainstorming"]);
+        assert_eq!(task, "");
+    }
+
+    #[test]
+    fn first_token_not_a_skill_yields_empty() {
+        let (skills, task) = split_skill_names("路径在哪", resolve);
+        assert!(skills.is_empty());
+        assert_eq!(task, "路径在哪");
+    }
+
+    #[test]
+    fn typo_second_skill_falls_into_task() {
+        let (skills, task) = split_skill_names("adapt-agent skil-creator 路径在哪", resolve);
+        assert_eq!(skills, vec!["adapt-agent"]);
+        assert_eq!(task, "skil-creator 路径在哪");
+    }
+
+    #[test]
+    fn duplicate_skill_deduped() {
+        let (skills, task) = split_skill_names("a a 任务", resolve);
+        assert_eq!(skills, vec!["a"]);
+        assert_eq!(task, "任务");
+    }
+
+    #[test]
+    fn task_whitespace_preserved_verbatim() {
+        let (skills, task) = split_skill_names("brainstorming line1\n  line2", resolve);
+        assert_eq!(skills, vec!["brainstorming"]);
+        assert_eq!(task, "line1\n  line2");
+    }
+
+    #[test]
+    fn variant_spellings_of_same_skill_dedup_to_one() {
+        // Different case both resolve to canonical "brainstorming" → one skill,
+        // NOT two (which would inject the same skill body twice). The first
+        // spelling the user typed is kept for display.
+        let (skills, task) = split_skill_names("BrainStorming brainstorming 任务", resolve);
+        assert_eq!(skills, vec!["BrainStorming"]);
+        assert_eq!(task, "任务");
     }
 }

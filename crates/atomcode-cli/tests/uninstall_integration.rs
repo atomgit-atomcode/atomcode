@@ -75,5 +75,5 @@ fn purge_and_keep_data_conflict_exit_2() {
 // NOTE: We intentionally don't run --purge / --keep-data as full integration tests
 // against a real install — the binary path resolves to the test runner exe (cargo's
 // target/debug/atomcode), and deleting it would break subsequent tests in the same
-// run. Coverage for end-to-end deletion is in atomcode-core's execute_tests via
-// NoopSelfDelete (see crates/atomcode-core/src/uninstall/actions.rs).
+// run. The lower-level deletion paths are covered by the CLI uninstall action tests
+// with a no-op self-delete implementation.

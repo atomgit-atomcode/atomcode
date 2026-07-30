@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use atomcode_auth::gateway_crypto::{self, SignInput};
-use atomcode_auth::oauth::{get_stored_auth, get_valid_auth_session};
+use atomcode_auth::oauth::{
+    classify_auth_recovery_error, get_stored_auth, get_valid_auth_session,
+    recover_auth_after_unauthorized, AuthRecoveryFailureKind,
+};
 
 use super::{RequestSigner, RequestSigningError, SignedAuth};
 
@@ -9,6 +12,7 @@ struct AtomGitRequestSigner {
     path: String,
 }
 
+#[async_trait::async_trait]
 impl RequestSigner for AtomGitRequestSigner {
     fn sign(&self, body: &[u8]) -> Result<SignedAuth, RequestSigningError> {
         let auth = get_valid_auth_session()
@@ -39,6 +43,42 @@ impl RequestSigner for AtomGitRequestSigner {
         Ok(SignedAuth {
             bearer: Some(auth.access_token),
             headers,
+            account_id: Some(auth.user_id),
+        })
+    }
+
+    async fn recover_unauthorized(
+        &self,
+        rejected: &SignedAuth,
+    ) -> Result<bool, RequestSigningError> {
+        let rejected_token = rejected.bearer.clone().ok_or_else(|| {
+            RequestSigningError::CredentialsUnavailable(
+                "AtomGit gateway rejected a request without an OAuth token".to_string(),
+            )
+        })?;
+        let expected_user_id = rejected.account_id.clone().ok_or_else(|| {
+            RequestSigningError::CredentialsUnavailable(
+                "AtomGit gateway auth identity is unavailable".to_string(),
+            )
+        })?;
+        tokio::task::spawn_blocking(move || {
+            recover_auth_after_unauthorized(&rejected_token, &expected_user_id)
+        })
+        .await
+        .map_err(|error| {
+            RequestSigningError::SigningFailed(format!(
+                "authentication recovery task failed: {error}"
+            ))
+        })?
+        .map(|_| true)
+        .map_err(|error| match classify_auth_recovery_error(&error) {
+            AuthRecoveryFailureKind::Transient => {
+                RequestSigningError::RecoveryTransient(error.to_string())
+            }
+            AuthRecoveryFailureKind::ReauthenticationRequired => {
+                RequestSigningError::ReauthenticationRequired(error.to_string())
+            }
+            AuthRecoveryFailureKind::Local => RequestSigningError::SigningFailed(error.to_string()),
         })
     }
 }

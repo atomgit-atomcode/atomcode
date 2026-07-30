@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, type CommandResult, UserInputRequestEvent } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, type CommandResult, UserInputRequestEvent } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -548,6 +548,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 是否已为「当前会话」上报过乐观侧栏条目。每次切换/新建会话时复位，
   // 避免同一会话第二条消息（尤其 sync 路径本地不落消息）重复上报、改写标题。
   const optimisticFiredRef = useRef(false);
+  // Sync path: text of a message THIS tab just optimistically appended (so the
+  // view leaves the "new conversation" landing page instantly instead of waiting
+  // for the server `user` echo, which only arrives after VL preprocessing). The
+  // matching self-echo is deduped in the `user` case so we don't render it twice.
+  // Turns are serialized (hub `turn_active`), so the next `user` echo after a send
+  // is this tab's own; a peer's message (different text, or after the ref clears)
+  // still appends normally.
+  const pendingSelfEchoRef = useRef<string | null>(null);
   // Artifact (code block) streaming: the daemon's ArtifactDetector strips fenced
   // code blocks from TextDelta and emits them as artifact_start / content / end.
   // These refs accumulate the language tag and code body for each artifact so
@@ -571,8 +579,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
 
       activeIdRef.current = sessionId;
+      providerPinnedRef.current = false;
       loadedForRef.current = null;
       optimisticFiredRef.current = false;
+      pendingSelfEchoRef.current = null;
       // An existing session stays send-locked until `/chat/active` proves it
       // has no detached operation. Its canonical id is already a safe stop
       // alias, including while the discovery request is pending or unavailable.
@@ -1061,8 +1071,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setUserInputReq(null);
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
-      if (e.provider) {
-        providerPinnedRef.current = false;
+      if (e.provider && !providerPinnedRef.current) {
         setProvider(e.provider);
       }
       // 同步当前审批模式，让新 tab 显示正确的模式 pill（含别的 tab 切成的 Auto/Plan）。
@@ -1080,10 +1089,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
       return;
     }
-    // 模型切换是进程级（全局），与正在查看哪个会话无关 → 不门控，始终更新下拉框。
+    // 模型切换是进程级（全局），与正在查看哪个会话无关。provider 事件是运行时
+    // ProviderChanged 的权威回声（本端确认的切换 / 别的 tab / TUI），一律采纳并解除
+    // pin——pin 只用于防止「重连快照」回退一次尚未传播的本地切换，不该挡真实的变更事件，
+    // 否则本端切过一次模型后就永远不再跟随 TUI 的模型切换（S1）。
     if (e.type === 'provider') {
-      providerPinnedRef.current = false;
       setProvider(e.provider);
+      providerPinnedRef.current = false;
       return;
     }
     // 审批模式切换是进程级（另一 tab / 未来 TUI）→ 始终同步 pill。
@@ -1155,6 +1167,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         });
         liveLifecycleRef.current = lifecycle.state;
         setBusy(lifecycle.state.running);
+        // Dedup THIS tab's own echo: we already optimistically appended it on send
+        // (leaving the landing page instantly). Consume the marker and skip the
+        // re-append; a peer's message still falls through and renders.
+        if (pendingSelfEchoRef.current !== null && e.text === pendingSelfEchoRef.current) {
+          pendingSelfEchoRef.current = null;
+          break;
+        }
         // Append the peer's user message + empty assistant placeholder
         const now = Date.now();
         setMessages((prev) => [
@@ -1164,6 +1183,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         ]);
         break;
       }
+
       case 'state': {
         const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
           type: 'state',
@@ -1337,15 +1357,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   /** Switch the active provider and notify the backend when in sync mode. */
   function switchProvider(name: string) {
+    providerPinnedRef.current = true;
     if (!sync) {
-      providerPinnedRef.current = true;
       setProvider(name);
       return;
     }
     const previous = provider;
     setProvider(name);
-    void postLiveProvider(name, sessionId).catch((error) => {
+    void postLiveProvider(name, sessionId).then((res) => {
+      if (res.ok) return;
+      // Rejected (e.g. a turn is running): undo the optimistic selection and unpin
+      // so the selector resumes following the runtime's authoritative model.
       setProvider(previous);
+      providerPinnedRef.current = false;
+      pushCommandNotice(res.activeTurn ? t('cmd.model.syncBusy') : (res.error ?? t('cmd.model.syncBusy')));
+    }).catch((error) => {
+      setProvider(previous);
+      providerPinnedRef.current = false;
       setHistoryHint(t('chat.connError', { msg: String(error) }));
     });
   }
@@ -1410,7 +1438,35 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         const SESSION_MUTATING = new Set(['undo', 'compact']);
         if (SESSION_MUTATING.has(command)) {
           if (busyRef.current) { pushCommandNotice(t('cmd.session.busy')); return; }
-          if (sync) { pushCommandNotice(t('cmd.session.syncUnsupported')); return; }
+          if (sync) {
+            // sync 模式：compact 派发到共享实时运行时（结果经 /live 的 Warning 事件
+            // 渲染压缩标记）；undo 暂无实时路径，维持拒绝。
+            if (command === 'compact') {
+              // Keep a handle on the pending notice so a failed dispatch can retract
+              // it — otherwise a stale "Compacting…" line lingers next to the error.
+              const pendingNote: Message = {
+                role: 'system',
+                parts: [{ kind: 'notice', text: t('cmd.compact.pending') }],
+                ts: Date.now(),
+              };
+              setMessages((prev) => [...prev, pendingNote]);
+              // Gate sendMessage while the dispatch is in flight, mirroring the
+              // non-sync path (compactingRef guards the submit handler).
+              compactingRef.current = true;
+              try {
+                const { accepted } = await postLiveCompact();
+                if (!accepted) pushCommandNotice(t('cmd.compact.syncNoRuntime'));
+              } catch (e) {
+                setMessages((prev) => prev.filter((m) => m !== pendingNote));
+                pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
+              } finally {
+                compactingRef.current = false;
+              }
+              return;
+            }
+            pushCommandNotice(t('cmd.session.syncUnsupported'));
+            return;
+          }
         }
         if (command === 'compact') pushCommandNotice(t('cmd.compact.pending'));
         const isCompact = command === 'compact';
@@ -1455,8 +1511,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           if (res.kind === 'context') {
             pushCommandNotice(
               t('cmd.context.body', {
-                sent: res.sent_tokens, sys: res.system_tokens, tools: res.tool_defs_tokens,
-                cold: res.cold_zone_tokens, total: res.sent_tokens + res.system_tokens + res.tool_defs_tokens + res.cold_zone_tokens,
+                used: res.used_tokens, msgs: res.total_messages,
+                pct: Math.round(res.utilization * 100),
                 window: res.ctx_window, name: res.ctx_name,
               })
             );
@@ -1771,9 +1827,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }
 
     if (sync) {
-      // ── Sync path: send to /live/message; do NOT locally append (the user
-      //    event will arrive back via the live stream, keeping all tabs in sync).
+      // ── Sync path: send to /live/message. Optimistically append the user
+      //    message NOW so the view leaves the "new conversation" landing page
+      //    immediately (the server `user` echo — which keeps OTHER tabs in sync —
+      //    only arrives after VL preprocessing, so waiting for it leaves the
+      //    sender stuck on the empty page). Our own echo is deduped in the `user`
+      //    case via `pendingSelfEchoRef`.
       setBusy(true);
+      const now = Date.now();
+      pendingSelfEchoRef.current = text;
+      setMessages((prev) => [
+        ...prev,
+        { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now },
+        { role: 'assistant', parts: [], ts: now },
+      ]);
       try {
         await postLiveMessage(
           text,
@@ -1782,6 +1849,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           activeIdRef.current,
         );
       } catch (error) {
+        // Roll back the optimistic append — the send never reached the server.
+        pendingSelfEchoRef.current = null;
+        setMessages((prev) => prev.slice(0, -2));
         setBusy(false);
         setQueued([]);
         setHistoryHint(t('chat.connError', { msg: String(error) }));
@@ -2405,81 +2475,87 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         onPaste={handlePaste}
       />
       <div class="input-footer">
-        <AttachMenu
-          onInsert={insertAtCursor}
-          onPickFile={() => setShowFilePicker(true)}
-          onAddImages={addImageFiles}
-        />
-        <button
-          class={'btn-sync' + (sync ? ' active' : '')}
-          onClick={toggleSync}
-          title={sync ? t('sync.on') : t('sync.off')}
-          aria-label={t('sync.toggle')}
-          aria-pressed={sync}
-        >
-          {/* lucide `arrow-left-right` — matches the pencil design's sync icon. */}
-          <svg
-            width="16"
-            height="16"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
+        <div class="input-footer-primary">
+          <AttachMenu
+            onInsert={insertAtCursor}
+            onPickFile={() => setShowFilePicker(true)}
+            onAddImages={addImageFiles}
+          />
+          <button
+            class={'btn-sync' + (sync ? ' active' : '')}
+            onClick={toggleSync}
+            title={sync ? t('sync.on') : t('sync.off')}
+            aria-label={t('sync.toggle')}
+            aria-pressed={sync}
           >
-            <path d="M8 3 4 7l4 4" />
-            <path d="M4 7h16" />
-            <path d="m16 21 4-4-4-4" />
-            <path d="M20 17H4" />
-          </svg>
-        </button>
-        <span class="footer-spacer" />
-        {tokens && (
-          <span class="footer-tokens">
-            {(tokens.total / 1000).toFixed(1)}k tokens
-          </span>
-        )}
-        <ModeSelector
-          value={modeState.displayMode}
-          disabled={Boolean(modeState.pendingMode)}
-          onChange={(m) => switchMode(m)}
-        />
-        <ModelSelector
-          value={provider}
-          onChange={(p) => switchProvider(p)}
-          onDefaultChange={followDefaultProvider}
-        />
-        {busy || recoveryPolicy.allowStop ? (
-          <>
-            {/* 执行中仍可发送：按下即排队，当前回合结束后自动发出。 */}
-            {recoveryPolicy.allowSend && (input.trim() || pendingImages.length > 0) && (
+            {/* lucide `arrow-left-right` — matches the pencil design's sync icon. */}
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M8 3 4 7l4 4" />
+              <path d="M4 7h16" />
+              <path d="m16 21 4-4-4-4" />
+              <path d="M20 17H4" />
+            </svg>
+          </button>
+          <span class="footer-spacer" />
+          {tokens && (
+            <span class="footer-tokens">
+              {(tokens.total / 1000).toFixed(1)}k tokens
+            </span>
+          )}
+        </div>
+        <div class="input-footer-actions">
+          <ModeSelector
+            value={modeState.displayMode}
+            disabled={Boolean(modeState.pendingMode)}
+            onChange={(m) => switchMode(m)}
+          />
+          <ModelSelector
+            value={provider}
+            onChange={(p) => switchProvider(p)}
+            onDefaultChange={followDefaultProvider}
+          />
+          <div class="input-turn-controls">
+            {busy || recoveryPolicy.allowStop ? (
+              <>
+                {/* 执行中仍可发送：按下即排队，当前回合结束后自动发出。 */}
+                {recoveryPolicy.allowSend && (input.trim() || pendingImages.length > 0) && (
+                  <button
+                    class="btn-send"
+                    onClick={sendMessage}
+                    disabled={Boolean(modeState.pendingMode)}
+                    title={t('chat.queue')}
+                    aria-label={t('chat.queue')}
+                  >
+                    ↑
+                  </button>
+                )}
+                <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
+                  <span class="stop-square" />
+                </button>
+              </>
+            ) : (
               <button
                 class="btn-send"
                 onClick={sendMessage}
-                disabled={Boolean(modeState.pendingMode)}
-                title={t('chat.queue')}
-                aria-label={t('chat.queue')}
+                disabled={!recoveryPolicy.allowSend || Boolean(modeState.pendingMode) || (!input.trim() && pendingImages.length === 0)}
+                title={recoveryPolicy.allowSend ? t('chat.send') : t('chat.recoveryBlocked')}
+                aria-label={recoveryPolicy.allowSend ? t('chat.send') : t('chat.recoveryBlocked')}
               >
                 ↑
               </button>
             )}
-            <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
-              <span class="stop-square" />
-            </button>
-          </>
-        ) : (
-          <button
-            class="btn-send"
-            onClick={sendMessage}
-            disabled={!recoveryPolicy.allowSend || Boolean(modeState.pendingMode) || (!input.trim() && pendingImages.length === 0)}
-            title={recoveryPolicy.allowSend ? t('chat.send') : t('chat.recoveryBlocked')}
-            aria-label={recoveryPolicy.allowSend ? t('chat.send') : t('chat.recoveryBlocked')}
-          >
-            ↑
-          </button>
-        )}
+          </div>
+        </div>
       </div>
     </div>
   );

@@ -23,7 +23,7 @@ pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod ui_event;
 pub(crate) mod usage_monitor;
-use commands::{dispatch_undo, execute_slash_command, format_rate_limited_line};
+use commands::{execute_slash_command, format_rate_limited_line};
 pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
@@ -36,12 +36,11 @@ use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCom
 use atomcode_coding::CodingRuntimeHandle;
 use atomcode_config::config::Config;
 use atomcode_config::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};
-use atomcode_daemon::legacy_convert::snapshot_to_core;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::{mpsc, watch};
 use ui_event::{UiAgentPhase as AgentPhase, UiEvent as AgentEvent};
 
-use atomcode_core::conversation::message::ImagePart;
+use atomcode_kernel::message::ImageContent;
 use base64::Engine;
 
 use crate::commands::{parse_bash_command, parse_slash_line, CommandRegistry};
@@ -62,14 +61,8 @@ fn runtime_mode(mode: crate::state::AgentMode) -> atomcode_coding::RuntimeMode {
     }
 }
 
-fn runtime_user_input(text: String, images: Vec<ImagePart>) -> atomcode_coding::UserInput {
-    atomcode_coding::UserInput {
-        text,
-        images: images
-            .iter()
-            .map(atomcode_daemon::legacy_convert::image_to_kernel)
-            .collect(),
-    }
+fn runtime_user_input(text: String, images: Vec<ImageContent>) -> atomcode_coding::UserInput {
+    atomcode_coding::UserInput { text, images }
 }
 
 fn submit_foreground_runtime(ctx: &LoopCtx, input: atomcode_coding::UserInput) -> bool {
@@ -103,8 +96,10 @@ fn reload_runtime_provider_from(
     if source.language == ctx.config.language {
         config.preferred_language = Some(crate::i18n::current_locale());
     }
+    let mut agent_cfg = config.agent_config();
+    agent_cfg.round_cap_checkpoint = true; // TUI implements the checkpoint panel (Task 3+)
     ctx.runtime.reload_provider(
-        config.agent_config(),
+        agent_cfg,
         ctx.foreground_runtime_id,
         ctx.runtime_event_tx.clone(),
     )
@@ -170,7 +165,7 @@ fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Try to grab an image from the system clipboard via `arboard`.
-/// Returns `Some((ImagePart, fingerprint))` if the clipboard holds an
+/// Returns `Some((ImageContent, fingerprint))` if the clipboard holds an
 /// image, `None` otherwise. The fingerprint is hashed off the raw RGBA
 /// Try to get an image from the clipboard. First attempts to read image
 /// bytes directly (screenshots, Preview Copy). If that fails, falls back
@@ -203,7 +198,7 @@ fn is_paste_image_chord(
 /// bytes (not the PNG-encoded base64) — same hash function the status
 /// poll uses, so paste-side and poll-side fingerprints line up for the
 /// "is this the same image we already attached?" check.
-fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
+fn try_paste_clipboard_image() -> Option<(ImageContent, u64)> {
     // Three-tier fallback chain for Ctrl+V → image attach. Each tier
     // covers a real-world clipboard shape Cmd+V already handled via
     // bracketed paste; Ctrl+V is intercepted at the key layer before
@@ -220,7 +215,7 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
         let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
         return Some((
-            ImagePart {
+            ImageContent {
                 media_type: "image/png".into(),
                 data: b64,
             },
@@ -296,7 +291,7 @@ fn read_macos_clipboard_file_url() -> Option<String> {
     Some(decoded.into_owned())
 }
 
-/// Map an `ImagePart::media_type` to a cache filename extension.
+/// Map an `ImageContent::media_type` to a cache filename extension.
 /// Unknown MIMEs degrade to `bin` — they still round-trip via the
 /// stored `media_type` field on `HistoryImageRef`, so the extension is
 /// purely informational for humans poking at `~/.atomcode/image-cache/`.
@@ -317,7 +312,7 @@ fn ext_for_mt(mt: &str) -> &'static str {
 /// the source of truth for the current submit.
 fn cache_write_image(
     cache_dir: &std::path::Path,
-    img: &atomcode_core::conversation::message::ImagePart,
+    img: &atomcode_kernel::message::ImageContent,
     hash: u64,
 ) {
     let path = cache_dir.join(format!("{:016x}.{}", hash, ext_for_mt(&img.media_type)));
@@ -401,6 +396,55 @@ fn image_markers_in_order(text: &str) -> Vec<usize> {
     out
 }
 
+/// Re-attach `[Image #N]` markers to a live-sync `UserEcho` whose text carries
+/// none. A webui/live submit keeps images STRUCTURALLY separate (`UserInput
+/// { text, images }`) with no inline markers, but the TUI echo renders the
+/// `└ [Image #N]` rows by scanning the text (`image_markers_in_order`) — so an
+/// image-bearing webui message would echo with an empty attachment row in a
+/// synchronized TUI. Append one marker per image (1-based) so the existing
+/// `UserEcho → UserWithAttachments` render surfaces them, matching how a native
+/// TUI paste (whose text already contains the markers) is echoed.
+///
+/// No-ops when there are no images, or when the text already carries markers
+/// (a native-paste echo forwarded through the same seam) so we never double up.
+pub(crate) fn echo_text_with_image_markers(text: String, image_count: usize) -> String {
+    if image_count == 0 || text.contains("[Image #") {
+        return text;
+    }
+    let markers = (1..=image_count)
+        .map(|n| format!("[Image #{n}]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.trim().is_empty() {
+        markers
+    } else {
+        format!("{text} {markers}")
+    }
+}
+
+/// The paste-gate rejection line for an attached image, or `None` when images
+/// ARE supported. Distinguishes "nothing configured" (`ModelNoImageSupport`)
+/// from a configured-but-unresolvable `vision_preprocessor_provider`
+/// (`VisionPreprocessorUnresolvable`, which names the typo'd value) so the
+/// message stops telling users who DID configure a preprocessor that it is
+/// "未配置". Shared by every gate that surfaces the rejection to the user.
+fn image_attach_reject_line(config: &Config, model: &str) -> Option<String> {
+    use atomcode_config::config::ImageAttachSupport as S;
+    match config.image_attach_support() {
+        S::Supported => None,
+        S::Unconfigured => {
+            Some(crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport { model }).into_owned())
+        }
+        S::PreprocessorUnresolvable(provider) => Some(
+            crate::i18n::t(crate::i18n::Msg::VisionPreprocessorUnresolvable {
+                model,
+                provider: &provider,
+            })
+            .into_owned(),
+        ),
+    }
+}
+
 pub(crate) fn compute_input_attachments(
     state: &crate::state::UiState,
     buf_text: &str,
@@ -475,7 +519,7 @@ pub(crate) fn hydrate_recalled_attachments(
                 let hash_u64 = u64::from_str_radix(&refed.hash, 16).unwrap_or(0);
                 state
                     .pending_images
-                    .push(atomcode_core::conversation::message::ImagePart {
+                    .push(atomcode_kernel::message::ImageContent {
                         media_type: refed.mt.clone(),
                         data: base64::engine::general_purpose::STANDARD.encode(&raw),
                     });
@@ -499,7 +543,7 @@ pub(crate) fn hydrate_recalled_attachments(
 const MAX_PATH_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Try to interpret a paste payload as a filesystem path to an image
-/// file and load it as an [`ImagePart`]. Returns `Some` only when the
+/// file and load it as an [`ImageContent`]. Returns `Some` only when the
 /// payload looks unambiguously like an image-attachment intent, never
 /// for plain prose that happens to mention a file name.
 ///
@@ -536,7 +580,7 @@ const MAX_PATH_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 /// works; collisions with a clipboard-paste of the same image (which
 /// hashes RGBA, not file bytes) are out of scope — the hash is a
 /// per-source dedup signal, not a global content identity.
-fn try_attach_image_from_path(text: &str) -> Option<(ImagePart, u64)> {
+fn try_attach_image_from_path(text: &str) -> Option<(ImageContent, u64)> {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.contains('\n') {
         return None;
@@ -581,7 +625,7 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImagePart, u64)> {
     let hash = rgba_fingerprint(0, 0, &bytes);
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Some((
-        ImagePart {
+        ImageContent {
             media_type: media_type.into(),
             data: b64,
         },
@@ -629,7 +673,7 @@ mod image_path_tests {
         p
     }
 
-    /// PNG path → ImagePart with `image/png` media type. The single
+    /// PNG path → ImageContent with `image/png` media type. The single
     /// happy-path covering iTerm2's Cmd+V-of-image temp-file shape.
     #[test]
     fn png_path_attaches_as_image_png() {
@@ -1076,13 +1120,39 @@ fn runtime_ui_availability(phase: atomcode_coding::RuntimePhase) -> RuntimeUiAva
 /// different: it is an authoritative CodingRuntime phase shared by local and
 /// live submissions, so both paths must hold until the replacement commits.
 /// Fatal states (`Failed` / `Stopped`) still surface the error.
-fn hold_submit_until_ready(live: bool, availability: RuntimeUiAvailability) -> bool {
+fn hold_submit_until_ready(
+    live: bool,
+    availability: RuntimeUiAvailability,
+    unavailable_reason: Option<atomcode_coding::ProviderUnavailableReason>,
+) -> bool {
     availability == RuntimeUiAvailability::Reconfiguring
         || (!live
-            && matches!(
-                availability,
-                RuntimeUiAvailability::AwaitingProvider | RuntimeUiAvailability::Starting
-            ))
+            && (availability == RuntimeUiAvailability::Starting
+                || (availability == RuntimeUiAvailability::AwaitingProvider
+                    && matches!(
+                        unavailable_reason,
+                        None | Some(
+                            atomcode_coding::ProviderUnavailableReason::AuthenticationRequired
+                        )
+                    ))))
+}
+
+/// Provider-unavailable events can arrive during startup before a queued
+/// provider recovery completes. Do not write `NotConfigured` into permanent
+/// scrollback: the footer already owns that persistent state, and a stale
+/// startup line becomes contradictory once the runtime is ready.
+fn provider_unavailable_announcement(
+    reason: atomcode_coding::ProviderUnavailableReason,
+) -> Option<crate::i18n::Msg<'static>> {
+    match reason {
+        atomcode_coding::ProviderUnavailableReason::NotConfigured => None,
+        atomcode_coding::ProviderUnavailableReason::AuthenticationRequired => {
+            Some(crate::i18n::Msg::CmdWhoamiNotSignedIn)
+        }
+        atomcode_coding::ProviderUnavailableReason::UnsupportedBuild => {
+            Some(crate::i18n::Msg::CmdProviderUnsupportedBuild)
+        }
+    }
 }
 
 /// Guard for the type-ahead drain: a queued message must only be replayed when
@@ -1151,6 +1221,48 @@ fn type_ahead_queue_action(event: &bg_runtime::RuntimeEventPayload) -> TypeAhead
             AgentEvent::TurnComplete { .. } | AgentEvent::TurnCancelled { .. },
         ) => TypeAheadQueueAction::Clear,
         _ => TypeAheadQueueAction::None,
+    }
+}
+
+/// Esc-with-pending is an explicit exception to the normal fail-closed
+/// type-ahead policy: presentation-only cancellation must not clear the replay
+/// copy, and the runtime-owned completed terminal releases exactly one entry.
+/// Runtime failure still clears everything.
+fn interrupt_queue_action(
+    event: &bg_runtime::RuntimeEventPayload,
+    base: TypeAheadQueueAction,
+    armed: bool,
+) -> (TypeAheadQueueAction, bool) {
+    if !armed {
+        return (base, false);
+    }
+    match event {
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => interrupt_queue_action(
+            &bg_runtime::RuntimeEventPayload::Native(envelope.event.clone()),
+            base,
+            true,
+        ),
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+            atomcode_coding::TurnCompletion::Completed { .. },
+        )) => (TypeAheadQueueAction::DrainOne, false),
+        bg_runtime::RuntimeEventPayload::Native(
+            CodingRuntimeEvent::TurnFinished(
+                atomcode_coding::TurnCompletion::SnapshotUnavailable { .. },
+            )
+            | CodingRuntimeEvent::RuntimeStopped(_),
+        ) => (TypeAheadQueueAction::Clear, false),
+        _ if matches!(base, TypeAheadQueueAction::Clear) => (TypeAheadQueueAction::None, true),
+        _ => (base, true),
+    }
+}
+
+/// A presentation-only terminal may clean up transient UI state before the
+/// runtime publishes its authoritative `TurnFinished`. While an Esc replay is
+/// armed, keep input routing in the busy phase so a manual submit cannot race
+/// ahead of the replay queue.
+fn hold_interrupt_wait_phase(state: &mut UiState, armed: bool) {
+    if armed && matches!(state.phase, UiPhase::Idle) {
+        state.phase = UiPhase::Streaming;
     }
 }
 
@@ -1295,7 +1407,7 @@ mod submit_hold_tests {
             turn_count: 0,
             tool_call_count: 0,
             stop_reason: ui_event::UiTurnStopReason::Natural,
-            snapshot: Default::default(),
+            snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         });
         assert_eq!(
             type_ahead_queue_action(&presentation_only),
@@ -1359,6 +1471,110 @@ mod submit_hold_tests {
         apply_type_ahead_queue_action(TypeAheadQueueAction::None, &mut queue, &mut authorized);
         assert_eq!(queue, VecDeque::from(["next"]));
         assert!(!authorized);
+    }
+
+    #[test]
+    fn interrupt_replay_waits_for_authoritative_terminal() {
+        let presentation_cancel = bg_runtime::RuntimeEventPayload::Ui(AgentEvent::TurnCancelled {
+            snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
+        });
+        assert_eq!(
+            interrupt_queue_action(
+                &presentation_cancel,
+                type_ahead_queue_action(&presentation_cancel),
+                true,
+            ),
+            (TypeAheadQueueAction::None, true),
+            "presentation cancellation cannot release or clear replay payloads"
+        );
+
+        let native_cancel = native_turn_finished(atomcode_kernel::event::StopReason::Cancelled);
+        assert_eq!(
+            interrupt_queue_action(
+                &native_cancel,
+                type_ahead_queue_action(&native_cancel),
+                true,
+            ),
+            (TypeAheadQueueAction::DrainOne, false),
+            "runtime-owned cancellation releases exactly one replayed message"
+        );
+    }
+
+    #[test]
+    fn interrupt_replay_fails_closed_when_snapshot_is_unavailable() {
+        let event = bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+            atomcode_coding::TurnCompletion::SnapshotUnavailable {
+                turn_id: 1,
+                reason: atomcode_kernel::event::StopReason::Cancelled,
+                error: atomcode_coding::RuntimeSnapshotError {
+                    message: "snapshot failed".into(),
+                },
+                stats: Default::default(),
+            },
+        ));
+        assert_eq!(
+            interrupt_queue_action(&event, type_ahead_queue_action(&event), true),
+            (TypeAheadQueueAction::Clear, false)
+        );
+    }
+
+    #[test]
+    fn presentation_terminal_keeps_interrupt_wait_busy() {
+        let mut state = UiState::new();
+        assert!(matches!(state.phase, UiPhase::Idle));
+        hold_interrupt_wait_phase(&mut state, true);
+        assert!(
+            matches!(state.phase, UiPhase::Streaming),
+            "manual input must keep using the streaming route until native terminal"
+        );
+
+        state.phase = UiPhase::Idle;
+        hold_interrupt_wait_phase(&mut state, false);
+        assert!(matches!(state.phase, UiPhase::Idle));
+    }
+
+    #[test]
+    fn interrupt_staging_preserves_fifo_and_existing_type_ahead() {
+        fn queued(text: &str, marker: usize) -> crate::state::QueuedMessage {
+            crate::state::QueuedMessage {
+                text: text.into(),
+                images: Vec::new(),
+                image_markers: vec![marker],
+            }
+        }
+        let mut pending = VecDeque::from([
+            crate::state::PendingSteer {
+                message: queued("pending-1", 1),
+                display_text: "pending-1".into(),
+            },
+            crate::state::PendingSteer {
+                message: queued("pending-2", 2),
+                display_text: "pending-2".into(),
+            },
+        ]);
+        let mut queue = VecDeque::from([queued("queued-3", 3)]);
+
+        assert!(stage_pending_steers(&mut pending, &mut queue));
+        assert!(pending.is_empty());
+        assert_eq!(
+            queue
+                .iter()
+                .map(|message| (message.text.as_str(), message.image_markers.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("pending-1", &[1][..]),
+                ("pending-2", &[2][..]),
+                ("queued-3", &[3][..]),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_cancel_never_authorizes_interrupt_staging() {
+        assert!(!should_stage_interrupt(false, true, true));
+        assert!(!should_stage_interrupt(true, false, true));
+        assert!(!should_stage_interrupt(true, true, false));
+        assert!(should_stage_interrupt(true, true, true));
     }
 
     #[test]
@@ -1426,7 +1642,7 @@ mod submit_hold_tests {
                 turn_count: 0,
                 tool_call_count: 0,
                 stop_reason,
-                snapshot: Default::default(),
+                snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
             })
         };
 
@@ -1508,15 +1724,28 @@ mod submit_hold_tests {
         // deferred runtime still constructing — hold the prompt.
         assert!(hold_submit_until_ready(
             false,
-            RuntimeUiAvailability::AwaitingProvider
+            RuntimeUiAvailability::AwaitingProvider,
+            Some(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired),
         ));
         assert!(hold_submit_until_ready(
             false,
-            RuntimeUiAvailability::Starting
+            RuntimeUiAvailability::Starting,
+            None,
         ));
         assert!(hold_submit_until_ready(
             false,
-            RuntimeUiAvailability::Reconfiguring
+            RuntimeUiAvailability::Reconfiguring,
+            None,
+        ));
+        assert!(!hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::AwaitingProvider,
+            Some(atomcode_coding::ProviderUnavailableReason::UnsupportedBuild),
+        ));
+        assert!(!hold_submit_until_ready(
+            false,
+            RuntimeUiAvailability::AwaitingProvider,
+            Some(atomcode_coding::ProviderUnavailableReason::NotConfigured),
         ));
 
         // Fatal / normal states: never hold — either it would submit fine
@@ -1524,16 +1753,37 @@ mod submit_hold_tests {
         // must surface.
         assert!(!hold_submit_until_ready(
             false,
-            RuntimeUiAvailability::Available
+            RuntimeUiAvailability::Available,
+            None,
         ));
         assert!(!hold_submit_until_ready(
             false,
-            RuntimeUiAvailability::Failed
+            RuntimeUiAvailability::Failed,
+            None,
         ));
         assert!(!hold_submit_until_ready(
             false,
-            RuntimeUiAvailability::Stopped
+            RuntimeUiAvailability::Stopped,
+            None,
         ));
+    }
+
+    #[test]
+    fn startup_not_configured_event_does_not_pollute_scrollback() {
+        assert_eq!(
+            provider_unavailable_announcement(
+                atomcode_coding::ProviderUnavailableReason::NotConfigured
+            ),
+            None
+        );
+        assert!(provider_unavailable_announcement(
+            atomcode_coding::ProviderUnavailableReason::AuthenticationRequired
+        )
+        .is_some());
+        assert!(provider_unavailable_announcement(
+            atomcode_coding::ProviderUnavailableReason::UnsupportedBuild
+        )
+        .is_some());
     }
 
     #[test]
@@ -1548,11 +1798,12 @@ mod submit_hold_tests {
             RuntimeUiAvailability::Failed,
             RuntimeUiAvailability::Stopped,
         ] {
-            assert!(!hold_submit_until_ready(true, availability));
+            assert!(!hold_submit_until_ready(true, availability, None));
         }
         assert!(hold_submit_until_ready(
             true,
-            RuntimeUiAvailability::Reconfiguring
+            RuntimeUiAvailability::Reconfiguring,
+            None,
         ));
     }
 
@@ -1663,6 +1914,17 @@ enum ReadyRuntimeRequest {
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
+    RewindCatalog {
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    Rewind {
+        catalog: atomcode_coding::RewindCatalog,
+        turn_id: u64,
+        scope: atomcode_coding::RewindScope,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
     ContextStats {
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
@@ -1690,6 +1952,7 @@ enum ReadyRuntimeRequest {
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
     ReloadCapabilities {
+        plugin_skill_dirs: Vec<(PathBuf, String)>,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
@@ -1764,6 +2027,8 @@ impl ReadyRuntimeControl {
             ReadyRuntimeRequest::Dispatch(command) => self.handle.accepts(command),
             ReadyRuntimeRequest::Compact(_)
             | ReadyRuntimeRequest::Undo { .. }
+            | ReadyRuntimeRequest::RewindCatalog { .. }
+            | ReadyRuntimeRequest::Rewind { .. }
             | ReadyRuntimeRequest::ContextStats { .. }
             | ReadyRuntimeRequest::RestoreSnapshot { .. }
             | ReadyRuntimeRequest::ResumeSession { .. }
@@ -1829,6 +2094,34 @@ impl ReadyRuntimeControl {
                         &event_tx,
                         runtime_id,
                         CodingRuntimeEvent::UndoFinished(result),
+                    );
+                }
+                ReadyRuntimeRequest::RewindCatalog {
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.rewind_points().await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::RewindCatalogRefreshed(result),
+                    );
+                }
+                ReadyRuntimeRequest::Rewind {
+                    catalog,
+                    turn_id,
+                    scope,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self
+                        .handle
+                        .rewind_from_catalog(catalog, turn_id, scope)
+                        .await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::RewindFinished(result),
                     );
                 }
                 ReadyRuntimeRequest::ContextStats {
@@ -1911,10 +2204,14 @@ impl ReadyRuntimeControl {
                     });
                 }
                 ReadyRuntimeRequest::ReloadCapabilities {
+                    plugin_skill_dirs,
                     runtime_id,
                     event_tx,
                 } => {
-                    let result = self.handle.reload_capabilities().await;
+                    let result = self
+                        .handle
+                        .reload_capabilities_with_plugin_skills(Some(plugin_skill_dirs))
+                        .await;
                     let _ = event_tx.send(bg_runtime::RuntimeEvent {
                         runtime_id,
                         event: bg_runtime::RuntimeEventPayload::Driver(
@@ -1962,6 +2259,16 @@ impl DeferredRuntimeControl {
                 runtime_ui_availability(handle.status().phase)
             }
             atomcode_coding::DeferredRuntimeState::Failed(_) => RuntimeUiAvailability::Failed,
+        }
+    }
+
+    fn provider_unavailable_reason(&self) -> Option<atomcode_coding::ProviderUnavailableReason> {
+        match &*self.state.borrow() {
+            atomcode_coding::DeferredRuntimeState::Ready(handle) => {
+                handle.provider_unavailable_reason()
+            }
+            atomcode_coding::DeferredRuntimeState::Starting
+            | atomcode_coding::DeferredRuntimeState::Failed(_) => None,
         }
     }
 
@@ -2126,6 +2433,13 @@ impl RuntimeControl {
         }
     }
 
+    fn provider_unavailable_reason(&self) -> Option<atomcode_coding::ProviderUnavailableReason> {
+        match self {
+            Self::Ready(ready) => ready.handle.provider_unavailable_reason(),
+            Self::Deferred(deferred) => deferred.provider_unavailable_reason(),
+        }
+    }
+
     fn send_native_result(
         event_tx: &mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
         runtime_id: bg_runtime::RuntimeId,
@@ -2220,6 +2534,40 @@ impl RuntimeControl {
             Self::Deferred(deferred) if deferred.normal_operation_allowed() => {
                 deferred.send(atomcode_coding::DriverCommand::RefreshContextStats)
             }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn refresh_rewind_catalog(
+        &self,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::RewindCatalog {
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn rewind(
+        &self,
+        catalog: atomcode_coding::RewindCatalog,
+        turn_id: u64,
+        scope: atomcode_coding::RewindScope,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::Rewind {
+                catalog,
+                turn_id,
+                scope,
+                runtime_id,
+                event_tx,
+            }),
             Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
     }
@@ -2364,11 +2712,13 @@ impl RuntimeControl {
 
     pub fn reload_capabilities(
         &self,
+        plugin_skill_dirs: Vec<(PathBuf, String)>,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
         match self {
             Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ReloadCapabilities {
+                plugin_skill_dirs,
                 runtime_id,
                 event_tx,
             }),
@@ -2381,7 +2731,9 @@ impl RuntimeControl {
                     }
                 };
                 tokio::spawn(async move {
-                    let result = handle.reload_capabilities().await;
+                    let result = handle
+                        .reload_capabilities_with_plugin_skills(Some(plugin_skill_dirs))
+                        .await;
                     let _ = event_tx.send(bg_runtime::RuntimeEvent {
                         runtime_id,
                         event: bg_runtime::RuntimeEventPayload::Driver(
@@ -2790,6 +3142,18 @@ mod local_restore_scope_tests {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LanguageChangeNotice {
+    None,
+    LanguageCommand,
+}
+
+impl LanguageChangeNotice {
+    fn should_render(self, language_changed: bool) -> bool {
+        language_changed && self == Self::LanguageCommand
+    }
+}
+
 /// Bag of handles passed into the loop.
 pub(crate) struct PendingProviderReload {
     origin_generation: Option<atomcode_coding::RuntimeGeneration>,
@@ -2799,6 +3163,12 @@ pub(crate) struct PendingProviderReload {
     rollback_runtime_config: Option<Config>,
     previous_model_name: Option<String>,
     announce: Option<String>,
+    /// Render the language-switch confirmation when this reload completes.
+    ///
+    /// Language is persisted globally, so other TUI processes will observe the
+    /// same config revision and reload their prompt. Only the process that
+    /// handled the explicit `/language` action owns the success notice.
+    language_change_notice: LanguageChangeNotice,
     manual_reload_announce: bool,
     selection_mode_after_success: Option<crate::ProviderSelectionMode>,
 }
@@ -2982,7 +3352,8 @@ pub struct LoopCtx {
     /// without extra plumbing. Used by the slash-command palette to
     /// surface user-invocable skills, and by the dispatcher to expand
     /// `/skill_name [args]` into a SendMessage.
-    pub skill_registry: std::sync::Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+    pub skill_registry:
+        std::sync::Arc<std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
     /// Snapshot of the terminal's rendering capabilities. Probed once at
     /// startup in `lib.rs`; threaded into `App::new` so `UiState` knows
     /// whether to use Unicode or ASCII fallbacks for the spinner glyph
@@ -3022,6 +3393,11 @@ pub struct LoopCtx {
         std::path::PathBuf,
         Result<Vec<crate::session::SessionMeta>, String>,
     )>,
+    /// Runtime-owned Rewind points loaded after the double-Esc gesture. The
+    /// main loop installs the modal because this event handler does not own
+    /// `App::active_modal`.
+    pub(crate) pending_rewind_catalog:
+        Option<Result<atomcode_coding::RewindCatalog, atomcode_coding::RuntimeError>>,
     /// Fresh-session and directory transitions accepted by CodingRuntime but
     /// not yet committed. The input buffer remains authoritative while this is set.
     pub(crate) pending_session_transition: Option<PendingSessionTransition>,
@@ -3090,33 +3466,47 @@ pub struct TransientHint {
     pub deadline: std::time::Instant,
 }
 
-/// Memoised result of the most recent clipboard probe. The hash is a
-/// content fingerprint of the clipboard image's raw RGBA bytes (or
-/// `None` when the clipboard holds no image). Letting `build_status`
-/// compare this against `UiState::pending_image_hashes` is what powers
-/// the "hide hint after I already pasted THIS image, but show it again
-/// if the user copies a different one" UX.
+/// Memoised result of the most recent clipboard probe plus the one-shot
+/// notification window. The hash is a content fingerprint of the clipboard
+/// image's raw RGBA bytes (or `None` when it holds no image). A newly observed
+/// hash opens a short hint window; leaving the same image in the clipboard does
+/// not rearm it.
 #[derive(Debug, Default)]
 pub struct ClipboardCheckState {
     pub image_hash: Option<u64>,
     pub last_checked: Option<std::time::Instant>,
+    /// Hash currently eligible for the one-shot footer hint.
+    pub hint_hash: Option<u64>,
+    /// The hint remains visible only for this short window even when the
+    /// clipboard keeps holding the same image indefinitely.
+    pub hint_deadline: Option<std::time::Instant>,
+    /// Desired hint state most recently observed by the renderer or idle
+    /// poller. A change produces exactly one redraw request.
+    pub published_hint_hash: Option<u64>,
 }
 
-/// Cheap content fingerprint for clipboard images. Hashes width, height,
-/// total byte length, plus the first and last 1KB of RGBA bytes — enough
-/// to distinguish typical screenshots while keeping the per-poll cost
-/// O(2KB) regardless of image dimensions (a 4K screenshot's 32MB raw
-/// buffer would be too slow to hash in full at 1.5s polling cadence).
+/// Cheap content fingerprint for clipboard images. Hashes width, height, total
+/// byte length, and evenly distributed byte windows. Sampling throughout the
+/// image distinguishes same-sized screenshots whose top/bottom chrome matches,
+/// while keeping each poll O(2KB) even for a 4K image.
 fn rgba_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
+    const SAMPLE_COUNT: usize = 16;
+    const SAMPLE_BYTES: usize = 128;
+
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     width.hash(&mut hasher);
     height.hash(&mut hasher);
     bytes.len().hash(&mut hasher);
-    let head_end = bytes.len().min(1024);
-    bytes[..head_end].hash(&mut hasher);
-    let tail_start = bytes.len().saturating_sub(1024);
-    bytes[tail_start..].hash(&mut hasher);
+    if bytes.len() <= SAMPLE_COUNT * SAMPLE_BYTES {
+        bytes.hash(&mut hasher);
+    } else {
+        let max_start = bytes.len() - SAMPLE_BYTES;
+        for sample in 0..SAMPLE_COUNT {
+            let start = max_start * sample / (SAMPLE_COUNT - 1);
+            bytes[start..start + SAMPLE_BYTES].hash(&mut hasher);
+        }
+    }
     hasher.finish()
 }
 
@@ -4720,14 +5110,16 @@ mod menu_tests {
         );
     }
 
-    fn skill_fixture(name: &str, desc: &str, user_invocable: bool) -> atomcode_core::skill::Skill {
-        atomcode_core::skill::Skill {
+    fn skill_fixture(
+        name: &str,
+        desc: &str,
+        user_invocable: bool,
+    ) -> atomcode_capabilities::skills::Skill {
+        atomcode_capabilities::skills::Skill {
             name: name.to_string(),
             description: desc.to_string(),
             template: "do thing".to_string(),
-            disable_model_invocation: false,
             user_invocable,
-            argument_hint: None,
             allowed_tools: vec![],
             skill_dir: std::path::PathBuf::new(),
             source_path: std::path::PathBuf::new(),
@@ -4741,7 +5133,7 @@ mod menu_tests {
         // the `/skills` gateway so the top palette stays uncluttered.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
@@ -4775,7 +5167,7 @@ mod menu_tests {
         // as `/skills <name>`.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
@@ -4797,7 +5189,7 @@ mod menu_tests {
         // to web-access. /skills zz returns no menu at all.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
@@ -4821,7 +5213,7 @@ mod menu_tests {
         // menu should disappear so arrow keys don't navigate stale entries.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
 
@@ -4842,7 +5234,7 @@ mod menu_tests {
         // either — they're LLM-only via the use_skill tool.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:visible", "shown", true));
         skills.register(skill_fixture("skills:hidden", "hidden", false));
         let lock = std::sync::RwLock::new(skills);
@@ -4853,6 +5245,39 @@ mod menu_tests {
         assert!(
             !items.iter().any(|(n, _)| n == "hidden"),
             "user_invocable=false skill leaked into sub-menu"
+        );
+    }
+
+    #[test]
+    fn skills_sub_mode_multi_fragment_filters_then_closes_on_complete_skill() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
+        skills.register(skill_fixture("skills:atomcode-smoke-test", "smoke", true));
+        skills.register(skill_fixture("skills:delegating-to-atomcode", "delegate", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        // `/skills atom smoke` keeps the menu OPEN and narrows to the one skill
+        // matching both fragments — the reported bug (a space used to kill it).
+        let items = build_menu_items("/skills atom smoke", 0, &reg, &custom, Some(&lock), None)
+            .expect("multi-fragment filter must keep the menu open");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, "atomcode-smoke-test");
+
+        // Once the first token is a COMPLETE skill followed by a space, the user
+        // is typing task args — close the menu so Enter submits (and the accepted
+        // `/skills <full-name> ` rewrite lands here after selection).
+        assert!(
+            build_menu_items(
+                "/skills atomcode-smoke-test ",
+                0,
+                &reg,
+                &custom,
+                Some(&lock),
+                None
+            )
+            .is_none(),
+            "a complete skill + space must close the menu so Enter submits"
         );
     }
 
@@ -4899,7 +5324,8 @@ mod menu_tests {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
         let with_none = build_menu_items("/", 0, &reg, &custom, None, None).unwrap();
-        let empty_skills = std::sync::RwLock::new(atomcode_core::skill::SkillRegistry::new());
+        let empty_skills =
+            std::sync::RwLock::new(atomcode_capabilities::skills::SkillRegistry::new());
         let with_empty =
             build_menu_items("/", 0, &reg, &custom, Some(&empty_skills), None).unwrap();
         assert_eq!(
@@ -4911,7 +5337,7 @@ mod menu_tests {
 
     #[test]
     fn build_skill_menu_items_lists_unique_bare_names() {
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
         skills.register(skill_fixture("skills:hidden", "no", false));
@@ -4931,10 +5357,32 @@ mod menu_tests {
     }
 
     #[test]
+    fn build_skill_menu_items_multi_fragment_and_filter() {
+        // Multiple space-separated fragments must ALL match (AND), so a long
+        // hyphenated name is reachable by typing loose fragments of it.
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
+        skills.register(skill_fixture("skills:atomcode-smoke-test", "smoke", true));
+        skills.register(skill_fixture("skills:delegating-to-atomcode", "delegate", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        // Single fragment `atomcode` matches BOTH (substring), like the menu today.
+        assert_eq!(build_skill_menu_items(Some(&lock), "atomcode").len(), 2);
+
+        // `atom smoke` (two fragments) narrows to just the smoke-test skill —
+        // it contains both "atom" and "smoke"; delegating-to-atomcode does not.
+        let narrowed = build_skill_menu_items(Some(&lock), "atom smoke");
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].0, "atomcode-smoke-test");
+
+        // A fragment matched by neither name yields nothing.
+        assert!(build_skill_menu_items(Some(&lock), "atom nope").is_empty());
+    }
+
+    #[test]
     fn dollar_trigger_lists_all_user_invocable_skills() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
         skills.register(skill_fixture("skills:hidden", "no", false));
@@ -4954,7 +5402,7 @@ mod menu_tests {
     fn dollar_trigger_filters_and_parity_with_skills_submode() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
@@ -4975,7 +5423,7 @@ mod menu_tests {
     fn dollar_trigger_only_at_start_and_closes_on_space() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
 
@@ -5267,7 +5715,7 @@ mod menu_tests {
     fn cache_write_image_writes_and_is_idempotent() {
         use base64::Engine;
         let dir = tempfile::tempdir().unwrap();
-        let img = atomcode_core::conversation::message::ImagePart {
+        let img = atomcode_kernel::message::ImageContent {
             media_type: "image/png".into(),
             data: base64::engine::general_purpose::STANDARD.encode(b"hello"),
         };
@@ -5344,7 +5792,7 @@ mod menu_tests {
 
         // ── Turn 1: paste image, submit ────────────────────────────────
         let raw_bytes = b"\x89PNG\r\n\x1a\nfake".to_vec();
-        let img = atomcode_core::conversation::message::ImagePart {
+        let img = atomcode_kernel::message::ImageContent {
             media_type: "image/png".into(),
             data: base64::engine::general_purpose::STANDARD.encode(&raw_bytes),
         };
@@ -5448,8 +5896,8 @@ mod menu_tests {
             source: PathBuf::from("x"),
             namespace: None,
         });
-        let items = build_menu_items("/myr", 0, &reg, &custom, None, None)
-            .expect("should find myreview");
+        let items =
+            build_menu_items("/myr", 0, &reg, &custom, None, None).expect("should find myreview");
         let name = &items[0].0;
         // Assert the contract directly: Required custom command must resolve
         // to ArgsRequirement::Required (which implies needs_args = true).
@@ -5471,8 +5919,8 @@ mod menu_tests {
             source: PathBuf::from("x"),
             namespace: None,
         });
-        let items = build_menu_items("/myr", 0, &reg, &custom, None, None)
-            .expect("should find myreview");
+        let items =
+            build_menu_items("/myr", 0, &reg, &custom, None, None).expect("should find myreview");
         let name = &items[0].0;
         // Assert the contract directly: Optional custom command must resolve
         // to ArgsRequirement::Optional (which implies needs_args = true).
@@ -5494,8 +5942,8 @@ mod menu_tests {
             source: PathBuf::from("x"),
             namespace: None,
         });
-        let items = build_menu_items("/myr", 0, &reg, &custom, None, None)
-            .expect("should find myreview");
+        let items =
+            build_menu_items("/myr", 0, &reg, &custom, None, None).expect("should find myreview");
         let name = &items[0].0;
         // Assert the contract directly: None custom command must resolve
         // to ArgsRequirement::None (which implies needs_args = false).
@@ -6125,8 +6573,9 @@ mod tool_format_tests {
 
     #[test]
     fn summarise_read_result_collapses_line_number_and_indent() {
-        // read_file emits `{n:>6}\t{indented source line}`; the preview should
-        // show `{n}  {trimmed content}` with no big left gap.
+        // read_file emits `{n}\t{indented source line}` (legacy transcripts may
+        // carry a padded `{n:>6}\t`, which the parser's `trim` still handles);
+        // the preview should show `{n}  {trimmed content}` with no big left gap.
         let out = "   873\t                    images: core_images,\n   874\t    other: 1,";
         assert_eq!(
             summarise_read_result(out),
@@ -6432,6 +6881,9 @@ pub struct App {
     /// was deliberately held while the provider was starting/reconfiguring.
     /// Diagnostic events never arm this latch.
     queue_drain_authorized: bool,
+    /// Esc with pending steers cancels the active turn, then replays those
+    /// messages only after the runtime-owned turn terminal proves Submit is safe.
+    interrupt_drain_pending: bool,
     /// Streaming-state `<think>…</think>` stripper. Kept on App (not
     /// a local in the streaming arm) because it carries state across
     /// agent events — a tag straddling two chunks would break if the
@@ -6565,6 +7017,7 @@ impl App {
             active_modal: None,
             message_queue: VecDeque::new(),
             queue_drain_authorized: false,
+            interrupt_drain_pending: false,
             think: ThinkStripper::new(),
             pending_tools: std::collections::HashMap::new(),
             exit_pending: None,
@@ -6902,7 +7355,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // loop below isn't blocked, and the warning — when it arrives a
     // second or two later — wakes the loop via `wake_tx` so the status
     // row repaints without the user needing to press a key.
-    if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+    if monitor::is_codingplan_provider(&resolved_provider_and_model(&ctx.config).0) {
         let cooled = ctx
             .monitor_last_check_at
             .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
@@ -7061,7 +7514,17 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     && retry_pending_provider_projection(&mut ctx, &mut app.state, renderer);
                 let config_changed = idle_boundary && poll_external_config(&mut ctx);
                 let auth_changed = poll_external_auth(&mut ctx);
-                if idle_boundary && (projection_changed || config_changed || auth_changed) {
+                let clipboard_hint_changed = idle_boundary
+                    && clipboard_image_hint_changed(
+                        &ctx.clipboard_check,
+                        &app.state.pending_image_hashes,
+                    );
+                if idle_boundary
+                    && (projection_changed
+                        || config_changed
+                        || auth_changed
+                        || clipboard_hint_changed)
+                {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
             }
@@ -7242,7 +7705,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let provider_reload_failed =
                         is_provider_reload_failure(&runtime_event.event);
-                    let queue_action = type_ahead_queue_action(&runtime_event.event);
+                    let base_queue_action = type_ahead_queue_action(&runtime_event.event);
+                    let interrupt_was_armed = app.interrupt_drain_pending;
+                    let (queue_action, interrupt_armed) = interrupt_queue_action(
+                        &runtime_event.event,
+                        base_queue_action,
+                        interrupt_was_armed,
+                    );
+                    app.interrupt_drain_pending = interrupt_armed;
                     let loop_action = fixed_interval_loop_action(&runtime_event.event);
                     if let Err(error) = publish_live_runtime_event(&ctx, &runtime_event.event) {
                         renderer.render(UiLine::Error(error));
@@ -7251,6 +7721,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     let pre_phase = app.state.phase;
                     apply_fixed_interval_loop_action(loop_action, &mut app.state, &mut ctx);
                     handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    hold_interrupt_wait_phase(&mut app.state, app.interrupt_drain_pending);
+                    if interrupt_was_armed
+                        && matches!(queue_action, TypeAheadQueueAction::Clear)
+                        && !app.message_queue.is_empty()
+                    {
+                        renderer.render(UiLine::Warning(
+                            crate::i18n::t(crate::i18n::Msg::PendingMessagesNotSent {
+                                count: app.message_queue.len(),
+                            })
+                            .into_owned(),
+                        ));
+                        renderer.flush();
+                    }
                     apply_type_ahead_queue_action(
                         queue_action,
                         &mut app.message_queue,
@@ -7398,7 +7881,17 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     && retry_pending_provider_projection(&mut ctx, &mut app.state, renderer);
                 let config_changed = idle_boundary && poll_external_config(&mut ctx);
                 let auth_changed = poll_external_auth(&mut ctx);
-                if idle_boundary && (projection_changed || config_changed || auth_changed) {
+                let clipboard_hint_changed = idle_boundary
+                    && clipboard_image_hint_changed(
+                        &ctx.clipboard_check,
+                        &app.state.pending_image_hashes,
+                    );
+                if idle_boundary
+                    && (projection_changed
+                        || config_changed
+                        || auth_changed
+                        || clipboard_hint_changed)
+                {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
             }
@@ -7604,7 +8097,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let provider_reload_failed =
                         is_provider_reload_failure(&runtime_event.event);
-                    let queue_action = type_ahead_queue_action(&runtime_event.event);
+                    let base_queue_action = type_ahead_queue_action(&runtime_event.event);
+                    let interrupt_was_armed = app.interrupt_drain_pending;
+                    let (queue_action, interrupt_armed) = interrupt_queue_action(
+                        &runtime_event.event,
+                        base_queue_action,
+                        interrupt_was_armed,
+                    );
+                    app.interrupt_drain_pending = interrupt_armed;
                     let loop_action = fixed_interval_loop_action(&runtime_event.event);
                     if let Err(error) = publish_live_runtime_event(&ctx, &runtime_event.event) {
                         renderer.render(UiLine::Error(error));
@@ -7613,6 +8113,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     let pre_phase = app.state.phase;
                     apply_fixed_interval_loop_action(loop_action, &mut app.state, &mut ctx);
                     handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    hold_interrupt_wait_phase(&mut app.state, app.interrupt_drain_pending);
+                    if interrupt_was_armed
+                        && matches!(queue_action, TypeAheadQueueAction::Clear)
+                        && !app.message_queue.is_empty()
+                    {
+                        renderer.render(UiLine::Warning(
+                            crate::i18n::t(crate::i18n::Msg::PendingMessagesNotSent {
+                                count: app.message_queue.len(),
+                            })
+                            .into_owned(),
+                        ));
+                        renderer.flush();
+                    }
                     apply_type_ahead_queue_action(
                         queue_action,
                         &mut app.message_queue,
@@ -7678,6 +8191,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
         drain_foreground_replay_events(&mut app, &mut ctx, renderer);
         install_pending_session_picker(&mut app, &mut ctx, renderer);
+        install_pending_rewind_modal(&mut app, &mut ctx, renderer);
 
         // ── Fixed-interval /loop decision (turn-completion driven) ──
         // Runs after EVERY select! wakeup, so it sees both edges that matter:
@@ -7747,21 +8261,27 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 }
 
 fn resolved_provider_fingerprint(config: &Config) -> Option<Vec<u8>> {
-    let requested = config.default_provider.as_str();
-    let name = if config.providers.contains_key(requested) {
-        requested
-    } else {
-        config.providers.keys().min()?.as_str()
-    };
-    serde_json::to_vec(&(name, config.providers.get(name)?)).ok()
+    // Fingerprint the ACTIVE resolved selection (new-schema or legacy), falling
+    // back to the first catalog model — so a new-schema default isn't missed
+    // (its id no longer lives in `config.providers`).
+    let name = config
+        .effective_model_selection()
+        .filter(|n| config.selection_exists(n))
+        .or_else(|| {
+            let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+            ids.sort();
+            ids.into_iter().next()
+        })?;
+    let pc = config.provider_config_for_selection(&name)?;
+    serde_json::to_vec(&(name, pc)).ok()
 }
 
 fn provider_requires_atomgit_auth(config: &Config) -> bool {
     config
         .active_provider(None)
         .ok()
-        .and_then(|provider| provider.base_url.as_deref())
-        .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway)
+        .and_then(|provider| provider.base_url)
+        .is_some_and(|url| atomcode_auth::gateway_crypto::is_atomgit_gateway(&url))
 }
 
 fn should_reload_provider(
@@ -7804,7 +8324,9 @@ fn should_deactivate_for_missing_auth(
 /// explicit `/reload`) its on-disk edits (`context_window`, model, …) are
 /// adopted so the settings of the model you're using actually take effect;
 /// the runtime copy is used only when disk lacks that provider entirely.
-/// `default_provider` is always pinned to the running selection.
+/// Both selection fields are pinned to the running selection:
+/// `default_provider` for legacy configs and `default_model` for the canonical
+/// account/model schema.
 fn merge_persisted_config_preserving_active(
     current: &Config,
     mut persisted: Config,
@@ -7820,6 +8342,31 @@ fn merge_persisted_config_preserving_active(
         }
     }
     persisted.default_provider = active_name;
+    if let Some(active_model) = current.default_model.as_ref() {
+        if let Some(profile) = current.models.get(active_model) {
+            let keep_runtime_profile =
+                !adopt_active_edits || !persisted.models.contains_key(active_model);
+            if keep_runtime_profile {
+                persisted
+                    .models
+                    .insert(active_model.clone(), profile.clone());
+            }
+
+            if let Some(account) = current.provider_accounts.get(&profile.account) {
+                let keep_runtime_account = !adopt_active_edits
+                    || !persisted.provider_accounts.contains_key(&profile.account);
+                if keep_runtime_account {
+                    persisted
+                        .provider_accounts
+                        .insert(profile.account.clone(), account.clone());
+                }
+            }
+        }
+    }
+    // `default_model` takes precedence over `default_provider`; assigning even
+    // `None` is required when a legacy pinned window observes another process
+    // switching the shared default to a new-schema model.
+    persisted.default_model = current.default_model.clone();
     persisted
 }
 
@@ -7849,6 +8396,27 @@ fn config_for_persistence(
                 .or_insert_with(|| provider.clone());
         }
         saved.default_provider = persisted.default_provider.clone();
+        if let Some(selection) = persisted.default_model.as_ref() {
+            if let Some(provider) = persisted.providers.get(selection) {
+                saved
+                    .providers
+                    .entry(selection.clone())
+                    .or_insert_with(|| provider.clone());
+            }
+            if let Some(profile) = persisted.models.get(selection) {
+                saved
+                    .models
+                    .entry(selection.clone())
+                    .or_insert_with(|| profile.clone());
+                if let Some(account) = persisted.provider_accounts.get(&profile.account) {
+                    saved
+                        .provider_accounts
+                        .entry(profile.account.clone())
+                        .or_insert_with(|| account.clone());
+                }
+            }
+        }
+        saved.default_model = persisted.default_model.clone();
     }
     saved
 }
@@ -7874,6 +8442,22 @@ fn commit_desired_config(
             Ok(())
         })?
         .ok_or_else(|| anyhow::anyhow!("config changed in another process; retry"))?;
+    Ok(DesiredConfigCommit {
+        commit,
+        previous: previous.expect("successful ConfigStore update observed the previous snapshot"),
+    })
+}
+
+fn commit_proxy_config(
+    store: &ConfigStore,
+    proxy: &atomcode_config::proxy::ProxyConfig,
+) -> Result<DesiredConfigCommit, anyhow::Error> {
+    let mut previous = None;
+    let commit = store.update(|persisted| {
+        previous = Some(persisted.clone());
+        persisted.network.proxy = proxy.clone();
+        Ok(())
+    })?;
     Ok(DesiredConfigCommit {
         commit,
         previous: previous.expect("successful ConfigStore update observed the previous snapshot"),
@@ -7930,6 +8514,7 @@ mod external_config_tests {
                 skip_tls_verify: false,
                 ephemeral,
                 capable_model: None,
+                pricing: None,
             },
         );
         config
@@ -7937,6 +8522,31 @@ mod external_config_tests {
 
     fn atomgit_config(model: &str) -> Config {
         config_with_url(model, false, "https://llm-api.atomgit.com/v1")
+    }
+
+    fn new_schema_config(default_model: &str) -> Config {
+        serde_json::from_value(serde_json::json!({
+            "default_model": default_model,
+            "provider_accounts": {
+                "account": {
+                    "provider": "openai",
+                    "base_url": "https://example.test/v1"
+                }
+            },
+            "models": {
+                "account/old": {
+                    "account": "account",
+                    "model": "old-wire",
+                    "context_window": 128000
+                },
+                "account/new": {
+                    "account": "account",
+                    "model": "new-wire",
+                    "context_window": 200000
+                }
+            }
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -7978,6 +8588,13 @@ mod external_config_tests {
     }
 
     #[test]
+    fn language_change_notice_is_owned_by_the_explicit_command() {
+        assert!(!LanguageChangeNotice::None.should_render(true));
+        assert!(LanguageChangeNotice::LanguageCommand.should_render(true));
+        assert!(!LanguageChangeNotice::LanguageCommand.should_render(false));
+    }
+
+    #[test]
     fn active_ephemeral_provider_is_not_replaced_from_disk() {
         assert!(!should_reload_provider(
             crate::ProviderSelectionMode::FollowGlobalDefault,
@@ -8007,6 +8624,48 @@ mod external_config_tests {
     }
 
     #[test]
+    fn pinned_new_schema_selection_ignores_an_external_default_change() {
+        let current = new_schema_config("account/old");
+        let persisted = new_schema_config("account/new");
+
+        let merged = merge_persisted_config_preserving_active(&current, persisted, false);
+
+        assert_eq!(merged.default_model.as_deref(), Some("account/old"));
+        let resolved = merged.resolve_model(None).unwrap();
+        assert_eq!(resolved.selection_id, "account/old");
+        assert_eq!(resolved.model, "old-wire");
+        assert_eq!(resolved.context_window, 128_000);
+    }
+
+    #[test]
+    fn pinned_legacy_selection_clears_an_external_new_schema_default() {
+        let current = config("legacy-wire", false);
+        let persisted = new_schema_config("account/new");
+
+        let merged = merge_persisted_config_preserving_active(&current, persisted, false);
+
+        assert_eq!(merged.default_model, None);
+        let resolved = merged.resolve_model(None).unwrap();
+        assert_eq!(resolved.selection_id, "main");
+        assert_eq!(resolved.model, "legacy-wire");
+    }
+
+    #[test]
+    fn manual_reload_updates_the_pinned_new_schema_model_without_switching_it() {
+        let current = new_schema_config("account/old");
+        let mut persisted = new_schema_config("account/new");
+        persisted.models.get_mut("account/old").unwrap().context_window = 64_000;
+
+        let merged = merge_persisted_config_preserving_active(&current, persisted, true);
+
+        assert_eq!(merged.default_model.as_deref(), Some("account/old"));
+        let resolved = merged.resolve_model(None).unwrap();
+        assert_eq!(resolved.selection_id, "account/old");
+        assert_eq!(resolved.model, "old-wire");
+        assert_eq!(resolved.context_window, 64_000);
+    }
+
+    #[test]
     fn manual_reload_adopts_active_provider_window_edit_but_keeps_selection() {
         // The reported bug: editing the ACTIVE provider's `context_window` in
         // config.toml + /reload was silently ignored. With `adopt_active_edits`
@@ -8020,7 +8679,7 @@ mod external_config_tests {
 
         assert_eq!(merged.default_provider, "main"); // selection preserved
         assert_eq!(merged.providers["main"].context_window, 32_000); // edit applied
-        // And the change is detected, so the runtime is actually reconfigured.
+                                                                     // And the change is detected, so the runtime is actually reconfigured.
         assert!(active_provider_config_changed(&current, &merged));
     }
 
@@ -8074,8 +8733,111 @@ mod external_config_tests {
     }
 
     #[test]
+    fn stale_window_write_does_not_restore_its_new_schema_model_as_default() {
+        let persisted = new_schema_config("account/new");
+        let mut desired = new_schema_config("account/old");
+        desired.models.remove("account/new");
+        desired.models.get_mut("account/old").unwrap().context_window = 64_000;
+        desired.language = Some(atomcode_config::locale::Locale::ZhCn);
+
+        let saved = config_for_persistence(&desired, &persisted, false);
+
+        assert_eq!(saved.default_model.as_deref(), Some("account/new"));
+        let resolved = saved.resolve_model(None).unwrap();
+        assert_eq!(resolved.selection_id, "account/new");
+        assert_eq!(resolved.model, "new-wire");
+        assert_eq!(saved.models["account/old"].context_window, 64_000);
+        assert_eq!(saved.language, Some(atomcode_config::locale::Locale::ZhCn));
+    }
+
+    #[test]
     fn config_save_without_an_observed_revision_fails_closed() {
         assert!(observed_revision_for_write(None).is_err());
+    }
+
+    #[test]
+    fn proxy_commit_creates_first_config_without_an_observed_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        let proxy = atomcode_config::proxy::ProxyConfig {
+            mode: atomcode_config::proxy::ProxyMode::DefaultProxy,
+            https: Some("http://proxy.example:8080".into()),
+            ..Default::default()
+        };
+
+        let committed = commit_proxy_config(&store, &proxy).unwrap();
+
+        assert_eq!(committed.commit.snapshot.config.network.proxy, proxy);
+        assert_eq!(store.read().unwrap().config.network.proxy, proxy);
+    }
+
+    #[test]
+    fn proxy_commit_preserves_a_concurrent_provider_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        store.replace(&config("initial-model", false)).unwrap();
+        store
+            .update(|persisted| {
+                persisted.providers.get_mut("main").unwrap().model = "external-model".into();
+                Ok(())
+            })
+            .unwrap();
+        let proxy = atomcode_config::proxy::ProxyConfig {
+            mode: atomcode_config::proxy::ProxyMode::NoProxy,
+            ..Default::default()
+        };
+
+        commit_proxy_config(&store, &proxy).unwrap();
+
+        let persisted = store.read().unwrap().config;
+        assert_eq!(persisted.providers["main"].model, "external-model");
+        assert_eq!(persisted.network.proxy, proxy);
+    }
+
+    #[test]
+    fn proxy_runtime_config_keeps_a_pinned_provider_selection() {
+        let current = config("pinned-model", false);
+        let mut persisted = config("global-model", false);
+        let global = persisted.providers.remove("main").unwrap();
+        persisted.providers.insert("global".into(), global);
+        persisted.default_provider = "global".into();
+        persisted.network.proxy.mode = atomcode_config::proxy::ProxyMode::NoProxy;
+
+        let desired = desired_config_from_snapshot_parts(
+            &current,
+            crate::ProviderSelectionMode::Pinned,
+            persisted,
+            false,
+        );
+
+        assert_eq!(desired.default_provider, "main");
+        assert_eq!(desired.providers["main"].model, "pinned-model");
+        assert_eq!(
+            desired.network.proxy.mode,
+            atomcode_config::proxy::ProxyMode::NoProxy
+        );
+    }
+
+    #[test]
+    fn proxy_runtime_config_retains_an_ephemeral_provider_missing_from_disk() {
+        let current = config("oauth-model", true);
+        let mut persisted = Config::default();
+        persisted.network.proxy.mode = atomcode_config::proxy::ProxyMode::DefaultProxy;
+
+        let desired = desired_config_from_snapshot_parts(
+            &current,
+            crate::ProviderSelectionMode::FollowGlobalDefault,
+            persisted,
+            false,
+        );
+
+        assert_eq!(desired.default_provider, "main");
+        assert!(desired.providers["main"].ephemeral);
+        assert_eq!(desired.providers["main"].model, "oauth-model");
+        assert_eq!(
+            desired.network.proxy.mode,
+            atomcode_config::proxy::ProxyMode::DefaultProxy
+        );
     }
 
     #[test]
@@ -8147,7 +8909,8 @@ mod external_config_tests {
         );
         next_default.default_provider = "next".into();
 
-        let visible = merge_persisted_config_preserving_active(&opened, next_default.clone(), false);
+        let visible =
+            merge_persisted_config_preserving_active(&opened, next_default.clone(), false);
 
         assert_eq!(visible.default_provider, "main");
         assert_eq!(visible.providers["main"].model, "opened-model");
@@ -8292,6 +9055,25 @@ mod external_config_tests {
 
         assert!(!config_commits_provider(&current, "main"));
         assert!(config_commits_provider(&current, "new-default"));
+    }
+
+    #[test]
+    fn new_schema_selection_projects_and_follows_default() {
+        // Regression for the reload-completion §14.1 gap: a new-schema model id
+        // must resolve through select_committed_provider (not be rejected, which
+        // would leave the footer/model name stale), and be seen as following its
+        // persisted default.
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "acc/coder",
+            "provider_accounts": { "acc": { "provider": "deepseek", "api_key": "sk" } },
+            "models": { "acc/coder": { "account": "acc", "model": "deepseek-coder", "context_window": 131072 } }
+        }))
+        .unwrap();
+        let (out, model) =
+            select_committed_provider(cfg, "acc/coder", None).expect("new-schema id resolves");
+        assert_eq!(model, "deepseek-coder");
+        assert_eq!(out.default_model.as_deref(), Some("acc/coder"));
+        assert!(config_commits_provider(&out, "acc/coder"));
     }
 
     #[test]
@@ -8499,7 +9281,10 @@ fn provider_projection_is_current(
 }
 
 fn config_commits_provider(config: &Config, provider: &str) -> bool {
-    config.default_provider == provider
+    // Compare the RESOLVED active selection (§14.1) rather than raw
+    // `default_provider`, so a new-schema config (selecting via `default_model`)
+    // is correctly seen as "following its persisted default" instead of pinned.
+    resolved_provider_and_model(config).0 == provider
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8510,17 +9295,24 @@ pub(crate) enum PersistedConfigReload {
 }
 
 fn resolved_provider_and_model(config: &Config) -> (String, String) {
-    let provider = if config.providers.contains_key(&config.default_provider) {
-        config.default_provider.clone()
-    } else {
-        config.providers.keys().min().cloned().unwrap_or_default()
-    };
-    let model = config
-        .providers
-        .get(&provider)
-        .map(|provider| provider.model.clone())
-        .unwrap_or_else(|| provider.clone());
-    (provider, model)
+    // Route through the single resolution boundary (§14.1) so the reload
+    // completion projects the ACTIVE selection for both schemas (returns the
+    // selection id + wire model). Falls back to the first catalog model when
+    // nothing resolves — parity with the old `providers.keys().min()`. For a
+    // legacy config this equals the previous `default_provider` + its model.
+    if let Ok(r) = config.resolve_model(None) {
+        return (r.selection_id, r.model);
+    }
+    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+    ids.sort();
+    ids.into_iter()
+        .find_map(|id| {
+            config
+                .resolve_model(Some(&id))
+                .ok()
+                .map(|r| (r.selection_id, r.model))
+        })
+        .unwrap_or_default()
 }
 
 fn select_committed_provider(
@@ -8528,28 +9320,37 @@ fn select_committed_provider(
     provider: &str,
     expected_model: Option<&str>,
 ) -> Option<(Config, String)> {
-    let model = config.providers.get(provider)?.model.clone();
+    // `provider` is a selection id — a legacy provider name OR a new-schema
+    // model id. Resolve through the single boundary (§14.1) so a new-schema
+    // selection projects instead of being rejected (which would leave the
+    // footer/model name stale after the switch).
+    let model = config.resolve_model(Some(provider)).ok()?.model;
     if expected_model.is_some_and(|expected| expected != model) {
         return None;
     }
-    config.default_provider = provider.to_string();
+    // Point the canonical `default_model` at this selection; keep the legacy
+    // `default_provider` in sync when it is a legacy provider.
+    config.default_model = Some(provider.to_string());
+    if config.providers.contains_key(provider) {
+        config.default_provider = provider.to_string();
+    }
     Some((config, model))
 }
 
 /// `manual_reload` is set for an explicit `/reload` (vs a background external
 /// config poll): only then does a pinned session adopt on-disk edits to its
 /// active provider (see `merge_persisted_config_preserving_active`).
-fn desired_config_from_snapshot(
-    ctx: &LoopCtx,
+fn desired_config_from_snapshot_parts(
+    current: &Config,
+    selection_mode: crate::ProviderSelectionMode,
     mut persisted: Config,
     manual_reload: bool,
 ) -> Config {
-    let active_is_ephemeral = ctx
-        .config
+    let active_is_ephemeral = current
         .providers
-        .get(&ctx.config.default_provider)
+        .get(&current.default_provider)
         .is_some_and(|provider| provider.ephemeral);
-    for (name, provider) in &ctx.config.providers {
+    for (name, provider) in &current.providers {
         if provider.ephemeral {
             persisted
                 .providers
@@ -8557,11 +9358,20 @@ fn desired_config_from_snapshot(
                 .or_insert_with(|| provider.clone());
         }
     }
-    if ctx.provider_selection_mode == crate::ProviderSelectionMode::Pinned || active_is_ephemeral {
-        merge_persisted_config_preserving_active(&ctx.config, persisted, manual_reload)
+    if selection_mode == crate::ProviderSelectionMode::Pinned || active_is_ephemeral {
+        merge_persisted_config_preserving_active(current, persisted, manual_reload)
     } else {
         persisted
     }
+}
+
+fn desired_config_from_snapshot(ctx: &LoopCtx, persisted: Config, manual_reload: bool) -> Config {
+    desired_config_from_snapshot_parts(
+        &ctx.config,
+        ctx.provider_selection_mode,
+        persisted,
+        manual_reload,
+    )
 }
 
 fn reconcile_persisted_config(
@@ -8583,7 +9393,8 @@ fn reconcile_persisted_config(
         &desired,
         ctx.runtime.ui_availability(),
         auth_available,
-    ) || (manual_reload_announce && active_provider_config_changed(&ctx.config, &desired));
+    ) || (manual_reload_announce
+        && active_provider_config_changed(&ctx.config, &desired));
 
     if !wants_reload {
         let (provider, model) = resolved_provider_and_model(&desired);
@@ -8622,6 +9433,7 @@ fn reconcile_persisted_config(
         rollback_runtime_config: None,
         previous_model_name: None,
         announce: None,
+        language_change_notice: LanguageChangeNotice::None,
         manual_reload_announce,
         selection_mode_after_success: None,
     });
@@ -8737,6 +9549,7 @@ fn poll_external_auth(ctx: &mut LoopCtx) -> bool {
                     rollback_runtime_config: None,
                     previous_model_name: None,
                     announce: None,
+                    language_change_notice: LanguageChangeNotice::None,
                     manual_reload_announce: false,
                     selection_mode_after_success: None,
                 });
@@ -8836,18 +9649,13 @@ fn attach_image_to_input(
     app: &mut App,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
-    img_hash: Option<(ImagePart, u64)>,
+    img_hash: Option<(ImageContent, u64)>,
 ) -> Result<bool> {
     let Some((img, hash)) = img_hash else {
         return Ok(false);
     };
-    if !ctx.config.can_handle_attached_images() {
-        renderer.render(UiLine::Error(
-            crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport {
-                model: &ctx.model_name,
-            })
-            .into_owned(),
-        ));
+    if let Some(reject) = image_attach_reject_line(&ctx.config, &ctx.model_name) {
+        renderer.render(UiLine::Error(reject));
         renderer.flush();
         if matches!(app.state.phase, UiPhase::Idle) {
             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -8901,7 +9709,7 @@ fn attach_typed_image_paths(
     app: &mut App,
     ctx: &mut LoopCtx,
     text: &mut String,
-    images: &mut Vec<ImagePart>,
+    images: &mut Vec<ImageContent>,
     kept_markers: &mut Vec<usize>,
 ) {
     if !ctx.config.can_handle_attached_images() {
@@ -9134,6 +9942,16 @@ fn handle_input(
                     return Ok(());
                 }
             }
+            // A model-initiated `request_user_input` prompt replaces the input
+            // box with a footer panel (phase == UserInput). Its keys route to
+            // `handle_user_input_key`, but a bracketed paste arrives as a single
+            // Paste event — without this branch it fell through every arm and
+            // was silently dropped, so the user could only type answers.
+            if matches!(app.state.phase, UiPhase::UserInput) {
+                app.state.insert_user_input_paste(&text);
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
             // No modal: paste goes into the type-ahead buffer just like
             // keyboard input (Idle or Streaming, both consume it).
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming) {
@@ -9153,7 +9971,7 @@ fn handle_input(
                 //     string land in their input buffer — Cmd+V on iTerm2
                 //     felt broken vs. Claude Code / Aider, which all do
                 //     this same path-recognition.
-                let image_paste: Option<(ImagePart, u64)> = if text.trim().is_empty() {
+                let image_paste: Option<(ImageContent, u64)> = if text.trim().is_empty() {
                     try_paste_clipboard_image()
                 } else {
                     try_attach_image_from_path(&text)
@@ -9200,6 +10018,44 @@ fn handle_input(
             modifiers,
             ..
         }) => {
+            // A raw Ctrl+V reaches us as a key event rather than bracketed
+            // paste on several terminals. While a modal owns input, treat it as
+            // text paste before modal key handling; otherwise forms receive a
+            // literal `v` and URLs/API keys appear impossible to paste.
+            //
+            // Ctrl+Shift+V remains untouched for terminals that translate it
+            // into bracketed paste. Image attachment is intentionally skipped
+            // while a modal is open because provider/password fields are text.
+            if app.active_modal.is_some() && is_paste_image_chord(code, modifiers) {
+                if let Some(text) = try_paste_clipboard_text() {
+                    let streaming = matches!(app.state.phase, UiPhase::Streaming);
+                    if let Some(modal) = app.active_modal.as_mut() {
+                        let action = modal.handle_paste(
+                            &text,
+                            &mut app.buf,
+                            &mut app.state,
+                            ctx,
+                            renderer,
+                        )?;
+                        if matches!(action, ModalAction::Close) {
+                            app.active_modal = None;
+                            if streaming {
+                                draw_spinner_now(
+                                    &mut app.state,
+                                    &app.buf,
+                                    ctx,
+                                    renderer,
+                                    app.message_queue.len(),
+                                    app.menu.selected,
+                                );
+                            } else {
+                                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
             // A capturing modal (the password prompt) installs mid-turn while a
             // tool runs (phase == Streaming). It must receive EVERY key
             // regardless of phase — otherwise typed chars leak into the
@@ -9299,13 +10155,13 @@ fn handle_input(
                             crate::event_loop::commands::run_login_flow(renderer, ctx)?;
                         }
                         if std::mem::take(&mut ctx.pending_open_provider_wizard) {
-                            let pw = crate::modals::ProviderWizard::MainMenu { selected: 0 };
-                            app.active_modal = Some(Box::new(pw));
+                            let panel = crate::modals::ProviderPanel::open();
+                            app.active_modal = Some(Box::new(panel));
                             if let Some(m) = app.active_modal.as_mut() {
                                 m.draw(&app.buf, &app.state, ctx, renderer);
                             }
-                            // ProviderWizard owns the next frame now; skip
-                            // the idle redraw below so we don't clobber it.
+                            // The panel owns the next frame now; skip the idle
+                            // redraw below so we don't clobber it.
                             return Ok(());
                         }
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -9388,6 +10244,7 @@ fn handle_input(
                 UiPhase::Streaming => handle_streaming_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Approval => handle_approval_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::UserInput => handle_user_input_key(app, ctx, renderer, code, modifiers)?,
+                UiPhase::RoundCap => handle_round_cap_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Suspended => {}
             }
         }
@@ -9533,11 +10390,6 @@ pub use crate::modals::ModelPicker;
 // at `crate::modals::SessionPicker` for existing call sites.
 pub use crate::modals::SessionPicker;
 
-// `ProviderWizard` + `WizardStep` + `DraftProvider` moved to
-// `crate::modals::provider_wizard`; re-exported at `crate::modals` for
-// existing call sites (execute_slash_command).
-pub use crate::modals::ProviderWizard;
-
 /// Parse a committed `$<name> [args]` line into `(name, args)`. Returns `None`
 /// when the line is not `$`-prefixed or carries no skill name. Mirrors
 /// `parse_slash_line` but for the `$` skills trigger.
@@ -9585,7 +10437,7 @@ fn strip_pasted_prompt_prefix(line: &str) -> Option<&str> {
 /// qualified name is shown to disambiguate. Sorted for stable navigation.
 /// Shared by the `/skills ` sub-mode and the `$` trigger so both stay in lockstep.
 fn build_skill_menu_items(
-    skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+    skill_registry: Option<&std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
     prefix_lower: &str,
 ) -> Vec<(String, String)> {
     let mut items: Vec<(String, String)> = Vec::new();
@@ -9600,7 +10452,15 @@ fn build_skill_menu_items(
                     .unwrap_or(skill.name.as_str());
                 let full_lower = skill.name.to_ascii_lowercase();
                 let bare_lower = bare.to_ascii_lowercase();
-                if bare_lower.contains(prefix_lower) || full_lower.contains(prefix_lower) {
+                // Multi-fragment AND filter: every whitespace-separated fragment
+                // must appear (in the bare OR full name) so `atom smoke` narrows
+                // to `atomcode-smoke-test`. Empty filter ⇒ no fragments ⇒ vacuous
+                // true ⇒ list all. A single fragment behaves exactly as the old
+                // single-substring match (`bra` ⇒ brainstorming).
+                let matches_all = prefix_lower
+                    .split_whitespace()
+                    .all(|frag| bare_lower.contains(frag) || full_lower.contains(frag));
+                if matches_all {
                     let bare_is_unique = skills.iter().all(|other| {
                         other.name == skill.name
                             || other
@@ -9634,7 +10494,7 @@ fn build_menu_items(
     cursor: usize,
     commands: &CommandRegistry,
     custom: &crate::custom_commands::CustomCommandRegistry,
-    skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+    skill_registry: Option<&std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
     file_index: Option<&file_index::FileIndex>,
 ) -> Option<Vec<(String, String)>> {
     // `@`-mention branch — checked first so it takes priority over any
@@ -9686,7 +10546,19 @@ fn build_menu_items(
     // to `/skills <name>` so the `skills` arm in execute_slash_command
     // looks up `skills:<name>` in the registry and dispatches.
     if let Some(after) = buf.strip_prefix("/skills ") {
-        if after.contains(char::is_whitespace) {
+        // Once the FIRST token is a complete user-invocable skill followed by a
+        // space, the user has moved past filtering — they're typing the skill's
+        // task args (or a second greedy skill) — so close the menu and let Enter
+        // submit. Until then, treat `after` as a multi-fragment fuzzy filter so
+        // `atom smoke` narrows to `atomcode-smoke-test` instead of the old
+        // "any space kills the menu" (which made multi-word filtering dead).
+        let first = after.split_whitespace().next().unwrap_or("");
+        let first_is_complete_skill = after.contains(char::is_whitespace)
+            && skill_registry
+                .and_then(|reg| reg.read().ok())
+                .and_then(|r| r.get(first).map(|s| s.user_invocable))
+                .unwrap_or(false);
+        if first_is_complete_skill {
             return None;
         }
         let items = build_skill_menu_items(skill_registry, &after.to_ascii_lowercase());
@@ -10237,11 +11109,40 @@ fn handle_idle_key(
             EmptyEscIntercept::TriggerUndo => {
                 app.exit_pending = None;
                 app.esc_undo_last_at = Some(now);
-                dispatch_undo("", &app.state, ctx, renderer);
+                // The catalog is loaded asynchronously and immediately replaced
+                // by the Rewind modal. Do not append a permanent loading line to
+                // scrollback: closing the modal would expose that stale status as
+                // if it were conversation output. Failures are surfaced below.
+                if let Err(error) = ctx
+                    .runtime
+                    .refresh_rewind_catalog(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
+                {
+                    renderer.render(UiLine::Error(format!(
+                        "{}: {error}",
+                        match crate::i18n::current_locale() {
+                            crate::i18n::Locale::ZhCn => "暂时无法打开回退",
+                            crate::i18n::Locale::En => "Rewind is unavailable",
+                        }
+                    )));
+                    renderer.flush();
+                }
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
         }
+    }
+
+    // F2 / Shift+F2: cycle through configured providers in stable model-list
+    // order. This idle-path handler runs after modal dispatch, so it cannot
+    // mutate a running turn or steal F2 from an active picker.
+    if let Some(direction) = crate::modals::model_picker::model_cycle_direction(code, modifiers) {
+        if let Some(provider) =
+            crate::modals::model_picker::adjacent_provider(&ctx.config, direction)
+        {
+            set_default_provider_and_reload(ctx, &provider, renderer);
+        }
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
     }
 
     // Ctrl+V: try clipboard image first, fall back to text paste.
@@ -10255,13 +11156,8 @@ fn handle_idle_key(
             // ModelArts.81001 "message[N].content[0] has invalid
             // field(s): text, type" for GLM-5.1). Helper in
             // `Config::can_handle_attached_images`.
-            if !ctx.config.can_handle_attached_images() {
-                renderer.render(UiLine::Error(
-                    crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport {
-                        model: &ctx.model_name,
-                    })
-                    .into_owned(),
-                ));
+            if let Some(reject) = image_attach_reject_line(&ctx.config, &ctx.model_name) {
+                renderer.render(UiLine::Error(reject));
                 renderer.flush();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
@@ -10615,7 +11511,7 @@ fn handle_idle_key(
                 let pending = std::mem::take(&mut app.state.pending_images);
                 let pending_markers = std::mem::take(&mut app.state.pending_image_markers);
                 let pending_hashes = std::mem::take(&mut app.state.pending_image_hashes);
-                let mut images: Vec<ImagePart> = Vec::with_capacity(pending.len());
+                let mut images: Vec<ImageContent> = Vec::with_capacity(pending.len());
                 let mut kept_markers: Vec<usize> = Vec::with_capacity(pending.len());
                 let mut kept_refs: Vec<crate::input::history::HistoryImageRef> =
                     Vec::with_capacity(pending.len());
@@ -10681,7 +11577,12 @@ fn handle_idle_key(
                 }
                 {
                     let availability = ctx.runtime.ui_availability();
-                    if hold_submit_until_ready(ctx.live_binding.is_some(), availability) {
+                    let unavailable_reason = ctx.runtime.provider_unavailable_reason();
+                    if hold_submit_until_ready(
+                        ctx.live_binding.is_some(),
+                        availability,
+                        unavailable_reason,
+                    ) {
                         // New session whose provider is still recovering auth
                         // (AwaitingProvider) or still starting (daemon deferred).
                         // The message was already echoed above; hold it in the
@@ -10722,7 +11623,9 @@ fn handle_idle_key(
                             // to a CodingPlan-managed provider, gated by a 15-min
                             // cooldown so rapid-fire messages don't spam the API.
                             // Non-CodingPlan users skip entirely (zero network).
-                            if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+                            if monitor::is_codingplan_provider(
+                                &resolved_provider_and_model(&ctx.config).0,
+                            ) {
                                 let cooled = ctx
                                     .monitor_last_check_at
                                     .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
@@ -10739,10 +11642,19 @@ fn handle_idle_key(
                             }
                         } else {
                             app.state.on_submit_rejected();
-                            renderer.render(UiLine::Error(
-                                crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable)
-                                    .into_owned(),
-                            ));
+                            let message = match unavailable_reason {
+                                Some(
+                                    atomcode_coding::ProviderUnavailableReason::UnsupportedBuild,
+                                ) => crate::i18n::Msg::CmdProviderUnsupportedBuild,
+                                Some(atomcode_coding::ProviderUnavailableReason::NotConfigured) => {
+                                    crate::i18n::Msg::CmdNoActiveProvider
+                                }
+                                Some(
+                                    atomcode_coding::ProviderUnavailableReason::AuthenticationRequired,
+                                )
+                                | None => crate::i18n::Msg::CmdProviderUnavailable,
+                            };
+                            renderer.render(UiLine::Error(crate::i18n::t(message).into_owned()));
                             // Commit cleared the input buffer before dispatch. Render that
                             // empty prompt so the retained renderer does not keep displaying
                             // the pre-commit text after the synchronous rejection.
@@ -11032,7 +11944,19 @@ pub(crate) fn set_agent_mode(
         renderer.render(UiLine::CommandOutput(msg));
         renderer.flush();
     }
-    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    // `redraw_idle_plain` renders `UiLine::InputPrompt`, whose retained handler
+    // treats reaching the idle prompt as "the turn is over" and
+    // `commit_inflight_tool()` + `clear_live_spinner()`. That is correct at
+    // idle, but this is also reached MID-TURN from the streaming Tab / Shift+Tab
+    // mode-cycle handler — where a tool is still in flight. Committing it early
+    // (then re-establishing the strip on the very next `draw_spinner_now`) makes
+    // the live spinner/thinking row flash a garbled frame that self-heals on the
+    // next paint (the reported "tab 切换时思考过程被覆盖，过一会儿恢复" bug).
+    // Only repaint the idle footer when actually idle; streaming callers own the
+    // repaint via `draw_spinner_now`.
+    if matches!(app.state.phase, crate::state::UiPhase::Idle) {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    }
 }
 
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
@@ -11071,7 +11995,43 @@ pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
     if ctx.is_plain_renderer {
         return false;
     }
-    ctx.config.providers.is_empty() && atomcode_auth::get_stored_auth().is_none()
+    provider_configuration_missing(&ctx.config, atomcode_auth::get_stored_auth().is_some())
+}
+
+fn provider_configuration_missing(config: &Config, has_stored_auth: bool) -> bool {
+    config.active_provider(None).is_err() && !has_stored_auth
+}
+
+#[cfg(test)]
+mod onboarding_provider_tests {
+    use super::provider_configuration_missing;
+    use atomcode_config::Config;
+
+    #[test]
+    fn new_schema_provider_does_not_trigger_onboarding_after_restart() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "taotoken/glm_for_coding",
+            "provider_accounts": {
+                "taotoken": {
+                    "provider": "openai",
+                    "base_url": "https://example.test/v1"
+                }
+            },
+            "models": {
+                "taotoken/glm_for_coding": {
+                    "account": "taotoken",
+                    "model": "glm_for_coding",
+                    "context_window": 131072
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(config.providers.is_empty(), "legacy table stays empty");
+        assert!(!provider_configuration_missing(&config, false));
+        assert!(provider_configuration_missing(&Config::default(), false));
+        assert!(!provider_configuration_missing(&Config::default(), true));
+    }
 }
 
 /// Extract current + latest version from the `ALREADY_LATEST` error
@@ -11118,6 +12078,28 @@ mod image_marker_tests {
         assert_eq!(marks("no images here"), Vec::<usize>::new());
         // Malformed markers are ignored.
         assert_eq!(marks("[Image #] [Image #x] [Image #3]"), vec![3]);
+    }
+
+    use super::echo_text_with_image_markers as reecho;
+
+    #[test]
+    fn reattaches_markers_for_webui_image_echo() {
+        // webui text has no inline markers; append one per image so the
+        // synchronized TUI echoes `└ [Image #N]` rows instead of an empty box.
+        assert_eq!(reecho("识别图片内容".into(), 1), "识别图片内容 [Image #1]");
+        assert_eq!(reecho("look".into(), 2), "look [Image #1] [Image #2]");
+        // And the appended markers are what the echo renderer will pick up.
+        assert_eq!(marks(&reecho("hi".into(), 2)), vec![1, 2]);
+    }
+
+    #[test]
+    fn reecho_noops_without_images_or_when_markers_present() {
+        // No images: unchanged.
+        assert_eq!(reecho("just text".into(), 0), "just text");
+        // Native-paste echo already carries markers: never double up.
+        assert_eq!(reecho("typed [Image #1]".into(), 1), "typed [Image #1]");
+        // Empty text + images: markers only, no leading space.
+        assert_eq!(reecho("".into(), 1), "[Image #1]");
     }
 }
 
@@ -11263,11 +12245,9 @@ fn redraw_after_slash(
 /// assets become visible to the slash-command palette and the agent
 /// loop within the same session.
 ///
-/// Hook executor is NOT rebuilt here: in this codebase the executor
-/// lives entirely on the agent side (see `agent::mod` lines around
-/// 718–722) and is reconstructed per `cd`. New hook plugins therefore
-/// pick up at the next `/cd` (or process restart). Per spec §8 this
-/// deferred behavior is acceptable.
+/// The runtime capability reload below rebuilds the complete agent-side
+/// capability graph, including plugin skills and hooks, before publishing the
+/// replacement generation.
 /// Returns `(skills_loaded, skip_warnings)`. Caller decides how (and
 /// whether) to surface the warnings — the TUI gates them behind verbose
 /// mode (Ctrl+O) and always shows a `N loaded / M skipped` summary on
@@ -11281,7 +12261,11 @@ pub(crate) fn request_capability_reload(ctx: &mut LoopCtx) -> Result<(), String>
         return Err(crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned());
     }
     ctx.runtime
-        .reload_capabilities(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
+        .reload_capabilities(
+            atomcode_capabilities::plugin::loader::installed_plugin_skill_dirs(&ctx.working_dir),
+            ctx.foreground_runtime_id,
+            ctx.runtime_event_tx.clone(),
+        )
         .map_err(|error| {
             crate::i18n::t(crate::i18n::Msg::CmdCapabilityReloadFailed {
                 error: &error.to_string(),
@@ -11330,11 +12314,18 @@ fn complete_mcp_reload_notice(
     })
 }
 
+pub(crate) fn reload_skill_registry(
+    registry: &mut atomcode_capabilities::skills::SkillRegistry,
+    working_dir: &std::path::Path,
+) -> Vec<String> {
+    atomcode_capabilities::plugin::loader::reload_skill_registry(registry, working_dir)
+}
+
 pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
     let mut loaded = 0usize;
     let mut warnings = Vec::new();
     if let Ok(mut guard) = ctx.skill_registry.write() {
-        warnings = guard.reload(&ctx.working_dir);
+        warnings = reload_skill_registry(&mut guard, &ctx.working_dir);
         loaded = guard.all().count();
     }
     ctx.custom_commands = crate::custom_commands::CustomCommandRegistry::load(&ctx.working_dir);
@@ -11403,6 +12394,24 @@ pub(crate) fn save_and_reload(
     success_message: String,
     persist_runtime_provider_as_default: bool,
 ) -> bool {
+    save_and_reload_with_notice(
+        ctx,
+        desired,
+        renderer,
+        success_message,
+        persist_runtime_provider_as_default,
+        LanguageChangeNotice::None,
+    )
+}
+
+fn save_and_reload_with_notice(
+    ctx: &mut LoopCtx,
+    desired: Config,
+    renderer: &mut dyn Renderer,
+    success_message: String,
+    persist_runtime_provider_as_default: bool,
+    language_change_notice: LanguageChangeNotice,
+) -> bool {
     if provider_transition_pending(ctx) {
         renderer.render(UiLine::Error(
             crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
@@ -11419,50 +12428,17 @@ pub(crate) fn save_and_reload(
         &desired,
         persist_runtime_provider_as_default,
     ) {
-        Ok(DesiredConfigCommit { commit, previous }) => {
-            let rollback_persisted_config = Some(previous);
-            let rollback_runtime_config = Some(previous_runtime_config);
-            let origin_generation = ctx.runtime.current_generation();
-            atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
-            if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
-                let rollback = rollback_pending_provider_reload(
-                    ctx,
-                    PendingProviderReload {
-                        origin_generation,
-                        desired_config: desired,
-                        persisted_revision: Some(commit.snapshot.revision),
-                        rollback_persisted_config,
-                        rollback_runtime_config,
-                        previous_model_name: Some(previous_model_name),
-                        announce: None,
-                        manual_reload_announce: false,
-                        selection_mode_after_success: None,
-                    },
-                );
-                let suffix = rollback
-                    .error
-                    .map(|error| format!("; config rollback failed: {error}"))
-                    .unwrap_or_default();
-                renderer.render(UiLine::Error(format!(
-                    "provider reload could not be started: {error}{suffix}"
-                )));
-                renderer.flush();
-                return false;
-            }
-            ctx.observed_config_revision = Some(commit.snapshot.revision.clone());
-            ctx.pending_provider_reload = Some(PendingProviderReload {
-                origin_generation,
-                desired_config: desired,
-                persisted_revision: Some(commit.snapshot.revision),
-                rollback_persisted_config,
-                rollback_runtime_config,
-                previous_model_name: Some(previous_model_name),
-                announce: Some(success_message),
-                manual_reload_announce: false,
-                selection_mode_after_success: None,
-            });
-            true
-        }
+        Ok(DesiredConfigCommit { commit, previous }) => stage_committed_config_reload(
+            ctx,
+            desired,
+            commit,
+            previous,
+            previous_runtime_config,
+            previous_model_name,
+            renderer,
+            success_message,
+            language_change_notice,
+        ),
         Err(e) => {
             renderer.render(UiLine::Error(
                 crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
@@ -11474,6 +12450,120 @@ pub(crate) fn save_and_reload(
             false
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_committed_config_reload(
+    ctx: &mut LoopCtx,
+    desired: Config,
+    commit: ConfigCommit,
+    previous_persisted_config: Config,
+    previous_runtime_config: Config,
+    previous_model_name: String,
+    renderer: &mut dyn Renderer,
+    success_message: String,
+    language_change_notice: LanguageChangeNotice,
+) -> bool {
+    let rollback_persisted_config = Some(previous_persisted_config);
+    let rollback_runtime_config = Some(previous_runtime_config);
+    let origin_generation = ctx.runtime.current_generation();
+    atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+    if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+        let rollback = rollback_pending_provider_reload(
+            ctx,
+            PendingProviderReload {
+                origin_generation,
+                desired_config: desired,
+                persisted_revision: Some(commit.snapshot.revision),
+                rollback_persisted_config,
+                rollback_runtime_config,
+                previous_model_name: Some(previous_model_name),
+                announce: None,
+                language_change_notice: LanguageChangeNotice::None,
+                manual_reload_announce: false,
+                selection_mode_after_success: None,
+            },
+        );
+        let suffix = rollback
+            .error
+            .map(|error| format!("; config rollback failed: {error}"))
+            .unwrap_or_default();
+        renderer.render(UiLine::Error(format!(
+            "provider reload could not be started: {error}{suffix}"
+        )));
+        renderer.flush();
+        return false;
+    }
+    ctx.observed_config_revision = Some(commit.snapshot.revision.clone());
+    ctx.pending_provider_reload = Some(PendingProviderReload {
+        origin_generation,
+        desired_config: desired,
+        persisted_revision: Some(commit.snapshot.revision),
+        rollback_persisted_config,
+        rollback_runtime_config,
+        previous_model_name: Some(previous_model_name),
+        announce: Some(success_message),
+        language_change_notice,
+        manual_reload_announce: false,
+        selection_mode_after_success: None,
+    });
+    true
+}
+
+pub(crate) fn save_proxy_and_reload(
+    ctx: &mut LoopCtx,
+    proxy: atomcode_config::proxy::ProxyConfig,
+    renderer: &mut dyn Renderer,
+    success_message: String,
+) -> bool {
+    if provider_transition_pending(ctx) {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+        ));
+        renderer.flush();
+        return false;
+    }
+    let previous_runtime_config = ctx.config.clone();
+    let previous_model_name = ctx.model_name.clone();
+    let DesiredConfigCommit { commit, previous } =
+        match commit_proxy_config(&ctx.config_store, &proxy) {
+            Ok(committed) => committed,
+            Err(error) => {
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
+                        error: &error.to_string(),
+                    })
+                    .into_owned(),
+                ));
+                renderer.flush();
+                return false;
+            }
+        };
+    let desired = desired_config_from_snapshot(ctx, commit.snapshot.config.clone(), false);
+
+    // First-run `/proxy` commonly runs before any provider exists. There is no
+    // HTTP client to rebuild yet; `/login` creates its client after this method
+    // applies the process proxy environment.
+    if desired.providers.is_empty() {
+        atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+        ctx.config = desired;
+        ctx.observed_config_revision = Some(commit.snapshot.revision);
+        renderer.render(UiLine::CommandOutput(success_message));
+        renderer.flush();
+        return true;
+    }
+
+    stage_committed_config_reload(
+        ctx,
+        desired,
+        commit,
+        previous,
+        previous_runtime_config,
+        previous_model_name,
+        renderer,
+        success_message,
+        LanguageChangeNotice::None,
+    )
 }
 
 pub(crate) fn save_language_and_reload(
@@ -11525,7 +12615,14 @@ pub(crate) fn save_language_and_reload(
 
     let mut desired = ctx.config.clone();
     desired.language = Some(locale);
-    save_and_reload(ctx, desired, renderer, String::new(), false)
+    save_and_reload_with_notice(
+        ctx,
+        desired,
+        renderer,
+        String::new(),
+        false,
+        LanguageChangeNotice::LanguageCommand,
+    )
 }
 
 /// Switch only this `CodingRuntime`. The shared `config.toml` default remains a
@@ -11539,7 +12636,7 @@ pub(crate) fn select_provider_and_reload(
     if provider_transition_pending(ctx) {
         return false;
     }
-    let Some(selected) = ctx.config.providers.get(provider_name) else {
+    let Some(selected) = ctx.config.provider_config_for_selection(provider_name) else {
         renderer.render(UiLine::Error(format!(
             "provider {provider_name:?} is no longer available"
         )));
@@ -11548,6 +12645,10 @@ pub(crate) fn select_provider_and_reload(
     };
     let selected_model = selected.model.clone();
     let mut desired = ctx.config.clone();
+    // `default_model` is canonical (`effective_model_selection` prefers it); set
+    // it too so a new-schema selection actually reloads instead of resolving the
+    // stale previous `default_model`.
+    desired.default_model = Some(provider_name.to_string());
     desired.default_provider = provider_name.to_string();
     let origin_generation = ctx.runtime.current_generation();
     atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
@@ -11574,6 +12675,7 @@ pub(crate) fn select_provider_and_reload(
             })
             .into_owned(),
         ),
+        language_change_notice: LanguageChangeNotice::None,
         manual_reload_announce: false,
         selection_mode_after_success: Some(crate::ProviderSelectionMode::Pinned),
     });
@@ -11591,25 +12693,43 @@ pub(crate) fn set_default_provider_and_reload(
     if provider_transition_pending(ctx) {
         return false;
     }
-    let Some(selected) = ctx.config.providers.get(provider_name) else {
-        renderer.render(UiLine::Error(format!(
-            "provider {provider_name:?} is no longer available"
-        )));
-        renderer.flush();
-        return false;
+    // `provider_name` is a selection id: a legacy provider name OR a new-schema
+    // model id (§14.1/§14.2). Validate through the single resolution boundary.
+    let resolved = match ctx.config.resolve_model(Some(provider_name)) {
+        Ok(r) => r,
+        Err(_) => {
+            renderer.render(UiLine::Error(format!(
+                "provider {provider_name:?} is no longer available"
+            )));
+            renderer.flush();
+            return false;
+        }
     };
-    if selected.ephemeral {
+    // Legacy ephemeral (OAuth /login) providers stay current-runtime-only.
+    if ctx
+        .config
+        .providers
+        .get(provider_name)
+        .map(|p| p.ephemeral)
+        .unwrap_or(false)
+    {
         return select_provider_and_reload(ctx, provider_name, renderer);
     }
-    let selected_model = selected.model.clone();
+    let selected_model = resolved.model.clone();
     let store = ctx.config_store.clone();
     let mut previous_persisted = None;
     let commit = match store.update(|config| {
-        if !config.providers.contains_key(provider_name) {
+        if config.resolve_model(Some(provider_name)).is_err() {
             anyhow::bail!("provider {provider_name:?} is no longer available");
         }
         previous_persisted = Some(config.clone());
-        config.default_provider = provider_name.to_string();
+        // `default_model` is the canonical selection (§14.1); keep the legacy
+        // `default_provider` in sync when the selection is a legacy provider so
+        // not-yet-migrated display consumers stay correct.
+        config.default_model = Some(provider_name.to_string());
+        if config.providers.contains_key(provider_name) {
+            config.default_provider = provider_name.to_string();
+        }
         Ok(())
     }) {
         Ok(commit) => commit,
@@ -11634,6 +12754,24 @@ pub(crate) fn set_default_provider_and_reload(
                 .or_insert_with(|| provider.clone());
         }
     }
+    // Ephemeral provider accounts (and their model profiles) aren't persisted,
+    // so re-add them to the desired config for the reload.
+    for (id, account) in &ctx.config.provider_accounts {
+        if account.ephemeral {
+            desired
+                .provider_accounts
+                .entry(id.clone())
+                .or_insert_with(|| account.clone());
+            for (mid, model) in &ctx.config.models {
+                if model.account == *id {
+                    desired
+                        .models
+                        .entry(mid.clone())
+                        .or_insert_with(|| model.clone());
+                }
+            }
+        }
+    }
     let origin_generation = ctx.runtime.current_generation();
     atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
     if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
@@ -11647,6 +12785,7 @@ pub(crate) fn set_default_provider_and_reload(
                 rollback_runtime_config: Some(ctx.config.clone()),
                 previous_model_name: Some(ctx.model_name.clone()),
                 announce: None,
+                language_change_notice: LanguageChangeNotice::None,
                 manual_reload_announce: false,
                 selection_mode_after_success: None,
             },
@@ -11677,20 +12816,28 @@ pub(crate) fn set_default_provider_and_reload(
             })
             .into_owned(),
         ),
+        language_change_notice: LanguageChangeNotice::None,
         manual_reload_announce: false,
         selection_mode_after_success: Some(crate::ProviderSelectionMode::Pinned),
     });
     true
 }
 
+/// Apply the config `/login` just persisted (fresh CodingPlan claim) to the
+/// running session. Passes `adopt_active_edits = true` (same as `/reload`): a
+/// successful `/login` re-claims models and rewrites the ACTIVE provider's own
+/// settings — notably `context_window` — so the running conversation MUST adopt
+/// them, otherwise the merge keeps the stale runtime copy and the footer window
+/// (e.g. `/100k`) never updates to the model's real window until the user runs
+/// `/reload` manually. When the active provider's config actually changed this
+/// triggers an async provider reload whose completion projects the new window.
 pub(crate) fn apply_persisted_config(
     ctx: &mut LoopCtx,
     config: Config,
     revision: ConfigRevision,
     renderer: &mut dyn Renderer,
 ) {
-    if let Err(error) = reconcile_persisted_config(ctx, ConfigSnapshot { config, revision }, false)
-    {
+    if let Err(error) = reconcile_persisted_config(ctx, ConfigSnapshot { config, revision }, true) {
         renderer.render(UiLine::Error(error.to_string()));
         renderer.flush();
     }
@@ -11727,6 +12874,41 @@ fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, 
             app.menu.selected,
         );
     }
+}
+
+/// Preserve pending steers across the kernel's cancel-time steer-buffer clear.
+/// Returns true when Esc should use interrupt-and-send semantics instead of
+/// restoring the cancelled prompt into the editor.
+fn stage_pending_steers_for_interrupt(app: &mut App) -> bool {
+    if !stage_pending_steers(&mut app.state.pending_steers, &mut app.message_queue) {
+        return false;
+    }
+    app.queue_drain_authorized = false;
+    app.interrupt_drain_pending = true;
+    // The current turn is intentionally being abandoned in favor of the
+    // pending messages; do not restore its original prompt over the draft.
+    app.state.last_submitted_message = None;
+    true
+}
+
+fn stage_pending_steers(
+    pending_steers: &mut VecDeque<crate::state::PendingSteer>,
+    message_queue: &mut VecDeque<crate::state::QueuedMessage>,
+) -> bool {
+    if pending_steers.is_empty() {
+        return false;
+    }
+    let mut replay = pending_steers
+        .drain(..)
+        .map(|pending| pending.message)
+        .collect::<VecDeque<_>>();
+    replay.append(message_queue);
+    *message_queue = replay;
+    true
+}
+
+fn should_stage_interrupt(send_ok: bool, bare_esc: bool, has_pending: bool) -> bool {
+    send_ok && bare_esc && has_pending
 }
 
 /// Slash commands allowed to EXECUTE while a turn is running. Everything else is
@@ -11904,14 +13086,31 @@ fn handle_streaming_key(
     // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
     if code == KeyCode::Esc {
         let send_ok = cancel_active_turn(ctx);
+        let interrupt_and_send = should_stage_interrupt(
+            send_ok,
+            modifiers.is_empty(),
+            !app.state.pending_steers.is_empty(),
+        ) && stage_pending_steers_for_interrupt(app);
         clear_capturing_modal_on_cancel(app);
         crate::tuix_trace!(
             "KEY",
-            "streaming Esc -> Cancel send_ok={} spinner={:?}",
+            "streaming Esc -> Cancel send_ok={} interrupt_and_send={} spinner={:?}",
             send_ok,
+            interrupt_and_send,
             app.state.spinner_label
         );
-        restore_cancelled_message_to_buf(app, renderer, ctx);
+        if interrupt_and_send {
+            draw_spinner_now(
+                &mut app.state,
+                &app.buf,
+                ctx,
+                renderer,
+                app.message_queue.len(),
+                app.menu.selected,
+            );
+        } else {
+            restore_cancelled_message_to_buf(app, renderer, ctx);
+        }
         return Ok(());
     }
 
@@ -12248,7 +13447,7 @@ fn handle_streaming_key(
             let pending = std::mem::take(&mut app.state.pending_images);
             let pending_markers = std::mem::take(&mut app.state.pending_image_markers);
             let pending_hashes = std::mem::take(&mut app.state.pending_image_hashes);
-            let mut q_images: Vec<ImagePart> = Vec::with_capacity(pending.len());
+            let mut q_images: Vec<ImageContent> = Vec::with_capacity(pending.len());
             let mut q_markers: Vec<usize> = Vec::with_capacity(pending.len());
             let mut q_refs: Vec<crate::input::history::HistoryImageRef> =
                 Vec::with_capacity(pending.len());
@@ -12267,16 +13466,6 @@ fn handle_streaming_key(
                     q_markers.push(n);
                 }
             }
-            if ctx.live_binding.is_none() {
-                // Same as the idle submit path: echo the EXACT text queued for
-                // the agent (`expanded`) — the full pasted body, no
-                // `[Pasted #N …]` placeholder — while history keeps the folded
-                // `line` for compact Up-arrow recall.
-                renderer.render(UiLine::UserWithAttachments {
-                    text: expanded.clone(),
-                    attachments: q_markers.clone(),
-                });
-            }
             ctx.history.push(crate::input::history::HistoryEntry {
                 text: line.clone(),
                 images: q_refs,
@@ -12286,16 +13475,25 @@ fn handle_streaming_key(
             });
             match midturn_submit_route(true) {
                 SubmitRoute::SteerNow => {
-                    // Steer into the running turn: the kernel folds this at the next
-                    // round boundary (see AgentEvent::Steered). No local queue. Count
-                    // it as PENDING now; the Steered event drains it once folded.
-                    if submit_foreground_runtime(ctx, runtime_user_input(expanded, q_images)) {
-                        app.state.on_steer_sent();
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  ↳ {}: {}\n",
-                            crate::i18n::t(crate::i18n::Msg::SteerFoldedHint),
-                            line
-                        )));
+                    // Steer into the running turn and retain an exact recovery copy.
+                    // The footer panel owns the acknowledgement; do not write a
+                    // permanent "will fold" line into conversation scrollback.
+                    let pending = crate::state::PendingSteer {
+                        message: crate::state::QueuedMessage {
+                            text: expanded,
+                            images: q_images,
+                            image_markers: q_markers,
+                        },
+                        display_text: line,
+                    };
+                    if submit_foreground_runtime(
+                        ctx,
+                        runtime_user_input(
+                            pending.message.text.clone(),
+                            pending.message.images.clone(),
+                        ),
+                    ) {
+                        app.state.on_steer_sent(pending);
                     } else {
                         renderer.render(UiLine::Error(
                             crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable).into_owned(),
@@ -12303,6 +13501,16 @@ fn handle_streaming_key(
                     }
                 }
                 _ => {
+                    if ctx.live_binding.is_none() {
+                        // A real type-ahead queue owns its acknowledgement in
+                        // transcript history immediately. SteerNow deliberately
+                        // skips this path: its footer remains authoritative until
+                        // the kernel confirms the fold with AgentEvent::Steered.
+                        renderer.render(UiLine::UserWithAttachments {
+                            text: expanded.clone(),
+                            attachments: q_markers.clone(),
+                        });
+                    }
                     app.message_queue.push_back(crate::state::QueuedMessage {
                         text: expanded,
                         images: q_images,
@@ -12478,24 +13686,75 @@ fn deliver_user_input_null(ctx: &mut LoopCtx, id: u64) {
     }
 }
 
-/// Pure predicate: should a `request_user_input` tool call be auto-skipped
-/// without showing the interactive panel?
-///
-/// Only Bypass / 免审批 mode (`Mode::Auto`) skips the panel.  Build and Plan
-/// modes always show the panel (asking during coding/planning is intentional).
-/// Extracted as a pure function so the contract is unit-testable without a
-/// full `LoopCtx`.
+/// Answer a round-cap checkpoint with `{"continue": bool}` and clear panel state.
+/// Mirrors `deliver_user_input` dispatch shape: goes through the native runtime
+/// `Respond` command (no daemon live-binding path needed — checkpoints are only
+/// emitted by the local kernel, not by the daemon bridge).
+fn deliver_round_cap(ctx: &mut LoopCtx, id: u64, cont: bool) {
+    // Clear the in-flight request id like the deliver_user_input siblings, so a
+    // later error during the resumed turn can't mistake the resolved checkpoint
+    // for a still-pending request.
+    if ctx.pending_runtime_request_id == Some(id) {
+        ctx.pending_runtime_request_id = None;
+    }
+    ctx.runtime
+        .dispatch(atomcode_coding::DriverCommand::Respond {
+            id,
+            value: serde_json::json!({ "continue": cont }),
+        })
+        .ok();
+}
+
+enum TuiUserInputPresentation {
+    Single(atomcode_capabilities::tools::request_user_input::UserInputRequest),
+    Batch(Vec<atomcode_capabilities::tools::request_user_input::UserInputRequest>),
+    Invalid,
+}
+
+/// Parse a native `request_user_input` payload into the presentation the
+/// interactive TUI owns. Deliberately has no `AgentMode` input: Auto / `-y`
+/// changes approval policy, not whether a human-facing TUI can ask questions.
+fn classify_tui_user_input(payload: serde_json::Value) -> TuiUserInputPresentation {
+    use atomcode_capabilities::tools::request_user_input::UserInputRequest;
+
+    if let Some(questions) = payload
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+    {
+        let requests = questions
+            .iter()
+            .filter_map(|question| {
+                serde_json::from_value::<UserInputRequest>(question.clone()).ok()
+            })
+            .collect::<Vec<_>>();
+        return if requests.is_empty() {
+            TuiUserInputPresentation::Invalid
+        } else {
+            TuiUserInputPresentation::Batch(requests)
+        };
+    }
+
+    serde_json::from_value(payload)
+        .map(TuiUserInputPresentation::Single)
+        .unwrap_or(TuiUserInputPresentation::Invalid)
+}
+
+/// Round-cap confirmation is an execution safety checkpoint rather than a
+/// model-authored user question. Preserve the existing unattended Auto-mode
+/// behavior: stop fail-closed instead of opening an interactive checkpoint.
 #[inline]
-pub(crate) fn user_input_should_auto_skip(mode: crate::state::AgentMode) -> bool {
+fn round_cap_should_auto_stop(mode: crate::state::AgentMode) -> bool {
     mode.is_auto()
 }
 
 /// Pure mapping used by approval compatibility tests.
 #[cfg(test)]
-fn approval_choice_to_decision(choice: ApprovalChoice) -> atomcode_core::tool::PermissionDecision {
-    use atomcode_core::tool::PermissionDecision;
+fn approval_choice_to_decision(
+    choice: ApprovalChoice,
+) -> atomcode_capabilities::tools::approval::PermissionDecision {
+    use atomcode_capabilities::tools::approval::PermissionDecision;
     match choice {
-        ApprovalChoice::Allow => PermissionDecision::Allow,
+        ApprovalChoice::Allow => PermissionDecision::AllowOnce,
         ApprovalChoice::AllowAlways => PermissionDecision::AllowAlways,
         ApprovalChoice::Deny => PermissionDecision::Deny,
     }
@@ -12575,7 +13834,7 @@ fn bypass_approval_choice() -> ApprovalChoice {
 #[cfg(test)]
 mod bypass_approval_tests {
     use super::{approval_choice_to_decision, bypass_approval_choice, ApprovalChoice};
-    use atomcode_core::tool::PermissionDecision;
+    use atomcode_capabilities::tools::approval::PermissionDecision;
 
     // The auto-approve invariant now lives on `approval_should_auto_bypass(mode)`
     // (see `auto_mode_bypasses_approval`); the old `dangerously_skip_permissions`
@@ -12589,8 +13848,8 @@ mod bypass_approval_tests {
     fn bypass_command_resolves_to_allow() {
         let decision = approval_choice_to_decision(bypass_approval_choice());
         assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "BYPASS must auto-approve with Allow, got {decision:?}"
+            matches!(decision, PermissionDecision::AllowOnce),
+            "BYPASS must auto-approve with AllowOnce, got {decision:?}"
         );
     }
 
@@ -12599,7 +13858,7 @@ mod bypass_approval_tests {
     fn approval_command_decision_mapping() {
         assert!(matches!(
             approval_choice_to_decision(ApprovalChoice::Allow),
-            PermissionDecision::Allow
+            PermissionDecision::AllowOnce
         ));
         assert!(matches!(
             approval_choice_to_decision(ApprovalChoice::AllowAlways),
@@ -13257,6 +14516,79 @@ pub(crate) fn user_input_response_for(
     }
 }
 
+/// The `{continue}` bool a key delivers at the round-cap checkpoint, or `None`
+/// if the key is not a resolving key. Enter honors the cursor position;
+/// Esc is always fail-closed (stop). Pure so it is unit-testable without a
+/// `LoopCtx`.
+fn round_cap_key_decision(code: KeyCode, cursor: usize) -> Option<bool> {
+    match code {
+        KeyCode::Enter => Some(cursor == 0),
+        KeyCode::Esc => Some(false),
+        _ => None,
+    }
+}
+
+/// Key handling while `UiPhase::RoundCap`. Two options: ↑/k toggle to
+/// "continue", ↓/j toggle to "stop"; Enter confirms the cursor selection;
+/// Esc is fail-closed (stop). Resolving keys clear the panel via
+/// `on_round_cap_resolved` and deliver `{"continue": bool}` to the kernel.
+fn handle_round_cap_key(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> Result<()> {
+    use crossterm::event::KeyModifiers;
+    let Some(panel) = app.state.round_cap_panel.as_ref() else {
+        return Ok(());
+    };
+    let id = panel.id;
+    // Ctrl+C = cancel the turn. Do NOT also `deliver_round_cap(false)`: that
+    // Respond would resolve the kernel's checkpoint Request and end the turn as
+    // MaxRounds *before* the Cancel is dequeued (a race in the kernel's
+    // `tokio::select!` between Respond and Cancel). Sending ONLY the Cancel is
+    // unambiguous: the kernel's cancel handler sets the turn token THEN flushes
+    // the pending Request to Null, so `run_turn` observes `cancel.is_cancelled()`
+    // and ends the turn as Cancelled (not MaxRounds) with no hang. Checked BEFORE
+    // the Char('k')/('j') arms so Ctrl+C never toggles the cursor.
+    if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+        app.state.on_round_cap_resolved();
+        cancel_active_turn(ctx);
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(p) = app.state.round_cap_panel.as_mut() {
+                p.move_up();
+            }
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(p) = app.state.round_cap_panel.as_mut() {
+                p.move_down();
+            }
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        }
+        _ => {
+            // Read cursor before resolving/clearing the panel.
+            let cursor = app
+                .state
+                .round_cap_panel
+                .as_ref()
+                .map(|p| p.cursor)
+                .unwrap_or(0);
+            if let Some(cont) = round_cap_key_decision(code, cursor) {
+                app.state.on_round_cap_resolved();
+                deliver_round_cap(ctx, id, cont);
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Key handling while `UiPhase::UserInput`. Mirrors `handle_approval_key`:
 /// resolving keys (Esc / Enter) clear the panel and deliver an
 /// `DriverCommand::Respond`; navigation / typing mutate the panel in place and
@@ -13715,10 +15047,9 @@ pub(super) fn handle_plugin_job_event(
             // ops keep the red Error so genuine failures stay prominent.
             if op == "auto-update" || op == "auto-install" || op == "auto-install-plugin" {
                 let detail = msg.lines().next().unwrap_or(msg.as_str());
-                renderer.render(UiLine::Warning(
-                    crate::i18n::t(crate::i18n::Msg::PluginAutoUpdateSkipped { detail })
-                        .into_owned(),
-                ));
+                let notice = crate::i18n::t(crate::i18n::Msg::PluginAutoUpdateSkipped { detail })
+                    .into_owned();
+                render_or_defer_background_notice(state, renderer, notice);
             } else {
                 renderer.render(UiLine::Error(format!("{}: {}", op, msg)));
             }
@@ -13731,10 +15062,11 @@ pub(super) fn handle_plugin_job_event(
             renderer.flush();
         }
         PluginJobEvent::PluginAlreadyInstalled { id } => {
-            // Stale install? Try reload + expand so the user still
-            // gets an answer if the plugin was installed but not loaded.
+            // The files are already present, but this process may predate the
+            // install (or have missed an earlier reload). Always refresh both
+            // the UI registry and runtime capability graph.
+            let _ = reload_plugins(ctx);
             if let Some(topic) = ctx.pending_guide_topic.take() {
-                let _ = reload_plugins(ctx);
                 if let Some(rendered) = commands::expand_skill(ctx, "ask", &topic) {
                     renderer.render(UiLine::CommandOutput(
                         crate::i18n::t(crate::i18n::Msg::CmdGuideAutoInvoke { topic: &topic })
@@ -13895,7 +15227,17 @@ fn turn_summary_label(
         // Streaming→Idle redraw can clobber it, but this line renders cleanly at
         // Idle. `.take()` consumes it so it can't leak into a later turn.
         let reason = state.last_turn_error.take();
-        let reason = reason.as_deref().map(summary_reason_headline);
+        // If a visible line already showed the cause this turn (red Error line /
+        // muted rate-limit line), render a bare `✗ 已中断 · …` — folding the same
+        // reason here would duplicate it. Only fold when nothing showed it above
+        // (the original "no cause visible anywhere" case). `.take()` the flag so
+        // it can't leak into a later turn's summary.
+        let shown_above = std::mem::replace(&mut state.turn_error_line_shown, false);
+        let reason = if shown_above {
+            None
+        } else {
+            reason.as_deref().map(summary_reason_headline)
+        };
         // An errored turn already rendered a red Error line just above; a
         // celebratory "✓ Nailed it" under it is contradictory, and we don't
         // burn a DONE_LABELS rotation slot on a failure.
@@ -13912,6 +15254,7 @@ fn turn_summary_label(
         // produced no summary (SnapshotUnavailable / RuntimeStopped), so it can
         // never fold into a LATER errored summary.
         state.last_turn_error = None;
+        state.turn_error_line_shown = false;
         let done = state.next_done_label();
         crate::i18n::t(crate::i18n::Msg::TurnSummary {
             done,
@@ -13922,6 +15265,169 @@ fn turn_summary_label(
             cached_pct,
         })
         .into_owned()
+    }
+}
+
+fn render_or_defer_background_notice(
+    state: &mut crate::state::UiState,
+    renderer: &mut dyn Renderer,
+    notice: String,
+) {
+    if state.turn_started_at.is_some() {
+        state.defer_background_notice(notice);
+    } else {
+        renderer.render(UiLine::Warning(notice));
+    }
+}
+
+fn flush_deferred_background_notices(
+    state: &mut crate::state::UiState,
+    renderer: &mut dyn Renderer,
+) {
+    let notices = state.take_background_notices();
+    if notices.is_empty() {
+        return;
+    }
+    renderer.render(UiLine::Warning(notices.join(" · ")));
+    renderer.flush();
+}
+
+fn complete_turn_presentation(state: &mut crate::state::UiState, renderer: &mut dyn Renderer) {
+    state.on_turn_complete();
+    flush_deferred_background_notices(state, renderer);
+}
+
+fn cancel_turn_presentation(state: &mut crate::state::UiState, renderer: &mut dyn Renderer) {
+    state.on_turn_cancelled();
+    flush_deferred_background_notices(state, renderer);
+}
+
+fn complete_peer_turn_presentation(
+    state: &mut crate::state::UiState,
+    renderer: &mut dyn Renderer,
+    think: &mut ThinkStripper,
+) {
+    renderer.render(UiLine::AssistantLineBreak);
+    renderer.flush();
+    think.reset();
+    complete_turn_presentation(state, renderer);
+}
+
+#[cfg(test)]
+mod background_notice_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct CaptureRenderer {
+        lines: Vec<UiLine>,
+        flushes: usize,
+    }
+
+    impl Renderer for CaptureRenderer {
+        fn render(&mut self, line: UiLine) {
+            self.lines.push(line);
+        }
+
+        fn flush(&mut self) {
+            self.flushes += 1;
+        }
+
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+        fn flush_deferred(&mut self) {}
+    }
+
+    #[test]
+    fn background_notice_is_deferred_and_deduplicated_during_turn() {
+        let mut state = crate::state::UiState::new();
+        state.on_submit();
+        let mut renderer = CaptureRenderer::default();
+
+        render_or_defer_background_notice(&mut state, &mut renderer, "sync failed".into());
+        render_or_defer_background_notice(&mut state, &mut renderer, "sync failed".into());
+
+        assert!(renderer.lines.is_empty());
+        assert_eq!(state.deferred_background_notices, vec!["sync failed"]);
+
+        complete_turn_presentation(&mut state, &mut renderer);
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::Warning(message)] if message == "sync failed"
+        ));
+        assert!(state.deferred_background_notices.is_empty());
+        assert_eq!(renderer.flushes, 1);
+    }
+
+    #[test]
+    fn background_notices_merge_after_turn_and_render_immediately_without_one() {
+        let mut state = crate::state::UiState::new();
+        let mut renderer = CaptureRenderer::default();
+
+        render_or_defer_background_notice(&mut state, &mut renderer, "idle notice".into());
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::Warning(message)] if message == "idle notice"
+        ));
+
+        renderer.lines.clear();
+        state.on_submit();
+        render_or_defer_background_notice(&mut state, &mut renderer, "market A".into());
+        render_or_defer_background_notice(&mut state, &mut renderer, "market B".into());
+        cancel_turn_presentation(&mut state, &mut renderer);
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::Warning(message)] if message == "market A · market B"
+        ));
+    }
+
+    #[test]
+    fn failed_terminal_without_snapshot_flushes_background_notice() {
+        let mut state = crate::state::UiState::new();
+        state.on_submit();
+        state.defer_background_notice("market failed".into());
+        let mut renderer = CaptureRenderer::default();
+        let mut think = ThinkStripper::default();
+        let mut pending_tools = std::collections::HashMap::new();
+        let mut setup_pending = true;
+        let mut reasoning_buffer = "partial".to_string();
+
+        finish_failed_turn_without_snapshot(
+            &mut state,
+            &mut renderer,
+            &mut think,
+            &mut pending_tools,
+            &mut setup_pending,
+            &mut reasoning_buffer,
+        );
+
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::Warning(message)] if message == "market failed"
+        ));
+        assert!(state.deferred_background_notices.is_empty());
+        assert!(!setup_pending);
+        assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
+    fn peer_terminal_flushes_background_notice_after_assistant_line() {
+        let mut state = crate::state::UiState::new();
+        state.on_submit();
+        state.defer_background_notice("market failed".into());
+        let mut renderer = CaptureRenderer::default();
+        let mut think = ThinkStripper::default();
+
+        complete_peer_turn_presentation(&mut state, &mut renderer, &mut think);
+
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::AssistantLineBreak, UiLine::Warning(message)]
+                if message == "market failed"
+        ));
+        assert!(state.deferred_background_notices.is_empty());
     }
 }
 
@@ -13955,9 +15461,13 @@ mod turn_error_reason_tests {
     use super::*;
 
     #[test]
-    fn errored_summary_folds_reason_and_consumes_it() {
+    fn errored_summary_folds_reason_when_nothing_showed_it_above() {
+        // Fallback path: an error path captured a reason but rendered NO visible
+        // cause line (`turn_error_line_shown` stays false) — the summary MUST
+        // fold the reason so the user still sees the cause.
         let mut state = UiState::new();
         state.last_turn_error = Some("账户余额不足（HTTP 402）".to_string());
+        assert!(!state.turn_error_line_shown);
         let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "3.2s");
         // Reason folded into the separator label (not a separate line).
         assert!(label.contains("账户余额不足（HTTP 402）"), "{label}");
@@ -13967,6 +15477,56 @@ mod turn_error_reason_tests {
         );
         // Consumed: cannot leak into the next turn.
         assert!(state.last_turn_error.is_none());
+    }
+
+    #[test]
+    fn errored_summary_suppresses_reason_when_shown_above() {
+        // A red Error / muted rate-limit line already showed the cause this turn,
+        // so the summary renders bare — no duplicate reason.
+        let mut state = UiState::new();
+        state.last_turn_error = Some("API key 未授权或已失效（HTTP 401）".to_string());
+        state.turn_error_line_shown = true;
+        let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "697ms");
+        // Still an interrupted summary…
+        assert!(
+            label.contains("已中断") || label.contains("Stopped"),
+            "{label}"
+        );
+        // …but the cause is NOT repeated — it's visible in the line above.
+        assert!(
+            !label.contains("401"),
+            "reason should not be folded: {label}"
+        );
+        // Both the reason and the flag are consumed for the next turn.
+        assert!(state.last_turn_error.is_none());
+        assert!(!state.turn_error_line_shown);
+    }
+
+    #[test]
+    fn deferred_summary_dedups_using_snapshot_across_on_submit() {
+        // A goal/loop round errored and showed its cause line, so its separator
+        // was DEFERRED with `turn_error_line_shown` snapshotted into the
+        // PendingSeparator. A later turn's `on_submit` then reset the LIVE flag.
+        // The deferred flush restores the snapshot, so it must still suppress the
+        // (already-shown) cause instead of folding it a second time.
+        let mut state = UiState::new();
+        state.last_turn_error = Some("API key 未授权或已失效（HTTP 401）".to_string());
+        state.turn_error_line_shown = true;
+        let snapshot = state.turn_error_line_shown; // captured at defer time
+
+        // A later turn begins: the live flag is reset, but the pending reason
+        // (last_turn_error) is intentionally NOT cleared by on_submit.
+        state.on_submit();
+        assert!(!state.turn_error_line_shown);
+        assert!(state.last_turn_error.is_some());
+
+        // Deferred flush restores the snapshot before building the summary.
+        state.turn_error_line_shown = snapshot;
+        let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "697ms");
+        assert!(
+            !label.contains("401"),
+            "deferred errored summary should dedup via snapshot: {label}"
+        );
     }
 
     #[test]
@@ -14036,6 +15596,9 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
     } else {
         // Reached only if a non-goal/non-loop turn was ever buffered (today
         // they render immediately). Kept as a correct fallback either way.
+        // Restore the defer-time shown-flag so this errored summary dedups the
+        // cause correctly even if a later turn's `on_submit` reset the live flag.
+        state.turn_error_line_shown = ps.error_line_shown;
         turn_summary_label(
             state,
             ps.errored,
@@ -14236,6 +15799,405 @@ fn ephemeral_tool_activity<'a>(tool_display: Option<&str>, chunk: &'a str) -> Op
     supported.then_some(activity)
 }
 
+fn subtask_progress_from_args(
+    call_id: &str,
+    arguments: &str,
+) -> Option<crate::render::SubtaskProgress> {
+    let repaired = atomcode_capabilities::tools::repair::repair_tool_args("task", arguments);
+    let value: serde_json::Value = serde_json::from_str(&repaired).ok()?;
+    let tasks = value.get("tasks")?.as_array()?;
+    if tasks.is_empty() {
+        return None;
+    }
+    let items = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| {
+            let kind = task
+                .get("subagent_type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("explore");
+            let description = task
+                .get("description")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            crate::render::SubtaskItem {
+                label: format!("{kind}#{}", index + 1),
+                description,
+                model: String::new(),
+                activity: String::new(),
+                started_at: None,
+                output_tokens: 0,
+                status: crate::render::SubtaskStatus::Pending,
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(crate::render::SubtaskProgress {
+        call_id: call_id.to_string(),
+        completed: 0,
+        total: items.len(),
+        items,
+    })
+}
+
+fn should_defer_task_approval_row(
+    tool_name: &str,
+    call_id: &str,
+    arguments: &str,
+    is_plain_renderer: bool,
+) -> bool {
+    tool_name == "task"
+        && !is_plain_renderer
+        && subtask_progress_from_args(call_id, arguments).is_some()
+}
+
+/// Fold one Task progress event into the fixed panel. On the first transition
+/// of a known child to a terminal state, return the permanent line to commit to
+/// scrollback. Replayed terminal events are idempotent and return `None`.
+fn update_subtask_progress(
+    progress: &mut crate::render::SubtaskProgress,
+    chunk: &str,
+) -> Option<String> {
+    use crate::render::SubtaskStatus;
+
+    let chunk = chunk
+        .strip_prefix(atomcode_capabilities::tools::task::SUBAGENT_ACTIVITY_MARKER)
+        .unwrap_or(chunk);
+    let parts = chunk.split(" \u{b7} ").collect::<Vec<_>>();
+    let started = parts
+        .first()
+        .is_some_and(|part| part.starts_with("\u{21bb} "));
+    let (label, model, activity, status) =
+        if parts.first().is_some_and(|part| *part == "\u{25cb} queued") {
+            (
+                parts.get(1).copied().unwrap_or_default(),
+                parts.get(2).copied(),
+                Some("waiting"),
+                SubtaskStatus::Pending,
+            )
+        } else if let Some(label) = parts
+            .first()
+            .and_then(|part| part.strip_prefix("\u{21bb} "))
+        {
+            (
+                label,
+                parts.get(1).copied(),
+                Some("running"),
+                SubtaskStatus::Running,
+            )
+        } else if parts.first().is_some_and(|part| *part == "\u{2713} done") {
+            (
+                parts.get(1).copied().unwrap_or_default(),
+                parts.get(2).copied(),
+                Some("completed"),
+                SubtaskStatus::Completed,
+            )
+        } else if parts
+            .first()
+            .is_some_and(|part| part.starts_with("\u{2717} failed"))
+        {
+            (
+                parts.get(1).copied().unwrap_or_default(),
+                parts.get(2).copied(),
+                parts.first().copied(),
+                SubtaskStatus::Failed,
+            )
+        } else {
+            (
+                parts.first().copied().unwrap_or_default(),
+                None,
+                parts.get(1).copied(),
+                SubtaskStatus::Running,
+            )
+        };
+
+    let Some(item) = progress.items.iter_mut().find(|item| item.label == label) else {
+        return None;
+    };
+    let was_terminal = matches!(
+        item.status,
+        SubtaskStatus::Completed | SubtaskStatus::Failed
+    );
+    if was_terminal {
+        return None;
+    }
+    item.status = status;
+    if started && item.started_at.is_none() {
+        item.started_at = Some(std::time::Instant::now());
+    }
+    if let Some(model) = model.filter(|model| !model.is_empty()) {
+        item.model = model.to_string();
+    }
+    if let Some(activity) = activity.filter(|activity| !activity.is_empty()) {
+        item.activity = activity.to_string();
+    }
+    if let Some(tokens) = parts
+        .iter()
+        .find_map(|part| part.strip_prefix("tokens="))
+        .and_then(|tokens| tokens.parse::<u64>().ok())
+    {
+        item.output_tokens = item.output_tokens.max(tokens);
+    }
+    let terminal_line = if matches!(status, SubtaskStatus::Completed | SubtaskStatus::Failed) {
+        let elapsed = item
+            .started_at
+            .map(|started_at| started_at.elapsed())
+            .unwrap_or_default();
+        Some(format!(
+            "{chunk} \u{b7} {} \u{b7} \u{2191} {} tokens",
+            crate::render::fmt_dur(elapsed),
+            crate::i18n::fmt_tokens(item.output_tokens as usize)
+        ))
+    } else {
+        None
+    };
+    progress.completed = progress
+        .items
+        .iter()
+        .filter(|item| item.status == SubtaskStatus::Completed)
+        .count();
+    terminal_line
+}
+
+/// Inspect only generated top-level `<task ...>` headers. Child output is
+/// arbitrary text inside the block and must not be allowed to spoof the
+/// aggregate state by merely mentioning `state="error"`.
+fn task_output_has_error_state(output: &str) -> bool {
+    let mut expect_header = true;
+    for line in output.lines() {
+        if expect_header {
+            let header = line.trim();
+            if header.starts_with("<task id=\"")
+                && header.contains("\" model=\"")
+                && (header.ends_with(" state=\"error\">") || header.ends_with(" state=\"failed\">"))
+            {
+                return true;
+            }
+            expect_header = false;
+        }
+        if line.trim() == "</task>" {
+            expect_header = true;
+        }
+    }
+    false
+}
+
+fn completed_task_detail(
+    detail: &str,
+    output: &str,
+    success: bool,
+    duration: std::time::Duration,
+) -> String {
+    let terminal = if !success || task_output_has_error_state(output) {
+        "finished"
+    } else {
+        "completed"
+    };
+    let elapsed = crate::render::fmt_dur(duration);
+    if detail.is_empty() {
+        format!("{terminal} \u{b7} {elapsed}")
+    } else {
+        format!("{detail} {terminal} \u{b7} {elapsed}")
+    }
+}
+
+#[cfg(test)]
+mod subtask_progress_projection_tests {
+    use super::{
+        completed_task_detail, should_defer_task_approval_row, subtask_progress_from_args,
+        update_subtask_progress,
+    };
+    use crate::render::SubtaskStatus;
+
+    #[test]
+    fn task_arguments_seed_stable_child_rows() {
+        let args = r#"{"tasks":[
+            {"subagent_type":"explore","description":"inspect atomcode"},
+            {"subagent_type":"worker","description":"fix codex","scope":["src/**"]}
+        ]}"#;
+        let progress = subtask_progress_from_args("call-7", args).expect("valid Task panel");
+
+        assert_eq!(progress.call_id, "call-7");
+        assert_eq!(progress.total, 2);
+        assert_eq!(progress.items[0].label, "explore#1");
+        assert_eq!(progress.items[0].description, "inspect atomcode");
+        assert_eq!(progress.items[1].label, "worker#2");
+        assert_eq!(progress.items[1].status, SubtaskStatus::Pending);
+    }
+
+    #[test]
+    fn task_projection_repairs_unescaped_newlines_like_the_tool() {
+        let args = "{\"tasks\":[{\"subagent_type\":\"explore\",\"description\":\"inspect\ncode\",\"prompt\":\"p\"}]}";
+        let progress = subtask_progress_from_args("call-7", args).expect("repairable Task panel");
+
+        assert_eq!(progress.items[0].description, "inspect\ncode");
+    }
+
+    #[test]
+    fn approval_defers_only_structured_retained_task_rows() {
+        let args = r#"{"tasks":[{"subagent_type":"worker","description":"edit","prompt":"p","scope":["src/**"]}]}"#;
+
+        assert!(should_defer_task_approval_row(
+            "task", "call-7", args, false
+        ));
+        assert!(!should_defer_task_approval_row(
+            "task", "call-7", args, true
+        ));
+        assert!(!should_defer_task_approval_row(
+            "bash", "call-7", args, false
+        ));
+        assert!(!should_defer_task_approval_row(
+            "task", "call-7", "{invalid", false
+        ));
+    }
+
+    #[test]
+    fn task_progress_updates_one_child_in_place() {
+        let args = r#"{"tasks":[
+            {"subagent_type":"explore","description":"inspect atomcode"},
+            {"subagent_type":"explore","description":"inspect codex"}
+        ]}"#;
+        let mut progress = subtask_progress_from_args("call-7", args).unwrap();
+        assert!(progress.items[0].started_at.is_none());
+        assert!(progress.items[1].started_at.is_none());
+
+        assert!(update_subtask_progress(
+            &mut progress,
+            "\u{1e}\u{25cb} queued \u{b7} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
+        )
+        .is_none());
+        assert_eq!(progress.items[0].status, SubtaskStatus::Pending);
+        assert_eq!(progress.items[0].model, "deepseek-v4-flash");
+        assert!(progress.items[0].started_at.is_none());
+
+        assert!(update_subtask_progress(
+            &mut progress,
+            "\u{21bb} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
+        )
+        .is_none());
+        assert_eq!(progress.items[0].status, SubtaskStatus::Running);
+        assert_eq!(progress.items[0].model, "deepseek-v4-flash");
+        assert!(progress.items[0].started_at.is_some());
+        assert_eq!(progress.items[1].status, SubtaskStatus::Pending);
+        assert!(progress.items[1].started_at.is_none());
+
+        assert!(update_subtask_progress(
+            &mut progress,
+            "\u{1e}explore#1 \u{b7} 已读取 commands.rs，正在分析内容 \u{b7} tokens=384",
+        )
+        .is_none());
+        assert_eq!(
+            progress.items[0].activity,
+            "已读取 commands.rs，正在分析内容"
+        );
+        assert_eq!(progress.items[0].output_tokens, 384);
+
+        progress.items[0].started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(33));
+        let terminal = update_subtask_progress(
+            &mut progress,
+            "\u{2713} done \u{b7} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
+        )
+        .expect("first terminal event must produce a permanent line");
+        assert_eq!(progress.items[0].status, SubtaskStatus::Completed);
+        assert_eq!(progress.completed, 1);
+        assert!(terminal.contains("33.0s"), "{terminal}");
+        assert!(terminal.contains("\u{2191} 384 tokens"), "{terminal}");
+        assert!(
+            update_subtask_progress(
+                &mut progress,
+                "\u{2713} done \u{b7} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
+            )
+            .is_none(),
+            "replayed terminal events must not duplicate scrollback"
+        );
+
+        assert!(update_subtask_progress(
+            &mut progress,
+            "\u{21bb} explore#2 \u{b7} deepseek-v4-flash \u{b7} inspect codex",
+        )
+        .is_none());
+        assert!(update_subtask_progress(
+            &mut progress,
+            "\u{1e}explore#2 \u{b7} checking completion \u{b7} tokens=725",
+        )
+        .is_none());
+        progress.items[1].started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+        let failed = update_subtask_progress(
+            &mut progress,
+            "\u{2717} failed (ProviderError) \u{b7} explore#2 \u{b7} deepseek-v4-flash \u{b7} inspect codex",
+        )
+        .expect("first failed event must produce a permanent line");
+        assert!(failed.contains("failed (ProviderError)"), "{failed}");
+        assert!(failed.contains("12.0s"), "{failed}");
+        assert!(failed.contains("\u{2191} 725 tokens"), "{failed}");
+        assert!(
+            update_subtask_progress(
+                &mut progress,
+                "\u{2717} failed (ProviderError) \u{b7} explore#2 \u{b7} deepseek-v4-flash \u{b7} inspect codex",
+            )
+            .is_none(),
+            "replayed failures must not duplicate scrollback"
+        );
+        assert_eq!(
+            progress.completed, 1,
+            "failed is finished but not completed"
+        );
+    }
+
+    #[test]
+    fn completed_task_keeps_one_compact_permanent_summary() {
+        assert_eq!(
+            completed_task_detail(
+                "3 subtasks",
+                r#"<task id="explore#1" model="mock" state="completed">
+<task_result>ok</task_result>
+</task>"#,
+                true,
+                std::time::Duration::from_secs(42),
+            ),
+            "3 subtasks completed \u{b7} 42.0s"
+        );
+        assert_eq!(
+            completed_task_detail(
+                "3 subtasks",
+                r#"<task id="explore#1" model="mock" state="error">
+<task_error>no</task_error>
+</task>"#,
+                true,
+                std::time::Duration::from_secs(2),
+            ),
+            "3 subtasks finished \u{b7} 2.0s"
+        );
+        assert_eq!(
+            completed_task_detail(
+                "3 subtasks",
+                r#"<task id="explore#1" model="mock" state="completed">
+<task_result>partial protocol result</task_result>
+</task>"#,
+                false,
+                std::time::Duration::from_secs(3),
+            ),
+            "3 subtasks finished \u{b7} 3.0s"
+        );
+        assert_eq!(
+            completed_task_detail(
+                "1 subtask",
+                r#"<task id="explore#1" model="mock" state="completed">
+<task_result>
+The parser should discuss state="error" without changing this successful result.
+</task_result>
+</task>"#,
+                true,
+                std::time::Duration::from_secs(4),
+            ),
+            "1 subtask completed \u{b7} 4.0s"
+        );
+    }
+}
+
 fn is_incomplete_review_result(name: &str, output: &str, success: bool) -> bool {
     !success && name == "code_review" && output.starts_with("Code review incomplete")
 }
@@ -14392,6 +16354,50 @@ mod kernel_terminal_projection_tests {
     }
 }
 
+fn project_token_usage(meta: atomcode_kernel::message::MessageMeta) -> AgentEvent {
+    AgentEvent::TokenUsage {
+        tokens: meta.tokens,
+        used_tokens: meta.used_tokens as usize,
+        ctx_window: meta.ctx_window as usize,
+    }
+}
+
+#[cfg(test)]
+mod token_usage_projection_tests {
+    use super::{project_token_usage, AgentEvent};
+    use atomcode_kernel::message::MessageMeta;
+    use atomcode_kernel::stream::TokenUsage;
+
+    #[test]
+    fn kernel_usage_preserves_footer_pressure_and_cost_breakdown() {
+        let event = project_token_usage(MessageMeta {
+            tokens: TokenUsage {
+                prompt: 4_200,
+                completion: 270,
+                cached: 3_100,
+            },
+            used_tokens: 58_200,
+            ctx_window: 1_000_000,
+            ..MessageMeta::default()
+        });
+
+        match event {
+            AgentEvent::TokenUsage {
+                tokens,
+                used_tokens,
+                ctx_window,
+            } => {
+                assert_eq!(tokens.prompt, 4_200);
+                assert_eq!(tokens.completion, 270);
+                assert_eq!(tokens.cached, 3_100);
+                assert_eq!(used_tokens, 58_200);
+                assert_eq!(ctx_window, 1_000_000);
+            }
+            other => panic!("unexpected projected event: {other:?}"),
+        }
+    }
+}
+
 fn project_kernel_event(
     event: atomcode_kernel::event::AgentEvent,
     ctx: &mut LoopCtx,
@@ -14453,14 +16459,10 @@ fn project_kernel_event(
                 duration: started.elapsed(),
             })
         }
-        Kernel::Usage(meta) => Some(AgentEvent::TokenUsage(atomcode_core::stream::TokenUsage {
-            prompt_tokens: meta.tokens.prompt as usize,
-            completion_tokens: meta.tokens.completion as usize,
-            cached_tokens: meta.tokens.cached as usize,
-        })),
+        Kernel::Usage(meta) => Some(project_token_usage(meta)),
         Kernel::Error { message, .. } => Some(AgentEvent::Error {
             error: message,
-            snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+            snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         }),
         Kernel::Warning(message) => Some(AgentEvent::Warning(message)),
         Kernel::RateLimited {
@@ -14476,7 +16478,7 @@ fn project_kernel_event(
             auto_resuming,
             server_message,
         }),
-        Kernel::Steered { count } => Some(AgentEvent::Steered { count }),
+        Kernel::Steered { count, inputs } => Some(AgentEvent::Steered { count, inputs }),
         Kernel::Cancelled
         | Kernel::Request { .. }
         | Kernel::Snapshot { .. }
@@ -14622,8 +16624,12 @@ fn sync_provider_projection_from_snapshot(
         return ProviderProjectionResult::Deferred;
     };
     let model = runtime_model.unwrap_or(&configured_model).to_string();
+    // Compare the RESOLVED active selection, not raw `default_provider`, so a
+    // new-schema selection (identified by its model id) is correctly detected as
+    // already-current instead of being re-projected every completion (§14.1).
+    let current_selection = resolved_provider_and_model(&ctx.config).0;
     if provider_projection_is_current(
-        &ctx.config.default_provider,
+        &current_selection,
         &ctx.model_name,
         ctx.observed_config_revision.as_ref(),
         &provider,
@@ -14717,6 +16723,44 @@ fn install_pending_session_picker(app: &mut App, ctx: &mut LoopCtx, renderer: &m
             renderer.render(UiLine::Error(
                 crate::i18n::t(crate::i18n::Msg::SessionListFailed { error: &error }).into_owned(),
             ));
+            renderer.flush();
+        }
+    }
+}
+
+fn install_pending_rewind_modal(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    if ctx.pending_rewind_catalog.is_none() || app.active_modal.is_some() {
+        return;
+    }
+    match ctx
+        .pending_rewind_catalog
+        .take()
+        .expect("pending rewind catalog checked Some above")
+    {
+        Ok(catalog) if catalog.points.is_empty() => {
+            renderer.render(UiLine::CommandOutput(
+                match crate::i18n::current_locale() {
+                    crate::i18n::Locale::ZhCn => "当前会话还没有可回退的回合。",
+                    crate::i18n::Locale::En => "This session has no Rewind points yet.",
+                }
+                .to_string(),
+            ));
+            renderer.flush();
+        }
+        Ok(catalog) => {
+            let modal: Box<dyn crate::modals::Modal> =
+                Box::new(crate::modals::RewindModal::open(catalog));
+            modal.draw(&app.buf, &app.state, ctx, renderer);
+            app.active_modal = Some(modal);
+        }
+        Err(error) => {
+            renderer.render(UiLine::Error(format!(
+                "{}: {error}",
+                match crate::i18n::current_locale() {
+                    crate::i18n::Locale::ZhCn => "加载回退点失败",
+                    crate::i18n::Locale::En => "Failed to load Rewind points",
+                }
+            )));
             renderer.flush();
         }
     }
@@ -14827,58 +16871,52 @@ fn handle_runtime_event(
                 }
                 CodingRuntimeEvent::Request(request) => {
                     use atomcode_capabilities::tools::{
-                        request_user_input::{
-                            UserInputRequest, UserInputResponse, REQUEST_USER_INPUT_KIND,
-                        },
+                        request_user_input::{UserInputResponse, REQUEST_USER_INPUT_KIND},
                         ApprovalRequest, APPROVAL_KIND,
                     };
                     if request.kind == REQUEST_USER_INPUT_KIND {
-                        // Batch form: a non-empty `questions` array. Handled before the
-                        // single path so a multi-question request never hits the flat parse.
-                        if let Some(qs) = request
-                            .payload
-                            .get("questions")
-                            .and_then(serde_json::Value::as_array)
-                        {
-                            let reqs: Vec<UserInputRequest> = qs
-                                .iter()
-                                .filter_map(|q| {
-                                    serde_json::from_value::<UserInputRequest>(q.clone()).ok()
-                                })
-                                .collect();
-                            if reqs.is_empty() {
-                                deliver_user_input(ctx, request.id, UserInputResponse::declined());
-                                return;
+                        match classify_tui_user_input(request.payload) {
+                            TuiUserInputPresentation::Batch(requests) => {
+                                state.user_input_batch =
+                                    Some(crate::state::UserInputBatch::new(request.id, &requests));
+                                state.phase = UiPhase::UserInput;
+                                redraw_idle_plain(buf, state, ctx, renderer);
                             }
-                            if user_input_should_auto_skip(state.agent_mode) {
-                                deliver_user_input_batch(
-                                    ctx,
-                                    request.id,
-                                    vec![UserInputResponse::declined(); reqs.len()],
-                                );
-                                return;
-                            }
-                            state.user_input_batch =
-                                Some(crate::state::UserInputBatch::new(request.id, &reqs));
-                            state.phase = UiPhase::UserInput;
-                            redraw_idle_plain(buf, state, ctx, renderer);
-                            return;
-                        }
-                        if user_input_should_auto_skip(state.agent_mode) {
-                            deliver_user_input(ctx, request.id, UserInputResponse::declined());
-                            return;
-                        }
-                        match serde_json::from_value::<UserInputRequest>(request.payload) {
-                            Ok(input) => {
+                            TuiUserInputPresentation::Single(input) => {
                                 state.user_input_panel =
                                     Some(crate::state::UserInputPanel::new(request.id, &input));
                                 state.phase = UiPhase::UserInput;
                                 redraw_idle_plain(buf, state, ctx, renderer);
                             }
-                            Err(_) => {
-                                deliver_user_input(ctx, request.id, UserInputResponse::declined())
+                            TuiUserInputPresentation::Invalid => {
+                                deliver_user_input(ctx, request.id, UserInputResponse::declined());
                             }
                         }
+                        return;
+                    }
+                    if request.kind == atomcode_kernel::ROUND_CAP_CHECKPOINT_KIND {
+                        let cap = request
+                            .payload
+                            .get("cap")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0) as u32;
+                        // Re-arm increment (rounds granted per "continue"); falls back
+                        // to `cap` if the kernel didn't send it (older payloads).
+                        let base = request
+                            .payload
+                            .get("base")
+                            .and_then(serde_json::Value::as_u64)
+                            .map(|b| b as u32)
+                            .unwrap_or(cap);
+                        // 无值守/免审批模式：fail-closed 停止（等同旧 MaxRounds）。
+                        if round_cap_should_auto_stop(state.agent_mode) {
+                            deliver_round_cap(ctx, request.id, false);
+                            return;
+                        }
+                        state.round_cap_panel =
+                            Some(crate::state::RoundCapPanel::new(request.id, cap, base));
+                        state.phase = UiPhase::RoundCap;
+                        redraw_idle_plain(buf, state, ctx, renderer);
                         return;
                     }
                     if request.kind != APPROVAL_KIND {
@@ -14901,16 +16939,14 @@ fn handle_runtime_event(
                             return;
                         }
                     };
-                    let snapshot = request
-                        .snapshot
-                        .as_deref()
-                        .map(snapshot_to_core)
-                        .unwrap_or_default();
+                    let snapshot = request.snapshot.as_deref().cloned().unwrap_or_else(|| {
+                        atomcode_kernel::message::SessionSnapshot::new(Vec::new())
+                    });
                     handle_agent_event(
                         AgentEvent::ApprovalNeeded {
                             tool_name: approval.tool.clone(),
                             reason: "Requires approval".into(),
-                            call: atomcode_core::tool::ToolCall {
+                            call: atomcode_kernel::tool::ToolCall {
                                 id: approval.call_id,
                                 name: approval.tool,
                                 arguments: approval.args,
@@ -14942,7 +16978,7 @@ fn handle_runtime_event(
                             ..
                         } if matches!(reason, atomcode_kernel::event::StopReason::Cancelled) => {
                             AgentEvent::TurnCancelled {
-                                snapshot: snapshot_to_core(snapshot.as_ref()),
+                                snapshot: snapshot.as_ref().clone(),
                             }
                         }
                         atomcode_coding::TurnCompletion::Completed {
@@ -14962,13 +16998,13 @@ fn handle_runtime_event(
                                 turn_count: stats.turn_count,
                                 tool_call_count: stats.tool_call_count,
                                 stop_reason: kernel_stop_reason(reason),
-                                snapshot: snapshot_to_core(snapshot.as_ref()),
+                                snapshot: snapshot.as_ref().clone(),
                             }
                         }
                         atomcode_coding::TurnCompletion::SnapshotUnavailable { error, .. } => {
                             AgentEvent::Error {
                                 error: error.message,
-                                snapshot: Default::default(),
+                                snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
                             }
                         }
                     };
@@ -14986,6 +17022,7 @@ fn handle_runtime_event(
                     if snapshot_unavailable {
                         finish_failed_turn_without_snapshot(
                             state,
+                            renderer,
                             think,
                             pending_tools,
                             setup_pending,
@@ -14998,12 +17035,15 @@ fn handle_runtime_event(
                     ctx.pending_runtime_request_id = None;
                     if matches!(
                         state.phase,
-                        UiPhase::Streaming | UiPhase::Approval | UiPhase::UserInput
+                        UiPhase::Streaming
+                            | UiPhase::Approval
+                            | UiPhase::UserInput
+                            | UiPhase::RoundCap
                     ) {
                         handle_agent_event(
                             AgentEvent::Error {
                                 error: "coding runtime stopped before turn terminal".into(),
-                                snapshot: Default::default(),
+                                snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
                             },
                             state,
                             think,
@@ -15016,6 +17056,7 @@ fn handle_runtime_event(
                         );
                         finish_failed_turn_without_snapshot(
                             state,
+                            renderer,
                             think,
                             pending_tools,
                             setup_pending,
@@ -15109,6 +17150,7 @@ fn handle_runtime_event(
                     handle_agent_event(
                         AgentEvent::GoalUpdate {
                             active: progress.active,
+                            terminal: progress.terminal,
                             round: progress.round,
                             elapsed_secs: progress.elapsed_secs,
                             condition: progress.condition,
@@ -15207,7 +17249,7 @@ fn handle_runtime_event(
                 CodingRuntimeEvent::UndoFinished(result) => {
                     match result {
                         Ok(result) => handle_undo_success(
-                            snapshot_to_core(result.snapshot.as_ref()),
+                            result.snapshot.as_ref().clone(),
                             result.restored_prompt,
                             result.target_n,
                             result.prompts_before,
@@ -15222,6 +17264,28 @@ fn handle_runtime_event(
                         }) => handle_undo_failure(requested, available, renderer),
                         Err(error) => {
                             renderer.render(UiLine::Error(format!("undo failed: {error}")));
+                            renderer.flush();
+                        }
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::RewindCatalogRefreshed(result) => {
+                    ctx.pending_rewind_catalog = Some(result);
+                    return;
+                }
+                CodingRuntimeEvent::RewindFinished(result) => {
+                    match result {
+                        Ok(result) => {
+                            handle_rewind_success(result, state, renderer, ctx, buf);
+                        }
+                        Err(error) => {
+                            renderer.render(UiLine::Error(format!(
+                                "{}: {error}",
+                                match crate::i18n::current_locale() {
+                                    crate::i18n::Locale::ZhCn => "回退失败",
+                                    crate::i18n::Locale::En => "Rewind failed",
+                                }
+                            )));
                             renderer.flush();
                         }
                     }
@@ -15431,6 +17495,7 @@ fn handle_runtime_event(
                     let PendingProviderReload {
                         desired_config,
                         announce,
+                        language_change_notice,
                         manual_reload_announce,
                         selection_mode_after_success,
                         ..
@@ -15480,7 +17545,7 @@ fn handle_runtime_event(
                                 .into_owned(),
                         ));
                     } else {
-                        if language_changed {
+                        if language_change_notice.should_render(language_changed) {
                             let locale = crate::i18n::current_locale();
                             let label = match locale {
                                 atomcode_config::locale::Locale::En => "English",
@@ -15495,7 +17560,16 @@ fn handle_runtime_event(
                             ));
                         }
                         if let Some(announcement) = announce.filter(|value| !value.is_empty()) {
-                            renderer.render(UiLine::CommandOutput(announcement));
+                            // Retained mode gives the next user message its own
+                            // leading paragraph boundary. Do not encode that
+                            // layout in the translated `/model` announcement:
+                            // the trailing newline used to create a transient
+                            // blank row that could be consumed while the footer
+                            // and live body changed geometry. PlainRenderer
+                            // still terminates CommandOutput with `\n` itself.
+                            renderer.render(UiLine::CommandOutput(
+                                announcement.trim_end_matches(['\r', '\n']).to_string(),
+                            ));
                         }
                         if manual_reload_announce {
                             renderer.render(UiLine::CommandOutput(
@@ -15718,13 +17792,14 @@ fn handle_runtime_event(
 /// runtime stop that violated the turn-terminal contract).
 fn finish_failed_turn_without_snapshot(
     state: &mut UiState,
+    renderer: &mut dyn Renderer,
     think: &mut ThinkStripper,
     pending_tools: &mut std::collections::HashMap<String, (String, String, bool)>,
     setup_pending: &mut bool,
     reasoning_buffer: &mut String,
 ) {
     state.response_finalized = true;
-    state.on_turn_complete();
+    complete_turn_presentation(state, renderer);
     think.reset();
     pending_tools.clear();
     reasoning_buffer.clear();
@@ -15863,9 +17938,7 @@ fn commit_live_capability_projection(
     let Some(binding) = ctx.live_binding.clone() else {
         return Ok(());
     };
-    let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
-        &ctx.current_session.to_conversation_snapshot(),
-    );
+    let snapshot = ctx.current_session.to_conversation_snapshot();
     ctx.live_binding = Some(
         atomcode_daemon::native_live::commit_runtime_snapshot(
             &binding,
@@ -15918,9 +17991,7 @@ fn commit_native_session_changed(
     let session_id = session.id.clone();
     let working_dir = atomcode_capabilities::pathnorm::strip_verbatim_path(&working_dir);
     let next_live_binding = if let Some(binding) = ctx.live_binding.clone() {
-        let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
-            &session.to_conversation_snapshot(),
-        );
+        let snapshot = session.to_conversation_snapshot();
         Some(
             atomcode_daemon::native_live::replace_snapshot(
                 &binding,
@@ -15952,6 +18023,7 @@ fn commit_native_session_changed(
     state.on_turn_complete();
     state.on_session_replaced();
     state.active_todos = None;
+    state.active_subtasks = None;
     sync_todo_titles(state);
     state.approval_panel = None;
     commands::bind_telemetry_to_session(ctx, &session);
@@ -16089,7 +18161,7 @@ fn run_local_shell_command(command: String, ctx: &LoopCtx) {
 }
 
 fn handle_undo_success(
-    snapshot: atomcode_core::conversation::ConversationSnapshot,
+    snapshot: atomcode_kernel::message::SessionSnapshot,
     restored_prompt: String,
     target_n: usize,
     prompts_before: usize,
@@ -16118,6 +18190,70 @@ fn handle_undo_success(
     renderer.render(UiLine::CommandOutput(
         crate::i18n::t(crate::i18n::Msg::CmdUndoDiskWarning).into_owned(),
     ));
+    renderer.flush();
+    state.on_turn_complete();
+}
+
+fn handle_rewind_success(
+    result: atomcode_coding::RewindResult,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+    buf: &mut Buffer,
+) {
+    let restored_conversation = matches!(
+        result.scope,
+        atomcode_coding::RewindScope::Conversation
+            | atomcode_coding::RewindScope::ConversationAndCode
+    );
+    if restored_conversation {
+        let new_len = result.snapshot.messages.len();
+        commands::stop_active_loop(state, ctx);
+        ctx.current_session
+            .update_from_conversation_snapshot(result.snapshot.as_ref().clone());
+        ctx.current_session.retain_turn_stats_after_undo(new_len);
+        ctx.current_session.touch();
+        ctx.bg_manager
+            .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
+        crate::modals::session_picker::replay_session(renderer, state, &ctx.current_session, true);
+        if let Some(prompt) = result.restored_prompt {
+            buf.set_restored_text(prompt);
+        }
+    }
+
+    let scope = match (crate::i18n::current_locale(), result.scope) {
+        (crate::i18n::Locale::ZhCn, atomcode_coding::RewindScope::Conversation) => "对话",
+        (crate::i18n::Locale::ZhCn, atomcode_coding::RewindScope::Code) => "代码",
+        (crate::i18n::Locale::ZhCn, atomcode_coding::RewindScope::ConversationAndCode) => {
+            "对话和代码"
+        }
+        (crate::i18n::Locale::En, atomcode_coding::RewindScope::Conversation) => "conversation",
+        (crate::i18n::Locale::En, atomcode_coding::RewindScope::Code) => "code",
+        (crate::i18n::Locale::En, atomcode_coding::RewindScope::ConversationAndCode) => {
+            "conversation and code"
+        }
+    };
+    let message = match crate::i18n::current_locale() {
+        crate::i18n::Locale::ZhCn => format!(
+            "↩ 已将{scope}回退到“{}”之前{}。",
+            result.point.prompt_preview,
+            if result.restored_files.is_empty() {
+                String::new()
+            } else {
+                format!("（恢复 {} 个文件）", result.restored_files.len())
+            }
+        ),
+        crate::i18n::Locale::En => format!(
+            "↩ Rewound {scope} to before “{}”{}.",
+            result.point.prompt_preview,
+            if result.restored_files.is_empty() {
+                String::new()
+            } else {
+                format!(" (restored {} files)", result.restored_files.len())
+            }
+        ),
+    };
+    renderer.render(UiLine::CommandOutput(message));
     renderer.flush();
     state.on_turn_complete();
 }
@@ -16160,8 +18296,7 @@ fn persist_native_compaction_snapshot(
         return false;
     };
 
-    let core_snapshot = snapshot_to_core(snapshot);
-    persist_current_session(ctx, core_snapshot, renderer)
+    persist_current_session(ctx, snapshot.clone(), renderer)
 }
 
 fn handle_coding_runtime_event(
@@ -16183,11 +18318,22 @@ fn handle_coding_runtime_event(
             }
         }
         CodingRuntimeEvent::CompactionFinished { completion } => {
+            let compaction_was_announced = state.compacting;
             state.compacting = false;
             match completion {
                 CompactionCompletion::Completed(outcome) if outcome.committed => {
                     state.on_compaction_committed(outcome.estimated_tokens_after);
-                    if mirror_persisted {
+                    // Match OpenCode/Codex: cheap, automatic pruning of stale
+                    // tool output is invisible transcript maintenance. Keep the
+                    // context gauge authoritative, but do not append a body row
+                    // or flush while the foreground turn is preparing its next
+                    // model request. Slow drain/summarize compaction announces
+                    // itself before running and remains visible even when replacing
+                    // one message with one summary produces zero net removals.
+                    // Manual and overflow paths retain their existing feedback.
+                    let silent_tool_fold = matches!(&outcome.trigger, CompactTrigger::Auto { .. })
+                        && !compaction_was_announced;
+                    if mirror_persisted && !silent_tool_fold {
                         renderer.render(UiLine::CompactionMark(
                             atomcode_config::i18n::format_compaction_mark(
                                 outcome.removed_messages,
@@ -16245,16 +18391,10 @@ fn handle_coding_runtime_event(
             }
         }
         CodingRuntimeEvent::ProviderUnavailable { reason, .. } => {
-            let message = match reason {
-                atomcode_coding::ProviderUnavailableReason::NotConfigured => {
-                    crate::i18n::t(crate::i18n::Msg::CmdNoActiveProvider)
-                }
-                atomcode_coding::ProviderUnavailableReason::AuthenticationRequired => {
-                    crate::i18n::t(crate::i18n::Msg::CmdWhoamiNotSignedIn)
-                }
-            };
-            renderer.render(UiLine::CommandOutput(message.into_owned()));
-            renderer.flush();
+            if let Some(message) = provider_unavailable_announcement(reason) {
+                renderer.render(UiLine::CommandOutput(crate::i18n::t(message).into_owned()));
+                renderer.flush();
+            }
         }
         _ => {}
     }
@@ -16303,6 +18443,8 @@ mod coding_runtime_event_tests {
 
     #[test]
     fn kernel_projection_preserves_reasoning_blocks() {
+        // Build a kernel assistant message that carries both tool calls and
+        // reasoning blocks (the Anthropic extended-thinking case).
         let mut message = atomcode_kernel::message::Message::assistant(
             "answer",
             vec![atomcode_kernel::tool::ToolCall {
@@ -16317,43 +18459,16 @@ mod coding_runtime_event_tests {
             provider: Some("anthropic".into()),
         }];
 
-        let projected = snapshot_to_core(&atomcode_kernel::message::SessionSnapshot::new(vec![
-            message,
-        ]))
-        .messages
-        .into_iter()
-        .next()
-        .expect("projected message");
-        let atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
-            thinking_blocks,
-            ..
-        } = projected.content
-        else {
-            panic!("expected assistant tool-call content");
-        };
-        assert_eq!(thinking_blocks.len(), 1);
-        assert_eq!(thinking_blocks[0].text, "thought");
-        assert_eq!(thinking_blocks[0].signature, "sig");
-    }
-
-    #[test]
-    fn kernel_projection_restores_legacy_cold_summaries() {
-        use atomcode_core::conversation::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
-        let mut summary = atomcode_kernel::message::Message::user(format!(
-            "{LEGACY_COLD_SUMMARY_PREFIX}older context"
-        ));
-        summary.synthetic = true;
-        summary.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.into());
-        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
-            summary,
-            atomcode_kernel::message::Message::user("recent"),
-        ]);
-
-        let projected = snapshot_to_core(&snapshot);
-
-        assert_eq!(projected.cold_summaries, vec!["older context"]);
-        assert_eq!(projected.messages.len(), 1);
-        assert_eq!(projected.messages[0].text(), Some("recent"));
+        // Verify the kernel message itself carries the reasoning blocks on its
+        // flat fields — no core::conversation projection needed.
+        assert!(!message.tool_calls.is_empty(), "tool_calls must be set");
+        assert_eq!(message.reasoning_blocks.len(), 1);
+        assert_eq!(message.reasoning_blocks[0].text, "thought");
+        assert_eq!(
+            message.reasoning_blocks[0].opaque.as_deref(),
+            Some("sig"),
+            "opaque (signature) must round-trip"
+        );
     }
 
     #[test]
@@ -16460,6 +18575,81 @@ mod coding_runtime_event_tests {
     }
 
     #[test]
+    fn automatic_tool_output_fold_is_silent_and_updates_context_gauge() {
+        let mut state = UiState::default();
+        state.phase = UiPhase::Streaming;
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            let mut folded = outcome(CompactTrigger::Auto { utilization: 0.7 }, true);
+            folded.removed_messages = 0;
+            folded.estimated_tokens_after = 22_800;
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(folded),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+
+        assert!(matches!(state.phase, UiPhase::Streaming));
+        assert_eq!(
+            state
+                .last_context
+                .as_ref()
+                .map(|snapshot| snapshot.sent_tokens),
+            Some(22_800),
+            "silent maintenance must still refresh the footer context gauge"
+        );
+        assert!(
+            output.is_empty(),
+            "automatic tool-output folding must not touch foreground transcript rendering"
+        );
+    }
+
+    #[test]
+    fn announced_automatic_summary_with_zero_net_removals_remains_visible() {
+        let mut state = UiState::default();
+        state.phase = UiPhase::Streaming;
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionStarted {
+                    trigger: CompactTrigger::Auto { utilization: 0.8 },
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+            let mut summarized = outcome(CompactTrigger::Auto { utilization: 0.8 }, true);
+            summarized.removed_messages = 0;
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(summarized),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+
+        assert!(!state.compacting);
+        assert!(matches!(state.phase, UiPhase::Streaming));
+        assert!(
+            !output.is_empty(),
+            "an announced automatic summary must render its completion marker"
+        );
+    }
+
+    #[test]
     fn manual_noop_renders_acknowledgement_and_restores_idle() {
         let mut state = UiState::default();
         state.phase = UiPhase::Streaming;
@@ -16544,6 +18734,25 @@ mod coding_runtime_event_tests {
         assert!(matches!(state.phase, UiPhase::Idle));
         assert!(!state.compacting);
         assert!(!output.is_empty());
+    }
+}
+
+fn goal_terminal_is_met(terminal: Option<atomcode_coding::GoalTerminal>) -> bool {
+    terminal == Some(atomcode_coding::GoalTerminal::Met)
+}
+
+#[cfg(test)]
+mod goal_end_tests {
+    use super::goal_terminal_is_met;
+    use atomcode_coding::GoalTerminal;
+
+    #[test]
+    fn only_explicit_met_terminal_is_successful() {
+        assert!(goal_terminal_is_met(Some(GoalTerminal::Met)));
+        assert!(!goal_terminal_is_met(Some(GoalTerminal::Failed)));
+        assert!(!goal_terminal_is_met(Some(GoalTerminal::Stopped)));
+        assert!(!goal_terminal_is_met(Some(GoalTerminal::Cancelled)));
+        assert!(!goal_terminal_is_met(None));
     }
 }
 
@@ -16678,6 +18887,20 @@ fn handle_agent_event(
                 sync_todo_titles(state); // titles follow the new plan (id = position)
             }
 
+            // Task fan-out owns a fixed footer panel while it runs. Seed the
+            // stable child rows from the call arguments before any batch /
+            // approval early return; live ToolProgress events update this
+            // projection in place and never enter transcript scrollback.
+            let task_panel = if name == "task" && !ctx.is_plain_renderer {
+                subtask_progress_from_args(&id, &arguments)
+            } else {
+                None
+            };
+            if let Some(progress) = task_panel.as_ref() {
+                state.active_subtasks = Some(progress.clone());
+                state.subagent_activity = None;
+            }
+
             // If this call is part of an active batch, the
             // ToolBatchStarted handler already rendered the group header
             // + child rows — skip the standalone ▸ ToolCallInFlight
@@ -16718,6 +18941,16 @@ fn handle_agent_event(
                 return;
             }
 
+            // A valid Task call is represented solely by the fixed Subtasks
+            // panel until its terminal event. Keep the call metadata so the
+            // result handler can append one compact permanent `Task(...)` row,
+            // but do not create an animated body tool row or generic spinner.
+            if task_panel.is_some() {
+                pending_tools.insert(id, (display.clone(), detail, false));
+                state.on_tool_call_started(&display);
+                return;
+            }
+
             // Emit the ▸ line immediately so users can see what command
             // is running, especially for long-running bash commands.
             renderer.render(UiLine::AssistantLineBreak);
@@ -16747,6 +18980,25 @@ fn handle_agent_event(
         }
         AgentEvent::ToolOutputChunk { call_id, chunk } => {
             let tool_display = pending_tools.get(&call_id).map(|(d, ..)| d.as_str());
+            if state
+                .active_subtasks
+                .as_ref()
+                .is_some_and(|progress| progress.call_id == call_id)
+            {
+                let terminal_line = state
+                    .active_subtasks
+                    .as_mut()
+                    .and_then(|progress| update_subtask_progress(progress, &chunk));
+                if let Some(terminal_line) = terminal_line {
+                    // Running activity belongs to the fixed panel, but a terminal
+                    // child is historical information. Commit it once so completed
+                    // and failed children remain visible above the live panel.
+                    renderer.render(UiLine::CommandOutput(terminal_line));
+                }
+                state.subagent_activity = None;
+                renderer.flush();
+                return;
+            }
             // Marker-prefixed child activity is EPHEMERAL: latest wins in the footer spinner,
             // never append it to scrollback. Scope the convention to known sub-agent tools so
             // an unrelated command that emits U+001E cannot hijack the UI.
@@ -16770,7 +19022,7 @@ fn handle_agent_event(
             name,
             output,
             success,
-            ..
+            duration,
         } => {
             // A result for this call arrived while an approval prompt is still up ⇒ the
             // approval was resolved WITHOUT the user answering (headless timeout fail-close,
@@ -16782,6 +19034,13 @@ fn handle_agent_event(
             // agent keeps working the rest of the turn.
             if name == "task" || name == "code_review" {
                 state.subagent_activity = None;
+                if state
+                    .active_subtasks
+                    .as_ref()
+                    .is_some_and(|progress| progress.call_id == call_id)
+                {
+                    state.active_subtasks = None;
+                }
             }
             // Title cache (id → content, for `todo update #N` row names) is maintained by
             // `sync_todo_titles` from `active_todos` at every panel mutation. This legacy parse
@@ -16874,9 +19133,12 @@ fn handle_agent_event(
             // Prefer the display-name we stored at ToolCallStarted time;
             // fall back to converting the raw name if we missed the Start
             // (e.g. protocol surfaced a Result without a matching Start).
-            let (display_name, detail, call_rendered) = pending_tools
+            let (display_name, mut detail, call_rendered) = pending_tools
                 .remove(&call_id)
                 .unwrap_or_else(|| (display_tool_name(&name), String::new(), false));
+            if name == "task" && output.contains("<task ") && !call_rendered {
+                detail = completed_task_detail(&detail, &output, success, duration);
+            }
 
             // Filter empty tool names (model occasionally emits malformed
             // tool calls with "" as the name; agent surfaces the error via
@@ -16911,7 +19173,9 @@ fn handle_agent_event(
 
             // Only emit the tool-call line here if ApprovalNeeded didn't
             // already render it — otherwise we'd print it twice.
-            if !call_rendered && !suppress_body_echo {
+            if !call_rendered
+                && (!suppress_body_echo || (name == "task" && output.contains("<task ")))
+            {
                 renderer.render(UiLine::ToolCall {
                     name: safe_name.clone(),
                     detail: detail.clone(),
@@ -17051,11 +19315,22 @@ fn handle_agent_event(
                 .get(&call.id)
                 .map(|(_, det, _)| det.clone())
                 .unwrap_or_else(|| format_tool_detail(&tool_name, &call.arguments));
+            let defer_task_row = should_defer_task_approval_row(
+                &tool_name,
+                &call.id,
+                &call.arguments,
+                ctx.is_plain_renderer,
+            );
 
             // Check if ToolCallStarted already rendered this tool call as a
             // dynamic ToolCallInFlight spinner. If so, we need to freeze it
             // to a static `▸` row before showing the approval prompt.
-            if let Some(entry) = pending_tools.get_mut(&call.id) {
+            if defer_task_row {
+                // The approval panel already names the Task being approved.
+                // Keep its transcript row deferred so ToolCallResult can append
+                // exactly one permanent `Task(... completed · duration)` row.
+                pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), false));
+            } else if let Some(entry) = pending_tools.get_mut(&call.id) {
                 let (disp, det, rendered) = entry;
                 if *rendered {
                     // ToolCallInFlight is animating — commit it to a static row
@@ -17189,6 +19464,7 @@ fn handle_agent_event(
                     was_goal_round: true,
                     was_loop_round: false,
                     errored,
+                    error_line_shown: state.turn_error_line_shown,
                     cached_pct,
                 });
             } else if state.loop_label.is_some() {
@@ -17204,6 +19480,7 @@ fn handle_agent_event(
                     was_goal_round: false,
                     was_loop_round: true,
                     errored,
+                    error_line_shown: state.turn_error_line_shown,
                     cached_pct,
                 });
             } else {
@@ -17221,7 +19498,7 @@ fn handle_agent_event(
                 renderer.render(UiLine::TurnSeparator { label });
             }
             renderer.flush();
-            state.on_turn_complete();
+            complete_turn_presentation(state, renderer);
 
             // Reset the think stripper between turns. If the previous turn
             // left an unclosed `<think>` in flight (cancelled mid-stream,
@@ -17269,7 +19546,7 @@ fn handle_agent_event(
             // (with cooldown) so the right-aligned hint reflects the
             // tokens the turn just consumed. Gated to CodingPlan users
             // only; non-CodingPlan paths skip all network activity.
-            if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+            if monitor::is_codingplan_provider(&resolved_provider_and_model(&ctx.config).0) {
                 let cooled = ctx
                     .usage_last_check_at
                     .map(|t| t.elapsed() >= usage_monitor::USAGE_COOLDOWN)
@@ -17340,7 +19617,7 @@ fn handle_agent_event(
             }
             renderer.render(UiLine::TurnCancelled);
             renderer.flush();
-            state.on_turn_cancelled();
+            cancel_turn_presentation(state, renderer);
             *setup_pending = false;
             // Same reset rationale as TurnComplete: a cancelled turn is the
             // single most common way for `<think>` to go unclosed, so this
@@ -17390,6 +19667,10 @@ fn handle_agent_event(
             // on a real terminal — the `✗ 已中断` summary renders cleanly at Idle,
             // so binding the reason to it guarantees the user sees the cause.
             state.last_turn_error = Some(error.clone());
+            // The cause is now visible in a committed red line above, so the
+            // errored turn-summary renders bare (`✗ 已中断 · …`) instead of
+            // folding the same reason a second time.
+            state.turn_error_line_shown = true;
             renderer.render(UiLine::Error(error));
             renderer.flush();
             // Diagnostic only. The runtime emits the authoritative
@@ -17479,17 +19760,21 @@ fn handle_agent_event(
             // over yet); the next idle/streaming redraw picks up the new
             // pending state on its own.
         }
-        AgentEvent::TokenUsage(u) => {
-            state.on_token_usage();
-            state.prompt_tokens += u.prompt_tokens;
-            state.completion_tokens += u.completion_tokens;
-            state.cached_tokens += u.cached_tokens;
-            state.total_tokens += u.completion_tokens;
+        AgentEvent::TokenUsage {
+            tokens: u,
+            used_tokens,
+            ctx_window,
+        } => {
+            state.on_token_usage(used_tokens, ctx_window);
+            state.prompt_tokens += u.prompt as usize;
+            state.completion_tokens += u.completion as usize;
+            state.cached_tokens += u.cached as usize;
+            state.total_tokens += u.completion as usize;
             // Per-turn tallies for the footer's billable count + cache annotation
             // (reset in on_turn_complete / on_turn_cancelled).
-            state.turn_prompt_tokens += u.prompt_tokens;
-            state.turn_completion_tokens += u.completion_tokens;
-            state.turn_cached_tokens += u.cached_tokens;
+            state.turn_prompt_tokens += u.prompt as usize;
+            state.turn_completion_tokens += u.completion as usize;
+            state.turn_cached_tokens += u.cached as usize;
         }
         AgentEvent::WorkingDirChanged(new_dir) => {
             // Fires when a tool (change_dir / bash cd) or
@@ -17775,6 +20060,7 @@ fn handle_agent_event(
         }
         AgentEvent::GoalUpdate {
             active,
+            terminal,
             round,
             condition,
             last_reason,
@@ -17796,16 +20082,14 @@ fn handle_agent_event(
                 // form here.
                 if state.goal_condition.is_some() {
                     if let Some(reason) = last_reason.as_deref() {
-                        let banner = if reason.contains("cancelled") {
+                        let banner = if terminal == Some(atomcode_coding::GoalTerminal::Cancelled) {
                             // Cancel already gets its own UiLine via
                             // TurnCancelled — skip to avoid double banner.
                             None
-                        } else if reason.contains("evaluator unavailable")
-                            || reason.contains("cleared by user")
-                        {
-                            Some(format!("  ⚠ Goal stopped: {reason}\n"))
-                        } else {
+                        } else if goal_terminal_is_met(terminal) {
                             Some(format!("  ✓ Goal met: {reason}\n"))
+                        } else {
+                            Some(format!("  ⚠ Goal stopped: {reason}\n"))
                         };
                         if let Some(line) = banner {
                             renderer.render(UiLine::CommandOutput(line));
@@ -17983,7 +20267,9 @@ fn handle_agent_event(
             // recover the conversation state. A correlated native restore has its
             // own completion event; ignore a stale generic sync while that handoff
             // owns the session boundary.
-            if !snapshot.messages.is_empty() || !snapshot.cold_summaries.is_empty() {
+            // A kernel snapshot carries cold-summary synthetics inline in
+            // `messages`, so a non-empty `messages` is the only presence check.
+            if !snapshot.messages.is_empty() {
                 apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
                     .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
@@ -18008,10 +20294,7 @@ fn handle_agent_event(
                 // 的第一步 AssistantLineBreak),否则短回复(如"在的!")一直挂在
                 // 流式当前行不提交,要等下一轮才一起刷出 —— sync 模式下的空助手气泡
                 // bug。同时 reset think-stripper,避免上一轮残留吞掉下一轮文本。
-                renderer.render(UiLine::AssistantLineBreak);
-                renderer.flush();
-                think.reset();
-                state.on_turn_complete();
+                complete_peer_turn_presentation(state, renderer, think);
             }
         }
         AgentEvent::ProviderChanged(provider) => {
@@ -18090,12 +20373,24 @@ fn handle_agent_event(
             // must NOT be captured as a turn-ending reason.
             if !auto_resuming {
                 state.last_turn_error = Some(line.clone());
+                // The pause reason is now visible in the muted line rendered just
+                // below, so the errored summary won't fold it a second time.
+                state.turn_error_line_shown = true;
             }
             renderer.render(UiLine::Muted(line));
             renderer.flush();
         }
-        AgentEvent::Steered { count } => {
-            state.on_steered(count);
+        AgentEvent::Steered { count: _, inputs } => {
+            let confirmed = state.on_steered(&inputs);
+            if ctx.live_binding.is_none() {
+                for pending in confirmed {
+                    renderer.render(UiLine::UserWithAttachments {
+                        text: pending.message.text,
+                        attachments: pending.message.image_markers,
+                    });
+                }
+                renderer.flush();
+            }
         }
     }
 }
@@ -18136,10 +20431,12 @@ fn apply_ai_session_name(ctx: &mut LoopCtx, name: String, renderer: &mut dyn Ren
 /// the native runtime hooks; this function must never write core JSON.
 fn persist_current_session(
     ctx: &mut LoopCtx,
-    snapshot: atomcode_core::conversation::ConversationSnapshot,
+    snapshot: atomcode_kernel::message::SessionSnapshot,
     renderer: &mut dyn Renderer,
 ) -> bool {
-    if snapshot.messages.is_empty() && snapshot.cold_summaries.is_empty() {
+    // Cold summaries live inline as synthetics in a kernel snapshot, so an empty
+    // `messages` is the empty-working-set signal.
+    if snapshot.messages.is_empty() {
         return true;
     }
     apply_session_snapshot(&mut ctx.current_session, snapshot);
@@ -18151,9 +20448,12 @@ fn persist_current_session(
 
 pub(crate) fn apply_session_snapshot(
     session: &mut crate::session::Session,
-    snapshot: atomcode_core::conversation::ConversationSnapshot,
+    snapshot: atomcode_kernel::message::SessionSnapshot,
 ) {
-    if snapshot.messages.is_empty() && snapshot.cold_summaries.is_empty() {
+    // A kernel snapshot carries cold-summary synthetics INLINE in `messages`, so
+    // an empty `messages` is the empty-working-set signal (the old core snapshot
+    // split cold_summaries out into a separate field, hence the two-part check).
+    if snapshot.messages.is_empty() {
         return;
     }
     session.update_from_conversation_snapshot(snapshot);
@@ -18173,7 +20473,7 @@ pub(crate) fn apply_session_snapshot(
             || session.name.starts_with("session-")
             || session.name.trim_start().starts_with('['));
     if should_rename {
-        use atomcode_core::conversation::message::Role;
+        use atomcode_kernel::message::Role;
         // Primary signal: `Message.synthetic` field (accurate for sessions
         // saved after the field landed). Secondary signal: bracket-prefix
         // legacy heuristic for sessions saved before the field existed
@@ -18182,7 +20482,8 @@ pub(crate) fn apply_session_snapshot(
             .messages
             .iter()
             .filter(|m| matches!(m.role, Role::User) && !m.synthetic)
-            .find_map(|m| m.text().filter(|t| !is_synthetic_user_text(t)));
+            .map(|m| m.text.as_str())
+            .find(|t| !is_synthetic_user_text(t));
         if let Some(text) = first_real_user {
             let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();
             if !name.is_empty() {
@@ -18209,23 +20510,38 @@ fn is_synthetic_user_text(text: &str) -> bool {
 mod session_naming_tests {
     use super::{apply_session_snapshot, is_synthetic_user_text};
     use crate::session::Session;
+    use atomcode_kernel::message::{Message, Role, SessionSnapshot};
+
+    fn user_msg(role: Role, text: &str) -> Message {
+        let mut m = Message::user(text);
+        m.role = role;
+        m
+    }
+
+    /// Build a kernel snapshot whose messages carry cold-summary synthetics
+    /// INLINE (mirrors `snapshot_to_kernel`), matching what the runtime emits.
+    fn snapshot(cold_summaries: &[&str], messages: Vec<Message>) -> SessionSnapshot {
+        use atomcode_kernel::message::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
+        let mut all = Vec::new();
+        for summary in cold_summaries {
+            let mut m = Message::user(format!("{LEGACY_COLD_SUMMARY_PREFIX}{summary}"));
+            m.synthetic = true;
+            m.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.to_string());
+            all.push(m);
+        }
+        all.extend(messages);
+        SessionSnapshot::new(all)
+    }
 
     #[test]
     fn apply_session_snapshot_renames_from_first_real_user() {
-        use atomcode_core::conversation::message::{Message, Role};
         let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
         let messages = vec![
-            Message::new(Role::User, "[System meta · not a user message]\nread this"),
-            Message::new(Role::User, "implement background sessions\nwith tests"),
+            user_msg(Role::User, "[System meta · not a user message]\nread this"),
+            user_msg(Role::User, "implement background sessions\nwith tests"),
         ];
 
-        apply_session_snapshot(
-            &mut session,
-            atomcode_core::conversation::ConversationSnapshot {
-                messages,
-                cold_summaries: Vec::new(),
-            },
-        );
+        apply_session_snapshot(&mut session, snapshot(&[], messages));
 
         assert_eq!(session.name, "implement background sessions");
         assert_eq!(session.messages.len(), 2);
@@ -18233,16 +20549,12 @@ mod session_naming_tests {
 
     #[test]
     fn apply_session_snapshot_preserves_custom_name() {
-        use atomcode_core::conversation::message::{Message, Role};
         let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
         session.name = "manual name".to_string();
 
         apply_session_snapshot(
             &mut session,
-            atomcode_core::conversation::ConversationSnapshot {
-                messages: vec![Message::new(Role::User, "new task")],
-                cold_summaries: Vec::new(),
-            },
+            snapshot(&[], vec![user_msg(Role::User, "new task")]),
         );
 
         assert_eq!(session.name, "manual name");
@@ -18250,18 +20562,14 @@ mod session_naming_tests {
 
     #[test]
     fn apply_session_snapshot_preserves_cold_summaries() {
-        use atomcode_core::conversation::{
-            message::{Message, Role},
-            ConversationSnapshot,
-        };
         let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
 
         apply_session_snapshot(
             &mut session,
-            ConversationSnapshot {
-                messages: vec![Message::new(Role::User, "new task")],
-                cold_summaries: vec!["compressed context".to_string()],
-            },
+            snapshot(
+                &["compressed context"],
+                vec![user_msg(Role::User, "new task")],
+            ),
         );
 
         assert_eq!(session.cold_summaries, vec!["compressed context"]);
@@ -18269,19 +20577,12 @@ mod session_naming_tests {
 
     #[test]
     fn apply_session_snapshot_accepts_a_cold_only_working_set() {
-        use atomcode_core::conversation::{
-            message::{Message, Role},
-            ConversationSnapshot,
-        };
         let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
-        session.messages = vec![Message::new(Role::User, "stale recent turn")];
+        session.messages = vec![user_msg(Role::User, "stale recent turn")];
 
         apply_session_snapshot(
             &mut session,
-            ConversationSnapshot {
-                messages: Vec::new(),
-                cold_summaries: vec!["all retained context".to_string()],
-            },
+            snapshot(&["all retained context"], Vec::new()),
         );
 
         assert!(session.messages.is_empty());
@@ -18335,21 +20636,335 @@ mod session_naming_tests {
 /// this on every redraw, so without caching every spinner tick (~12/s
 /// during streaming) would round-trip to the platform clipboard API.
 const CLIPBOARD_HINT_TTL_MS: u64 = 1500;
+const CLIPBOARD_HINT_DISPLAY_SECS: u64 = 6;
 
-fn clipboard_image_hash(cache: &std::sync::Mutex<ClipboardCheckState>) -> Option<u64> {
+fn observe_clipboard_image(
+    state: &mut ClipboardCheckState,
+    image_hash: Option<u64>,
+    now: std::time::Instant,
+) {
+    if state.image_hash == image_hash {
+        return;
+    }
+    state.image_hash = image_hash;
+    state.hint_hash = image_hash;
+    state.hint_deadline =
+        image_hash.map(|_| now + std::time::Duration::from_secs(CLIPBOARD_HINT_DISPLAY_SECS));
+}
+
+fn apply_clipboard_observation(
+    state: &mut ClipboardCheckState,
+    observation: Result<Option<u64>, ()>,
+    now: std::time::Instant,
+) {
+    if let Ok(image_hash) = observation {
+        observe_clipboard_image(state, image_hash, now);
+    }
+}
+
+fn active_clipboard_hint(
+    state: &mut ClipboardCheckState,
+    pending_image_hashes: &[u64],
+    now: std::time::Instant,
+) -> Option<u64> {
+    let hash = state.hint_hash?;
+    if pending_image_hashes.contains(&hash)
+        || state.hint_deadline.is_none_or(|deadline| now >= deadline)
+    {
+        state.hint_hash = None;
+        state.hint_deadline = None;
+        return None;
+    }
+    Some(hash)
+}
+
+fn publish_clipboard_hint(state: &mut ClipboardCheckState, hint_hash: Option<u64>) -> bool {
+    let changed = state.published_hint_hash != hint_hash;
+    state.published_hint_hash = hint_hash;
+    changed
+}
+
+fn clipboard_image_hint_state(
+    cache: &std::sync::Mutex<ClipboardCheckState>,
+    pending_image_hashes: &[u64],
+    probe_clipboard: bool,
+) -> (Option<u64>, bool) {
     let mut state = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
     let stale = state
         .last_checked
         .map(|t| t.elapsed() >= std::time::Duration::from_millis(CLIPBOARD_HINT_TTL_MS))
         .unwrap_or(true);
-    if stale {
-        state.image_hash = arboard::Clipboard::new()
-            .and_then(|mut c| c.get_image())
-            .ok()
-            .map(|img| rgba_fingerprint(img.width, img.height, img.bytes.as_ref()));
-        state.last_checked = Some(std::time::Instant::now());
+    if probe_clipboard && stale {
+        let observation = match arboard::Clipboard::new() {
+            Ok(mut clipboard) => match clipboard.get_image() {
+                Ok(img) => Ok(Some(rgba_fingerprint(
+                    img.width,
+                    img.height,
+                    img.bytes.as_ref(),
+                ))),
+                Err(arboard::Error::ContentNotAvailable) => Ok(None),
+                Err(_) => Err(()),
+            },
+            Err(_) => Err(()),
+        };
+        apply_clipboard_observation(&mut state, observation, now);
+        state.last_checked = Some(now);
     }
-    state.image_hash
+    let hint_hash = active_clipboard_hint(&mut state, pending_image_hashes, now);
+    let changed = publish_clipboard_hint(&mut state, hint_hash);
+    (hint_hash, changed)
+}
+
+fn clipboard_image_hint_hash(
+    cache: &std::sync::Mutex<ClipboardCheckState>,
+    pending_image_hashes: &[u64],
+) -> Option<u64> {
+    clipboard_image_hint_state(cache, pending_image_hashes, true).0
+}
+
+fn clipboard_image_hint_changed(
+    cache: &std::sync::Mutex<ClipboardCheckState>,
+    pending_image_hashes: &[u64],
+) -> bool {
+    // The idle tick exists to repaint an expired/consumed hint, not to copy
+    // potentially tens of MB of RGBA clipboard data in the background.
+    clipboard_image_hint_state(cache, pending_image_hashes, false).1
+}
+
+#[cfg(test)]
+mod clipboard_hint_tests {
+    use super::{
+        active_clipboard_hint, apply_clipboard_observation, observe_clipboard_image,
+        publish_clipboard_hint, rgba_fingerprint, ClipboardCheckState,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn image_hint_is_one_shot_until_clipboard_content_changes() {
+        let now = Instant::now();
+        let mut state = ClipboardCheckState::default();
+
+        observe_clipboard_image(&mut state, Some(7), now);
+        assert_eq!(active_clipboard_hint(&mut state, &[], now), Some(7));
+        assert_eq!(
+            active_clipboard_hint(&mut state, &[], now + Duration::from_secs(7)),
+            None
+        );
+
+        // The same image staying in the clipboard must not restart the hint.
+        observe_clipboard_image(&mut state, Some(7), now + Duration::from_secs(8));
+        assert_eq!(
+            active_clipboard_hint(&mut state, &[], now + Duration::from_secs(8)),
+            None
+        );
+
+        // A different image is a new clipboard event and gets its own window.
+        observe_clipboard_image(&mut state, Some(8), now + Duration::from_secs(9));
+        assert_eq!(
+            active_clipboard_hint(&mut state, &[], now + Duration::from_secs(9)),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn attaching_or_clearing_the_image_consumes_and_rearms_the_hint() {
+        let now = Instant::now();
+        let mut state = ClipboardCheckState::default();
+
+        observe_clipboard_image(&mut state, Some(7), now);
+        assert_eq!(active_clipboard_hint(&mut state, &[7], now), None);
+
+        observe_clipboard_image(&mut state, None, now + Duration::from_secs(1));
+        observe_clipboard_image(&mut state, Some(7), now + Duration::from_secs(2));
+        assert_eq!(
+            active_clipboard_hint(&mut state, &[], now + Duration::from_secs(2)),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn transient_probe_failure_preserves_the_consumed_image_state() {
+        let now = Instant::now();
+        let mut state = ClipboardCheckState::default();
+
+        apply_clipboard_observation(&mut state, Ok(Some(7)), now);
+        assert_eq!(
+            active_clipboard_hint(&mut state, &[], now + Duration::from_secs(7)),
+            None
+        );
+        apply_clipboard_observation(&mut state, Err(()), now + Duration::from_secs(8));
+        apply_clipboard_observation(&mut state, Ok(Some(7)), now + Duration::from_secs(9));
+
+        assert_eq!(
+            active_clipboard_hint(&mut state, &[], now + Duration::from_secs(9)),
+            None,
+            "a temporary ClipboardOccupied-style failure must not rearm the same image"
+        );
+    }
+
+    #[test]
+    fn fingerprint_samples_changes_between_matching_head_and_tail() {
+        let mut first = vec![0u8; 16 * 1024];
+        let mut second = first.clone();
+        first[7 * 1024..9 * 1024].fill(1);
+        second[7 * 1024..9 * 1024].fill(2);
+
+        assert_ne!(
+            rgba_fingerprint(64, 64, &first),
+            rgba_fingerprint(64, 64, &second)
+        );
+    }
+
+    #[test]
+    fn published_hint_transitions_request_one_show_and_one_hide_redraw() {
+        let mut state = ClipboardCheckState::default();
+
+        assert!(publish_clipboard_hint(&mut state, Some(7)));
+        assert!(!publish_clipboard_hint(&mut state, Some(7)));
+        assert!(publish_clipboard_hint(&mut state, None));
+        assert!(!publish_clipboard_hint(&mut state, None));
+    }
+}
+
+fn status_context_usage(
+    state: &UiState,
+    configured_window: usize,
+    provider_available: bool,
+) -> (usize, usize) {
+    if !provider_available {
+        return (0, 0);
+    }
+    match state.last_context.as_ref() {
+        Some(snap) => (
+            snap.sent_tokens,
+            if snap.ctx_window > 0 {
+                snap.ctx_window
+            } else {
+                configured_window
+            },
+        ),
+        None => (0, configured_window),
+    }
+}
+
+/// Whether the footer should present the foreground as having no configured
+/// provider.
+///
+/// Configuration has two supported schemas: legacy `[providers.*]` and native
+/// `[provider_accounts.*]` + `[models.*]`. Checking `config.providers` directly
+/// only sees the legacy half and makes a perfectly usable native model appear
+/// as "(未配置)" whenever no CodingPlan auth is stored. Route through the same
+/// active-provider resolution boundary used to build the runtime instead.
+fn status_provider_unconfigured(
+    unavailable_reason: Option<atomcode_coding::ProviderUnavailableReason>,
+    config: &Config,
+    has_stored_auth: bool,
+) -> bool {
+    match unavailable_reason {
+        Some(atomcode_coding::ProviderUnavailableReason::NotConfigured) => true,
+        Some(
+            atomcode_coding::ProviderUnavailableReason::AuthenticationRequired
+            | atomcode_coding::ProviderUnavailableReason::UnsupportedBuild,
+        ) => false,
+        None => config.active_provider(None).is_err() && !has_stored_auth,
+    }
+}
+
+#[cfg(test)]
+mod status_context_usage_tests {
+    use super::{status_context_usage, status_provider_unconfigured};
+    use crate::state::{ContextSnapshot, UiState};
+    use atomcode_coding::ProviderUnavailableReason;
+    use atomcode_config::Config;
+
+    #[test]
+    fn configured_model_window_fills_narrow_usage_snapshot() {
+        let mut state = UiState::new();
+        state.last_context = Some(ContextSnapshot {
+            sent_tokens: 22_800,
+            ctx_window: 0,
+            ..ContextSnapshot::default()
+        });
+
+        assert_eq!(
+            status_context_usage(&state, 128_000, true),
+            (22_800, 128_000)
+        );
+    }
+
+    #[test]
+    fn authoritative_context_window_wins_over_config_fallback() {
+        let mut state = UiState::new();
+        state.last_context = Some(ContextSnapshot {
+            sent_tokens: 22_800,
+            ctx_window: 200_000,
+            ..ContextSnapshot::default()
+        });
+
+        assert_eq!(
+            status_context_usage(&state, 128_000, true),
+            (22_800, 200_000)
+        );
+    }
+
+    #[test]
+    fn unavailable_provider_does_not_invent_a_context_window() {
+        let mut state = UiState::new();
+        state.last_context = Some(ContextSnapshot {
+            sent_tokens: 22_800,
+            ctx_window: 200_000,
+            ..ContextSnapshot::default()
+        });
+
+        assert_eq!(status_context_usage(&state, 128_000, false), (0, 0));
+    }
+
+    #[test]
+    fn native_model_configuration_is_not_reported_as_unconfigured() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "account/model",
+            "provider_accounts": {
+                "account": {
+                    "provider": "openai",
+                    "base_url": "https://api.example.test/v1"
+                }
+            },
+            "models": {
+                "account/model": {
+                    "account": "account",
+                    "model": "example-model",
+                    "context_window": 128000
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(config.providers.is_empty(), "legacy table stays empty");
+        assert!(!status_provider_unconfigured(None, &config, false));
+    }
+
+    #[test]
+    fn provider_reason_distinguishes_configuration_from_other_unavailability() {
+        let config = Config::default();
+        assert!(status_provider_unconfigured(None, &config, false));
+        assert!(!status_provider_unconfigured(None, &config, true));
+        assert!(status_provider_unconfigured(
+            Some(ProviderUnavailableReason::NotConfigured),
+            &config,
+            true
+        ));
+        assert!(!status_provider_unconfigured(
+            Some(ProviderUnavailableReason::AuthenticationRequired),
+            &config,
+            false
+        ));
+        assert!(!status_provider_unconfigured(
+            Some(ProviderUnavailableReason::UnsupportedBuild),
+            &config,
+            false
+        ));
+    }
 }
 
 pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
@@ -18362,11 +20977,16 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     //   2. Upgrade-available hint (existing behavior).
     //   3. None.
     let runtime_availability = ctx.runtime.ui_availability();
-    let no_provider = matches!(
+    let unavailable_reason = ctx.runtime.provider_unavailable_reason();
+    let no_provider = status_provider_unconfigured(
+        unavailable_reason,
+        &ctx.config,
+        atomcode_auth::get_stored_auth().is_some(),
+    );
+    let provider_waiting = matches!(
         runtime_availability,
         RuntimeUiAvailability::AwaitingProvider
-    ) || (ctx.config.providers.is_empty()
-        && atomcode_auth::get_stored_auth().is_none());
+    ) && !no_provider;
     let runtime_failed = matches!(runtime_availability, RuntimeUiAvailability::Failed);
     // Open-source build pointed at an AtomGit gateway: any chat will
     // fail-fast with `CpOfficialBuildRequired`. Surface that diagnosis
@@ -18397,14 +21017,30 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             crate::i18n::t(crate::i18n::Msg::StatusNoProvider).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
+    } else if provider_waiting {
+        let message = match unavailable_reason {
+            Some(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired) => {
+                crate::i18n::Msg::CmdWhoamiNotSignedIn
+            }
+            Some(
+                atomcode_coding::ProviderUnavailableReason::UnsupportedBuild
+                | atomcode_coding::ProviderUnavailableReason::NotConfigured,
+            )
+            | None => crate::i18n::Msg::CmdProviderUnavailable,
+        };
+        Some((
+            crate::i18n::t(message).into_owned(),
+            crate::render::HintSeverity::Warning,
+        ))
     } else if runtime_failed {
         Some((
             crate::i18n::t(crate::i18n::Msg::StatusRuntimeUnavailable).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
-    } else if let Some(warning) = monitor::is_codingplan_provider(&ctx.config.default_provider)
-        .then(|| ctx.monitor_warning.lock().ok().and_then(|g| g.clone()))
-        .flatten()
+    } else if let Some(warning) =
+        monitor::is_codingplan_provider(&resolved_provider_and_model(&ctx.config).0)
+            .then(|| ctx.monitor_warning.lock().ok().and_then(|g| g.clone()))
+            .flatten()
     {
         // Only surface the CodingPlan drift warning while a CodingPlan-managed
         // (AtomGit*) provider is active. A warning set on an AtomGit provider
@@ -18418,8 +21054,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         usage_monitor::build_usage_hint(&ctx.usage_slot, &ctx.config.default_provider)
     {
         Some(usage)
-    } else if let Some(h) = clipboard_image_hash(&ctx.clipboard_check)
-        .filter(|h| !state.pending_image_hashes.contains(h))
+    } else if let Some(h) =
+        clipboard_image_hint_hash(&ctx.clipboard_check, &state.pending_image_hashes)
     {
         // Transient cue — beats the upgrade banner because the action
         // window is "now" (the image is in the clipboard right now).
@@ -18526,16 +21162,16 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else {
         None
     };
-    // Pull current ctx usage from the last ContextStats emission. Pre-
-    // first-turn `last_context` is None — render shows nothing then.
+    // Pull current ctx usage from the last ContextStats emission. Before the
+    // first turn, show zero usage against the configured provider window. When
+    // no provider is available, suppress both values instead of exposing
+    // Config's internal 128k fallback as an invented model capability.
     // Using `sent_tokens` (what was actually sent to the model on the
     // last turn) instead of cumulative `total_tokens` because the user
     // cares about "how close to overflow am I", not "how many tokens
     // has this session burned in total". See render::StatusLine docs.
-    let (ctx_used, ctx_window) = match state.last_context.as_ref() {
-        Some(snap) => (snap.sent_tokens, snap.ctx_window),
-        None => (0, 0),
-    };
+    let (ctx_used, ctx_window) =
+        status_context_usage(state, ctx.config.default_context_window(), !no_provider);
     // Session-name badge: surfaced only when the user has explicitly
     // renamed the conversation. Auto-named sessions (default /
     // session-* / first-message-derived) intentionally stay badge-less
@@ -18645,6 +21281,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     crate::render::StatusLine {
         model,
         cwd,
+        pending_messages: state
+            .pending_steers
+            .iter()
+            .map(|pending| pending.display_text.clone())
+            .collect(),
         history: None,
         command_output: state.footer_command_output.clone(),
         ctx_used,
@@ -18661,9 +21302,37 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         goal,
         loop_status,
         todo,
+        subtasks: state.active_subtasks.clone(),
         approval,
         user_input,
+        round_cap_panel: state.round_cap_panel.as_ref().map(|p| {
+            crate::render::round_cap_view(p.cap, p.base, p.cursor, &round_cap_stats(state))
+        }),
     }
+}
+
+/// Format the live stats string for the round-cap checkpoint panel.
+/// Returns "Xh Ym Zs · N.NNK tokens" (time · tokens), or just one
+/// component if the other is absent/zero.  Tool count is omitted —
+/// no live in-turn tool accumulator exists (only the per-turn
+/// completion count in `PendingSeparator`).
+fn round_cap_stats(state: &crate::state::UiState) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(d) = state.turn_elapsed() {
+        parts.push(crate::render::fmt_dur(d));
+    }
+    // Per-turn token total (matches the per-turn `turn_elapsed()` above) —
+    // `total_tokens` is session-cumulative and would misreport the tokens spent
+    // in THIS turn, which is what the checkpoint is asking about.
+    let turn_tokens =
+        state.turn_prompt_tokens + state.turn_completion_tokens + state.turn_cached_tokens;
+    if turn_tokens > 0 {
+        parts.push(format!(
+            "{} tokens",
+            atomcode_config::i18n::fmt_tokens(turn_tokens)
+        ));
+    }
+    parts.join(" · ")
 }
 
 fn build_input_status(state: &UiState, ctx: &LoopCtx, buf: &Buffer) -> crate::render::StatusLine {
@@ -18828,11 +21497,6 @@ fn format_spinner_label(
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
     }
-    if state.steer_pending > 0 {
-        // Draining "waiting to fold" count — appears when you steer, gone once the
-        // kernel folds it into the turn (mirrors codex/opencode's pending indicator).
-        out.push_str(&format!(" · {} to fold", state.steer_pending));
-    }
     // (The mid-stream "· esc to cancel" stall hint was removed by request — esc
     // still cancels, it's just no longer advertised in the spinner. The stall
     // machinery (`stream_stalled`) stays for the compaction-slow variant.)
@@ -18968,7 +21632,7 @@ pub(crate) fn enrich_todo_detail(
     if name != "todo" && name != "todowrite" {
         return base.to_string();
     }
-    let repaired = atomcode_core::turn::json_repair::repair_tool_args(name, args_json);
+    let repaired = atomcode_capabilities::tools::repair::repair_tool_args(name, args_json);
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) else {
         return base.to_string();
     };
@@ -18991,7 +21655,7 @@ pub(crate) fn enrich_todo_detail(
 }
 
 pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
-    let repaired_args = atomcode_core::turn::json_repair::repair_tool_args(name, args_json);
+    let repaired_args = atomcode_capabilities::tools::repair::repair_tool_args(name, args_json);
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired_args) else {
         return String::new();
     };
@@ -19480,6 +22144,113 @@ pub(crate) fn web_search_result_suffix(output: &str) -> Option<String> {
     })
 }
 
+/// Rebuild a parallel tool-batch group (header + child rows) for the `/resume`
+/// replay path, mirroring the live `AgentEvent::ToolBatchStarted` layout.
+///
+/// The saved transcript has no `parallel_safe` flag — batch metadata is a
+/// live-only UI construct that is never persisted — so the header always uses
+/// the non-"in parallel" form. That is exactly what non-read-only batches
+/// (bash / write / todowrite) showed live anyway; only a pure read-only batch
+/// loses the literal "in parallel" words after a resume.
+///
+/// Each child already carries its final `→ N lines` / `→ ✗` result suffix,
+/// computed from the persisted tool results (`result_of`: call_id → (success,
+/// output)), so the replayed group matches a *completed* live batch without any
+/// in-place child updates. `todo_titles` enriches `todo update` child rows the
+/// same way the live path does.
+pub(crate) fn build_replay_tool_batch(
+    calls: &[atomcode_kernel::tool::ToolCall],
+    result_of: &std::collections::HashMap<String, (bool, String)>,
+    todo_titles: &std::collections::HashMap<u64, String>,
+) -> (String, Vec<crate::render::ToolGroupChild>) {
+    let count = calls.len();
+    let unique_names: std::collections::HashSet<&str> =
+        calls.iter().map(|c| c.name.as_str()).collect();
+    let label = if unique_names.len() == 1 {
+        format!(
+            "Running {} {} calls",
+            count,
+            unique_names.iter().next().copied().unwrap_or("tool")
+        )
+    } else {
+        format!("Running {} tools", count)
+    };
+    let head_glyph = "\u{25cf}";
+    let child_glyph = "\u{2514}";
+    let arrow = "\u{2192}";
+    let header = format!("{} {}", head_glyph, label);
+
+    let raw_details: Vec<String> = calls
+        .iter()
+        .map(|c| format_tool_detail(&c.name, &c.arguments))
+        .collect();
+    let disambiguated = disambiguate_batch_details(
+        &calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        &calls
+            .iter()
+            .map(|c| c.arguments.as_str())
+            .collect::<Vec<_>>(),
+        &raw_details,
+    );
+    let mut todo_add_counter: usize = 0;
+    let children = calls
+        .iter()
+        .zip(disambiguated.iter())
+        .map(|(c, detail)| {
+            // Mirror the live todo `#N` numbering / update enrichment.
+            let detail = if c.name == "todo" || c.name == "todowrite" {
+                let action = serde_json::from_str::<serde_json::Value>(&c.arguments)
+                    .ok()
+                    .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string));
+                match action.as_deref() {
+                    Some("add") => {
+                        todo_add_counter += 1;
+                        format!("#{} {}", todo_add_counter, detail)
+                    }
+                    Some("update") => {
+                        enrich_todo_detail(&c.name, &c.arguments, detail, todo_titles)
+                    }
+                    _ => detail.clone(),
+                }
+            } else {
+                detail.clone()
+            };
+            // Result suffix from the persisted result — matches the live
+            // `ToolGroupChildUpdate`: `→ N lines` / `→ ✗` / web_search sources.
+            let suffix = match result_of.get(&c.id) {
+                Some((false, _)) => format!(" {} \u{2717}", arrow),
+                Some((true, output)) => {
+                    let web = (c.name == "web_search")
+                        .then(|| web_search_result_suffix(output))
+                        .flatten();
+                    if let Some(srcs) = web {
+                        format!(" {} {}", arrow, srcs)
+                    } else {
+                        let n = output.lines().count().max(1);
+                        let unit = if n == 1 { "line" } else { "lines" };
+                        format!(" {} {} {}", arrow, n, unit)
+                    }
+                }
+                // No persisted result (e.g. a batch cut off mid-turn): leave the
+                // child bare, exactly like a live child awaiting its result.
+                None => String::new(),
+            };
+            // bash → `Short det` (no parens); others → `Short(det)`. Matches the
+            // live completed-child (`ToolGroupChildUpdate`) formatting.
+            let body = if c.name.eq_ignore_ascii_case("bash") {
+                format!("{} {}", display_tool_name_short(&c.name), detail)
+            } else {
+                format!("{}({})", display_tool_name_short(&c.name), detail)
+            };
+            crate::render::ToolGroupChild {
+                call_id: c.id.clone(),
+                text: format!("  {} {}{}", child_glyph, body, suffix),
+            }
+        })
+        .collect();
+    (header, children)
+}
+
 pub(crate) fn summarise(output: &str) -> String {
     let first = output.lines().next().unwrap_or("(no output)");
     let n = output.lines().count();
@@ -19495,9 +22266,10 @@ pub(crate) fn summarise(output: &str) -> String {
 
 /// Collapse a `read_file` first-line preview into a tidy `{n}  {content}`.
 ///
-/// `read_file` formats each line as `{n:>6}\t{source line}` — the line number
-/// right-padded to 6 columns, a tab, then the source line WITH its own
-/// indentation. For a deeply-indented line the tab plus that indentation renders
+/// `read_file` formats each line as `{n}\t{source line}` — the line number, a
+/// tab, then the source line WITH its own indentation (legacy transcripts may
+/// carry a `{n:>6}\t` 6-column-padded number, which the `trim` below still
+/// handles). For a deeply-indented line the tab plus that indentation renders
 /// as a big empty gap between the number and the text. Recognise the
 /// `<digits>\t` prefix and collapse the tab + the content's leading whitespace to
 /// two spaces; fall back to the raw first line for anything else (directory
@@ -19795,10 +22567,10 @@ pub(crate) fn approval_denial_label(output: &str, success: bool) -> Option<Strin
 fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
     let applicable = reasoning_effort_applicable_on_provider(ctx);
     ctx.reasoning_effort = if applicable {
+        let sel = ctx.config.effective_model_selection().unwrap_or_default();
         ctx.config
-            .providers
-            .get(&ctx.config.default_provider)
-            .and_then(|p| p.reasoning_effort.clone())
+            .provider_config_for_selection(&sel)
+            .and_then(|p| p.reasoning_effort)
     } else {
         None
     };
@@ -19806,17 +22578,16 @@ fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
 
 /// Persist the current reasoning_effort to config.toml
 fn persist_reasoning_effort(ctx: &mut LoopCtx) {
-    let default_provider = ctx.config.default_provider.clone();
-    if let Some(p) = ctx.config.providers.get_mut(&default_provider) {
-        p.reasoning_effort = ctx.reasoning_effort.clone();
-    }
+    let selection = ctx.config.effective_model_selection().unwrap_or_default();
     let effort = ctx.reasoning_effort.clone();
+    // Schema-aware write (new-schema `[models.*]` or legacy `[providers.*]`).
+    ctx.config
+        .update_selection_reasoning(&selection, |r| *r.reasoning_effort = effort.clone());
     match ctx.config_store.update(|config| {
-        let provider = config
-            .providers
-            .get_mut(&default_provider)
-            .ok_or_else(|| anyhow::anyhow!("provider {default_provider:?} not found"))?;
-        provider.reasoning_effort = effort;
+        if !config.update_selection_reasoning(&selection, |r| *r.reasoning_effort = effort.clone())
+        {
+            anyhow::bail!("provider {selection:?} not found");
+        }
         Ok(())
     }) {
         Ok(commit) => ctx.observed_config_revision = Some(commit.snapshot.revision),
@@ -19825,18 +22596,16 @@ fn persist_reasoning_effort(ctx: &mut LoopCtx) {
 }
 
 pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
+    let selection = ctx.config.effective_model_selection().unwrap_or_default();
     let ptype = ctx
         .config
-        .providers
-        .get(&ctx.config.default_provider)
-        .map(|p| p.provider_type.as_str())
-        .unwrap_or("");
+        .provider_config_for_selection(&selection)
+        .map(|p| p.provider_type)
+        .unwrap_or_default();
     // Model-name check delegates to the provider so the UI "applicable" hint
     // and the actual request-body gate (OpenAiProvider) can never diverge.
     (ptype == "deepseek" || ptype == "openai")
-        && atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(
-            &ctx.model_name,
-        )
+        && atomcode_capabilities::provider::reason_effort_applicable(&ctx.model_name)
 }
 
 /// Install a [`crate::modals::password::PasswordModal`] as the active modal on
@@ -19939,19 +22708,16 @@ pub(crate) fn todo_progress_from_args(args: &str) -> Option<crate::render::TodoP
 /// when the last valid call cleared the list. Used to seed the panel on
 /// `/resume` / session switch with zero extra storage.
 pub(crate) fn todo_progress_from_messages(
-    messages: &[atomcode_core::conversation::message::Message],
+    messages: &[atomcode_kernel::message::Message],
 ) -> Option<crate::render::TodoProgress> {
-    use atomcode_core::conversation::message::MessageContent;
     // Fold `todowrite` (replace) + `todo` (add/update) in transcript order through the SAME
     // reducer capabilities uses, so a resumed session's panel reflects incremental updates —
     // not just the last full-list todowrite. Collect (name, args) in order first.
+    // kernel `Message.tool_calls` is a flat field (non-empty only on assistant
+    // messages that requested tools), so no content-variant match is needed.
     let calls: Vec<(&str, &str)> = messages
         .iter()
-        .filter_map(|m| match &m.content {
-            MessageContent::AssistantWithToolCalls { tool_calls, .. } => Some(tool_calls),
-            _ => None,
-        })
-        .flat_map(|tcs| tcs.iter())
+        .flat_map(|m| m.tool_calls.iter())
         .map(|c| (c.name.as_str(), c.arguments.as_str()))
         .collect();
     let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
@@ -20007,22 +22773,17 @@ mod todo_block_tests {
 
     #[test]
     fn todo_progress_from_messages_last_valid_wins() {
-        use atomcode_core::conversation::message::{Message, MessageContent, Role};
-        use atomcode_core::tool::ToolCall;
-        let mk = |id: &str, args: &str| Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
+        use atomcode_kernel::message::Message;
+        use atomcode_kernel::tool::ToolCall;
+        let mk = |id: &str, args: &str| {
+            Message::assistant(
+                "",
+                vec![ToolCall {
                     id: id.into(),
                     name: "todowrite".into(),
                     arguments: args.into(),
                 }],
-                reasoning_content: None,
-                thinking_blocks: vec![],
-            },
-            synthetic: false,
-            internal_origin: None,
+            )
         };
         let msgs = vec![
             mk("1", r#"{"todos":[{"content":"old","status":"pending"}]}"#),
@@ -20042,22 +22803,17 @@ mod todo_block_tests {
     fn todo_progress_from_messages_folds_incremental_todo_events() {
         // Replay parity: a resumed session must reflect `todo` add/update events, not just the
         // last full-list todowrite (this was the gap the incremental tool introduced).
-        use atomcode_core::conversation::message::{Message, MessageContent, Role};
-        use atomcode_core::tool::ToolCall;
-        let call = |id: &str, name: &str, args: &str| Message {
-            role: Role::Assistant,
-            content: MessageContent::AssistantWithToolCalls {
-                text: None,
-                tool_calls: vec![ToolCall {
+        use atomcode_kernel::message::Message;
+        use atomcode_kernel::tool::ToolCall;
+        let call = |id: &str, name: &str, args: &str| {
+            Message::assistant(
+                "",
+                vec![ToolCall {
                     id: id.into(),
                     name: name.into(),
                     arguments: args.into(),
                 }],
-                reasoning_content: None,
-                thinking_blocks: vec![],
-            },
-            synthetic: false,
-            internal_origin: None,
+            )
         };
         let msgs = vec![
             call(
@@ -20419,56 +23175,192 @@ mod format_shell_command_tests {
 }
 
 #[cfg(test)]
-mod user_input_bypass_tests {
-    use super::user_input_should_auto_skip;
+mod user_input_mode_tests {
+    use super::{classify_tui_user_input, round_cap_should_auto_stop, TuiUserInputPresentation};
     use crate::state::AgentMode;
 
-    /// Bypass (Auto) mode → panel must be skipped.
     #[test]
-    fn bypass_mode_skips_panel() {
+    fn flat_payload_is_presented_as_a_single_question() {
+        let payload = serde_json::json!({
+            "header": "Scope",
+            "question": "Which module?",
+            "mode": "single",
+            "options": [{ "label": "Core" }],
+            "custom": false
+        });
+
+        let TuiUserInputPresentation::Single(request) = classify_tui_user_input(payload) else {
+            panic!("flat payload must open the single-question panel");
+        };
+        assert_eq!(request.header, "Scope");
+    }
+
+    #[test]
+    fn questions_array_is_presented_as_a_batch() {
+        let payload = serde_json::json!({
+            "questions": [
+                {
+                    "header": "Scope",
+                    "question": "Which module?",
+                    "mode": "single",
+                    "options": [{ "label": "Core" }],
+                    "custom": false
+                },
+                {
+                    "header": "Style",
+                    "question": "Preferred style?",
+                    "mode": "text"
+                }
+            ]
+        });
+
+        let TuiUserInputPresentation::Batch(requests) = classify_tui_user_input(payload) else {
+            panic!("questions array must open the batch panel");
+        };
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].header, "Style");
+    }
+
+    #[test]
+    fn invalid_payload_declines_instead_of_opening_an_empty_panel() {
+        assert!(matches!(
+            classify_tui_user_input(serde_json::json!({ "questions": [] })),
+            TuiUserInputPresentation::Invalid
+        ));
+    }
+
+    #[test]
+    fn auto_mode_still_stops_round_cap_fail_closed() {
+        assert!(round_cap_should_auto_stop(AgentMode::Auto));
+        for mode in [AgentMode::Build, AgentMode::Plan, AgentMode::AcceptEdits] {
+            assert!(!round_cap_should_auto_stop(mode));
+        }
+    }
+}
+
+// ── Round-cap key handler tests ─────────────────────────────────────────────
+//
+// E2E tests that capture a `DriverCommand::Respond` emitted by
+// `handle_round_cap_key` are infeasible in this file's unit-test harness:
+// `handle_round_cap_key` requires a live `LoopCtx` (which holds a
+// `RuntimeControl` backed by a real `tokio` channel, plus ~25 other fields
+// including `History`, `mpsc` receivers, `CommandRegistry`, etc.).  No test
+// fixture for that structure exists in this crate — all tests here either
+// call pure functions directly or use the small subset of fields exposed by
+// `App` (which IS constructable via `App::new(&caps_for_test())`).
+//
+// Coverage split:
+//   • `on_round_cap_resolved` semantics → state.rs
+//     (`on_round_cap_resolved_clears_panel_and_resumes_streaming`)
+//   • `RoundCapPanel` toggle / choice logic → state.rs
+//     (`round_cap_panel_toggle_and_choice`)
+//   • `chosen_continue` contract used by Enter / Esc → tests below (pure)
+//   • Key-routing stub replacement → verified by `cargo build` (compile check)
+#[cfg(test)]
+mod round_cap_key_tests {
+    use super::round_cap_key_decision;
+    use crate::state::{RoundCapPanel, UiPhase, UiState};
+
+    /// Enter on cursor=0 (continue) → `chosen_continue()` returns true.
+    /// This mirrors the decision made inside `handle_round_cap_key` on Enter.
+    #[test]
+    fn round_cap_enter_on_continue_chosen_continue_is_true() {
+        let panel = RoundCapPanel::new(9, 200, 200);
+        assert_eq!(panel.cursor, 0, "new panel defaults to cursor=0 (continue)");
         assert!(
-            user_input_should_auto_skip(AgentMode::Auto),
-            "Bypass/Auto mode must auto-skip the user_input panel"
+            panel.chosen_continue(),
+            "cursor=0 must map to chosen_continue()=true"
         );
     }
 
-    /// Build mode → panel must be shown (no skip).
+    /// Enter on cursor=1 (stop) → `chosen_continue()` returns false.
     #[test]
-    fn build_mode_shows_panel() {
+    fn round_cap_enter_on_stop_chosen_continue_is_false() {
+        let mut panel = RoundCapPanel::new(9, 200, 200);
+        panel.move_down(); // cursor → 1 (stop)
         assert!(
-            !user_input_should_auto_skip(AgentMode::Build),
-            "Build mode must NOT skip the user_input panel"
+            !panel.chosen_continue(),
+            "cursor=1 must map to chosen_continue()=false"
         );
     }
 
-    /// Plan mode → panel must be shown (planning explicitly asks the user).
+    /// Enter honors the cursor: cursor=0 (continue) → Some(true),
+    /// cursor=1 (stop) → Some(false).
     #[test]
-    fn plan_mode_shows_panel() {
-        assert!(
-            !user_input_should_auto_skip(AgentMode::Plan),
-            "Plan mode must NOT skip the user_input panel"
+    fn round_cap_key_decision_enter_honors_cursor() {
+        use crossterm::event::KeyCode;
+        assert_eq!(
+            round_cap_key_decision(KeyCode::Enter, 0),
+            Some(true),
+            "Enter on cursor=0 must deliver true (continue)"
+        );
+        assert_eq!(
+            round_cap_key_decision(KeyCode::Enter, 1),
+            Some(false),
+            "Enter on cursor=1 must deliver false (stop)"
         );
     }
 
-    /// AcceptEdits mode → panel must be shown (only file edits are auto-approved).
+    /// Esc is fail-closed: regardless of cursor position, always delivers false.
     #[test]
-    fn accept_edits_mode_shows_panel() {
-        assert!(
-            !user_input_should_auto_skip(AgentMode::AcceptEdits),
-            "AcceptEdits mode must NOT skip the user_input panel"
+    fn round_cap_key_decision_esc_always_stops() {
+        use crossterm::event::KeyCode;
+        assert_eq!(
+            round_cap_key_decision(KeyCode::Esc, 0),
+            Some(false),
+            "Esc on cursor=0 (continue) must still deliver false (fail-closed)"
+        );
+        assert_eq!(
+            round_cap_key_decision(KeyCode::Esc, 1),
+            Some(false),
+            "Esc on cursor=1 (stop) must deliver false"
         );
     }
 
-    /// Confirm the shape of the auto-answer: `declined()` encodes `declined: true`.
-    /// The Bypass mode delivers this response — `format_result` turns it into a non-error
-    /// "No answer was provided…" message so the model proceeds with its own judgment
-    /// instead of treating the decline as an error to recover from.
+    /// Non-resolving keys return None — they do not trigger a deliver.
     #[test]
-    fn declined_response_shape() {
-        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
-        let r = UserInputResponse::declined();
-        assert!(r.declined, "declined() must set declined=true");
-        assert!(r.text.is_none(), "declined() must have no text");
-        assert!(r.selected.is_empty(), "declined() must have no selections");
+    fn round_cap_key_decision_non_resolving_returns_none() {
+        use crossterm::event::KeyCode;
+        assert_eq!(
+            round_cap_key_decision(KeyCode::Up, 0),
+            None,
+            "Up is a navigation key, not a resolving key"
+        );
+    }
+
+    /// `on_round_cap_resolved` clears the panel and sets phase→Streaming.
+    /// Mirrors the state transitions performed by both Enter and Esc arms.
+    #[test]
+    fn round_cap_resolved_clears_panel_and_resumes() {
+        let mut state = UiState::new();
+        state.round_cap_panel = Some(RoundCapPanel::new(9, 200, 200));
+        state.phase = UiPhase::RoundCap;
+        state.on_round_cap_resolved();
+        assert!(state.round_cap_panel.is_none(), "panel cleared");
+        assert_eq!(state.phase, UiPhase::Streaming, "phase → Streaming");
+    }
+
+    /// Navigation: Up always clamps to cursor=0 (continue).
+    #[test]
+    fn round_cap_move_up_clamps_to_continue() {
+        let mut p = RoundCapPanel::new(7, 100, 100);
+        p.move_down(); // cursor → 1
+        p.move_up(); // cursor → 0
+        assert!(
+            p.chosen_continue(),
+            "move_up brings cursor back to 'continue'"
+        );
+        p.move_up(); // clamped: cursor stays 0
+        assert!(p.chosen_continue(), "move_up at 0 is idempotent");
+    }
+
+    /// Navigation: Down always clamps to cursor=1 (stop).
+    #[test]
+    fn round_cap_move_down_clamps_to_stop() {
+        let mut p = RoundCapPanel::new(7, 100, 100);
+        p.move_down(); // cursor → 1
+        assert!(!p.chosen_continue(), "move_down sets cursor to 'stop'");
+        p.move_down(); // clamped: cursor stays 1
+        assert!(!p.chosen_continue(), "move_down at 1 is idempotent");
     }
 }
