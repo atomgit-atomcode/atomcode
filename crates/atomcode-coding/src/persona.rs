@@ -953,6 +953,13 @@ mod tests {
             frontier.contains("## PROGRESS SIGNPOSTS:"),
             "signposts section always injected: {frontier}"
         );
+        // Header must start its own line — guards the section HEAD boundary against a
+        // stray `\` continuation welding it onto the preceding paragraph (bare `contains`
+        // above would still match a welded `wslview`.## PROGRESS SIGNPOSTS`).
+        assert!(
+            frontier.contains("\n## PROGRESS SIGNPOSTS:"),
+            "signposts header must be on its own line: {frontier}"
+        );
         assert!(
             frontier.contains("Before a batch of tool calls"),
             "signpost guidance present: {frontier}"
