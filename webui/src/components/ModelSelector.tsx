@@ -126,7 +126,7 @@ export function ModelSelector({
     return stripped || m.provider;
   };
   return (
-    <>
+    <div class="model-controls">
       {current?.effort_applicable && (
         <div class="model-selector effort-selector model-selector-up" ref={effortRef}>
           <button
@@ -180,6 +180,6 @@ export function ModelSelector({
           </div>
         )}
       </div>
-    </>
+    </div>
   );
 }

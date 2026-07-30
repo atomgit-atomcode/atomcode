@@ -2475,81 +2475,87 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         onPaste={handlePaste}
       />
       <div class="input-footer">
-        <AttachMenu
-          onInsert={insertAtCursor}
-          onPickFile={() => setShowFilePicker(true)}
-          onAddImages={addImageFiles}
-        />
-        <button
-          class={'btn-sync' + (sync ? ' active' : '')}
-          onClick={toggleSync}
-          title={sync ? t('sync.on') : t('sync.off')}
-          aria-label={t('sync.toggle')}
-          aria-pressed={sync}
-        >
-          {/* lucide `arrow-left-right` — matches the pencil design's sync icon. */}
-          <svg
-            width="16"
-            height="16"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
+        <div class="input-footer-primary">
+          <AttachMenu
+            onInsert={insertAtCursor}
+            onPickFile={() => setShowFilePicker(true)}
+            onAddImages={addImageFiles}
+          />
+          <button
+            class={'btn-sync' + (sync ? ' active' : '')}
+            onClick={toggleSync}
+            title={sync ? t('sync.on') : t('sync.off')}
+            aria-label={t('sync.toggle')}
+            aria-pressed={sync}
           >
-            <path d="M8 3 4 7l4 4" />
-            <path d="M4 7h16" />
-            <path d="m16 21 4-4-4-4" />
-            <path d="M20 17H4" />
-          </svg>
-        </button>
-        <span class="footer-spacer" />
-        {tokens && (
-          <span class="footer-tokens">
-            {(tokens.total / 1000).toFixed(1)}k tokens
-          </span>
-        )}
-        <ModeSelector
-          value={modeState.displayMode}
-          disabled={Boolean(modeState.pendingMode)}
-          onChange={(m) => switchMode(m)}
-        />
-        <ModelSelector
-          value={provider}
-          onChange={(p) => switchProvider(p)}
-          onDefaultChange={followDefaultProvider}
-        />
-        {busy || recoveryPolicy.allowStop ? (
-          <>
-            {/* 执行中仍可发送：按下即排队，当前回合结束后自动发出。 */}
-            {recoveryPolicy.allowSend && (input.trim() || pendingImages.length > 0) && (
+            {/* lucide `arrow-left-right` — matches the pencil design's sync icon. */}
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M8 3 4 7l4 4" />
+              <path d="M4 7h16" />
+              <path d="m16 21 4-4-4-4" />
+              <path d="M20 17H4" />
+            </svg>
+          </button>
+          <span class="footer-spacer" />
+          {tokens && (
+            <span class="footer-tokens">
+              {(tokens.total / 1000).toFixed(1)}k tokens
+            </span>
+          )}
+        </div>
+        <div class="input-footer-actions">
+          <ModeSelector
+            value={modeState.displayMode}
+            disabled={Boolean(modeState.pendingMode)}
+            onChange={(m) => switchMode(m)}
+          />
+          <ModelSelector
+            value={provider}
+            onChange={(p) => switchProvider(p)}
+            onDefaultChange={followDefaultProvider}
+          />
+          <div class="input-turn-controls">
+            {busy || recoveryPolicy.allowStop ? (
+              <>
+                {/* 执行中仍可发送：按下即排队，当前回合结束后自动发出。 */}
+                {recoveryPolicy.allowSend && (input.trim() || pendingImages.length > 0) && (
+                  <button
+                    class="btn-send"
+                    onClick={sendMessage}
+                    disabled={Boolean(modeState.pendingMode)}
+                    title={t('chat.queue')}
+                    aria-label={t('chat.queue')}
+                  >
+                    ↑
+                  </button>
+                )}
+                <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
+                  <span class="stop-square" />
+                </button>
+              </>
+            ) : (
               <button
                 class="btn-send"
                 onClick={sendMessage}
-                disabled={Boolean(modeState.pendingMode)}
-                title={t('chat.queue')}
-                aria-label={t('chat.queue')}
+                disabled={!recoveryPolicy.allowSend || Boolean(modeState.pendingMode) || (!input.trim() && pendingImages.length === 0)}
+                title={recoveryPolicy.allowSend ? t('chat.send') : t('chat.recoveryBlocked')}
+                aria-label={recoveryPolicy.allowSend ? t('chat.send') : t('chat.recoveryBlocked')}
               >
                 ↑
               </button>
             )}
-            <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
-              <span class="stop-square" />
-            </button>
-          </>
-        ) : (
-          <button
-            class="btn-send"
-            onClick={sendMessage}
-            disabled={!recoveryPolicy.allowSend || Boolean(modeState.pendingMode) || (!input.trim() && pendingImages.length === 0)}
-            title={recoveryPolicy.allowSend ? t('chat.send') : t('chat.recoveryBlocked')}
-            aria-label={recoveryPolicy.allowSend ? t('chat.send') : t('chat.recoveryBlocked')}
-          >
-            ↑
-          </button>
-        )}
+          </div>
+        </div>
       </div>
     </div>
   );
