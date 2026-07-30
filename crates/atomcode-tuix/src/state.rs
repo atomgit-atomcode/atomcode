@@ -896,6 +896,11 @@ pub struct UiState {
     /// `/cost` and idle `/usage` leave it `None`. Cleared wherever
     /// `footer_command_output` is.
     pub footer_usage: Option<crate::modals::usage::UsageModal>,
+    /// Non-fatal startup/background notices that arrived while a turn owned the
+    /// body timeline. They are deduplicated and rendered only after the
+    /// authoritative turn terminal so unrelated maintenance output never lands
+    /// between tool rows.
+    pub(crate) deferred_background_notices: Vec<String>,
     /// Per-turn token tallies (reset at turn end). Feed the footer's billable
     /// token count + cache-hit annotation via [`turn_token_summary`]; kept
     /// separate from the session-cumulative `*_tokens` above.
@@ -1247,6 +1252,7 @@ impl UiState {
             cached_tokens: 0,
             footer_command_output: None,
             footer_usage: None,
+            deferred_background_notices: Vec::new(),
             turn_prompt_tokens: 0,
             turn_completion_tokens: 0,
             turn_cached_tokens: 0,
@@ -1559,6 +1565,20 @@ impl UiState {
         // Belt-and-suspenders: a fresh turn always starts with zero steers, even
         // if the previous turn ended abnormally and never fired on_turn_complete.
         self.pending_steers.clear();
+    }
+
+    pub(crate) fn defer_background_notice(&mut self, notice: String) {
+        if !self
+            .deferred_background_notices
+            .iter()
+            .any(|existing| existing == &notice)
+        {
+            self.deferred_background_notices.push(notice);
+        }
+    }
+
+    pub(crate) fn take_background_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.deferred_background_notices)
     }
 
     /// The runtime rejected the turn before accepting it. Keep the UI idle and

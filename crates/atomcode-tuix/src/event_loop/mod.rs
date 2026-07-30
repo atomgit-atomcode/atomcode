@@ -14914,10 +14914,9 @@ pub(super) fn handle_plugin_job_event(
             // ops keep the red Error so genuine failures stay prominent.
             if op == "auto-update" || op == "auto-install" || op == "auto-install-plugin" {
                 let detail = msg.lines().next().unwrap_or(msg.as_str());
-                renderer.render(UiLine::Warning(
-                    crate::i18n::t(crate::i18n::Msg::PluginAutoUpdateSkipped { detail })
-                        .into_owned(),
-                ));
+                let notice = crate::i18n::t(crate::i18n::Msg::PluginAutoUpdateSkipped { detail })
+                    .into_owned();
+                render_or_defer_background_notice(state, renderer, notice);
             } else {
                 renderer.render(UiLine::Error(format!("{}: {}", op, msg)));
             }
@@ -15133,6 +15132,169 @@ fn turn_summary_label(
             cached_pct,
         })
         .into_owned()
+    }
+}
+
+fn render_or_defer_background_notice(
+    state: &mut crate::state::UiState,
+    renderer: &mut dyn Renderer,
+    notice: String,
+) {
+    if state.turn_started_at.is_some() {
+        state.defer_background_notice(notice);
+    } else {
+        renderer.render(UiLine::Warning(notice));
+    }
+}
+
+fn flush_deferred_background_notices(
+    state: &mut crate::state::UiState,
+    renderer: &mut dyn Renderer,
+) {
+    let notices = state.take_background_notices();
+    if notices.is_empty() {
+        return;
+    }
+    renderer.render(UiLine::Warning(notices.join(" · ")));
+    renderer.flush();
+}
+
+fn complete_turn_presentation(state: &mut crate::state::UiState, renderer: &mut dyn Renderer) {
+    state.on_turn_complete();
+    flush_deferred_background_notices(state, renderer);
+}
+
+fn cancel_turn_presentation(state: &mut crate::state::UiState, renderer: &mut dyn Renderer) {
+    state.on_turn_cancelled();
+    flush_deferred_background_notices(state, renderer);
+}
+
+fn complete_peer_turn_presentation(
+    state: &mut crate::state::UiState,
+    renderer: &mut dyn Renderer,
+    think: &mut ThinkStripper,
+) {
+    renderer.render(UiLine::AssistantLineBreak);
+    renderer.flush();
+    think.reset();
+    complete_turn_presentation(state, renderer);
+}
+
+#[cfg(test)]
+mod background_notice_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct CaptureRenderer {
+        lines: Vec<UiLine>,
+        flushes: usize,
+    }
+
+    impl Renderer for CaptureRenderer {
+        fn render(&mut self, line: UiLine) {
+            self.lines.push(line);
+        }
+
+        fn flush(&mut self) {
+            self.flushes += 1;
+        }
+
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+        fn flush_deferred(&mut self) {}
+    }
+
+    #[test]
+    fn background_notice_is_deferred_and_deduplicated_during_turn() {
+        let mut state = crate::state::UiState::new();
+        state.on_submit();
+        let mut renderer = CaptureRenderer::default();
+
+        render_or_defer_background_notice(&mut state, &mut renderer, "sync failed".into());
+        render_or_defer_background_notice(&mut state, &mut renderer, "sync failed".into());
+
+        assert!(renderer.lines.is_empty());
+        assert_eq!(state.deferred_background_notices, vec!["sync failed"]);
+
+        complete_turn_presentation(&mut state, &mut renderer);
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::Warning(message)] if message == "sync failed"
+        ));
+        assert!(state.deferred_background_notices.is_empty());
+        assert_eq!(renderer.flushes, 1);
+    }
+
+    #[test]
+    fn background_notices_merge_after_turn_and_render_immediately_without_one() {
+        let mut state = crate::state::UiState::new();
+        let mut renderer = CaptureRenderer::default();
+
+        render_or_defer_background_notice(&mut state, &mut renderer, "idle notice".into());
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::Warning(message)] if message == "idle notice"
+        ));
+
+        renderer.lines.clear();
+        state.on_submit();
+        render_or_defer_background_notice(&mut state, &mut renderer, "market A".into());
+        render_or_defer_background_notice(&mut state, &mut renderer, "market B".into());
+        cancel_turn_presentation(&mut state, &mut renderer);
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::Warning(message)] if message == "market A · market B"
+        ));
+    }
+
+    #[test]
+    fn failed_terminal_without_snapshot_flushes_background_notice() {
+        let mut state = crate::state::UiState::new();
+        state.on_submit();
+        state.defer_background_notice("market failed".into());
+        let mut renderer = CaptureRenderer::default();
+        let mut think = ThinkStripper::default();
+        let mut pending_tools = std::collections::HashMap::new();
+        let mut setup_pending = true;
+        let mut reasoning_buffer = "partial".to_string();
+
+        finish_failed_turn_without_snapshot(
+            &mut state,
+            &mut renderer,
+            &mut think,
+            &mut pending_tools,
+            &mut setup_pending,
+            &mut reasoning_buffer,
+        );
+
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::Warning(message)] if message == "market failed"
+        ));
+        assert!(state.deferred_background_notices.is_empty());
+        assert!(!setup_pending);
+        assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
+    fn peer_terminal_flushes_background_notice_after_assistant_line() {
+        let mut state = crate::state::UiState::new();
+        state.on_submit();
+        state.defer_background_notice("market failed".into());
+        let mut renderer = CaptureRenderer::default();
+        let mut think = ThinkStripper::default();
+
+        complete_peer_turn_presentation(&mut state, &mut renderer, &mut think);
+
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::AssistantLineBreak, UiLine::Warning(message)]
+                if message == "market failed"
+        ));
+        assert!(state.deferred_background_notices.is_empty());
     }
 }
 
@@ -16727,6 +16889,7 @@ fn handle_runtime_event(
                     if snapshot_unavailable {
                         finish_failed_turn_without_snapshot(
                             state,
+                            renderer,
                             think,
                             pending_tools,
                             setup_pending,
@@ -16760,6 +16923,7 @@ fn handle_runtime_event(
                         );
                         finish_failed_turn_without_snapshot(
                             state,
+                            renderer,
                             think,
                             pending_tools,
                             setup_pending,
@@ -17495,13 +17659,14 @@ fn handle_runtime_event(
 /// runtime stop that violated the turn-terminal contract).
 fn finish_failed_turn_without_snapshot(
     state: &mut UiState,
+    renderer: &mut dyn Renderer,
     think: &mut ThinkStripper,
     pending_tools: &mut std::collections::HashMap<String, (String, String, bool)>,
     setup_pending: &mut bool,
     reasoning_buffer: &mut String,
 ) {
     state.response_finalized = true;
-    state.on_turn_complete();
+    complete_turn_presentation(state, renderer);
     think.reset();
     pending_tools.clear();
     reasoning_buffer.clear();
@@ -19200,7 +19365,7 @@ fn handle_agent_event(
                 renderer.render(UiLine::TurnSeparator { label });
             }
             renderer.flush();
-            state.on_turn_complete();
+            complete_turn_presentation(state, renderer);
 
             // Reset the think stripper between turns. If the previous turn
             // left an unclosed `<think>` in flight (cancelled mid-stream,
@@ -19319,7 +19484,7 @@ fn handle_agent_event(
             }
             renderer.render(UiLine::TurnCancelled);
             renderer.flush();
-            state.on_turn_cancelled();
+            cancel_turn_presentation(state, renderer);
             *setup_pending = false;
             // Same reset rationale as TurnComplete: a cancelled turn is the
             // single most common way for `<think>` to go unclosed, so this
@@ -19996,10 +20161,7 @@ fn handle_agent_event(
                 // 的第一步 AssistantLineBreak),否则短回复(如"在的!")一直挂在
                 // 流式当前行不提交,要等下一轮才一起刷出 —— sync 模式下的空助手气泡
                 // bug。同时 reset think-stripper,避免上一轮残留吞掉下一轮文本。
-                renderer.render(UiLine::AssistantLineBreak);
-                renderer.flush();
-                think.reset();
-                state.on_turn_complete();
+                complete_peer_turn_presentation(state, renderer, think);
             }
         }
         AgentEvent::ProviderChanged(provider) => {
