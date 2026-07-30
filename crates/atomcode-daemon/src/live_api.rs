@@ -374,6 +374,11 @@ pub(crate) async fn run_chat_turn_v2(
         let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
         (SessionSnapshot::new(msgs), text, images, turn_base)
     };
+    // Stash the ORIGINAL image to the display-only sidecar BEFORE it is stripped from the
+    // model conversation below (`user_images = Vec::new()`), so a reloading client refills
+    // the thumbnail from the sidecar. The /chat path previously skipped this, so the image
+    // was lost after refresh for anyone loading the session fresh from disk. Mirrors /live.
+    stash_vl_display_images(&runtime_cfg.working_dir, &session_id, &user_text, &user_images);
     let naming_session_id = session_id.clone();
     let naming_project_bucket =
         atomcode_capabilities::session::SessionManager::project_hash(&runtime_cfg.working_dir);
@@ -1185,6 +1190,32 @@ fn text_carries_vl_caption(text: &str) -> bool {
     text.contains("[图片内容（由") || text.contains("[图片识别失败]")
 }
 
+/// Stash a VL-preprocessed submission's ORIGINAL images into the session's display-only
+/// sidecar so another client (or a page refresh) re-attaches the thumbnail. No-op unless
+/// the runtime text carries a VL caption — i.e. the image was stripped from the model
+/// conversation, leaving the persisted snapshot image-less — AND at least one image exists.
+/// Both the `/live` and `/chat` VL-strip paths call this; the `/chat` path previously
+/// skipped it, so reloading clients (other users) saw only the "missing image" placeholder.
+fn stash_vl_display_images(
+    working_dir: &std::path::Path,
+    session_id: &str,
+    runtime_text: &str,
+    original_images: &[ImageContent],
+) {
+    if !text_carries_vl_caption(runtime_text) || original_images.is_empty() {
+        return;
+    }
+    let display: Vec<crate::ImageData> = original_images
+        .iter()
+        .map(|image| crate::ImageData {
+            media_type: image.media_type.clone(),
+            data: image.data.clone(),
+            missing: false,
+        })
+        .collect();
+    crate::append_display_images(working_dir, session_id, display);
+}
+
 /// 对 live 输入做视觉预处理：主模型不支持视觉时，用 VL 模型把图片转文字拼进 caption
 /// （原图始终保留在 MultiPart 里用于缩略图渲染）。与 `/chat` 路径共享
 /// [`preprocess_image_caption`]；任何 config/provider 加载失败都降级为原文，不阻断发送。
@@ -1323,17 +1354,12 @@ pub(crate) async fn live_message(
     // VL preprocessing produced a caption ⇒ the runtime strips the image from the
     // conversation (it must never re-enter model context — see estimate_tokens). Stash the
     // originals in the display-only sidecar so a page refresh re-attaches the thumbnail.
-    if text_carries_vl_caption(&runtime_text) && !original_images.is_empty() {
-        let display: Vec<crate::ImageData> = original_images
-            .iter()
-            .map(|image| crate::ImageData {
-                media_type: image.media_type.clone(),
-                data: image.data.clone(),
-                missing: false,
-            })
-            .collect();
-        crate::append_display_images(&join.binding.working_dir, &join.binding.session_id, display);
-    }
+    stash_vl_display_images(
+        &join.binding.working_dir,
+        &join.binding.session_id,
+        &runtime_text,
+        &original_images,
+    );
     let (runtime_input, echo_input) = split_live_inputs(req.message, original_images, runtime_text);
     match crate::native_live::submit_confirmed_with_echo(runtime_input, echo_input).await {
         Ok(_) => Json(serde_json::json!({ "accepted": true })),
@@ -1879,6 +1905,77 @@ mod tests {
             media_type: "image/png".into(),
             data: tag.into(),
         }
+    }
+
+    // A reloaded VL-stripped user message renders as a "missing image" placeholder
+    // (see MessageInfo::from_kernel). Other clients only recover the thumbnail if the
+    // ORIGINAL bytes were stashed to the display-only sidecar during the turn.
+    fn missing_user_msg() -> crate::MessageInfo {
+        crate::MessageInfo {
+            role: "user".into(),
+            content: "识别一下".into(),
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: Some(vec![crate::ImageData {
+                media_type: "image/png".into(),
+                data: String::new(),
+                missing: true,
+            }]),
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn vl_stripped_image_survives_reload_via_display_sidecar() {
+        // Repro of "image lost after refresh for other users": on a VL-strip turn the
+        // persisted user message is image-less, so the ORIGINAL image MUST be stashed to
+        // the display-only sidecar for a fresh reload to refill it. The /live path did
+        // this; the /chat path did NOT — both now share `stash_vl_display_images`.
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        let sid = "sess-vl-reload";
+        // Production has an existing project sessions dir by the time a turn runs; the
+        // sidecar write is best-effort (ignores errors), so create the dir for the test.
+        std::fs::create_dir_all(
+            atomcode_capabilities::session::SessionManager::for_project(wd).root(),
+        )
+        .unwrap();
+
+        // BUG: no sidecar written → a fresh reload keeps the "missing" placeholder.
+        let mut before = vec![missing_user_msg()];
+        crate::attach_display_images(&mut before, wd, sid);
+        assert!(
+            before[0].images.as_ref().unwrap()[0].missing,
+            "no sidecar → other clients still see the missing placeholder"
+        );
+
+        // FIX: the shared helper stashes the original bytes (VL caption + image present).
+        stash_vl_display_images(
+            wd,
+            sid,
+            "识别一下\n\n[图片内容（由 vl 识别）]\na cat",
+            &[img("REAL-BYTES")],
+        );
+
+        let mut after = vec![missing_user_msg()];
+        crate::attach_display_images(&mut after, wd, sid);
+        let refilled = &after[0].images.as_ref().unwrap()[0];
+        assert!(!refilled.missing, "sidecar present → placeholder refilled");
+        assert_eq!(refilled.data, "REAL-BYTES");
+
+        // Gating: no VL caption OR no image → nothing stashed (don't pollute the sidecar).
+        let sid2 = "sess-no-vl";
+        stash_vl_display_images(wd, sid2, "plain text, no caption", &[img("X")]);
+        stash_vl_display_images(wd, sid2, "[图片内容（由 vl 识别）] no image", &[]);
+        let mut plain = vec![missing_user_msg()];
+        crate::attach_display_images(&mut plain, wd, sid2);
+        assert!(
+            plain[0].images.as_ref().unwrap()[0].missing,
+            "no VL caption / no image → nothing stashed → stays missing"
+        );
     }
 
     #[test]
