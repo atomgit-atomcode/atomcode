@@ -13,8 +13,11 @@ memory 工具的 global scope 由 `MemoryStore::global()` 经 `super::config_dir
 
 ## 现状(已核对)
 
-- `MemoryStore::new(path)` 本就以完整路径参数化；`global()` 走 `config_dir()`（尊重 `ATOMCODE_HOME`）；唯 `project(project_root)` 硬编码 `.atomcode`（store.rs:29-31）。
-- **读、写、prompt 注入三侧全部经 `MemoryStore::project()`**：调用点在 tuix `event_loop/commands.rs`（`/memory`、`/remember`、prompt 组装 `commands.rs:7210`）、`atomcode-clix/src/code.rs`、`atomcode-capabilities/src/tools/memory.rs:40`。因此**只改 `project()` 一处即同时覆盖三侧**，无调用点改动。
+- `MemoryStore::new(path)` 本就以完整路径参数化；`global()` 走 `config_dir()`（尊重 `ATOMCODE_HOME`）；唯 `project(project_root)` 硬编码 `.atomcode`。
+- **⚠️ 存在两份 `MemoryStore`，两份都在生产用、`project()` 都硬编码 `.atomcode`**（计划期 grep 发现，spec 初稿曾漏）：
+  1. `atomcode-capabilities/src/memory/store.rs`（用户点的，L1 端口）：被 tuix `event_loop/commands.rs`（`/memory`/`/remember`/prompt 组装）、`atomcode-clix/src/code.rs`、`atomcode-capabilities/src/tools/memory.rs:40`（`remember` 工具）、以及 **prompt 注入 hook `memory/hook.rs:49`（`MemoryStore::project(project_root)`）** 使用。
+  2. `atomcode-config/src/config/memory.rs`（原版；store.rs 是它的 VERBATIM 端口，两者字节兼容）：被 **daemon（webui）`atomcode-daemon/src/commands.rs:527/531`（`MemoryStore::global()`/`project()`）** 使用。
+- 结论：**两份 `project()` 必须同样修，否则另一条路径（TUI 或 daemon/webui）仍落回 `.atomcode`，宿主 bug 只修一半**。每份内部读/写/注入都经各自 `project()`，故各改一处即覆盖该 crate 的全部路径，无调用点 churn。
 - `.atomcode` 每项目目录名在全仓另有约 8 处硬编码（skills/commands/hooks/setup/lock/sensitive_path 等），无统一解析器——**本设计不触碰它们**（见"范围决策"）。
 
 ## 范围决策(brainstorming 收敛)
@@ -27,7 +30,9 @@ memory 工具的 global scope 由 `MemoryStore::global()` 经 `super::config_dir
 
 ## 具体设计
 
-### 改动 —— `MemoryStore::project` 读环境变量(store.rs)
+**两份 `MemoryStore` 各自施加同一改动**（`atomcode-capabilities/src/memory/store.rs` 与 `atomcode-config/src/config/memory.rs`），保持二者字节兼容。下述以 store.rs 为例，config/memory.rs 逐字镜像。
+
+### 改动 —— `MemoryStore::project` 读环境变量(每份 store 各一处)
 
 拆成"纯函数 + 读 env"两层，纯函数脱离 env 可稳定单测：
 
@@ -69,15 +74,16 @@ pub fn project(project_root: &Path) -> Self {
   - `(root, Some("/abs/dir"))` → `/abs/dir/memory.md`
   - `(root, Some(""))` → 回退默认 `.atomcode`
 - **env 集成一条(自设自清,避免并行泄漏)**：设 `ATOMCODE_PROJECT_MEMORY_DIR` 后 `project(root).path()` 落到自定义目录；`remove_var` 后回默认。（同文件内串行、测尾清理。）
-- **回归**：`cargo test -p atomcode-capabilities`（含 memory store + `remember_writes_project_entry`）全绿。
+- **两份 store 各自加上述纯函数测试 + 一条 env 测试**（capabilities 与 config 各一套）。
+- **回归**：`cargo test -p atomcode-capabilities`（含 memory store + `remember_writes_project_entry`）与 `cargo test -p atomcode-config`（含 config/memory.rs 既有测试）全绿。
 
 ## 文档
 
 - 配置文档补一条 `ATOMCODE_PROJECT_MEMORY_DIR`（与 `ATOMCODE_HOME` 并列）：默认 `.atomcode`，可为相对(挂 working_dir)或绝对目录，仅影响 project-scope 记忆文件位置——回应"记忆写到哪了"的可发现性痛点。
 
-## 计划期须验证
+## 计划期已验证
 
-- grep 兜底确认**没有别处绕过 `MemoryStore` 直接读/写 `.atomcode/memory.md`**；若有，一并归口到 `project()`（否则宿主设了 env 仍会有一侧落回 `.atomcode`，重演不对称）。
+- grep 兜底：无别处绕过 `MemoryStore` 直接拼 `.atomcode/memory.md`（除测试）。但**发现第二份 store**（config/memory.rs，daemon 在用）——已纳入设计，两份都改。`hook.rs` 注入侧走 `project()`，自动覆盖。
 
 ## 非目标(defer)
 
