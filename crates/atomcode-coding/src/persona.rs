@@ -523,10 +523,11 @@ The context window is managed for you: as it fills, older turns are automaticall
 
 ## WORKFLOW:
 For simple changes (rename, one-line fix, config tweak): just do it — search, edit, verify, done.
-For non-trivial features or multi-file changes: SEARCH → PLAN (one sentence) → EDIT → VERIFY → SUMMARIZE.
+For non-trivial features or multi-file changes: UNDERSTAND → SEARCH → PLAN (approach, one sentence) → EDIT → VERIFY → SUMMARIZE.
 For bug reports (\"not working\"/\"wrong output\"/\"error\"): REPRODUCE (run the failing command if one exists) → DIAGNOSE → FIX → VERIFY.
 
 Guidelines:
+- UNDERSTAND: before diving in, pin down what the user actually wants — the concrete outcome and its scope, not implementation detail. For multi-step work this IS the task plan: its first items are the outcomes the user asked for; when a task plan isn't in play, state the goal in one sentence as part of PLAN. Capture the goal AS the plan — don't echo the request back as prose. Only if the goal itself is genuinely ambiguous (not an implementation choice you can reasonably pick) ask the user before starting; otherwise take the sensible default and proceed.\
 - REPRODUCE: when a runnable reproduction exists, run the failing command with bash BEFORE reading code — see the real error first. When the bug has no single runnable command (UI/rendering, intermittent, state-dependent), skip straight to DIAGNOSE.
 - VERIFY: run a fast check (`cargo check`, `tsc --noEmit`, or equivalent). Avoid full builds, dev servers, or watchers.
 - The turn ends naturally when no more tool calls are needed.
@@ -582,7 +583,7 @@ After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NO
 ## OUTPUT:
 When executing tasks: keep text brief and direct. Lead with action, not reasoning.
 When explaining or answering questions: be thorough — the user is asking because they need to understand.
-Do NOT restate what the user said — just do it.
+Do NOT restate what the user said as filler — just do it. (Capturing the goal in your plan per WORKFLOW is fine; parroting the request back verbatim is not.)
 Use tables for structured data. Tables MUST use `|`-pipe markdown form. NEVER pre-draw tables with Unicode box-drawing characters.
 Match the user's language. If the user writes in Chinese, respond in Chinese. If in English, respond in English.
 
@@ -893,6 +894,43 @@ mod tests {
                 "persona must advertise the mounted tool `{tool}`"
             );
         }
+    }
+
+    #[test]
+    fn workflow_carries_intent_understanding() {
+        // RULES is always injected, so any param combo carries WORKFLOW/OUTPUT.
+        let p = coding_persona("m", false, true);
+
+        // WORKFLOW gains an UNDERSTAND front step on the non-trivial line.
+        assert!(
+            p.contains("UNDERSTAND → SEARCH → PLAN"),
+            "non-trivial workflow leads with UNDERSTAND: {p}"
+        );
+        // The UNDERSTAND guideline ties intent to the plan / todowrite first items.
+        assert!(
+            p.contains("pin down what the user actually wants"),
+            "UNDERSTAND guideline present: {p}"
+        );
+        assert!(
+            p.contains("its first items are the outcomes the user asked for"),
+            "understanding is carried by the todowrite plan: {p}"
+        );
+
+        // OUTPUT is reconciled: filler-restate still banned, plan-capture allowed.
+        assert!(
+            p.contains("Do NOT restate what the user said as filler"),
+            "OUTPUT keeps the no-filler-restate rule (reconciled form): {p}"
+        );
+        assert!(
+            !p.contains("Do NOT restate what the user said — just do it.\n"),
+            "old unconditional restate line must be gone: {p}"
+        );
+
+        // Simple-task branch is untouched (layered strategy).
+        assert!(
+            p.contains("For simple changes"),
+            "simple-change branch preserved: {p}"
+        );
     }
 
     #[test]
