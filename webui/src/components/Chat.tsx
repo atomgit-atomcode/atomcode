@@ -1089,11 +1089,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
       return;
     }
-    // 模型切换是进程级（全局），与正在查看哪个会话无关。若当前未显式固定模型则跟随更新。
+    // 模型切换是进程级（全局），与正在查看哪个会话无关。provider 事件是运行时
+    // ProviderChanged 的权威回声（本端确认的切换 / 别的 tab / TUI），一律采纳并解除
+    // pin——pin 只用于防止「重连快照」回退一次尚未传播的本地切换，不该挡真实的变更事件，
+    // 否则本端切过一次模型后就永远不再跟随 TUI 的模型切换（S1）。
     if (e.type === 'provider') {
-      if (!providerPinnedRef.current) {
-        setProvider(e.provider);
-      }
+      setProvider(e.provider);
+      providerPinnedRef.current = false;
       return;
     }
     // 审批模式切换是进程级（另一 tab / 未来 TUI）→ 始终同步 pill。
@@ -1362,8 +1364,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }
     const previous = provider;
     setProvider(name);
-    void postLiveProvider(name, sessionId).catch((error) => {
+    void postLiveProvider(name, sessionId).then((res) => {
+      if (res.ok) return;
+      // Rejected (e.g. a turn is running): undo the optimistic selection and unpin
+      // so the selector resumes following the runtime's authoritative model.
       setProvider(previous);
+      providerPinnedRef.current = false;
+      pushCommandNotice(res.activeTurn ? t('cmd.model.syncBusy') : (res.error ?? t('cmd.model.syncBusy')));
+    }).catch((error) => {
+      setProvider(previous);
+      providerPinnedRef.current = false;
       setHistoryHint(t('chat.connError', { msg: String(error) }));
     });
   }

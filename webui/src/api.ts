@@ -802,15 +802,20 @@ export async function postLiveSwitchSession(sessionId: string): Promise<void> {
 
 /** Sync-mode model switch: notify the daemon immediately when the dropdown
  *  changes (not just on send), so the TUI header and other tabs follow. */
-export async function postLiveProvider(provider: string, sessionId?: string | null): Promise<void> {
+export async function postLiveProvider(
+  provider: string,
+  sessionId?: string | null,
+): Promise<{ ok: boolean; activeTurn: boolean; error?: string }> {
   const resp = await fetch('/live/provider', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ provider, ...(sessionId ? { session_id: sessionId } : {}) }),
   });
   if (!resp.ok) throw new Error(`switch live provider failed: ${resp.status}`);
-  const body = await resp.json() as { ok?: boolean; error?: string };
-  if (!body.ok) throw new Error(body.error ?? 'live runtime rejected the provider switch');
+  // A business rejection (e.g. active_turn) is NOT thrown — the caller reverts its
+  // optimistic selection and shows a notice. Only transport failures throw.
+  const body = await resp.json() as { ok?: boolean; active_turn?: boolean; error?: string };
+  return { ok: body.ok === true, activeTurn: body.active_turn === true, error: body.error };
 }
 
 // --- /command endpoint ---
