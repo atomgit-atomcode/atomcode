@@ -2521,6 +2521,25 @@ async fn get_models() -> impl IntoResponse {
     (StatusCode::OK, Json(models_from_config(&config))).into_response()
 }
 
+/// Resolve the model selection used by `/chat` through the unified config boundary.
+///
+/// New-schema CodingPlan models live in `[models.*]` and therefore are not present in
+/// the legacy `config.providers` map. Keep the selection id intact for the runtime while
+/// projecting the flattened provider config needed by image preprocessing and runtime
+/// metadata.
+fn resolve_chat_provider(
+    config: &Config,
+    requested: Option<String>,
+) -> anyhow::Result<(String, atomcode_config::config::provider::ProviderConfig)> {
+    let selection = requested
+        .or_else(|| config.effective_model_selection())
+        .ok_or_else(|| anyhow::anyhow!("no model selected"))?;
+    let provider = config
+        .provider_config_for_selection(&selection)
+        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", selection))?;
+    Ok((selection, provider))
+}
+
 // ============== Streaming Chat API ==============
 
 /// Chat request body
@@ -3680,14 +3699,9 @@ async fn process_chat_request(
     let config = atomcode_config::ConfigStore::default_store().read()?.config;
     atomcode_config::proxy::apply_process_proxy_config(&config.network.proxy);
 
-    // Determine provider
-    let provider_name = req
-        .provider
-        .unwrap_or_else(|| config.default_provider.clone());
-    let provider_config = config
-        .providers
-        .get(&provider_name)
-        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_name))?;
+    // Determine the unified model selection. CodingPlan/new-schema selections live in
+    // `[models.*]`, not the retired per-model `[providers.*]` projection.
+    let (provider_name, provider_config) = resolve_chat_provider(&config, req.provider)?;
     // The provider config's existence is validated above; the native runtime
     // builds (and validates) its own kernel provider for the actual turn and
     // surfaces a clean error there. No core-provider preflight is needed — the
@@ -5427,6 +5441,95 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_resolves_new_schema_model_selection() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "AtomGit-deepseek-v4-flash",
+            "provider_accounts": {
+                "AtomGit": {
+                    "provider": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1"
+                }
+            },
+            "models": {
+                "AtomGit-deepseek-v4-flash": {
+                    "account": "AtomGit",
+                    "model": "deepseek-v4-flash",
+                    "context_window": 128000
+                }
+            }
+        }))
+        .unwrap();
+
+        let (selection, provider) =
+            resolve_chat_provider(&config, Some("AtomGit-deepseek-v4-flash".into())).unwrap();
+        assert_eq!(selection, "AtomGit-deepseek-v4-flash");
+        assert_eq!(provider.model, "deepseek-v4-flash");
+        assert_eq!(provider.provider_type, "openai");
+    }
+
+    #[test]
+    fn chat_defaults_to_effective_model_selection() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "stale-legacy-default",
+            "default_model": "AtomGit-GLM-5.2",
+            "provider_accounts": {
+                "AtomGit": {
+                    "provider": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1"
+                }
+            },
+            "models": {
+                "AtomGit-GLM-5.2": {
+                    "account": "AtomGit",
+                    "model": "GLM-5.2",
+                    "context_window": 128000
+                }
+            }
+        }))
+        .unwrap();
+
+        let (selection, provider) = resolve_chat_provider(&config, None).unwrap();
+        assert_eq!(selection, "AtomGit-GLM-5.2");
+        assert_eq!(provider.model, "GLM-5.2");
+    }
+
+    #[test]
+    fn chat_still_resolves_legacy_provider() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "claude",
+            "providers": {
+                "claude": {
+                    "type": "claude",
+                    "model": "claude-opus-4-7"
+                }
+            }
+        }))
+        .unwrap();
+
+        let (selection, provider) = resolve_chat_provider(&config, None).unwrap();
+        assert_eq!(selection, "claude");
+        assert_eq!(provider.model, "claude-opus-4-7");
+        assert_eq!(provider.provider_type, "claude");
+    }
+
+    #[test]
+    fn chat_rejects_unknown_selection() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "claude",
+            "providers": {
+                "claude": {
+                    "type": "claude",
+                    "model": "claude-opus-4-7"
+                }
+            }
+        }))
+        .unwrap();
+
+        let error = resolve_chat_provider(&config, Some("missing".into())).unwrap_err();
+        assert_eq!(error.to_string(), "Provider 'missing' not found");
+    }
 
     #[test]
     fn models_endpoint_lists_new_schema_and_folded_codingplan_models() {
