@@ -1205,6 +1205,13 @@ fn stash_vl_display_images(
     if !text_carries_vl_caption(runtime_text) || original_images.is_empty() {
         return;
     }
+    // Ensure the project sessions dir exists: `append_display_images` is best-effort and
+    // never creates it, and on `/chat` a brand-new session's first turn can reach here
+    // before any snapshot save has created the dir — without this the sidecar write would
+    // silently fail and the image would still be lost after refresh.
+    let _ = std::fs::create_dir_all(
+        atomcode_capabilities::session::SessionManager::for_project(working_dir).root(),
+    );
     let display: Vec<crate::ImageData> = original_images
         .iter()
         .map(|image| crate::ImageData {
@@ -1937,12 +1944,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wd = dir.path();
         let sid = "sess-vl-reload";
-        // Production has an existing project sessions dir by the time a turn runs; the
-        // sidecar write is best-effort (ignores errors), so create the dir for the test.
-        std::fs::create_dir_all(
-            atomcode_capabilities::session::SessionManager::for_project(wd).root(),
-        )
-        .unwrap();
+        // NOTE: the sessions dir is deliberately NOT pre-created — stash_vl_display_images
+        // must create it itself (a brand-new session's first /chat turn reaches the stash
+        // before any snapshot save has made the dir).
 
         // BUG: no sidecar written → a fresh reload keeps the "missing" placeholder.
         let mut before = vec![missing_user_msg()];
