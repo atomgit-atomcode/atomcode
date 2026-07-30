@@ -391,12 +391,19 @@ impl LiveViewHub {
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))
     }
 
-    /// Whether the bound runtime is mid-turn (or parked awaiting approval). A
-    /// provider reload in this state hard-kills the in-flight turn (via
-    /// `AgentCommand::Shutdown`) and drops its context — the runtime respawns
-    /// from the last on-disk snapshot, which predates the interrupted turn. The
-    /// provider-switch entry points refuse in this state so the user stops the
-    /// turn first. Unbound → false (nothing to interrupt).
+    /// Whether the bound runtime is mid-turn, parked awaiting approval, or already
+    /// reconfiguring. A provider reload in any of these states hard-kills the
+    /// in-flight turn (via `AgentCommand::Shutdown`) and drops its context — the
+    /// runtime respawns from the last on-disk snapshot, which predates the
+    /// interrupted turn. The provider-switch entry points refuse so the user stops
+    /// the turn first. Unbound → false (nothing to interrupt).
+    ///
+    /// This is a best-effort guard, not an atomic gate: the caller releases this
+    /// lock before it re-acquires state to dispatch, and the runtime processes a
+    /// concurrently-queued submit ahead of the reassemble, so a turn that starts
+    /// in that narrow window can still be caught. Closing it fully needs
+    /// runtime-level coordination (out of this fix's scope). The phase set mirrors
+    /// [`Self::bind_with_provider`]'s active-turn set so both refuse identically.
     pub fn turn_in_progress(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.turn_active {
@@ -407,7 +414,7 @@ impl LiveViewHub {
         };
         matches!(
             bound.control.status().phase,
-            RuntimePhase::InTurn | RuntimePhase::WaitingApproval
+            RuntimePhase::InTurn | RuntimePhase::WaitingApproval | RuntimePhase::Reconfiguring
         )
     }
 
@@ -1315,6 +1322,11 @@ mod tests {
 
         // Parked awaiting approval also counts as in-flight.
         control.status.lock().unwrap().phase = RuntimePhase::WaitingApproval;
+        assert!(hub.turn_in_progress());
+
+        // Already reconfiguring (e.g. a prior reload in flight): a second reload
+        // must also be refused — mirrors bind_with_provider's active set.
+        control.status.lock().unwrap().phase = RuntimePhase::Reconfiguring;
         assert!(hub.turn_in_progress());
     }
 

@@ -1291,8 +1291,12 @@ pub(crate) async fn live_message(
                 crate::native_live::reload_provider(&join.binding, next, requested_fingerprint)
                     .await
             {
+                // Same active-turn flag as /live/provider so the client can tell the
+                // user to stop the turn rather than showing a raw error.
+                let active_turn = matches!(error, crate::live_hub::HubError::ActiveTurn);
                 return Json(serde_json::json!({
                     "accepted": false,
+                    "active_turn": active_turn,
                     "error": format!("provider reload rejected: {error:?}"),
                 }));
             }
@@ -1664,6 +1668,9 @@ pub(crate) async fn live_reasoning_effort(
             Err(error) => Err(crate::live_hub::HubError::RuntimeRejected(error)),
         };
         if let Err(error) = reload_result {
+            // Roll back the persisted effort (the reload that would apply it was
+            // refused). Surface the same active_turn flag as /live/provider.
+            let active_turn = matches!(error, crate::live_hub::HubError::ActiveTurn);
             let rollback_error =
                 match store.update_if_revision(&commit.snapshot.revision, |config| {
                     config.update_selection_reasoning(&target, |r| {
@@ -1676,6 +1683,7 @@ pub(crate) async fn live_reasoning_effort(
                 };
             return Json(serde_json::json!({
                 "ok": false,
+                "active_turn": active_turn,
                 "error": match rollback_error {
                     Some(rollback) => format!(
                         "provider reload rejected: {error:?}; config rollback failed: {rollback}"
