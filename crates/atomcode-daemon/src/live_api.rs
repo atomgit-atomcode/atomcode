@@ -1492,6 +1492,14 @@ pub(crate) async fn live_provider(
     .await
     {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
+        // A turn is running: reassembling the provider would hard-kill it and drop
+        // the interrupted turn's context. Surface a distinct flag so the client can
+        // revert its optimistic selection and tell the user to stop the turn first.
+        Err(crate::live_hub::HubError::ActiveTurn) => Json(serde_json::json!({
+            "ok": false,
+            "active_turn": true,
+            "error": "a turn is running; stop it before switching the model",
+        })),
         Err(error) => Json(serde_json::json!({
             "ok": false,
             "error": format!("provider reload rejected: {error:?}"),

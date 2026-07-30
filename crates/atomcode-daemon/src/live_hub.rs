@@ -391,12 +391,37 @@ impl LiveViewHub {
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))
     }
 
+    /// Whether the bound runtime is mid-turn (or parked awaiting approval). A
+    /// provider reload in this state hard-kills the in-flight turn (via
+    /// `AgentCommand::Shutdown`) and drops its context — the runtime respawns
+    /// from the last on-disk snapshot, which predates the interrupted turn. The
+    /// provider-switch entry points refuse in this state so the user stops the
+    /// turn first. Unbound → false (nothing to interrupt).
+    pub fn turn_in_progress(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.turn_active {
+            return true;
+        }
+        let Some(bound) = state.binding.as_ref() else {
+            return false;
+        };
+        matches!(
+            bound.control.status().phase,
+            RuntimePhase::InTurn | RuntimePhase::WaitingApproval
+        )
+    }
+
     pub async fn reload_provider(
         &self,
         expected: &LiveBinding,
         next: atomcode_coding::CodingAgentConfig,
         provider_fingerprint: String,
     ) -> Result<atomcode_coding::RuntimeGeneration, HubError> {
+        // Refuse to swap the provider while a turn is running: reassemble would
+        // hard-kill it and silently discard the interrupted turn's work.
+        if self.turn_in_progress() {
+            return Err(HubError::ActiveTurn);
+        }
         let handle = self.bound_handle_for(expected)?;
         let provider = next.provider_name.clone();
         let generation = handle
@@ -1270,6 +1295,27 @@ mod tests {
             .unwrap_err(),
             HubError::Unbound
         );
+    }
+
+    #[test]
+    fn turn_in_progress_reflects_runtime_phase_and_gates_provider_reload() {
+        let hub = LiveViewHub::new();
+        // Unbound: nothing to interrupt.
+        assert!(!hub.turn_in_progress());
+
+        let (control, _) = control();
+        hub.bind("session-1", PathBuf::from("/one"), snapshot("old"), control.clone())
+            .unwrap();
+        // Ready phase, no active turn → a provider reload is safe.
+        assert!(!hub.turn_in_progress());
+
+        // A running turn (InTurn phase) must gate the reload.
+        control.status.lock().unwrap().phase = RuntimePhase::InTurn;
+        assert!(hub.turn_in_progress());
+
+        // Parked awaiting approval also counts as in-flight.
+        control.status.lock().unwrap().phase = RuntimePhase::WaitingApproval;
+        assert!(hub.turn_in_progress());
     }
 
     #[test]
