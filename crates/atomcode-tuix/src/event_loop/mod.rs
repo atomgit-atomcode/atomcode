@@ -8324,7 +8324,9 @@ fn should_deactivate_for_missing_auth(
 /// explicit `/reload`) its on-disk edits (`context_window`, model, …) are
 /// adopted so the settings of the model you're using actually take effect;
 /// the runtime copy is used only when disk lacks that provider entirely.
-/// `default_provider` is always pinned to the running selection.
+/// Both selection fields are pinned to the running selection:
+/// `default_provider` for legacy configs and `default_model` for the canonical
+/// account/model schema.
 fn merge_persisted_config_preserving_active(
     current: &Config,
     mut persisted: Config,
@@ -8340,6 +8342,31 @@ fn merge_persisted_config_preserving_active(
         }
     }
     persisted.default_provider = active_name;
+    if let Some(active_model) = current.default_model.as_ref() {
+        if let Some(profile) = current.models.get(active_model) {
+            let keep_runtime_profile =
+                !adopt_active_edits || !persisted.models.contains_key(active_model);
+            if keep_runtime_profile {
+                persisted
+                    .models
+                    .insert(active_model.clone(), profile.clone());
+            }
+
+            if let Some(account) = current.provider_accounts.get(&profile.account) {
+                let keep_runtime_account = !adopt_active_edits
+                    || !persisted.provider_accounts.contains_key(&profile.account);
+                if keep_runtime_account {
+                    persisted
+                        .provider_accounts
+                        .insert(profile.account.clone(), account.clone());
+                }
+            }
+        }
+    }
+    // `default_model` takes precedence over `default_provider`; assigning even
+    // `None` is required when a legacy pinned window observes another process
+    // switching the shared default to a new-schema model.
+    persisted.default_model = current.default_model.clone();
     persisted
 }
 
@@ -8369,6 +8396,27 @@ fn config_for_persistence(
                 .or_insert_with(|| provider.clone());
         }
         saved.default_provider = persisted.default_provider.clone();
+        if let Some(selection) = persisted.default_model.as_ref() {
+            if let Some(provider) = persisted.providers.get(selection) {
+                saved
+                    .providers
+                    .entry(selection.clone())
+                    .or_insert_with(|| provider.clone());
+            }
+            if let Some(profile) = persisted.models.get(selection) {
+                saved
+                    .models
+                    .entry(selection.clone())
+                    .or_insert_with(|| profile.clone());
+                if let Some(account) = persisted.provider_accounts.get(&profile.account) {
+                    saved
+                        .provider_accounts
+                        .entry(profile.account.clone())
+                        .or_insert_with(|| account.clone());
+                }
+            }
+        }
+        saved.default_model = persisted.default_model.clone();
     }
     saved
 }
@@ -8476,6 +8524,31 @@ mod external_config_tests {
         config_with_url(model, false, "https://llm-api.atomgit.com/v1")
     }
 
+    fn new_schema_config(default_model: &str) -> Config {
+        serde_json::from_value(serde_json::json!({
+            "default_model": default_model,
+            "provider_accounts": {
+                "account": {
+                    "provider": "openai",
+                    "base_url": "https://example.test/v1"
+                }
+            },
+            "models": {
+                "account/old": {
+                    "account": "account",
+                    "model": "old-wire",
+                    "context_window": 128000
+                },
+                "account/new": {
+                    "account": "account",
+                    "model": "new-wire",
+                    "context_window": 200000
+                }
+            }
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn follow_global_detects_model_change_inside_same_provider() {
         assert!(should_reload_provider(
@@ -8551,6 +8624,48 @@ mod external_config_tests {
     }
 
     #[test]
+    fn pinned_new_schema_selection_ignores_an_external_default_change() {
+        let current = new_schema_config("account/old");
+        let persisted = new_schema_config("account/new");
+
+        let merged = merge_persisted_config_preserving_active(&current, persisted, false);
+
+        assert_eq!(merged.default_model.as_deref(), Some("account/old"));
+        let resolved = merged.resolve_model(None).unwrap();
+        assert_eq!(resolved.selection_id, "account/old");
+        assert_eq!(resolved.model, "old-wire");
+        assert_eq!(resolved.context_window, 128_000);
+    }
+
+    #[test]
+    fn pinned_legacy_selection_clears_an_external_new_schema_default() {
+        let current = config("legacy-wire", false);
+        let persisted = new_schema_config("account/new");
+
+        let merged = merge_persisted_config_preserving_active(&current, persisted, false);
+
+        assert_eq!(merged.default_model, None);
+        let resolved = merged.resolve_model(None).unwrap();
+        assert_eq!(resolved.selection_id, "main");
+        assert_eq!(resolved.model, "legacy-wire");
+    }
+
+    #[test]
+    fn manual_reload_updates_the_pinned_new_schema_model_without_switching_it() {
+        let current = new_schema_config("account/old");
+        let mut persisted = new_schema_config("account/new");
+        persisted.models.get_mut("account/old").unwrap().context_window = 64_000;
+
+        let merged = merge_persisted_config_preserving_active(&current, persisted, true);
+
+        assert_eq!(merged.default_model.as_deref(), Some("account/old"));
+        let resolved = merged.resolve_model(None).unwrap();
+        assert_eq!(resolved.selection_id, "account/old");
+        assert_eq!(resolved.model, "old-wire");
+        assert_eq!(resolved.context_window, 64_000);
+    }
+
+    #[test]
     fn manual_reload_adopts_active_provider_window_edit_but_keeps_selection() {
         // The reported bug: editing the ACTIVE provider's `context_window` in
         // config.toml + /reload was silently ignored. With `adopt_active_edits`
@@ -8615,6 +8730,24 @@ mod external_config_tests {
         assert_eq!(saved.providers["global"].model, "global-model");
         assert_eq!(saved.language, Some(atomcode_config::locale::Locale::ZhCn));
         assert_eq!(saved.providers["local"].model, "local-model");
+    }
+
+    #[test]
+    fn stale_window_write_does_not_restore_its_new_schema_model_as_default() {
+        let persisted = new_schema_config("account/new");
+        let mut desired = new_schema_config("account/old");
+        desired.models.remove("account/new");
+        desired.models.get_mut("account/old").unwrap().context_window = 64_000;
+        desired.language = Some(atomcode_config::locale::Locale::ZhCn);
+
+        let saved = config_for_persistence(&desired, &persisted, false);
+
+        assert_eq!(saved.default_model.as_deref(), Some("account/new"));
+        let resolved = saved.resolve_model(None).unwrap();
+        assert_eq!(resolved.selection_id, "account/new");
+        assert_eq!(resolved.model, "new-wire");
+        assert_eq!(saved.models["account/old"].context_window, 64_000);
+        assert_eq!(saved.language, Some(atomcode_config::locale::Locale::ZhCn));
     }
 
     #[test]
