@@ -525,7 +525,12 @@ fn sudo_opts_have_askpass_or_noninteractive(rest: &str) -> bool {
 fn build_command(command: &str) -> Result<tokio::process::Command, String> {
     // Prefer bash for the bash-isms models emit; the OS PATH resolves it. If bash is
     // absent the spawn fails and the model sees a clear error (it can retry with sh).
-    let mut cmd = tokio::process::Command::new("bash");
+    // HarmonyOS / OpenHarmony does NOT ship bash — fall back to sh (mksh).
+    #[cfg(target_env = "ohos")]
+    let shell = "sh";
+    #[cfg(not(target_env = "ohos"))]
+    let shell = "bash";
+    let mut cmd = tokio::process::Command::new(shell);
     cmd.arg("-c").arg(command);
     Ok(cmd)
 }
