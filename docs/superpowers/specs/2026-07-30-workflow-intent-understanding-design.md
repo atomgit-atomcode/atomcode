@@ -49,12 +49,20 @@ atomcode 现状：
 ```
 - UNDERSTAND: before diving in, pin down what the user actually wants — the concrete
   outcome and its scope, not implementation detail. For multi-step work this IS the
-  todowrite plan: its first items are the outcomes the user asked for; when todowrite
+  task plan: its first items are the outcomes the user asked for; when a task plan
   isn't in play, state the goal in one sentence as part of PLAN. Capture the goal AS the
   plan — don't echo the request back as prose. Only if the goal itself is genuinely
-  ambiguous (not an implementation choice you can reasonably pick) ask with
-  request_user_input before starting; otherwise take the sensible default and proceed.
+  ambiguous (not an implementation choice you can reasonably pick) ask the user before
+  starting; otherwise take the sensible default and proceed.
 ```
+
+> **实现期修正(已评审接受)**：措辞刻意**不点名** `todowrite` / `request_user_input` 两个工具。
+> 原因:`RULES` 是**无条件注入**的,而这两个工具受 env 门控(`ATOMCODE_TODO` /
+> `ATOMCODE_REQUEST_USER_INPUT`);在无条件块里点名它们会撞坏已有门控不变式测试
+> (`todo_guidance_present_only_when_enabled`、`skills_block_points_at_ui_answering`),
+> 且会在工具未挂载时引用不存在的工具。工具级指令仍由**门控的** `## TASK TRACKING`
+> (点名 `todowrite`)与 `## ASKING THE USER`(点名 `request_user_input`)承载,默认态下
+> 二者与本泛化引导自然连上。
 
 `For simple changes ... : just do it` 那一行**保持不变**——这是分层策略里「小任务不复述、零噪音」的分支。
 
