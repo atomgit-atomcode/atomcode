@@ -5,7 +5,7 @@
 //! memory, the same coexistence stance as [`crate::session`]; sole known divergence:
 //! under `sudo` without `$ATOMCODE_HOME` — see [`config_dir`]):
 //! - **global**: `$ATOMCODE_HOME/memory.md` (else `~/.atomcode/memory.md`)
-//! - **project**: `<project_root>/.atomcode/memory.md`
+//! - **project**: `<project_root>/.atomcode/memory.md` (overridable via `ATOMCODE_PROJECT_MEMORY_DIR`)
 //!
 //! Entries are plain `- ` bullet lines — human-editable, git-diffable. [`MemoryStore`]
 //! is the byte-compatible load/append/remove/merge engine (ported verbatim);

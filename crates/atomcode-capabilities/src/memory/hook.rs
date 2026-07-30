@@ -265,6 +265,8 @@ mod tests {
 
     #[test]
     fn for_project_labels_with_directory_name() {
+        // Remove any override so we always test the default `.atomcode` path.
+        std::env::remove_var("ATOMCODE_PROJECT_MEMORY_DIR");
         let h = MemoryHook::for_project(Path::new("/tmp/some/repo-name"));
         assert_eq!(h.project_name, "repo-name");
         assert!(h.project.path().ends_with(".atomcode/memory.md"));
