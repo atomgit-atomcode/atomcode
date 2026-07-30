@@ -8,7 +8,7 @@ description = "L2 review specialization: assembles the neutral kernel + capabili
 atomcode-kernel = { path = "../atomcode-kernel" }
 # Read-only review toolset: fs read/grep/glob + ast_grep + report_finding (in `tools`),
 # code-intelligence (`codeintel`), and web_search (`web`). NO write/edit/bash mounted.
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "codeintel", "web"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "codeintel", "web", "skills"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 # The `code_review` sub-agent tool: async Tool trait + JSON arg parsing.
 async-trait = "0.1"
